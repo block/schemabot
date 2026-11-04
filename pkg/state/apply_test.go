@@ -154,6 +154,10 @@ func TestDeriveApplyState_PostCopyPhases(t *testing.T) {
 		{[]string{"CUTTING_OVER", "RUNNING", "PENDING"}, Apply.Running},
 		{[]string{"CUTTING_OVER", "RUNNING"}, Apply.Running},
 		{[]string{"COMPLETED", "CUTTING_OVER", "RUNNING"}, Apply.Running},
+		// A sibling resuming after a stop has its copy ahead of it too, so the
+		// apply reports the resume rather than the cutover.
+		{[]string{"CUTTING_OVER", "RESUMING"}, Apply.Resuming},
+		{[]string{"COMPLETED", "CUTTING_OVER", "RESUMING"}, Apply.Resuming},
 		// Pending tasks with no active sibling stay Pending, not Running.
 		{[]string{"PENDING", "PENDING"}, Apply.Pending},
 	}

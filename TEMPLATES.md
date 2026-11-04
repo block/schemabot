@@ -587,12 +587,169 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 </details>
 
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
 📋 **Plan**: **2** tables to alter
 
 
 ---
 
 ▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-primary-key-warning"></a><strong>MySQL Plan (Existing Primary Key Warning)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+💡 **Lint Warnings**: 1 advisory finding
+- `customers`: Primary key column `id` has type `varchar`
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-new-primary-key-issue"></a><strong>MySQL Plan (New Primary Key Issue)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `customers` (
+    `id` varchar(64) NOT NULL,
+    `created_at` datetime(3) NOT NULL,
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `customers`: Primary key column `id` has type `varchar`
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
+📋 **Plan**: **1** table to create
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-related-guidance"></a><strong>MySQL Plan (Related Guidance)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
+```
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `invoices` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `shipments` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `sessions` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+
+<details>
+<summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>
+
+**`customers`**
+- Primary key column `id` has type `varchar`
+
+**`orders`**
+- Primary key column `id` has type `varchar`
+
+**`invoices`**
+- Primary key column `id` has type `varchar`
+
+**`shipments`**
+- Primary key column `id` has type `varchar`
+
+**`sessions`**
+- Primary key column `id` has type `varchar`
+
+**`events`**
+- Primary key column `id` has type `varchar`
+
+</details>
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
+
+📋 **Plan**: **7** tables to alter
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `users`:
 ```
 schemabot apply -e staging
 ```
@@ -2197,6 +2354,71 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="rollout-plans-copy-discarded-on-another-target-paused"></a><strong>Rollout Plans (Copy Discarded On Another Target, Paused)</strong></summary>
+
+
+## Schema Change Apply — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+On target `us/testapp_3`:
+
+⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
+- `products` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `products` ADD INDEX `idx_category` (`category`) ``
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 3 targets
+
+
+---
+
+**Confirmation required** — review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e production
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
 <summary><a name="rollout-plans-table-sizes-two-targets"></a><strong>Rollout Plans (Table Sizes, Two Targets)</strong></summary>
 
 
@@ -2332,9 +2554,9 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 </details>
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -2368,9 +2590,9 @@ Before dropping an index in MySQL, first make the dropped index invisible and ve
 
 </details>
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -2396,6 +2618,14 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 📋 **Plan**: **2** tables to alter
 
+💡 **Lint Warnings**: 1 advisory finding
+- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
+
 ---
 
 **⛔ Apply rejected**: 3 unsafe changes detected
@@ -2403,9 +2633,9 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 3. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 3 unsafe changes on `orders` and `users`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -2875,6 +3105,20 @@ schemabot plan -e staging
 </details>
 
 <details>
+<summary><a name="missing-e-flag-on-a-control-command"></a><strong>Missing -e Flag On A Control Command</strong></summary>
+
+
+## ❌ Missing Argument
+
+`schemabot stop` needs the environment of the apply it controls. Apply `apply-a1b2c3d4e5f6` runs in `staging`, so comment:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="invalid-command"></a><strong>Invalid Command</strong></summary>
 
 
@@ -3279,6 +3523,40 @@ SchemaBot cannot determine whether this PR contains managed schema changes: the 
 | Database | Type | Change | Status |
 |----------|------|--------|--------|
 | `orders` | mysql | 1 alter | Stopped |
+
+</details>
+
+
+## Aggregate Check — Multi-Target Rollout Names Its Targets
+
+<details>
+<summary><strong>Aggregate Check — Multi-Target Rollout Names Its Targets</strong></summary>
+
+**After `schemabot apply -e production --target shop-002`**
+
+1 apply pending
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | `shop-002` applied; apply the rest of the environment to finish | Pending |
+
+
+**After `schemabot plan -e production`**
+
+1 apply pending on 3 of 4 targets
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | 1 alter · pending on 3 of 4 targets: `shop-001`, `shop-003`, `shop-004` | Pending |
+
+
+**While `schemabot apply -e production` runs**
+
+Apply in progress on 3 of 4 targets
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | 1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004` | In progress |
 
 </details>
 
@@ -3756,7 +4034,9 @@ ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes are being applied. This comment will be updated with progress.
+**Status**: Queued
+
+This schema change starts automatically, and this comment updates once it does.
 
 </details>
 
@@ -3813,9 +4093,28 @@ schemabot unlock -d testapp --force
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
+This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
 
-Wait for it to complete or stop it first.
+Once it finishes, apply again:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-already-applying-the-latest-commit"></a><strong>Apply Blocked: Already Applying The Latest Commit</strong></summary>
+
+
+## ⚠️ Apply Already In Progress — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
+
+It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.
 
 </details>
 
@@ -3916,7 +4215,7 @@ _Requested by @jackjackbits_
 
 The pending confirmation is for `staging`, not `production`; nothing was applied.
 
-To confirm the `staging` plan:
+To apply the `staging` plan:
 
 ```
 schemabot apply-confirm -e staging -d testapp --defer-cutover
@@ -4014,6 +4313,24 @@ schemabot apply -e staging
 **Database**: `testapp`
 
 Staging is currently in progress. Wait for it to complete before applying to production.
+
+Once staging completes, retry:
+```
+schemabot apply -e production
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-by-prior-env-stopped"></a><strong>Apply Blocked By Prior Env (Stopped)</strong></summary>
+
+
+## ⛔ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging has a stopped apply. Start it again with the command on its progress comment.
 
 Once staging completes, retry:
 ```
@@ -4165,9 +4482,24 @@ Schema changes require approval from an authorized reviewer before applying.
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from an authorized reviewer before applying.
+@jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. That approval no longer counts, so the latest commit needs a new approval.
 
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Ask for an approval of the latest commit.
+<details>
+<summary>How <code>schema/testapp/orders.sql</code> changed since the approval</summary>
+
+Approved at `4f1c2d9`:
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL COMMENT 'NULL until a coupon is applied';
+```
+
+Latest commit `9a3b5c7`:
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
+```
+
+</details>
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4177,7 +4509,57 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Request a review from anyone listed above
+1. Ask @jdoe or anyone listed above to approve the latest commit
+2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-required-approval-on-an-earlier-commit-pr-targets-another-branch"></a><strong>Apply Blocked: Review Required (Approval On An Earlier Commit, PR Targets Another Branch)</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+@jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` also count as changes to this PR. That approval no longer counts, so the latest commit needs a new approval.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Ask @jdoe or anyone listed above to approve the latest commit
+2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-required-unchanged-file-changed-base"></a><strong>Apply Blocked: Review Required (Unchanged File, Changed Base)</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+@jdoe approved an earlier commit. `schema/testapp/orders.sql` has not changed since then, but the base branch it builds on has, so applying it now would run different DDL. That approval no longer counts, so the latest commit needs a new approval.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4209,7 +4591,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.
+**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so that approval does not count. Operators can find the error in the server logs.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4219,7 +4601,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Ask anyone listed above to approve the latest commit
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4296,11 +4678,11 @@ schemabot apply -e staging
 @mona is not authorized to run `schemabot apply` for this database.
 
 **Operators of `orders`** — members of these teams, or these users, can run it:
-- `acme/orders-operators`
+- @acme/orders-operators
 
 **Other authorized teams and users**:
-- `acme/db-admins`
-- `jdoe`
+- @acme/db-admins
+- @jdoe
 
 Ask one of them to run it, or request membership in one of the teams above.
 <!-- schemabot:offer-support-channel -->
@@ -4473,18 +4855,21 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: ~1.6M · ~438 MB
 
 **`users`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
+- Rows: ~1.5M · ~391 MB
 
 **`products`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 
 ---
@@ -4526,12 +4911,14 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
+- Rows: ~1.5M · ~391 MB
 
 **`products`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 
 ---
@@ -4573,6 +4960,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4621,6 +5009,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4669,6 +5058,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4716,6 +5106,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4763,6 +5154,57 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="second-table-checksumming-cutover-deferred"></a><strong>Second Table Checksumming: Cutover Deferred</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Options**: ⏸️ Defer Cutover
+
+**Status**: Checksumming
+
+📊 1/3 complete · 1 checksumming · 1 queued
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21.92%)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows verified: 321,450 / 1,466,232
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4810,6 +5252,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4946,10 +5389,10 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 - Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 - Shards: 4 (1 copying, 1 waiting for cutover, 1 queued, 1 complete)
-  - ◉ `80-c0`: 31%
-  - ● `40-80`: waiting for cutover
-  - ○ `c0-`: queued
   - ✓ `-40`: complete
+  - ● `40-80`: waiting for cutover
+  - ◉ `80-c0`: 31%
+  - ○ `c0-`: queued
 
 
 ---
@@ -5177,6 +5620,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5224,6 +5668,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5477,7 +5922,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🚫 Cancelled (not started)
+**`users`**: 🚫 Cancelled at 72.00%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -5945,6 +6390,46 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="cutover-started-superseded-progress-comment"></a><strong>Cutover Started: Superseded Progress Comment</strong></summary>
+
+
+Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the cutover</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
+
+**1/1** table(s) ready for cutover
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
 
 
@@ -5972,7 +6457,10 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-SchemaBot triggers cutover automatically — no action needed.
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -6125,7 +6613,7 @@ schemabot apply -e staging
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ❌ **Error:** The schema change failed on the target; the engine&#39;s account of it is in the logs below. (error 1265)
+> ❌ **Error:** An existing value would be truncated by the column&#39;s target type or length. Correct the data or choose a compatible type before applying the change. (error 1265)
 
 1 of 2 tables completed before failure.
 
@@ -6154,7 +6642,7 @@ schemabot apply -e staging
 == apply logs ==
 2026-03-15 14:22:00 UTC [INF] Apply dispatched to data plane [queued -> running]
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
-2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
+2026-03-15 14:28:00 UTC [ERR] Apply failed: An existing value would be truncated by the column's target type or length. Correct the data or choose a compatible type before applying the change. (error 1265) [running -> failed]
 
 == engine logs: shard-a ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
@@ -6217,7 +6705,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`** — Cancelled
+**`users`** — Cancelled at 72.00%
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
@@ -6674,12 +7162,12 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 </details>
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
 ```
-schemabot rollback-confirm -e staging --allow-unsafe
+schemabot rollback-confirm -e staging
 ```
 
-The lock still pins this rollback plan, so the command above confirms it.
+The lock still pins this rollback plan, so the command above, with `--allow-unsafe`, confirms it.
 
 To cancel, comment:
 ```
@@ -6744,6 +7232,38 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 ```
 
 </details>
+
+</details>
+
+<details>
+<summary><a name="rollback-refused-multiple-targets"></a><strong>Rollback Refused: Multiple Targets</strong></summary>
+
+
+## Rollback Not Supported — Staging
+
+Rollback isn't currently supported for schema changes across multiple targets.
+
+To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:
+```
+schemabot apply -e staging -d payments
+```
+
+</details>
+
+<details>
+<summary><a name="rollbackconfirm-refused-rollback-plan-stored-without-routing"></a><strong>Rollback-confirm Refused: Rollback Plan Stored Without Routing</strong></summary>
+
+
+## ❌ Rollback-confirm Failed
+
+**Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+### Error
+
+> Plan `plan_8f2c41` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. Run `schemabot rollback -e staging` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`.
+<!-- schemabot:offer-support-channel -->
 </details>
 
 ### CLI Output
@@ -6849,7 +7369,9 @@ The new apply will only process tables that haven't completed.
        ALTER TABLE `orders` ADD INDEX `idx_total_cents`(`total_cents`);
 
 
-Stopped. Use 'schemabot start -e staging <apply_id>' to resume from checkpoint.
+⏹️ Apply stopped
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 
 ```
 </details>
@@ -6891,7 +7413,7 @@ Press Enter to proceed with cutover (or Ctrl+C to detach): _
 Row copy complete. All data has been copied and new writes
 continue to be replicated to keep the shadow table in sync.
 
-To proceed: schemabot cutover -e staging <apply_id>
+To proceed: schemabot cutover <apply_id> -e staging
 Watching for cutover... (Ctrl+C to detach)
 
 ```
@@ -7266,7 +7788,8 @@ Sequential mode: User stopped mid-apply
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-Use 'schemabot start' to resume from checkpoint.
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 
 ```
 </details>
@@ -7645,6 +8168,10 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ ff-: 10.00% · 101,000 / 1,010,000 rows · ETA: 4m 40s
            ◉ fc-fd: 11.00% · 110,440 / 1,004,000 rows · ETA: 4m 38s
            ... 223 more copying shards
+           ● -01: waiting for cutover
+           ● 01-02: waiting for cutover
+           ● 02-03: waiting for cutover
+           ... 27 more shards past copying
 
 ```
 </details>
@@ -7675,6 +8202,10 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ f0-f8: 26.00% · 390,000 / 1,500,000 rows · ETA: 2m 34s
            ◉ e8-f0: 29.00% · 432,100 / 1,490,000 rows · ETA: 2m 31s
            ... 17 more copying shards
+           ● -08: waiting for cutover
+           ● 08-10: waiting for cutover
+           ● 10-18: waiting for cutover
+           ... 9 more shards past copying
 
   ── commerce_001 ──
 
@@ -7843,8 +8374,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
        • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
        • Shards: 2 (2 copying)
-           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
            ◉ -80: 95.24% · 2,000,000 / 2,100,000 rows · ETA: 10s
+           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
 
 ```
 </details>
@@ -8145,7 +8676,7 @@ ESC detach • s stop
 
 ```
 
-Stop command: User runs 'schemabot stop -e staging <apply_id>'
+Stop command: User runs 'schemabot stop <apply_id> -e staging'
 
 ⏹️  Schema change stopped
 
@@ -8154,7 +8685,9 @@ Environment: staging
 Stopped:     2 table(s)
 Skipped:     1 table(s) (already complete)
 
-Checkpoint saved. Use 'schemabot start -e staging apply-a1b2c3d4e5f67890' to resume.
+Checkpoint saved.
+To resume from where it stopped:
+  schemabot start apply-a1b2c3d4e5f67890 -e staging
 
 ```
 </details>
@@ -8193,7 +8726,7 @@ Checkpoint saved. Use 'schemabot start -e staging apply-a1b2c3d4e5f67890' to res
 
 ```
 
-Start command: User runs 'schemabot start -e staging <apply_id>'
+Start command: User runs 'schemabot start <apply_id> -e staging'
 
 ▶️  Schema change resumed
 
@@ -8242,18 +8775,69 @@ ESC detach • s stop
 
 ```
 
-3 active schema changes
+2 active schema changes
 
   APPLY ID      DATABASE   ENV         STATE                STARTED         SOURCE
   apply_abc123  orders-db  staging     Running              15 minutes ago  https://github.com/acme/shop/pull/412
   apply_def456  users-db   production  Waiting for cutover  45 minutes ago  cli:jdoe
-  apply_ghi789  analytics  staging     Stopped              2 hours ago     https://github.com/acme/analytics/pull/87
+
+Recent schema changes
+44 total: 41 Completed · 2 Failed · 1 Stopped
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
+  apply_ghi789  analytics   staging  Stopped    2 hours ago  https://github.com/acme/analytics/pull/87
+  apply_jkl012  orders-db   staging  Completed  3 hours ago  https://github.com/acme/shop/pull/415
+  apply_mno345  billing-db  staging  Failed     5 hours ago  cli:jdoe
+
+Showing the 3 most recent schema changes. Use --limit N to show more.
+Use 'schemabot status <apply_id>' to view details
+
+Nothing active:
+
+No active schema changes
+
+Recent schema changes
+2 total: 1 Completed · 1 Failed
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
+  apply_jkl012  orders-db   staging  Completed  3 hours ago  https://github.com/acme/shop/pull/415
+  apply_mno345  billing-db  staging  Failed     5 hours ago  cli:jdoe
 
 Use 'schemabot status <apply_id>' to view details
 
-No active applies:
+No applies at all:
 
 No recent schema changes
+
+More finished applies than the server's cap:
+
+2 active schema changes
+
+  APPLY ID      DATABASE   ENV         STATE                STARTED         SOURCE
+  apply_abc123  orders-db  staging     Running              15 minutes ago  https://github.com/acme/shop/pull/412
+  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  cli:jdoe
+
+Recent schema changes
+44 total: 41 Completed · 2 Failed · 1 Stopped
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
+  apply_jkl012  orders-db   staging  Completed  3 hours ago  https://github.com/acme/shop/pull/415
+  apply_mno345  billing-db  staging  Failed     5 hours ago  cli:jdoe
+
+Showing the 2 most recent schema changes. Add --after apply_mno345 for the next 2.
+Use 'schemabot status <apply_id>' to view details
+
+The next page, reached with --after apply_mno345, lists only finished applies:
+
+Recent schema changes
+44 total: 41 Completed · 2 Failed · 1 Stopped
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
+  apply_pqr678  orders-db   staging  Completed  7 hours ago  https://github.com/acme/shop/pull/409
+  apply_stu901  billing-db  staging  Failed     9 hours ago  cli:jdoe
+
+Showing 2 more schema changes. Add --after apply_stu901 for the next 2.
+Use 'schemabot status <apply_id>' to view details
 
 ```
 </details>
@@ -8268,6 +8852,8 @@ No recent schema changes
   APPLY ID              EXTERNAL APPLY ID         EXTERNAL OP ID         DATABASE   ENV         STATE                STARTED        SOURCE
   apply-multi-a1b2c3d4  remote-apply-us-east-001  remote-op-us-east-001  orders-db  production  Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
 
+No recent finished schema changes
+
 Use 'schemabot status <apply_id>' to view details
 
 Multiple matching operations:
@@ -8277,6 +8863,8 @@ Multiple matching operations:
   APPLY ID                EXTERNAL APPLY ID         DATABASE      ENV         STATE    STARTED        SOURCE
   apply-sharded-d5e6f7g8  remote-apply-us-east-002  inventory-db  production  Running  4 minutes ago  https://github.com/acme/shop/pull/412
 
+No recent finished schema changes
+
 Use 'schemabot status <apply_id>' to view details
 
 No data-plane apply id recorded:
@@ -8285,6 +8873,8 @@ No data-plane apply id recorded:
 
   APPLY ID                DATABASE     ENV         STATE    STARTED       SOURCE
   apply-pending-l3m4n5o6  payments-db  production  Pending  1 minute ago  https://github.com/acme/shop/pull/412
+
+No recent finished schema changes
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -8329,13 +8919,13 @@ No schema changes found for database 'new-db'
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
-- 🟢 `eu` — ready for cutover — next in order
+- 🟢 `eu` — ready for cutover
 - 🔄 `us` — running table copy
 - ⏳ `au` — waiting for us
 - ⏳ `ca` — waiting for us
 
 <details open>
-<summary>🟢 eu — ready for cutover — next in order</summary>
+<summary>🟢 eu — ready for cutover</summary>
 <dl><dd>
 
 **Database**: `payments_eu`
@@ -8394,6 +8984,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -8475,12 +9066,14 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
+- Rows: ~1.5M · ~391 MB
 
 **`products`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 
 </dd></dl>
@@ -8501,6 +9094,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: ~1.6M · ~438 MB
 
 
 </dd></dl>
@@ -8555,7 +9149,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_040`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
-  - … 1 more copying targets
+  - … 1 more copying target
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 
@@ -8588,7 +9182,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_002`: 12.48% · 183,029 / 1,466,232 rows
-  - … 1 more copying targets
+  - … 1 more copying target
 
 
 </dd></dl>
@@ -8624,9 +9218,9 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 - Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
 - Targets: 3 (1 copying, 1 queued, 1 complete)
+  - ✓ `orders_000`: 1,466,232 rows
   - ◉ `orders_001`: 62.38% · 914,707 / 1,466,232 rows
   - ○ `orders_002`: queued
-  - ✓ `orders_000`: 1,466,232 rows
 
 
 ---
@@ -8650,7 +9244,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-✅ Rolled out to 3 targets
+<details><summary>Apply details (1 table done on 3 targets)</summary>
 
 **`orders`**: ✅ Complete (3 targets)
 
@@ -8658,6 +9252,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
+</details>
 
 </details>
 
@@ -8673,13 +9268,13 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
-- 🟢 `eu` — ready for cutover — next in order
+- 🟢 `eu` — ready for cutover
 - 🔄 `us` — running table copy
 - ⏳ `au` — waiting for us
 - ⏳ `ca` — waiting for us
 
 <details open>
-<summary>🟢 eu — ready for cutover — next in order</summary>
+<summary>🟢 eu — ready for cutover</summary>
 <dl><dd>
 
 **Database**: `payments_eu`
@@ -8738,6 +9333,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -9265,7 +9861,7 @@ schemabot apply -e production
 == apply logs ==
 2026-03-15 14:22:00 UTC [INF] Apply dispatched to data plane [queued -> running]
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
-2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
+2026-03-15 14:28:00 UTC [ERR] Apply failed: An existing value would be truncated by the column's target type or length. Correct the data or choose a compatible type before applying the change. (error 1265) [running -> failed]
 
 == engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001 ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
@@ -9794,7 +10390,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 │  Deployments:  1 ready for cutover · 1 running · 1 waiting  │
 └─────────────────────────────────────────────────────────────┘
 
-🟢 us-east — ready for cutover — next in order (orders-us-east)
+🟢 us-east — ready for cutover (orders-us-east)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
@@ -9964,19 +10560,16 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
   ❌ First failure: prod/payments-041 — duplicate key name 'idx_orders_source'
 
-❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 79%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
-       • Targets: 60 (1 failed, 19 copying, 40 complete)
+       • Rows: 4,093,000 / 4,720,000 across 59 of 64 targets · ETA: ≥ 10m 0s
+       • Targets: 64 (1 failed, 19 copying, 4 queued, 40 complete)
            ✗ payments-041: failed
            ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
            ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
            ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
            ... 16 more copying targets
-
-  4 of 64 targets have not reported progress yet.
 
   Targets needing attention:
     ❌ payments-041 — failed: duplicate key name 'idx_orders_source'
@@ -10004,7 +10597,6 @@ To stop this schema change:
 │  Targets:      3 ready for cutover                    │
 └───────────────────────────────────────────────────────┘
 
-🟢 prod — 3 ready for cutover (3 targets)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
        targets payments-001, payments-002
@@ -10043,18 +10635,126 @@ To cut over prod/payments-001:
 │  Targets:      1 completed · 2 stopped                │
 └───────────────────────────────────────────────────────┘
 
-⏹️ prod — 1 completed · 2 stopped (3 targets)
 
-     ~ orders: ⏹️ Stopped
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 55.00%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-
+       • Rows: 132,000 / 240,000
        • Targets: 3 (2 stopped, 1 complete)
+           ✓ payments-001: 80,000 rows
            ○ payments-002: stopped at 40.00% · 32,000 / 80,000 rows
            ○ payments-003: stopped at 25.00% · 20,000 / 80,000 rows
-           ✓ payments-001: 80,000 rows
 
 To resume from where it stopped:
   schemabot start apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-on-a-keyspaces-only-shard"></a><strong>Sharded Apply On A Keyspace's Only Shard</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-a1b2c3d4                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Completed                              │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:29:00 UTC                    │
+│  Duration:     6s                                     │
+└───────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-copying-across-four-shards"></a><strong>Sharded Apply Copying Across Four Shards</strong></summary>
+
+```
+
+┌─────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                     │
+│  Database:     shop                                     │
+│  Environment:  production                               │
+│  State:        Running                                  │
+│  Shards:       1 running table copy, 3 waiting for -40  │
+│  Caller:       github:octocat                           │
+│  Source:       https://github.com/acme/shop/pull/412    │
+│  Started:      Jan 15 14:26:00 UTC                      │
+│  Duration:     4m                                       │
+└─────────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38% (1 of 4 shards)
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+       • Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
+       • Shards: 4 (1 copying, 3 queued)
+           ◉ -40: 62.38% · 914,707 / 1,466,232 rows · ETA: 3m 15s
+           ○ 40-80: queued
+           ○ 80-c0: queued
+           ○ c0-: queued
+    ~ VSchema (shop_001): Pending
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
+
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-with-a-failed-shard"></a><strong>Sharded Apply With A Failed Shard</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Failed                                 │
+│  Shards:       1 failed, 3 cancelled                  │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     1m                                     │
+└───────────────────────────────────────────────────────┘
+
+  shard -40: resolve shard primary for -40: context deadline exceeded
+
+
+  ── shop_001 ──
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+
+       • Shards: 4 (1 failed, 3 cancelled)
+           ✗ -40: failed
+           ○ 40-80: cancelled
+           ○ 80-c0: cancelled
+           ○ c0-: cancelled
+    ~ VSchema (shop_001): Cancelled
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
 ```
 </details>
 
@@ -10286,7 +10986,8 @@ Sequential mode: User stopped mid-apply
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-Use 'schemabot start' to resume from checkpoint.
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 ```
 </details>
 
@@ -10444,7 +11145,8 @@ Defer cutover: Stopped by user (s)
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 6,400,000 / 7,200,000
 
-Use 'schemabot start -e staging <apply_id>' to resume.
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 
 ```
 </details>
@@ -10465,10 +11167,10 @@ To check status:
   schemabot status <apply_id>
 
 To proceed with cutover:
-  schemabot cutover -e staging <apply_id>
+  schemabot cutover <apply_id> -e staging
 
 To abort the schema change:
-  schemabot stop -e staging <apply_id>
+  schemabot stop <apply_id> -e staging
 
 ```
 </details>
@@ -10512,9 +11214,13 @@ Tables are being renamed atomically...
 
 Lint violations: Non-blocking warnings during plan/apply
 
-💡 Lint Warnings (2):
+💡 Lint Warnings (3):
   • orders: has_float: New column uses floating-point data type
   • users: no_default: Column added without DEFAULT value
+  • customers: Primary key column "id" has type "varchar"
+
+📖 Related guidance:
+  • Choosing a primary key: https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key
 
 
 ```
@@ -10643,12 +11349,9 @@ ESC detach • s stop
 ## Multi-Deployment Apply TUI (CLI)
 
 ```
-⣾ running
-Deployments: 1 ready for cutover · 1 running · 1 waiting
-Apply ID: apply-multi-a1b2c3d4
-Environment: production
+⣾ Running... 1 ready for cutover · 1 running · 1 waiting (3 deployments)
 
-🟢 us-east — ready for cutover — next in order (orders-us-east)
+🟢 us-east — ready for cutover (orders-us-east)
   External operation ID: remote-op-us-east-001
   External apply ID: remote-apply-us-east-001
 
@@ -10672,10 +11375,8 @@ Environment: production
 
 
 SchemaBot will cut over us-east next — no action needed.
-To stop this schema change:
-  schemabot stop apply-multi-a1b2c3d4 -e production
 
-ESC to detach
+ESC detach • s stop
 ```
 
 

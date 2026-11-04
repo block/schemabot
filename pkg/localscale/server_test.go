@@ -173,3 +173,40 @@ func TestQualifyAlterTableName(t *testing.T) {
 		})
 	}
 }
+
+// A cancelled deploy request settles from what its schema changes did, not from
+// their reaching a terminal status: a schema change can complete before the
+// cancel reaches it, and only a request none of whose DDL landed was cancelled.
+func TestCancelOutcome(t *testing.T) {
+	tests := []struct {
+		name       string
+		migrations []migrationInfo
+		want       cancelSettlement
+	}{
+		{
+			name:       "a schema change still running keeps the cancel pending",
+			migrations: []migrationInfo{{status: "cancelled"}, {status: "running"}},
+			want:       cancelPending,
+		},
+		{
+			name:       "no schema change completed confirms the cancel",
+			migrations: []migrationInfo{{status: "cancelled"}, {status: "failed"}},
+			want:       cancelConfirmed,
+		},
+		{
+			name:       "every schema change completed before the cancel reached it",
+			migrations: []migrationInfo{{status: "complete"}, {status: "COMPLETE"}},
+			want:       cancelLostToCompletion,
+		},
+		{
+			name:       "a completed schema change beside a cancelled one is partially applied",
+			migrations: []migrationInfo{{status: "complete"}, {status: "cancelled"}},
+			want:       cancelPartiallyApplied,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, cancelOutcome(tt.migrations))
+		})
+	}
+}

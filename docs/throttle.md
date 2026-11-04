@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [Capacity and automatic scaling](#capacity-and-automatic-scaling)
 - [redo-aware](#redo-aware)
 - [threads-running](#threads-running)
 - [commit-latency](#commit-latency)
@@ -25,6 +26,18 @@ throttle at the same time, the reasons are joined with `; `.
 This page explains each signal: what it measures, why the engine pauses on it,
 and what to look at when the throttle lasts longer than expected.
 
+## Capacity and automatic scaling
+
+SchemaBot enables Spirit's automatic write-thread scaling by default. It adjusts concurrency
+from throttle feedback, increasing throughput when capacity permits and backing off under
+pressure. This scales the copy's work; it does not resize your database instance.
+
+Allow headroom for both application traffic and the schema change. If progress stays slow,
+check the reported reason alongside database CPU, I/O, and application latency. A quieter
+window or more database capacity may help, depending on the bottleneck. The throttle thresholds
+are protective limits, not a guarantee of your application's latency target. A sustained pause
+deserves investigation even when application traffic is low.
+
 ## redo-aware
 
 ```
@@ -42,13 +55,11 @@ instance the copy throttles against its own footprint. In the example, 4
 active threads exceed a budget of 3 on a 2-vCPU instance, a state the copy's
 own threads can reach with little or no application load.
 
-**When to act.** Usually nothing: the throttle is self-limiting, trading copy
-speed for CPU headroom. Because the copy's own threads count toward the
-budget, a throttled copy on a small or even idle instance is normal and is
-not evidence of application overload. If the copy must finish sooner, move
-to a larger instance class; raising the copy's own concurrency does not help
-while this signal is active, since the extra threads count against the same
-budget.
+**When to act.** Brief pauses need no intervention. The copy's own threads
+count toward the budget, so this signal can fire even when application traffic
+is low. If it persists, check active queries and CPU load to see what consumes
+the budget. Automatic scaling adjusts the write threads within the available
+capacity; a larger instance may help when CPU headroom remains the bottleneck.
 
 ## threads-running
 
@@ -75,16 +86,16 @@ commit-latency 112.4ms >= 100ms
 
 The average commit latency on the database has crossed the engine's
 threshold, the right-hand value in the reason (SchemaBot configures 100ms,
-auto-enabled on Aurora). Slow commits mean the storage layer is saturating,
-so the copy backs off before write latency degrades for the application.
+auto-enabled on Aurora). Slow commits signal pressure on the write path,
+so the copy backs off to reduce its contribution to that pressure.
 
 **When to act.** A sustained throttle points at storage pressure: check the
 instance's write IOPS and commit latency metrics. Do not expect a
 co-occurring redo-aware reason as confirmation: redo-aware subtracts exactly
 the threads parked on redo-log waits, so a saturated redo log makes its
 count fall rather than rise, and commit-latency is the signal designed to
-notice. A sustained commit-latency throttle on its own says the instance is
-undersized for the combined application and copy write load.
+notice. A sustained commit-latency throttle calls for investigating the write
+path; it does not by itself prove that a larger instance will resolve it.
 
 ## Throttled with no reason
 

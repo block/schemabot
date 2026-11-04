@@ -85,8 +85,202 @@ func strandedReaperServiceWithTasks(reaped []*storage.ReapedOperation, reapErr e
 	svc.storage = &mockStorageWithApplyStores{
 		operations: &staticApplyOperationStore{reaped: reaped, reapErr: reapErr},
 		tasks:      &reapingTaskStore{reaped: reapedTasks, reapErr: taskReapErr},
+		controls:   &reapingControlRequestStore{fakeControlRequestStore: &fakeControlRequestStore{}},
 	}
 	return svc
+}
+
+// reapingControlRequestStore serves the reaper pass a canned stranded listing
+// and records the settlements the pass makes against it.
+type reapingControlRequestStore struct {
+	*fakeControlRequestStore
+	stranded []*storage.StrandedControlRequest
+	listErr  error
+}
+
+func (s *reapingControlRequestStore) ListStrandedPending(context.Context, int) ([]*storage.StrandedControlRequest, error) {
+	return s.stranded, s.listErr
+}
+
+// strandedControlRequestReaperService wires a pass whose control-request sweep
+// finds the given stranded requests and whose apply store serves the apply
+// they belong to, with the other sweeps finding nothing.
+func strandedControlRequestReaperService(apply *storage.Apply, stranded []*storage.StrandedControlRequest, pending ...storage.ControlOperation) (*Service, *reapingControlRequestStore) {
+	pendingByOp := make(map[storage.ControlOperation]*storage.ApplyControlRequest, len(pending))
+	for _, op := range pending {
+		pendingByOp[op] = &storage.ApplyControlRequest{ApplyID: apply.ID, Operation: op, Status: storage.ControlRequestPending}
+	}
+	controls := &reapingControlRequestStore{
+		fakeControlRequestStore: &fakeControlRequestStore{pending: pendingByOp},
+		stranded:                stranded,
+	}
+	svc := newTestService()
+	svc.storage = &mockStorageWithApplyStores{
+		applies:    &getApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{},
+		tasks:      &reapingTaskStore{},
+		controls:   controls,
+	}
+	return svc, controls
+}
+
+func strandedRequest(apply *storage.Apply, op storage.ControlOperation) *storage.StrandedControlRequest {
+	return &storage.StrandedControlRequest{
+		Request: &storage.ApplyControlRequest{ApplyID: apply.ID, Operation: op, Status: storage.ControlRequestPending, RequestedBy: "operator"},
+		Apply:   apply,
+	}
+}
+
+// A start left pending on a completed apply is answered by the reaper with the
+// same outcome the drive would have disclosed: the apply completed, so the
+// start took effect and completes. A failed apply fails the start with the
+// apply's own reason, so the operator reads that the command did not reach the
+// outcome they asked for.
+func TestRunStrandedReaperPassAnswersAStartStrandedOnASettledApply(t *testing.T) {
+	t.Run("completed apply completes the start", func(t *testing.T) {
+		apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Completed}
+		svc, controls := strandedControlRequestReaperService(apply,
+			[]*storage.StrandedControlRequest{strandedRequest(apply, storage.ControlOperationStart)},
+			storage.ControlOperationStart)
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, controls.completed)
+		assert.Empty(t, controls.failed)
+	})
+
+	t.Run("failed apply fails the start with the apply's reason", func(t *testing.T) {
+		apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-failed", State: state.Apply.Failed, ErrorMessage: "target rejected the schema change"}
+		svc, controls := strandedControlRequestReaperService(apply,
+			[]*storage.StrandedControlRequest{strandedRequest(apply, storage.ControlOperationStart)},
+			storage.ControlOperationStart)
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Empty(t, controls.completed)
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, controls.failed)
+		assert.Equal(t, []string{"target rejected the schema change"}, controls.failureReasons)
+	})
+}
+
+// A revert or skip-revert left pending on a settled apply is answered by the
+// reaper from the outcome, the same way the drive tail's terminal sweep answers
+// it: a revert took effect only if the apply reverted, and a skip-revert only if
+// it completed. A revert the completed schema change outran fails with a reason
+// saying the change is live, rather than staying pending and being re-listed on
+// every pass.
+func TestRunStrandedReaperPassAnswersRevertPhaseRequestsStrandedOnASettledApply(t *testing.T) {
+	tests := []struct {
+		name          string
+		applyState    string
+		op            storage.ControlOperation
+		wantCompleted []storage.ControlOperation
+		wantFailed    []storage.ControlOperation
+		wantReason    string
+	}{
+		{name: "a revert the completed apply outran fails", applyState: state.Apply.Completed, op: storage.ControlOperationRevert,
+			wantFailed: []storage.ControlOperation{storage.ControlOperationRevert},
+			wantReason: "the schema change completed before the revert could take effect; the change is live on the target"},
+		{name: "a skip-revert on a completed apply completes", applyState: state.Apply.Completed, op: storage.ControlOperationSkipRevert,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationSkipRevert}},
+		{name: "a revert on a reverted apply completes", applyState: state.Apply.Reverted, op: storage.ControlOperationRevert,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationRevert}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-settled", State: tt.applyState}
+			svc, controls := strandedControlRequestReaperService(apply,
+				[]*storage.StrandedControlRequest{strandedRequest(apply, tt.op)}, tt.op)
+
+			svc.runStrandedReaperPass(t.Context())
+
+			assert.Equal(t, tt.wantCompleted, controls.completed)
+			assert.Equal(t, tt.wantFailed, controls.failed)
+			if tt.wantReason != "" {
+				assert.Equal(t, []string{tt.wantReason}, controls.failureReasons)
+			}
+			assert.Empty(t, controls.pending, "a request the reaper visited must not stay pending for the next pass")
+		})
+	}
+}
+
+// A request no drive will consume once the apply has settled is completed by
+// the reaper rather than re-listed on every pass. A retired operation has no
+// driver left to serve it. A release recorded on a paused on_failure=pause
+// rollout stays pending as the rollout's latch until the apply settles; it is
+// completed, which keeps the rollout released.
+func TestRunStrandedReaperPassCompletesRequestsNoDriveConsumesOnASettledApply(t *testing.T) {
+	retired := storage.RetiredControlOperations()
+	require.NotEmpty(t, retired, "the retired-operation case needs a retired operation to strand")
+	tests := []struct {
+		name       string
+		applyState string
+		op         storage.ControlOperation
+	}{
+		{name: "a retired operation's request completes", applyState: state.Apply.Completed, op: retired[0]},
+		{name: "a release on a failed apply completes", applyState: state.Apply.Failed, op: storage.ControlOperationRelease},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-settled", State: tt.applyState}
+			svc, controls := strandedControlRequestReaperService(apply,
+				[]*storage.StrandedControlRequest{strandedRequest(apply, tt.op)}, tt.op)
+
+			svc.runStrandedReaperPass(t.Context())
+
+			assert.Equal(t, []storage.ControlOperation{tt.op}, controls.completed)
+			assert.Empty(t, controls.failed)
+			assert.Empty(t, controls.pending, "a request the reaper visited must not stay pending for the next pass")
+		})
+	}
+}
+
+// The listing is per request but the settlement is per apply: it reloads the
+// apply and answers every pending request on it in one visit, so an apply that
+// stranded both a stop and a cancel is settled once, not once per row.
+func TestRunStrandedReaperPassSettlesEachStrandedApplyOnce(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Cancelled}
+	svc, controls := strandedControlRequestReaperService(apply,
+		[]*storage.StrandedControlRequest{
+			strandedRequest(apply, storage.ControlOperationStop),
+			strandedRequest(apply, storage.ControlOperationCancel),
+		},
+		storage.ControlOperationStop, storage.ControlOperationCancel)
+
+	svc.runStrandedReaperPass(t.Context())
+
+	assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel}, controls.completed,
+		"one visit answers both requests; a second visit would complete them again")
+}
+
+// A storage failure listing stranded control requests is recorded under the
+// sweep's own reason, and losing its election is not a failure.
+func TestRunStrandedReaperPassRecordsControlRequestSweepOutcomes(t *testing.T) {
+	t.Run("listing failure", func(t *testing.T) {
+		reader := reaperMetricReader(t)
+		svc := strandedReaperService(nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).controls = &reapingControlRequestStore{
+			fakeControlRequestStore: &fakeControlRequestStore{},
+			listErr:                 errors.New("control requests table unavailable"),
+		}
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Equal(t, []string{"stranded_control_request_reaper_error"}, claimFailureReasons(t, reader))
+	})
+
+	t.Run("busy is not a failure", func(t *testing.T) {
+		reader := reaperMetricReader(t)
+		svc := strandedReaperService(nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).controls = &reapingControlRequestStore{
+			fakeControlRequestStore: &fakeControlRequestStore{},
+			listErr:                 storage.ErrStrandedControlRequestReaperBusy,
+		}
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Empty(t, claimFailureReasons(t, reader), "an unelected control-request sweep is not a failure")
+	})
 }
 
 func settledOperation(deployment string) *storage.ReapedOperation {
@@ -243,6 +437,7 @@ func TestRunStrandedReaperPassDoesNotHoldOneSweepBehindTheOther(t *testing.T) {
 	svc.storage = &mockStorageWithApplyStores{
 		operations: &gatedApplyOperationStore{gate: operationSweepGate},
 		tasks:      &startedTaskStore{started: taskSweepStarted},
+		controls:   &reapingControlRequestStore{fakeControlRequestStore: &fakeControlRequestStore{}},
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), reaperPassDeadline)
@@ -321,6 +516,16 @@ func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, limit int) ([]
 	return s.expirations, nil
 }
 
+// Get serves the expired apply the pass reloads to publish its terminal summary.
+func (s *expiringApplyStore) Get(_ context.Context, id int64) (*storage.Apply, error) {
+	for _, expiration := range s.expirations {
+		if expiration.Apply.ID == id {
+			return expiration.Apply, nil
+		}
+	}
+	return nil, nil
+}
+
 // retryableExpiryService wires a service whose expiry pass is served by applies,
 // returning the store its apply-log writes land in.
 func retryableExpiryService(applies storage.ApplyStore) (*Service, *capturingApplyLogStore) {
@@ -372,6 +577,33 @@ func TestRunRetryableExpiryPassRecordsWhyRecoveryStoppedInTheApplyLog(t *testing
 	assert.Contains(t, entry.Message, string(storage.RetryableExpirationAttemptBudget))
 	assert.Equal(t, state.Apply.FailedRetryable, entry.OldState)
 	assert.Equal(t, state.Apply.Failed, entry.NewState)
+}
+
+// Expiry is the transition that makes a retrying apply terminal, and no driver
+// holds the apply to publish that outcome. The pass publishes the apply's
+// terminal summary itself, after recording why recovery stopped, so the PR
+// gets its failure summary and its Check Run leaves "in progress" instead of
+// keeping the last progress comment for an apply that has already failed.
+func TestRunRetryableExpiryPassPublishesTheTerminalSummary(t *testing.T) {
+	tasks := &terminalSummaryTaskStore{tasks: []*storage.Task{{TaskIdentifier: "task-1", ApplyID: 42, State: state.Task.Failed}}}
+	applyLogs := &capturingApplyLogStore{}
+	svc := newTestService()
+	svc.storage = &mockStorageWithApplyStores{applies: &expiringApplyStore{expirations: budgetExpiration()}, tasks: tasks, applyLogs: applyLogs}
+	var published []recordedTerminalSummary
+	svc.OnApplyTerminalSummary = func(_ context.Context, a *storage.Apply, ts []*storage.Task) error {
+		require.Len(t, applyLogs.logs, 1, "why recovery stopped is logged before the summary renders the apply's failure details")
+		published = append(published, recordedTerminalSummary{apply: a, tasks: ts})
+		return nil
+	}
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	require.Len(t, published, 1, "the expired apply's terminal summary is published once")
+	assert.Equal(t, "apply-42", published[0].apply.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Failed, published[0].apply.State)
+	require.Len(t, published[0].tasks, 1)
+	assert.Equal(t, "task-1", published[0].tasks[0].TaskIdentifier)
+	assert.True(t, tasks.called, "the summary reloads every task of the apply")
 }
 
 // A retryable-apply expiry is a control-plane lifecycle transition an operator

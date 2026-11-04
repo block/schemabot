@@ -279,6 +279,26 @@ func (r *TargetRouter) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*
 	return response, err
 }
 
+// CompareSchemaFileChange routes a schema file comparison to the resolved
+// target, mirroring PlanDiff's routing.
+func (r *TargetRouter) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("schema file comparison request is required")
+	}
+	var response *ternv1.CompareSchemaFileChangeResponse
+	err := r.routeReadWithAuthRetry(ctx, "compare_schema_file_change", targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database,
+		func(gen *targetClientGeneration, resolved *inventory.Target) error {
+			routedReq := proto.Clone(req).(*ternv1.CompareSchemaFileChangeRequest)
+			routedReq.Database = req.Database
+			routedReq.Type = resolved.DatabaseType
+			routedReq.Target = resolved.Target
+			var dispatchErr error
+			response, dispatchErr = gen.client.CompareSchemaFileChange(ctx, routedReq)
+			return dispatchErr
+		})
+	return response, err
+}
+
 // routeReadWithAuthRetry dispatches a routed read on the route's current
 // generation and, when the dispatch fails with a classified target
 // authentication error, evicts that exact generation, re-resolves the target,

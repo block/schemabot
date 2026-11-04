@@ -28,6 +28,7 @@ type Storage struct {
 	checks          *checkStore
 	settings        *settingsStore
 	webhookEvents   *webhookEventStore
+	driverPools     *driverPoolStore
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -90,13 +91,14 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		tasks:           &taskStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		applyLogs:       &applyLogStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity},
-		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
+		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect, locker: deps.Locker},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
 		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
+		driverPools:     &driverPoolStore{db: rdb, dialect: deps.Dialect},
 	}
 }
 
@@ -158,6 +160,11 @@ func (s *Storage) Settings() storage.SettingsStore {
 // WebhookEvents returns the durable webhook event inbox store.
 func (s *Storage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
+}
+
+// DriverPools returns the store of each server's driver pool.
+func (s *Storage) DriverPools() storage.DriverPoolStore {
+	return s.driverPools
 }
 
 // Ping verifies the database connection is alive.

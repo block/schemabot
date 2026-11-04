@@ -34,17 +34,17 @@ import (
 // apply-confirm. A re-plan that routes a statement to direct execution that
 // disclosedPlan did not stops on either path, since no comment disclosed it.
 //
-// disclosedCopyDiscard is what the comment behind this apply told the operator
-// about an unfinished copy on the target, read from the lock's pending
-// confirmation. It is the consent this re-plan is checked against: the plan
-// decided whether to stop, and the same decision is made again here, against the
-// target as it is now.
+// disclosedCopies are the unfinished copies the comment behind this apply told
+// the operator it discards, read from the lock's pending confirmation. They are
+// the consent this re-plan is checked against: the plan decided whether to
+// stop, and the same decision is made again here, copy by copy, against the
+// targets as they are now.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
-	disclosedCopyDiscard bool,
+	disclosedCopies []storage.DisclosedCopy,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -58,10 +58,6 @@ func (h *Handler) executeApply(
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", disclosedPlan.PlanIdentifier, "narrowed_to", disclosedPlan.NarrowedTo)
 	}
-	// The apply a refusal asks the operator to re-run: the one they sent,
-	// narrowed as its confirmed plan was, with the options they typed.
-	recoveryCommand := templates.ApplyCommand(environment, result.Database, applyCommandOptionsOf(result))
-
 	// Re-plan for drift detection
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
@@ -100,6 +96,11 @@ func (h *Handler) executeApply(
 	if storedPlan != nil {
 		actionName = action.Apply
 	}
+	// What a refusal tells the operator when the lock changed under the apply:
+	// re-run the apply they sent, narrowed as its confirmed plan was, with the
+	// options they typed.
+	repinRefusal := applyLockIntentChangedRefusal(actionName, database, environment, requestedBy, result.Database, applyCommandOptionsOf(result))
+
 	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("apply rejected: failed final PR freshness fetch",
@@ -260,9 +261,9 @@ func (h *Handler) executeApply(
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
 				return
 			}
-			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
+			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
+				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
 				}
 				h.logger.Error("failed to re-pin the pending confirmation onto the plan whose comment shows the targets' changed plans",
@@ -395,9 +396,9 @@ func (h *Handler) executeApply(
 			}
 			// The comment just posted renders this re-plan, so it discloses
 			// whatever unfinished copy the re-plan would discard.
-			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
+			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
+				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
 				}
 				h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the newly-direct changes",
@@ -420,11 +421,15 @@ func (h *Handler) executeApply(
 	//
 	// A discard the operator was already shown proceeds. They agreed to that
 	// cost, and asking again on every confirm would make the stop unpassable.
-	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 && !disclosedCopyDiscard {
+	// Consent is to the copies named, on the targets they were named on, so a
+	// copy the disclosure did not name stops the apply even when it named
+	// others.
+	discarding := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
+	if undisclosed := undisclosedDiscards(discarding, disclosedCopies); undisclosed > 0 {
 		h.logger.Info("apply stopped for confirmation: re-plan discards an existing copy the disclosure did not show",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "action", actionName,
-			"plan_id", planResp.PlanID, "discarded_copies", len(discarded))
+			"plan_id", planResp.PlanID, "discarded_copies", len(discarding), "undisclosed_copies", undisclosed)
 		// The disclosure is posted before it is recorded. The record's whole
 		// claim is that the operator was shown the copy, so a post that never
 		// lands must leave no consent behind: the next attempt stops and asks
@@ -436,8 +441,8 @@ func (h *Handler) executeApply(
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
 			return
 		}
-		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, true); err != nil {
-			if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
+		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, discarding); err != nil {
+			if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 				return
 			}
 			// Without the re-pin the confirm command would load the disclosure
@@ -550,7 +555,7 @@ func (h *Handler) executeApply(
 	if err != nil {
 		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, err))
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
 		return
 	}
 
@@ -594,17 +599,20 @@ func (h *Handler) executeApply(
 	// the apply could complete between the check and the post, leaving a
 	// stale "In Progress" comment that the observer never edits.
 	progressBody := templates.RenderApplyStarted(templates.ApplyStatusCommentData{
-		ApplyID:     applyResp.ApplyID,
-		Database:    database,
-		Environment: environment,
-		RequestedBy: requestedBy,
-		State:       apply.State,
-		Engine:      schemaResult.Type,
+		ApplyID:      applyResp.ApplyID,
+		Database:     database,
+		Environment:  environment,
+		RequestedBy:  requestedBy,
+		State:        apply.State,
+		Engine:       schemaResult.Type,
+		DeferCutover: apply.GetOptions().DeferCutover,
+		SkipRevert:   apply.GetOptions().SkipRevert,
 	})
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply,
+		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work)); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
 			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
@@ -784,12 +792,17 @@ func unverifiedMemberWorkMessage(unverified, environment string, automatic bool)
 	return fmt.Sprintf("SchemaBot could not verify %s, so nothing was applied. %s", unverified, recovery)
 }
 
-func applyExecutionErrorMessage(command, environment string, err error) string {
+// applyExecutionErrorMessage renders the PR-facing detail for a failed apply
+// dispatch. tenant is the deployment's own tenant, carried by every command the
+// detail coaches so pasting one addresses this deployment.
+func applyExecutionErrorMessage(command, environment, tenant string, err error) string {
 	return dispatchErrorMessage(err, dispatchMessages{
 		command:     command,
 		environment: environment,
+		tenant:      tenant,
 		lockIntentChanged: "The pending schema change changed while this command was running. " +
 			"The apply was rejected; review the latest plan and run the command again.",
+		replan:   fmt.Sprintf("Run `%s` to create a new plan.", templates.TenantCommand("schemabot "+action.Apply, environment, tenant)),
 		internal: "Failed to execute apply. See SchemaBot server logs for details.",
 	})
 }
@@ -797,16 +810,21 @@ func applyExecutionErrorMessage(command, environment string, err error) string {
 // dispatchMessages carries the command-specific words dispatchErrorMessage
 // renders around the shared classification of a failed dispatch.
 type dispatchMessages struct {
-	// command and environment name the PR command to re-issue in a remedy,
-	// for example `schemabot rollback-confirm -e staging`.
+	// command, environment and tenant name the PR command to re-issue in a
+	// remedy, for example `schemabot rollback-confirm -e staging --tenant acme`.
 	command     string
 	environment string
+	tenant      string
 	// lockIntentChanged is the whole message for a lock intent change; its
 	// recovery differs between apply and rollback.
 	lockIntentChanged string
 	// afterRefusal, when set, follows the remedy for a refused feature and
 	// says what the refusal left in place for the re-issued command to use.
 	afterRefusal string
+	// replan follows a refusal of the stored plan itself (missing, created
+	// for another environment, or stored without routing) and names the
+	// command that creates a plan the dispatch can run.
+	replan string
 	// internal is the fixed line for every failure whose text belongs in
 	// server logs.
 	internal string
@@ -818,7 +836,10 @@ type dispatchMessages struct {
 // expected race whose answer is lockIntentChanged, and an unsupported feature
 // is rejected before anything is stored and would be refused the same way on
 // retry, so the operator sees the feature error followed by the command to
-// re-issue without the option that asked for it. A rollout member's refused
+// re-issue without the option that asked for it. A stored plan the dispatch
+// cannot run as it stands (missing, created for another environment, or
+// stored without routing) is named by its identifier, followed by the command
+// that creates a new one. A rollout member's refused
 // plan is named by target and table from fields SchemaBot controls. Everything
 // else is an internal error whose text stays in server logs behind the fixed
 // line.
@@ -829,7 +850,7 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {
 		parts := []string{featureErr.Error() + "."}
-		if remedy := unsupportedFeatureRemedy(featureErr.Feature, msgs.command, msgs.environment); remedy != "" {
+		if remedy := unsupportedFeatureRemedy(featureErr.Feature, msgs); remedy != "" {
 			parts = append(parts, remedy)
 			if msgs.afterRefusal != "" {
 				parts = append(parts, msgs.afterRefusal)
@@ -838,13 +859,29 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		return strings.Join(parts, " ")
 	}
 	if refused, ok := errors.AsType[*api.RolloutShapeRefusedError](err); ok {
-		parts := []string{rolloutShapeRefusalMessage(refused, msgs.command, msgs.environment)}
+		parts := []string{rolloutShapeRefusalMessage(refused, msgs.command, msgs.environment, msgs.tenant)}
 		// Only a refused option leaves the pending plan usable: a refused
 		// deployment shape is refused again however the command is re-issued.
 		if refused.Refusal == api.RolloutDeferCutoverRefused && msgs.afterRefusal != "" {
 			parts = append(parts, msgs.afterRefusal)
 		}
 		return strings.Join(parts, " ")
+	}
+	if refused, ok := errors.AsType[*api.DeferredCutoverCapacityError](err); ok {
+		parts := []string{deferredCutoverCapacityMessage(refused, msgs.command, msgs.environment, msgs.tenant)}
+		if msgs.afterRefusal != "" {
+			parts = append(parts, msgs.afterRefusal)
+		}
+		return strings.Join(parts, " ")
+	}
+	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
+		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)
+	}
+	if mismatch, ok := errors.AsType[*api.PlanEnvironmentMismatchError](err); ok {
+		return templates.PlanEnvironmentMismatchDetail(mismatch.PlanID, mismatch.PlanEnvironment, mismatch.RequestedEnvironment, msgs.replan)
+	}
+	if unrouted, ok := errors.AsType[*api.PlanRoutingMetadataError](err); ok {
+		return templates.PlanRoutingMetadataDetail(unrouted.PlanID, unrouted.Field, msgs.replan)
 	}
 	if refused, ok := errors.AsType[*api.MemberPlanRefusedError](err); ok {
 		switch refused.Refusal {
@@ -864,11 +901,11 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 // unsupportedFeatureRemedy names the command to re-issue without the option
 // that asked for a feature the database type refused. Features no PR command
 // option requests have no remedy: the operator cannot change the request.
-func unsupportedFeatureRemedy(feature schema.Feature, command, environment string) string {
+func unsupportedFeatureRemedy(feature schema.Feature, msgs dispatchMessages) string {
 	if feature != schema.FeatureDeferredCutover {
 		return ""
 	}
-	return fmt.Sprintf("Run `schemabot %s -e %s` again without `--defer-cutover`.", command, environment)
+	return fmt.Sprintf("Run `%s` again without `--defer-cutover`.", templates.TenantCommand("schemabot "+msgs.command, msgs.environment, msgs.tenant))
 }
 
 // rolloutShapeRefusalMessage is the PR comment line for an apply a multi-target
@@ -880,20 +917,54 @@ func unsupportedFeatureRemedy(feature schema.Feature, command, environment strin
 // flag. A refused multi-deployment shape is not: the pending plan covers every
 // deployment, so the remedy is a fresh apply narrowed to one target, and a
 // rollback, which cannot be narrowed, is reverted in the schema files instead.
-func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, environment string) string {
+//
+// Every command it names carries the deployment's tenant, since a tenant
+// deployment ignores a pasted command that does not.
+func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, environment, tenant string) string {
 	switch refused.Refusal {
 	case api.RolloutDeferCutoverRefused:
-		return fmt.Sprintf("`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot %s -e %s` again without `--defer-cutover`.", command, environment)
+		return fmt.Sprintf("`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `%s` again without `--defer-cutover`.", templates.TenantCommand("schemabot "+command, environment, tenant))
 	case api.RolloutMultiTargetDeploymentsRefused:
-		narrowed := fmt.Sprintf("`schemabot %s -e %s --target %s`", action.Apply, environment, refused.FirstTarget)
+		narrowed := fmt.Sprintf("`%s --target %s`", templates.TenantCommand("schemabot "+action.Apply, environment, tenant), refused.FirstTarget)
 		if command == action.RollbackConfirm {
 			// The refused rollback still holds this PR's lock, which would
 			// block the apply the remedy names, so the remedy releases it first.
-			return fmt.Sprintf("A rollback to more than one deployment is not supported yet when a deployment has several targets. Release this PR's lock with `schemabot %s`, then revert the schema files in a new PR and apply it one target at a time, starting with %s.", action.Unlock, narrowed)
+			unlock := "schemabot " + action.Unlock
+			if tenant != "" {
+				unlock += " --tenant " + tenant
+			}
+			return fmt.Sprintf("A rollback to more than one deployment is not currently supported when a deployment has several targets. Release this PR's lock with `%s`, then revert the schema files in a new PR and apply it one target at a time, starting with %s.", unlock, narrowed)
 		}
 		return "An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with " + narrowed + "."
 	}
 	return "This rollout shape is not supported. See SchemaBot server logs for details."
+}
+
+// deferredCutoverCapacityMessage is the PR comment line for an apply started
+// with --defer-cutover that would keep more drivers waiting at its cutover
+// than max_drivers_per_apply gives one apply, or than SchemaBot's servers
+// have. It reads only the refusal's counts, so no error text reaches the
+// comment. Re-issuing without the flag always runs. An apply's remedy names
+// `apply`, never `apply-confirm`: the refusal is reached at apply, before
+// the operator is asked to confirm. A rollback's names `rollback-confirm`,
+// which the pinned rollback plan lets the operator re-issue as it stands.
+func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, command, environment, tenant string) string {
+	work, rerunCommand := "apply", action.Apply
+	if command == action.RollbackConfirm {
+		work, rerunCommand = "rollback", action.RollbackConfirm
+	}
+	rerun := templates.TenantCommand("schemabot "+rerunCommand, environment, tenant)
+	switch {
+	case refused.ExceedsPerApplyCap():
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and one apply can use at most %d (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to %d. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.PerApplyCap, refused.Operations, rerun)
+	case refused.NoLiveServers():
+		return fmt.Sprintf("This %s can't defer its cutover: no SchemaBot server running drivers has checked in during the last %s. Apply again once SchemaBot's drivers are running, or run `%s` without `--defer-cutover`.",
+			work, api.LiveWindowText(), rerun)
+	default:
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and SchemaBot's servers have %d drivers that can wait. To defer it, give the servers %d more by raising `drivers` or running more servers. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Drivers, refused.Operations-refused.Drivers, rerun)
+	}
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an
@@ -953,7 +1024,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 // depend on when the lock changed. Declining leaves the copy gate armed, so
 // the next apply-confirm stops and discloses again rather than proceeding on
 // consent that was never recorded.
-func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, environment, actionName, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
+func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, environment, actionName, expectedPendingPlanID, planID string, disclosedCopies []storage.DisclosedCopy) error {
 	// An empty observed intent asks the conditional acquire for a free lock,
 	// which would re-create a released one, so there is nothing safe to move.
 	if expectedPendingPlanID == "" {
@@ -961,13 +1032,13 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 			database, dbType, planID)
 	}
 	err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, &storage.Lock{
-		DatabaseName:         database,
-		DatabaseType:         dbType,
-		Owner:                fmt.Sprintf("%s#%d", repo, pr),
-		Repository:           repo,
-		PullRequest:          pr,
-		PendingPlanID:        planID,
-		DisclosedCopyDiscard: disclosedCopyDiscard,
+		DatabaseName:    database,
+		DatabaseType:    dbType,
+		Owner:           fmt.Sprintf("%s#%d", repo, pr),
+		Repository:      repo,
+		PullRequest:     pr,
+		PendingPlanID:   planID,
+		DisclosedCopies: disclosedCopies,
 	}, expectedPendingPlanID)
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		h.logPreservedLockIntent(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planID)
@@ -1005,16 +1076,16 @@ func (h *Handler) logPreservedLockIntent(ctx context.Context, repo string, pr in
 // reportRepinRefused answers an apply whose pending confirmation could not be
 // re-pinned because another command pinned or released the lock meanwhile. The
 // stop comment just posted coaches a confirmation the lock no longer carries,
-// so the operator is told the lock changed, given recoveryCommand to re-run,
-// and told that a retry names the command holding the lock, if any. It reports
+// so the operator is given refusal, which says the lock changed, names the
+// apply to re-run, and says a retry names the command holding the lock. It reports
 // whether err was that refusal; any other error is left for the caller to
 // report. repinPendingConfirmation has already logged the refusal with the
 // lock's state, so it is not logged again here.
-func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, actionName, database, environment, requestedBy, recoveryCommand string) bool {
+func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, refusal templates.ApplyLockIntentChangedData) bool {
 	if !errors.Is(err, storage.ErrLockIntentChanged) {
 		return false
 	}
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database, recoveryCommand))
+	h.postComment(repo, pr, installationID, templates.RenderApplyLockIntentChanged(refusal))
 	return true
 }
 

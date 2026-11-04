@@ -32,7 +32,7 @@ E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 # reproducing on CI runners.
 export COMPOSE_BAKE := false
 
-.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-k8s-multi-target test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -190,6 +190,7 @@ check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
 
 docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
 	@python3 scripts/prepare-pr-demo.py
+	@python3 scripts/prepare-pr-multi-target-demo.py
 	@python3 scripts/render-pr-mockups.py --prepared
 	@bash scripts/render-pr-demo.sh
 	@python3 scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
@@ -352,6 +353,13 @@ test-e2e: test-e2e-local test-e2e-grpc ## Run all e2e tests
 # E2E local environment shorthand
 E2E_DC = docker compose -f deploy/e2e/docker-compose.yml
 
+# Bound on each seed apply test-e2e-local runs before the tests. A healthy seed
+# apply finishes in seconds; the bound turns a stalled one into a setup failure
+# that prints the LocalScale logs while the CI job still has time to collect
+# them, instead of a runner cancellation that captures nothing.
+E2E_SEED_APPLY_TIMEOUT ?= 180
+E2E_SEED_APPLY = scripts/e2e-seed-apply.sh $(E2E_SEED_APPLY_TIMEOUT)
+
 # Run local e2e tests in an isolated environment (no conflicts with make demo)
 # Keeps containers alive between runs for fast iteration. Use FRESH=1 to rebuild from scratch.
 # Use `make test-e2e-local-down` to tear down manually.
@@ -383,8 +391,8 @@ endif
 		sleep 1; \
 	done
 	@echo "Applying schemas (MySQL + Vitess in parallel)..."
-	@( ./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
-	   ./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
+	@( $(E2E_SEED_APPLY) mysql-staging -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
+	   $(E2E_SEED_APPLY) mysql-production -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
 	MYSQL_PID=$$!; \
 	for ks in testapp testapp_sharded; do \
 		if [ -f examples/vitess/schema/$$ks/vschema.json ]; then \
@@ -396,10 +404,10 @@ endif
 				-d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
 		fi; \
 	done; \
-	./bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
-	./bin/schemabot apply -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
+	$(E2E_SEED_APPLY) vitess-staging -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
+	$(E2E_SEED_APPLY) vitess-production -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
 	wait $$MYSQL_PID
 	@echo "Running e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:14370 \
@@ -545,6 +553,12 @@ test-e2e-k8s-etre: ## Run the etre-resolver k8s e2e on minikube
 
 test-e2e-k8s-vitess: ## Run the vitess-resolver k8s e2e on minikube
 	@e2e/k8s/e2e-vitess-test.sh
+
+# Run the multi-target k8s e2e on minikube: one data plane serves several
+# targets, each resolved through Etre to its own MySQL server, and every apply
+# rolls out table by table across them over gRPC.
+test-e2e-k8s-multi-target: ## Run the multi-target rollout k8s e2e on minikube
+	@e2e/k8s/e2e-multi-target-test.sh
 
 # Start local dev environment with gRPC backend (separate Tern server)
 up-grpc:

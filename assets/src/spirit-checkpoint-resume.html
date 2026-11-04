@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>SchemaBot, Spirit, and a saved checkpoint</title>
+<style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,monospace}</style>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SchemaBot coordinates a Spirit copy; MySQL preserves the checkpoint and replacement table while Spirit is interrupted, then the copy resumes"></svg>
+<script>
+const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5',purple:'#8250df'};
+const clamp=x=>Math.max(0,Math.min(1,x));
+const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8)=>`<rect x="${x}" y="${y}" width="${Math.max(0,w)}" height="${h}" rx="${r}" fill="${fill}" stroke="${stroke}"/>`;
+const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}">${esc(s)}</text>`;
+const path=(d,color=C.line,w=2)=>`<path d="${d}" fill="none" stroke="${color}" stroke-width="${w}" stroke-linecap="round"/>`;
+const dot=(x,y,c=C.blue)=>`<circle cx="${x}" cy="${y}" r="4" fill="${c}"/>`;
+function renderFrame(t){
+ t=Math.max(0,Math.min(t,21.9));
+ const phase=t<6?0:t<10?1:t<14?2:3;
+ const progress=phase===0?Math.min(.64,t/6*.64):phase===1?.64:phase===2?.60:Math.min(1,.60+(t-14)/5*.4);
+ const saved=phase===0?(t>=5?.60:t>=3?.30:0):phase<3?.60:t>=19?1:t>=17?.80:.60;
+ const working=phase===0||phase===3,complete=progress===1;
+ const labels=['Copy and checkpoint','Process interrupted','Recover saved state','Continue the copy'];
+ const captions=[
+ 'SchemaBot starts the reviewed change; Spirit copies rows and saves progress in MySQL.',
+ 'The process stops; the application, replacement table, and checkpoint remain.',
+ 'SchemaBot restarts the change; Spirit loads its checkpoint and replays retained writes.',
+ complete?'The copy finishes; verification and cutover still come next.':'Resume from saved progress, repeating only work beyond the checkpoint.'
+ ];
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'An interrupted process. A saved place.',32,C.ink,650);
+ for(let i=0;i<4;i++){let x=36+i*263;s+=rect(x,130,247,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
+ // Logical responsibilities, not separate required deployments.
+ s+=rect(36,195,286,114,'#fff',C.line,10)+txt(56,232,'SchemaBot',23,C.ink,650)+txt(56,262,'Reviewed plan · cutover schedule',14,C.muted)+txt(56,287,'Controls · progress · recovery',13,C.muted);
+ s+=path('M119 309 V346',C.blue)+path('M114 340 L119 347 L124 340',C.blue)+path('M258 347 V309',C.green)+path('M253 315 L258 309 L263 315',C.green)+txt(43,332,phase===2?'resume':'control',11,C.blue)+txt(269,332,'status',11,C.green);
+ s+=rect(36,347,286,158,phase===1?C.soft:'#fff',phase===1?C.line:C.blue,10)+txt(56,384,'Spirit',23,phase===1?C.muted:C.ink,650);
+ s+=txt(56,415,phase===1?'Process interrupted':phase===2?'Load checkpoint + catch up':complete?'Copy finished':'Read rows · write chunks',15,phase===1?C.amber:C.blue,550);
+ s+=txt(56,445,'Online copy engine',14,C.muted)+txt(56,481,'Runs outside MySQL',13,C.muted);
+ s+=rect(508,195,556,359,'#fff',C.line,12)+txt(531,231,'Target MySQL database',23,C.ink,650);
+ s+=rect(531,251,242,95,C.blueBg)+txt(548,280,'Live table',16,C.blue,600)+txt(548,310,'Application reads + writes',13,C.ink)+txt(548,331,'Continue during interruption',12,C.muted);
+ s+=rect(790,251,251,95,C.soft)+txt(807,280,'Replacement table',16,C.ink,600)+rect(807,298,216,9,'#fff')+rect(807,298,216*progress,9,C.blue)+txt(807,331,Math.floor(progress*100)+'% copy progress',13,C.muted);
+ s+=rect(531,369,510,146,saved?C.greenBg:C.soft)+txt(550,400,'Saved checkpoint',18,C.green,600);
+ s+=txt(550,431,'Copy position',14,C.ink)+txt(930,431,Math.round(saved*100)+'%',17,C.green,650,'mono');
+ s+=txt(550,459,'Binary log position',14,C.ink)+txt(550,490,saved?'Stored in MySQL · survives the Spirit process':'First checkpoint not yet saved',13,C.muted);
+ const c=phase===1?C.line:C.blue;
+ s+=path('M322 392 H451 V323 H508',c)+path('M508 287 H422 V368 H322',c);
+ s+=txt(340,276,'rows + writes',12,working?C.blue:C.muted,550);
+ s+=path('M322 469 H508',phase===2?C.green:phase===1?C.line:C.green,2);
+ s+=txt(343,456,phase===2?'read checkpoint':'save progress',12,phase===1?C.muted:C.green,550);
+ if(working){let u=(t*.65)%1;s+=dot(322+u*186,469,C.green);let v=(t*.9)%1;s+=dot(322+v*129,392);}
+ if(phase===2){let u=(t*.55)%1;s+=dot(508-u*186,469,C.green);}
+ s+=rect(36,576,1028,57,C.soft)+txt(55,612,captions[phase],17,C.ink,500);
+ s+=txt(36,659,'Illustrative progress · Resume requires the same DDL and Spirit version, a usable checkpoint, and retained binary logs.',12,C.muted);
+ s+=txt(36,678,'Logical roles shown; Spirit can run within the SchemaBot process.',12,C.muted);
+ document.getElementById('art').innerHTML=s;return {phase,progress,saved};
+}
+window.renderFrame=renderFrame;renderFrame(0);
+</script></html>

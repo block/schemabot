@@ -10,8 +10,8 @@ import (
 // ControlRejectionData is one operator control command that SchemaBot accepted
 // and then could not carry out.
 type ControlRejectionData struct {
-	// Operation is the control operation as the operator issued it (stop,
-	// cutover, revert, …).
+	// Operation is the control operation spelled as the command the operator
+	// typed (stop, cutover, skip-revert, …).
 	Operation string
 	// Message is the engine or driver explanation for the rejection. It is
 	// sanitized before rendering.

@@ -2,82 +2,47 @@ package github
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hmarr/codeowners"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseCodeowners(t *testing.T) {
-	tests := []struct {
-		name     string
-		content  string
-		expected []string
-	}{
-		{
-			name:     "empty",
-			content:  "",
-			expected: nil,
-		},
-		{
-			name:     "comments and blank lines",
-			content:  "# This is a CODEOWNERS file\n\n# Another comment\n",
-			expected: nil,
-		},
-		{
-			name:     "single owner",
-			content:  "* @alice\n",
-			expected: []string{"alice"},
-		},
-		{
-			name:     "multiple owners on one line",
-			content:  "*.sql @alice @bob @org/dba-team\n",
-			expected: []string{"alice", "bob", "org/dba-team"},
-		},
-		{
-			name:     "multiple lines deduplicated",
-			content:  "*.sql @alice @bob\n*.yaml @alice @carol\n",
-			expected: []string{"alice", "bob", "carol"},
-		},
-		{
-			name:     "case insensitive dedup",
-			content:  "* @Alice\n*.sql @alice\n",
-			expected: []string{"Alice"},
-		},
-		{
-			name:     "team owners",
-			content:  "schema/ @org/dba-team @org/platform\n",
-			expected: []string{"org/dba-team", "org/platform"},
-		},
-		{
-			name:     "mixed comments and rules",
-			content:  "# Global owners\n* @alice\n\n# Schema owners\nschema/ @bob @org/dba\n",
-			expected: []string{"alice", "bob", "org/dba"},
-		},
-		{
-			name:     "no at prefix ignored",
-			content:  "* alice bob\n",
-			expected: nil, // CODEOWNERS requires @ prefix
-		},
-	}
+// A CODEOWNERS rule the parser accepts but cannot match, such as a bare
+// `/ @owner`, yields an error rather than a panic, so the review gate can fail
+// closed with a reason. The error text names the path and the fix but not the
+// panic, which travels separately with its stack for server-side logging.
+// Rules the parser handles still match normally.
+func TestMatchCodeownersPathReturnsAnErrorForAnUnmatchableRule(t *testing.T) {
+	broken, err := codeowners.ParseFile(strings.NewReader("/ @platform-admins\n"))
+	require.NoError(t, err)
+	owners, err := MatchCodeownersPath(broken, "schema/orders/.schema")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema/orders/.schema")
+	assert.Contains(t, err.Error(), "fix the rule on the base branch")
+	assert.NotContains(t, err.Error(), "index out of range")
+	assert.Nil(t, owners)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ParseCodeowners(tt.content)
-			if tt.expected == nil {
-				assert.Empty(t, result)
-			} else {
-				require.Len(t, result, len(tt.expected))
-				for _, expected := range tt.expected {
-					assert.Contains(t, result, expected)
-				}
-			}
-		})
-	}
+	var unmatchable *UnmatchableCodeownersRuleError
+	require.ErrorAs(t, err, &unmatchable)
+	assert.Equal(t, "schema/orders/.schema", unmatchable.Path)
+	require.NotNil(t, unmatchable.Panic)
+	assert.Contains(t, fmt.Sprint(unmatchable.Panic.Value), "index out of range")
+	assert.NotEmpty(t, unmatchable.Panic.Stack)
+
+	working, err := codeowners.ParseFile(strings.NewReader("/schema/orders/ @orders-team\n"))
+	require.NoError(t, err)
+	owners, err = MatchCodeownersPath(working, "schema/orders/.schema")
+	require.NoError(t, err)
+	require.Len(t, owners, 1)
+	assert.Equal(t, "orders-team", owners[0].Value)
 }
 
 func TestGetApprovedReviewers(t *testing.T) {
@@ -210,6 +175,25 @@ func TestGetApprovedReviewsCarriesCommit(t *testing.T) {
 	require.Len(t, approvals, 1)
 	assert.Equal(t, "alice", approvals[0].User)
 	assert.Equal(t, "bbb222", approvals[0].CommitID)
+}
+
+// Approvals come in the order they were given, with the login breaking ties,
+// so a comment that names several approvers names them the same way each time.
+func TestGetApprovedReviewsOrdersBySubmission(t *testing.T) {
+	now := time.Now()
+	reviews := []*ReviewInfo{
+		{User: "dave", State: ReviewApproved, SubmittedAt: now},
+		{User: "carol", State: ReviewApproved, SubmittedAt: now.Add(-time.Hour)},
+		{User: "Bob", State: ReviewApproved, SubmittedAt: now},
+		{User: "alice", State: ReviewApproved, SubmittedAt: now.Add(-2 * time.Hour)},
+	}
+
+	var users []string
+	for _, approval := range GetApprovedReviews(reviews) {
+		users = append(users, approval.User)
+	}
+
+	assert.Equal(t, []string{"alice", "carol", "Bob", "dave"}, users)
 }
 
 func TestIsTeamMember(t *testing.T) {

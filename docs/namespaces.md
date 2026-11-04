@@ -7,6 +7,7 @@
 - [Schema Directory Structure](#schema-directory-structure)
 - [Where to Put the Schema Directory](#where-to-put-the-schema-directory)
 - [Environment Substitution in Namespace Names](#environment-substitution-in-namespace-names)
+- [Per-Environment Schema Roots](#per-environment-schema-roots)
 - [Ignoring Namespaces](#ignoring-namespaces)
 - [Ignoring Tables](#ignoring-tables)
 - [Per-Target Schema Overrides](#per-target-schema-overrides)
@@ -72,6 +73,12 @@ type: mysql
 ```
 
 SchemaBot plans each namespace independently — `app_primary` and `app_analytics` each produce their own `SchemaChange` with separate table changes.
+
+Each namespace is diffed against its own MySQL database, so a table
+whose schema file is deleted is dropped in that namespace's database and shows up
+under that namespace only. This needs a namespace-free target DSN; see
+[MySQL target DSN requirements](#mysql-target-dsn-requirements) for what a DSN that
+names a database cannot do.
 
 ### MySQL — Different databases entirely
 
@@ -262,6 +269,67 @@ schemabot plan -s myapp/schema -e production
 - Quote literal paths in shell commands, especially legacy `$ENV` names, to prevent shell variable expansion.
 - Pass concrete schema names to `pull --namespace` and `onboard --namespace`, such as `bikeshare_production`; placeholders are for repository directories and `ignore_namespaces` entries.
 
+## Per-Environment Schema Roots
+
+By default every environment reads the same schema: the directory holding
+`schemabot.yaml`. When environments need different schemas, give the config
+directory an entry named for the environment. That entry becomes the
+environment's schema root, and its subdirectories are the environment's
+namespaces. Pull request plans and local `schemabot plan -s <config dir> -e
+<environment>` resolve it the same way, so a local plan reads the schema the
+pull request plans. `schemabot onboard` writes the pulled namespace files into
+the source environment's schema root, and `schemabot.yaml` stays in the config
+directory.
+
+The entry can be a real directory or a symlink. Environments that share one
+schema can point at a common directory:
+
+```
+orders/schema/
+├── schemabot.yaml
+├── base/
+│   └── orders_001/
+│       └── orders.sql
+├── staging    -> base
+└── production -> base
+```
+
+An environment directory can also be built from namespace symlinks into one
+shared tree. Each environment then lists only the namespaces it has, with no
+`ignore_namespaces` entries needed for the rest:
+
+```
+app/
+├── schemabot.yaml
+├── tables/
+│   └── app_{env}/
+│       └── items.sql
+├── staging/
+│   ├── app_{env}   -> ../tables/app_{env}
+│   └── app_1_{env} -> ../tables/app_{env}
+└── production/
+    └── app_{env}   -> ../tables/app_{env}
+```
+
+Here staging plans `app_staging` and `app_1_staging`, and
+production plans `app_production`.
+
+- An environment with no entry of its own reads the config directory.
+- An environment symlink must use a relative target that resolves to a
+  directory inside the config directory, and every directory on the way to the
+  target must be a real directory. An absolute target, a target outside the
+  config directory, a target reached through another symlinked directory, or a
+  target that is not a directory fails the plan instead of falling back to the
+  config directory.
+- An entry named for the environment that is neither a directory nor a symlink
+  also fails the plan.
+- Namespace symlinks inside an environment directory resolve relative to that
+  directory. They may point anywhere in the repository, including outside the
+  environment directory, as `../tables/...` does above.
+- With flat files directly in an environment schema root, the namespace is that
+  root's directory name after any symlink is resolved. In the first layout that
+  is `base`.
+
 ## Ignoring Namespaces
 
 Some schema roots contain a namespace directory that should never be reconciled against a live database. A common example is a Vitess keyspace that exists only in local test infrastructure: the repository carries its schema files so local tooling can create the keyspace, but no real environment has it (or the environment keeps it intentionally empty). Without an exclusion, every plan would propose creating those tables.
@@ -316,6 +384,16 @@ the whole database as one unit: an ignored namespace's live tables would
 have no declaring files and the diff would plan them as `DROP TABLE`, the
 inverse of "ignore". SchemaBot refuses this combination, and the plan fails with
 an error asking for a namespace-free DSN or removal of `ignore_namespaces`.
+
+A DSN that names a database also cannot drop a table when the schema root has
+two or more namespaces. Every namespace is diffed against that one database, so
+a live table that no schema file declares is in every namespace's live schema at
+once, and the deleted file that said which namespace held it is no longer in the
+request. SchemaBot cannot place the `DROP TABLE` in a namespace, so the plan
+fails with an error that names the table, the namespaces and the database. To
+drop it, keep that database's schema files in one namespace directory, or have a
+SchemaBot operator switch the target to a namespace-free DSN. With a single
+namespace, the drop belongs to it and is planned like any other drop.
 
 ## Ignoring Tables
 
@@ -419,6 +497,7 @@ The canonical namespace stays the name everywhere SchemaBot labels a namespace �
 | MySQL, different databases | 1 per database | 1 each | separate directories |
 | Vitess, multiple keyspaces | 1 | many | `commerce/`, `commerce_sharded/` |
 | Environment-specific namespace | 1 | 1 per env | `bikeshare_{env}/` (legacy `bikeshare_$ENV/`) |
+| Different schema per environment | 1 | per environment root | `staging/`, `production -> base` |
 | Repo-only namespace (never deployed) | 1 | all except ignored | `ignore_namespaces: [commerce_test]` |
 | Deployment-specific physical schema | 1 | 1 canonical | `bikeshare/` + per-target `schema_overrides` |
 

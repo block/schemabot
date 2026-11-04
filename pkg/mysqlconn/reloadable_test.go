@@ -221,6 +221,50 @@ func TestOpenReloadableRotatesCredentialsOnAccessDenied(t *testing.T) {
 	assert.Equal(t, int32(1), reloads.Load())
 }
 
+// The UTC session pin is a property of the storage pool, not of the DSN it
+// booted with, so a pool that re-resolves its DSN after a credential rotation
+// dials the rotated connection with the same pin: UTC on the Go MySQL driver's
+// side and time_zone='+00:00' on the session's. The assertions read the config
+// each generation is dialed with, which is what the session will run under.
+func TestOpenReloadableKeepsUTCSessionAcrossReload(t *testing.T) {
+	original := newConnector
+	t.Cleanup(func() { newConnector = original })
+	var mu sync.Mutex
+	var dialed []*mysql.Config
+	results := []error{accessDeniedError(), nil}
+	newConnector = func(cfg *mysql.Config) (driver.Connector, error) {
+		return connectFunc(func(context.Context) (driver.Conn, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			dialed = append(dialed, cfg)
+			// assert (not require): this runs on the dialing goroutine.
+			if !assert.LessOrEqual(t, len(dialed), len(results), "unexpected extra dial attempt") {
+				return nil, errors.New("unexpected extra dial attempt")
+			}
+			if err := results[len(dialed)-1]; err != nil {
+				return nil, err
+			}
+			return stubConn{}, nil
+		}), nil
+	}
+
+	db, err := OpenReloadable("schemabot:old@tcp(localhost:3306)/app?time_zone=%27-07%3A00%27", func() (string, error) {
+		return "schemabot:rotated@tcp(localhost:3306)/app?time_zone=%27-07%3A00%27", nil
+	}, WithUTCSession())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	require.NoError(t, db.PingContext(t.Context()))
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, dialed, 2, "the refused dial must be retried against the reloaded DSN")
+	for i, cfg := range dialed {
+		assert.Equal(t, time.UTC, cfg.Loc, "dial %d must read and write DATETIME values as UTC", i)
+		assert.Equal(t, "'+00:00'", cfg.Params["time_zone"], "dial %d must replace the DSN's session zone", i)
+	}
+	assert.Equal(t, "rotated", dialed[1].Passwd, "the retry must carry the rotated credential alongside the pin")
+}
+
 func TestOpenReloadableRejectsBadDSN(t *testing.T) {
 	_, err := OpenReloadable("not-a-dsn", func() (string, error) { return "", nil })
 	require.Error(t, err)

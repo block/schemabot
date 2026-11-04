@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -18,7 +19,24 @@ const (
 	// database, which is the distinction that matters when deciding whether to
 	// proceed with a deploy.
 	ExitStorageSchemaOutstanding = 2
+
+	// ExitInterrupted says the operator's Ctrl-C or SIGTERM ended the command
+	// before it reached its usual outcome: a watch was stopped while its apply
+	// carries on, or a schema change was never submitted. It is the status a
+	// shell reports for a process the interrupt signal ended, and the one the
+	// CLI exits with on a second signal, so a script sees one status for an
+	// interrupt however the command took it, and never mistakes it for the
+	// apply having failed.
+	ExitInterrupted = 130
 )
+
+// interrupted is the error a command returns once the operator's signal has
+// ended it and the command has already said so: silent, so the status is all
+// that is left to report, and carrying the cancellation for callers that
+// match on it.
+func interrupted(ctx context.Context) error {
+	return &ExitCodeError{Code: ExitInterrupted, Err: fmt.Errorf("%w: %w", ErrSilent, ctx.Err())}
+}
 
 // ExitCodeError carries the process exit status a command wants, alongside its
 // error. main honors the status and prints the error unless it is silent, so a

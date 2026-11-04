@@ -1,8 +1,13 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +18,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -431,4 +438,135 @@ func TestDurableWebhookDispatchMetricsSupersededOutcome(t *testing.T) {
 	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
 	require.Len(t, durationPoints, 1)
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "superseded")
+}
+
+// Committed dead letters carry bounded reasons derived from typed processing
+// errors. The same reason and delivery origin let logs explain recovery.
+func TestDurablePermanentFailureReasons(t *testing.T) {
+	type failureCase struct {
+		name       string
+		eventType  string
+		tenant     string
+		processErr error
+		want       metrics.WebhookFailureReason
+	}
+	cases := []failureCase{
+		{name: "file cap", processErr: fmt.Errorf("auto-plan: %w", ghclient.ErrPRFilesIncomplete), want: metrics.WebhookFailurePRFileCap},
+		{name: "unknown", processErr: errors.New("decode durable invalid_payload pr_file_cap unresolved_route"), want: metrics.WebhookFailureOther},
+		{name: "missing tenant", tenant: "", want: metrics.WebhookFailureUnresolvedRoute},
+		{name: "invalid tenant", tenant: "garbage", want: metrics.WebhookFailureUnresolvedRoute},
+		{name: "nonpositive tenant", tenant: "0", want: metrics.WebhookFailureUnresolvedRoute},
+	}
+	for _, eventType := range []string{"pull_request", "check_run", "check_suite", "issue_comment", "push", "merge_group"} {
+		cases = append(cases, failureCase{name: "decode " + eventType, eventType: eventType, want: metrics.WebhookFailureInvalidPayload})
+	}
+	for _, tc := range cases {
+		for _, origin := range []string{"organic", "synthesized"} {
+			t.Run(tc.name+"/"+origin, func(t *testing.T) {
+				reader := newDispatchMetricsReader(t)
+				event := durablePullRequestEvent(t)
+				event.TenantID = tc.tenant
+				if tc.eventType != "" {
+					event.Event = tc.eventType
+					event.Payload = []byte(`{not json`)
+				}
+				if origin == "synthesized" {
+					event.DeliveryID = storage.SynthesizedWebhookDeliveryIDPrefix + event.DeliveryID
+				}
+				store := newScriptedWebhookEventStore(event)
+				h := newDurableDriverHandler(t, store, nil, nil)
+				var logs bytes.Buffer
+				h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+				if tc.processErr != nil {
+					h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+						return false, fmt.Errorf("wrapped processing error: %w", tc.processErr)
+					}
+				}
+				h.driveNextDurableWebhook(t.Context(), 0, "test-driver")
+				require.Len(t, store.failedPermanent, 1)
+				var total int64
+				for _, dp := range collectCounterPoints(t, reader, "schemabot.webhook.events_total") {
+					status, _ := dp.Attributes.Value("status")
+					reason, hasReason := dp.Attributes.Value("failure_reason")
+					if status.AsString() != "durable_dispatch_failed_permanent" {
+						assert.False(t, hasReason)
+						continue
+					}
+					assert.Equal(t, string(tc.want), reason.AsString())
+					assertStringAttr(t, dp.Attributes, "repository", event.Repository)
+					assertStringAttr(t, dp.Attributes, "event_type", event.Event)
+					assert.Equal(t, int64(1), dp.Value)
+					total += dp.Value
+				}
+				assert.Equal(t, int64(1), total)
+				var matched int
+				for line := range strings.Lines(logs.String()) {
+					var entry map[string]any
+					require.NoError(t, json.Unmarshal([]byte(line), &entry))
+					if entry["failure_reason"] == nil {
+						continue
+					}
+					matched++
+					assert.Equal(t, string(tc.want), entry["failure_reason"])
+					assert.Equal(t, origin, entry["origin"])
+					assert.Equal(t, event.DeliveryID, entry["delivery_id"])
+					assert.Equal(t, event.Repository, entry["repo"])
+					assert.Equal(t, float64(event.PullRequest), entry["pr"])
+				}
+				assert.Equal(t, 1, matched)
+			})
+		}
+	}
+}
+
+// A retry or unsuccessful terminal write never claims that a committed dead
+// letter exists. Failed writes retain the processing cause and permanent reason
+// in logs, including when a peer has already replaced the delivery lease.
+func TestDurablePermanentFailureRequiresSuccessfulWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		retry    bool
+		writeErr error
+	}{
+		{name: "storage error", writeErr: errors.New("storage unavailable")},
+		{name: "lease lost", writeErr: storage.ErrWebhookEventLeaseLost},
+		{name: "row removed", writeErr: storage.ErrWebhookEventNotFound},
+		{name: "retry", retry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newDispatchMetricsReader(t)
+			store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+			store.markFailedPermanentErr = tc.writeErr
+			h := newDurableDriverHandler(t, store, nil, nil)
+			var logs bytes.Buffer
+			h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return tc.retry, ghclient.ErrPRFilesIncomplete
+			}
+			h.driveNextDurableWebhook(t.Context(), 0, "test-driver")
+			require.Empty(t, store.failedPermanent)
+			for _, dp := range collectCounterPoints(t, reader, "schemabot.webhook.events_total") {
+				status, _ := dp.Attributes.Value("status")
+				assert.NotEqual(t, "durable_dispatch_failed_permanent", status.AsString())
+				_, hasReason := dp.Attributes.Value("failure_reason")
+				assert.False(t, hasReason)
+			}
+			assert.NotContains(t, logs.String(), "dead-lettered")
+			if tc.writeErr != nil {
+				message := "durable webhook driver failed to record delivery failure"
+				outcome := "finish_error"
+				if errors.Is(tc.writeErr, storage.ErrWebhookEventLeaseLost) || errors.Is(tc.writeErr, storage.ErrWebhookEventNotFound) {
+					message = "durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone"
+					outcome = "lease_lost"
+				}
+				record := findLogRecord(t, logs.Bytes(), message)
+				assert.Equal(t, ghclient.ErrPRFilesIncomplete.Error(), record["process_error"])
+				assert.Equal(t, tc.writeErr.Error(), record["error"])
+				assert.Equal(t, "pr_file_cap", record["failure_reason"])
+				durations := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+				require.Len(t, durations, 1)
+				assertStringAttr(t, durations[0].Attributes, "outcome", outcome)
+			}
+		})
+	}
 }

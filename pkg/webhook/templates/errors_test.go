@@ -517,3 +517,21 @@ func TestRenderRepositoryTreeTruncated(t *testing.T) {
 		assert.Contains(t, body, "## ⚠️ Repository Too Large to Search\n\n*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
 	})
 }
+
+// The plan refusal details name the plan and what SchemaBot stored with it as
+// code spans, then end in the caller's command to create a new plan. A
+// backtick or newline in a stored name cannot break the span or the line.
+func TestPlanRefusalDetails(t *testing.T) {
+	const replan = "Run `schemabot apply -e staging` to create a new plan."
+
+	assert.Equal(t, "Plan `plan-1` no longer exists, so nothing was applied. "+replan,
+		PlanNotFoundDetail("plan-1", replan))
+	assert.Equal(t, "Plan `plan-1` was created for `production`, not `staging`, so nothing was applied. "+replan,
+		PlanEnvironmentMismatchDetail("plan-1", "production", "staging", replan))
+	assert.Equal(t, "Plan `plan-1` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. "+replan,
+		PlanRoutingMetadataDetail("plan-1", "deployment", replan))
+
+	hostile := PlanNotFoundDetail("plan`1\n## injected", replan)
+	assert.NotContains(t, hostile, "\n")
+	assert.Contains(t, hostile, "`` plan`1 ## injected ``")
+}

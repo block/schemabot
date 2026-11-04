@@ -96,6 +96,52 @@ func TestHasSchemaInputFiles(t *testing.T) {
 	}
 }
 
+// TestFindConfigsForPRFilesResolvesRenamedAwaySchemaFiles covers a pull
+// request that renames a schema file so the default branch stops declaring its
+// table: to a disabled name, to a non-schema file, or out of every config
+// directory. Like a plain deletion, each must resolve the config that managed
+// the old path, so the pull request is planned rather than passed with no plan.
+func TestFindConfigsForPRFilesResolvesRenamedAwaySchemaFiles(t *testing.T) {
+	tests := []struct {
+		name string
+		file PRFile
+	}{
+		{name: "deleted", file: PRFile{Filename: "schema/users.sql", Status: "removed"}},
+		{name: "renamed to a disabled name", file: PRFile{Filename: "schema/users.sql.disabled", PreviousFilename: "schema/users.sql", Status: "renamed"}},
+		{name: "renamed to a non-schema file", file: PRFile{Filename: "docs/users.md", PreviousFilename: "schema/users.sql", Status: "renamed"}},
+		{name: "renamed out of every config directory", file: PRFile{Filename: "archive/users.sql", PreviousFilename: "schema/users.sql", Status: "renamed"}},
+		{name: "renamed within the config directory", file: PRFile{Filename: "schema/users_v2.sql", PreviousFilename: "schema/users.sql", Status: "renamed"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupConfigTestGitHubServer(t)
+			registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			configs, err := ic.FindConfigsForPRFiles(t.Context(), "octocat/hello-world", "abc123", []PRFile{tt.file})
+
+			require.NoError(t, err)
+			require.Len(t, configs, 1)
+			assert.Equal(t, "widgets", configs[0].Config.Database)
+			assert.Equal(t, "schema", configs[0].SchemaDir)
+			assert.True(t, HasDiscoveryInputFiles([]PRFile{tt.file}))
+		})
+	}
+}
+
+// TestHasDiscoveryInputFilesIgnoresRenamesOfNonSchemaFiles verifies that a
+// rename only counts as a discovery input when it vacates a schema path, so a
+// pull request that moves documentation around still skips discovery.
+func TestHasDiscoveryInputFilesIgnoresRenamesOfNonSchemaFiles(t *testing.T) {
+	t.Parallel()
+
+	assert.False(t, HasDiscoveryInputFiles([]PRFile{
+		{Filename: "docs/users-guide.md", PreviousFilename: "docs/users.md", Status: "renamed"},
+		{Filename: "app/service.go", Status: "modified"},
+	}))
+}
+
 func TestFindAllConfigsForPRClassifiesGitHubUnavailable(t *testing.T) {
 	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 

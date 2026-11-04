@@ -178,16 +178,12 @@ func participantRefoldKey(repo string, pr int) string {
 	return fmt.Sprintf("%s#%d", repo, pr)
 }
 
-// scheduleLeaderRefoldIfConfigured arms a bounded aggregate re-fold when this
-// deployment leads the repo's aggregate. Fold passes that break before they
-// can read participant state call this so a transient failure cannot strand
-// an aggregate whose unresolved participants render as in_progress on the
-// promise of a coming re-read — the next attempt fetches the then-current
-// head and folds it, and the per-PR budget still bounds the chain. Non-leader
-// repos never fold participants, so there is nothing to re-arm.
-func (h *Handler) scheduleLeaderRefoldIfConfigured(ctx context.Context, repo string, pr int, installationID int64) {
-	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
-		h.logger.Debug("repo is not an aggregate leader; no re-fold to arm", "repo", repo, "pr", pr)
+// scheduleAggregateRefoldIfConfigured arms a bounded retry for leaders and
+// environment-scoped publishers. Both verify discovery and current-head state,
+// so transient read failures need a retry even without participant traffic.
+func (h *Handler) scheduleAggregateRefoldIfConfigured(ctx context.Context, repo string, pr int, installationID int64) {
+	if h.service == nil || (!h.service.Config().IsAggregateLeaderForRepo(repo) && len(h.service.Config().AllowedEnvironments) == 0) {
+		h.logger.Debug("repository has no scoped aggregate or leader; no re-fold to arm", "repo", repo, "pr", pr)
 		return
 	}
 	h.scheduleParticipantRefold(ctx, repo, pr, installationID)
@@ -197,7 +193,7 @@ func (h *Handler) scheduleLeaderRefoldIfConfigured(ctx context.Context, repo str
 // aggregate fold against it. The head is fetched fresh on every pass so a
 // nudge raced by a new commit folds the commit that is actually current;
 // updateAggregateCheck independently verifies head freshness before writing.
-// A pass that breaks before it can fold re-arms (leader-gated, bounded) so
+// A pass that breaks before it can fold re-arms (when configured, bounded) so
 // the retry chain survives transient client and PR-fetch failures.
 func (h *Handler) refoldAggregateForPR(repo string, pr int, installationID int64, trigger string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -207,14 +203,14 @@ func (h *Handler) refoldAggregateForPR(repo string, pr int, installationID int64
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for aggregate re-fold",
 			"repo", repo, "pr", pr, "trigger", trigger, "error", err)
-		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, installationID)
+		h.scheduleAggregateRefoldIfConfigured(ctx, repo, pr, installationID)
 		return
 	}
 	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR head for aggregate re-fold",
 			"repo", repo, "pr", pr, "trigger", trigger, "error", err)
-		h.scheduleLeaderRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
+		h.scheduleAggregateRefoldIfConfigured(ctx, repo, pr, client.InstallationID())
 		return
 	}
 	if prInfo.IsClosed() {

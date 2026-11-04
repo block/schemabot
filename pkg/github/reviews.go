@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/hmarr/codeowners"
+
+	"github.com/block/schemabot/pkg/panicsafe"
 )
 
 // Review states returned by the GitHub API.
@@ -87,7 +90,8 @@ func GetApprovedReviewers(reviews []*ReviewInfo) []string {
 // GetApprovedReviews returns, for each user whose latest decisive review is
 // APPROVED, that approving review, so callers can see which commit each
 // approval was given on. Latest-decisive-review semantics match
-// GetApprovedReviewers.
+// GetApprovedReviewers. Approvals come in the order they were given, so
+// comments that name approvers name them the same way every time.
 func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
 	latest := make(map[string]*ReviewInfo)
 	for _, r := range reviews {
@@ -109,6 +113,12 @@ func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
 			approved = append(approved, r)
 		}
 	}
+	slices.SortFunc(approved, func(a, b *ReviewInfo) int {
+		if c := a.SubmittedAt.Compare(b.SubmittedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(strings.ToLower(a.User), strings.ToLower(b.User))
+	})
 	return approved
 }
 
@@ -140,25 +150,41 @@ func (ic *InstallationClient) FetchCodeownersRuleset(ctx context.Context, repo, 
 	return nil, nil
 }
 
-// FetchCodeowners fetches CODEOWNERS from standard locations in the repo.
-// Returns all owners across all rules (not path-scoped).
-// Returns empty slice (not error) if no CODEOWNERS file exists.
-func (ic *InstallationClient) FetchCodeowners(ctx context.Context, repo, ref string) ([]string, error) {
-	ruleset, err := ic.FetchCodeownersRuleset(ctx, repo, ref)
-	if err != nil {
-		return nil, err
-	}
-	if ruleset == nil {
-		return nil, nil
-	}
-	return OwnerNames(OwnersFromRuleset(ruleset)), nil
+// UnmatchableCodeownersRuleError reports a CODEOWNERS rule the parser accepts
+// but cannot match. Error() names only the path being matched, so it can reach
+// a PR comment; Panic carries the recovered value and stack for server-side
+// logs, where the identifiers needed to triage it live.
+type UnmatchableCodeownersRuleError struct {
+	Path  string
+	Panic *panicsafe.Error
+}
+
+func (e *UnmatchableCodeownersRuleError) Error() string {
+	return fmt.Sprintf("match CODEOWNERS path %s: the CODEOWNERS file holds a rule that cannot be matched; fix the rule on the base branch", e.Path)
+}
+
+func (e *UnmatchableCodeownersRuleError) Unwrap() error {
+	return e.Panic
 }
 
 // MatchCodeownersPath finds the owners for a specific file path using CODEOWNERS rules.
 // Last matching rule wins (standard CODEOWNERS semantics).
 // Returns nil, nil if no rule matches. Returns an error if pattern matching fails.
+//
+// The parser panics on some rules it accepts, such as a bare `/ @owner`, and
+// CODEOWNERS is repository content, so a panic is returned as an
+// *UnmatchableCodeownersRuleError: the review gate then fails closed with a
+// reason instead of never answering.
 func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeowners.Owner, error) {
-	rule, err := ruleset.Match(filePath)
+	var rule *codeowners.Rule
+	recovered, err := panicsafe.Catch(func() error {
+		var matchErr error
+		rule, matchErr = ruleset.Match(filePath)
+		return matchErr
+	})
+	if recovered != nil {
+		return nil, &UnmatchableCodeownersRuleError{Path: filePath, Panic: recovered}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("match CODEOWNERS path %s: %w", filePath, err)
 	}
@@ -166,22 +192,6 @@ func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeown
 		return nil, nil
 	}
 	return rule.Owners, nil
-}
-
-// OwnersFromRuleset extracts all unique owners from a ruleset.
-func OwnersFromRuleset(ruleset codeowners.Ruleset) []codeowners.Owner {
-	seen := make(map[string]bool)
-	var owners []codeowners.Owner
-	for _, rule := range ruleset {
-		for _, o := range rule.Owners {
-			key := strings.ToLower(o.String())
-			if !seen[key] {
-				seen[key] = true
-				owners = append(owners, o)
-			}
-		}
-	}
-	return owners
 }
 
 // IsTeamOwner returns true if the owner is a GitHub team (org/team format).
@@ -201,15 +211,6 @@ func TeamParts(o codeowners.Owner) (org, slug string) {
 		return parts[0], parts[1]
 	}
 	return o.Value, ""
-}
-
-// ParseCodeowners parses CODEOWNERS content and returns unique owner names without @ prefix.
-func ParseCodeowners(content string) []string {
-	ruleset, err := codeowners.ParseFile(bytes.NewBufferString(content))
-	if err != nil {
-		return nil
-	}
-	return OwnerNames(OwnersFromRuleset(ruleset))
 }
 
 // OwnerNames converts a slice of codeowners.Owner to string names without @ prefix.

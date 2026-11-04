@@ -88,5 +88,5 @@ func (m WatchModel) hiddenLinesNote(hidden int) string {
 }
 
 func (m WatchModel) statusCommand() string {
-	return fmt.Sprintf("  %s status %s -e %s", cliname.Name(), m.applyID, m.environment)
+	return "  " + cliname.Command("status", m.applyID, "-e", m.environment)
 }

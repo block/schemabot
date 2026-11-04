@@ -106,6 +106,39 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "rollout step -1 is negative")
 	})
 
+	// GetLocked_ReadsWhatAClaimCommitted verifies the locked read answers with
+	// the row as the last claim on it committed it, and nil for a row that
+	// does not exist.
+	t.Run("GetLocked_ReadsWhatAClaimCommitted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_locked_read_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_locked_read", 933)
+		id := createOperation(t, store, apply.ID, "region-a", "")
+
+		unclaimed, err := store.ApplyOperations().GetLocked(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, unclaimed)
+		assert.Equal(t, state.ApplyOperation.Pending, unclaimed.State)
+		assert.Empty(t, unclaimed.LeaseOwner)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, id, claimed.ID)
+
+		got, err := store.ApplyOperations().GetLocked(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, state.ApplyOperation.Running, got.State)
+		assert.Equal(t, "driver-a", got.LeaseOwner)
+		assert.NotNil(t, got.StartedAt)
+
+		missing, err := store.ApplyOperations().GetLocked(ctx, id+1000)
+		require.NoError(t, err)
+		assert.Nil(t, missing)
+	})
+
 	// FindNextApplyOperation_ClaimsInDeploymentOrder verifies the operation
 	// ladder: a pending operation is claimed into running with a fresh lease,
 	// and a later deployment remains blocked until its earlier sibling
@@ -418,13 +451,13 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 	})
 
-	// FindNextApplyOperation_ParallelStartsTargetsUpToCapAndCutsOverInOrder
+	// FindNextApplyOperation_ParallelStartsTargetsUpToCapAndCutsOverEachWhenReady
 	// verifies a parallel rollout over the targets of one deployment. Copies
 	// start without waiting on earlier targets, bounded by the per-apply driver
-	// cap, so a third target queues until a slot frees. Cutover stays one target
-	// at a time in list order: payments-003 parked at the barrier does not cut
-	// over while payments-002, earlier in the list, is still parked.
-	t.Run("FindNextApplyOperation_ParallelStartsTargetsUpToCapAndCutsOverInOrder", func(t *testing.T) {
+	// cap, so a third target queues until a slot frees. Each target cuts over
+	// as soon as it is parked: payments-003 cuts over while payments-002,
+	// earlier in the list, is still mid-cutover.
+	t.Run("FindNextApplyOperation_ParallelStartsTargetsUpToCapAndCutsOverEachWhenReady", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "operation_target_parallel_db", storage.DatabaseTypeMySQL)
@@ -457,20 +490,133 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		for _, id := range ids[1:] {
 			require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.WaitingForCutover))
 		}
-		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
-		require.NoError(t, err)
-		require.NotNil(t, cutover)
-		assert.Equal(t, ids[1], cutover.ID, "the earliest parked target cuts over first")
+		for _, want := range ids[1:] {
+			cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, cutover, "a parked target cuts over while an earlier one is mid-cutover")
+			assert.Equal(t, want, cutover.ID, "parked targets are taken in list order")
+		}
+	})
 
-		held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
-		require.NoError(t, err)
-		assert.Nil(t, held, "a later target does not cut over while an earlier one is mid-cutover")
+	// FindNextApplyOperationCutover_CapsCutoversApartFromCopies verifies the
+	// cutover claim's own fan-out cap. Under parallel, payments-001 through
+	// payments-003 are parked at the cutover while two later targets hold the
+	// apply's copy drivers. The parked targets do not wait behind those copies:
+	// as many cut over at once as the per-apply cap allows, and the last one
+	// cuts over as soon as one of them completes.
+	t.Run("FindNextApplyOperationCutover_CapsCutoversApartFromCopies", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_cutover_cap_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_cutover_cap", 926)
+		maxDrivers := storage.DefaultMaxDriversPerApply
+		parked := make([]int64, maxDrivers+1)
+		for i := range parked {
+			target := fmt.Sprintf("payments-%03d", i+1)
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+				OperationKey: storage.TargetOperationKey(target, ""), OperationKind: storage.ApplyOperationKindWork,
+				State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+			parked[i] = id
+		}
+		copying := make([]string, maxDrivers)
+		for i := range copying {
+			copying[i] = fmt.Sprintf("payments-%03d", len(parked)+i+1)
+		}
+		insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyParallel, storage.OnFailureHalt, copying...)
+		for range copying {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-copy")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "the later targets' copies take the apply's copy drivers")
+		}
 
-		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[1]))
-		next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		for _, want := range parked[:maxDrivers] {
+			cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-cutover")
+			require.NoError(t, err)
+			require.NotNil(t, cutover, "a parked target cuts over while every copy driver is busy")
+			assert.Equal(t, want, cutover.ID)
+		}
+		capped, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-cutover")
 		require.NoError(t, err)
-		require.NotNil(t, next)
-		assert.Equal(t, ids[2], next.ID, "the next target in list order cuts over once the earlier one completes")
+		assert.Nil(t, capped, "the last parked target waits while the apply is at its cutover cap")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, parked[0]))
+		last, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-cutover")
+		require.NoError(t, err)
+		require.NotNil(t, last, "a settled cutover frees a slot for the last parked target")
+		assert.Equal(t, parked[maxDrivers], last.ID)
+	})
+
+	// FindNextApplyOperationCutover_ConcurrentClaimsHoldTheCap verifies the
+	// cutover cap is a hard bound under contention. Eight targets of a parallel
+	// rollout are parked at the cutover, and eight drivers poll in the same
+	// instant. However the claims interleave, no more of them start a cutover
+	// than the per-apply cap allows, and the parked targets they leave stay
+	// parked for the next poll.
+	t.Run("FindNextApplyOperationCutover_ConcurrentClaimsHoldTheCap", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_cutover_contention_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_cutover_contention", 927)
+		const drivers = 8
+		for i := range drivers {
+			target := fmt.Sprintf("payments-%03d", i+1)
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+				OperationKey: storage.TargetOperationKey(target, ""), OperationKind: storage.ApplyOperationKindWork,
+				State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+		}
+
+		start := make(chan struct{})
+		results := make(chan *storage.ApplyOperation, drivers)
+		errs := make(chan error, drivers)
+		var wg sync.WaitGroup
+		for i := range drivers {
+			owner := fmt.Sprintf("driver-%d", i)
+			wg.Go(func() {
+				<-start
+				claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, owner)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if claimed != nil {
+					results <- claimed
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		close(errs)
+
+		for err := range errs {
+			require.NoError(t, err)
+		}
+		claimed := 0
+		for range results {
+			claimed++
+		}
+		assert.GreaterOrEqual(t, claimed, 1, "the claim that takes the parent apply admits its cutover")
+		assert.LessOrEqual(t, claimed, storage.DefaultMaxDriversPerApply, "no more targets cut over at once than the cap allows")
+
+		ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		cuttingOver, parked := 0, 0
+		for _, op := range ops {
+			switch op.State {
+			case state.ApplyOperation.CuttingOver:
+				cuttingOver++
+			case state.ApplyOperation.WaitingForCutover:
+				parked++
+			}
+		}
+		assert.Equal(t, claimed, cuttingOver, "every admitted claim is the only way a target reaches cutting_over")
+		assert.Equal(t, drivers-claimed, parked, "the targets not admitted stay parked")
 	})
 
 	// FindNextApplyOperation_ParallelFailureAdmission verifies that parallel
@@ -679,9 +825,10 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	})
 
 	// CutoverBlocker_FollowsDeploymentOrder verifies whose turn it is to cut
-	// over. An earlier deployment holds a later one's cutover until it has
-	// completed, whether it is still copying or parked at the cutover itself,
-	// and the blocker named is the earliest one holding the turn.
+	// over across deployments. An earlier deployment holds a later one's
+	// cutover until it has completed: copying, parked at its own cutover,
+	// cutting over, in its revert window, or halted, it holds every later
+	// cutover, and the blocker named is the earliest one holding it.
 	t.Run("CutoverBlocker_FollowsDeploymentOrder", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -699,30 +846,122 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		usID := insert("us", state.ApplyOperation.WaitingForCutover)
 		auID := insert("au", state.ApplyOperation.Running)
 
-		requireBlocker := func(operationID, wantBlockerID int64, msg string) {
-			t.Helper()
-			blocker, err := store.ApplyOperations().CutoverBlocker(ctx, operationID)
-			require.NoError(t, err)
-			if wantBlockerID == 0 {
-				assert.Nil(t, blocker, msg)
-				return
-			}
-			require.NotNil(t, blocker, msg)
-			assert.Equal(t, wantBlockerID, blocker.ID, msg)
-		}
+		requireBlocker := cutoverBlockerAsserter(t, store)
 		requireBlocker(euID, 0, "the first deployment's cutover is never held")
 		requireBlocker(usID, euID, "a parked earlier deployment holds the next cutover")
 		requireBlocker(auID, euID, "the earliest deployment holding the turn is the one named")
+		for _, opState := range []string{
+			state.ApplyOperation.Running, state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow,
+			state.ApplyOperation.Stopped, state.ApplyOperation.FailedRetryable, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted,
+		} {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, euID, opState))
+			requireBlocker(usID, euID, "an earlier deployment that is "+opState+" holds the next cutover")
+		}
 
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, euID))
 		requireBlocker(usID, 0, "a completed earlier deployment releases the turn")
 		requireBlocker(auID, usID, "the turn passes one deployment at a time")
 	})
 
+	// CutoverBlocker_HeldOnlyByAnEarlierTargetThatHalted verifies when an
+	// earlier target of the same deployment holds a later target's cutover.
+	// Parked, copying, cutting over, in its revert window, or completed, it
+	// holds nothing; stopped, retrying a failure, cancelled, or reverted, it
+	// holds every later cutover, and the blocker named is the earliest one
+	// holding it.
+	t.Run("CutoverBlocker_HeldOnlyByAnEarlierTargetThatHalted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "cutover_target_turn_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_cutover_target_turn", 929)
+		insert := func(target, opState string) int64 {
+			t.Helper()
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "shop", Target: target, OperationKey: target, State: opState, CutoverPolicy: storage.CutoverPolicyParallel,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		first := insert("shop-001", state.ApplyOperation.WaitingForCutover)
+		second := insert("shop-002", state.ApplyOperation.WaitingForCutover)
+		third := insert("shop-003", state.ApplyOperation.WaitingForCutover)
+
+		requireBlocker := cutoverBlockerAsserter(t, store)
+		requireBlocker(first, 0, "the first target's cutover is never held")
+		requireBlocker(second, 0, "a parked earlier target does not hold the next cutover")
+		for _, opState := range []string{state.ApplyOperation.Running, state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow} {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, first, opState))
+			requireBlocker(second, 0, "an earlier target that is "+opState+" does not hold the next cutover")
+		}
+		for _, opState := range []string{state.ApplyOperation.Stopped, state.ApplyOperation.FailedRetryable, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted} {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, first, opState))
+			requireBlocker(second, first, "an earlier target that is "+opState+" holds the next cutover")
+			requireBlocker(third, first, "the earliest target holding the cutover is the one named")
+		}
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, first))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, second, state.ApplyOperation.Stopped))
+		requireBlocker(second, 0, "a completed earlier target holds nothing")
+		requireBlocker(third, second, "a later target's stop holds every cutover after it")
+	})
+
+	// CutoverBlocker_HeldByARetryTheDriveIsRidingOut verifies that a retry a
+	// live drive rides out holds later cutovers of the same deployment.
+	// shop-001's data plane parks its apply between recovery attempts while
+	// its drive keeps its lease, so shop-001's operation row stays running and
+	// only its task records the retry. That retry holds shop-002's cutover,
+	// both the automatic claim and a requested one, exactly as a
+	// failed_retryable row would; once shop-001's task resumes, shop-002 cuts
+	// over while shop-001 is still copying.
+	t.Run("CutoverBlocker_HeldByARetryTheDriveIsRidingOut", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "cutover_live_retry_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_cutover_live_retry", 928)
+		insert := func(target, opState string) int64 {
+			t.Helper()
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "shop", Target: target, OperationKey: target, State: opState,
+				CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		firstID := insert("shop-001", state.ApplyOperation.Running)
+		secondID := insert("shop-002", state.ApplyOperation.WaitingForCutover)
+		firstTask := newTask(apply, "task_shop_001_live_retry", "orders", time.Now().UTC().Truncate(time.Second))
+		firstTask.ApplyOperationID = &firstID
+		firstTask.State = state.Task.FailedRetryable
+		_, err := store.Tasks().Create(ctx, firstTask)
+		require.NoError(t, err)
+
+		blocker, err := store.ApplyOperations().CutoverBlocker(ctx, secondID)
+		require.NoError(t, err)
+		require.NotNil(t, blocker, "a retry recorded only on shop-001's task holds shop-002's requested cutover")
+		assert.Equal(t, firstID, blocker.ID)
+		assert.Equal(t, state.ApplyOperation.Running, blocker.State, "shop-001's row stays running while its drive rides out the retry")
+		held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, held, "the automatic cutover claim is held by the same retry")
+
+		resumed, err := store.Tasks().Get(ctx, firstTask.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, resumed)
+		resumed.State = state.Task.Running
+		require.NoError(t, store.Tasks().Update(ctx, resumed))
+		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, secondID)
+		require.NoError(t, err)
+		assert.Nil(t, blocker, "once shop-001's retry recovers, shop-001 still copying holds nothing")
+		claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "shop-002 cuts over once the retry ahead of it has recovered")
+		assert.Equal(t, secondID, claimed.ID)
+	})
+
 	// CutoverBlocker_ShardSiblingsDoNotTakeTurns verifies that the shard work
-	// rows of one deployment never hold each other's cutover. They share the
-	// deployment's one data-plane apply, which a cutover addresses as a whole,
-	// so only an earlier deployment can hold the turn.
+	// rows of one deployment never hold each other's requested cutover. They
+	// share the deployment's one data-plane apply, which a cutover addresses
+	// as a whole, so only an earlier deployment can hold it.
 	t.Run("CutoverBlocker_ShardSiblingsDoNotTakeTurns", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -749,15 +988,26 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, blocker, "a later deployment waits for the earlier deployment's shards")
 		assert.Equal(t, copyingShard, blocker.ID)
+
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, copyingShard, state.ApplyOperation.Stopped))
+		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, parkedShard)
+		require.NoError(t, err)
+		assert.Nil(t, blocker, "a stopped shard of the same deployment does not hold a parked shard's requested cutover")
+
+		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, laterDeployment)
+		require.NoError(t, err)
+		require.NotNil(t, blocker, "a stopped shard of an earlier deployment still holds a later deployment's cutover")
+		assert.Equal(t, copyingShard, blocker.ID)
 		assert.Equal(t, "eu", blocker.Deployment)
 	})
 
-	// CutoverBlocker_TargetsOfOneDeploymentTakeTurns verifies that the targets
-	// of one deployment are separate members. Each target is its own database
-	// with its own cutover, so an earlier target holds a later target's turn
-	// exactly as an earlier deployment would, while the shards of one target
-	// never hold each other's requested cutover.
-	t.Run("CutoverBlocker_TargetsOfOneDeploymentTakeTurns", func(t *testing.T) {
+	// CutoverBlocker_TargetsOfOneDeploymentAreSeparateMembers verifies that the
+	// targets of one deployment are separate members. Each target is its own
+	// database with its own cutover, so an earlier target holds a later
+	// target's cutover exactly as an earlier deployment would, once it has
+	// halted, while the shards of one target never hold each other's requested
+	// cutover.
+	t.Run("CutoverBlocker_TargetsOfOneDeploymentAreSeparateMembers", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "cutover_turn_targets_db", storage.DatabaseTypeMySQL)
@@ -777,14 +1027,20 @@ func TestApplyOperations(t *testing.T, h Harness) {
 
 		blocker, err := store.ApplyOperations().CutoverBlocker(ctx, parkedTarget)
 		require.NoError(t, err)
-		require.NotNil(t, blocker, "an earlier target of the same deployment holds a later target's cutover")
+		assert.Nil(t, blocker, "an earlier target that is still copying does not hold a later target's cutover")
+
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, copyingTarget, state.ApplyOperation.Stopped))
+		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, parkedTarget)
+		require.NoError(t, err)
+		require.NotNil(t, blocker, "a stopped earlier target of the same deployment holds a later target's cutover")
 		assert.Equal(t, copyingTarget, blocker.ID)
 		assert.Equal(t, "orders-001", blocker.Target)
 
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, copyingTarget))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, parkedTarget, state.ApplyOperation.Stopped))
 		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, parkedShard)
 		require.NoError(t, err)
-		assert.Nil(t, blocker, "the shards of one target never hold each other once the earlier target has completed")
+		assert.Nil(t, blocker, "a stopped shard of one target never holds another shard of the same target")
 	})
 
 	// CutoverBlocker_FailedSiblingFollowsOnFailure verifies that a
@@ -838,26 +1094,28 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Nil(t, blocker, "a release lets the cutover proceed past the failed deployment")
 	})
 
-	// FindNextApplyOperation_OrderedCutoverTakesOneTargetsShardsOneAtATime
-	// verifies what stays ordered inside one rollout member. Under barrier and
-	// under parallel, both shards of payments-001 start their copies together,
-	// but they cut over one at a time: shard 80- parks behind shard -80 even
-	// though both belong to the same target. The target's finalizer waits until
-	// both shards have completed.
-	t.Run("FindNextApplyOperation_OrderedCutoverTakesOneTargetsShardsOneAtATime", func(t *testing.T) {
+	// FindNextApplyOperation_OrderedCutoverTakesEachShardWhenReady verifies
+	// what stays ordered inside one rollout member. Under barrier and under
+	// parallel, both shards of payments-001 start their copies together and
+	// each cuts over as soon as it is parked: shard 80- does not wait while
+	// shard -80 is mid-cutover. The target's finalizer waits until both shards
+	// have completed.
+	t.Run("FindNextApplyOperation_OrderedCutoverTakesEachShardWhenReady", func(t *testing.T) {
 		for _, cutoverPolicy := range []string{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel} {
 			t.Run(cutoverPolicy, func(t *testing.T) {
-				testOneTargetsShardsCutOverOneAtATime(t, h, cutoverPolicy)
+				testOneTargetsShardsCutOverWhenReady(t, h, cutoverPolicy)
 			})
 		}
 	})
 
 	// FindNextApplyOperation_FinalizerWaitsOnEarlierMembers verifies that a
-	// finalizer is ordered against earlier rollout members like a cutover. A
+	// finalizer is held by earlier rollout members the way a cutover is. A
 	// VSchema-only rollout over region-a and region-b has one finalizer per
-	// member and no work. region-b's finalizer does not start while region-a's
-	// is running, under any policy, and once region-a's fails it stays held
-	// under halt, and under pause until an operator releases the rollout, so
+	// member and no work. While region-a's is running, region-b's does not
+	// start when the two are separate deployments, under every policy; when
+	// they are targets of one deployment, it starts without waiting under
+	// barrier and parallel. Once region-a's fails, region-b's stays held under
+	// halt, and under pause until an operator releases the rollout, so
 	// region-b's VSchema never goes out behind a failed region-a. Under
 	// continue it starts once region-a's has failed, and under every policy it
 	// starts once region-a's completes.
@@ -866,20 +1124,31 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			name          string
 			cutoverPolicy string
 			onFailure     string
-			// earlierFails fails region-a's finalizer; otherwise it completes.
-			earlierFails  bool
-			release       bool
+			// earlierState is the state region-a's finalizer settles in before
+			// region-b's is offered: running, failed or completed.
+			earlierState string
+			release      bool
+			// targets makes region-a and region-b targets of one deployment
+			// instead of two deployments.
+			targets       bool
 			laterAdmitted bool
 		}{
-			{name: "rolling_halt_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureHalt, earlierFails: true},
-			{name: "rolling_pause_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailurePause, earlierFails: true},
-			{name: "rolling_pause_released", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailurePause, earlierFails: true, release: true, laterAdmitted: true},
-			{name: "rolling_continue_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureContinue, earlierFails: true, laterAdmitted: true},
-			{name: "barrier_halt_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierFails: true},
-			{name: "barrier_continue_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureContinue, earlierFails: true, laterAdmitted: true},
-			{name: "parallel_halt_failed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierFails: true},
-			{name: "parallel_continue_failed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureContinue, earlierFails: true, laterAdmitted: true},
-			{name: "parallel_halt_completed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, laterAdmitted: true},
+			{name: "rolling_halt_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Failed},
+			{name: "rolling_pause_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailurePause, earlierState: state.ApplyOperation.Failed},
+			{name: "rolling_pause_released", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailurePause, earlierState: state.ApplyOperation.Failed, release: true, laterAdmitted: true},
+			{name: "rolling_continue_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureContinue, earlierState: state.ApplyOperation.Failed, laterAdmitted: true},
+			{name: "barrier_halt_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Failed},
+			{name: "barrier_continue_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureContinue, earlierState: state.ApplyOperation.Failed, laterAdmitted: true},
+			{name: "parallel_halt_failed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Failed},
+			{name: "parallel_continue_failed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureContinue, earlierState: state.ApplyOperation.Failed, laterAdmitted: true},
+			{name: "barrier_halt_running", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running},
+			{name: "barrier_halt_running_targets", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running, targets: true, laterAdmitted: true},
+			{name: "barrier_pause_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailurePause, earlierState: state.ApplyOperation.Failed},
+			{name: "barrier_pause_released", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailurePause, earlierState: state.ApplyOperation.Failed, release: true, laterAdmitted: true},
+			{name: "parallel_halt_running", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running},
+			{name: "parallel_halt_running_targets", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running, targets: true, laterAdmitted: true},
+			{name: "parallel_halt_failed_targets", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Failed, targets: true},
+			{name: "parallel_halt_completed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Completed, laterAdmitted: true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				ctx := t.Context()
@@ -887,13 +1156,17 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				lock := CreateLock(t, store, "operation_finalizer_order_"+tc.name, storage.DatabaseTypeVitess)
 				apply := CreateApply(t, store, lock, "apply_operation_finalizer_order_"+tc.name, 915)
 				ids := make([]int64, 0, 2)
-				for _, deployment := range []string{"region-a", "region-b"} {
-					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-						ApplyID: apply.ID, Deployment: deployment,
+				for _, member := range []string{"region-a", "region-b"} {
+					op := &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: member,
 						OperationKey:  "group_finalizer",
 						OperationKind: storage.ApplyOperationKindGroupFinalizer,
 						CutoverPolicy: tc.cutoverPolicy, OnFailure: tc.onFailure,
-					})
+					}
+					if tc.targets {
+						op.Deployment, op.Target, op.OperationKey = "shop", member, member+"/group_finalizer"
+					}
+					id, err := store.ApplyOperations().Insert(ctx, op)
 					require.NoError(t, err)
 					ids = append(ids, id)
 				}
@@ -903,13 +1176,16 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				require.NotNil(t, first)
 				require.Equal(t, ids[0], first.ID, "region-a's finalizer starts first")
 
-				held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
-				require.NoError(t, err)
-				assert.Nil(t, held, "region-b's finalizer waits while region-a's is running under %s", tc.cutoverPolicy)
+				if tc.cutoverPolicy == storage.CutoverPolicyRolling || !tc.targets {
+					held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					require.NoError(t, err)
+					assert.Nil(t, held, "region-b's finalizer waits while region-a's is running")
+				}
 
-				if tc.earlierFails {
+				switch tc.earlierState {
+				case state.ApplyOperation.Failed:
 					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "vschema apply rejected"))
-				} else {
+				case state.ApplyOperation.Completed:
 					require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0]))
 				}
 				if tc.release {
@@ -934,7 +1210,6 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				}
 				require.NotNil(t, next, "%s admits region-b's finalizer", tc.name)
 				assert.Equal(t, ids[1], next.ID)
-				assert.Equal(t, "region-b", next.Deployment)
 			})
 		}
 	})
@@ -944,9 +1219,9 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// into rolling. payments-001 and payments-002 each have two shards of
 	// orders and an orders finalizer. Once payments-001's shards park at the
 	// barrier, payments-002's copies start even though payments-001's finalizer
-	// is still pending. What is visible stays ordered: payments-002 does not cut
-	// over, and its finalizer does not start, until payments-001's finalizer has
-	// completed.
+	// is still pending. payments-002 does not wait for that finalizer at its
+	// cutover either: once payments-001's shards have cut over, payments-002
+	// cuts over while payments-001's finalizer is still pending.
 	t.Run("FindNextApplyOperation_BarrierStartsLaterCopyPastParkedMemberFinalizer", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -972,28 +1247,19 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
 			require.NoError(t, err)
 			require.NotNil(t, cutover)
-			assert.Equal(t, want, cutover.ID, "payments-001 cuts over first, one shard at a time")
+			assert.Equal(t, want, cutover.ID, "payments-001's shards are taken first, in list order")
 			require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, want))
 		}
 
-		heldCutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
 		require.NoError(t, err)
-		assert.Nil(t, heldCutover, "payments-002 does not cut over while payments-001's finalizer is pending")
+		require.NotNil(t, next, "payments-002 cuts over while payments-001's finalizer is pending")
+		assert.Equal(t, shards["payments-002"][0], next.ID)
 
 		finalizer, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 		require.NoError(t, err)
 		require.NotNil(t, finalizer)
 		assert.Equal(t, finalizers["payments-001"], finalizer.ID, "payments-001's finalizer starts once its shards complete")
-
-		stillHeld, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
-		require.NoError(t, err)
-		assert.Nil(t, stillHeld, "payments-002 does not cut over while payments-001's finalizer is running")
-
-		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, finalizers["payments-001"]))
-		next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
-		require.NoError(t, err)
-		require.NotNil(t, next)
-		assert.Equal(t, shards["payments-002"][0], next.ID, "payments-002 cuts over once payments-001 has completed")
 	})
 
 	// FindNextApplyOperation_BarrierNeverParksLaterCopyBehindOrphanedFinalizer
@@ -1246,73 +1512,15 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 	})
 
-	// CutoverBlocker_OwedFinalizerOfAnotherNamespaceHoldsTheTurn verifies that
-	// another namespace's failure does not orphan a finalizer that is still
-	// owed. Target orders-001 of a targets list runs ns_0 and ns_1 under
-	// parallel and continue, and orders-002 is parked at the cutover. When one
-	// namespace's shard fails and the other's completes, the surviving
-	// namespace's finalizer has not run yet, so it holds orders-002's turn to
-	// cut over, while the failed namespace's finalizer, which will never start,
-	// does not.
-	t.Run("CutoverBlocker_OwedFinalizerOfAnotherNamespaceHoldsTheTurn", func(t *testing.T) {
-		for _, failing := range []string{"ns_0", "ns_1"} {
-			t.Run(failing+"_fails", func(t *testing.T) {
-				ctx := t.Context()
-				store := h.NewStorage(t)
-				lock := CreateLock(t, store, "cutover_owed_finalizer_db", storage.DatabaseTypeVitess)
-				apply := CreateApply(t, store, lock, "apply_cutover_owed_finalizer", 924)
-				insert := func(target, scopedKey, kind string) int64 {
-					t.Helper()
-					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-						ApplyID: apply.ID, Deployment: "orders", Target: target,
-						OperationKey: storage.TargetOperationKey(target, scopedKey), OperationKind: kind,
-						CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue,
-					})
-					require.NoError(t, err)
-					return id
-				}
-				work := map[string]int64{}
-				finalizers := map[string]int64{}
-				for _, namespace := range []string{"ns_0", "ns_1"} {
-					work[namespace] = insert("orders-001", storage.ShardOperationKey(namespace, "-80", "orders"), storage.ApplyOperationKindWork)
-				}
-				for _, namespace := range []string{"ns_0", "ns_1"} {
-					finalizers[namespace] = insert("orders-001", namespace+storage.OperationKeyDelimiter+state.GroupFinalizerKeySegment, storage.ApplyOperationKindGroupFinalizer)
-				}
-				laterTarget := insert("orders-002", storage.ShardOperationKey("ns_0", "-80", "orders"), storage.ApplyOperationKindWork)
-				succeeding := "ns_1"
-				if failing == "ns_1" {
-					succeeding = "ns_0"
-				}
-				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, work[failing], "duplicate key name 'idx_orders_source'"))
-				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, work[succeeding]))
-				require.NoError(t, store.ApplyOperations().UpdateState(ctx, laterTarget, state.ApplyOperation.WaitingForCutover))
-
-				blocker, err := store.ApplyOperations().CutoverBlocker(ctx, laterTarget)
-				require.NoError(t, err)
-				require.NotNil(t, blocker, "orders-001 still owes %s's finalization", succeeding)
-				assert.Equal(t, finalizers[succeeding], blocker.ID, "%s's pending finalizer holds orders-002's cutover", succeeding)
-				held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
-				require.NoError(t, err)
-				assert.Nil(t, held, "orders-002 does not cut over while %s's finalizer is owed", succeeding)
-
-				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, finalizers[succeeding]))
-				blocker, err = store.ApplyOperations().CutoverBlocker(ctx, laterTarget)
-				require.NoError(t, err)
-				assert.Nil(t, blocker, "%s's finalizer, orphaned by its own failed work, does not hold the turn", failing)
-			})
-		}
-	})
-
 	// Finalizer_ScopeComparesByteForByte verifies that a finalizer's scope
 	// matches work keys byte-for-byte on every dialect, as
 	// state.FinalizerFinalizesWork does, even where the storage collation
 	// folds case and accents. Target orders-001 of a targets list has two
 	// namespaces whose names differ only by case (or accent): one has shard
 	// work, and the other has only a VSchema change, so only a finalizer.
-	// When the shard fails, the other namespace's finalizer is still owed: it
-	// holds orders-002's cutover turn, and it starts, because it neither waits
-	// for nor is orphaned by work in a different namespace.
+	// When the shard fails, the other namespace's finalizer is still owed, and
+	// it starts, because it neither waits for nor is orphaned by work in a
+	// different namespace.
 	t.Run("Finalizer_ScopeComparesByteForByte", func(t *testing.T) {
 		for _, tc := range []struct {
 			name, workNamespace, finalizerNamespace string
@@ -1337,14 +1545,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				}
 				work := insert("orders-001", storage.ShardOperationKey(tc.workNamespace, "-80", "orders"), storage.ApplyOperationKindWork)
 				finalizer := insert("orders-001", tc.finalizerNamespace+storage.OperationKeyDelimiter+state.GroupFinalizerKeySegment, storage.ApplyOperationKindGroupFinalizer)
-				laterTarget := insert("orders-002", storage.ShardOperationKey("ns_0", "-80", "orders"), storage.ApplyOperationKindWork)
 				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, work, "duplicate key name 'idx_orders_source'"))
-				require.NoError(t, store.ApplyOperations().UpdateState(ctx, laterTarget, state.ApplyOperation.WaitingForCutover))
-
-				blocker, err := store.ApplyOperations().CutoverBlocker(ctx, laterTarget)
-				require.NoError(t, err)
-				require.NotNil(t, blocker, "%s's failed work does not orphan %s's finalizer", tc.workNamespace, tc.finalizerNamespace)
-				assert.Equal(t, finalizer, blocker.ID, "%s's owed finalizer holds orders-002's cutover", tc.finalizerNamespace)
 
 				claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 				require.NoError(t, err)
@@ -1671,6 +1872,145 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, storage.DefaultMaxDriversPerApply, claimed, "a wide apply occupies exactly the cap's worth of drivers, not every claimable shard")
 	})
 
+	// FindNextApplyOperation_SkipDeferredCutoverWork verifies the claim a
+	// driver reserved for everything but deferred-cutover work makes. It never
+	// starts or recovers an operation of an apply deferring its cutover, so it
+	// takes the regular apply's operation even though the deferred one queued
+	// first, and leaves the deferred one to the other drivers. It still claims
+	// a deferred operation to deliver a stop or cancel, since that ends the
+	// work, including recovering a crashed drive of one with a stop pending.
+	t.Run("FindNextApplyOperation_SkipDeferredCutoverWork", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		deferredApply := CreateApply(t, store, CreateLock(t, store, "operation_skip_deferred_db", storage.DatabaseTypeMySQL), "apply_operation_skip_deferred", 931)
+		deferredApply.Options = []byte(`{"defer_cutover":true}`)
+		require.NoError(t, store.Applies().Update(ctx, deferredApply))
+		regularApply := CreateApply(t, store, CreateLock(t, store, "operation_skip_regular_db", storage.DatabaseTypeMySQL), "apply_operation_skip_regular", 932)
+
+		insert := func(apply *storage.Apply) int64 {
+			t.Helper()
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a",
+				OperationKey:  "commerce/-80/users",
+				OperationKind: storage.ApplyOperationKindWork,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		deferredOp := insert(deferredApply)
+		regularOp := insert(regularApply)
+
+		claimSkipping := func() *storage.ApplyOperation {
+			t.Helper()
+			got, err := store.ApplyOperations().FindNextApplyOperation(ctx, "reserved-driver", storage.SkipDeferredCutoverWork())
+			require.NoError(t, err)
+			return got
+		}
+		claim := func() *storage.ApplyOperation {
+			t.Helper()
+			got, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			return got
+		}
+
+		got := claimSkipping()
+		require.NotNil(t, got, "the reserved driver takes the regular apply's operation")
+		assert.Equal(t, regularOp, got.ID)
+		assert.Nil(t, claimSkipping(), "the reserved driver does not start the deferred apply's operation")
+
+		got = claim()
+		require.NotNil(t, got, "any other driver starts the deferred apply's operation")
+		assert.Equal(t, deferredOp, got.ID)
+
+		released, err := store.ApplyOperations().ReleaseClaim(ctx, got.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		assert.Nil(t, claimSkipping(), "the reserved driver does not recover the deferred apply's stale operation")
+		got = claim()
+		require.NotNil(t, got, "any other driver recovers the deferred apply's stale operation")
+		assert.Equal(t, deferredOp, got.ID)
+
+		released, err = store.ApplyOperations().ReleaseClaim(ctx, got.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		requestControl(t, store, deferredApply.ID, storage.ControlOperationStop)
+		got = claimSkipping()
+		require.NotNil(t, got, "the reserved driver recovers the deferred apply's stale operation to deliver its pending stop")
+		assert.Equal(t, deferredOp, got.ID)
+
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, deferredOp, state.ApplyOperation.Stopped))
+		requestControl(t, store, deferredApply.ID, storage.ControlOperationCancel)
+		got = claimSkipping()
+		require.NotNil(t, got, "the reserved driver still delivers a cancel to the deferred apply")
+		assert.Equal(t, deferredOp, got.ID)
+	})
+
+	// FindNextApplyOperation_SkipDeferredCutoverWorkRecoversForStopOrCancel
+	// verifies both arms that recover a crashed drive of an apply deferring its
+	// cutover: the stale-active arm, and the failed_retryable arm's
+	// crash-recovery branch. The reserved driver leaves each to the other
+	// drivers until a stop or cancel is pending, then recovers it so the
+	// request is delivered, for either request.
+	t.Run("FindNextApplyOperation_SkipDeferredCutoverWorkRecoversForStopOrCancel", func(t *testing.T) {
+		for _, arm := range []struct {
+			name    string
+			opState string
+		}{
+			{"stale active", state.ApplyOperation.Running},
+			{"crashed retry", state.ApplyOperation.FailedRetryable},
+		} {
+			for _, request := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+				t.Run(arm.name+" "+string(request), func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+
+					// A running parent whose driver crashed: claimed, then
+					// released, which backdates its heartbeat past the
+					// staleness window.
+					apply := CreateClaimedApply(t, store, CreateLock(t, store, "operation_deferred_recovery_db", storage.DatabaseTypeMySQL), "apply_operation_deferred_recovery", 941, "crashed-driver")
+					apply.State = state.Apply.Running
+					apply.Options = []byte(`{"defer_cutover":true}`)
+					require.NoError(t, store.Applies().Update(ctx, apply))
+					released, err := store.Applies().ReleaseClaim(ctx, apply.Lease())
+					require.NoError(t, err)
+					require.True(t, released)
+
+					// Its operation, left in the arm's state by the crashed
+					// drive and released the same way.
+					opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: "region-a",
+						OperationKey:  "commerce/-80/users",
+						OperationKind: storage.ApplyOperationKindWork,
+					})
+					require.NoError(t, err)
+					crashed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "crashed-driver")
+					require.NoError(t, err)
+					require.NotNil(t, crashed, "the crashed driver had claimed the operation")
+					require.Equal(t, opID, crashed.ID)
+					require.NoError(t, store.ApplyOperations().UpdateState(ctx, opID, arm.opState))
+					released, err = store.ApplyOperations().ReleaseClaim(ctx, crashed.Lease())
+					require.NoError(t, err)
+					require.True(t, released)
+
+					claimSkipping := func() *storage.ApplyOperation {
+						t.Helper()
+						got, err := store.ApplyOperations().FindNextApplyOperation(ctx, "reserved-driver", storage.SkipDeferredCutoverWork())
+						require.NoError(t, err)
+						return got
+					}
+					assert.Nil(t, claimSkipping(), "the reserved driver leaves the crashed deferred drive to the other drivers")
+
+					requestControl(t, store, apply.ID, request)
+					got := claimSkipping()
+					require.NotNil(t, got, "the reserved driver recovers the crashed deferred drive to deliver its pending %s", request)
+					assert.Equal(t, opID, got.ID)
+					assert.Equal(t, arm.opState, got.State, "recovery keeps the state the crashed drive left")
+				})
+			}
+		}
+	})
+
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
 	// operation lease fences a single-row write on the child token, while an
 	// apply lease fences a joined child/parent write; stale holders lose
@@ -1727,6 +2067,120 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.NotNil(t, operation.StartedAt)
 	})
 
+	// MarkFailedRetryable verifies the pause write records the failure reason
+	// on a resumable row, leaving completed_at unset because the row is not
+	// terminal, and that it takes the same lease fence as the other operation
+	// writes: a holder whose lease was rotated away changes nothing.
+	t.Run("MarkFailedRetryable", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_failed_retryable_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_failed_retryable", 912)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		staleCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "old-driver", Token: "stale-token",
+		})
+		require.ErrorIs(t, store.ApplyOperations().MarkFailedRetryable(staleCtx, opID, "storage unavailable"), storage.ErrApplyLeaseLost)
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State, "a stale lease holder must not pause the row")
+		assert.Empty(t, operation.ErrorMessage)
+
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"))
+		operation, err = store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, operation.State)
+		assert.Equal(t, "storage unavailable", operation.ErrorMessage)
+		assert.Nil(t, operation.CompletedAt, "a resumable row carries no completion time")
+		assert.False(t, state.IsApplyOperationTerminal(operation.State))
+
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"),
+			"re-issuing the same pause is a no-op, not an error")
+
+		err = store.ApplyOperations().MarkFailedRetryable(ctx, 999999, "storage unavailable")
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	})
+
+	// ClearEngineResumeState verifies the clear removes both the context and
+	// the metadata so a later read reports the state missing, takes the same
+	// lease fence as the other operation writes, and is a no-op on a row whose
+	// state is already absent.
+	t.Run("ClearEngineResumeState", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_clear_resume_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_clear_resume", 913)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+		require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ownedCtx, opID, &storage.EngineResumeState{
+			ApplyOperationID: opID, MigrationContext: "deploy-ns-0", Metadata: `{"handoff":"true"}`,
+		}))
+
+		staleCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "old-driver", Token: "stale-token",
+		})
+		require.ErrorIs(t, store.ApplyOperations().ClearEngineResumeState(staleCtx, opID), storage.ErrApplyLeaseLost)
+		stored, err := store.ApplyOperations().GetEngineResumeState(ctx, opID)
+		require.NoError(t, err, "a stale lease holder must not clear the state")
+		assert.Equal(t, "deploy-ns-0", stored.MigrationContext)
+		assert.JSONEq(t, `{"handoff":"true"}`, stored.Metadata)
+
+		require.NoError(t, store.ApplyOperations().ClearEngineResumeState(ownedCtx, opID))
+		_, err = store.ApplyOperations().GetEngineResumeState(ctx, opID)
+		require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound, "a cleared row reads as never handed to the engine")
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State, "the clear touches only the resume state")
+
+		require.NoError(t, store.ApplyOperations().ClearEngineResumeState(ownedCtx, opID),
+			"clearing an already-cleared row is a no-op, not an error")
+
+		err = store.ApplyOperations().ClearEngineResumeState(ctx, 999999)
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	})
+
+	// An operation row carries no terminal-state guard: the lease fence alone
+	// decides who may write it. No peer can claim a terminal operation, so what
+	// refuses a late write is the drive's end handing its lease back: after
+	// that, a write under the old lease fails and the row stays terminal.
+	t.Run("UpdateState_EndedDriveCannotWriteOverTerminalOperation", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_displaced_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_displaced", 908)
+		opID := createOperation(t, store, apply.ID, "region-a", "schema")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, claimed.Lease())
+
+		require.NoError(t, store.ApplyOperations().MarkFailed(ownedCtx, opID, "engine failed"))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		require.ErrorIs(t, store.ApplyOperations().UpdateState(ownedCtx, opID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Failed, operation.State, "a drive that has ended must not reopen a terminal operation")
+	})
+
 	// MarkPendingStoppedByApply verifies the bulk transition changes only
 	// pending siblings, leaves running and terminal rows intact, preserves the
 	// resumable stopped timestamp contract, and enforces the caller's lease.
@@ -1772,6 +2226,73 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, failed)
 		assert.Equal(t, state.ApplyOperation.Failed, failed.State)
+	})
+
+	// MarkPendingCancelledByApply settles the siblings that never started,
+	// pending ones and ones a stop reached while still pending, as cancelled
+	// with completed_at stamped. It leaves running, terminal, and started
+	// stopped rows intact, and fails closed for a driver whose operation lease
+	// was rotated away.
+	t.Run("MarkPendingCancelledByApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_cancel_pending_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_cancel_pending", 908)
+		ownerID := createOperation(t, store, apply.ID, "region-a", "owner")
+		pendingID := createOperation(t, store, apply.ID, "region-b", "pending")
+		completedID := createOperation(t, store, apply.ID, "region-c", "completed")
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+		neverStartedStoppedID := createOperation(t, store, apply.ID, "region-d", "never-started-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, neverStartedStoppedID, state.ApplyOperation.Stopped))
+		startedStoppedID := createOperation(t, store, apply.ID, "region-e", "started-stopped")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, startedStoppedID))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, startedStoppedID, state.ApplyOperation.Stopped))
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, ownerID, claimed.ID)
+		lease := func(token string) storage.OperationLease {
+			return storage.OperationLease{ApplyID: apply.ID, OperationID: ownerID, Owner: claimed.LeaseOwner, Token: token}
+		}
+
+		_, err = store.ApplyOperations().MarkPendingCancelledByApply(storage.WithOperationLease(ctx, lease("stale-token")), apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		pending, err := store.ApplyOperations().Get(ctx, pendingID)
+		require.NoError(t, err)
+		require.NotNil(t, pending)
+		assert.Equal(t, state.ApplyOperation.Pending, pending.State, "a displaced driver cancels nothing")
+
+		ownedCtx := storage.WithOperationLease(ctx, lease(claimed.LeaseToken))
+		changed, err := store.ApplyOperations().MarkPendingCancelledByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), changed, "the pending row and the stopped row that never started")
+		again, err := store.ApplyOperations().MarkPendingCancelledByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Zero(t, again)
+
+		pending, err = store.ApplyOperations().Get(ctx, pendingID)
+		require.NoError(t, err)
+		require.NotNil(t, pending)
+		assert.Equal(t, state.ApplyOperation.Cancelled, pending.State)
+		assert.NotNil(t, pending.CompletedAt, "cancelled is final, so completed_at is stamped")
+		neverStartedStopped, err := store.ApplyOperations().Get(ctx, neverStartedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, neverStartedStopped)
+		assert.Equal(t, state.ApplyOperation.Cancelled, neverStartedStopped.State, "a stop that caught the row pending left nothing on its target")
+		assert.NotNil(t, neverStartedStopped.CompletedAt)
+		startedStopped, err := store.ApplyOperations().Get(ctx, startedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, startedStopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, startedStopped.State, "a stopped row that started settles through the drive that delivers the cancel")
+		owner, err := store.ApplyOperations().Get(ctx, ownerID)
+		require.NoError(t, err)
+		require.NotNil(t, owner)
+		assert.Equal(t, state.ApplyOperation.Running, owner.State, "the operation under way settles through its own drive")
+		completed, err := store.ApplyOperations().Get(ctx, completedID)
+		require.NoError(t, err)
+		require.NotNil(t, completed)
+		assert.Equal(t, state.ApplyOperation.Completed, completed.State)
 	})
 
 	// MarkPendingStoppedByApply_OperationLease verifies a fan-out driver can
@@ -1822,6 +2343,199 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		again, err := store.ApplyOperations().MarkPendingStoppedByApply(ownedCtx, apply.ID)
 		require.NoError(t, err)
 		assert.Zero(t, again)
+	})
+
+	// RequeueNeverStartedForStartByApply verifies that a pending start puts
+	// the rows a stop caught before they started back in the queue: stopped
+	// rows that never started return to pending without completed_at, while
+	// a stopped row that had started, a stopped row whose engine took up a
+	// task, a running row, and a completed row stay as they are. The write needs a pending start, and does nothing while a
+	// stop or a cancel is pending too, so a stop accepted after the start
+	// keeps every row it stopped. A displaced driver requeues nothing.
+	t.Run("RequeueNeverStartedForStartByApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_requeue_start_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_requeue_start", 909)
+		ownerID := createOperation(t, store, apply.ID, "region-a", "owner")
+		neverStartedID := createOperation(t, store, apply.ID, "region-b", "never-started-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, neverStartedID, state.ApplyOperation.Stopped))
+		startedStoppedID := createOperation(t, store, apply.ID, "region-c", "started-stopped")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, startedStoppedID))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, startedStoppedID, state.ApplyOperation.Stopped))
+		completedID := createOperation(t, store, apply.ID, "region-d", "completed")
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+		// A start claims a stopped row without stamping started_at, so a row the
+		// engine took up after such a claim shows it only through its tasks.
+		engineTouchedID := createOperation(t, store, apply.ID, "region-e", "engine-touched-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, engineTouchedID, state.ApplyOperation.Stopped))
+		addTask := func(operationID int64, name, taskState string) {
+			t.Helper()
+			task := newTask(apply, "task_requeue_"+name, name, time.Now().UTC().Truncate(time.Second))
+			task.ApplyOperationID = &operationID
+			task.State = taskState
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+		}
+		addTask(neverStartedID, "never_started", state.Task.Pending)
+		addTask(engineTouchedID, "engine_touched", state.Task.Stopped)
+		// A row the data plane already holds a remote apply for was dispatched,
+		// whether or not a task mirrored the engine's work yet.
+		dispatchedID := createOperation(t, store, apply.ID, "region-f", "dispatched-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, dispatchedID, state.ApplyOperation.Stopped))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, dispatchedID, "remote-dispatched", "remote-operation-dispatched"))
+		addTask(dispatchedID, "dispatched", state.Task.Pending)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, ownerID, claimed.ID)
+		lease := func(token string) storage.OperationLease {
+			return storage.OperationLease{ApplyID: apply.ID, OperationID: ownerID, Owner: claimed.LeaseOwner, Token: token}
+		}
+		ownedCtx := storage.WithOperationLease(ctx, lease(claimed.LeaseToken))
+		requireNeverStartedState := func(want, msg string) {
+			t.Helper()
+			operation, err := store.ApplyOperations().Get(ctx, neverStartedID)
+			require.NoError(t, err)
+			require.NotNil(t, operation)
+			assert.Equal(t, want, operation.State, msg)
+		}
+
+		changed, err := store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Zero(t, changed, "without a pending start a stopped row stays stopped")
+		requireNeverStartedState(state.ApplyOperation.Stopped, "without a pending start a stopped row stays stopped")
+
+		requestControl(t, store, apply.ID, storage.ControlOperationStart)
+		for _, blocking := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+			requestControl(t, store, apply.ID, blocking)
+			changed, err := store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+			require.NoError(t, err)
+			assert.Zero(t, changed, "a pending %s keeps the rows it reached", blocking)
+			requireNeverStartedState(state.ApplyOperation.Stopped, "a pending "+string(blocking)+" keeps the rows it reached")
+			require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, blocking))
+		}
+
+		_, err = store.ApplyOperations().RequeueNeverStartedForStartByApply(storage.WithOperationLease(ctx, lease("stale-token")), apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		requireNeverStartedState(state.ApplyOperation.Stopped, "a displaced driver requeues nothing")
+
+		changed, err = store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), changed, "only the stopped row that never started")
+		again, err := store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Zero(t, again)
+
+		neverStarted, err := store.ApplyOperations().Get(ctx, neverStartedID)
+		require.NoError(t, err)
+		require.NotNil(t, neverStarted)
+		assert.Equal(t, state.ApplyOperation.Pending, neverStarted.State, "queued work again once a start is pending")
+		assert.Nil(t, neverStarted.StartedAt)
+		assert.Nil(t, neverStarted.CompletedAt, "pending is not settled, so completed_at stays unset")
+		startedStopped, err := store.ApplyOperations().Get(ctx, startedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, startedStopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, startedStopped.State, "a stopped row that had started resumes through its own claim")
+		owner, err := store.ApplyOperations().Get(ctx, ownerID)
+		require.NoError(t, err)
+		require.NotNil(t, owner)
+		assert.Equal(t, state.ApplyOperation.Running, owner.State)
+		completed, err := store.ApplyOperations().Get(ctx, completedID)
+		require.NoError(t, err)
+		require.NotNil(t, completed)
+		assert.Equal(t, state.ApplyOperation.Completed, completed.State)
+		engineTouched, err := store.ApplyOperations().Get(ctx, engineTouchedID)
+		require.NoError(t, err)
+		require.NotNil(t, engineTouched)
+		assert.Nil(t, engineTouched.StartedAt)
+		assert.Equal(t, state.ApplyOperation.Stopped, engineTouched.State, "a row whose engine took up a task resumes from its checkpoint, not from the queue")
+		dispatched, err := store.ApplyOperations().Get(ctx, dispatchedID)
+		require.NoError(t, err)
+		require.NotNil(t, dispatched)
+		assert.Equal(t, state.ApplyOperation.Stopped, dispatched.State, "a row with a remote apply resumes it rather than dispatching again")
+
+		// A stop accepted after the requeue reaches the requeued row again:
+		// it is pending, never started, and the stop's sweep stops it.
+		require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationStart))
+		requestControl(t, store, apply.ID, storage.ControlOperationStop)
+		restopped, err := store.ApplyOperations().MarkPendingStoppedByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), restopped, "only the requeued row is pending")
+		requireNeverStartedState(state.ApplyOperation.Stopped, "a stop accepted after the requeue stops the requeued row")
+	})
+
+	// MarkStoppedNeverStarted verifies that returning an undispatched
+	// operation to stopped clears the started_at its claim stamped, so the
+	// row still reads as never started to a later requeue or cancel sweep.
+	t.Run("MarkStoppedNeverStarted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_stopped_never_started_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_stopped_never_started", 910)
+		id := createOperation(t, store, apply.ID, "region-a", "undispatched")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, id))
+		started, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, started)
+		require.NotNil(t, started.StartedAt, "precondition: the claim stamped started_at")
+
+		require.NoError(t, store.ApplyOperations().MarkStoppedNeverStarted(ctx, id))
+		stopped, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, stopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, stopped.State)
+		assert.Nil(t, stopped.StartedAt, "an operation that never dispatched reads as never started")
+	})
+
+	// MarkResumedRunning verifies the resumed operation's move to running is a
+	// compare-and-set on resuming under its own operation lease: it moves a
+	// resuming row once, leaves a row in any other state alone, and fails
+	// closed for a stale token or a lease on another operation.
+	t.Run("MarkResumedRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_resumed_running_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_resumed_running", 910)
+		opID := createOperation(t, store, apply.ID, "region-a", "schema")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, opID, claimed.ID)
+		ownedCtx := storage.WithOperationLease(ctx, claimed.Lease())
+		require.NoError(t, store.ApplyOperations().UpdateState(ownedCtx, opID, state.ApplyOperation.Resuming))
+		requireState := func(want, msg string) {
+			t.Helper()
+			operation, err := store.ApplyOperations().Get(ctx, opID)
+			require.NoError(t, err)
+			require.NotNil(t, operation)
+			assert.Equal(t, want, operation.State, msg)
+		}
+
+		stale := claimed.Lease()
+		stale.Token = "stale-token"
+		_, err = store.ApplyOperations().MarkResumedRunning(storage.WithOperationLease(ctx, stale), opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		otherOperation := claimed.Lease()
+		otherOperation.OperationID = opID + 1
+		_, err = store.ApplyOperations().MarkResumedRunning(storage.WithOperationLease(ctx, otherOperation), opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		requireState(state.ApplyOperation.Resuming, "a lease that does not own the row moves nothing")
+
+		promoted, err := store.ApplyOperations().MarkResumedRunning(ownedCtx, opID)
+		require.NoError(t, err)
+		assert.True(t, promoted)
+		requireState(state.ApplyOperation.Running, "the owning driver moves a resuming row to running")
+		promoted, err = store.ApplyOperations().MarkResumedRunning(ownedCtx, opID)
+		require.NoError(t, err)
+		assert.False(t, promoted, "a row that is already running is left alone")
+
+		require.NoError(t, store.ApplyOperations().UpdateState(ownedCtx, opID, state.ApplyOperation.Stopped))
+		promoted, err = store.ApplyOperations().MarkResumedRunning(ownedCtx, opID)
+		require.NoError(t, err)
+		assert.False(t, promoted)
+		requireState(state.ApplyOperation.Stopped, "a row a drive settled after the resume is not reopened")
 	})
 
 	// SaveExternalID_EnforcesDeploymentInvariant verifies sibling operations
@@ -2045,13 +2759,112 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		_, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver")
 		require.Error(t, err)
 	})
+
+	// ListRecentTargets_DistinctTargetsOfOneType verifies that a data plane
+	// learns every target it applied to for one database type: each
+	// (database, environment, target) appears once however many operations
+	// ran against it, settled applies count, and operations of another
+	// database type or with no target are left out.
+	t.Run("ListRecentTargets_DistinctTargetsOfOneType", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		insertTargeted := func(t *testing.T, applyID int64, deployment, target string) {
+			t.Helper()
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: applyID, Deployment: deployment, Target: target,
+			})
+			require.NoError(t, err)
+		}
+
+		orders := CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+		ordersStaging := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_staging", 981, state.Apply.Completed, "staging")
+		insertTargeted(t, ordersStaging.ID, "region-a", "orders-staging-a")
+		insertTargeted(t, ordersStaging.ID, "region-b", "orders-staging-b")
+		ordersRetry := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_staging_retry", 982, state.Apply.Failed, "staging")
+		insertTargeted(t, ordersRetry.ID, "region-a", "orders-staging-a")
+		ordersProduction := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_production", 983, state.Apply.Running, "production")
+		insertTargeted(t, ordersProduction.ID, "region-a", "orders-production-a")
+		insertTargeted(t, ordersProduction.ID, "region-c", "")
+
+		billing := CreateLock(t, store, "billing", storage.DatabaseTypeMySQL)
+		billingStaging := CreateApplyWithStateAndEnv(t, store, billing, "apply_billing_staging", 984, state.Apply.Completed, "staging")
+		insertTargeted(t, billingStaging.ID, "region-a", "billing-staging-a")
+
+		targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "orders", Environment: "production", Target: "orders-production-a"},
+			{Database: "orders", Environment: "staging", Target: "orders-staging-a"},
+			{Database: "orders", Environment: "staging", Target: "orders-staging-b"},
+		}, targets)
+
+		mysqlTargets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeMySQL, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "billing", Environment: "staging", Target: "billing-staging-a"},
+		}, mysqlTargets)
+
+		// The cutoff is rendered in whole microseconds, so a lookback that
+		// would truncate to an empty window is refused rather than narrowed.
+		for _, lookback := range []time.Duration{0, 500 * time.Nanosecond} {
+			_, err = store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, lookback)
+			require.ErrorContains(t, err, "lookback must be at least 1µs, got "+lookback.String())
+		}
+	})
+
+	// ListRecentTargets_TuplesAreDistinctAndBytewiseOrdered verifies that
+	// targets differing only by case are listed separately and that the
+	// tuples come back in the same bytewise order on every dialect: a target
+	// is a resolver key compared byte for byte, so a storage collation that
+	// folds case must not merge two of them, and neither a case-folding nor
+	// a locale collation may reorder them. Database names and environments
+	// are stored folded to lowercase, so their variants differ by
+	// punctuation, which bytewise order sorts '-' before '_' and those
+	// collations sort the other way round.
+	t.Run("ListRecentTargets_TuplesAreDistinctAndBytewiseOrdered", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		seed := func(t *testing.T, lock *storage.Lock, applyID string, planID int64, env string, targets ...string) {
+			t.Helper()
+			apply := CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, env)
+			for i, target := range targets {
+				_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+					ApplyID: apply.ID, Deployment: fmt.Sprintf("region-%d", i), Target: target,
+				})
+				require.NoError(t, err)
+			}
+		}
+
+		ordersB := CreateLock(t, store, "orders-b", storage.DatabaseTypeVitess)
+		seed(t, ordersB, "apply_orders_b_staging_b", 985, "staging-b", "orders-a", "orders-A", "orders-b", "orders_B")
+		seed(t, ordersB, "apply_orders_b_staging_a", 986, "staging_a", "orders-a")
+		ordersA := CreateLock(t, store, "orders_a", storage.DatabaseTypeVitess)
+		seed(t, ordersA, "apply_orders_a_staging", 987, "staging", "orders-a")
+
+		targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-A"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-a"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-b"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders_B"},
+			{Database: "orders-b", Environment: "staging_a", Target: "orders-a"},
+			{Database: "orders_a", Environment: "staging", Target: "orders-a"},
+		}, targets)
+	})
+
+	t.Run("ListRecentTargets_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ApplyOperations().ListRecentTargets(t.Context(), storage.DatabaseTypeVitess, time.Hour)
+		require.Error(t, err)
+	})
 }
 
-// testOneTargetsShardsCutOverOneAtATime seeds one target with two shards of
+// testOneTargetsShardsCutOverWhenReady seeds one target with two shards of
 // orders and an orders finalizer under an ordered cutover policy, and checks
-// that the shards copy together, cut over one at a time, and that the
-// finalizer waits for both.
-func testOneTargetsShardsCutOverOneAtATime(t *testing.T, h Harness, cutoverPolicy string) {
+// that the shards copy together, each cuts over without waiting for the
+// other, and that the finalizer waits for both.
+func testOneTargetsShardsCutOverWhenReady(t *testing.T, h Harness, cutoverPolicy string) {
 	t.Helper()
 	ctx := t.Context()
 	store := h.NewStorage(t)
@@ -2076,19 +2889,15 @@ func testOneTargetsShardsCutOverOneAtATime(t *testing.T, h Harness, cutoverPolic
 	require.NotNil(t, first)
 	assert.Equal(t, shardIDs[0], first.ID, "shard -80 cuts over first")
 
-	held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+	second, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
 	require.NoError(t, err)
-	assert.Nil(t, held, "shard 80- does not cut over while shard -80 of the same target is mid-cutover")
+	require.NotNil(t, second, "shard 80- cuts over while shard -80 of the same target is mid-cutover")
+	assert.Equal(t, shardIDs[1], second.ID)
 
 	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[0]))
 	finalizerEarly, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 	require.NoError(t, err)
 	assert.Nil(t, finalizerEarly, "the finalizer waits while shard 80- has not completed")
-
-	second, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
-	require.NoError(t, err)
-	require.NotNil(t, second)
-	assert.Equal(t, shardIDs[1], second.ID, "shard 80- cuts over once shard -80 completes")
 
 	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardIDs[1]))
 	finalizer, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
@@ -2150,4 +2959,21 @@ func requestControl(t *testing.T, store storage.Storage, applyID int64, operatio
 		Metadata:    []byte(`{}`),
 	})
 	require.NoError(t, err)
+}
+
+// cutoverBlockerAsserter returns a check that operationID's cutover is held by
+// wantBlockerID, or by nothing when wantBlockerID is zero.
+func cutoverBlockerAsserter(t *testing.T, store storage.Storage) func(operationID, wantBlockerID int64, msg string) {
+	t.Helper()
+	return func(operationID, wantBlockerID int64, msg string) {
+		t.Helper()
+		blocker, err := store.ApplyOperations().CutoverBlocker(t.Context(), operationID)
+		require.NoError(t, err)
+		if wantBlockerID == 0 {
+			assert.Nil(t, blocker, msg)
+			return
+		}
+		require.NotNil(t, blocker, msg)
+		assert.Equal(t, wantBlockerID, blocker.ID, msg)
+	}
 }

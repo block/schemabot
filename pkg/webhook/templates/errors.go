@@ -640,6 +640,18 @@ schemabot %s -e staging
 `+"```", action, action))
 }
 
+// RenderControlMissingEnv answers a control command that names an apply but
+// omits -e. The apply's own environment is known, so the reply gives the
+// exact command to run rather than a placeholder.
+func RenderControlMissingEnv(action, applyID, environment string) string {
+	return offerSupportChannel(fmt.Sprintf("## "+glyph.Failed+` Missing Argument
+
+`+"`schemabot %s`"+` needs the environment of the apply it controls. Apply `+"`%s`"+` runs in `+"`%s`"+`, so comment:
+`+"```"+`
+schemabot %s %s -e %s
+`+"```", action, applyID, environment, action, applyID, environment))
+}
+
 func renderTemplate(tmpl *template.Template, data SchemaErrorData) string {
 	var sb strings.Builder
 	if err := tmpl.Execute(&sb, data); err != nil {
@@ -713,4 +725,30 @@ func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
 	}
 	return fmt.Sprintf("Target %s has an unsafe change on %s that the plan comment never showed, so nothing was applied. Run apply again for this environment: its comment shows each target's own plan, and `--allow-unsafe` can then consent to this change.",
 		inlineCode(target), subject)
+}
+
+// The plan refusal details below answer a dispatch whose stored plan cannot be
+// applied as it stands. Each is built from the plan identifier and the names
+// SchemaBot stored with the plan rather than from the refusal's error text,
+// and ends in replan: the command that creates a plan the dispatch can run.
+
+// PlanNotFoundDetail is the error line for a dispatch whose stored plan no
+// longer exists.
+func PlanNotFoundDetail(planID, replan string) string {
+	return fmt.Sprintf("Plan %s no longer exists, so nothing was applied. %s", inlineCode(planID), replan)
+}
+
+// PlanEnvironmentMismatchDetail is the error line for a dispatch whose stored
+// plan was created for a different environment than the command targets.
+func PlanEnvironmentMismatchDetail(planID, planEnvironment, requestedEnvironment, replan string) string {
+	return fmt.Sprintf("Plan %s was created for %s, not %s, so nothing was applied. %s",
+		inlineCode(planID), inlineCode(planEnvironment), inlineCode(requestedEnvironment), replan)
+}
+
+// PlanRoutingMetadataDetail is the error line for a dispatch whose stored plan
+// lacks a routing field (deployment or target), so SchemaBot cannot tell where
+// to run it.
+func PlanRoutingMetadataDetail(planID, field, replan string) string {
+	return fmt.Sprintf("Plan %s was stored without its %s, so SchemaBot cannot route it and nothing was applied. %s",
+		inlineCode(planID), inlineCode(field), replan)
 }

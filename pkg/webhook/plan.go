@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -452,6 +454,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	configuredEnvironments = append([]string(nil), configuredEnvironments...)
 	allowedEnvironments := append([]string(nil), h.service.Config().AllowedEnvironments...)
 
+	if len(environments) == 0 && len(configuredEnvironments) > 0 {
+		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+		if err != nil {
+			h.logger.Error("failed to fetch PR for environment with no local work", "repo", repo, "pr", pr, "error", err)
+			return
+		}
+		h.logger.Info("database has no environments served by this deployment; refreshing aggregate scope",
+			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", schemaDatabase)
+		h.updateAggregateCheck(ctx, client, repo, pr, prInfo.HeadSHA)
+		return
+	}
 	if len(environments) == 0 {
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
@@ -488,6 +501,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Environments whose namespace placement refusal could not be persisted,
 	// kept for the same reason and posted under the placement block's reason.
 	placementBlockUnstored := map[string]string{}
+	// Environments whose plan could not be produced at all, in plan order. Each
+	// gets a failing stored check row once the loop knows the head SHA, so the
+	// aggregate fold cannot pass on the environments that did plan.
+	var planFailedEnvironments []string
 	// Whether any environment's rollout round found a member with work. The
 	// primary's plan alone cannot say, so auto-plan reads this before skipping
 	// its comment.
@@ -505,17 +522,25 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		multiEnvData.UnmanagedSchema = unmanagedSchema
 		multiEnvData.UnmanagedEnvironments = h.service.Config().OrderedEnvironments(allowedEnvironments)
 	}
+	// planFailed records an environment whose plan could not be produced: its
+	// error goes on the comment and the environment gets a failing row. Every
+	// such failure goes through here, so none can reach the comment without
+	// also reaching the gate.
+	planFailed := func(env string, err error) {
+		multiEnvData.Errors[env] = userFacingError(err)
+		planFailedEnvironments = append(planFailedEnvironments, env)
+	}
 
 	for _, env := range environments {
 		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
+			planFailed(env, err)
 			continue
 		}
 		if err := h.attachServerEnvironments(schemaResult, env); err != nil {
 			h.logger.Error("schema environment validation failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
+			planFailed(env, err)
 			continue
 		}
 
@@ -580,7 +605,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
+			planFailed(env, err)
 			continue
 		}
 
@@ -639,8 +664,43 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// is empty. Post a failing aggregate so branch protection isn't stuck
 	// waiting for a check that will never arrive.
 	if headSHA != "" {
+		// The fold below reads stored rows only, so an environment that failed
+		// to plan while another stored a row must fail through a row of its own.
+		// A successful schema request seeded the database identity and head SHA
+		// every environment of this delivery shares.
+		failedSchema := &ghclient.SchemaRequestResult{
+			Database:   multiEnvData.Database,
+			Type:       multiEnvData.DatabaseType,
+			Repository: multiEnvData.Repository,
+			HeadSHA:    multiEnvData.HeadSHA,
+		}
+		planFailedUnstored := map[string]string{}
+		for _, env := range planFailedEnvironments {
+			if _, checkErr := h.storePlanFailedCheck(ctx, client, repo, pr, failedSchema, env); checkErr != nil {
+				h.logger.Error("failed to store failing check record for an environment that could not plan; posting a blocked failing aggregate before the fold instead",
+					"repo", repo, "pr", pr, "env", env, "database_type", failedSchema.Type,
+					"database", failedSchema.Database, "head_sha", failedSchema.HeadSHA, "error", checkErr)
+				planFailedUnstored[env] = planFailedUnstoredSummary
+			}
+		}
+		// A failure stored check state does not hold is invisible to the fold,
+		// which would pass on the environments that did plan. Its failing
+		// aggregate is posted first, carrying a block every fold leaves in
+		// place, so neither this fold nor one from a later plan of another
+		// environment publishes success over it. Should the block itself not be
+		// stored, the fold is skipped rather than allowed to publish.
+		foldSeesEveryFailure := true
+		if len(planFailedUnstored) > 0 {
+			foldSeesEveryFailure = h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, planFailedUnstored, planFailedUnrecordedBlock)
+		}
 		h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, multiEnvData.Database, multiEnvData.DatabaseType)
-		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		if foldSeesEveryFailure {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		} else {
+			h.logger.Error("aggregate not folded: an environment's plan failure is recorded neither on its check row nor as an aggregate block, so a fold could pass without it; the aggregate check keeps its prior state until the check is re-run or a commit is pushed",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "database_type", multiEnvData.DatabaseType,
+				"database", multiEnvData.Database, "environments", slices.Sorted(maps.Keys(planFailedUnstored)))
+		}
 	} else if len(multiEnvData.Errors) > 0 {
 		prInfo, fetchErr := client.FetchPullRequest(ctx, repo, pr)
 		if fetchErr != nil {
@@ -1052,6 +1112,11 @@ const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this
 // unverifiedMemberWorkMessage names the recovery instead.
 const msgOtherTargetPlansUnverified = "SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists."
 
+// msgDeferredCutoverCapacityUnverified is the apply comment when SchemaBot
+// could not read what it needs to tell whether the apply's deferred cutover
+// fits. Nothing is held yet, so the command is safe to retry.
+const msgDeferredCutoverCapacityUnverified = "SchemaBot could not check whether it has the drivers this deferred cutover needs, so nothing was applied. Retry the command, and see server logs if it persists."
+
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together
 // rather than repeating. Returns nil when the plan carries no per-shard
@@ -1422,11 +1487,20 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 
 	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 
+	// Preserve rule IDs before splitting findings between Issues and warnings.
+	// The renderer maps these to guides without parsing human-facing messages.
+	for _, finding := range planResp.LintResults {
+		if finding != nil && finding.Linter != "" {
+			data.LintRuleNames = append(data.LintRuleNames, finding.Linter)
+		}
+	}
+
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {
 		data.LintViolations = append(data.LintViolations, templates.LintViolationData{
-			Message: w.Message,
-			Table:   w.Table,
+			Message:    w.Message,
+			Table:      w.Table,
+			LinterName: w.Linter,
 		})
 	}
 

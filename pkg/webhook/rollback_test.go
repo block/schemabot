@@ -21,6 +21,41 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// The rollback comment names a finding's rule only in its lint fold, so it
+// shows warning-severity findings and withholds error-severity ones. It links a
+// guide only for what it shows: an operator reading "Related guidance" with nothing above it naming
+// the rule has no way to tell what the link is about.
+func TestRollbackPlanCommentRelatedGuidance(t *testing.T) {
+	for _, severity := range []string{"warning", "error"} {
+		t.Run(severity, func(t *testing.T) {
+			resp := &apitypes.PlanResponse{
+				Changes: []*apitypes.SchemaChangeResponse{{Namespace: "app", TableChanges: []*apitypes.TableChangeResponse{{TableName: "customers", DDL: "ALTER TABLE `customers` DROP INDEX `idx_created_at`;"}}}},
+				LintResults: []*apitypes.LintViolationResponse{
+					{Table: "customers", Linter: "primary_key", Severity: severity, Message: `Primary key column "id" has type "varchar"`},
+					{Table: "orders", Linter: "primary_key", Severity: severity, Message: `Primary key column "id" has type "varchar"`},
+				},
+			}
+			h, _, _ := newTestHandler(t)
+			data := h.rollbackCommentData("app", "mysql", "staging", "apply_abc123", resp, "")
+			if severity == "warning" {
+				require.Len(t, data.LintViolations, 2)
+				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
+			} else {
+				assert.Empty(t, data.LintViolations)
+			}
+			out := templates.RenderRollbackPlanComment(data)
+			if severity == "warning" {
+				assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"),
+					"two findings on one rule link the guide once")
+				assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]")
+			} else {
+				assert.NotContains(t, out, "docs/mysql.md#choosing-a-primary-key")
+				assert.NotContains(t, out, "📖 **Related guidance:**")
+			}
+		})
+	}
+}
+
 func TestWebhookRollbackDispatch(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 
@@ -328,8 +363,8 @@ func assertRollbackLockPinKept(t *testing.T, locks *actorAuthLockStore) {
 
 // A rollback whose plan drops a table is refused when rollback-confirm is
 // given without --allow-unsafe: the refusal names the dropped table and the
-// exact rollback-confirm command that consents to it, no rollback apply is
-// created (the fake apply store cannot create one), and the lock keeps
+// rollback-confirm command to re-issue with --allow-unsafe, no rollback apply
+// is created (the fake apply store cannot create one), and the lock keeps
 // pinning the rollback plan so the re-issued command confirms it.
 func TestHandleRollbackConfirmBlocksUnsafeChangesWithoutAllowUnsafe(t *testing.T) {
 	locks := &actorAuthLockStore{locks: []*storage.Lock{prOwnedRollbackLock()}}
@@ -348,7 +383,7 @@ func TestHandleRollbackConfirmBlocksUnsafeChangesWithoutAllowUnsafe(t *testing.T
 	assert.Contains(t, body, "**⛔ Rollback rejected**: 1 unsafe change detected")
 	assert.Contains(t, body, "1. `audit_log`: DROP TABLE removes all data")
 	assert.Contains(t, body, "DROP TABLE `audit_log`")
-	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --allow-unsafe\n```")
+	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging\n```")
 	assert.NotContains(t, body, "schemabot apply")
 	assertRollbackLockPinKept(t, locks)
 }
@@ -370,7 +405,7 @@ func TestHandleRollbackConfirmBlockKeepsDeferCutoverInTheRetry(t *testing.T) {
 	assert.False(t, retry)
 
 	body := requireComment(t, comments, "rollback unsafe-changes refusal")
-	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --allow-unsafe --defer-cutover\n```")
+	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --defer-cutover\n```")
 	assertRollbackLockPinKept(t, locks)
 }
 
@@ -397,7 +432,7 @@ func TestHandleRollbackConfirmBlocksShardOnlyUnsafeChange(t *testing.T) {
 	assert.Contains(t, body, "**⛔ Rollback rejected**: 1 unsafe change detected")
 	assert.Contains(t, body, "1. `orders` (shard `80-`)")
 	assert.Contains(t, body, "`legacy`")
-	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --allow-unsafe\n```")
+	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging\n```")
 	assertRollbackLockPinKept(t, locks)
 }
 

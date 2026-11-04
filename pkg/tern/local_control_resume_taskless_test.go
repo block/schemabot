@@ -35,11 +35,13 @@ func TestResumeApply_TasklessNoOpCompletesNotFails(t *testing.T) {
 		},
 		logger: slog.Default(),
 	}
+	reader := newTernMetricsReader(t)
 
 	err := client.ResumeApply(t.Context(), apply)
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Completed, apply.State,
 		"a task-less no-op apply must complete on recovery, not be marked failed")
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "completing the apply releases it from the active-apply gauge")
 	assert.NotEqual(t, state.Apply.Failed, apply.State)
 }
 

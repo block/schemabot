@@ -8,7 +8,7 @@ import (
 
 func previewPlansListOutput() {
 	WritePlansList(PlansListData{
-		Limit:    20,
+		Limit:    4,
 		MaxLimit: 200,
 		HasMore:  true,
 		Plans: []PlanSummaryData{

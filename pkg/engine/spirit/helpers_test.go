@@ -20,7 +20,7 @@ func TestNamespaceForTable(t *testing.T) {
 	declaredIn := map[string]string{"invoices": "billing", "users": "users", "orders": "users"}
 
 	t.Run("returns the namespace recorded for the declaration", func(t *testing.T) {
-		ns, err := namespaceForTable("orders", declaredIn, sf)
+		ns, err := namespaceForTable("orders", declaredIn, sf, "shop")
 		require.NoError(t, err)
 		assert.Equal(t, "users", ns)
 	})
@@ -29,26 +29,28 @@ func TestNamespaceForTable(t *testing.T) {
 	// DROP TABLE plan) is attributed to that sole namespace.
 	t.Run("single namespace fallback returns the only namespace", func(t *testing.T) {
 		single := schema.SchemaFiles{"default": {Files: map[string]string{"other.sql": ""}}}
-		ns, err := namespaceForTable("dropped_table", map[string]string{"other": "default"}, single)
+		ns, err := namespaceForTable("dropped_table", map[string]string{"other": "default"}, single, "shop")
 		require.NoError(t, err)
 		assert.Equal(t, "default", ns)
 	})
 
-	// With two or more namespaces and no declaration, the namespace is
-	// ambiguous. Returning an arbitrary map key would make per-table progress
-	// matching nondeterministic, so the lookup fails with the same error on
-	// every run instead.
-	t.Run("multi-namespace with no declaration returns an error", func(t *testing.T) {
+	// With two or more namespaces diffed against one database, an undeclared
+	// table is live in every namespace's schema at once, so no namespace can
+	// be shown to own its drop. Returning an arbitrary map key would make
+	// per-table progress matching nondeterministic, so the lookup refuses
+	// with the same error, naming both namespaces and the remedy, on every
+	// run instead.
+	t.Run("multi-namespace with no declaration refuses naming every namespace", func(t *testing.T) {
 		for range 50 {
-			ns, err := namespaceForTable("dropped_table", declaredIn, sf)
-			require.EqualError(t, err, `no namespace defines table "dropped_table" among 2 schema namespaces [billing users]`)
+			ns, err := namespaceForTable("dropped_table", declaredIn, sf, "shop")
+			require.EqualError(t, err, `DROP TABLE "dropped_table" cannot be placed: namespaces [billing users] all diff against database "shop". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
 			assert.Empty(t, ns)
 		}
 	})
 
 	t.Run("empty schema files returns an error", func(t *testing.T) {
-		ns, err := namespaceForTable("nonexistent", nil, schema.SchemaFiles{})
-		require.EqualError(t, err, `no namespace defines table "nonexistent" among 0 schema namespaces []`)
+		ns, err := namespaceForTable("nonexistent", nil, schema.SchemaFiles{}, "shop")
+		require.EqualError(t, err, `DROP TABLE "nonexistent" cannot be placed: the request carries no schema files for database "shop". Restore this database's schema files, or remove the database from the SchemaBot config`)
 		assert.Empty(t, ns)
 	})
 }
@@ -86,8 +88,38 @@ func TestGroupChangesByNamespace_FollowsDeclarations(t *testing.T) {
 		got, err := groupChangesByNamespace(
 			[]engine.TableChange{alterOrders, createInvoices},
 			[]table.TableSchema{{Name: "orders", Schema: liveOrders}},
-			declaredIn, sf)
+			declaredIn, sf, "testdb")
 		require.NoError(t, err)
 		require.Equal(t, want, got)
 	}
+}
+
+// A single-namespace request owns every live table, so an undeclared table's
+// DROP and its original definition both land in that namespace. An empty
+// change list yields no SchemaChange at all, even with live tables present,
+// because originals are captured only for namespaces the plan changes.
+func TestGroupChangesByNamespace_SingleNamespace(t *testing.T) {
+	sf := schema.SchemaFiles{"shop": {Files: map[string]string{"orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}}}
+	declaredIn := map[string]string{"orders": "shop"}
+	liveOrders := "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	liveOld := "CREATE TABLE `orders_old` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	current := []table.TableSchema{{Name: "orders", Schema: liveOrders}, {Name: "orders_old", Schema: liveOld}}
+
+	t.Run("an undeclared table's drop and original belong to the only namespace", func(t *testing.T) {
+		dropOld := engine.TableChange{Table: "orders_old", Operation: ddl.StatementDropTable, DDL: "DROP TABLE `orders_old`"}
+		got, err := groupChangesByNamespace([]engine.TableChange{dropOld}, current, declaredIn, sf, "shop")
+		require.NoError(t, err)
+		require.Equal(t, []engine.SchemaChange{{
+			Namespace:             "shop",
+			TableChanges:          []engine.TableChange{dropOld},
+			OriginalFiles:         map[string]string{"orders.sql": liveOrders, "orders_old.sql": liveOld},
+			OriginalFilesCaptured: true,
+		}}, got)
+	})
+
+	t.Run("an empty change list yields no schema change", func(t *testing.T) {
+		got, err := groupChangesByNamespace(nil, current, declaredIn, sf, "shop")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
 }

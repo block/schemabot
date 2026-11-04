@@ -249,16 +249,26 @@ findings, each with output examples.
 ```console
 $ schemabot status -e staging
 1 active schema change
-4 total: 2 Completed · 1 Failed · 1 Running
 
-  APPLY ID          DATABASE  ENV      STATE      STARTED         SOURCE
-  apply-example-73  shop      staging  Running    10 minutes ago  https://github.com/acme/store/pull/42
-  apply-example-72  billing   staging  Completed  1 hour ago      https://github.com/acme/billing/pull/18
-  apply-example-71  catalog   staging  Failed     2 hours ago     https://github.com/acme/store/pull/40
-  apply-example-70  accounts  staging  Completed  3 hours ago     https://github.com/acme/accounts/pull/12
+  APPLY ID          DATABASE  ENV      STATE    STARTED         SOURCE
+  apply-example-73  shop      staging  Running  10 minutes ago  https://github.com/acme/store/pull/42
+
+Recent schema changes
+3 total: 2 Completed · 1 Failed
+
+  APPLY ID          DATABASE  ENV      STATE      STARTED      SOURCE
+  apply-example-72  billing   staging  Completed  1 hour ago   https://github.com/acme/billing/pull/18
+  apply-example-71  catalog   staging  Failed     2 hours ago  https://github.com/acme/store/pull/40
+  apply-example-70  accounts  staging  Completed  3 hours ago  https://github.com/acme/accounts/pull/12
 
 Use 'schemabot status <apply_id>' to view details
 ```
+
+Every active schema change is listed first, however long ago it started. The
+finished ones follow, newest first. Raise `--limit` to see more of them. Past
+the server's cap (1,000 applies, 200 plans), `status` and `list-plans` name the
+ID to pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
+shows a paged walk.
 
 Inspect one apply with `status <apply_id>` for a single snapshot, or use
 `progress <apply_id>` to keep watching. The [progress example](#follow-and-control-a-change) shows the live view.
@@ -306,7 +316,14 @@ Next: open a normal PR with these files. SchemaBot will reconcile other configur
 `onboard` writes local files and verifies them with a plan; it does not apply
 DDL. It refuses to overwrite existing files by default. Keep the complete
 schema for the namespaces you manage: omitting an existing table can propose
-a drop. See [namespace scope](namespaces.md) for shared databases.
+a drop. See [namespace scope](namespaces.md) for shared databases. When the
+`-s` directory has an [environment schema root](namespaces.md#per-environment-schema-roots)
+for the source environment, `onboard` writes the namespace files there and
+keeps `schemabot.yaml` in the `-s` directory. `plan` and `apply` read that root
+for the environment too. Without one, `onboard` refuses a namespace named for
+the environment, because writing it would create the environment's root and
+hide the other namespaces. It also refuses namespaces whose directories are
+symlinks to one directory unless the pull returns the same schema for each.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
@@ -472,6 +489,8 @@ An environment can fan out to several targets, from a `targets:` list or a
 Pass `--target` to plan and apply one member only, for example to land a
 change on one target before the rest:
 
+![Plan and apply an index to one target of a multi-target environment](../assets/cli-target.gif)
+
 ```console
 $ schemabot apply -s ./schema -e production --target payments-002
 ...
@@ -497,13 +516,20 @@ dispatched, and an apply or plan of the whole environment lifts that block
 once every target has the change. `apply-confirm` takes no `--target`: it confirms the
 target its apply named. The server records the narrowing on the
 stored plan and refuses to apply it anywhere but the target it was made for,
-and a narrowed apply cannot be rolled back with `rollback`: restore that
-target by planning and applying the previous schema with the same `--target`.
+and `rollback` isn't supported for schema changes across multiple targets
+yet: undo one by applying schema files without the change, or restore a
+narrowed apply's target by planning and applying the previous schema with the
+same `--target`.
 In an environment with a single target, `--target` names the whole rollout,
 so the plan and apply are not narrowed.
 
 A plan of the whole rollout plans every target beside the first one and shows
-what applies where. It reports no changes only when every target is at the
+what applies where. Applying it fans the change out to every target and
+follows each target's copy in the same watcher:
+
+![Apply an index to four targets of one environment and follow their copies in parallel](../assets/cli-multi-target.gif)
+
+The plan reports no changes only when every target is at the
 desired schema, so a re-run of an `apply` that already landed, or the
 verification step of `onboard`, reads as up to date. When the first target is
 already at the desired schema, for example after an apply narrowed to it,
@@ -609,6 +635,9 @@ Press **Esc** to detach while copying; the apply keeps running. **s** requests
 a stop for this MySQL example. At deferred cutover, **Enter** requests the
 swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 
+For progress bar colors, phase labels, and keyboard controls, see the
+[progress display reference](#progress-display-reference).
+
 ### Understand throttling
 
 When copying is throttled, the live view explains why. This MySQL example
@@ -629,6 +658,13 @@ to resume from the checkpoint and reopen live progress.
 
 ![Press s, wait for Stopped, then run start and follow the change to completion](../assets/cli-stop.gif)
 
+On a [multi-target environment](mysql.md#multi-target-environments), stop
+and start act on the whole apply. Every target still copying stops at its
+checkpoint, a target that already finished stays finished, and `start`
+resumes each stopped target from its own checkpoint:
+
+![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)
+
 ### Choose when to cut over
 
 For engines that support deferred cutover, start the apply with
@@ -638,7 +674,7 @@ from the watch or with the cutover command. The CLI acknowledges the request
 and then watches progress. Initial output:
 
 ```console
-$ schemabot cutover -e staging apply-example-73
+$ schemabot cutover apply-example-73 -e staging
 ✓ Cutover requested successfully.
 🔄 Cutting over...
 ...
@@ -683,10 +719,10 @@ $ schemabot progress apply-example-84
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
-           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
-           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
            ✓ -40: 1,000,000 rows
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 
 
 ESC detach • c cancel
@@ -718,8 +754,27 @@ Pick the operation for the current state and engine:
 | `rollback` | Plan a new change toward the schema stored before an earlier apply |
 
 Support and timing differ by engine; see the [engine capability matrix](engines.md).
-A request being accepted does not mean its effect has landed. Check progress
-until you see the resulting state. For example, a completed apply returns:
+A request being accepted does not mean its effect has landed. `revert` and
+`skip-revert` say so directly: each reports the operation as requested, not
+done, and prints the `progress` command that follows it. Repeating a request
+that is already pending reports it as already requested:
+
+```console
+$ schemabot revert -e staging apply-example-73
+Revert requested for shop/staging (apply apply-example-73) — SchemaBot will undo this schema change
+To watch and manage: schemabot progress apply-example-73 -e staging
+
+$ schemabot skip-revert -e staging apply-example-73
+Skip-revert requested for shop/staging (apply apply-example-73) — SchemaBot will close the revert window and make this schema change permanent
+To watch and manage: schemabot progress apply-example-73 -e staging
+
+$ schemabot skip-revert -e staging apply-example-73
+Skip-revert already requested for shop/staging (apply apply-example-73) — SchemaBot will finish the existing request
+To watch and manage: schemabot progress apply-example-73 -e staging
+```
+
+Check progress until you see the resulting state. For example, a completed
+apply returns:
 
 ```console
 $ schemabot status apply-example-73
@@ -899,7 +954,7 @@ Waiting on an operator:
     apply: apply-example-68 (rolled_back)
     blocking reason: rollback_completed
     do: Reconcile the target environment. No plan and no new commit clears this on its own.
-  staging/shipments: The apply holding this check is stopped, so the check stays in progress and the gate stays closed.
+  staging/shipments: The apply holding this check is stopped, so the gate stays closed.
     apply: apply-example-81 (stopped)
     do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.
 ```
@@ -985,18 +1040,31 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+An `--all-repos` sweep skips a declared repository the server's GitHub App is
+not installed on, names it, and keeps scanning the rest. The skip still makes
+the run exit nonzero, because that repository was never read. Any other scan
+failure stops the sweep.
+
+```console
+$ schemabot checks backfill --all-repos -e staging --last 2h --dry-run
+Scanned 6 open PRs updated in the last 2h in acme/ledger, acme/store for SchemaBot (staging).
+Skipped repositories the server's GitHub App is not installed on: acme/payroll. Install the App on each, or remove it from the server's repos config.
+No missing SchemaBot Check Runs found.
+Error: checks backfill left 1 repository without the GitHub App installed needing attention
+```
+
 A sweep that does find unfinished checks says what each one is waiting on, so
 the report can be triaged without opening every pull request in it:
 
 ```console
 $ schemabot checks backfill --all-repos --dry-run
-Scanned 148 open PRs in acme/store, acme/ledger for SchemaBot (staging), SchemaBot (production).
+Scanned 148 open PRs in acme/ledger, acme/store for SchemaBot (staging), SchemaBot (production).
 
 Stuck Check Runs — uncompleted for over 1h (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):
 PR                                      CHECK                   STATUS       AGE      WAITING ON  REASON
-https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 https://github.com/acme/ledger/pull/88  SchemaBot (production)  in_progress  31h0m0s  operator    reconciliation_owed
 https://github.com/acme/ledger/pull/91  SchemaBot (production)  queued       unknown  -           -
+https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 
 A run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`.
 
@@ -1019,6 +1087,145 @@ The stored rows are read only for runs old enough to reach the report, since
 a fleet sweep would otherwise pay a storage read per pull request for runs
 that started minutes ago and never get printed. `--stuck-after` sets that
 threshold, and a run whose start time cannot be read is always explained.
+
+### Progress display reference
+
+<details>
+<summary>MySQL progress bars, phase labels, and keyboard controls</summary>
+
+The TUI and CLI use emoji progress bars to convey state at a glance. Each color maps to a
+specific state. The bar is 20 squares wide; filled squares represent percent complete.
+
+#### Progress bar colors
+
+| Color | Emoji | Meaning | Used when |
+|-------|-------|---------|-----------|
+| Blue  | `🟦`  | In progress | Engine actively working: copying rows, cutting over, recovering state |
+| Yellow | `🟨` | Not final | Waiting for cutover, revert window open, reverting, skipping revert, or retrying after a recoverable failure |
+| Green | `🟩`  | Complete | Table finished successfully |
+| Orange | `🟧` | Stopped | Stopped mid-progress (partially complete) |
+| Red   | `🟥`  | Failed | Table failed |
+| White | `⬜`  | Empty | Remaining (unfilled portion of any bar) |
+
+#### Per-table display by state
+
+**Copying rows** — blue bar with percent, row counts, and ETA while the estimate still holds:
+```
+  orders: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32% (71,436/221,193 rows) ETA 5m 30s
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Copying rows after estimate exceeded** — full-width activity indicator with no percentage:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 145,000 so far
+       • ℹ️ More rows than initially estimated, copying is still active and will continue
+```
+
+**Catching up** — blue bar at 100% with the first-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Catching up on accumulated changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Checksumming** — blue bar tracking verify progress once Spirit reports a total
+(indeterminate "Checksumming to verify data..." before that):
+```
+  orders: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21%)
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows verified: 321,450 / 1,466,232
+```
+
+**Post-checksum** — blue bar at 100% with the second-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Queued** (pending, not yet started) — empty bar:
+```
+  products: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ queued
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+**Starting** (running but no row data yet):
+```
+  users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ starting...
+         ALTER TABLE `users` ADD COLUMN `phone` varchar(20)
+```
+
+**Waiting for cutover** — yellow bar at 100%:
+```
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cutting over** — blue bar at 100% with spinner (the engine is working again, so the
+bar returns to blue):
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Complete** — green bar at 100%:
+```
+  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Stopped** — orange bar at the progress when stop occurred:
+```
+  orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Failed** — red bar at the progress when failure occurred:
+```
+  orders: 🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cancelled** (sequential mode — earlier table failed, this one never ran):
+```
+  products: ⊘ Cancelled (not started)
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+#### Status line (above tables)
+
+The TUI shows a single status line above the table list. It varies by overall state:
+
+| State | Status line |
+|-------|-------------|
+| Starting | `⠋ Loading...` |
+| Pending | `⠋ Queued, starts automatically` |
+| Running | `⠋ Running...` |
+| Stopping | `⠋ Stopping...` |
+| Waiting for cutover | *(cutover prompt shown in footer instead)* |
+| Cutting over | `⠋ Cutting over...` |
+| Completed | *(no status line — completion message shown after tables)* |
+| Stopped | *(no status line — stopped message shown after tables)* |
+
+A rollout of several targets uses the same status line and adds its counts to it, such as `⠋ Running... 1 completed · 3 running (4 targets)`, or `⠋ Running on all 4 targets...` while every target is in the same state. A stop that has not landed yet keeps the counts too, such as `⠋ Stopping on all 4 targets...`. A finished rollout has no status line either: its outcome follows the tables with the same counts, such as `⏹️ Apply stopped: 1 completed · 3 stopped (4 targets)`.
+
+The `⠋` is a Braille spinner (animated in the TUI, static here).
+
+#### Footer
+
+| State | Footer |
+|-------|--------|
+| Running | `ESC detach • s stop` |
+| Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
+| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover <id> -e <env>` |
+| Cutting over | `Cutover in progress - please wait...` |
+| Stopped | `To resume from where it stopped:` followed by `schemabot start <id> -e <env>` |
+
+A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target SchemaBot cuts over next, and a stopped rollout ends on the same resume command as a single target.
+
+</details>
 
 ## Use the CLI from scripts and agents
 
@@ -1060,16 +1267,27 @@ A watching `apply -o log` or `apply -o json` returns as soon as the apply
 reaches a final state. It exits 0 only when the apply completed, and non-zero
 when it was stopped, failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. For a stopped apply the error
-names the `start` command that resumes it. A watcher that cannot reach the
-server retries with backoff, and exits non-zero once polls have kept failing
+names the `start` command that resumes it. The interactive watcher follows
+the same exit rule once the apply ends, and exits 0 when you detach with Esc
+while the apply is still running. A watcher that cannot reach the server
+retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
-rerun the original watch command, preserving its output format and connection
-flags, or to run `progress` with the apply ID to see its current state. When a
-refused poll carries a `Retry-After` header, as a proxy or rate limiter in
-front of SchemaBot may send, a watcher waits at least that long before polling
-again, up to 5 minutes per poll, so a watcher held off this way takes longer
-to give up.
+run `progress` with the apply ID to watch it again. That command names the
+environment and any `--profile` or `--endpoint` the watch was started with, so
+pasting it reaches the same server. When a refused poll
+carries a `Retry-After` header, as a proxy or rate limiter in front of
+SchemaBot may send, a watcher waits at least that long before polling again,
+up to 5 minutes per poll, so a watcher held off this way takes longer to give
+up.
+
+A single Ctrl-C or SIGTERM ends only the watch. The command prints a notice to
+stderr saying the apply continues and how to watch it again with `progress`,
+and exits 130, the status a shell reports for an interrupted process, so a
+script can tell an interrupted watch from an apply that failed. The apply
+itself runs on unaffected. A Ctrl-C that lands before the apply or rollback
+has been submitted ends the command before anything is started, with a notice
+saying so, and the same exit status.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

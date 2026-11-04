@@ -61,7 +61,7 @@ func loadControlRejections(ctx context.Context, stor storage.Storage, logger con
 			continue
 		}
 		rejections = append(rejections, templates.ControlRejectionData{
-			Operation:   string(req.Operation),
+			Operation:   req.Operation.Command(),
 			Message:     req.ErrorMessage,
 			RequestedBy: req.RequestedBy,
 		})

@@ -66,6 +66,13 @@ type Dialect interface {
 	// are compared through it where both sides are expressions rather than a
 	// bound placeholder (see BinaryEquals).
 	BinaryCollation(expression string) string
+	// BinarySortKey returns expression under a collation that both compares
+	// and orders byte-for-byte. A selected column wrapped in it is distinct
+	// only for identical bytes and sorts, by its alias, in the same bytewise
+	// order on every dialect. Use it for result columns whose order is part
+	// of a storage contract; BinaryCollation only promises equality, so it
+	// leaves predicates free to use indexes under the column's own collation.
+	BinarySortKey(expression string) string
 	// JoinedUpdate returns an UPDATE that changes target rows selected through a
 	// join. Aliases qualify join and predicate expressions, while assignments to
 	// target columns must be unqualified so the statement is valid across
@@ -285,6 +292,12 @@ func (MySQLDialect) BinaryEquals(column string) string {
 // BinaryEquals: under the table default utf8mb4_0900_ai_ci, values that differ
 // only by case or accent compare equal.
 func (MySQLDialect) BinaryCollation(expression string) string {
+	return "(" + expression + ") COLLATE utf8mb4_0900_bin"
+}
+
+// BinarySortKey applies the binary collation, which orders by code point and
+// so, for utf8mb4, in the bytewise order of the UTF-8 encoding.
+func (MySQLDialect) BinarySortKey(expression string) string {
 	return "(" + expression + ") COLLATE utf8mb4_0900_bin"
 }
 
@@ -517,6 +530,13 @@ func (PostgresDialect) BinaryEquals(column string) string {
 // collations already compare equality byte-for-byte.
 func (PostgresDialect) BinaryCollation(expression string) string {
 	return expression
+}
+
+// BinarySortKey applies the "C" collation: the database's default collation
+// compares equality byte-for-byte but orders by locale rules, which interleave
+// case and punctuation, while "C" orders by byte value.
+func (PostgresDialect) BinarySortKey(expression string) string {
+	return "(" + expression + `) COLLATE "C"`
 }
 
 // JoinedUpdate builds a PostgreSQL UPDATE … FROM statement. The join condition

@@ -189,7 +189,7 @@ func TestDerive_FoldedTargetParkedForCutoverOffersTheCutover(t *testing.T) {
 	first := model.Deployments[0]
 	assert.Equal(t, so.WaitingForCutover, first.State)
 	assert.Equal(t, StateReadyForCutoverNext, first.Presentation)
-	assert.Equal(t, "ready for cutover — next in order", first.Label)
+	assert.Equal(t, "ready for cutover", first.Label)
 	assert.Equal(t, 0, first.Row)
 	assert.Equal(t, "waiting for primary/orders-001", model.Deployments[1].Label)
 	assert.Equal(t, NextActionCutover, model.NextAction.Kind)

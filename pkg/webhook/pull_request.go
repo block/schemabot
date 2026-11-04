@@ -471,7 +471,8 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
 	// discovered database. Together those cover every condition that records
-	// an aggregate blocking reason, so a stored block can now be released.
+	// a discovery block. Prior plan successes are invalidated before a stored
+	// aggregate block is released, so only replacement results can pass.
 	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
 
 	affectedDatabases := checkDatabaseKeysForConfigs(configs)
@@ -496,7 +497,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// leader publishes the required check and gates on participants' own
 		// checks when they exist, so a silent participant cannot wedge branch
 		// protection (its check is non-required by the aggregate contract).
-		if h.isAggregateParticipant(repo) {
+		if h.isAggregateParticipant(repo) && !h.participantPathsTouched(repo, files) {
 			h.logger.Info("aggregate participant staying silent on PR with no managed schema changes",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -569,6 +570,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		return "auto-plan discarded because the PR moved during discovery", nil
 	}
 
+	// Discovery is complete. Publish empty environments and pending placeholders
+	// before independent database planners can finish in a different order.
+	if len(h.service.Config().AllowedEnvironments) > 0 {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+	}
+
 	postPlanComment := shouldPostComment()
 
 	// Launch auto-plan for each discovered config
@@ -576,7 +583,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
 	}
-	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles)
+	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles, files, discovered)
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
@@ -600,21 +607,50 @@ const severalDatabases = 2
 // bare command it would then offer comes back rejected as ambiguous, or starts
 // a database its comment is not about.
 //
+// Discovery resolves each file's config on its own, so the raw files reach what
+// auto-plan discovered over the proposed files plus what the files narrowing
+// set aside reach. Only those are walked again: the count shares the delivery's
+// deadline with discovery, and a second walk over every file can find that
+// deadline already spent on a large PR.
+//
 // A discovery failure counts as several: naming the database always yields a
 // command that resolves, so an unanswerable question degrades to the scoped
 // rendering rather than to a command that may not work.
-func (h *Handler) autoPlanCommandScopeDatabases(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, changedFiles []ghclient.PRFile) int {
-	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, changedFiles)
-	if err != nil {
-		h.logger.Warn("failed to resolve which databases a bare command would reach; auto-plan comments will name their database",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
-		return severalDatabases
+func (h *Handler) autoPlanCommandScopeDatabases(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, changedFiles, proposedFiles []ghclient.PRFile, discovered []ghclient.DiscoveredConfig) int {
+	configs := slices.Clone(discovered)
+	if narrowed := filesNarrowedAway(changedFiles, proposedFiles); len(narrowed) > 0 {
+		narrowedConfigs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, narrowed)
+		if err != nil {
+			h.logger.Warn("failed to resolve which databases a bare command would reach; auto-plan comments will name their database",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "narrowed_files", len(narrowed), "error", err)
+			return severalDatabases
+		}
+		configs = append(configs, narrowedConfigs...)
 	}
 	databases := make(map[string]struct{}, len(configs))
 	for _, cfg := range configs {
 		databases[cfg.Config.Database] = struct{}{}
 	}
 	return len(databases)
+}
+
+// filesNarrowedAway returns the changed files the proposed list does not carry
+// as they are: the files narrowing dropped as inherited, and the renames it kept
+// with their vacated path cleared. Each is returned as it was changed, so
+// discovery over it sees what a bare command sees.
+func filesNarrowedAway(changed, proposed []ghclient.PRFile) []ghclient.PRFile {
+	type fileKey struct{ filename, previous string }
+	kept := make(map[fileKey]struct{}, len(proposed))
+	for _, file := range proposed {
+		kept[fileKey{file.Filename, file.PreviousFilename}] = struct{}{}
+	}
+	var narrowed []ghclient.PRFile
+	for _, file := range changed {
+		if _, ok := kept[fileKey{file.Filename, file.PreviousFilename}]; !ok {
+			narrowed = append(narrowed, file)
+		}
+	}
+	return narrowed
 }
 
 // autoPlanInputsMoved reports whether the PR changed underneath a plan that is
@@ -1297,18 +1333,17 @@ func (h *Handler) settleStaleCheckState(ctx context.Context, repo string, pr int
 	return h.markStalePlanOnlyCheckStateSuccessful(ctx, repo, pr, headSHA, check)
 }
 
+// blockStaleStartedApplyCheckState blocks a row a started apply owns on headSHA.
+// Whether the row stays in_progress or settles as action_required is decided by
+// the store from the row as it is at write time, so an apply that completes
+// after this cleanup read the row is never shown as running again.
 func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
-	check.HeadSHA = headSHA
-	check.HasChanges = true
+	readStatus := check.Status
+	readHeadSHA := check.HeadSHA
 	check.BlockingReason = schemaRemovedAfterApplyBlock.blockingReason
 	check.ErrorMessage = schemaRemovedAfterApplyBlock.message
-	if check.Status == checkStatusInProgress {
-		check.Conclusion = ""
-	} else {
-		check.Status = checkStatusCompleted
-		check.Conclusion = checkConclusionActionRequired
-	}
-	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
+	blocked, err := h.service.Storage().Checks().BlockStaleStartedApply(ctx, check, headSHA)
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "stale_check_cleanup",
 			Repository:   repo,
@@ -1321,7 +1356,26 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "check_id", check.ID,
-			"apply_id", check.ApplyID, "error", err)
+			"read_head_sha", readHeadSHA, "error", err)
+		return false
+	}
+	if !blocked {
+		// Between the cleanup read and this write, the apply released the row,
+		// another apply claimed it, or a newer commit's cleanup moved it on.
+		// That later write is the stored state and stays in place.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "stale_check_cleanup",
+			Repository:   repo,
+			Database:     check.DatabaseName,
+			DatabaseType: check.DatabaseType,
+			Environment:  check.Environment,
+			Status:       "noop",
+		})
+		h.logger.Info("stale check left to the write that released, claimed, or moved it after cleanup read it",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_head_sha", readHeadSHA, "read_status", readStatus)
 		return false
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -1332,6 +1386,14 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 		Environment:  check.Environment,
 		Status:       "blocked",
 	})
+	if check.Status != readStatus {
+		h.logger.Info("stale check blocked against the status its apply recorded after cleanup read it",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"read_status", readStatus,
+			"stored_status", check.Status, "stored_conclusion", check.Conclusion)
+	}
 	return true
 }
 

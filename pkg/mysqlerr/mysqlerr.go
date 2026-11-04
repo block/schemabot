@@ -83,6 +83,7 @@ var reasons = map[int]string{
 	1048: "A row held NULL in a column that cannot be null. When a change adds NOT NULL, backfill the existing NULLs before applying it.",
 	1062: "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key.",
 	1264: "An existing value is out of range for the column's target type. Widen the type or correct the data before applying the change.",
+	1265: "An existing value would be truncated by the column's target type or length. Correct the data or choose a compatible type before applying the change.",
 	1292: "An existing value would be truncated by the column's target type. Correct the data or choose a compatible type before applying the change.",
 	1364: "A row had no value for a column that has no default. Give the column a default, or backfill the rows, before applying the change.",
 	1366: "An existing value cannot be stored in the column's target type. Correct the data or choose a compatible type before applying the change.",

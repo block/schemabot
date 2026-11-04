@@ -30,6 +30,12 @@ include `Authorization: Bearer <token>`; for forward-auth, send requests through
 your installation's authenticating proxy. Local installations with authentication
 disabled need no token. The examples below omit authentication headers.
 
+For a PR's merge gate, `GET /api/checks/inspect?repo=org/repo&pull_request=42&environment=production`
+reads current-head check evidence. The environment filter also includes unresolved
+local predecessors, with pending placeholders for missing results. Expected Check
+Run names follow verified repository registrations, so an absent optional
+environment is not reported as a missing check. See [Check Runs](check-runs.md).
+
 ## What databases exist?
 
 Start with `schemabot databases`. It lists the
@@ -324,7 +330,9 @@ A database whose environment lists `targets` addresses several targets at once,
 and each holds its own schema. There is no single live schema to return, so a
 pull returns the primary target's — the one a caller materializes — plus a
 `targets` array naming every target the environment addresses and how each of
-the others differs from the primary.
+the others differs from the primary. Where targets hold different namespaces,
+each namespace comes from the first target holding it; see
+[targets that hold different namespaces](#targets-that-hold-different-namespaces).
 
 ```sh
 schemabot pull -d shop -e production
@@ -371,9 +379,9 @@ Content-Type: application/json
 </details>
 
 Read the array as the environment's whole member set. Exactly one entry carries
-`"primary": true`, and it is the target whose schema is in `namespaces`; it
-never carries `diverged_tables`, because it is the baseline the others are
-compared against. A reconciling caller can take the member set straight from
+`"primary": true`, and it is the target whose schema is in `namespaces` for
+every namespace it holds; it never carries `diverged_tables`, because it is the
+baseline the others are compared against. A reconciling caller can take the member set straight from
 this array rather than deriving it from target names.
 
 `difference` is one of:
@@ -381,7 +389,7 @@ this array rather than deriving it from target names.
 | Value | Meaning |
 |---|---|
 | `differs` | both targets hold the table, with different DDL |
-| `only_on_primary` | only the primary target holds the table |
+| `only_on_primary` | only the baseline target holds the table: the primary, or for a namespace the primary does not hold, the first target holding it |
 | `only_on_target` | only this target holds the table |
 
 An empty `diverged_tables` means the two targets genuinely agree. It never means
@@ -395,12 +403,71 @@ indexes in a different order are reported as `differs`. The comparison errs
 toward reporting: it will send you to look at a table that turns out to agree,
 but it will not call two different schemas equal.
 
+#### Targets that hold different namespaces
+
 A target whose entry [selects namespaces](configuration.md#selecting-namespaces-per-target)
-is pulled for exactly those namespaces, by name, and an explicitly requested
-namespace it does not select is left out of its pull. When every entry of the
-environment selects namespaces, a requested namespace none of them selects is
-rejected with `400` naming it and the selectable ones, rather than answered
-with an empty schema:
+holds exactly those, and is pulled for them by name; an entry selecting nothing
+holds every namespace. Each namespace in `namespaces` comes from its baseline
+target, the first target in rollout order holding it, and every later target
+holding the namespace is compared with that baseline. A target is compared only
+on the namespaces it holds, so a shard target is never reported as missing the
+unsharded schema. Each entry in `targets` carries the `namespaces` its entry
+selects, omitted when it selects none.
+
+Here `shop` sits on `shop-001`, one shard schema sits on each of `shop-002` and
+`shop-003`, and `shop-004` holds a second copy of `shop_0`:
+
+```sh
+schemabot pull -d shop -e production
+```
+
+```sql
+-- Target `shop-001` — primary target, schema below for `shop`
+-- Target `shop-002` — schema below for `shop_0`
+-- Target `shop-003` — schema below for `shop_1`
+-- Target `shop-004` — 1 table differs from the schema below
+--   shop_0.line_items: differs
+```
+
+<details>
+<summary>API equivalent</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production"}
+```
+
+```json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "production",
+  "table_count": 5,
+  "namespaces": {
+    "shop": {"tables": {"…": "CREATE TABLE …"}},
+    "shop_0": {"tables": {"…": "CREATE TABLE …"}},
+    "shop_1": {"tables": {"…": "CREATE TABLE …"}}
+  },
+  "targets": [
+    {"deployment": "commerce-a", "target": "shop-001", "table_count": 1, "primary": true, "namespaces": ["shop"]},
+    {"deployment": "commerce-a", "target": "shop-002", "table_count": 2, "namespaces": ["shop_0"]},
+    {"deployment": "commerce-a", "target": "shop-003", "table_count": 2, "namespaces": ["shop_1"]},
+    {"deployment": "commerce-a", "target": "shop-004", "table_count": 2, "namespaces": ["shop_0"], "diverged_tables": [
+      {"namespace": "shop_0", "table": "line_items", "difference": "differs"}
+    ]}
+  ]
+}
+```
+
+</details>
+
+A pull naming namespaces returns each from the target holding it, so
+`--namespace shop_1` returns `shop_1`'s schema from `shop-003` even though the
+primary does not hold it. When every entry of the environment selects
+namespaces, a requested namespace none of them selects is rejected with `400`
+naming it and the selectable ones, rather than answered with an empty schema:
 
 ```json
 {
@@ -408,11 +475,6 @@ with an empty schema:
   "error_code": ""
 }
 ```
-
-The response shape does not change, but the comparison is still keyed by namespace and table: two
-targets holding different namespaces report each other's tables as
-`only_on_primary` and `only_on_target`, because neither holds the other's
-namespace.
 
 An environment that does not list `targets` carries no `targets` array at all.
 
@@ -610,6 +672,15 @@ as zero time remaining. Throttled tasks can include `throttle_reason`.
 the same figure the plan comment shows. It is fixed for the life of the apply
 and does not grow as rows copy. It is omitted when the plan had no estimate,
 and on a row for one shard of a table, since the plan measures the whole table.
+`estimated_rows` is the table's planned row count, under the same rules. It is
+there from the moment the task is created, so a table that is still queued, or
+whose copy has not yet reported, shows how much it will copy; once the engine
+reports, `rows_total` is the figure to use. The CLI and the PR comment show it
+as an approximate count (`Rows: ~4.2M`) while the table is queued, and a
+rollout's table line counts each target that has not reported by its estimate,
+so the total spans every target and reads as approximate (`Rows: 500 / ~4k`).
+A sharded table rolled up across its shards carries `estimated_bytes` but not
+`estimated_rows`.
 A PostgreSQL concurrent index build reports a whole-build percentage estimated
 from the server's build phase and its counters; it stays below 100 until the
 apply completes and holds its last value between phases (see
@@ -623,6 +694,25 @@ so several rows for the same table share a deployment and differ in their
 target. The pair is read from the stored task's operation row, so a
 single-target apply reports its one member the same way, and a row the server
 cannot match to a stored task carries neither field.
+A sharded apply lists one operation per shard and table it changes, plus each
+keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
+then rolled up across the shards: one entry per keyspace table, with `status`
+the shard state that needs attention first, `rows_copied` and `rows_total`
+summed over the shards that have reported a total, and `shards` listing each
+shard's own state and rows. `estimated_bytes` is the table's planned size
+across all its shards, and `planned_shards` the number of shards the plan
+recorded it spanning. A shard whose wave has not started reports its
+operation's state and no rows. A table on its keyspace's only shard keeps its
+task's entry, with its `task_id`, and lists no shards. Each finalizer that
+changes its keyspace's VSchema appears in `metadata.vschema_changes` with its
+status and the diff from the stored plan. A sharded apply's operations can
+attach one dispatch at a time, so it reads as every operation its generation
+manifest declares: one still to attach is listed in `operations` as `pending`
+and under its table's `shards` as `pending` with no rows, and a table none of
+whose shards has attached carries the `ddl` and `change_type` the stored plan
+reviewed for it. The CLI and the PR
+comments render the apply as one change, its tables under their keyspace.
+`operations` still lists every attached row.
 `task_id`, when present, identifies the individual task, including repeated
 statements against the same member and table. It names the control plane's
 task and stays the same on every poll, whether the server answers from its
@@ -639,8 +729,9 @@ where the response comes from. While the data plane reports the apply's
 progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
 `PostgreSQL`. A response served from SchemaBot's storage carries the stored
 engine name instead: `spirit`, `planetscale`, `strata`, or `postgres`. Storage
-serves a settled, retryable-failed, resuming, or multi-deployment apply, and a
-remote apply the data plane has not yet been handed. `Unknown` means the data
+serves a settled, retryable-failed, resuming, or multi-deployment apply, an
+apply whose manifest declares more than one operation, and a remote apply the
+data plane has not yet been handed. `Unknown` means the data
 plane reported an engine this server does not recognize.
 
 <details>
@@ -667,6 +758,7 @@ Response excerpt (illustrative values):
       "rows_copied": 6000000,
       "rows_total": 10000000,
       "estimated_bytes": 3200000000,
+      "estimated_rows": 9800000,
       "percent_complete": 60,
       "eta_seconds": 2520,
       "throttled": true,
@@ -695,9 +787,9 @@ Response excerpt (illustrative values):
   "engine": "spirit",
   "state": "running",
   "operations": [
-    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling"},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "rolling"},
-    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "rolling", "already_converged": true}
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "parallel", "already_converged": true}
   ],
   "tables": [
     {
@@ -707,6 +799,7 @@ Response excerpt (illustrative values):
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "completed",
       "estimated_bytes": 2400000000,
+      "estimated_rows": 7400000,
       "percent_complete": 100
     },
     {
@@ -718,6 +811,7 @@ Response excerpt (illustrative values):
       "rows_copied": 2000000,
       "rows_total": 8000000,
       "estimated_bytes": 2600000000,
+      "estimated_rows": 7900000,
       "percent_complete": 25
     }
   ]
@@ -725,8 +819,8 @@ Response excerpt (illustrative values):
 ```
 
 Both rows report the same table under the same deployment; `target` names
-which member owns each copy. Each row's `estimated_bytes` is that target's own
-copy of the table.
+which member owns each copy. Each row's `estimated_bytes` and `estimated_rows`
+are that target's own copy of the table.
 
 `already_converged` marks an operation the apply recorded completed when it was
 created, because its target already had the change: nothing ran there, so it
@@ -744,19 +838,23 @@ on both:
 ```json
 {
   "operations": [
-    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
-    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "rolling", "rollout_step": 2},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "pending", "cutover_policy": "rolling", "rollout_step": 2}
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "parallel", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "parallel", "rollout_step": 2},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel", "rollout_step": 2}
   ]
 }
 ```
 
-The CLI and the PR comment count such a rollout in tables, `Tables: 1 of 2
-done on 2 targets`, rather than in target states. A target that already had
-the change ran no table and is not counted. Targets in an outcome an operator
-acts on are named beside the count, so a failed `docks` on `shop-002` reads
-`Tables: 1 of 2 done on 2 targets · 1 failed`.
+The CLI's deployment line and the PR comment's headline count such a rollout
+in tables, `1 of 2 tables done on 2 targets`, rather than in target states, and
+read `2 tables done on 2 targets` once every table is done on every target. A
+target that already had the change ran no table and is not counted. Targets in
+an outcome an operator acts on are counted beside it, failures first, so a
+failed `refunds` on `shop-002` reads `1 of 2 tables done on 2 targets · 1 target
+failed`. A table lists its targets while it is in flight on any of them or any of
+them stopped, even when another target's failure makes the table read as
+failed; any other table counts them on its own line.
 
 </details>
 
@@ -783,6 +881,98 @@ Table log lines include `deployment` and `target` when the response supplies
 them, which it does for every row the server can attribute to its stored task,
 on a single-target apply as well as a rollout. Task IDs are used for tracking
 but are not printed.
+
+<details>
+<summary>Sharded apply response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-76
+```
+
+Response excerpt (illustrative values) for `orders` copying across a
+keyspace's four shards, of which only `-40` has started:
+
+```json
+{
+  "apply_id": "apply-example-76",
+  "database": "shop",
+  "database_type": "mysql",
+  "environment": "production",
+  "engine": "strata",
+  "state": "running",
+  "sharded": true,
+  "operations": [
+    {"deployment": "data-plane", "operation_key": "shop_001/-40/orders", "operation_kind": "work", "state": "running"},
+    {"deployment": "data-plane", "operation_key": "shop_001/40-80/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/80-c0/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/c0-/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/group_finalizer", "operation_kind": "group_finalizer", "state": "pending"}
+  ],
+  "tables": [
+    {
+      "table_name": "orders",
+      "keyspace": "shop_001",
+      "deployment": "data-plane",
+      "change_type": "alter",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)",
+      "status": "running",
+      "rows_copied": 620,
+      "rows_total": 1000,
+      "percent_complete": 62,
+      "eta_seconds": 195,
+      "estimated_bytes": 23400000000,
+      "planned_shards": 4,
+      "shards": [
+        {"shard": "-40", "status": "running", "rows_copied": 620, "rows_total": 1000, "eta_seconds": 195, "percent_complete": 62},
+        {"shard": "40-80", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0},
+        {"shard": "80-c0", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0},
+        {"shard": "c0-", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0}
+      ]
+    }
+  ],
+  "metadata": {
+    "vschema_changes": "[{\"namespace\":\"shop_001\",\"status\":\"\",\"diff\":\"+  \\\"orders\\\": {}\"}]"
+  }
+}
+```
+
+`schemabot progress apply-example-76` renders it as one change. The header
+counts the shards by status, the rows cover only the started shard, so the ETA
+is a floor, and the VSchema change shows its diff:
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-example-76                         │
+│  Database:     shop                                     │
+│  Environment:  production                               │
+│  State:        Running                                  │
+│  Shards:       1 running table copy, 3 waiting for -40  │
+└─────────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.00% (1 of 4 shards)
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+       • Rows: 620 / 1,000 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
+       • Shards: 4 (1 copying, 3 queued)
+           ◉ -40: 62.00% · 620 / 1,000 rows · ETA: 3m 15s
+           ○ 40-80: queued
+           ○ 80-c0: queued
+           ○ c0-: queued
+    ~ VSchema (shop_001): Pending
+       +  "orders": {}
+```
+
+A shard verifying its copy also carries `checksum_rows_checked` and
+`checksum_rows_total`, and its line reads
+`◉ -40: checksumming 25.00% · 250 / 1,000 rows verified`. Once the shards
+are in different phases past the copy, such as `-40` checksumming while the
+other three are queued, the table's bar spans every shard and counts a shard
+that has not reported as nothing, so `orders` reads 25% rather than the
+started shard's own figure.
+
+</details>
 
 <details>
 <summary>PostgreSQL response example</summary>
@@ -858,12 +1048,16 @@ schemabot status -e production
 
 ```text
 2 active schema changes
-3 total: 1 Completed · 1 Running · 1 Waiting for cutover
 
   APPLY ID          DATABASE  ENV         STATE                STARTED         SOURCE
-  apply-example-72  billing   production  Waiting for cutover  2 hours ago     example/billing#73
   apply-example-73  shop      production  Running              20 minutes ago  example/store#42
-  apply-example-71  accounts  production  Completed            1 hour ago      example/accounts#18
+  apply-example-72  billing   production  Waiting for cutover  2 hours ago     example/billing#73
+
+Recent schema changes
+1 total: 1 Completed
+
+  APPLY ID          DATABASE  ENV         STATE      STARTED     SOURCE
+  apply-example-71  accounts  production  Completed  1 hour ago  example/accounts#18
 
 Use 'schemabot status <apply_id>' to view details
 ```
@@ -898,19 +1092,134 @@ within the last day.
 | Filter | Meaning |
 |---|---|
 | `environment`, `deployment` | Scope to one environment or one data plane |
-| `active=true` | Only applies still in flight |
+| `database` | Scope to one database |
+| `active=true` or `active=false` | Only applies still in flight, or only finished ones |
 | `state=<state>` or `failed=true` | Only applies in a state, or only failures |
 | `last=<duration>` | Only applies updated within a window, such as `24h` |
-| `limit` | Result limit: default 20, maximum 1,000 |
+| `limit` | Page size: default 20, maximum 1,000 |
+| `starting_after` | The ID of the last apply the previous page listed |
 
-Check `has_more` before treating the list as complete. There is no pagination
-cursor; increase the limit or narrow the filters. Even at the maximum, a
-busy scope can exceed the returned list. `state_counts` still covers all
-matching applies.
+Applies are listed newest first, in the order they were created. `active=true`
+keeps the applies still in flight, stopped ones excluded, and `active=false`
+keeps the rest: completed, failed, stopped, cancelled, and reverted. Together
+the two list every apply exactly once. The response echoes `active` when the
+request set it; a server that predates `active=false` omits the echo.
 
-Applies being driven right now are listed first, oldest start first — the
-longer a schema change has held a table, the higher it sits — and the rest
-follow, most recently active first.
+Without `--state` or `--failed`, `schemabot status` makes one request for each
+half. It lists every active apply first, newest first, then the finished ones a
+page at a time under **Recent schema changes**. `--limit` and `--after` page
+the finished applies; a page reached with `--after` lists only finished
+applies.
+
+When more applies match than one page holds, the response sets `has_more`.
+Request the next page with the same filters and `starting_after` set to the
+last apply's ID; repeat until `has_more` is false. The order never changes, so
+every apply created before the walk began is listed exactly once, and one
+created during the walk is not listed. A filter is applied at each request, so
+an apply that moves in or out of a filter's set during the walk, such as one
+that finishes while `active=true` is paged, is listed on the pages read while
+it matched. A `last` window is measured from each request. `starting_after`
+must name an apply in the same environment, database, and deployment as the
+filters; anything else returns `400` naming the mismatch. The apply's state is
+not checked, so a walk continues after an apply that finished since the
+previous page. The response echoes `starting_after`, so a client can tell a
+continued page from the first page of a server that predates paging. `limit`
+may change between pages, and `state_counts` covers every matching apply on
+every page.
+
+Below the server's cap, a truncated CLI list says to raise `--limit`. Once a
+page is at the cap, the footer names the apply to pass to `--after` for the
+next page:
+
+```sh
+schemabot status -e staging -n 1000
+```
+
+Output excerpt (illustrative values):
+
+```text
+1 active schema change
+
+  APPLY ID            DATABASE  ENV      STATE    STARTED         SOURCE
+  apply-example-1171  shop      staging  Running  20 minutes ago  example/store#42
+
+Recent schema changes
+1170 total: 1150 Completed · 20 Failed
+
+  APPLY ID            DATABASE  ENV      STATE      STARTED         SOURCE
+  apply-example-1170  accounts  staging  Completed  40 minutes ago  example/accounts#88
+  ...
+  apply-example-172   billing   staging  Completed  9 days ago      example/billing#75
+
+Showing the 1000 most recent schema changes. Add --after apply-example-172 for the next 1000.
+Use 'schemabot status <apply_id>' to view details
+```
+
+```sh
+schemabot status -e staging -n 1000 --after apply-example-172
+```
+
+Output excerpt (illustrative values):
+
+```text
+Recent schema changes
+1170 total: 1150 Completed · 20 Failed
+
+  APPLY ID           DATABASE  ENV      STATE      STARTED      SOURCE
+  apply-example-171  accounts  staging  Completed  9 days ago   example/accounts#19
+  ...
+  apply-example-1    shop      staging  Failed     90 days ago  example/store#2
+
+Use 'schemabot status <apply_id>' to view details
+```
+
+`--all` requests every page itself, 1,000 applies per request unless `-n`
+sets the page size, and prints every active apply followed by every finished
+one. With `--json` it pages the unfiltered list instead and returns a single
+response whose `applies` array holds every page, newest first:
+
+```sh
+schemabot status -e staging --all --json
+```
+
+Output excerpt (illustrative values):
+
+```json
+{
+  "active_count": 1,
+  "limit": 1000,
+  "max_limit": 1000,
+  "state_counts": {
+    "completed": 4,
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-73",
+      "database": "shop",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "running",
+      "caller": "example/store#42",
+      "started_at": "2026-09-01T02:41:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-76",
+      "database": "billing",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "completed",
+      "caller": "example/billing#75",
+      "started_at": "2026-09-01T02:00:00Z",
+      "completed_at": "2026-09-01T02:20:00Z",
+      "updated_at": "2026-09-01T02:20:00Z"
+    }
+  ]
+}
+```
+
+The excerpt shows the first two of the five applies.
 
 Each row carries the apply ID, database, environment, state, engine, caller,
 error message, and started, completed, and updated timestamps. A row carries
@@ -937,6 +1246,7 @@ Response excerpt (illustrative values):
   "active_count": 0,
   "limit": 20,
   "max_limit": 1000,
+  "active": true,
   "state_counts": {
     "running": 1
   },
@@ -981,16 +1291,6 @@ Response excerpt (illustrative values):
   },
   "applies": [
     {
-      "apply_id": "apply-example-72",
-      "database": "billing",
-      "environment": "production",
-      "engine": "spirit",
-      "state": "waiting_for_cutover",
-      "caller": "example/billing#73",
-      "started_at": "2026-09-01T01:01:00Z",
-      "updated_at": "2026-09-01T03:01:00Z"
-    },
-    {
       "apply_id": "apply-example-73",
       "database": "shop",
       "environment": "production",
@@ -1010,8 +1310,83 @@ Response excerpt (illustrative values):
       "started_at": "2026-09-01T02:01:00Z",
       "completed_at": "2026-09-01T02:58:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-72",
+      "database": "billing",
+      "environment": "production",
+      "engine": "spirit",
+      "state": "waiting_for_cutover",
+      "caller": "example/billing#73",
+      "started_at": "2026-09-01T01:01:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
     }
   ]
+}
+```
+
+</details>
+
+<details>
+<summary>Paged request and response example</summary>
+
+```http
+GET /api/status?environment=staging&limit=2
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "active_count": 1,
+  "limit": 2,
+  "max_limit": 1000,
+  "has_more": true,
+  "state_counts": {
+    "completed": 4,
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-73",
+      "database": "shop",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "running",
+      "caller": "example/store#42",
+      "started_at": "2026-09-01T02:41:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-76",
+      "database": "billing",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "completed",
+      "caller": "example/billing#75",
+      "started_at": "2026-09-01T02:00:00Z",
+      "completed_at": "2026-09-01T02:20:00Z",
+      "updated_at": "2026-09-01T02:20:00Z"
+    }
+  ]
+}
+```
+
+The next page repeats the filters and starts after the last apply listed:
+
+```http
+GET /api/status?environment=staging&limit=2&starting_after=apply-example-76
+```
+
+An apply from a different listing is refused:
+
+```http
+GET /api/status?environment=production&limit=2&starting_after=apply-example-76
+```
+
+```json
+{
+  "error": "starting_after apply apply-example-76 is in environment staging, not production; repeat the previous page's filters"
 }
 ```
 
@@ -1390,9 +1765,38 @@ Response excerpt from the plan request (illustrative values):
 }
 ```
 
-The list defaults to 20 plans and caps at 200. Check `has_more`; there is no
-pagination cursor. Filters narrow the recent results but do not provide an
-exhaustive search across all historical DDL.
+The list defaults to 20 plans per page and caps a page at 200, newest first.
+When more plans match, the response sets `has_more`. Request the next page
+with the same filters and `starting_after` set to the last plan's ID; repeat
+until `has_more` is false. Plans never change once stored, so a walk lists
+every matching plan exactly once, and a plan stored during the walk is newer
+than the pages after the first. A `last` window is measured from each request.
+`starting_after` must name a plan matching the `database`, `environment`,
+`repository`, and `pull_request` filters; anything else returns `400` naming
+the mismatch. The response echoes `starting_after`, as the status list does.
+Below the cap, a truncated `schemabot list-plans` says to raise `--limit`;
+once a page is at the cap, it names the plan to pass to `--after` for the next
+page. `schemabot list-plans --all` requests every page itself, 200 plans per
+request unless `-n` sets the page size:
+
+```sh
+schemabot list-plans -e staging -n 200
+```
+
+Output excerpt (illustrative values):
+
+```text
+Recent plans
+
+  PLAN ID           DATABASE  ENV      CHANGES                 CREATED      SOURCE
+  plan-example-412  shop      staging  1 alter, 2 drop · ⚠️ 2  2 hours ago  example/store#42
+  ...
+  plan-example-213  shop      staging  1 alter                 9 days ago   example/store#17
+
+  ⚠️ unsafe change
+
+  Showing the 200 most recent plans. Add --after plan-example-213 for the next 200.
+```
 
 <details>
 <summary>List stored plans</summary>

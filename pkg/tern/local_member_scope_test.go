@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,9 +20,15 @@ import (
 
 // perOperationResumeStore answers each operation's engine resume state with a
 // context naming that operation, so a test can tell whose engine state a
-// control call carried.
+// control call carried. blocker is the earlier member CutoverBlocker reports
+// as holding every cutover, nil when nothing holds.
 type perOperationResumeStore struct {
 	*exactProgressApplyOperationStore
+	blocker *storage.ApplyOperation
+}
+
+func (s *perOperationResumeStore) CutoverBlocker(context.Context, int64) (*storage.ApplyOperation, error) {
+	return s.blocker, nil
 }
 
 func (s *perOperationResumeStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
@@ -87,7 +94,7 @@ func newSharedApplyFixture(firstState, secondState, firstTaskState, secondTaskSt
 			applies:         &exactProgressApplyStore{apply: apply},
 			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{firstTask, secondTask}},
 			controlRequests: controlRequests,
-			applyOperations: &perOperationResumeStore{&exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{first, second}}},
+			applyOperations: &perOperationResumeStore{exactProgressApplyOperationStore: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{first, second}}},
 		},
 		spiritEngine: eng,
 		logger:       slog.Default(),
@@ -123,6 +130,59 @@ func TestLocalClient_ProgressScopedToOneRolloutMemberReportsOnlyThatMember(t *te
 	assert.Equal(t, ternv1.State_STATE_FAILED, whole.State, "the whole apply still reports its recorded verdict")
 	assert.Empty(t, whole.ApplyOperationId)
 	assert.Len(t, whole.Tables, 2)
+}
+
+// Two member targets of one deployment share its data-plane apply, which halts
+// on failure. payments-001 failed before payments-002 started, so the apply
+// settled as failed with payments-002 still pending and unclaimed. Its scoped
+// answer reports that it will never start, read from its operation row, and
+// names the apply's settled state. A member a driver has claimed, or one that
+// has started, may still be running with its tasks pending, and a stopped
+// apply starts its pending members again, so neither reports it. Nor does one
+// a claim that selected it before the apply settled went on to start: the
+// verdict is confirmed under the row's lock, which waits for that claim.
+func TestLocalClient_ProgressScopedToOneRolloutMemberReportsItWillNeverStart(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name          string
+		applyState    string
+		claim         func(op *storage.ApplyOperation)
+		inFlightClaim bool
+		neverStarts   bool
+	}{
+		{name: "unclaimed in a failed apply", applyState: state.Apply.Failed, neverStarts: true},
+		{name: "claimed in a failed apply", applyState: state.Apply.Failed, claim: func(op *storage.ApplyOperation) { op.LeaseOwner = "driver-3" }},
+		{name: "started in a failed apply", applyState: state.Apply.Failed, claim: func(op *storage.ApplyOperation) { op.StartedAt = &now }},
+		{name: "started by a claim in flight when first read", applyState: state.Apply.Failed, inFlightClaim: true},
+		{name: "unclaimed in a stopped apply", applyState: state.Apply.Stopped},
+		{name: "unclaimed in a running apply", applyState: state.Apply.Running},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newSharedApplyFixture(state.ApplyOperation.Failed, state.ApplyOperation.Pending, state.Task.Failed, state.Task.Pending)
+			fx.apply.State = tc.applyState
+			if tc.claim != nil {
+				tc.claim(fx.second)
+			}
+			if tc.inFlightClaim {
+				started := *fx.second
+				started.State, started.StartedAt, started.LeaseOwner = state.ApplyOperation.Running, &now, "driver-3"
+				fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore).claimedUnderLock = map[int64]*storage.ApplyOperation{fx.second.ID: &started}
+			}
+
+			scoped, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: "12"})
+			require.NoError(t, err)
+			assert.Equal(t, "12", scoped.ApplyOperationId)
+			assert.Equal(t, ternv1.State_STATE_PENDING, scoped.State)
+			assert.Equal(t, storageStateToProto(tc.applyState), scoped.ApplyState, "the answer names the state of the apply the member belongs to")
+			assert.Equal(t, tc.neverStarts, scoped.OperationNeverStarts)
+		})
+	}
+
+	fx := newSharedApplyFixture(state.ApplyOperation.Failed, state.ApplyOperation.Pending, state.Task.Failed, state.Task.Pending)
+	fx.apply.State = state.Apply.Failed
+	whole, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	assert.False(t, whole.OperationNeverStarts, "an answer for the whole apply speaks for no one operation")
 }
 
 // A progress request that names an operation this apply does not have is
@@ -181,6 +241,129 @@ func TestLocalClient_CutoverOfASharedApplyIsBoundToTheNamedMember(t *testing.T) 
 	assert.Empty(t, fx.engine.cutoverContexts, "queueing a cutover never swaps anything")
 }
 
+// A control plane cuts over both members of a shared data-plane apply with
+// one command by listing both operations. The data plane records one request
+// for the set, which each member's drive then takes for its own operation, so
+// both members swap on one operator command. Every member's drive on the
+// control plane sends the same list, so a resend naming the other member is
+// the same request, while a cutover for one member alone is refused until the
+// set settles rather than being folded into it.
+func TestLocalClient_CutoverListingSeveralOperationsIsOneRequestForThemAll(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover, state.Task.WaitingForCutover)
+	cutover := func(operationID string, operationIDs ...string) *ternv1.CutoverResponse {
+		resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{
+			ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "cli:alice",
+			ApplyOperationId: operationID, ApplyOperationIds: operationIDs,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		return resp
+	}
+
+	require.True(t, cutover("12", "12", "11").Accepted)
+	require.Len(t, fx.controlRequests.requests, 1)
+	boundTo, err := fx.controlRequests.requests[0].CutoverOperationIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{11, 12}, boundTo, "the recorded request is bound to every operation listed")
+	first, err := fx.controlRequests.requests[0].CutoverOperationID()
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), first, "a server that reads only the single-operation key takes the request for one listed operation")
+
+	assert.True(t, cutover("11", "11", "12").Accepted, "another member's drive sending the same list is the same request")
+	assert.Len(t, fx.controlRequests.requests, 1)
+
+	alone := cutover("11")
+	assert.False(t, alone.Accepted)
+	assert.Equal(t, "a cutover of apply apply-shared-deployment for operations 11, 12 is still pending; this cutover for operation 11 was not queued", alone.ErrorMessage)
+	assert.Len(t, fx.controlRequests.requests, 1)
+	assert.Empty(t, fx.engine.cutoverContexts, "queueing a cutover never swaps anything")
+}
+
+// A control plane re-sends its cutover command to the data plane on every
+// drive tick, carrying the same command id, until the set resolves. The data
+// plane records the command once and echoes the id: a re-send while it is
+// pending is the same request, a re-send after the engine failed the cutover
+// is answered with that failure rather than re-arming the request, and a
+// re-send after it completed is accepted without recording anything. Only a
+// new command id records a new request.
+func TestLocalClient_CutoverCommandIsRecordedOncePerCommandID(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover, state.Task.WaitingForCutover)
+	cutover := func(commandID string) *ternv1.CutoverResponse {
+		resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{
+			ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "tern-grpc",
+			ApplyOperationId: "11", ApplyOperationIds: []string{"11", "12"}, CommandId: commandID,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		return resp
+	}
+
+	first := cutover("9.0")
+	require.True(t, first.Accepted)
+	assert.Equal(t, "9.0", first.CommandId, "the data plane echoes the command id it recorded")
+	require.Len(t, fx.controlRequests.requests, 1)
+	recorded := fx.controlRequests.requests[0]
+	commandID, err := recorded.ControlCommandID()
+	require.NoError(t, err)
+	assert.Equal(t, "9.0", commandID)
+	boundTo, err := recorded.CutoverOperationIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{11, 12}, boundTo, "recording the command keeps the operations the request is bound to")
+
+	assert.True(t, cutover("9.0").Accepted, "a re-send while the command is pending is the same request")
+	assert.Equal(t, int64(0), recorded.Revision)
+
+	recorded.Status = storage.ControlRequestFailed
+	recorded.ErrorMessage = "cutover reached 1 of the 2 operations it was sent for; engine refused the cutover"
+	afterFailure := cutover("9.0")
+	assert.False(t, afterFailure.Accepted, "a re-send of a failed command is answered with the failure")
+	assert.Equal(t, "cutover reached 1 of the 2 operations it was sent for; engine refused the cutover", afterFailure.ErrorMessage)
+	assert.Equal(t, "9.0", afterFailure.CommandId)
+	assert.Equal(t, storage.ControlRequestFailed, recorded.Status, "the failed command is not re-armed")
+	assert.Equal(t, int64(0), recorded.Revision)
+
+	recorded.Status = storage.ControlRequestCompleted
+	recorded.ErrorMessage = ""
+	assert.True(t, cutover("9.0").Accepted, "a re-send of a completed command is accepted")
+	assert.Equal(t, storage.ControlRequestCompleted, recorded.Status, "the completed command is not re-armed")
+
+	next := cutover("9.1")
+	assert.True(t, next.Accepted)
+	assert.Equal(t, storage.ControlRequestPending, recorded.Status, "a new command records a new request")
+	assert.Equal(t, int64(1), recorded.Revision)
+	assert.Empty(t, fx.engine.cutoverContexts, "queueing a cutover never swaps anything")
+}
+
+// A cutover list is refused before anything is recorded when it names an
+// operation the apply does not have, names one twice, or names a single
+// operation outside the list, which a server reading only that field would cut
+// over in place of the listed ones.
+func TestLocalClient_CutoverListIsRefusedWhenItDoesNotNameTheApplysOperations(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		operationID  string
+		operationIDs []string
+		want         string
+	}{
+		{name: "operation the apply does not have", operationID: "11", operationIDs: []string{"11", "77"}, want: "cutover names an operation this apply does not have: apply_operation 77 does not exist"},
+		{name: "operation listed twice", operationID: "11", operationIDs: []string{"11", "11"}, want: "cutover names operation 11 more than once"},
+		{name: "single operation outside the list", operationID: "12", operationIDs: []string{"11"}, want: "cutover names operation 12 apart from the operations it lists"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover, state.Task.WaitingForCutover)
+			resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{
+				ApplyId: fx.apply.ApplyIdentifier, Environment: "staging",
+				ApplyOperationId: tc.operationID, ApplyOperationIds: tc.operationIDs,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.False(t, resp.Accepted)
+			assert.Equal(t, tc.want, resp.ErrorMessage)
+			assert.Empty(t, fx.controlRequests.requests, "a refused cutover records no request")
+		})
+	}
+}
+
 // A pending cutover bound to payments-002 is left alone by payments-001's
 // drive even though payments-001 is parked at its own cutover too, and is
 // taken by payments-002's drive, which swaps payments-002 alone: the engine
@@ -199,6 +382,31 @@ func TestLocalClient_BoundCutoverIsTakenOnlyByItsOwnMembersDrive(t *testing.T) {
 
 	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "the bound member's drive swaps that member alone")
+	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
+}
+
+// An operator's cutover for payments-002 was accepted and bound to it while
+// payments-001 was still copying, and payments-001 then failed under
+// `on_failure: halt` before payments-002's drive took the request. The drive
+// re-checks the hold when it takes the request, so payments-002 does not cut
+// over past the failure: the request stays pending, and is taken once nothing
+// holds payments-002 any longer.
+func TestLocalClient_BoundCutoverIsHeldByAnEarlierMemberThatFailedAfterAcceptance(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Failed, state.ApplyOperation.WaitingForCutover, state.Task.Failed, state.Task.WaitingForCutover)
+	fx.controlRequests.requests = []*storage.ApplyControlRequest{{
+		ID: 1, ApplyID: fx.apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+		RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(fx.second.ID),
+	}}
+	opStore := fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore)
+	opStore.blocker = fx.first
+
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.Empty(t, fx.engine.cutoverContexts, "a held member must not cut over past the earlier failure")
+	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status, "the acknowledged request waits for the hold to clear")
+
+	opStore.blocker = nil
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "once nothing holds it, the bound member's drive takes the request")
 	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
 }
 
@@ -377,4 +585,23 @@ func TestPlanIDForTasks(t *testing.T) {
 	_, err = planIDForTasks(&storage.Apply{ApplyIdentifier: "apply-without-plan"}, []*storage.Task{task(0)})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither the tasks nor apply apply-without-plan name a plan")
+}
+
+// A control plane that orders a rollout's cutovers defers each operation's
+// cutover on the data plane, so the data plane's apply carries the deferral,
+// and then sends one operation's cutover at a time. The data plane queues that
+// cutover for the operation it names while a sibling is still copying, rather
+// than waiting for every operation as an operator's --defer-cutover would.
+func TestLocalClient_CutoverNamingOneOperationIsQueuedWhileASiblingCopies(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.Running, state.Task.WaitingForCutover, state.Task.Running)
+	fx.apply.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
+
+	resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "cli:alice", ApplyOperationId: "11"})
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted, resp.GetErrorMessage())
+	require.Len(t, fx.controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status)
+	boundIDs, err := fx.controlRequests.requests[0].CutoverOperationIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{11}, boundIDs, "the cutover is bound to the operation it names")
 }

@@ -1,0 +1,218 @@
+# Shard MySQL servers for the multi-target k8s e2e.
+#
+# Each Deployment is one target of a multi-target environment, resolved through
+# Etre by its DSID. Every shard holds the same shardapp schema, the shape of a
+# database split across several clusters that all carry the same tables, and
+# one nsapp_* schema of its own, the shape of an environment whose targets each
+# select different namespaces. The shards reuse mysql-config from mysql.yaml
+# (ROW binlog, GTID) and keep a small buffer pool so several fit on one node.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-shard-001
+  labels:
+    app: mysql-shard-001
+    role: mysql-shard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-shard-001
+  template:
+    metadata:
+      labels:
+        app: mysql-shard-001
+        role: mysql-shard
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          args: ["--innodb-buffer-pool-size=64M", "--innodb-log-buffer-size=8M"]
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: testpassword
+            - name: MYSQL_INITDB_SKIP_TZINFO
+              value: "1"
+          ports:
+            - containerPort: 3306
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d/schemabot.cnf
+              subPath: my.cnf
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: mysql-config
+          configMap:
+            name: mysql-config
+        - name: init-scripts
+          configMap:
+            name: mysql-init-shard-001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-shard-001
+spec:
+  selector:
+    app: mysql-shard-001
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-shard-001
+data:
+  init-shard.sql: |
+    CREATE DATABASE IF NOT EXISTS shardapp;
+    CREATE DATABASE IF NOT EXISTS nsapp_a;
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-shard-002
+  labels:
+    app: mysql-shard-002
+    role: mysql-shard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-shard-002
+  template:
+    metadata:
+      labels:
+        app: mysql-shard-002
+        role: mysql-shard
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          args: ["--innodb-buffer-pool-size=64M", "--innodb-log-buffer-size=8M"]
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: testpassword
+            - name: MYSQL_INITDB_SKIP_TZINFO
+              value: "1"
+          ports:
+            - containerPort: 3306
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d/schemabot.cnf
+              subPath: my.cnf
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: mysql-config
+          configMap:
+            name: mysql-config
+        - name: init-scripts
+          configMap:
+            name: mysql-init-shard-002
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-shard-002
+spec:
+  selector:
+    app: mysql-shard-002
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-shard-002
+data:
+  init-shard.sql: |
+    CREATE DATABASE IF NOT EXISTS shardapp;
+    CREATE DATABASE IF NOT EXISTS nsapp_b;
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-shard-003
+  labels:
+    app: mysql-shard-003
+    role: mysql-shard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-shard-003
+  template:
+    metadata:
+      labels:
+        app: mysql-shard-003
+        role: mysql-shard
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          args: ["--innodb-buffer-pool-size=64M", "--innodb-log-buffer-size=8M"]
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: testpassword
+            - name: MYSQL_INITDB_SKIP_TZINFO
+              value: "1"
+          ports:
+            - containerPort: 3306
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d/schemabot.cnf
+              subPath: my.cnf
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: mysql-config
+          configMap:
+            name: mysql-config
+        - name: init-scripts
+          configMap:
+            name: mysql-init-shard-003
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-shard-003
+spec:
+  selector:
+    app: mysql-shard-003
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-shard-003
+data:
+  init-shard.sql: |
+    CREATE DATABASE IF NOT EXISTS shardapp;
+    CREATE DATABASE IF NOT EXISTS nsapp_c;

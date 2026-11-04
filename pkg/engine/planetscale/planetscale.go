@@ -42,7 +42,8 @@
 //	             in_progress_vschema, in_progress_cutover
 //	Complete:    complete, complete_pending_revert
 //	Error:       complete_error, error, failed
-//	Cancelled:   in_progress_cancel, complete_cancel, cancelled
+//	Cancelling:  in_progress_cancel
+//	Cancelled:   complete_cancel, cancelled
 //	Revert:      in_progress_revert, in_progress_revert_vschema,
 //	             complete_revert, complete_revert_error
 //
@@ -63,7 +64,7 @@
 //	complete_pending_revert   → StateRevertWindow         Deployment complete (revert available)
 //	complete_error, error     → StateFailed               Deployment failed
 //	failed                    → StateFailed               Deployment failed
-//	in_progress_cancel        → StateCancelled            Cancelling deploy...
+//	in_progress_cancel        → StateRunning              Cancelling deploy...
 //	cancelled, complete_cancel→ StateCancelled            Deployment cancelled
 //	in_progress_revert        → StateRunning              Revert in progress...
 //	in_progress_revert_vschema→ StateRunning              Reverting VSchema changes
@@ -390,6 +391,7 @@ import (
 	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -435,8 +437,9 @@ var deployRequestPendingWait = 30 * time.Minute
 var snapshotRetryWait = 10 * time.Minute
 
 // branchPasswordHeadroom is the part of a branch password's lifetime that is
-// not spent waiting out schema snapshots: the transient retries, the DDL and
-// VSchema writes themselves, and the branch validation after them.
+// not spent on the keyspaces' snapshot windows: the transient retries, the DDL
+// and VSchema writes themselves, and the branch validation after them, which
+// can itself wait out a snapshot for snapshotRetryWait.
 const branchPasswordHeadroom = 30 * time.Minute
 
 // branchPasswordTTL is how long, in seconds, the branch password an apply
@@ -609,6 +612,22 @@ type Engine struct {
 	vtgateDBsMu sync.Mutex
 	vtgateDBs   map[string]*sql.DB // dsn -> cached *sql.DB
 
+	// validationBranchSchema, when set, replaces the branch MySQL read that
+	// post-apply validation compares against the desired schema. Tests set
+	// it to drive validation without a branch to connect to.
+	validationBranchSchema func(ctx context.Context, password *ps.DatabaseBranchPassword, keyspaces []string) (map[string][]table.TableSchema, error)
+
+	// now, when set, replaces the wall clock for elapsed-time checks on
+	// deploy request state. Tests set it to place a poll at a chosen time.
+	now func() time.Time
+}
+
+// clock returns the engine's current time.
+func (e *Engine) clock() time.Time {
+	if e.now != nil {
+		return e.now()
+	}
+	return time.Now()
 }
 
 // Compile-time check that Engine implements the interface.
@@ -775,10 +794,17 @@ func isRetryableMySQLConnectionError(err error) bool {
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
-// running a schema snapshot (e.g., after RefreshSchema). VSchema updates
-// are blocked while the snapshot completes.
+// running a schema snapshot (e.g., after RefreshSchema or DDL on a branch).
+// VSchema updates are rejected while the snapshot completes ("schema snapshot
+// is in progress"), and VSchema reads are answered with "schema refreshing;
+// please try again in a few moments". Both clear on their own once the
+// snapshot finishes.
 func isSnapshotInProgress(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "schema snapshot is in progress") || strings.Contains(msg, "schema refreshing")
 }
 
 // isDeployStillValidatingError reports whether the PlanetScale API rejected a
@@ -825,19 +851,6 @@ var retryDelay = func(attempt int, lastErr error) time.Duration {
 	return base + time.Duration(rand.IntN(2000))*time.Millisecond
 }
 
-func generateBranchName(database, planID string) string {
-	sanitized := strings.ReplaceAll(database, "_", "-")
-	if len(sanitized) > 20 {
-		sanitized = sanitized[:20]
-	}
-	// Use last 8 chars of plan ID for uniqueness
-	shortID := planID
-	if len(shortID) > 8 {
-		shortID = shortID[len(shortID)-8:]
-	}
-	return fmt.Sprintf("schemabot-%s-%s", sanitized, shortID)
-}
-
 func deployStateToEngineState(drState string) engine.State {
 	switch drState {
 	case deployState.Pending, deployState.Ready:
@@ -855,7 +868,11 @@ func deployStateToEngineState(drState string) engine.State {
 	case deployState.CompleteError, deployState.Error, deployState.Failed, deployState.CompleteRevertError:
 		return engine.StateFailed
 	case deployState.InProgressCancel:
-		return engine.StateCancelled
+		// PlanetScale has accepted the cancel but not confirmed it, and an
+		// unconfirmed cancel can still end the deploy in complete_error. The
+		// deploy request is still in motion, so it reads as running until it
+		// settles on cancelled or failed.
+		return engine.StateRunning
 	case deployState.CompleteCancel, deployState.Cancelled:
 		return engine.StateCancelled
 	case deployState.InProgressRevert, deployState.InProgressRevertVSchema:

@@ -14,6 +14,8 @@ import (
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/api"
 )
 
 // pkSwapSchema is a schema file declaring a composite primary key on a table
@@ -43,10 +45,12 @@ func seedPKSwapTargetTable(t *testing.T, dbName string) {
 // An apply on a plan containing an engine-blocked change is rejected before
 // any lock is taken: the PR gets a ⛔ rejection comment naming the table and
 // the refusal, with no retry or --allow-unsafe coaching, and the database
-// lock stays free.
+// lock stays free. The server opts out of direct execution, so the refused
+// statement blocks rather than running as native DDL.
 func TestE2EApplyRejectedOnBlockedPlan(t *testing.T) {
 	dbName := "webhook_blocked_gate"
 	svc := setupE2EService(t, dbName)
+	svc.Config().DirectExecution = &api.DirectExecutionConfig{Enabled: false}
 	seedPKSwapTargetTable(t, dbName)
 
 	mux := http.NewServeMux()

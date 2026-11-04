@@ -218,6 +218,38 @@ func TestDiagnoseReadsDurableBlockingReasonsFirst(t *testing.T) {
 	}
 }
 
+// A guard block stored on the rollup is released only when a re-run of the
+// check or a new commit re-verifies the whole pull request: every fold skips
+// it, a plan command included. An operator reading its diagnosis is told
+// exactly that, never to run a plan that succeeds and leaves the gate shut.
+func TestDiagnoseTellsARollupGuardBlockToReverifyThePullRequest(t *testing.T) {
+	t.Parallel()
+
+	for _, reason := range []string{BlockPlanFailedUnrecorded, BlockNamespacePlacementRefused, BlockConfigDiscoveryFailed} {
+		t.Run(reason, func(t *testing.T) {
+			t.Parallel()
+			got := Diagnose(&storage.Check{
+				HeadSHA: headSHA, Environment: "production",
+				DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel,
+				Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: reason,
+			}, headSHA, nil)
+			assert.Equal(t, ReasonGuardBlocked, got.Reason)
+			assert.True(t, got.Blocking)
+			assert.False(t, got.SelfConverging)
+			assert.NotContains(t, got.Remedy, "schemabot plan")
+			assert.Contains(t, got.Remedy, "re-run the check or push a commit")
+		})
+	}
+
+	// The same reason on a database's own row is lifted by that row's plan.
+	row := Diagnose(&storage.Check{
+		HeadSHA: headSHA, Environment: "production", DatabaseType: "mysql", DatabaseName: "orders",
+		Status: StatusCompleted, Conclusion: ConclusionFailure, BlockingReason: BlockNamespacePlacementRefused,
+	}, headSHA, nil)
+	assert.Equal(t, ReasonGuardBlocked, row.Reason)
+	assert.Contains(t, row.Remedy, "`schemabot plan -e <environment>`")
+}
+
 // A stopped apply keeps its check in progress deliberately and settles only
 // when an operator starts or cancels it, so it is never something to wait out.
 func TestDiagnoseReadsAStoppedApplyAsOperatorOwned(t *testing.T) {

@@ -297,6 +297,43 @@ func TestConnectionDSN_WithConnectTimeout(t *testing.T) {
 	})
 }
 
+// A storage DSN that names its own zone, or a local loc, is pinned to UTC on
+// both the driver and the session side; a target DSN without the option keeps
+// what it carries.
+func TestConnectionDSN_WithUTCSession(t *testing.T) {
+	t.Run("replaces every spelling of time_zone and the driver location", func(t *testing.T) {
+		got, err := ConnectionDSN(
+			"root:secret@tcp(localhost:3306)/app?parseTime=true&loc=Local&TIME_ZONE=%27-07%3A00%27",
+			WithUTCSession(),
+		)
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"time_zone": "'+00:00'"}, cfg.Params)
+		assert.Equal(t, time.UTC, cfg.Loc)
+		assert.True(t, cfg.ParseTime)
+	})
+
+	t.Run("sets time_zone on a DSN with no params", func(t *testing.T) {
+		got, err := ConnectionDSN("root:secret@tcp(localhost:3306)/app", WithUTCSession())
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"time_zone": "'+00:00'"}, cfg.Params)
+	})
+
+	t.Run("a connection without the option keeps its own zone", func(t *testing.T) {
+		got, err := ConnectionDSN("root:secret@tcp(localhost:3306)/app?time_zone=%27-07%3A00%27")
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"time_zone": "'-07:00'"}, cfg.Params)
+	})
+}
+
 // Every SchemaBot-managed connection gets bounded connect and write timeouts
 // so a target that stops responding surfaces as an error instead of a hung
 // drive. A positive timeout carried in the DSN or supplied as an option wins

@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/lintguidance"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -573,7 +574,7 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	}
 	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  %s %s\n", cliname.Name(), rerun)
+	fmt.Printf("  %s\n", cliname.Command(rerun))
 	fmt.Println()
 }
 
@@ -583,8 +584,8 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 // name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
 func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
 	findings := unsafeFindingLines(changes)
-	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s %s",
-		len(findings), strings.Join(findings, "; "), cliname.Name(), rerun)
+	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s",
+		len(findings), strings.Join(findings, "; "), cliname.Command(rerun))
 }
 
 // WriteUnsafeWarningAllowed writes a warning when destructive changes are
@@ -667,4 +668,17 @@ func unsafeChangeFindings(c UnsafeChange) []string {
 		return c.Reasons
 	}
 	return ui.LintReasons(c.Reason)
+}
+
+// WriteRelatedGuidance links only findings displayed by the calling surface.
+func WriteRelatedGuidance(rules []string, isMySQL bool) {
+	guides := lintguidance.Guides(lintguidance.Scope{Rules: rules, IsMySQL: isMySQL})
+	if len(guides) == 0 {
+		return
+	}
+	fmt.Println(glyph.Docs + " Related guidance:")
+	for _, guide := range guides {
+		fmt.Printf("  • %s: %s\n", guide.Label, guide.URL)
+	}
+	fmt.Println()
 }

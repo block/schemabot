@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -62,6 +63,22 @@ func (h *Handler) leaderExpectsParticipantsForPR(repo string, files []ghclient.P
 	return len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0
 }
 
+// participantPathsTouched reports whether the PR selects this participant's
+// managed directories even though no schema config resolved (for example a
+// documentation-only change inside a participant's paths).
+func (h *Handler) participantPathsTouched(repo string, files []ghclient.PRFile) bool {
+	config, ok := h.serverConfig()
+	if !ok || !config.RepoHasSchemaDirAllowlist(repo) {
+		return false
+	}
+	for _, file := range prFilePaths(files) {
+		if config.SchemaPathAllowedForRepo(repo, file) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) aggregateCheckNameForRepo(repo string) string {
 	config, ok := h.serverConfig()
 	if !ok {
@@ -88,8 +105,9 @@ func (h *Handler) aggregateCheckTargetsForRepo(repo string) []aggregateCheckTarg
 	if !ok || len(config.AllowedEnvironments) == 0 {
 		return []aggregateCheckTarget{{name: base, environment: aggregateSentinel}}
 	}
-	targets := make([]aggregateCheckTarget, 0, len(config.AllowedEnvironments))
-	for _, env := range config.AllowedEnvironments {
+	environments, _ := config.CheckEnvironmentsForRepo(context.Background(), nil, repo, "")
+	targets := make([]aggregateCheckTarget, 0, len(environments))
+	for _, env := range environments {
 		targets = append(targets, aggregateCheckTarget{
 			name:        aggregateCheckNameForEnv(base, env),
 			environment: env,
@@ -237,20 +255,43 @@ func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
 	return false
 }
 
-// computeAggregate determines the aggregate conclusion and status from per-database checks.
-func computeAggregate(checks []*storage.Check) (conclusion, status string) {
-	// in_progress takes precedence — the aggregate should show running
+// computeAggregate determines the aggregate conclusion and status from
+// per-database checks. stopped names the applies resting in the stopped state;
+// nil reads as "nothing is stopped".
+func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclusion, status string) {
+	// in_progress takes precedence — the aggregate should show running. A row
+	// held open by a stopped apply is not running work: it waits on an
+	// operator to start or cancel the apply, so it folds as action_required
+	// below, still blocking merge, rather than as a run that never finishes.
+	heldByStoppedApply := false
 	for _, c := range checks {
-		if c.Status == checkStatusInProgress {
-			return "", checkStatusInProgress
+		if c.Status == checkStatusCompleted {
+			continue
 		}
+		if c.Status == checkStatusInProgress && stopped.holds(c) {
+			heldByStoppedApply = true
+			continue
+		}
+		return "", checkStatusInProgress
 	}
 
-	// All checks are completed — compute conclusion
+	// Every remaining check is completed or held by a stopped apply — compute
+	// the conclusion.
 	for _, c := range checks {
-		if c.Conclusion == checkConclusionFailure {
+		if c.Status != checkStatusCompleted {
+			continue
+		}
+		if c.BlockingReason != "" && c.Conclusion == checkConclusionSuccess {
 			return checkConclusionFailure, checkStatusCompleted
 		}
+		switch c.Conclusion {
+		case checkConclusionSuccess, checkConclusionActionRequired:
+		default:
+			return checkConclusionFailure, checkStatusCompleted
+		}
+	}
+	if heldByStoppedApply {
+		return checkConclusionActionRequired, checkStatusCompleted
 	}
 	for _, c := range checks {
 		if c.Conclusion == checkConclusionActionRequired {
@@ -278,11 +319,18 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		pending := 0
 		unresolved := 0
 		tenantApplies := 0
+		stoppedApplies := 0
+		var pendingCheck *storage.Check
 		for _, c := range checks {
+			if c.Status == checkStatusInProgress && stopped.holds(c) {
+				stoppedApplies++
+				continue
+			}
 			if c.Conclusion != checkConclusionActionRequired {
 				continue
 			}
 			pending++
+			pendingCheck = c
 			switch {
 			case isUnresolvedParticipantCheck(c):
 				unresolved++
@@ -291,6 +339,10 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 			}
 		}
 		switch {
+		case pending == 0 && stoppedApplies > 0:
+			// Every row holding the aggregate is a stopped apply, so the PR
+			// is waiting on an operator to start or cancel, not on work.
+			title = stoppedAppliesTitle(stoppedApplies)
 		case pending > 0 && unresolved == pending:
 			// Every blocking row is a participant whose Check Run could not be
 			// read; no apply is actually pending, the participants are silent.
@@ -326,9 +378,12 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		case tenantApplies > 0:
 			title = fmt.Sprintf("%d applies pending (%d tenant)", pending, tenantApplies)
 		case pending == 1:
-			title = "1 apply pending"
+			title = "1 apply pending" + rolloutTargetsPhrase(pendingCheck)
 		default:
 			title = fmt.Sprintf("%d applies pending", pending)
+		}
+		if pending > 0 && stoppedApplies > 0 {
+			title = fmt.Sprintf("%s (%d stopped)", title, stoppedApplies)
 		}
 		summary = buildAggregateTable(checks, stopped)
 	default:
@@ -336,11 +391,13 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		inProgress := 0
 		waiting := 0
 		paused := 0
+		var inProgressCheck *storage.Check
 		for _, c := range checks {
 			if c.Status != checkStatusInProgress {
 				continue
 			}
 			inProgress++
+			inProgressCheck = c
 			switch {
 			case isUnresolvedParticipantCheck(c):
 				waiting++
@@ -357,22 +414,55 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 			} else {
 				title = fmt.Sprintf("Waiting for %d participant deployments to report", waiting)
 			}
-		case inProgress > 0 && paused == inProgress:
-			// Every row holding the aggregate open is a stopped apply, so the
-			// PR is waiting on an operator to start or cancel, not on work.
-			if paused == 1 {
-				title = "1 apply stopped"
-			} else {
-				title = fmt.Sprintf("%d applies stopped", paused)
-			}
 		case paused > 0:
 			title = fmt.Sprintf("Apply in progress (%d stopped)", paused)
+		case inProgress == 1:
+			title = "Apply in progress" + rolloutTargetsPhrase(inProgressCheck)
 		default:
 			title = "Apply in progress"
 		}
 		summary = buildAggregateTable(checks, stopped)
 	}
 	return title, summary
+}
+
+// rolloutTargetsPhrase says how many of a rollout's targets a row's work is on,
+// for a title that speaks for that one row, so the PR's merge box shows how far
+// the change has rolled out. A row that names no rollout of several targets
+// adds nothing. Titles over several rows leave it out: counts from different
+// databases do not add up to anything a reader can act on.
+func rolloutTargetsPhrase(c *storage.Check) string {
+	if c.RolloutTargets <= 1 || c.RolloutTargetsWithWork <= 0 {
+		return ""
+	}
+	if c.RolloutTargetsWithWork >= c.RolloutTargets {
+		return fmt.Sprintf(" on all %d targets", c.RolloutTargets)
+	}
+	return fmt.Sprintf(" on %d of %d targets", c.RolloutTargetsWithWork, c.RolloutTargets)
+}
+
+// stoppedAppliesTitle names the stopped applies holding the aggregate.
+func stoppedAppliesTitle(n int) string {
+	if n == 1 {
+		return "1 apply stopped"
+	}
+	return fmt.Sprintf("%d applies stopped", n)
+}
+
+// isStoppedAppliesAggregate reports whether an aggregate Check Run concluded
+// because stopped applies are all that hold it, the case the fold titles with
+// stoppedAppliesTitle. It is read off the title because that is the only place
+// a deployment that cannot see the applies learns why the run concluded; the
+// conclusion alone is the same as for changes no apply has run yet.
+func isStoppedAppliesAggregate(run *ghclient.CheckRunResult) bool {
+	if run.Status != checkStatusCompleted || run.Conclusion != checkConclusionActionRequired {
+		return false
+	}
+	var n int
+	if _, err := fmt.Sscanf(run.Title, "%d", &n); err != nil {
+		return false
+	}
+	return n > 0 && run.Title == stoppedAppliesTitle(n)
 }
 
 // stoppedApplyIDs is the set of applies resting in the stopped state, so the

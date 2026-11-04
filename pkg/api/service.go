@@ -181,10 +181,18 @@ type Service struct {
 	stopRecovery   chan struct{}
 	cancelRecovery context.CancelFunc
 	operatorWake   chan struct{}
+	// reservedDriverWake is the reserved driver's own wake channel, set when
+	// the pool reserves one (see reservedDriverID). The reserved driver skips
+	// deferred-cutover work, so a wake for that work must never be spent on it:
+	// it listens here instead of on operatorWake, and every wake goes to both.
+	reservedDriverWake chan struct{}
 	// claimingStopped records that stopRecovery has been closed, so the claim
 	// gate can be closed ahead of StopOperator and closed at most once.
 	claimingStopped bool
-	recoveryWg      sync.WaitGroup
+	// driverPoolServerID is this run's row in driver_pools,
+	// set by StartOperator and removed by StopOperator.
+	driverPoolServerID string
+	recoveryWg         sync.WaitGroup
 	// maintenanceWg holds the reaper passes, which share the driver lifecycle
 	// but claim nothing and drive nothing. They are waited on apart from the
 	// drivers so that a reaper which does not return cannot decide whether the
@@ -192,10 +200,17 @@ type Service struct {
 	maintenanceWg        sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
-	retryableExpiryEvery time.Duration
+	// operatorHeartbeatEvery overrides OperatorHeartbeatInterval in tests.
+	operatorHeartbeatEvery time.Duration
+	// operatorHeartbeatDeadline overrides operatorHeartbeatTimeout in tests.
+	operatorHeartbeatDeadline time.Duration
+	retryableExpiryEvery      time.Duration
 	// driversBusy counts this process's operator drivers that currently hold
 	// claimed work; it backs the drivers-busy gauge.
 	driversBusy atomic.Int64
+	// operatorDrivers is the driver pool size StartOperator resolved, read by
+	// each driver to decide whether it is the reserved one.
+	operatorDrivers atomic.Int64
 	// heldClaims tracks the apply leases this process's drivers are currently
 	// driving under, keyed by apply id. Shutdown hands them back explicitly so a
 	// peer driver picks the work up on its next poll, instead of waiting out the
@@ -215,6 +230,15 @@ type Service struct {
 	heldOperationClaimsMu       sync.Mutex
 	heldOperationClaims         map[int64]heldOperationClaim
 	heldOperationClaimsDraining bool
+	// resumeObservers records, per apply id, the GitHub comment of the stop
+	// summary this process last attached a progress comment observer to
+	// rotate, so later claims of the same resume here do not attach another.
+	// It narrows the durable signal, the stop's summary comment that stays
+	// unconsumed until an observer rotates it, to one attach per process per
+	// stop. Each stop posts its own summary comment, so a later stop of the
+	// same rollout never matches the entry an earlier resume left behind.
+	resumeObserversMu sync.Mutex
+	resumeObservers   map[int64]int64
 
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
@@ -242,8 +266,25 @@ type Service struct {
 	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
 
+	// OnStoppedApplyClaimed is called after a driver claims a stopped apply,
+	// before the drive starts, on both single- and multi-operation drives. A
+	// start claim has already committed the apply out of stopped; a claim that
+	// delivers a pending cancel leaves it stopped until the drive settles it.
+	// Set by the webhook handler to move the PR Check Run off "stopped", which
+	// it republishes from the apply's state in storage, so both claims show
+	// what storage records. It must not block: the drive waits on it.
+	OnStoppedApplyClaimed func(apply *storage.Apply)
+
+	// OnQueuedStartWithdrawn is called after a stop withdrew a start no driver
+	// had acted on, whatever surface sent the stop. The apply never left
+	// stopped, so no drive runs to update its PR, which would otherwise end on
+	// the start's acknowledgement. Set by the webhook handler to tell the PR
+	// the start was withdrawn. caller is the stop's caller. It must not block:
+	// the stop's response waits on it.
+	OnQueuedStartWithdrawn func(apply *storage.Apply, caller string)
+
 	// OnApplyTerminalSummary is called after an apply is terminalized by the
-	// aggregate projection CAS. Set by the webhook handler to publish the
+	// aggregate projection CAS or by retryable expiry. Set by the webhook handler to publish the
 	// apply-level terminal PR summary and refresh GitHub check state; the
 	// summary-marker claim inside the publish path keeps it exactly-once
 	// against any still-live per-driver observer.

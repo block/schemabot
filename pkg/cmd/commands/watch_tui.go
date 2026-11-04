@@ -9,7 +9,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -33,6 +32,9 @@ type WatchModel struct {
 	tables     []templates.TableProgress
 	operations []templates.ProgressOperation
 	released   bool // apply-level release latch: a released pause runs degraded, not paused
+	// sharded is whether the apply is one change fanned out across its
+	// keyspaces' shards, so it renders without operation sections.
+	sharded bool
 	// deferCutover is whether the apply waits for an operator at each cutover.
 	deferCutover bool
 	errorMsg     string
@@ -69,6 +71,7 @@ type progressMsg struct {
 	tables       []templates.TableProgress
 	operations   []templates.ProgressOperation
 	released     bool              // apply-level release latch: a released pause runs degraded, not paused
+	sharded      bool              // one change fanned out across its keyspaces' shards
 	deferCutover bool              // the apply waits for an operator at each cutover
 	errorMsg     string            // Human-readable error message
 	failed       bool              // true when the API call didn't return usable progress data
@@ -130,9 +133,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// During cutover, ignore all keyboard input except q to force quit
-		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
-
 		if isEnterKey(msg) {
 			return m.handleEnterKey()
 		}
@@ -140,7 +140,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			// Don't allow detach during cutover
-			if isCuttingOver {
+			if m.cuttingOver() {
 				return m, nil
 			}
 			m.detached = true
@@ -149,12 +149,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "s", "c":
-			// Don't allow stop/cancel during cutover
-			if isCuttingOver {
-				return m, nil
-			}
 			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if (state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)) && !m.stopTriggered {
+			if m.stopKeyAvailable() && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}
@@ -172,7 +168,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMsg = msg.errorMsg
 			m.requestedRetryDelay = msg.retryAfter
 			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
-				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
+				m.errorMsg = progressGiveUpMessage(m.applyID, m.environment, m.consecutiveErrors) + ": " + msg.errorMsg
 				m.initialized = true
 				return m, tea.Quit
 			}
@@ -196,6 +192,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
+		m.sharded = msg.sharded
 		m.deferCutover = msg.deferCutover
 		m.errorMsg = msg.errorMsg
 
@@ -276,6 +273,21 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// cuttingOver reports whether a cutover is underway or was requested from this
+// watcher. During cutover the watcher ignores every key but q.
+func (m WatchModel) cuttingOver() bool {
+	return state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
+}
+
+// stopKeyAvailable reports whether the apply is in a state the s (or c) key
+// stops, so a footer advertises the key exactly where pressing it acts.
+func (m WatchModel) stopKeyAvailable() bool {
+	if m.cuttingOver() {
+		return false
+	}
+	return state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)
+}
+
 func isEnterKey(msg tea.KeyMsg) bool {
 	return msg.Type == tea.KeyEnter || msg.Type == tea.KeyCtrlJ ||
 		msg.String() == "enter" || msg.String() == "ctrl+j"
@@ -349,15 +361,24 @@ func runWatchModel(model WatchModel) (err error) {
 		printExitContext(m.applyID, m.deployRequestURL, m.environment)
 	}
 
-	// The TUI view already displays errors inline, so return ErrSilent
-	// to exit with code 1 without printing the error again.
-	if m.errorMsg != "" && !state.IsState(m.state, state.Apply.Completed) {
-		return ErrSilent
-	}
-	if state.IsState(m.state, state.Apply.Failed) {
-		return ErrSilent
-	}
+	return m.exitError()
+}
 
+// exitError is the watch's exit status for its final model, the same rule
+// terminalWatchExit and noActiveChangeError give the non-interactive watch:
+// only a completed apply succeeds. Any other end (stopped, failed,
+// cancelled, reverted, no active schema change) or an error means the
+// schema change is not on the target. The view already shows the outcome,
+// including the start command for a stopped apply, so the failure is
+// ErrSilent. Detaching while the apply still runs is not an outcome, so it
+// exits 0.
+func (m WatchModel) exitError() error {
+	if state.IsState(m.state, state.Apply.Completed) {
+		return nil
+	}
+	if m.errorMsg != "" || m.watchHasEnded() {
+		return ErrSilent
+	}
 	return nil
 }
 
@@ -382,11 +403,7 @@ func formatExitContext(applyID, deployRequestURL, environment string) string {
 	if deployRequestURL != "" {
 		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
 	}
-	cmd := fmt.Sprintf("%s progress %s", cliname.Name(), applyID)
-	if environment != "" {
-		cmd += " -e " + environment
-	}
-	fmt.Fprintf(&b, "  Resume:    %s\n", cmd)
+	fmt.Fprintf(&b, "  Resume:    %s\n", templates.ProgressCommand(applyID, environment))
 	b.WriteString("\n")
 	return b.String()
 }

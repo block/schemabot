@@ -3,6 +3,7 @@ package templates
 import (
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,12 @@ func TestLabel_PlanetScalePhases(t *testing.T) {
 	assert.Equal(t, "Validating deploy request", state.Label(state.Apply.ValidatingDeployRequest))
 	assert.Equal(t, "Cancelled", state.Label(state.Apply.Cancelled))
 	assert.Equal(t, "Retrying", state.Label(state.Apply.FailedRetryable))
+}
+
+// A pending apply reads as queued, the same word the PR comment and the shared
+// rollup use for an apply that has not started yet.
+func TestFormatProgressState_PendingReadsAsQueued(t *testing.T) {
+	assert.Equal(t, "⏳ Queued", FormatProgressState(state.Apply.Pending))
 }
 
 func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
@@ -66,29 +73,47 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
 }
 
+// At the server's cap a larger --limit cannot show more, so the footer names
+// the --after apply that starts the next page. A page reached with --after
+// says it shows more rather than the most recent, and keeps naming the next
+// --after apply.
 func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
-	output := captureStdout(t, func() {
-		WriteStatusList(StatusListData{
-			ActiveCount: 0,
-			Limit:       1000,
-			MaxLimit:    1000,
-			HasMore:     true,
-			Applies: []ActiveApplyData{
-				{
-					ApplyID:     "apply-example",
-					Database:    "orders",
-					Environment: "staging",
-					State:       state.Apply.Completed,
-					StartedAt:   "2026-05-28T12:00:00Z",
-					CompletedAt: "2026-05-28T12:00:02Z",
-					Caller:      "cli",
-				},
-			},
-		})
-	})
+	page := StatusListData{
+		Limit:    1000,
+		MaxLimit: 1000,
+		HasMore:  true,
+		Applies: []ActiveApplyData{{
+			ApplyID: "apply-example", Database: "orders", Environment: "staging", State: state.Apply.Completed,
+			StartedAt: "2026-05-28T12:00:00Z", CompletedAt: "2026-05-28T12:00:02Z", Caller: "cli",
+		}},
+	}
+	first := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, first, "Showing the 1000 most recent schema changes. Add --after apply-example for the next 1000.")
+	assert.NotContains(t, first, "Use --limit N to show more.")
 
-	assert.Contains(t, output, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
-	assert.NotContains(t, output, "Use --limit N to show more.")
+	page.After = "apply-previous"
+	continued := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, continued, "Showing 1 more schema changes. Add --after apply-example for the next 1000.")
+
+	page.FailuresOnly = true
+	page.Applies[0].State = state.Apply.Failed
+	failed := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, failed, "Showing 1 more failed schema changes. Add --after apply-example for the next 1000.")
+}
+
+// An empty page reached with --after means nothing is older than the apply it
+// continues from, not that nothing matches the filters.
+func TestWriteStatusListEmptyContinuedPage(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{Sectioned: true, Limit: 20, Last: "24h", After: "apply-oldest"})
+	})
+	assert.Contains(t, output, "No schema changes older than apply-oldest updated in the last 24h")
+	assert.NotContains(t, output, "No recent schema changes")
+
+	failed := captureStdout(t, func() {
+		WriteStatusList(StatusListData{FailuresOnly: true, Limit: 20, After: "apply-oldest"})
+	})
+	assert.Contains(t, failed, "No failed schema changes older than apply-oldest")
 }
 
 func TestWriteStatusListStateSummary(t *testing.T) {
@@ -618,6 +643,16 @@ func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
 	unsized := base
 	unsized.EstimatedBytes = nil
 	assert.Contains(t, FormatTableProgress(unsized), "Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n")
+
+	// A queued table has reported nothing yet, so it shows the plan's
+	// estimates, both approximate, and nothing without them.
+	queued := TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Pending, DDL: base.DDL,
+		EstimatedRows: new(int64(48_200_000)), EstimatedBytes: &bytes,
+	}
+	assert.Contains(t, FormatTableProgress(queued), "Rows: ~48.2M · ~23.4 GB\n")
+	queued.EstimatedRows = nil
+	assert.NotContains(t, FormatTableProgress(queued), "Rows:")
 }
 
 // A table applying its accumulated changes names the catch-up phase rather
@@ -1054,34 +1089,36 @@ func TestStateColorFunc_PlanetScalePhases(t *testing.T) {
 	}
 }
 
+// Every apply state renders in a color in the status table and has its own
+// progress state line, so no state an operator can see reads as plain text
+// beside the colored ones or falls through to its raw stored name.
+func TestEveryApplyStateHasAColor(t *testing.T) {
+	for _, s := range everyApplyState(t) {
+		assert.NotNilf(t, stateColorFunc(s), "state %q has no status table color", s)
+		assert.NotEqualf(t, s, FormatProgressState(s), "state %q renders its progress line as the raw state", s)
+	}
+}
+
+// everyApplyState returns the value of every state.Apply field, so a state
+// added to the registry is covered without editing a list.
+func everyApplyState(t *testing.T) []string {
+	t.Helper()
+	v := reflect.ValueOf(state.Apply)
+	states := make([]string, 0, v.NumField())
+	for i := range v.NumField() {
+		s := v.Field(i).String()
+		require.NotEmptyf(t, s, "state.Apply.%s is empty", v.Type().Field(i).Name)
+		states = append(states, s)
+	}
+	return states
+}
+
 // Red means "something broke, go fix it" — an operator scanning a status list
 // should be able to trust that red marks a real failure. Operator-initiated
 // terminal states (stopped, cancelled, reverted) are deliberate outcomes and
 // render orange instead, so a routine revert never reads as a failure.
 func TestStateColorsReserveRedForFailure(t *testing.T) {
-	allStates := []string{
-		state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.RunningDegraded,
-		state.Apply.WaitingForDeploy,
-		state.Apply.WaitingForCutover,
-		state.Apply.Recovering,
-		state.Apply.CuttingOver,
-		state.Apply.RevertWindow,
-		state.Apply.SkippingRevert,
-		state.Apply.Reverting,
-		state.Apply.Completed,
-		state.Apply.Failed,
-		state.Apply.FailedRetryable,
-		state.Apply.Stopped,
-		state.Apply.Cancelled,
-		state.Apply.Reverted,
-		state.Apply.PreparingBranch,
-		state.Apply.ApplyingBranchChanges,
-		state.Apply.ValidatingBranch,
-		state.Apply.CreatingDeployRequest,
-		state.Apply.ValidatingDeployRequest,
-	}
+	allStates := everyApplyState(t)
 	for _, s := range allStates {
 		if fn := stateColorFunc(s); fn != nil {
 			colored := fn(state.Label(s))
@@ -1142,6 +1179,68 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 	})
 	assert.Contains(t, failed, "❌ Failed")
 	assert.Contains(t, failed, ui.ColorRed)
+}
+
+// Every task state other than running renders its own table row. A state that
+// fell through to the running row would show a table as "Running..." when it
+// is waiting on an operator, reverted, or otherwise not moving at all. The
+// running row has two shapes, so each state is rendered both ways: with no
+// counters it says "Running...", and with row counters it draws a copy bar
+// and names the state on a "Status:" line that no other row prints.
+func TestFormatTableProgress_EveryStateHasItsOwnRow(t *testing.T) {
+	bare := TableProgress{TableName: "users", ChangeType: "alter"}
+	counted := TableProgress{TableName: "users", ChangeType: "alter", RowsCopied: 400, RowsTotal: 1000, PercentComplete: 40}
+
+	bare.Status = state.Task.Running
+	require.Contains(t, FormatTableProgress(bare), "Running...")
+	counted.Status = state.Task.Running
+	require.Contains(t, FormatTableProgress(counted), "40.00%")
+
+	v := reflect.ValueOf(state.Task)
+	for i := range v.NumField() {
+		status := v.Field(i).String()
+		require.NotEmpty(t, status, "state.Task.%s is empty", v.Type().Field(i).Name)
+		if status == state.Task.Running {
+			continue
+		}
+		t.Run(status, func(t *testing.T) {
+			bare.Status = status
+			assert.NotContainsf(t, FormatTableProgress(bare), "Running...",
+				"state.Task.%s renders as a running table", v.Type().Field(i).Name)
+
+			counted.Status = status
+			assert.NotContainsf(t, FormatTableProgress(counted), "Status: ",
+				"state.Task.%s with row counters renders as a running copy", v.Type().Field(i).Name)
+		})
+	}
+}
+
+// A table whose deploy is deferred reads as waiting for the deploy, the same
+// words the PR comment uses, rather than as a copy that is still running. The
+// row keeps the layout every phase row shares: the DDL, a blank line, then
+// the shard list. Should a table in this state carry row counters, they do
+// not bring back a copy bar or a rows line.
+func TestFormatTableProgress_WaitingForDeploy(t *testing.T) {
+	output := ansiEscape.ReplaceAllString(FormatTableProgress(TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		Status:          state.Task.WaitingForDeploy,
+		DDL:             "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)",
+		RowsCopied:      400,
+		RowsTotal:       1000,
+		PercentComplete: 40,
+		Shards: []ShardProgress{
+			{Shard: "-80", Status: state.Task.WaitingForDeploy},
+			{Shard: "80-", Status: state.Task.WaitingForDeploy},
+		},
+	}), "")
+
+	assert.Contains(t, output, "users: ⏸️ Waiting for deploy\n")
+	assert.NotContains(t, output, "Running...")
+	assert.NotContains(t, output, "🟦", "the counters do not render a copy bar")
+	assert.NotContains(t, output, "Rows: 400", "the counters do not render copy progress")
+	assert.Contains(t, output, "ADD COLUMN `nickname` varchar(64);\n\n"+indentDetail+"Shards: 2",
+		"the DDL, a blank line, then the shard list, as every phase row lays them out")
 }
 
 func TestThrottleReferenceRequiresActiveRecognizedSignal(t *testing.T) {

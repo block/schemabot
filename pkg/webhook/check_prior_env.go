@@ -440,6 +440,15 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
 		return true, nil
+	case isStoppedAppliesAggregate(checkResult):
+		h.logger.Info("prior environment GitHub check is held by a stopped apply, blocking apply",
+			"repo", repo, "pr", pr,
+			"database", database,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_name", checkName, "check_title", checkResult.Title)
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByStoppedPriorEnvApply(database, environment, priorEnv))
+		return true, nil
 	default:
 		status := "has pending changes"
 		action := fmt.Sprintf("Apply %s first", priorEnv)

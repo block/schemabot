@@ -618,3 +618,26 @@ func TestChecksShowTargetRefusesAnAmbiguousOrIncompletePullRequest(t *testing.T)
 		require.Error(t, err)
 	})
 }
+
+func TestInspectionCoverageFailureKeepsRowsAndDoesNotClaimClearGate(t *testing.T) {
+	for _, blocking := range []bool{false, true} {
+		conclusion := checkstate.ConclusionSuccess
+		if blocking {
+			conclusion = checkstate.ConclusionFailure
+		}
+		var out bytes.Buffer
+		require.NoError(t, renderChecksInspection(&out, &apitypes.ChecksInspectResponse{
+			Repo: "org/repo", PullRequest: 1, HeadSHA: "head", ChecksEnabled: true,
+			CoverageError: "Could not determine which SchemaBot checks should exist.",
+			Rows:          []apitypes.InspectedCheck{{Environment: "production", Database: "orders", RecordedSHA: "head", CoversHead: true, Status: checkstate.StatusCompleted, Conclusion: conclusion, Blocking: blocking, Summary: "Schema configuration could not be read."}},
+		}))
+		assert.Contains(t, out.String(), "Check coverage unavailable:")
+		assert.Contains(t, out.String(), "orders")
+		assert.NotContains(t, out.String(), "Nothing is holding the merge gate open")
+		if blocking {
+			assert.Contains(t, out.String(), "Schema configuration could not be read")
+		} else {
+			assert.Contains(t, out.String(), "expected Check Run coverage could not be verified")
+		}
+	}
+}

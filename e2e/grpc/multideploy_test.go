@@ -360,7 +360,6 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
-	var sawSecondParked bool // second deployment reached waiting_for_cutover
 	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
 		func() bool {
 			ops := multiDeployOps(t, apply.ApplyID, first, second)
@@ -369,10 +368,6 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 			// Happy path: neither deployment should fail.
 			require.Falsef(t, failedApplyState(firstOp.State), "%s operation failed: %s", first, firstOp.ErrorMessage)
 			require.Falsef(t, failedApplyState(secondOp.State), "%s operation failed: %s", second, secondOp.ErrorMessage)
-
-			if state.IsState(secondOp.State, state.Apply.WaitingForCutover) {
-				sawSecondParked = true
-			}
 
 			// Barrier ordering invariant: the later deployment must never
 			// complete before the earlier one.
@@ -391,11 +386,13 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 		},
 	)
 
-	// Barrier engaged: the later deployment parked at the cutover barrier.
-	// Ordered cutover is checked by the in-poll violation guard and the
-	// completion timestamps below.
-	require.Truef(t, sawSecondParked,
-		"expected %s to park at waiting_for_cutover under barrier policy", second)
+	// Barrier engaged: both deployments parked at the cutover barrier. The
+	// apply log is the durable record of the park; sampling the operation
+	// states would miss it, since a driver claims the next cutover as soon as
+	// the one before it settles. Ordered cutover is checked by the in-poll
+	// violation guard and the completion timestamps below.
+	assert.GreaterOrEqualf(t, barrierParkTransitions(t, apply.ApplyID), 2,
+		"expected %s and %s to park at %s under barrier policy", first, second, state.Apply.WaitingForCutover)
 
 	// Completion timestamps confirm the earlier deployment cut over first.
 	final := multiDeployOperationStates(t, apply.ApplyID)
@@ -886,29 +883,9 @@ func TestGRPCMultiDeploy_BarrierReleaseBounded(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
-	// Phase 1: wait until the later deployment parks at the cutover barrier. The
-	// ordering invariant holds throughout — the later deployment must never
+	// Phase 1: wait for the earlier deployment to complete its ordered cutover.
+	// The ordering invariant holds throughout — the later deployment must never
 	// complete before the earlier one.
-	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
-		func() bool {
-			ops := multiDeployOps(t, apply.ApplyID, first, second)
-			require.Falsef(t, failedApplyState(ops[first].State), "%s operation failed: %s", first, ops[first].ErrorMessage)
-			require.Falsef(t, failedApplyState(ops[second].State), "%s operation failed: %s", second, ops[second].ErrorMessage)
-			if state.IsState(ops[second].State, state.Apply.Completed) {
-				require.Truef(t, state.IsState(ops[first].State, state.Apply.Completed),
-					"barrier violated: %s completed while %s was %q", second, first, ops[first].State)
-			}
-			return state.IsState(ops[second].State, state.Apply.WaitingForCutover)
-		},
-		func() string {
-			ops := multiDeployOperationStates(t, apply.ApplyID)
-			return fmt.Sprintf("waiting for %s to park at the cutover barrier; %s=%q %s=%q",
-				second, first, ops[first].State, second, ops[second].State)
-		},
-	)
-
-	// Phase 2: wait for the earlier deployment to complete its ordered cutover,
-	// still holding the ordering invariant.
 	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
 		func() bool {
 			ops := multiDeployOps(t, apply.ApplyID, first, second)
@@ -927,11 +904,11 @@ func TestGRPCMultiDeploy_BarrierReleaseBounded(t *testing.T) {
 		},
 	)
 
-	// Phase 3 — the guard: the earlier deployment is completed and the later one
-	// was observed parked at the barrier, so the only remaining work is the
-	// ordered cutover claim releasing and driving the parked successor. It must
-	// reach completed within the short post-barrier deadline; a stranded barrier
-	// fails here fast rather than hanging until the broad rollout deadline.
+	// Phase 2 — the guard: the earlier deployment is completed, so the only
+	// remaining work is the ordered cutover claim releasing and driving the
+	// parked successor. It must reach completed within the short post-barrier
+	// deadline; a stranded barrier fails here fast rather than hanging until the
+	// broad rollout deadline.
 	testutil.Poll(t, barrierReleaseDeadline, testutil.PollInterval,
 		func() bool {
 			ops := multiDeployOps(t, apply.ApplyID, first, second)
@@ -947,7 +924,25 @@ func TestGRPCMultiDeploy_BarrierReleaseBounded(t *testing.T) {
 		},
 	)
 
+	// The successor was released from the barrier rather than cut over without
+	// parking: the apply log records both deployments parking there.
+	assert.GreaterOrEqualf(t, barrierParkTransitions(t, apply.ApplyID), 2,
+		"expected %s and %s to park at %s before their ordered cutovers", first, second, state.Apply.WaitingForCutover)
+
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}
+
+// barrierParkTransitions counts the apply log's state transitions into
+// waiting_for_cutover, one per operation that parked at the cutover barrier.
+func barrierParkTransitions(t *testing.T, applyID string) int {
+	t.Helper()
+	parked := 0
+	for _, e := range grpcApplyLogs(t, applyID, 500) {
+		if e.EventType == "state_transition" && state.IsState(e.NewState, state.Apply.WaitingForCutover) {
+			parked++
+		}
+	}
+	return parked
 }
 
 // TestGRPCMultiDeploy_TargetsRolloutThroughCLI runs a multi-target rollout

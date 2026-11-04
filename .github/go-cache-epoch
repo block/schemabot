@@ -1,0 +1,5 @@
+# The Go build cache key hashes this file alongside go.sum. actions/cache never
+# overwrites an existing key, so a build the Build job in test.yaml starts warming
+# reaches the saved cache only under a new key. Bump the number below whenever
+# that job warms a build the cache does not yet hold.
+1

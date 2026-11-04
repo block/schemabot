@@ -175,10 +175,22 @@ var narrowedApplyBlock = checkBlockReason{
 	message:        "Rolling out one target at a time. Apply the rest of the environment to finish.",
 }
 
-// noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
-// the server-configured environments for the database do not overlap this
-// service's allowed_environments. SchemaBot cannot safely plan the schema
-// change in that configuration, so the aggregate check must fail closed.
+// planFailedUnrecordedBlock is carried by the failing aggregate posted for an
+// environment that could not plan while another environment of the same plan
+// did, when the failing check row recording that could not be stored either.
+// Stored check state then holds nothing of the failure, so a fold from it, on
+// this plan or on a later plan of another environment, could pass on the
+// environments that did plan. The block keeps every such fold off the
+// aggregate until auto-plan re-verifies the PR and durably invalidates prior
+// successful results. Only replacement results can then pass the aggregate.
+var planFailedUnrecordedBlock = checkBlockReason{
+	blockingReason: checkstate.BlockPlanFailedUnrecorded,
+	message:        planFailedUnstoredSummary,
+}
+
+// noAllowedConfiguredEnvironmentsBlock holds the gate when a changed database
+// has no configured environments. A known database registered only in another
+// publisher's environments instead has verified no local work.
 var noAllowedConfiguredEnvironmentsBlock = checkBlockReason{
 	blockingReason: checkstate.BlockNoAllowedConfiguredEnvironments,
 	message:        "SchemaBot found schema changes, but no configured environment for this database is allowed for this SchemaBot deployment. Align server environment configuration with allowed_environments, then retry the check.",
@@ -205,5 +217,6 @@ var allCheckBlockReasons = []checkBlockReason{
 	namespacePlacementRefusedBlock,
 	noAllowedConfiguredEnvironmentsBlock,
 	narrowedApplyBlock,
+	planFailedUnrecordedBlock,
 	{blockingReason: participantUnresolvedBlockingReason},
 }

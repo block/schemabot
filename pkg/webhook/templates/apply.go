@@ -34,6 +34,10 @@ type TableProgressData struct {
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
+	// EstimatedRows is the table's row count when it was planned, shown while
+	// the table is queued and before the engine reports RowsTotal. Nil when
+	// the plan had no estimate.
+	EstimatedRows *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -44,6 +48,9 @@ type TableProgressData struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
+	// Started reports that the engine began the table's change: its task
+	// left the queue, whether or not it reported rows before it settled.
+	Started bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying or
@@ -106,15 +113,32 @@ func countReadyForCutover(tables []TableProgressData) int {
 	return ready
 }
 
-// ShardProgressData is the high-level status of one shard, for the compact
-// per-shard summary in the PR comment. It intentionally carries only state +
-// percent (no row counts/ETA) to keep the comment quiet.
+// ShardProgressData is one shard's or target's progress, for the compact
+// per-part summary in the PR comment: its state, copy figures, and verify
+// figures, with no ETA to keep the comment quiet.
 type ShardProgressData struct {
 	Shard           string
 	Status          string // canonical lowercase shard/task state
 	PercentComplete int
 	RowsCopied      int64
 	RowsTotal       int64
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// member's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a member whose copy is still
+	// ahead with no total reported, so a queued target says how much it will
+	// copy.
+	PlannedRows *int64
+}
+
+// part is the shard or target as the shared part listing reads it.
+func (m ShardProgressData) part() presentation.Part {
+	return presentation.Part{
+		Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal,
+		ChecksumRowsChecked: m.ChecksumRowsChecked, ChecksumRowsTotal: m.ChecksumRowsTotal,
+		PlannedRows: m.PlannedRows,
+	}
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -175,12 +199,19 @@ type ApplyStatusCommentData struct {
 	Rollback bool
 
 	// DeferCutover reports whether cutover waits on an explicit operator
-	// trigger (the apply's durable defer-cutover option). It selects the
-	// waiting-for-cutover footer: deferred applies get the pasteable
-	// `schemabot cutover` command, while non-deferred applies get a note that
-	// the drive triggers cutover automatically — surfacing the command there
-	// would tell the operator to act when no action is needed.
+	// trigger (the apply's durable defer-cutover option). Before cutover it
+	// is listed on the options line above the status, so a reader of a long
+	// copy or checksum knows the apply will pause and wait for them. It also
+	// selects the waiting-for-cutover footer: deferred applies get the
+	// pasteable `schemabot cutover` command, while non-deferred applies get a
+	// note that the drive triggers cutover automatically — surfacing the
+	// command there would tell the operator to act when no action is needed.
 	DeferCutover bool
+
+	// SkipRevert reports whether the apply was started with --skip-revert (the
+	// apply's durable skip-revert option). Before cutover it is listed on the
+	// options line beside DeferCutover, as the plan listed it.
+	SkipRevert bool
 
 	// PlanID names the plan this member is running, alongside the database and
 	// the apply identifier. It is set only when the members of one apply do not
@@ -234,6 +265,12 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
+
+	// The apply's options sit above the status: they hold for the whole apply
+	// while the status changes on every update.
+	if !data.InRolloutSection {
+		writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
+	}
 
 	// Status line. For the revert window it carries the countdown to permanence
 	// inline (e.g. "Revert Window | Closes in 28m 30s") so the operator sees the
@@ -430,10 +467,56 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 		}
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
+	if state.IsState(data.State, state.Apply.Pending) {
+		sb.WriteString("\n" + queuedApplyExplanation + "\n")
+	}
 	if state.IsState(data.State, state.Apply.Failed) {
 		writeSupportChannelOffer(sb)
 	}
 }
+
+// writeApplyOptions writes the apply's options line while the apply is still
+// working toward its cutover, listing every option it was started with the way
+// the plan did. For a deferred apply it tells the reader of a long copy that
+// the apply will wait for them at the cutover gate. Once a deferred apply waits
+// for cutover the footer gives the command itself, and after cutover the
+// options have nothing left to tell the reader.
+func writeApplyOptions(sb *strings.Builder, deferCutover, skipRevert bool, applyState string) {
+	if !precedesCutover(applyState) {
+		return
+	}
+	writeOptionsLine(sb, deferCutover, skipRevert)
+}
+
+// precedesCutover reports whether an apply in this state has not yet reached
+// cutover and will go through it: queued, copying rows or in a post-copy phase,
+// resuming that work, or preparing a PlanetScale branch and deploy request.
+// States that may or may not still be before cutover (recovering, retrying,
+// stopped, or a degraded rollout whose other deployments may already be
+// cutting over) are left out, so the line never claims a pause that has
+// passed.
+func precedesCutover(applyState string) bool {
+	return state.IsState(applyState,
+		state.Apply.Pending,
+		state.Apply.Resuming,
+		state.Apply.Running,
+		state.Apply.CatchingUp,
+		state.Apply.Checksumming,
+		state.Apply.PostChecksum,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest)
+}
+
+// queuedApplyExplanation follows the status line of an apply SchemaBot has
+// accepted but not yet started. A queued apply can wait while other schema
+// changes hold SchemaBot's capacity, and without this line a comment that stays
+// queued reads the same as one that hung. It says only what is true however
+// long the wait: the change starts without anyone acting, and the comment
+// follows it once it does.
+const queuedApplyExplanation = "This schema change starts automatically, and this comment updates once it does."
 
 func applyStatusDetail(applyState string) string {
 	applyState = state.NormalizeState(applyState)
@@ -453,7 +536,7 @@ func applyStatusDetail(applyState string) string {
 	case state.Apply.Reverting:
 		return "Reverting"
 	case state.Apply.Pending:
-		return "Starting"
+		return "Queued"
 	case state.Apply.Running, state.Apply.RunningDegraded:
 		return "In Progress"
 	case state.Apply.CatchingUp:
@@ -780,7 +863,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData,
 			// the schema change continues from its checkpoint or restarts from scratch,
 			// so the row-copy percent is indeterminate. Render state-only until the
 			// apply transitions to running and real progress is known.
-			if data.State == state.Apply.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(table.Status)) {
+			if resumesTable(data.State, table) {
 				renderResumingTable(sb, dialect, table, budget)
 				continue
 			}
@@ -841,6 +924,18 @@ func namespaceLabel(engine string) string {
 		return "Keyspace"
 	}
 	return "Schema"
+}
+
+// resumesTable reports whether a table of an apply in applyState is one the
+// start picks back up: the apply is resuming and the table is neither finished
+// nor still to begin. A table that never started has nothing to resume, so it
+// stays queued, as a rollout reads it.
+func resumesTable(applyState string, table TableProgressData) bool {
+	if !state.IsState(applyState, state.Apply.Resuming) {
+		return false
+	}
+	status := state.NormalizeTaskStatus(table.Status)
+	return !state.IsTerminalTaskState(status) && status != state.Task.Pending
 }
 
 // renderResumingTable renders a table while the apply is resuming, before the
@@ -935,6 +1030,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	case state.Task.Pending:
 		fmt.Fprintf(sb, "**%s**: \u23f3 Queued\n", inlineCode(table.TableName))
 		writeDDLLine(sb, dialect, table.DDL, budget)
+		writePlannedRows(sb, table.EstimatedRows, table.EstimatedBytes, "")
 
 	case state.Task.Completed:
 		bar := ui.ProgressBarComplete()
@@ -981,6 +1077,13 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 
 	case state.Task.WaitingForCutover:
 		fmt.Fprintf(sb, "**%s**: %s Waiting for cutover\n", inlineCode(table.TableName), ui.ProgressBarWaitingCutover())
+		writeDDLLine(sb, dialect, table.DDL, budget)
+
+	case state.Task.WaitingForDeploy:
+		// The deploy request is staged and waits for the operator to deploy it.
+		// Nothing has run on the target yet, so no bar: a bar would read as a
+		// copy underway.
+		fmt.Fprintf(sb, "**%s**: ⏸️ Waiting for deploy\n", inlineCode(table.TableName))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Recovering:
@@ -1044,7 +1147,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		}
 
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**%s**: 🚫 Cancelled (not started)\n", inlineCode(table.TableName))
+		fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), cancelledTablePhrase(table))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.RevertWindow:
@@ -1057,6 +1160,12 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	case state.Task.Reverting:
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(sb, "**%s**: %s \u21a9\ufe0f Reverting\n", inlineCode(table.TableName), bar)
+		writeDDLLine(sb, dialect, table.DDL, budget)
+
+	case state.Task.Reverted:
+		// The change was applied, then undone at an operator's request. A full
+		// orange bar: settled, and the change is no longer in effect.
+		fmt.Fprintf(sb, "**%s**: %s \u21a9\ufe0f Reverted\n", inlineCode(table.TableName), ui.ProgressBar(100, ui.ColorOrange))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Stopped:
@@ -1072,43 +1181,30 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
-// shardSummaryBreakdownState reports whether a table's aggregate status is
-// in-flight work whose line carries the compact per-shard breakdown.
-func shardSummaryBreakdownState(status string) bool {
-	switch state.NormalizeTaskStatus(status) {
-	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
-		return true
-	default:
-		return false
-	}
-}
-
-// renderShardSummary lists a sharded table's shards while it is in flight.
+// renderShardSummary lists a sharded table's shards while it is in flight. A
+// settled table's line already says where it ended, so the listing stays out
+// of the way then.
 func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
-	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, presentation.PendingQueued, budget)
+	if !presentation.ListsParts(table.Status) {
+		return // completed/pending/cancelled/failed: no breakdown, stay quiet
+	}
+	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, budget)
 }
 
 // writeMemberList lists a table's members, the shards of a sharded table or
-// the targets of a multi-target deployment, while the table is in flight: a
-// line counting them by state, then one line per member with its state in
-// words. It is the listing the CLI shows (presentation.ListParts), so a wide
-// table names only its failures and slowest members, leaving the rest to the
-// counts, rather than growing a line per member. A settled table's line
-// already says where it ended, so the listing stays out of the way then. A
-// comment that would not fit otherwise keeps only the line counting them
+// the targets of a multi-target deployment: a line counting them by state,
+// then one line per member with its state in words. Its callers decide when a
+// table lists its members (presentation.ListsParts, presentation.ListsTargets).
+// It is the listing the CLI shows (presentation.ListParts), so a wide table
+// names only its failures and slowest members, leaving the rest to the counts,
+// rather than growing a line per member. A comment that would not fit otherwise keeps only the line counting them
 // (ddlBlockBudget.listsMembers). pendingWord names the members still to run
 // (presentation.PendingWord), in the count and on their lines alike.
-func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
 	if len(members) <= 1 {
 		return
 	}
-	if !shardSummaryBreakdownState(status) {
-		return // completed/pending/cancelled/failed: no breakdown, stay quiet
-	}
-	part := func(i int) presentation.Part {
-		m := members[i]
-		return presentation.Part{Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal}
-	}
+	part := func(i int) presentation.Part { return members[i].part() }
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	c.PendingLabel = pendingWord
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
@@ -1189,6 +1285,31 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
+}
+
+// tableBegan reports whether the engine began a table's change before it
+// settled. A table with rows copied began even where the data carries no
+// start signal of its own.
+func tableBegan(table TableProgressData) bool {
+	return table.Started || copiedRows(table)
+}
+
+// copiedRows reports whether a table's row copy made any progress.
+func copiedRows(table TableProgressData) bool {
+	return table.PercentComplete > 0 || table.RowsCopied > 0
+}
+
+// cancelledTablePhrase is a cancelled table's state: how far its row copy
+// had come when the cancel stopped it, or that it was never started.
+func cancelledTablePhrase(table TableProgressData) string {
+	switch {
+	case copiedRows(table):
+		return "Cancelled at " + ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
+	case tableBegan(table):
+		return "Cancelled"
+	default:
+		return "Cancelled (not started)"
+	}
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
@@ -1285,6 +1406,18 @@ func countTablesWithDDL(tables []TableProgressData) int {
 		}
 	}
 	return count
+}
+
+// writePlannedRows writes the rows line of a table no engine has reported on
+// yet: the plan's row estimate and size, both approximate, so the work ahead
+// is visible before the copy starts. span names the targets the estimate
+// covers when it is summed across several. It writes nothing when the plan
+// had no row estimate.
+func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64, span string) {
+	if estimatedRows == nil {
+		return
+	}
+	fmt.Fprintf(sb, "- Rows: %s%s%s\n", ui.FormatApproxRows(*estimatedRows), span, ui.FormatTableSizeClause(estimatedBytes))
 }
 
 // writeRowsAndETA writes the rows copied / total line with optional ETA.
@@ -1793,7 +1926,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 	if states[state.Task.Failed] {
 		return glyph.Failed
 	}
-	if states["reverted"] {
+	if states[state.Task.Reverted] {
 		return "↩️"
 	}
 	if states[state.Task.Stopped] {
@@ -1833,10 +1966,14 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 			label = fmt.Sprintf("Stopped at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		}
 		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), label)
-	case "reverted":
+	case state.Task.Reverted:
 		fmt.Fprintf(sb, "**%s** — Reverted\n", inlineCode(t.TableName))
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**%s** — Cancelled\n", inlineCode(t.TableName))
+		label := "Cancelled"
+		if copiedRows(t) {
+			label = fmt.Sprintf("Cancelled at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+		}
+		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), label)
 	default:
 		// Unknown or in-flight statuses still get a visible label — a bare
 		// table name reads as success, which is wrong for anything but
@@ -1882,6 +2019,8 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+		DeferCutover: resp.Options["defer_cutover"] == "true",
+		SkipRevert:   resp.Options["skip_revert"] == "true",
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 	if step, err := apitypes.ParseProgressStep(resp.Metadata); err != nil {

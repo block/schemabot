@@ -116,7 +116,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	// retains them as blocking.
 	h.cleanupStaleChecks(repo, pr, headSHA, installationID, nil)
 
-	if h.isAggregateParticipant(repo) {
+	if h.isAggregateParticipant(repo) && !h.participantPathsTouched(repo, files) {
 		h.logger.Info("aggregate participant staying silent on plan for PR with no managed schema changes",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
 		return nil
@@ -148,11 +148,17 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	return nil
 }
 
+// prHasCurrentSchemaBotFiles reports whether a command must go through normal
+// config discovery rather than the "no managed schema changes" path. It reads
+// the same schema paths discovery walks up from, so a rename that vacates a
+// schema path (users.sql renamed to users.sql.disabled, or moved out of the
+// config directory) counts, as a deletion does: merging it stops declaring
+// that file's tables, and refreshing the checks as passing would hide that.
 func prHasCurrentSchemaBotFiles(files []ghclient.PRFile) bool {
+	if len(ghclient.DiscoverySchemaPaths(files)) > 0 {
+		return true
+	}
 	for _, file := range files {
-		if strings.HasSuffix(file.Filename, ".sql") || strings.HasSuffix(file.Filename, "vschema.json") {
-			return true
-		}
 		if path.Base(file.Filename) == ghclient.ConfigFileName && !strings.EqualFold(file.Status, "removed") {
 			return true
 		}

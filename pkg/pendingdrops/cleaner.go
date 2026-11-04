@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -181,8 +182,16 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 	cutoff := now.Add(-c.retention)
 	var dropped, wouldDrop, kept, skipped int
 	var dropErr error
+	hasLog := false
+	remaining := make([]string, 0, len(tables))
 
 	for _, tableName := range tables {
+		if tableName == LogTable {
+			// The quarantine log records which apply moved each table here;
+			// it is not a quarantined table and is never dropped.
+			hasLog = true
+			continue
+		}
 		quarantinedAt, ok := ParseTimestamp(tableName)
 		if !ok {
 			c.logger.Warn("pending drops cleanup: table name has no valid timestamp prefix, table will never be auto-dropped",
@@ -191,10 +200,12 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 				"table", tableName,
 			)
 			metrics.RecordPendingDropsCleanupSkipped(ctx, target.Database, target.Environment)
+			remaining = append(remaining, tableName)
 			skipped++
 			continue
 		}
 		if !quarantinedAt.Before(cutoff) {
+			remaining = append(remaining, tableName)
 			kept++
 			continue
 		}
@@ -207,6 +218,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 				"table", tableName,
 				"age", age,
 			)
+			remaining = append(remaining, tableName)
 			wouldDrop++
 			continue
 		}
@@ -220,6 +232,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 				"error", err,
 			)
 			metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "drop_error")
+			remaining = append(remaining, tableName)
 			dropErr = err
 			continue
 		}
@@ -233,6 +246,8 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		dropped++
 	}
 
+	prunedRecords, logErr := c.pruneQuarantineLog(ctx, conn, target, hasLog, remaining, cutoff)
+
 	attrs := []any{
 		"database", target.Database,
 		"environment", target.Environment,
@@ -241,15 +256,64 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		"skipped_unparseable", skipped,
 	}
 	if c.dryRun {
-		attrs = append(attrs, "would_drop", wouldDrop)
+		attrs = append(attrs, "would_drop", wouldDrop, "would_prune_log_records", prunedRecords)
 	} else {
-		attrs = append(attrs, "dropped", dropped)
+		attrs = append(attrs, "dropped", dropped, "pruned_log_records", prunedRecords)
 	}
 	c.logger.Info("pending drops cleanup pass complete", attrs...)
+
+	// Both causes are kept: a pass that could neither drop a copy nor read
+	// the log has two things for an operator to look at.
+	var errs []error
 	if dropErr != nil {
-		return fmt.Errorf("drop expired pending drops tables on %s/%s: %w", target.Database, target.Environment, dropErr)
+		errs = append(errs, fmt.Errorf("drop expired pending drops tables on %s/%s: %w", target.Database, target.Environment, dropErr))
 	}
-	return nil
+	if logErr != nil {
+		errs = append(errs, fmt.Errorf("prune %s.%s on %s/%s: %w", Database, LogTable, target.Database, target.Environment, logErr))
+	}
+	return errors.Join(errs...)
+}
+
+// pruneQuarantineLog deletes the quarantine log records of copies past
+// retention that no longer exist: copies this or an earlier pass dropped, and
+// copies whose RENAME never landed. remaining lists the pending drops tables
+// still present after this pass. A dry run reports how many records it would
+// delete and deletes none, and a target with no log has nothing to prune.
+func (c *Cleaner) pruneQuarantineLog(ctx context.Context, conn *sql.Conn, target Target, hasLog bool, remaining []string, cutoff time.Time) (int, error) {
+	if !hasLog {
+		return 0, nil
+	}
+	expired, err := expiredLogRecords(ctx, conn, remaining, cutoff)
+	if err != nil {
+		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "log_error")
+		return 0, err
+	}
+	if c.dryRun {
+		for _, name := range expired {
+			c.logger.Info("pending drops cleanup dry run: quarantine log record of a copy that is gone would be deleted",
+				"database", target.Database,
+				"environment", target.Environment,
+				"quarantine_table", name,
+			)
+		}
+		return len(expired), nil
+	}
+	deleteSQL := "DELETE FROM `" + Database + "`.`" + LogTable + "` WHERE quarantine_table = ?"
+	pruned := 0
+	for _, name := range expired {
+		if _, err := conn.ExecContext(ctx, deleteSQL, name); err != nil {
+			c.logger.Error("pending drops cleanup: could not delete the quarantine log record of a copy that is gone; it is deleted on a later pass",
+				"database", target.Database,
+				"environment", target.Environment,
+				"quarantine_table", name,
+				"error", err,
+			)
+			metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "log_error")
+			return pruned, fmt.Errorf("delete log record of %s: %w", name, err)
+		}
+		pruned++
+	}
+	return pruned, nil
 }
 
 func targetLockName(target Target) string {

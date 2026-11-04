@@ -150,6 +150,13 @@ apply does not do better.
 is the deliberate pause state: resuming through the `start` command re-checks
 that no other apply is active on the same target, then hands the work to a
 fresh driver, continuing from engine checkpoints rather than starting over.
+A `stop` sent before any driver has acted on that `start` withdraws it: the
+apply stays `stopped` and the response carries `"status": "start_withdrawn"`.
+When the apply belongs to a PR, the PR is told: a `stop` command on the PR says
+so in its reply, and a `stop` sent from anywhere else gets a "Start Withdrawn"
+comment on the PR.
+A `stop` on a `stopped` apply with no `start` waiting is refused with
+`409 already_stopped`.
 
 ## The retry budget
 
@@ -161,7 +168,9 @@ apply to `failed_retryable` instead of `failed`, and recovery is automatic: a
 recovery driver reclaims the apply and continues it from where it left off,
 using engine checkpoints so completed work is not redone. Failures where
 retrying cannot help — the engine rejected a statement, the target refused the
-change — skip this state and go straight to permanent `failed`.
+change, a row already in the table cannot be stored under the new definition
+(a NULL in a column the change makes `NOT NULL`) — skip this state and go
+straight to permanent `failed`.
 
 A clean shutdown is not one of these failures. A process that stops on purpose
 hands its claims back and leaves the apply active, so a peer driver resumes it
@@ -221,6 +230,21 @@ change that the plan the caller reviewed never disclosed is refused as
 `400 invalid_request` instead, because no opt-in covers a change the caller
 was not shown: review that member's own plan and apply it in an apply narrowed
 to that member.
+
+An apply started with `--defer-cutover` that would keep more drivers waiting
+at its cutover than `max_drivers_per_apply` gives one apply, or than the
+fleet's servers have, is refused with `deferred_cutover_capacity`
+([Deferred cutover capacity](configuration.md#deferred-cutover-capacity)).
+Its status says whether a retry can help:
+
+- `409 deferred_cutover_capacity` means no server running drivers has
+  checked in during the last minute. Retry once SchemaBot's drivers are
+  running, or apply without `--defer-cutover`.
+- `422 deferred_cutover_capacity` means the apply is wider than
+  `max_drivers_per_apply`, or than every live server's drivers together. The
+  `error` names which to raise and by how much: `max_drivers_per_apply`, or
+  the servers' `drivers` or replica count. Otherwise apply without
+  `--defer-cutover`.
 
 No apply record is created for any of these refusals. Match `error_code`
 rather than parsing the human-readable `error` field.

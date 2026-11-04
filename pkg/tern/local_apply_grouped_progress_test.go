@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -551,4 +552,67 @@ func TestApplyEngineTableDisplayFields_BoundsTheThrottleReason(t *testing.T) {
 	assert.Equal(t, engine.SanitizeThrottleReason(reason), task.ThrottleReason)
 	assert.LessOrEqual(t, len(task.ThrottleReason), 255, "the reason fits the throttle_reason column")
 	assert.True(t, strings.HasPrefix(task.ThrottleReason, "replica lag / x"))
+}
+
+// erroringProgressEngine is an externally authoritative engine whose every
+// progress poll fails with a transient error, as when the provider's API is
+// rate limiting or unreachable while the deploy request keeps running.
+type erroringProgressEngine struct {
+	engine.Engine
+	calls int
+}
+
+func (e *erroringProgressEngine) Name() string { return "planetscale" }
+
+func (e *erroringProgressEngine) ProgressIsExternallyAuthoritative() bool { return true }
+
+func (e *erroringProgressEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	e.calls++
+	return nil, errors.New("get deploy request: rate limited")
+}
+
+// A Vitess apply's deploy request keeps running on the provider whatever the
+// drive concludes. When every progress poll fails, the drive cannot see the
+// work, which says nothing about its health, so once the poll's error budget
+// is spent the apply pauses as failed_retryable for a later claim to reattach
+// to the same deploy request. It is never failed outright over live work.
+func TestPollForCompletionAtomic_VitessProgressOutagePausesApplyForRetry(t *testing.T) {
+	eng := &erroringProgressEngine{}
+	client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, maxConsecutiveProgressPollErrors, eng.calls, "the poll spends its whole error budget first")
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
+	assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("progress polling failed after %d consecutive errors", maxConsecutiveProgressPollErrors))
+	assert.Contains(t, apply.ErrorMessage, "rate limited")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.FailedRetryable, task.State, "task %s", task.TaskIdentifier)
+	}
+	assert.NotContains(t, recording.states, state.Task.Failed, "no task is failed outright")
+}
+
+// Once a Vitess apply has cut over and its revert window is open, the
+// revert-phase task states are what make a recovery claim reattach to the
+// deploy request instead of settling the tasks from a schema comparison that
+// matches the reviewed target until a revert lands. A progress outage in that
+// phase therefore never pauses the apply as failed_retryable, which would
+// rewrite those states and let recovery complete an apply the provider can
+// still revert: no task is ever written failed_retryable, and the apply is
+// failed rather than left for a recovery to settle as completed.
+func TestPollForCompletionAtomic_VitessProgressOutageInRevertWindowDoesNotPause(t *testing.T) {
+	eng := &erroringProgressEngine{}
+	client, apply, tasks, recording := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetAmple, state.Task.RevertWindow)
+	apply.State = state.Apply.RevertWindow
+	client.storage.(*exactProgressStorage).applies.(*snapshotApplyStore).stored.State = state.Apply.RevertWindow
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, maxConsecutiveProgressPollErrors, eng.calls, "the poll spends its whole error budget first")
+	assert.Equal(t, state.Apply.Failed, apply.State, "a revert-phase apply is not paused for a recovery to settle from schema")
+	assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("progress polling failed after %d consecutive errors", maxConsecutiveProgressPollErrors))
+	assert.NotContains(t, recording.states, state.Task.FailedRetryable, "no revert-phase task is rewritten failed_retryable")
+	for _, task := range tasks {
+		assert.NotEqual(t, state.Task.Completed, task.State, "task %s", task.TaskIdentifier)
+	}
 }

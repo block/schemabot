@@ -64,7 +64,7 @@ func TestRollbackPreviewUsesTargetDialect(t *testing.T) {
 			var runErr error
 			output := captureStdout(func() {
 				cmd := RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
-				runErr = cmd.Run(&Globals{Endpoint: server.URL})
+				runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
 			})
 			require.NoError(t, runErr)
 			plain := stripAnsi(output)
@@ -118,7 +118,7 @@ func TestRollbackCmd_ApplySaysItShowedThePlanEveryMemberRuns(t *testing.T) {
 	var runErr error
 	captureStdout(func() {
 		cmd := RollbackCmd{ApplyID: "apply-example-85", Environment: "production", AutoApprove: true}
-		runErr = cmd.Run(&Globals{Endpoint: server.URL})
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
 	})
 	require.Error(t, runErr, "the recording server fails the apply once it is requested")
 	require.Len(t, applied, 1, "the rollback is applied: %v", runErr)

@@ -205,7 +205,7 @@ type keyspaceResult struct {
 // current schema and builds the keyspace's SchemaChange, including the VSchema
 // diff and the metadata that gates VSchema removals and in-place mutations.
 func (e *Engine) planKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) (*keyspaceResult, error) {
-	diff, diffErr := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, currentSchema)
+	diff, diffErr := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, currentSchema, rereadMissingVSchema)
 	if diffErr != nil {
 		return nil, diffErr
 	}

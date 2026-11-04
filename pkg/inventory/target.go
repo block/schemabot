@@ -1,7 +1,17 @@
 // Package inventory resolves opaque data-plane targets into inventory records.
 package inventory
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrTargetNotFound is wrapped by a Resolver when the inventory answered and
+// holds no record of the requested target. It is not returned for a lookup
+// that failed, so a caller visiting targets it learned of elsewhere (such as
+// from stored applies) can tell a target that left the inventory from one it
+// could not read.
+var ErrTargetNotFound = errors.New("target not found in the inventory")
 
 // Request identifies the opaque execution target a data plane must look up.
 // For inventory-backed deployments, Target is typically a DSID. Static

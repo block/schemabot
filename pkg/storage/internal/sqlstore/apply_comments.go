@@ -14,7 +14,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, summarized_state, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -23,7 +23,7 @@ type applyCommentStore struct {
 }
 
 // applyCommentUpsertStatement renders Upsert's statement. Both renderings bind
-// the five inserted columns first; the leased rendering then binds the apply ID
+// the seven inserted columns first; the leased rendering then binds the apply ID
 // and the lease token.
 //
 // The unleased rendering is a plain VALUES upsert. The leased rendering selects
@@ -35,28 +35,30 @@ type applyCommentStore struct {
 // statement's snapshot still holds, at whatever isolation level the storage
 // session runs.
 func applyCommentUpsertStatement(d Dialect, leased bool) string {
-	const insert = "INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id) "
+	const insert = "INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id, summarized_state) "
 	upsert := d.UpsertClause(
 		[]string{"apply_id", "comment_state"},
 		[]UpsertAssignment{
 			{Column: "github_comment_id"},
 			{Column: "posted_phase"},
+			{Column: "posted_cutover_operation_id"},
 			{Column: "pending_freeze_github_comment_id"},
+			{Column: "summarized_state"},
 			{Column: "superseded_at", Expr: "NULL"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
 	)
 	if !leased {
-		return insert + "VALUES (?, ?, ?, ?, ?) " + upsert
+		return insert + "VALUES (?, ?, ?, ?, ?, ?, ?) " + upsert
 	}
-	return insert + "SELECT ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token") + " " + upsert
+	return insert + "SELECT ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token") + " " + upsert
 }
 
 // Upsert creates or updates a comment record.
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
-// posted_phase, and pending_freeze_github_comment_id so the
-// row always describes the currently tracked comment and the freeze it may
-// still owe. The conflict path also clears superseded_at (the row is live
+// posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id,
+// and summarized_state so the row always describes the currently tracked
+// comment and the freeze it may still owe. The conflict path also clears superseded_at (the row is live
 // again) and stamps updated_at: that column is the summary-claim freshness
 // signal read by ReclaimStaleSummaryClaim, not incidental audit metadata, so
 // every mutation must renew it explicitly on both dialects.
@@ -67,12 +69,12 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	}
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, false),
-			comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID)
+			comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID, comment.SummarizedState)
 		return err
 	}
 
 	result, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, true),
-		comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
+		comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID, comment.SummarizedState, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -260,23 +262,32 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 }
 
 // ClaimSummaryComment atomically claims the terminal summary publish for an
-// apply by inserting the summary marker as a claim sentinel
+// apply in terminalState by inserting the summary marker as a claim sentinel
 // (github_comment_id = 0). The unique key on (apply_id, comment_state) makes
 // this a race-safe first-writer-wins: the insert that lands the row wins the
-// claim. When the row already exists but is superseded — a stop's posted
-// summary marker consumed by a resume rotation — that summary belongs to an
-// earlier terminal state, so the current terminal state's summary is still
-// owed: the conditional update converts the superseded row back into a claim
-// sentinel, and exactly one concurrent claimant sees the affected row. Only a
-// row that records a posted comment is reclaimable this way — a superseded
-// claim sentinel belongs to a publish that is still in flight or crashed
-// mid-publish, and stealing it here would hand two writers the same claim;
-// abandoned sentinels are recovered by ReclaimStaleSummaryClaim instead.
-// Losing both paths means another writer already claimed or posted the
-// summary for the current terminal state. Deliberately lease-agnostic — the
-// claim itself is the exactly-once authority, so a publisher whose apply
-// lease was re-claimed can still win or lose cleanly.
-func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error) {
+// claim.
+//
+// An existing row that records a posted summary for an earlier terminal state
+// does not block the claim, since the current terminal state's summary is
+// still owed. Two shapes qualify: a row a resume rotation superseded (a stop's
+// summary consumed when the apply resumed), and an active row whose
+// summarized_state names a different terminal state that the apply can leave
+// (a stop's summary the apply reached its next terminal state before any
+// rotation consumed, or one a rotation marked rotated past). A row recording a
+// settled state always blocks: a settled outcome is final, so a claimant
+// asking for any other state is acting on a stale read of the apply. The
+// conditional update converts either back into a claim sentinel, and exactly
+// one concurrent claimant sees the affected row. Only a row that records a
+// posted comment is reclaimable this way — a claim sentinel belongs to a
+// publish that is still in flight or crashed mid-publish, and stealing it here
+// would hand two writers the same claim; abandoned sentinels are recovered by
+// ReclaimStaleSummaryClaim instead. An active row with no summarized_state
+// predates the state being recorded and blocks the claim as before. Losing
+// both paths means another writer already claimed or posted the summary for
+// the current terminal state. Deliberately lease-agnostic — the claim itself
+// is the exactly-once authority, so a publisher whose apply lease was
+// re-claimed can still win or lose cleanly.
+func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int64, terminalState string) (bool, error) {
 	insertIfAbsent := s.dialect.InsertIfAbsent([]string{"apply_id", "comment_state"})
 	result, err := s.db.ExecContext(ctx, `
 		INSERT`+insertIfAbsent.Modifier+` INTO apply_comments (apply_id, comment_state, github_comment_id)
@@ -284,11 +295,11 @@ func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int
 		`+insertIfAbsent.Suffix+`
 	`, applyID, state.Comment.Summary)
 	if err != nil {
-		return false, fmt.Errorf("claim summary comment for apply %d: %w", applyID, err)
+		return false, fmt.Errorf("claim summary comment for apply %d (%s): %w", applyID, terminalState, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("read summary claim rows affected for apply %d: %w", applyID, err)
+		return false, fmt.Errorf("read summary claim rows affected for apply %d (%s): %w", applyID, terminalState, err)
 	}
 	if rows == 1 {
 		return true, nil
@@ -297,20 +308,106 @@ func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int
 	// The converted sentinel starts a new claim: stamping updated_at restarts
 	// its staleness window so ReclaimStaleSummaryClaim cannot immediately hand
 	// the same claim to a second publisher.
+	//
+	// A marker that records another terminal state is reclaimed only while the
+	// apply is still in the state being claimed. A reconciliation pass reads its
+	// batch once and claims later, so the apply may have been started again in
+	// between; recording a summary of the earlier state under a running apply
+	// would leave that summary blocking the next claim of the same state.
+	settled := settledApplyStates()
+	args := []any{applyID, state.Comment.Summary, terminalState}
+	args = append(args, stringArgs(settled)...)
+	args = append(args, applyID, terminalState)
 	result, err = s.db.ExecContext(ctx, `
 		UPDATE apply_comments
-		SET github_comment_id = 0, superseded_at = NULL, updated_at = NOW()
-		WHERE apply_id = ? AND comment_state = ? AND superseded_at IS NOT NULL
-		  AND github_comment_id != 0
-	`, applyID, state.Comment.Summary)
+		SET github_comment_id = 0, superseded_at = NULL, summarized_state = NULL, updated_at = NOW()
+		WHERE apply_id = ? AND comment_state = ? AND github_comment_id != 0
+		  AND (superseded_at IS NOT NULL
+		       OR (summarized_state IS NOT NULL AND summarized_state != ?
+		           AND summarized_state NOT IN (`+placeholders(len(settled))+`)
+		           AND EXISTS (SELECT 1 FROM applies WHERE id = ? AND state = ?)))
+	`, args...)
 	if err != nil {
-		return false, fmt.Errorf("reclaim superseded summary comment for apply %d: %w", applyID, err)
+		return false, fmt.Errorf("reclaim earlier summary comment for apply %d (%s): %w", applyID, terminalState, err)
 	}
 	rows, err = result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("read superseded summary reclaim rows affected for apply %d: %w", applyID, err)
+		return false, fmt.Errorf("read earlier summary reclaim rows affected for apply %d (%s): %w", applyID, terminalState, err)
 	}
 	return rows == 1, nil
+}
+
+// SettleSummaryForResume settles the summary marker a resume rotation rotated
+// for: the active marker that still records githubCommentID. While the apply is
+// active it supersedes the marker; once the apply is terminal again it marks
+// the marker rotated past, which keeps it active for the next resume while
+// naming no terminal state, so the claim of the state the apply reached is not
+// blocked and reconciliation finds that summary owed when its publish already
+// lost the claim. A marker that records another comment, or a claim sentinel,
+// belongs to a terminal publish that came after the summary the rotation saw,
+// and is left in place.
+//
+// The apply row is share-locked before its state is read and stays locked
+// until the marker write commits, so the choice between the two writes and the
+// write itself see one apply state: a transition waits for the commit, and its
+// own summary claim then sees the marker this write left. Both dialects'
+// locking reads return the latest committed row at READ COMMITTED. With a
+// lease in context the write requires it, and a lost lease surfaces as
+// storage.ErrApplyLeaseLost.
+func (s *applyCommentStore) SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (storage.ResumeSummarySettlement, error) {
+	if githubCommentID == 0 {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("settle summary of apply %d for resume: no posted summary comment given; a claim sentinel is never the rotation's marker", applyID)
+	}
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return storage.ResumeSummaryLeftInPlace, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("begin settle summary comment %d of apply %d for resume: %w", githubCommentID, applyID, err)
+	}
+	defer rollbackTx(ctx, tx, "settle summary for resume")
+
+	var applyState, leaseToken string
+	err = tx.QueryRowContext(ctx, `SELECT state, lease_token FROM applies WHERE id = ? FOR SHARE`, applyID).Scan(&applyState, &leaseToken)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("settle summary comment %d for resume: apply %d does not exist: %w", githubCommentID, applyID, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("lock apply %d to settle summary comment %d for resume: %w", applyID, githubCommentID, err)
+	}
+	if hasLease && leaseToken != lease.Token {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("apply lease for apply %d is no longer current: %w", applyID, storage.ErrApplyLeaseLost)
+	}
+
+	settlement := storage.ResumeSummaryConsumed
+	assignment := "superseded_at = NOW()"
+	var args []any
+	if state.IsTerminalApplyState(applyState) {
+		settlement = storage.ResumeSummaryRotatedPast
+		assignment = "summarized_state = ?"
+		args = append(args, storage.SummaryRotatedPast)
+	}
+	args = append(args, applyID, state.Comment.Summary, githubCommentID)
+	result, err := tx.ExecContext(ctx, `
+		UPDATE apply_comments
+		SET `+assignment+`, updated_at = NOW()
+		WHERE apply_id = ? AND comment_state = ? AND github_comment_id = ? AND superseded_at IS NULL
+	`, args...)
+	if err != nil {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("settle summary comment %d of apply %d (state %s) for resume: %w", githubCommentID, applyID, applyState, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("read settle rows affected for summary comment %d of apply %d: %w", githubCommentID, applyID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return storage.ResumeSummaryLeftInPlace, fmt.Errorf("commit settle summary comment %d of apply %d for resume: %w", githubCommentID, applyID, err)
+	}
+	if rows != 1 {
+		return storage.ResumeSummaryLeftInPlace, nil
+	}
+	return settlement, nil
 }
 
 // ReclaimStaleSummaryClaim takes over a summary claim sentinel abandoned by a
@@ -428,8 +525,8 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	var comment storage.ApplyComment
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
-		&comment.GitHubCommentID, &comment.PostedPhase, &comment.PendingFreezeCommentID, &comment.EditCount,
-		&comment.LastEditedAt, &comment.SupersededAt, &comment.CreatedAt, &comment.UpdatedAt,
+		&comment.GitHubCommentID, &comment.PostedPhase, &comment.PostedCutoverOperationID, &comment.PendingFreezeCommentID, &comment.EditCount,
+		&comment.LastEditedAt, &comment.SupersededAt, &comment.SummarizedState, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

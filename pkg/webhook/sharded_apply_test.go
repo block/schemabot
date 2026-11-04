@@ -43,27 +43,6 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
 }
 
-func TestParseShardOperationKey(t *testing.T) {
-	ns, shard, table, ok := parseShardOperationKey("cdb_resolute_sharded/-40/mutes")
-	require.True(t, ok)
-	assert.Equal(t, "cdb_resolute_sharded", ns)
-	assert.Equal(t, "-40", shard)
-	assert.Equal(t, "mutes", table)
-
-	for _, key := range []string{"", "cdb_resolute_sharded/group_finalizer", "deployment-only", "ns//table"} {
-		_, _, _, ok := parseShardOperationKey(key)
-		assert.False(t, ok, "key %q must not parse as a shard work key", key)
-	}
-
-	finalizerNS, ok := parseFinalizerOperationKey("cdb_resolute_sharded/group_finalizer")
-	require.True(t, ok)
-	assert.Equal(t, "cdb_resolute_sharded", finalizerNS)
-	for _, key := range []string{"cdb_resolute_sharded/-40/mutes", "group_finalizer", ""} {
-		_, ok := parseFinalizerOperationKey(key)
-		assert.False(t, ok, "key %q must not parse as a finalizer key", key)
-	}
-}
-
 func TestIsShardedApply(t *testing.T) {
 	shardOp := func(shard string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{Deployment: "cake", OperationKey: "ks/" + shard + "/mutes"}
@@ -268,32 +247,6 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, view, ""))
 	assert.Contains(t, summary, "### Finalize\n\n**`commerce`**: Finalized\n")
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
-}
-
-// A finalizer whose rollout ended without running it must not read as
-// pending, whichever record says so: a cancelled/reverted operation row
-// (written by the cancel path or mirrored by the stranded-operation reaper)
-// reads as cancelled, and so does a row still pending under a parent whose
-// verdict is final — a halted rollout terminalizes the apply immediately,
-// while the reaper only settles the stranded row minutes after the summary
-// posted. Stopped — on the operation or the parent — reads as stopped: a
-// stopped apply is resumable, so its finalizer may yet run.
-func TestVSchemaStatusForOperationState_TerminalInertStates(t *testing.T) {
-	running := state.Apply.Running
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Cancelled))
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Reverted))
-	assert.Equal(t, "stopped", vschemaStatusForOperationState(running, state.ApplyOperation.Stopped))
-	assert.Equal(t, "", vschemaStatusForOperationState(running, state.ApplyOperation.Pending),
-		"a pending finalizer under a live apply still reads as pending")
-
-	pending := state.ApplyOperation.Pending
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Failed, pending),
-		"a halted rollout's terminal summary must not promise VSchema work no claim arm will run")
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Cancelled, pending))
-	assert.Equal(t, "stopped", vschemaStatusForOperationState(state.Apply.Stopped, pending),
-		"a stopped apply's pending finalizer may yet run on resume")
-	assert.Equal(t, "failed", vschemaStatusForOperationState(state.Apply.Failed, state.ApplyOperation.Failed),
-		"the operation's own failure outranks the parent verdict")
 }
 
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.
@@ -667,8 +620,8 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 	assert.Equal(t, "mutes", table.Table)
 	assert.Equal(t, state.Task.Running, table.Status, "the copying shard is the most attention-worthy")
 	require.Len(t, table.Shards, 3)
-	assert.Equal(t, templates.ShardProgressData{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100}, table.Shards[0])
-	assert.Equal(t, templates.ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 37}, table.Shards[1])
+	assert.Equal(t, templates.ShardProgressData{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100, RowsCopied: 500000, RowsTotal: 500000}, table.Shards[0])
+	assert.Equal(t, templates.ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 37, RowsCopied: 185000, RowsTotal: 500000}, table.Shards[1])
 	assert.Equal(t, templates.ShardProgressData{Shard: "80-", Status: state.ApplyOperation.Pending, PercentComplete: 0}, table.Shards[2],
 		"an operation without a task contributes its operation state")
 	assert.Equal(t, int64(685000), table.RowsCopied, "rows sum across the shards that have reported")
@@ -1087,4 +1040,26 @@ func isShardedPlanCacheMethod(fn *ast.FuncDecl) bool {
 	}
 	ident, ok := star.X.(*ast.Ident)
 	return ok && ident.Name == "shardedPlanCache"
+}
+
+// A shard's stored copy and verify figures reach the comment's shard list, so
+// a checksumming shard says how far its verify has got rather than only that
+// it is checksumming.
+func TestShardedTableStatusesByKeyspaceCarriesEachShardsCopyAndVerifyFigures(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, OperationKey: "ks/-80/orders", State: state.ApplyOperation.Running},
+		{ID: 2, OperationKey: "ks/80-/orders", State: state.ApplyOperation.Running},
+	}
+	tasksByOp := map[int64][]*storage.Task{
+		1: {{State: state.Task.Checksumming, ProgressPercent: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000}},
+		2: {{State: state.Task.Running, ProgressPercent: 50, RowsCopied: 500, RowsTotal: 1000}},
+	}
+
+	tables := shardedTableStatusesByKeyspace(ops, tasksByOp, nil)["ks"]
+
+	require.Len(t, tables, 1)
+	assert.Equal(t, []templates.ShardProgressData{
+		{Shard: "-80", Status: state.Task.Checksumming, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+		{Shard: "80-", Status: state.Task.Running, PercentComplete: 50, RowsCopied: 500, RowsTotal: 1000},
+	}, tables[0].Shards)
 }

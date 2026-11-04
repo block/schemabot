@@ -105,7 +105,7 @@ func TestApplyCmd_NarrowedApplyIsNotGatedOnOtherMembers(t *testing.T) {
 
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", Target: "payments-002", NoLock: true, AutoApprove: true}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.Error(t, runErr, "the recording server fails the apply once it is requested")
 	assert.NotContains(t, runErr.Error(), "rollout members cannot be applied as planned")
@@ -133,7 +133,7 @@ func TestApplyCmd_RolloutWideApplySendsNoTarget(t *testing.T) {
 
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true, AutoApprove: true}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.Error(t, runErr, "the recording server fails the apply once it is requested")
 	req, applied := applyRequest()

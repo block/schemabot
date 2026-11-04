@@ -187,6 +187,7 @@ const (
 	PreviewAggregateCheckSummary        PreviewType = "aggregate_check_summary"          // Aggregate check Details summary (own databases + tenant deployments)
 	PreviewAggregateCheckFileCapBlocked PreviewType = "aggregate_check_file_cap_blocked" // Failing aggregate when the PR exceeds GitHub's changed-file cap
 	PreviewAggregateCheckStopped        PreviewType = "aggregate_check_stopped"          // Aggregate check while a stopped apply holds the PR
+	PreviewAggregateCheckRollout        PreviewType = "aggregate_check_rollout"          // Aggregate check naming the targets a multi-target rollout still needs
 
 	// Single-table apply comment previews (most common case)
 	PreviewCommentSingleProgress           PreviewType = "comment_single_progress"             // Single table running
@@ -217,6 +218,7 @@ const (
 	PreviewCommentBlockedByPriorEnv     PreviewType = "comment_blocked_prior_env"            // Blocked by staging (pending)
 	PreviewCommentBlockedByPriorFailed  PreviewType = "comment_blocked_prior_env_failed"     // Blocked by staging (failed)
 	PreviewCommentBlockedByPriorInProg  PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)
+	PreviewCommentBlockedByPriorStopped PreviewType = "comment_blocked_prior_env_stopped"    // Blocked by staging (apply stopped)
 	PreviewCommentReviewRequired        PreviewType = "comment_review_required"              // Review gate: approval needed
 	PreviewCommentReviewGateError       PreviewType = "comment_review_gate_error"            // Review gate: fail-closed error
 	PreviewCommentChecksGateNotPassing  PreviewType = "comment_checks_gate_not_passing"      // Checks gate: non-passing CI/lint

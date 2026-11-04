@@ -175,7 +175,10 @@ type PlanCommentData struct {
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
-	Errors         []string
+
+	// LintRuleNames includes rule IDs from findings of every severity.
+	LintRuleNames []string
+	Errors        []string
 
 	// IgnoredNamespaces lists the namespaces whose schema files were excluded
 	// from this plan by the repository's ignore_namespaces config — only entries
@@ -324,6 +327,20 @@ type DeploymentDriftData struct {
 	// planned: a target missing from the list would read as one with nothing
 	// to copy.
 	TableSizes []TargetTableSize
+	// DiscardedCopies are the unfinished copies applying the other targets'
+	// own plans discards, each naming its target, in rollout order. The
+	// primary target's are PlanCommentData.DiscardedCopies. Each is written
+	// under the plan of the target it is on, so the comment the operator
+	// confirms names every copy the apply destroys, wherever it is. Set only
+	// for a clean rollup, the only one whose targets' plans an apply runs.
+	DiscardedCopies []TargetExistingCopy
+}
+
+// TargetExistingCopy is an unfinished copy on one rollout target.
+type TargetExistingCopy struct {
+	// Target names the target the way an operator addresses it.
+	Target string
+	Copy   ExistingCopyData
 }
 
 // TargetTableSize is one rollout target's size estimate for one table its plan
@@ -442,6 +459,17 @@ func driftMemberNames(entries []DeploymentDriftEntry) []string {
 // disagree about whether the reader still has a decision to make.
 func (d PlanCommentData) applyingWithoutConfirmation() bool {
 	return d.IsLocked && !d.PendingManualConfirmation
+}
+
+// disclosesUnsafeChanges reports whether this comment lists the plan's unsafe
+// changes: wherever the reader still decides whether they run. The plan
+// comment lists them for review, and a paused comment lists what its
+// apply-confirm consents to, since that command carries --allow-unsafe forward
+// and a plan can turn unsafe after the opt-in. The comment of an apply already
+// running leaves them out: the operator consented to them on the plan comment,
+// and the DDL on this comment is the record of what the apply runs.
+func (d PlanCommentData) disclosesUnsafeChanges() bool {
+	return !d.applyingWithoutConfirmation()
 }
 
 // directNotesDeferCutover reports whether the direct disclosure says
@@ -621,7 +649,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// When the unsafe warning below lists every attributed table, the
 	// attribution rides on those findings instead of a section of its own, so
 	// each change is explained once.
-	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0
+	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && data.disclosesUnsafeChanges()
 	attributionNotes, attributionFolded := unsafeAttributionNotes(data, unsafeShown && attributionStillActionable(data))
 	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) && !attributionFolded {
 		writeAttributedChanges(&sb, data.AttributedChanges)
@@ -653,16 +681,11 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writePausedApplyCause(&sb, data.PausedApplyCause)
 	}
 
-	// Unsafe changes warning — shown on every comment, because the plan may
-	// have changed since the operator opted in with --allow-unsafe: the plan
-	// comment lists them for review, a paused comment lists what its
-	// apply-confirm consents to, and the comment of an apply already running is
-	// the record of what it destroys. The running comment drops the guidance on
-	// how to make a drop safe, which is out of reach once the apply runs.
-	// Target plans disclose them under the primary target's group, whose plan
-	// they are from.
+	// Unsafe changes warning — shown where the reader still decides whether
+	// they run (see disclosesUnsafeChanges). Target plans disclose them under
+	// the primary target's group, whose plan they are from.
 	if unsafeShown && !targetPlans {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL, !data.applyingWithoutConfirmation())
+		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -671,6 +694,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	if !data.IsLocked {
 		writePlanWideLint(&sb, data.LintViolations, data.DeploymentDrift, targetPlans)
 	}
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
 
 	// Errors
 	if len(data.Errors) > 0 {
@@ -962,11 +986,19 @@ func shortSHA(sha string) string {
 
 // writeOptions writes the options line if any options are enabled.
 func writeOptions(sb *strings.Builder, data PlanCommentData) {
+	writeOptionsLine(sb, data.DeferCutover, data.SkipRevert)
+}
+
+// writeOptionsLine writes the options an operator chose for an apply, if any.
+// The plan, apply, and progress comments all write it through here, so an
+// option reads the same from the plan through the apply and none is dropped
+// along the way.
+func writeOptionsLine(sb *strings.Builder, deferCutover, skipRevert bool) {
 	var opts []string
-	if data.DeferCutover {
+	if deferCutover {
 		opts = append(opts, "⏸️ Defer Cutover")
 	}
-	if data.SkipRevert {
+	if skipRevert {
 		opts = append(opts, "⏩ Skip Revert")
 	}
 	if len(opts) > 0 {
@@ -2327,15 +2359,37 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 		}
 		// So is an unsafe change, which `--allow-unsafe` consents to on every
-		// target. The primary's group discloses its own with the primary
-		// plan's. The comment of an apply already running lists them too: a
-		// target's plan can turn unsafe after the operator opted in, and that
-		// comment is the only record of what the apply destroys there.
+		// target, wherever the reader still decides whether it runs. The
+		// primary's group discloses its own with the primary plan's.
 		if g.Primary {
 			writePrimaryTargetDisclosures(sb, data, g)
-		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 {
-			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL, !data.applyingWithoutConfirmation())
+		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && data.disclosesUnsafeChanges() {
+			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
 		}
+		writeTargetDiscardedCopies(sb, data, g)
+	}
+}
+
+// writeTargetDiscardedCopies writes, under a target group's plan, the
+// unfinished copies applying its targets' own plans discards, one section per
+// target. The primary target's are written with its other disclosures. Each
+// section names its target unless the group's heading already names that
+// target alone.
+func writeTargetDiscardedCopies(sb *strings.Builder, data PlanCommentData, g DeploymentPlanGroup) {
+	for _, target := range g.Members {
+		var copies []ExistingCopyData
+		for _, c := range data.DeploymentDrift.DiscardedCopies {
+			if c.Target == target {
+				copies = append(copies, c.Copy)
+			}
+		}
+		if len(copies) == 0 {
+			continue
+		}
+		if !headedByItself(data.DeploymentDrift, g) {
+			fmt.Fprintf(sb, "On target %s:\n\n", inlineCode(target))
+		}
+		writeDiscardedCopies(sb, copies, data.applyingWithoutConfirmation())
 	}
 }
 
@@ -2352,6 +2406,9 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 		fmt.Fprintf(sb, "On target %s:\n\n", inlineCode(g.Members[0]))
 	}
 	writeExistingCopies(sb, data)
+	if !data.disclosesUnsafeChanges() {
+		return
+	}
 	var unsafe []UnsafeChangeData
 	if data.HasUnsafeChanges {
 		unsafe = append(unsafe, data.UnsafeChanges...)
@@ -2359,7 +2416,7 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 	unsafe = append(unsafe, g.unsafeBeyondPrimaryPlan()...)
 	if len(unsafe) > 0 {
 		notes, _ := unsafeAttributionNotes(data, data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && attributionStillActionable(data))
-		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL, !data.applyingWithoutConfirmation())
+		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL)
 	}
 }
 
@@ -2653,10 +2710,9 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 
 // writeUnsafeWarning lists the unsafe findings. attributionNotes, keyed by
 // table, carries the attribution for tables another pull request changed, so
-// the reader learns where a change came from on the finding itself.
-// dropGuidance adds how to make a destructive drop safe, which only a comment
-// whose reader still decides the apply can act on.
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, dropGuidance bool) {
+// the reader learns where a change came from on the finding itself, and how
+// to make a destructive drop safe.
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
@@ -2671,9 +2727,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attribu
 		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
 	}
 	sb.WriteString("\n")
-	if dropGuidance {
-		writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
-	}
+	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
 }
 
 // unsafeChangeLabel names an unsafe change's table, with the shards and the
@@ -3292,6 +3346,14 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		}
 	}
 
+	var guidanceScopes []guidanceScope
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil && data.Errors[env] == "" {
+			guidanceScopes = append(guidanceScopes, plan.disclosesEverySeverity())
+		}
+	}
+	writeRelatedGuidance(&sb, guidanceScopes...)
+
 	// Footer with apply instructions
 	sb.WriteString("---\n\n")
 	writeMultiEnvFooter(&sb, data)
@@ -3457,7 +3519,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// Unsafe changes warning
 	if unsafeShown && !targetPlans {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL, true)
+		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL)
 	}
 
 	// Lint violations.
@@ -3587,7 +3649,12 @@ func writeEnvApplyLeadIn(sb *strings.Builder, sentence string, plan *PlanComment
 	sb.WriteString(sentence + ":\n")
 }
 
-func tenantCommand(baseCommand, environment, tenant string) string {
+// TenantCommand renders a pasteable PR command for one environment, carrying
+// the deployment's tenant when it has one so the pasted command addresses this
+// deployment. baseCommand starts with the bot's trigger word, "schemabot": a PR
+// comment is read by the bot, not run as the CLI, so the command word never
+// varies with cli_name.
+func TenantCommand(baseCommand, environment, tenant string) string {
 	return scopedCommand(baseCommand, environment, "", tenant)
 }
 
@@ -3605,10 +3672,12 @@ func scopedCommand(baseCommand, environment, database, tenant string) string {
 // beyond its environment and database. A pasteable hint for either command has
 // to repeat them, because the command reads its options from the comment that
 // carries it and nothing else: a hint that drops --defer-cutover runs the
-// cutover the operator chose to defer, one that drops --allow-unsafe is blocked
-// again, and one that drops --target applies to every rollout member instead of
-// the one the operator narrowed to. Target is set only for apply hints:
-// apply-confirm takes its target from the plan it confirms.
+// cutover the operator chose to defer, and one that drops --target applies to
+// every rollout member instead of the one the operator narrowed to.
+// --allow-unsafe is the exception: it is repeated only in an apply-confirm
+// hint for the plan the operator consented to, and every other hint leaves it
+// out and asks for it with UnsafeReconsent. Target is set only for apply
+// hints: apply-confirm takes its target from the plan it confirms.
 type ApplyCommandOptions struct {
 	Target       string
 	Tenant       string
@@ -3620,9 +3689,36 @@ type ApplyCommandOptions struct {
 // ApplyCommand renders a pasteable apply command for one environment, carrying
 // the database the operator named with -d and the options they typed, so a
 // refusal that asks the operator to re-run their apply names the apply they
-// asked for.
+// asked for. It leaves out --allow-unsafe: the apply plans again, and consent
+// to unsafe changes is typed against a plan the operator has seen, never
+// pasted from an earlier command. UnsafeReconsent is the sentence that leads
+// into the command when the operator's command carried it.
 func ApplyCommand(environment, database string, opts ApplyCommandOptions) string {
+	opts.AllowUnsafe = false
 	return scopedApplyCommand("schemabot apply", environment, database, opts)
+}
+
+// UnsafeReconsent is the consent clause that leads into an ApplyCommand built
+// from a command that carried --allow-unsafe, and empty for one that did not.
+// Like the plan comment's apply instruction, it states the consent in the
+// sentence that leads into the command rather than putting the flag in it, so
+// consenting again takes typing it.
+func UnsafeReconsent(opts ApplyCommandOptions) string {
+	if !opts.AllowUnsafe {
+		return ""
+	}
+	return "with `--allow-unsafe` to confirm unsafe changes"
+}
+
+// writeRerunCommand writes lead and the apply to re-run in its own fenced
+// block. A consent clause, when there is one, follows lead and leads into the
+// command. gap separates the lead-in from the fence.
+func writeRerunCommand(sb *strings.Builder, lead, consent, command, gap string) {
+	if consent != "" {
+		lead += " " + consent
+	}
+	fmt.Fprintf(sb, "%s:%s", lead, gap)
+	writeCommandBlock(sb, command)
 }
 
 // scopedApplyCommand renders a pasteable apply or apply-confirm command for one
@@ -3685,7 +3781,10 @@ type ConfirmationRefusalData struct {
 
 // RenderConfirmationPlanForOtherEnvironment refuses an apply-confirm whose -e
 // names a different environment than the pending confirmation was planned for.
-// The confirm command it offers keeps the pending confirmation. The apply
+// The confirm command it offers keeps the pending confirmation, but not the
+// --allow-unsafe the operator typed: that consent was aimed at the requested
+// environment, so the pending plan's unsafe changes are confirmed by typing it
+// again, led in by UnsafeReconsent. The apply
 // command it offers for the requested environment does not: it answers to the
 // environment ordering gate like any apply, and once through it releases this
 // pull request's lock, so the pinned plan is gone and the requested
@@ -3699,11 +3798,12 @@ func RenderConfirmationPlanForOtherEnvironment(data ConfirmationRefusalData) str
 
 	writeConfirmationRefusalHeader(&sb, data)
 	fmt.Fprintf(&sb, "The pending confirmation is for `%s`, not `%s`; nothing was applied.\n\n", data.PlanEnvironment, data.RequestedEnvironment)
-	fmt.Fprintf(&sb, "To confirm the `%s` plan:\n\n", data.PlanEnvironment)
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, data.Options))
-	fmt.Fprintf(&sb, "\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n",
-		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment)
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	confirmOptions := data.Options
+	confirmOptions.AllowUnsafe = false
+	writeRerunCommand(&sb, fmt.Sprintf("To apply the `%s` plan", data.PlanEnvironment), UnsafeReconsent(data.Options),
+		scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, confirmOptions), "\n\n")
+	writeApplyCommandBlock(&sb, fmt.Sprintf("\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it",
+		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment), data.RequestedEnvironment, data.Database, data.Options)
 	writeConfirmationRefusalFooter(&sb, data)
 
 	return offerSupportChannel(sb.String())
@@ -3723,8 +3823,8 @@ func RenderConfirmationPlanUnavailable(data ConfirmationRefusalData) string {
 
 	writeConfirmationRefusalHeader(&sb, data)
 	sb.WriteString("The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
-	fmt.Fprintf(&sb, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n")
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeApplyCommandBlock(&sb, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it",
+		data.RequestedEnvironment, data.Database, data.Options)
 	writeConfirmationRefusalFooter(&sb, data)
 
 	return offerSupportChannel(sb.String())
@@ -3747,6 +3847,12 @@ func writeConfirmationRefusalFooter(sb *strings.Builder, data ConfirmationRefusa
 // writeCommandBlock writes one pasteable command in its own fenced block.
 func writeCommandBlock(sb *strings.Builder, command string) {
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// writeApplyCommandBlock writes lead and an apply the operator is asked to run
+// again in its own fenced block, led into by UnsafeReconsent when there is one.
+func writeApplyCommandBlock(sb *strings.Builder, lead, environment, database string, opts ApplyCommandOptions) {
+	writeRerunCommand(sb, lead, UnsafeReconsent(opts), ApplyCommand(environment, database, opts), "\n\n")
 }
 
 // allPlansIdentical returns true if all environments have identical changes.

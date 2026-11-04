@@ -1109,8 +1109,8 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
-	assert.Contains(t, rendered, "--allow-unsafe")
-	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
+	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `users`:\n```\nschemabot apply -e staging\n```\n")
+	assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
 }
 
 // A table can carry several lint violations in one engine-joined reason
@@ -1241,7 +1241,7 @@ func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "## Schema Change Plan")
-	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
+	assert.Contains(t, rendered, "```\nschemabot apply -e staging\n```")
 }
 
 func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) {
@@ -1263,7 +1263,7 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
-	assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
+	assert.Contains(t, rendered, "```\nschemabot apply -e staging --tenant alpha\n```")
 }
 
 // A plan comment's copy-paste commands name a database only where a bare
@@ -1279,6 +1279,30 @@ func TestPlanCommentDatabaseFlag(t *testing.T) {
 	assert.Empty(t, planCommentDatabaseFlag("", "payments", false, 0), "an unscoped command stays unscoped")
 	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true, 2), "an auto-plan on a PR touching several databases names the one its comment plans")
 	assert.Empty(t, planCommentDatabaseFlag("", "payments", true, 1), "an auto-plan on a PR touching one database has nothing to disambiguate")
+}
+
+// Primary-key advice remains reachable for legacy warnings and new-schema
+// errors; the latter still render as Issues and retain their consent gate.
+func TestBuildPlanCommentData_PrimaryKeyGuidance(t *testing.T) {
+	for _, severity := range []string{"warning", "error"} {
+		t.Run(severity, func(t *testing.T) {
+			resp := &apitypes.PlanResponse{
+				Changes:     []*apitypes.SchemaChangeResponse{{Namespace: "app", TableChanges: []*apitypes.TableChangeResponse{{TableName: "customers", DDL: "ALTER TABLE `customers` ADD COLUMN `name` varchar(64)", ChangeType: "alter", IsUnsafe: severity == "error", UnsafeReason: "Primary key uses a discouraged type"}}}},
+				LintResults: []*apitypes.LintViolationResponse{{Table: "customers", Linter: "primary_key", Severity: severity, Message: "Primary key uses a discouraged type"}},
+			}
+			data := buildPlanCommentData(&ghclient.SchemaRequestResult{Database: "app", Type: "mysql"}, resp, "staging", "", "", "", "")
+			assert.Contains(t, data.LintRuleNames, "primary_key")
+			if severity == "warning" {
+				require.Len(t, data.LintViolations, 1)
+				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
+			} else {
+				assert.Empty(t, data.LintViolations)
+				assert.True(t, data.HasUnsafeChanges)
+			}
+			out := templates.RenderPlanComment(data)
+			assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"))
+		})
+	}
 }
 
 // The plan comment carries the stored plan's identifier, so DDL the comment

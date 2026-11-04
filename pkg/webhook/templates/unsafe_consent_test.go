@@ -136,10 +136,10 @@ func TestRenderPlanComment_AttributionKeepsItsSectionWhenNotAnUnsafeFinding(t *t
 // comment lists the unsafe changes it consents to: the plan can have changed
 // since the operator first opted in, and confirming must not run an unsafe
 // change no comment showed. An attribution rides on its finding there as on
-// the plan comment. The comment of an apply already running lists them too,
-// as the record of what the apply destroys, without the drop guidance or the
-// attribution that only a reader still deciding the apply can act on.
-func TestRenderPlanComment_EveryLockedCommentListsTheUnsafeChangesItRuns(t *testing.T) {
+// the plan comment. The comment of an apply already running leaves the list,
+// the drop guidance, and the attribution out, since its reader has no decision
+// left to make, and shows the DDL the apply runs.
+func TestRenderPlanComment_PausedCommentListsTheUnsafeChangesItConsentsTo(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
 	data.IsLocked = true
@@ -153,7 +153,7 @@ func TestRenderPlanComment_EveryLockedCommentListsTheUnsafeChangesItRuns(t *test
 
 	data.PendingManualConfirmation = false
 	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "⚠️ **Issues**: 2 unsafe changes detected\n1. `transfer_events`: DROP COLUMN discards the column's data\n2. `refund_backfill`: DROP TABLE removes all data\n")
+	assert.NotContains(t, out, "**Issues**", "the running comment leaves the consented unsafe changes out")
 	assert.NotContains(t, out, "Destructive drop guidance", "the guidance is out of reach once the apply runs")
 	assert.NotContains(t, out, "changed by open PR", "the attribution coaches a decision the running apply no longer offers")
 	assert.NotContains(t, out, "Check before applying")

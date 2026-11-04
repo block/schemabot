@@ -643,10 +643,10 @@ func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T
 }
 
 // When another target's plan turns unsafe after the operator opted in with
-// --allow-unsafe, the apply's comment lists that target's unsafe change whether
-// it stops for confirmation or runs: a paused comment's apply-confirm carries
-// the opt-in forward, and a running comment is the only record of what the
-// apply destroys on that target.
+// --allow-unsafe, a paused comment lists that target's unsafe change, because
+// its apply-confirm carries the opt-in forward. The comment of an apply
+// already running leaves the list out and shows the target's DDL, the record
+// of what the apply runs there.
 func TestRenderPlanComment_RolloutApplyListsAnotherTargetsNewUnsafeChange(t *testing.T) {
 	data := convergedPrimaryPlanData()
 	data.IsLocked = true
@@ -662,7 +662,8 @@ func TestRenderPlanComment_RolloutApplyListsAnotherTargetsNewUnsafeChange(t *tes
 
 	data.PendingManualConfirmation = false
 	out = RenderPlanComment(data)
-	assert.Contains(t, out, "⚠️ **Issues**: 1 unsafe change detected\n1. `users`: DROP COLUMN discards the column's data\n")
+	assert.NotContains(t, out, "**Issues**", "the running comment leaves the consented unsafe changes out")
+	assert.Contains(t, out, "DROP COLUMN `legacy_ref`", "the target's DDL stays on the running comment")
 	assert.Contains(t, out, "**Applying automatically**")
 }
 
@@ -1220,6 +1221,6 @@ func TestRenderUnsafeChangesBlocked_NamesOtherTargetsChanges(t *testing.T) {
 		"the refusal shows the plan the targets would run")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter · rolling out to targets `primary/testapp_2`, `primary/testapp_3`\n")
 	assert.NotContains(t, out, "No schema changes detected\n\n---", "the refusal does not read as a no-op when other targets have work")
-	assert.Equal(t, 1, strings.Count(out, "`bikes`"), "each unsafe change is listed once")
-	assert.Contains(t, out, "schemabot apply -e production --allow-unsafe")
+	assert.Equal(t, 1, strings.Count(out, ". `bikes`"), "each unsafe change is listed once")
+	assert.Contains(t, out, "add `--allow-unsafe` to confirm 1 unsafe change on `bikes`:\n```\nschemabot apply -e production\n```")
 }

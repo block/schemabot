@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>A table copy, from start to cutover</title>
+<style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,monospace}</style>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Spirit copies a live table, catches up on writes, verifies the data, waits for the scheduled time, and cuts over"></svg>
+<script>
+const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5',purple:'#8250df'};
+const clamp=x=>Math.max(0,Math.min(1,x));
+const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8)=>`<rect x="${x}" y="${y}" width="${Math.max(0,w)}" height="${h}" rx="${r}" fill="${fill}" stroke="${stroke}"/>`;
+const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}">${esc(s)}</text>`;
+const path=(d,color=C.line,w=2)=>`<path d="${d}" fill="none" stroke="${color}" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round"/>`;
+const dot=(x,y,color=C.blue,r=4)=>`<circle cx="${x}" cy="${y}" r="${r}" fill="${color}"/>`;
+const starts=[0,6,8.5,11.5,15,17,19];
+const labels=['Copy rows','Catch up','Verify','Wait for time','Catch up','Cut over'];
+function renderFrame(t){
+ t=Math.max(0,Math.min(t,21.9));
+ const phase=Math.max(0,starts.findLastIndex(v=>t>=v)),done=phase===6,swapped=t>=18.2;
+ const copy=clamp((t-.8)/5.0),verify=clamp((t-8.7)/2.5);
+ const captions=[
+  'Copy rows while the application keeps using the live table.',
+  'Replay writes made during the copy to bring the replacement up to date.',
+  'Compare the data before allowing the change to move forward.',
+  'Keep replaying writes and periodically recheck while waiting for the chosen time.',
+  'Catch up on the latest writes before the final swap.',
+  'Take the cutover lock and atomically swap the tables when conditions permit.',
+  'The application now uses the verified table with its new index.'
+ ];
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,42,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,91,'A new schema. A live database.',32,C.ink,650);
+ s+=rect(808,29,256,52,phase===3?C.amberBg:C.soft)+txt(825,49,'Cutover scheduled in advance',12,C.muted,550)+txt(825,69,'Tuesday · 03:00',16,phase===3?C.amber:C.ink,600);
+ for(let i=0;i<6;i++){
+  const x=36+i*174,color=done||i<phase?C.green:i===phase?C.blue:C.muted;
+  s+=rect(x,119,158,4,done||i<phase?C.green:i===phase?C.blue:C.line,'none',2)+txt(x,146,labels[i],15,color,i===phase?650:500);
+ }
+ // The application and tables never move; only the routing changes at cutover.
+ s+=rect(407,177,286,59,C.soft,C.line,10)+txt(467,214,'Application',21,C.ink,600);
+ const routeColor=phase===5&&!swapped?C.amber:C.blue;
+ s+=path('M550 236 V257 H278 V294',swapped?C.line:routeColor,swapped?1.5:3);
+ s+=path('M550 257 H822 V294',swapped?C.blue:C.line,swapped?3:1.5);
+ s+=txt(346,279,swapped?'':'reads + writes',12,C.blue,550)+txt(707,279,swapped?'reads + writes':'',12,C.blue,550);
+ if(!(phase===5&&!swapped)){
+  let u=(t*.9)%1;
+  if(u<.14)s+=dot(550,236+u/.14*21);
+  else if(u<.83)s+=dot(550+(swapped?272:-272)*(u-.14)/.69,257);
+  else s+=dot(swapped?822:278,257+(u-.83)/.17*37);
+ }
+ const x1=54,x2=628,py=294,pw=418;
+ function table(x,right){
+  const live=right?swapped:!swapped;
+  let a=rect(x,py,pw,180,'#fff',live?C.blue:C.line,10)+rect(x+18,py+17,live?63:96,24,live?C.blueBg:C.soft)+txt(x+29,py+34,live?'Live':right?'Replacement':'Previous',12,live?C.blue:C.muted,600);
+  a+=txt(x+18,py+68,'customers',23,C.ink,600,'mono');
+  const n=right?Math.floor(copy*24):24;
+  for(let j=0;j<24;j++){
+   let xx=x+18+(j%12)*32,yy=py+88+Math.floor(j/12)*21;
+   let checked=phase>=3||(phase===2&&j/24<verify);
+   a+=rect(xx,yy,26,13,j<n?(right&&checked?C.greenBg:C.blueBg):C.soft,'none',3);
+   if(j<n)a+=rect(xx+4,yy+5,18,3,right&&checked?C.green:C.blue,'none',1);
+  }
+  a+=txt(x+18,py+157,right?'New index: idx_created_at':swapped?'Retained for supported revert':'Original schema',14,right?C.green:C.muted,500,right?'mono':'');
+  if(right)a+=txt(x+pw-73,py+68,Math.round(copy*100)+'%',16,copy===1?C.green:C.blue,600);
+  return a;
+ }
+ s+=table(x1,false)+table(x2,true);
+ if(!swapped){
+  const flowColor=phase===2?C.green:phase===3?C.amber:C.blue;
+  s+=path('M472 383 H628',flowColor,2)+path('M620 377 L628 383 L620 389',flowColor,2);
+  s+=txt(489,366,phase===0?'rows':phase===2?'verify':'writes',13,flowColor,600);
+  for(let j=0;j<3;j++){
+   const u=(t*(phase===0?.6:.9)+j/3)%1;
+   s+=rect(477+u*137,379,8,8,flowColor,'none',2);
+  }
+ }
+ const stateText=done?'Complete':phase===0?'Copying rows':phase===1||phase===4?'Replaying writes':phase===2?'Verifying data':phase===3?'Waiting for Tuesday at 03:00':swapped?'Tables swapped':'Acquiring the cutover lock';
+ const stateColor=done?C.green:phase===3||phase===5?C.amber:C.blue;
+ s+=dot(45,555,stateColor,5)+txt(60,561,stateText,17,stateColor,600);
+ s+=txt(36,612,captions[phase],17,C.ink,450);
+ s+=txt(36,662,'Illustrative timing · Table-copy path · Instant DDL skips this workflow',12,C.muted);
+ document.getElementById('art').innerHTML=s;
+ return {phase,copy,swapped};
+}
+window.renderFrame=renderFrame;renderFrame(0);
+</script></html>

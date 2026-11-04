@@ -395,6 +395,179 @@ func testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t *testing.T, newStor
 		require.NotNil(t, stored)
 		assert.Equal(t, "completed", stored.Status)
 	})
+
+	// A terminal apply's driver marks the stored check state action_required
+	// and releases the apply's ownership of the row. A displaced driver must
+	// not release the row or rewrite its outcome: the check stays in progress
+	// and owned by the apply until the driver holding the lease decides.
+	t.Run("check action required under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_check_action_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_check_action", 941, "driver-a")
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: apply.Environment, DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+		actionRequired := *check
+		actionRequired.Status = "completed"
+		actionRequired.Conclusion = "action_required"
+
+		err := writeDuringUncommittedSteal(t, store, waiting, "UPDATE checks",
+			func() error {
+				_, err := store.Checks().MarkActionRequiredForApply(ctx, &actionRequired, apply)
+				return err
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		stored := loadCheck(t, store, check)
+		assert.Equal(t, "in_progress", stored.Status, "a displaced driver must not mark the check action required")
+		assert.Empty(t, stored.Conclusion)
+		assert.Equal(t, apply.ID, stored.ApplyID, "a displaced driver must not release the apply's ownership of the check")
+
+		current := *apply
+		current.LeaseOwner = "driver-b"
+		current.LeaseToken = "tok-b"
+		updated, err := store.Checks().MarkActionRequiredForApply(ctx, &actionRequired, &current)
+		require.NoError(t, err)
+		assert.True(t, updated)
+		stored = loadCheck(t, store, check)
+		assert.Equal(t, "completed", stored.Status)
+		assert.Equal(t, "action_required", stored.Conclusion)
+		assert.Zero(t, stored.ApplyID)
+	})
+
+	// A cancelled forward apply whose task completed may have changed the
+	// target, so its driver records a failed check owned by the apply. A
+	// displaced driver must not record that outcome: the check stays as the
+	// driver holding the lease last left it.
+	t.Run("cancelled apply check failure under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_check_cancel_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_check_cancel", 942, "driver-a")
+		_, err := store.db.ExecContext(ctx, `UPDATE tasks SET state = ? WHERE task_identifier = ?`, state.Task.Completed, "task_apply_fence_check_cancel")
+		require.NoError(t, err)
+		apply.State = state.Apply.Cancelled
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: apply.Environment, DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+		failed := *check
+		failed.Status = "completed"
+		failed.Conclusion = "failure"
+
+		err = writeDuringUncommittedSteal(t, store, waiting, "UPDATE checks",
+			func() error {
+				_, err := store.Checks().MarkCancelledApplyFailed(ctx, &failed, apply)
+				return err
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		stored := loadCheck(t, store, check)
+		assert.Equal(t, "in_progress", stored.Status, "a displaced driver must not record the cancelled apply's failure")
+		assert.Empty(t, stored.Conclusion)
+		assert.Equal(t, apply.ID, stored.ApplyID)
+
+		current := *apply
+		current.LeaseOwner = "driver-b"
+		current.LeaseToken = "tok-b"
+		updated, err := store.Checks().MarkCancelledApplyFailed(ctx, &failed, &current)
+		require.NoError(t, err)
+		assert.True(t, updated)
+		stored = loadCheck(t, store, check)
+		assert.Equal(t, "completed", stored.Status)
+		assert.Equal(t, "failure", stored.Conclusion)
+		assert.Equal(t, apply.ID, stored.ApplyID)
+	})
+
+	// A resume rotation's write to the summary marker it rotated for reads
+	// the apply's lease and state under a lock, so a displaced driver's write
+	// waits on the apply row and fails closed once the steal commits.
+	t.Run("resume summary supersede under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_resume_summary_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_resume_summary", 943, "driver-a")
+		stopped := state.Apply.Stopped
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9301, SummarizedState: &stopped,
+		}))
+
+		displacedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		err := writeDuringUncommittedSteal(t, store, waiting, "lease_token FROM applies",
+			func() error {
+				_, err := store.ApplyComments().SettleSummaryForResume(displacedCtx, apply.ID, 9301)
+				return err
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		marker, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+		require.NoError(t, err)
+		require.NotNil(t, marker)
+		assert.Nil(t, marker.SupersededAt, "a displaced driver must not consume the summary marker")
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-b", Token: "tok-b"})
+		settled, err := store.ApplyComments().SettleSummaryForResume(ownerCtx, apply.ID, 9301)
+		require.NoError(t, err)
+		assert.Equal(t, storage.ResumeSummaryConsumed, settled)
+	})
+
+	// The rotation decides from the apply's state whether to consume the
+	// marker or mark it rotated past, so a terminal transition that is in
+	// flight when the rotation writes must be seen, not the state the
+	// transition is replacing. Otherwise the rotation consumes the marker the
+	// terminal state's own summary claim needs to find in place, and that
+	// summary is lost. The transition is left uncommitted while the rotation
+	// writes; the write waits on the apply row and, once the transition
+	// commits, marks the marker rotated past in the same write.
+	t.Run("resume summary settle during a terminal transition", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_resume_terminal_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_resume_terminal", 944, "driver-a")
+		stopped := state.Apply.Stopped
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9401, SummarizedState: &stopped,
+		}))
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		var settled storage.ResumeSummarySettlement
+		err := writeDuringUncommittedSteal(t, store, waiting, "lease_token FROM applies",
+			func() error {
+				var err error
+				settled, err = store.ApplyComments().SettleSummaryForResume(ownerCtx, apply.ID, 9401)
+				return err
+			},
+			`UPDATE applies SET state = ? WHERE id = ?`, state.Apply.Stopped, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.ResumeSummaryRotatedPast, settled, "a rotation must not consume the marker once the apply is terminal again")
+		marker, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+		require.NoError(t, err)
+		require.NotNil(t, marker)
+		assert.Nil(t, marker.SupersededAt, "the marker stays active for the next resume")
+		assert.Equal(t, int64(9401), marker.GitHubCommentID)
+		require.NotNil(t, marker.SummarizedState)
+		assert.Equal(t, storage.SummaryRotatedPast, *marker.SummarizedState)
+
+		won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
+		require.NoError(t, err)
+		assert.True(t, won, "the second stop's summary claim wins over the marker rotated past")
+	})
+}
+
+// loadCheck reads the stored check state for check's target, failing the test
+// when it is missing.
+func loadCheck(t *testing.T, store *Storage, check *storage.Check) *storage.Check {
+	t.Helper()
+	stored, err := store.Checks().Get(t.Context(), check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	return stored
 }
 
 // newShardProgressTask builds a per-shard progress row for operation opID of

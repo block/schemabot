@@ -5,6 +5,7 @@
 package webhook
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -588,6 +589,103 @@ func TestE2EStaleCheckCleanupWithNothingPlannedPublishesAggregate(t *testing.T) 
 	case <-time.After(webhookIntegrationCheckRunDeadline):
 		t.Fatal("timed out waiting for the aggregate check run stale cleanup publishes")
 	}
+}
+
+// releaseBeforeStaleBlockStore runs release just before each stale cleanup
+// block reaches storage, standing in for an apply driver on another pod that
+// writes between cleanup's read and its write.
+type releaseBeforeStaleBlockStore struct {
+	storage.CheckStore
+	release func(ctx context.Context)
+}
+
+func (s *releaseBeforeStaleBlockStore) BlockStaleStartedApply(ctx context.Context, check *storage.Check, headSHA string) (bool, error) {
+	s.release(ctx)
+	return s.CheckStore.BlockStaleStartedApply(ctx, check, headSHA)
+}
+
+type releaseBeforeStaleBlockStorage struct {
+	storage.Storage
+	checks *releaseBeforeStaleBlockStore
+}
+
+func (s *releaseBeforeStaleBlockStorage) Checks() storage.CheckStore { return s.checks }
+
+// A PR's later commit drops its only schema change while a completed rollback
+// still owns its row. Stale cleanup reads the row as in_progress, and the
+// rollback releases it as action_required before cleanup writes. Cleanup
+// leaves the rollback's outcome in place and does not count the row as one it
+// cleaned, so it publishes no aggregate on the strength of a write it never
+// made.
+func TestE2EStaleCheckCleanupLeavesRowReleasedAfterRead(t *testing.T) {
+	dbName := "webhook_stale_released_after_read"
+	ctx := t.Context()
+	var rollback *storage.Apply
+	wrapper := &releaseBeforeStaleBlockStore{}
+	svc := setupE2EServiceWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
+		wrapper.CheckStore = st.Checks()
+		return &releaseBeforeStaleBlockStorage{Storage: st, checks: wrapper}
+	})
+	wrapper.release = func(ctx context.Context) {
+		released := &storage.Check{
+			Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "oldsha111",
+			Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: dbName,
+			CheckRunID: 100, HasChanges: true, Status: checkStatusCompleted,
+			Conclusion: checkConclusionActionRequired, BlockingReason: rollbackCompletedBlock.blockingReason,
+		}
+		updated, err := svc.Storage().Checks().MarkActionRequiredForApply(ctx, released, rollback)
+		assert.NoError(t, err)
+		assert.True(t, updated, "the rollback must release its row before cleanup writes")
+	}
+
+	rollbackID, err := svc.Storage().Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "rollback-released-after-read",
+		Database:        dbName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Completed,
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+	rollback, err = svc.Storage().Applies().Get(ctx, rollbackID)
+	require.NoError(t, err)
+	require.NotNil(t, rollback)
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      rollbackID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "newsha222")
+
+	h := newE2EHandler(t, svc, client)
+	h.cleanupStaleChecks("octocat/hello-world", 1, "newsha222", 0, checkDatabaseKeysForConfigs(nil))
+
+	select {
+	case cr := <-checkRuns:
+		assert.Failf(t, "stale cleanup published a Check Run for a row it did not write", "check run %q on %s", cr.Name, cr.HeadSHA)
+	default:
+	}
+	stored := requireStoredCheck(t, svc, "staging", storage.DatabaseTypeMySQL, dbName)
+	assert.Equal(t, "oldsha111", stored.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, stored.Status)
+	assert.Equal(t, checkConclusionActionRequired, stored.Conclusion)
+	assert.Equal(t, rollbackCompletedBlock.blockingReason, stored.BlockingReason)
+	assert.Zero(t, stored.ApplyID, "the rollback's release stays in place")
 }
 
 // A database is converted from MySQL to Strata while an apply started under

@@ -67,6 +67,25 @@ func TestPRHasCurrentSchemaBotFiles(t *testing.T) {
 	}
 }
 
+// A rename that vacates a schema path stops the default branch declaring that
+// file's tables, exactly as a deletion does, so a command on a PR carrying only
+// such a rename must go through normal config discovery instead of refreshing
+// the checks as passing.
+func TestPRHasCurrentSchemaBotFilesCountsRenamesThatVacateSchema(t *testing.T) {
+	tests := []struct {
+		name string
+		file ghclient.PRFile
+	}{
+		{"renamed to a disabled name", ghclient.PRFile{Filename: "schema/widgets/users.sql.disabled", PreviousFilename: "schema/widgets/users.sql", Status: "renamed"}},
+		{"renamed to a non-schema file", ghclient.PRFile{Filename: "docs/users.md", PreviousFilename: "schema/widgets/users.sql", Status: "renamed"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.True(t, prHasCurrentSchemaBotFiles([]ghclient.PRFile{tt.file}))
+		})
+	}
+}
+
 func TestSchemaChangeReconciliationItemsUseApplyStateOverStaleCheckStatus(t *testing.T) {
 	items := schemaChangeReconciliationItems([]schemaChangeReconciliationRecord{
 		{

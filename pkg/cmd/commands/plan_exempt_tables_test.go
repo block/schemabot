@@ -124,7 +124,7 @@ func TestApplyCmd_ExemptTablesDisclosedOnce(t *testing.T) {
 			t.Cleanup(server.Close)
 
 			cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", NoLock: true}
-			out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+			out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 			assert.Equal(t, 1, strings.Count(out, "Ignored tables in namespace"),
 				"exemption stated once:\n%s", out)

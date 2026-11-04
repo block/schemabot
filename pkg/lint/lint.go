@@ -49,7 +49,6 @@ func DefaultConfig() Config {
 		AllowedPKTypes:         "bigint,binary,varbinary",
 		AllowedPostgresPKTypes: "bigint,uuid",
 		AllowedCharsets:        "utf8mb4,binary",
-		IgnoreTables:           []string{"schema_version"},
 	}
 }
 

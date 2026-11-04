@@ -307,6 +307,120 @@ func TestE2EPlanUnscopedPlansRegisteredDatabaseWhenPRTouchesUnregisteredConfig(t
 	}
 }
 
+// setupFakeGitHubForRenameVacatingSchema serves a PR whose only changed file
+// renames schema/<db>/users.sql to users.sql.disabled while the default branch
+// still holds users.sql, and orders.sql stays in the schema directory. Merging
+// the PR stops the default branch declaring the users table, so the PR is a
+// schema change for that database even though no current file name is a
+// schema file.
+func setupFakeGitHubForRenameVacatingSchema(t *testing.T, mux *http.ServeMux, dbName string) *planFlowResult {
+	t.Helper()
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"orders.sql": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	vacated := "schema/" + dbName + "/users.sql"
+	prFiles := []*gh.CommitFile{{
+		Filename:         new(vacated + ".disabled"),
+		PreviousFilename: new(vacated),
+		Status:           new("renamed"),
+	}}
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
+	result.baseHolds(vacated, "schema/"+dbName+"/orders.sql")
+	return result
+}
+
+// assertRenameVacatingSchemaIsPlanned waits for the plan comment and the
+// aggregate Check Run of a PR that only renames a schema file away, and checks
+// the PR was planned and blocked rather than refreshed as passing.
+func assertRenameVacatingSchemaIsPlanned(t *testing.T, result *planFlowResult, dbName string) {
+	t.Helper()
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, dbName)
+		assert.Contains(t, body, "orders")
+		assert.NotContains(t, body, "No Schema Files Changed")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment on a rename that vacates a schema path")
+	}
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for the aggregate Check Run on a rename that vacates a schema path")
+	}
+}
+
+// TestE2EPlanCommandOnRenameVacatingSchemaPlansDatabase covers a user
+// commenting a bare `schemabot plan` on a PR whose only change renames a schema
+// file to a non-schema name (users.sql to users.sql.disabled) while the default
+// branch still holds users.sql. The command must resolve the config through
+// the vacated path, post a plan, and leave the aggregate Check Run blocking —
+// never the "No Schema Files Changed" refresh that would publish a passing
+// aggregate for a PR that stops declaring a table.
+func TestE2EPlanCommandOnRenameVacatingSchemaPlansDatabase(t *testing.T) {
+	dbName := "webhook_plan_rename_vacated"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForRenameVacatingSchema(t, mux, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	assertRenameVacatingSchemaIsPlanned(t, result, dbName)
+}
+
+// TestE2EAutoPlanOnRenameVacatingSchemaPlansDatabase covers the same PR as
+// TestE2EPlanCommandOnRenameVacatingSchemaPlansDatabase arriving as an opened
+// pull request: auto-plan must discover the database through the vacated path,
+// post a plan, and leave the aggregate Check Run blocking.
+func TestE2EAutoPlanOnRenameVacatingSchemaPlansDatabase(t *testing.T) {
+	dbName := "webhook_autoplan_rename_vacated"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForRenameVacatingSchema(t, mux, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	assertRenameVacatingSchemaIsPlanned(t, result, dbName)
+}
+
 // registerSecondSchemabotConfig serves an additional schemabot.yaml at the
 // given repo path so a test PR can span more than one discovered config.
 func registerSecondSchemabotConfig(t *testing.T, mux *http.ServeMux, repoPath, content string) {

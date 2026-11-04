@@ -140,13 +140,15 @@ func TestPlanAllChangesDirect(t *testing.T) {
 
 // TestPlanBlockedApplyError verifies the refusal every admission path returns
 // for a plan with a blocked step: it names the first blocked table and its
-// reason, falls back to a fixed reason when the engine recorded none, and is
+// reason (the first, when several are blocked, since the remedy text tells the
+// operator what to fix first), falls back to a fixed reason when the engine recorded none, and is
 // nil for a plan whose every step is executable.
 func TestPlanBlockedApplyError(t *testing.T) {
 	blocked := &Plan{PlanIdentifier: "plan-blocked", Namespaces: map[string]*NamespacePlanData{
 		"public": {Tables: []TableChange{
 			{Table: "orders", Operation: "alter"},
 			{Table: "users", Operation: "alter", ExecutionMode: "blocked", ModeReason: "requires privileges unavailable to the engine"},
+			{Table: "accounts", Operation: "alter", ExecutionMode: "blocked", ModeReason: "table exceeds the native-safe size ceiling"},
 		}},
 	}}
 	require.EqualError(t, blocked.BlockedApplyError(), `stored plan plan-blocked contains a blocked change for table "users": requires privileges unavailable to the engine`)
@@ -757,4 +759,24 @@ func TestTableChangeTaskEstimatedBytes(t *testing.T) {
 
 	assert.Nil(t, change.TaskEstimatedBytes("-80"), "a shard-scoped task carries no whole-table estimate")
 	assert.Nil(t, TableChange{Table: "users"}.TaskEstimatedBytes(""), "no estimate at plan time means none on the task")
+}
+
+// A task carries the plan's row estimate under the same whole-table rule as
+// its size: its own copy when it spans the table, none when scoped to a shard.
+// Only an ALTER copies rows, so a DROP of a sized table carries none.
+func TestTableChangeTaskEstimatedRows(t *testing.T) {
+	rows := int64(48_200_000)
+	change := TableChange{Table: "orders", Operation: "alter", EstimatedRows: &rows}
+
+	whole := change.TaskEstimatedRows("")
+	require.NotNil(t, whole)
+	assert.Equal(t, rows, *whole)
+	*whole = 1
+	assert.Equal(t, int64(48_200_000), *change.EstimatedRows, "the task gets its own copy of the estimate")
+
+	assert.Nil(t, change.TaskEstimatedRows("-80"), "a shard-scoped task carries no whole-table estimate")
+	assert.Nil(t, TableChange{Table: "users", Operation: "alter"}.TaskEstimatedRows(""), "no estimate at plan time means none on the task")
+
+	drop := TableChange{Table: "orders", Operation: "drop", EstimatedRows: &rows}
+	assert.Nil(t, drop.TaskEstimatedRows(""), "a drop copies no rows, so its task carries no row estimate")
 }

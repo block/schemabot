@@ -448,6 +448,123 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	}
 }
 
+// An operator stopped a two-target rollout while region-a copied and region-b
+// waited its turn, then started it again. The start posts one fresh progress
+// comment at the bottom of the PR and freezes the stopped one. The rollout then
+// hands off from region-a to region-b, reading pending while region-b waits for
+// its claim; that is not a stop, so the observer edits the fresh comment in
+// place through the handoff and into region-b's copy, rotating nothing and
+// posting no summary.
+func TestE2ERolloutStartRotatesOnceAcrossTheTargetHandoff(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-rollout-start",
+		pr:         171,
+		database:   "e2e_rollout_start_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, taskA, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	insertTarget := func(target, opState string) int64 {
+		t.Helper()
+		id, err := st.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "default", Target: target, OperationKey: target, State: opState,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		})
+		require.NoError(t, err)
+		return id
+	}
+	regionA := insertTarget("region-a", state.ApplyOperation.Resuming)
+	regionB := insertTarget("region-b", state.ApplyOperation.Pending)
+	taskA.ApplyOperationID = &regionA
+	require.NoError(t, st.Tasks().Update(ctx, taskA))
+	taskB := *taskA
+	taskB.TaskIdentifier = taskA.TaskIdentifier + "_b"
+	taskB.ApplyOperationID = &regionB
+	taskB.State = state.Task.Pending
+	taskB.RowsCopied = 0
+	taskB.ProgressPercent = 0
+	_, err := st.Tasks().Create(ctx, &taskB)
+	require.NoError(t, err)
+	setTargets := func(applyState, regionAState, regionBState string) {
+		t.Helper()
+		apply.State = applyState
+		require.NoError(t, st.ApplyOperations().UpdateState(ctx, regionA, regionAState))
+		require.NoError(t, st.ApplyOperations().UpdateState(ctx, regionB, regionBState))
+	}
+
+	h.postAndTrackComment(ctx, "org/repo-rollout-start", 171, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	stoppedProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-rollout-start", 171, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(taskA.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The start's first tick posts the fresh comment and freezes the stopped one.
+	obs.OnProgress(apply, []*storage.Task{taskA, &taskB})
+	var freshID int64
+	select {
+	case created := <-capture.creates:
+		freshID = created.ID
+		assert.NotContains(t, created.Body, "Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the start to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the stopped comment")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID))
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the stopped progress comment to be frozen")
+	}
+
+	// requireInPlaceEdit advances past the edit interval, ticks, and requires
+	// the tick to edit the fresh comment rather than post another one.
+	requireInPlaceEdit := func(msg string, tasks ...*storage.Task) string {
+		t.Helper()
+		fake.Advance(activeInterval + time.Second)
+		obs.OnProgress(apply, tasks)
+		select {
+		case edited := <-capture.edits:
+			assert.Equal(t, freshID, edited.CommentID, msg)
+			return edited.Body
+		case created := <-capture.creates:
+			t.Fatalf("%s: a start rotates once; got another new comment %d:\n%s", msg, created.ID, created.Body)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: expected an in-place edit of the fresh comment", msg)
+		}
+		return ""
+	}
+
+	setTargets(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
+	taskA.RowsCopied, taskA.ProgressPercent = 700, 70
+	requireInPlaceEdit("region-a copying", taskA, &taskB)
+
+	// The handoff: region-a is done and region-b is queued for its claim.
+	setTargets(state.Apply.Pending, state.ApplyOperation.Completed, state.ApplyOperation.Pending)
+	taskA.State, taskA.RowsCopied, taskA.ProgressPercent = state.Task.Completed, 1000, 100
+	handoff := requireInPlaceEdit("the handoff", taskA, &taskB)
+	assert.NotContains(t, handoff, "Stopped", "a rollout between targets is not stopped")
+	assert.Contains(t, handoff, "Rolling out: 1 of 2 targets done, 1 queued")
+	assert.Contains(t, handoff, "`region-b`: queued")
+
+	setTargets(state.Apply.Running, state.ApplyOperation.Completed, state.ApplyOperation.Running)
+	taskB.State, taskB.RowsCopied, taskB.ProgressPercent = state.Task.Running, 300, 30
+	requireInPlaceEdit("region-b copying", taskA, &taskB)
+
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("no summary posts while the rollout is under way; got comment %d:\n%s", created.ID, created.Body)
+	default:
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the stop's summary is the one the start rotated on, and no other summary replaced it")
+}
+
 // A resume rotation whose fresh comment lands but whose summary-marker
 // consumption fails must not leave the marker active for the rest of the
 // drive: the marker is the durable signal that the next terminal summary needs
@@ -566,7 +683,7 @@ func TestE2EResumeRotationWaitsForSummaryClaimSentinel(t *testing.T) {
 
 	// A stop-side publisher has claimed the summary but not yet posted it: the
 	// marker row is a claim sentinel with no comment ID.
-	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won, "the claim sentinel is created for the in-flight publish")
 
@@ -679,6 +796,259 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 	require.NotNil(t, summary)
 	assert.Equal(t, terminalSummaryID, summary.GitHubCommentID)
 	assert.Nil(t, summary.SupersededAt)
+}
+
+// A started apply that reaches its next terminal state before any progress
+// tick rotated its comment still gets the summary of that state: the stop's
+// summary is still recorded when the apply completes, and it describes the
+// stop, not the completion, so the completion's publish claims the marker and
+// posts the result at the bottom of the PR.
+func TestE2EStartedApplyCompletingBeforeRotationPostsItsSummary(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-complete-before-rotation",
+		pr:         159,
+		database:   "e2e_complete_before_rotation_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture := f.st, f.apply, f.task, f.capture
+
+	f.handler.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 50%")
+	requireCommentCreate(t, capture)
+	stoppedSummaryID := seedStoppedSummary(t, f)
+
+	// The started copy finishes before the first progress tick: the observer's
+	// first callback is the terminal one.
+	obs := f.newObserver(st, clock.NewFake(task.CreatedAt))
+	setStoredApplyState(t, f, state.Apply.Completed)
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	var completionSummaryID int64
+	select {
+	case created := <-capture.creates:
+		completionSummaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Applied")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the completion summary while the stop's summary is still recorded")
+	}
+	assert.NotEqual(t, stoppedSummaryID, completionSummaryID)
+
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, completionSummaryID, summary.GitHubCommentID)
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Completed, *summary.SummarizedState)
+	assert.Nil(t, summary.SupersededAt)
+}
+
+// An operator can stop a started apply again while the first progress tick
+// after the start is still rotating its comment. The second stop's publish
+// finds the first stop's summary still recorded and loses its claim to it. The
+// rotation must not consume that summary, because it is what the next start
+// rotates on; it marks it rotated past instead. Reconciliation then posts the
+// second stop's summary, and the next start still posts a fresh progress
+// comment at the bottom of the PR.
+func TestE2EStopDuringResumeRotationKeepsStopSummaryAndNextRotation(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-stop-during-rotation",
+		pr:         158,
+		database:   "e2e_stop_during_rotation_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	requireCommentCreate(t, capture)
+	firstStopSummaryID := seedStoppedSummary(t, f)
+
+	// The second stop lands while the rotation posts its fresh comment: by
+	// the time the rotation consumes the summary marker, the apply is stopped
+	// again and the stop's terminal publish has already run.
+	fake := clock.NewFake(task.CreatedAt)
+	secondStop := *apply
+	secondStop.State = state.Apply.Stopped
+	stoppedTask := *task
+	stoppedTask.State = state.Task.Stopped
+	stopObserver := f.newObserver(st, fake)
+	racing := &summaryConsumeHookStorage{Storage: st, beforeConsume: func() {
+		setStoredApplyState(t, f, state.Apply.Stopped)
+		stopObserver.OnTerminal(&secondStop, []*storage.Task{&stoppedTask})
+	}}
+	obs := f.newObserver(racing, fake)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var firstRotationID int64
+	select {
+	case created := <-capture.creates:
+		firstRotationID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the first start's rotation to post a fresh progress comment")
+	}
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("the second stop's publish must lose its claim to the recorded summary; got comment %d: %s", created.ID, created.Body)
+	default:
+	}
+
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, firstStopSummaryID, summary.GitHubCommentID)
+	assert.Nil(t, summary.SupersededAt, "the summary stays active for the next start's rotation")
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, storage.SummaryRotatedPast, *summary.SummarizedState)
+
+	// Reconciliation finds the second stop owed its summary once the stop has
+	// settled, and posts it.
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?",
+		int(storage.SummaryClaimStaleAfter.Seconds())+60, apply.ID)
+	require.NoError(t, err)
+	h.ReconcileMissingSummaryComments(ctx)
+
+	var secondStopSummaryID int64
+	select {
+	case created := <-capture.creates:
+		secondStopSummaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected reconciliation to post the second stop's summary")
+	}
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, secondStopSummaryID, summary.GitHubCommentID)
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Stopped, *summary.SummarizedState)
+
+	// The second start: a fresh drive's observer rotates on the second stop's
+	// summary and consumes it.
+	setStoredApplyState(t, f, state.Apply.Resuming)
+	nextStart := f.newObserver(st, fake)
+	nextStart.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+		assert.NotEqual(t, firstRotationID, created.ID)
+		tracked, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, tracked)
+		assert.Equal(t, created.ID, tracked.GitHubCommentID, "the second start's comment is the tracked progress comment")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the second start to post a fresh progress comment")
+	}
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the second start's rotation consumes the second stop's summary")
+}
+
+// A start's rotation can post its fresh progress comment and then fail to
+// settle the stop's summary, and the apply can be stopped again before any
+// later tick retries. The terminal publish settles the owed summary first, so
+// the second stop's summary claim is not blocked by the summary the rotation
+// already rotated away, and the second stop's summary posts at the bottom of
+// the PR.
+func TestE2EResumeSummarySettleFlushedAtTerminalPublish(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-resume-settle-flush",
+		pr:         160,
+		database:   "e2e_resume_settle_flush_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	requireCommentCreate(t, capture)
+	firstStopSummaryID := seedStoppedSummary(t, f)
+
+	// The rotation posts its fresh comment, but settling the stop's summary
+	// fails at storage.
+	failingStorage := &failingCommentSupersedeStorage{Storage: st}
+	obs := f.newObserver(failingStorage, clock.NewFake(task.CreatedAt))
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the start's rotation to post a fresh progress comment")
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Nil(t, summary.SupersededAt, "the failed settle leaves the stop's summary active")
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Stopped, *summary.SummarizedState, "the failed settle leaves the stop's summary unchanged")
+
+	// The apply is stopped again before the next tick, and storage heals.
+	setStoredApplyState(t, f, state.Apply.Stopped)
+	failingStorage.heal()
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	var secondStopSummaryID int64
+	select {
+	case created := <-capture.creates:
+		secondStopSummaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the second stop's summary once the terminal publish settles the owed summary")
+	}
+	assert.NotEqual(t, firstStopSummaryID, secondStopSummaryID)
+
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, secondStopSummaryID, summary.GitHubCommentID, "the second stop's summary is the recorded summary")
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Stopped, *summary.SummarizedState)
+	assert.Nil(t, summary.SupersededAt, "the second stop's summary stays active for the next start's rotation")
+}
+
+// setStoredApplyState writes applyState to the fixture apply's stored row
+// only, the way a driver's terminal write lands before its observer publishes.
+func setStoredApplyState(t *testing.T, f *applyCommentFixture, applyState string) {
+	t.Helper()
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+	_, err = db.ExecContext(t.Context(), "UPDATE applies SET state = ? WHERE id = ?", applyState, f.apply.ID)
+	require.NoError(t, err)
+}
+
+// seedStoppedSummary posts the summary a stop leaves behind and records it as
+// the summary of the stopped state. Returns the posted comment ID.
+func seedStoppedSummary(t *testing.T, f *applyCommentFixture) int64 {
+	t.Helper()
+	ctx := t.Context()
+	f.handler.postAndTrackComment(ctx, f.apply.Repository, f.apply.PullRequest, 12345, f.apply, state.Comment.Summary, "Schema Change Stopped")
+	summaryID := requireCommentCreate(t, f.capture)
+	stopped := state.Apply.Stopped
+	require.NoError(t, f.st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         f.apply.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: summaryID,
+		SummarizedState: &stopped,
+	}))
+	return summaryID
 }
 
 // Across repeated stop/start iterations, each resume folds the progress
@@ -1516,85 +1886,451 @@ func TestE2EDeferredCutoverPromptStaysMutedWithoutCutover(t *testing.T) {
 	assert.False(t, postCutoverPhase(trackedPhase(prog)), "no post-cutover phase is recorded without a cutover")
 }
 
-// A deferred-cutover apply parks at the gate in waiting_for_cutover until the
-// operator's cutover command arrives. The first observer tick that finds the
-// apply parked posts the cutover prompt — carrying the pasteable cutover
-// command — as a fresh comment at the bottom of the PR timeline rather than
-// an edit of the tracked progress comment, tracks it as the cutover comment,
-// and mutes progress edits behind it so later ticks at the gate change
-// nothing.
-func TestE2EDeferredCutoverParkedGatePostsPrompt(t *testing.T) {
+// A deferred-cutover apply that finishes its checksum parks at the gate in
+// waiting_for_cutover until the operator's cutover command arrives. Reaching
+// the gate is not a command taking effect, so the tracked progress comment
+// moves from checksumming to waiting for cutover in place, carrying the
+// pasteable cutover command in its footer, and no other comment is posted —
+// not by a later tick at the gate, and not by a fresh observer after a
+// restart.
+func TestE2EDeferredCutoverParkedGateEditsProgressInPlace(t *testing.T) {
 	ctx := t.Context()
 
 	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
 		repo:         "org/repo-cutover-parked",
 		pr:           154,
 		database:     "e2e_cutover_parked_db",
-		applyState:   state.Apply.WaitingForCutover,
+		applyState:   state.Apply.Checksumming,
 		deferCutover: true,
 	})
 	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
 
-	h.postAndTrackComment(ctx, "org/repo-cutover-parked", 154, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	h.postAndTrackComment(ctx, "org/repo-cutover-parked", 154, 12345, apply, state.Comment.Progress, "Checksumming to verify data")
 	progressID := requireCommentCreate(t, capture)
 
 	fake := clock.NewFake(task.CreatedAt)
 	obs := f.newObserver(st, fake)
 
-	// The first tick at the parked gate posts the prompt as a new comment.
+	// The checksum passed and the apply parked at the gate.
+	apply.State = state.Apply.WaitingForCutover
+	task.State = state.Task.WaitingForCutover
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
 	obs.OnProgress(apply, []*storage.Task{task})
 
-	var promptID int64
 	select {
-	case created := <-capture.creates:
-		promptID = created.ID
-		assert.Contains(t, created.Body, "**Status**: Waiting for Cutover")
-		assert.Contains(t, created.Body, "To proceed with cutover:")
-		assert.Contains(t, created.Body, fmt.Sprintf("schemabot cutover %s -e staging", apply.ApplyIdentifier))
 	case edited := <-capture.edits:
-		t.Fatalf("the parked gate posts the prompt as a new comment, not an edit; got an edit of %d: %s", edited.CommentID, edited.Body)
+		assert.Equal(t, progressID, edited.CommentID, "the gate edits the tracked progress comment")
+		assert.Contains(t, edited.Body, "**Status**: Waiting for Cutover")
+		assert.Contains(t, edited.Body, fmt.Sprintf("To proceed with cutover:\n```\nschemabot cutover %s -e staging\n```\n", apply.ApplyIdentifier))
+	case created := <-capture.creates:
+		t.Fatalf("reaching the gate must not post a comment; got %d: %s", created.ID, created.Body)
 	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be posted at the parked gate")
+		t.Fatal("expected the progress comment to move to waiting for cutover")
 	}
-	assert.NotEqual(t, progressID, promptID, "the prompt is its own comment, not the progress comment")
 
-	// The cutover row tracks the prompt so a restart's fresh observer finds it.
 	cutoverRow, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Cutover)
 	require.NoError(t, err)
-	require.NotNil(t, cutoverRow)
-	assert.Equal(t, promptID, cutoverRow.GitHubCommentID)
-	assert.Nil(t, cutoverRow.SupersededAt, "the prompt row stays live while the gate waits for its answer")
+	assert.Nil(t, cutoverRow, "no cutover prompt comment is tracked")
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, progressID, prog.GitHubCommentID, "the progress comment stays the tracked one")
 
-	// Later ticks at the gate are muted behind the live prompt: nothing is
-	// posted and nothing is edited.
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-	select {
-	case created := <-capture.creates:
-		t.Fatalf("a later tick at the gate must not post another comment; got %d: %s", created.ID, created.Body)
-	case edited := <-capture.edits:
-		t.Fatalf("a later tick at the gate must not edit while the prompt is live; got an edit of %d: %s", edited.CommentID, edited.Body)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	// A pod restart or re-claimed drive hands the parked apply to a fresh
-	// observer with no in-memory record of the prompt. The durable cutover row
-	// is what keeps a multi-day park from re-posting the prompt on every
-	// restart: the fresh observer rehydrates from the row and stays muted.
-	obs2 := f.newObserver(st, fake)
-	fake.Advance(activeInterval + time.Second)
-	obs2.OnProgress(apply, []*storage.Task{task})
-	select {
-	case created := <-capture.creates:
-		t.Fatalf("a fresh observer at the parked gate must not re-post the prompt; got %d: %s", created.ID, created.Body)
-	case edited := <-capture.edits:
-		t.Fatalf("a fresh observer at the parked gate must not edit while the prompt is live; got an edit of %d: %s", edited.CommentID, edited.Body)
-	case <-time.After(100 * time.Millisecond):
+	// A later tick at the gate, and a fresh observer on a restart, keep the
+	// same comment: neither posts.
+	for _, o := range []*CommentObserver{obs, f.newObserver(st, fake)} {
+		fake.Advance(stagnantInterval + time.Second)
+		o.OnProgress(apply, []*storage.Task{task})
+		select {
+		case created := <-capture.creates:
+			t.Fatalf("a tick at the gate must not post a comment; got %d: %s", created.ID, created.Body)
+		case edited := <-capture.edits:
+			assert.Equal(t, progressID, edited.CommentID, "an edit at the gate lands on the tracked progress comment")
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
-// When the operator's cutover on a parked deferred-cutover apply resolves
-// directly to a terminal state, the cutover prompt is the completion comment:
+// When the operator's cutover takes effect on a deferred apply that is still
+// active, the effect is tracked in a fresh progress comment at the bottom of
+// the PR and the comment that waited for cutover is folded into a details
+// block pointing at it. The durable cutover control request is what marks
+// the cutover as the operator's. The rotation happens once, whichever cutover
+// phase the first tick past the gate finds — cutting over, or the revert
+// window when cutting over passed between ticks — and later phases of the same
+// cutover, later ticks, and a fresh observer all edit the fresh comment in
+// place.
+func TestE2EDeferredCutoverCommandRotatesProgressComment(t *testing.T) {
+	for name, firstPhase := range map[string]string{
+		"cutting over":  state.Apply.CuttingOver,
+		"revert window": state.Apply.RevertWindow,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			repo := "org/repo-cutover-command-" + strings.ReplaceAll(name, " ", "-")
+			f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+				repo:         repo,
+				pr:           156,
+				database:     "e2e_cutover_cmd_" + strings.Fields(name)[0],
+				applyState:   state.Apply.WaitingForCutover,
+				deferCutover: true,
+			})
+			st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+			h.postAndTrackComment(ctx, repo, 156, 12345, apply, state.Comment.Progress, "Waiting for Cutover — run `schemabot cutover` to proceed")
+			gateProgressID := requireCommentCreate(t, capture)
+
+			// The operator's cutover command was recorded durably before it
+			// was acknowledged.
+			_, _, err := st.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationCutover,
+				RequestedBy: "operator",
+			})
+			require.NoError(t, err)
+
+			fake := clock.NewFake(task.CreatedAt)
+			obs := f.newObserver(st, fake)
+
+			apply.State = firstPhase
+			task.State = state.Task.CuttingOver
+			obs.OnProgress(apply, []*storage.Task{task})
+
+			var freshID int64
+			select {
+			case created := <-capture.creates:
+				freshID = created.ID
+				assert.Contains(t, created.Body, "Schema Change Status — Staging")
+			case <-time.After(5 * time.Second):
+				t.Fatal("expected a fresh progress comment when the cutover takes effect")
+			}
+
+			select {
+			case edited := <-capture.edits:
+				assert.Equal(t, gateProgressID, edited.CommentID, "the fold lands on the comment that waited for cutover")
+				assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
+					"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/156#issuecomment-%d).", repo, freshID)), edited.Body)
+				assert.Contains(t, edited.Body, "<summary>Progress before the cutover</summary>")
+				assert.Contains(t, edited.Body, "Waiting for Cutover — run `schemabot cutover` to proceed", "the waiting rendering is kept inside the fold")
+			case <-time.After(5 * time.Second):
+				t.Fatal("expected the comment that waited for cutover to be folded")
+			}
+
+			prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+			require.NoError(t, err)
+			require.NotNil(t, prog)
+			assert.Equal(t, freshID, prog.GitHubCommentID)
+			assert.Nil(t, prog.PendingFreezeCommentID, "the fold landed, so none is owed")
+			require.NotNil(t, prog.PostedPhase)
+			assert.Equal(t, controlPhase(firstPhase), *prog.PostedPhase)
+
+			// The cutover moves on into the revert window, a later tick runs,
+			// and a fresh observer takes over: each edits the fresh comment.
+			apply.State = state.Apply.RevertWindow
+			task.State = state.Task.RevertWindow
+			for _, o := range []*CommentObserver{obs, obs, f.newObserver(st, fake)} {
+				fake.Advance(activeInterval + time.Second)
+				o.OnProgress(apply, []*storage.Task{task})
+				select {
+				case created := <-capture.creates:
+					t.Fatalf("a cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+				case edited := <-capture.edits:
+					assert.Equal(t, freshID, edited.CommentID, "later edits land on the fresh comment")
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
+// A deferred apply submitted with skip-revert chosen upfront passes from the
+// cutover straight into skipping revert, so the first tick past the gate can
+// find it there with only the operator's cutover request on record. That tick
+// still owes the cutover command's rotation: a fresh progress comment at the
+// bottom of the PR, with the comment that waited for cutover folded under the
+// cutover's headline. Later ticks and a fresh observer edit the fresh comment.
+func TestE2EDeferredCutoverFirstObservedSkippingRevertRotates(t *testing.T) {
+	ctx := t.Context()
+	const repo = "org/repo-cutover-skip-revert"
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:         repo,
+		pr:           158,
+		database:     "e2e_cutover_skip_revert_db",
+		applyState:   state.Apply.WaitingForCutover,
+		deferCutover: true,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, repo, 158, 12345, apply, state.Comment.Progress, "Waiting for Cutover — run `schemabot cutover` to proceed")
+	gateProgressID := requireCommentCreate(t, capture)
+
+	_, _, err := st.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	apply.State = state.Apply.SkippingRevert
+	task.State = state.Task.RevertWindow
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	freshID := requireCommentCreate(t, capture)
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, gateProgressID, edited.CommentID, "the fold lands on the comment that waited for cutover")
+		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
+			"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/158#issuecomment-%d).", repo, freshID)), edited.Body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the comment that waited for cutover to be folded")
+	}
+
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, freshID, prog.GitHubCommentID)
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, phaseSkippingRevert, *prog.PostedPhase)
+
+	for _, o := range []*CommentObserver{obs, f.newObserver(st, fake)} {
+		fake.Advance(activeInterval + time.Second)
+		o.OnProgress(apply, []*storage.Task{task})
+		select {
+		case created := <-capture.creates:
+			t.Fatalf("the cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+		case edited := <-capture.edits:
+			assert.Equal(t, freshID, edited.CommentID, "later edits land on the fresh comment")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// In an ordered deferred rollout across several deployments, each member waits
+// at the gate for its own cutover command, and the one apply-level cutover
+// request is re-bound to each member in turn. Every member's cutover is an
+// operator command taking effect, so each one rotates a fresh progress comment
+// in and folds the comment that tracked the previous member's cutover — the
+// second member's cutover does not edit the first member's comment because
+// both recorded the same phase. This holds for the observer that rotated the
+// first member and for a fresh observer after a restart.
+func TestE2EOrderedDeferredCutoverRotatesForEachMember(t *testing.T) {
+	const firstMember, secondMember = int64(9101), int64(9102)
+	for name, freshObserverForSecond := range map[string]bool{
+		"same observer":  false,
+		"fresh observer": true,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			repo := "org/repo-ordered-cutover-" + strings.ReplaceAll(name, " ", "-")
+			f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+				repo:         repo,
+				pr:           159,
+				database:     "e2e_ordered_cutover_" + strings.Fields(name)[0],
+				applyState:   state.Apply.WaitingForCutover,
+				deferCutover: true,
+			})
+			st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+			h.postAndTrackComment(ctx, repo, 159, 12345, apply, state.Comment.Progress, "Waiting for Cutover — run `schemabot cutover` to proceed")
+			gateProgressID := requireCommentCreate(t, capture)
+
+			fake := clock.NewFake(task.CreatedAt)
+			obs := f.newObserver(st, fake)
+
+			// cutOverMember records the operator's cutover bound to the member,
+			// moves the apply through the cutover, and returns the fresh
+			// progress comment the rotation posted after checking it folded
+			// the comment tracking the previous cutover.
+			cutOverMember := func(o *CommentObserver, member, supersededID int64) int64 {
+				t.Helper()
+				_, _, err := st.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+					ApplyID:     apply.ID,
+					Operation:   storage.ControlOperationCutover,
+					RequestedBy: "operator",
+					Metadata:    storage.CutoverRequestMetadata(member),
+				})
+				require.NoError(t, err)
+
+				apply.State = state.Apply.CuttingOver
+				task.State = state.Task.CuttingOver
+				fake.Advance(activeInterval + time.Second)
+				o.OnProgress(apply, []*storage.Task{task})
+
+				freshID := requireCommentCreate(t, capture)
+				select {
+				case edited := <-capture.edits:
+					assert.Equal(t, supersededID, edited.CommentID, "the fold lands on the comment tracking the previous cutover")
+					assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
+						"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/159#issuecomment-%d).", repo, freshID)), edited.Body)
+				case <-time.After(5 * time.Second):
+					t.Fatal("expected the comment tracking the previous cutover to be folded")
+				}
+
+				prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+				require.NoError(t, err)
+				require.NotNil(t, prog)
+				assert.Equal(t, freshID, prog.GitHubCommentID)
+				require.NotNil(t, prog.PostedPhase)
+				assert.Equal(t, phaseCuttingOver, *prog.PostedPhase)
+				require.NotNil(t, prog.PostedCutoverOperationID)
+				assert.Equal(t, member, *prog.PostedCutoverOperationID)
+				return freshID
+			}
+
+			firstID := cutOverMember(obs, firstMember, gateProgressID)
+
+			// The first member finished; the driver consumed its request and
+			// the second member is parked at the gate. The tick edits the
+			// first member's comment in place.
+			require.NoError(t, st.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationCutover))
+			apply.State = state.Apply.WaitingForCutover
+			task.State = state.Task.WaitingForCutover
+			fake.Advance(activeInterval + time.Second)
+			obs.OnProgress(apply, []*storage.Task{task})
+			select {
+			case created := <-capture.creates:
+				t.Fatalf("parking the next member at the gate must not rotate; got %d: %s", created.ID, created.Body)
+			case edited := <-capture.edits:
+				assert.Equal(t, firstID, edited.CommentID, "the gate edits the first member's comment in place")
+			case <-time.After(5 * time.Second):
+				t.Fatal("expected the gate to edit the first member's comment")
+			}
+
+			second := obs
+			if freshObserverForSecond {
+				second = f.newObserver(st, fake)
+			}
+			secondID := cutOverMember(second, secondMember, firstID)
+
+			// The second member's cutover moves into its revert window: later
+			// ticks and a fresh observer edit its comment.
+			apply.State = state.Apply.RevertWindow
+			task.State = state.Task.RevertWindow
+			for _, o := range []*CommentObserver{second, f.newObserver(st, fake)} {
+				fake.Advance(activeInterval + time.Second)
+				o.OnProgress(apply, []*storage.Task{task})
+				select {
+				case created := <-capture.creates:
+					t.Fatalf("a member's cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+				case edited := <-capture.edits:
+					assert.Equal(t, secondID, edited.CommentID, "later edits land on the second member's comment")
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
+// A progress comment that records no rollout member — the handler's own
+// post, such as the fresh comment of a resume, or one an older build posted —
+// cannot say whose cutover it tracks. When the next member of an ordered
+// rollout is cut over after such a comment was posted past the gate, the
+// operator's command still lands in a fresh comment at the bottom of the PR
+// rather than editing that comment in place.
+func TestE2EOrderedDeferredCutoverRotatesPastCommentWithoutMember(t *testing.T) {
+	ctx := t.Context()
+	const repo = "org/repo-ordered-cutover-no-member"
+	const nextMember = int64(9202)
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:         repo,
+		pr:           160,
+		database:     "e2e_ordered_cutover_no_member",
+		applyState:   state.Apply.RevertWindow,
+		deferCutover: true,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// The tracked comment was posted in the previous member's revert window
+	// and records no member.
+	h.postAndTrackComment(ctx, repo, 160, 12345, apply, state.Comment.Progress, "Revert window — previous member")
+	pastID := requireCommentCreate(t, capture)
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	require.NotNil(t, prog.PostedPhase)
+	require.Equal(t, phaseRevertWindow, *prog.PostedPhase)
+	require.Nil(t, prog.PostedCutoverOperationID, "the handler's post records no member")
+
+	_, _, err = st.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		RequestedBy: "operator",
+		Metadata:    storage.CutoverRequestMetadata(nextMember),
+	})
+	require.NoError(t, err)
+
+	obs := f.newObserver(st, clock.NewFake(task.CreatedAt))
+	apply.State = state.Apply.CuttingOver
+	task.State = state.Task.CuttingOver
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	freshID := requireCommentCreate(t, capture)
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, pastID, edited.CommentID, "the fold lands on the comment that recorded no member")
+		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
+			"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/160#issuecomment-%d).", repo, freshID)), edited.Body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the comment that recorded no member to be folded")
+	}
+	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, freshID, prog.GitHubCommentID)
+	require.NotNil(t, prog.PostedCutoverOperationID)
+	assert.Equal(t, nextMember, *prog.PostedCutoverOperationID)
+}
+
+// A cutover that is not the effect of an operator's command transitions the
+// progress comment in place: an apply that never deferred its cutover cuts
+// over on its own, and a deferred apply with no recorded cutover request has
+// no command whose effect anyone is waiting to see.
+func TestE2ECutoverWithoutOperatorCommandEditsInPlace(t *testing.T) {
+	for name, deferCutover := range map[string]bool{
+		"automatic cutover":                false,
+		"deferred with no cutover request": true,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			repo := "org/repo-cutover-in-place-" + strings.ReplaceAll(name, " ", "-")
+			f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+				repo:         repo,
+				pr:           157,
+				database:     "e2e_cutover_inplace_" + strings.Fields(name)[0],
+				applyState:   state.Apply.WaitingForCutover,
+				deferCutover: deferCutover,
+			})
+			st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+			h.postAndTrackComment(ctx, repo, 157, 12345, apply, state.Comment.Progress, "Waiting for Cutover")
+			progressID := requireCommentCreate(t, capture)
+
+			fake := clock.NewFake(task.CreatedAt)
+			obs := f.newObserver(st, fake)
+			for _, applyState := range []string{state.Apply.CuttingOver, state.Apply.RevertWindow} {
+				apply.State = applyState
+				fake.Advance(activeInterval + time.Second)
+				obs.OnProgress(apply, []*storage.Task{task})
+				select {
+				case created := <-capture.creates:
+					t.Fatalf("state %q must not rotate without an operator's cutover; got %d: %s", applyState, created.ID, created.Body)
+				case edited := <-capture.edits:
+					assert.Equal(t, progressID, edited.CommentID, "state %q edits the tracked comment in place", applyState)
+				case <-time.After(5 * time.Second):
+					t.Fatalf("expected state %q to edit the tracked comment", applyState)
+				}
+			}
+		})
+	}
+}
+
+// When the operator's cutover on a deferred-cutover apply parked behind a
+// separate cutover prompt comment resolves directly to a terminal state, the
+// cutover prompt is the completion comment:
 // the terminal edit turns it into the applied summary and the summary marker
 // records it as the terminal publish. The tracked progress comment — still
 // rendering the cutover gate and its pasteable cutover command — also
@@ -1615,12 +2351,11 @@ func TestE2EDeferredCutoverFastTerminalFinalizesProgressComment(t *testing.T) {
 	h.postAndTrackComment(ctx, "org/repo-cutover-fast-terminal", 155, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
 	progressID := requireCommentCreate(t, capture)
 
-	fake := clock.NewFake(task.CreatedAt)
-	obs := f.newObserver(st, fake)
-
-	// The tick at the parked gate posts and tracks the cutover prompt.
-	obs.OnProgress(apply, []*storage.Task{task})
+	// The apply parked behind a separate cutover prompt comment.
+	h.postAndTrackComment(ctx, "org/repo-cutover-fast-terminal", 155, 12345, apply, state.Comment.Cutover, "Ready for cutover — run `schemabot cutover` to proceed")
 	promptID := requireCommentCreate(t, capture)
+
+	obs := f.newObserver(st, clock.NewFake(task.CreatedAt))
 
 	// The operator's cutover completes the apply before another progress tick
 	// lands.
@@ -2355,10 +3090,11 @@ func (s *failingCommentUpsertStorage) ApplyComments() storage.ApplyCommentStore 
 
 func (s *failingCommentUpsertStorage) heal() { s.healed.Store(true) }
 
-// failingCommentSupersedeStore wraps an ApplyCommentStore so every Supersede
+// failingCommentSupersedeStore wraps an ApplyCommentStore so every supersede
 // fails until the outage is healed, modeling a storage outage between posting
-// the post-cutover rotation comment and consuming the cutover row. Reads and
-// every other write pass through.
+// a rotation comment and consuming the row it rotated away: the cutover row
+// after a post-cutover rotation, or the summary marker after a resume
+// rotation. Reads and every other write pass through.
 type failingCommentSupersedeStore struct {
 	storage.ApplyCommentStore
 	healed *atomic.Bool
@@ -2369,6 +3105,37 @@ func (s *failingCommentSupersedeStore) Supersede(ctx context.Context, applyID in
 		return s.ApplyCommentStore.Supersede(ctx, applyID, commentState)
 	}
 	return errors.New("injected comment supersede failure")
+}
+
+func (s *failingCommentSupersedeStore) SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (storage.ResumeSummarySettlement, error) {
+	if s.healed.Load() {
+		return s.ApplyCommentStore.SettleSummaryForResume(ctx, applyID, githubCommentID)
+	}
+	return storage.ResumeSummaryLeftInPlace, errors.New("injected summary settle failure")
+}
+
+// summaryConsumeHookStorage runs beforeConsume once, just before the first
+// resume rotation consumes its summary marker, modeling a control operation
+// that lands while the rotation is posting its fresh comment. Every store
+// passes through to the real storage.
+type summaryConsumeHookStorage struct {
+	storage.Storage
+	beforeConsume func()
+	once          sync.Once
+}
+
+func (s *summaryConsumeHookStorage) ApplyComments() storage.ApplyCommentStore {
+	return &summaryConsumeHookStore{ApplyCommentStore: s.Storage.ApplyComments(), hook: s}
+}
+
+type summaryConsumeHookStore struct {
+	storage.ApplyCommentStore
+	hook *summaryConsumeHookStorage
+}
+
+func (s *summaryConsumeHookStore) SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (storage.ResumeSummarySettlement, error) {
+	s.hook.once.Do(s.hook.beforeConsume)
+	return s.ApplyCommentStore.SettleSummaryForResume(ctx, applyID, githubCommentID)
 }
 
 // failingCommentSupersedeStorage serves the failing comment store while
@@ -2477,6 +3244,7 @@ func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 9001,
 	}))
+	settleReconcileScenario(t, schemabotDB, apply)
 
 	installClient, capture := setupFakeGitHubForComments(t)
 	factory := &fakeClientFactory{client: installClient}
@@ -2595,7 +3363,22 @@ func seedReconcileScenario(t *testing.T, st storage.Storage, schemabotDB *sql.DB
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 9001,
 	}))
+	settleReconcileScenario(t, schemabotDB, apply)
 	return apply
+}
+
+// settleReconcileScenario ages apply past the settle floor summary
+// reconciliation leaves to a live publisher, so the scenario reads as an apply
+// whose publisher has had its chance and failed.
+func settleReconcileScenario(t *testing.T, schemabotDB *sql.DB, apply *storage.Apply) {
+	t.Helper()
+	_, err := schemabotDB.ExecContext(t.Context(),
+		"UPDATE applies SET completed_at = completed_at - INTERVAL 10 MINUTE, updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?", apply.ID)
+	require.NoError(t, err)
+	if apply.CompletedAt != nil {
+		settled := apply.CompletedAt.Add(-10 * time.Minute)
+		apply.CompletedAt = &settled
+	}
 }
 
 // TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply verifies startup
@@ -2658,7 +3441,7 @@ func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 
 	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-claimed", "e2e_reconcile_claimed_db", state.Apply.Completed, state.Task.Completed)
 
-	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Completed)
 	require.NoError(t, err)
 	require.True(t, won)
 
@@ -3031,7 +3814,7 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 // posted — a metadata-only DDL finishes faster than the handler's post, so the
 // driver's observer has already found nothing to edit at terminal. The handler
 // re-checks the apply after posting and finalizes the comment in place, so the
-// PR never shows a progress comment frozen at "Starting" after the success
+// PR never shows a progress comment frozen at "Queued" after the success
 // summary. An apply that is still active is left to the observer to edit.
 func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 	ctx := t.Context()
@@ -3085,7 +3868,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		var created commentCreate
 		select {
 		case created = <-capture.creates:
-			assert.Contains(t, created.Body, "**Status**: Starting")
+			assert.Contains(t, created.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
 			t.Fatal("timed out waiting for the initial progress comment")
 		}
@@ -3094,7 +3877,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		case edited := <-capture.edits:
 			assert.Equal(t, created.ID, edited.CommentID, "the finalize edits the just-posted comment")
 			assert.Contains(t, edited.Body, "**Status**: Applied")
-			assert.NotContains(t, edited.Body, "**Status**: Starting")
+			assert.NotContains(t, edited.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
 			t.Fatal("timed out waiting for the terminal finalize edit")
 		}
@@ -3154,4 +3937,71 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 			// expected: the observer owns all further edits
 		}
 	})
+}
+
+// A rollout's operations run on several clients that each hold the same
+// observer, and each delivers the settled apply's terminal state to it. The
+// observer publishes each terminal state once: the first delivery of the stop
+// edits the progress comment and posts the stop's summary, and the repeated
+// deliveries, concurrent or not, leave the PR untouched. Once the rollout is
+// started again and the observer sees it in flight, stopping it a second time
+// publishes the second stop.
+func TestE2EObserverPublishesEachTerminalOnceAcrossDeliveries(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-terminal-once",
+		pr:         147,
+		database:   "e2e_terminal_once_db",
+		applyState: state.Apply.Running,
+	})
+	apply, task, capture := f.apply, f.task, f.capture
+	f.handler.postAndTrackComment(t.Context(), apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Running at 50%")
+	requireCommentCreate(t, capture)
+	obs := f.newObserver(f.st, clock.NewFake(task.CreatedAt))
+
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+	assert.Equal(t, 1, drainSummaryCreates(capture, "Schema Change Stopped"),
+		"the first delivery of the stop posts its summary")
+	drainCommentEdits(capture)
+
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(func() { obs.OnTerminal(apply, []*storage.Task{task}) })
+	}
+	wg.Wait()
+	assert.Zero(t, len(capture.creates), "a repeated delivery of the stop posts no comment")
+	assert.Zero(t, len(capture.edits), "a repeated delivery of the stop edits no comment")
+
+	apply.State = state.Apply.Running
+	task.State = state.Task.Running
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	drainSummaryCreates(capture, "")
+	drainCommentEdits(capture)
+
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+	assert.Equal(t, 1, drainSummaryCreates(capture, "Schema Change Stopped"),
+		"the second stop of the resumed rollout posts its own summary")
+}
+
+// drainSummaryCreates empties the captured comment creates and counts those
+// whose body contains headline.
+func drainSummaryCreates(capture *commentCapture, headline string) int {
+	var count int
+	for range len(capture.creates) {
+		if created := <-capture.creates; strings.Contains(created.Body, headline) {
+			count++
+		}
+	}
+	return count
+}
+
+// drainCommentEdits empties the captured comment edits.
+func drainCommentEdits(capture *commentCapture) {
+	for range len(capture.edits) {
+		<-capture.edits
+	}
 }

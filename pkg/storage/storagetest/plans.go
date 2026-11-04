@@ -552,6 +552,69 @@ func TestPlans(t *testing.T, h Harness) {
 		assert.Empty(t, unmatched, "a filter matching nothing lists as empty, not an error")
 	})
 
+	// Walking the plan listing page by page from each page's last plan, placed
+	// by its list anchor, lists every plan exactly once, in the same order as
+	// one unpaged listing, including plans that share a creation second.
+	t.Run("List_StartAfterWalksEveryPlanOnce", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+		for i := range 7 {
+			// Pairs of plans share a second, so the walk has to break ties
+			// by id at page boundaries.
+			createPlanAt(t, store, fmt.Sprintf("plan_walk_%d", i), "orders", "org/repo", 7, base.Add(time.Duration(i/2)*time.Second))
+		}
+		createPlanAt(t, store, "plan_walk_other_db", "billing", "org/repo", 7, base)
+
+		unpaged, err := store.Plans().List(ctx, storage.ListPlansOptions{Database: "orders", Limit: 20})
+		require.NoError(t, err)
+		require.Len(t, unpaged, 7)
+
+		var walked []*storage.Plan
+		opts := storage.ListPlansOptions{Database: "orders", Limit: 2}
+		for page := 0; ; page++ {
+			require.Less(t, page, 10, "the walk must end")
+			plans, err := store.Plans().List(ctx, opts)
+			require.NoError(t, err)
+			walked = append(walked, plans...)
+			if len(plans) < opts.Limit {
+				break
+			}
+			anchor, err := store.Plans().GetListAnchor(ctx, plans[len(plans)-1].PlanIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, anchor)
+			opts.StartAfter = &anchor.Position
+		}
+		assert.Equal(t, planIdentifiers(unpaged), planIdentifiers(walked))
+	})
+
+	// A plan's list anchor carries its listing position and the fields a
+	// listing filters on, matching the stored plan, and an unknown plan has
+	// none.
+	t.Run("GetListAnchor", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		createdAt := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+		createPlanAt(t, store, "plan_anchor", "orders", "org/repo", 7, createdAt)
+
+		stored, err := store.Plans().Get(ctx, "plan_anchor")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		anchor, err := store.Plans().GetListAnchor(ctx, "plan_anchor")
+		require.NoError(t, err)
+		require.NotNil(t, anchor)
+		assert.Equal(t, stored.ID, anchor.Position.ID)
+		assert.WithinDuration(t, stored.CreatedAt, anchor.Position.CreatedAt, time.Second)
+		assert.Equal(t, "orders", anchor.Database)
+		assert.Equal(t, "staging", anchor.Environment)
+		assert.Equal(t, "org/repo", anchor.Repository)
+		assert.Equal(t, 7, anchor.PullRequest)
+
+		missing, err := store.Plans().GetListAnchor(ctx, "plan_missing")
+		require.NoError(t, err)
+		assert.Nil(t, missing)
+	})
+
 	t.Run("List_FiltersByReviewRound", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

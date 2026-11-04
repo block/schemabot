@@ -161,10 +161,11 @@ func TestMemberWorkDifference(t *testing.T) {
 		"the same document with a different recorded effect")
 }
 
-// A rollout member whose apply would discard an unfinished copy is named on the
-// work the PR apply reads, so the refusal tells the operator which target holds
-// the copy at stake.
-func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
+// A rollout member whose apply would discard an unfinished copy carries that
+// copy, named for its target, on the work the PR apply reads, so the apply asks
+// for the two-step confirm over it rather than refusing. Only a member that
+// could not say whether it discards a copy refuses.
+func TestMemberWorkOfCarriesAnotherTargetsDiscardedCopy(t *testing.T) {
 	work := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
 		Namespace: "payments",
 		TableChanges: []*ternv1.TableChange{{
@@ -184,11 +185,25 @@ func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
 	}}
 
 	got := memberWorkOf(&rollup)
-	assert.Equal(t, memberRefusal{target: "primary/payments-002", reason: `applying its plan discards the unfinished copy of orders in namespace "payments"`}, got.copyAtStake)
+	assert.False(t, got.copyAtStake.refuses(), "a copy the member reported is disclosed, not refused")
+	require.Len(t, got.discarded, 1)
+	assert.Equal(t, "primary/payments-002", got.discarded[0].target)
+	assert.Equal(t, "primary/payments-002", got.discarded[0].member)
+	assert.Equal(t, "payments", got.discarded[0].copy.Namespace)
+	assert.Equal(t, []string{"orders"}, got.discarded[0].copy.Tables)
 	assert.Equal(t, []string{"primary/payments-002"}, got.names)
 
+	primary := &apitypes.PlanResponse{}
+	outcome := reviewDriftOutcome{state: driftClean, work: got}
+	assert.Equal(t, 1, rolloutDiscardedCopies(primary, outcome, true), "the apply runs the member's plan, so its copy needs consent")
+	assert.Equal(t, 0, rolloutDiscardedCopies(primary, outcome, false), "an apply that runs only the primary plan discards nothing on the member")
+
 	rollup.Entries[1].ExistingCopies = nil
-	assert.Empty(t, memberWorkOf(&rollup).copyAtStake, "a member that reported a clean target puts nothing at stake")
+	assert.Empty(t, memberWorkOf(&rollup).discarded, "a member that reported a clean target discards nothing")
+
+	rollup.Entries[1].ExistingCopiesReported = false
+	assert.Equal(t, memberRefusal{target: "primary/payments-002", reason: "its data plane did not report whether applying its plan discards an unfinished copy"},
+		memberWorkOf(&rollup).copyAtStake, "a member that could not say refuses")
 }
 
 // A PostgreSQL targets rollout whose primary target already has the schema

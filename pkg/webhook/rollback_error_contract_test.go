@@ -2,10 +2,13 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	grpccodes "google.golang.org/grpc/codes"
@@ -33,12 +36,29 @@ type rollbackTestStorage struct {
 	plans   storage.PlanStore
 	tasks   storage.TaskStore
 	locks   storage.LockStore
+	// operations are the source apply's operation rows.
+	operations []*storage.ApplyOperation
 }
 
 func (s *rollbackTestStorage) Applies() storage.ApplyStore { return s.applies }
 func (s *rollbackTestStorage) Plans() storage.PlanStore    { return s.plans }
 func (s *rollbackTestStorage) Tasks() storage.TaskStore    { return s.tasks }
 func (s *rollbackTestStorage) Locks() storage.LockStore    { return s.locks }
+
+// ApplyOperations serves the source apply's operation rows; with none set, it
+// is an apply that rolls back on the one target its plan was made against.
+func (s *rollbackTestStorage) ApplyOperations() storage.ApplyOperationStore {
+	return rollbackTestOperationStore{operations: s.operations}
+}
+
+type rollbackTestOperationStore struct {
+	storage.ApplyOperationStore
+	operations []*storage.ApplyOperation
+}
+
+func (s rollbackTestOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	return s.operations, nil
+}
 
 type rollbackTestApplyStore struct {
 	storage.ApplyStore
@@ -169,6 +189,10 @@ type rollbackTestLockStore struct {
 
 	acquireCalls int
 	releaseCalls int
+	// released is set by Release and read from the fake GitHub server's
+	// goroutine, which checks whether the lock was released before a GitHub
+	// read.
+	released atomic.Bool
 	// releaseCtxErr snapshots the release context's cancellation state at
 	// call time, proving the release ran detached from an already-cancelled
 	// command context.
@@ -186,6 +210,7 @@ func (s *rollbackTestLockStore) Acquire(_ context.Context, _ *storage.Lock) erro
 
 func (s *rollbackTestLockStore) Release(ctx context.Context, _, _, _ string) error {
 	s.releaseCalls++
+	s.released.Store(true)
 	s.releaseCtxErr = ctx.Err()
 	return s.releaseErr
 }
@@ -810,6 +835,78 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Contains(t, body, "rollback DDL rejected by engine")
 	})
 
+	// The apply ran across multiple targets, and rollback is not currently supported
+	// for multiple targets. The refusal is the
+	// command's answer, and in a PR it names the remedy the PR already holds:
+	// revert its schema files and apply again.
+	// The remedy is an apply of schema files without the change, and where
+	// those files can be applied from depends on the PR, so the comment reads
+	// its state: an open PR reverts the change itself, a merged one needs a
+	// reverting PR, a closed one a PR that plans the default branch's schema
+	// files. A state that cannot be read gets each state's step. The lock is
+	// released before the PR state is read, so a slow GitHub read never holds
+	// it for a rollback that was already refused.
+	for _, tc := range []struct {
+		name     string
+		serve    func(mux *http.ServeMux, lockReleased func() bool, t *testing.T)
+		wantText string
+	}{
+		{
+			name: "open PR",
+			serve: func(mux *http.ServeMux, released func() bool, t *testing.T) {
+				servePullRequestState(t, mux, "open", false, released)
+			},
+			wantText: "To undo `apply-123`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line",
+		},
+		{
+			name: "merged PR",
+			serve: func(mux *http.ServeMux, released func() bool, t *testing.T) {
+				servePullRequestState(t, mux, "closed", true, released)
+			},
+			wantText: "To undo `apply-123`, open a PR that reverts the change in the schema files, then run there:",
+		},
+		{
+			name: "closed PR",
+			serve: func(mux *http.ServeMux, released func() bool, t *testing.T) {
+				servePullRequestState(t, mux, "closed", false, released)
+			},
+			wantText: "To undo `apply-123`, open a PR that only adds or toggles a `# nonce` comment line",
+		},
+		{
+			name:     "PR state unreadable",
+			serve:    func(*http.ServeMux, func() bool, *testing.T) {},
+			wantText: "- If it closed without merging, open a PR that only adds or toggles a `# nonce` comment line",
+		},
+	} {
+		t.Run("rollback of an apply across multiple targets is refused with the remedy, "+tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			lockStore := &rollbackTestLockStore{}
+			tc.serve(mux, lockStore.released.Load, t)
+			st := remotePlanRollbackStorage(lockStore)
+			for i, target := range []string{"orders-staging", "orders-staging-b", "orders-staging-c", "orders-staging-d"} {
+				st.operations = append(st.operations, &storage.ApplyOperation{
+					ID: int64(i + 1), ApplyID: 7, Deployment: "tenant-a", Target: target,
+					OperationKey: storage.TargetOperationKey(target, ""), OperationKind: storage.ApplyOperationKindWork,
+				})
+			}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+			retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+			require.NoError(t, err)
+			assert.False(t, retry, "the refusal is deterministic for this apply; re-driving would refuse again")
+			assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the refusal")
+			body := requireComment(t, comments, "rollout rollback refusal comment")
+			assert.Contains(t, body, "## Rollback Not Supported — Staging")
+			assert.Contains(t, body, "Rollback isn't currently supported for schema changes across multiple targets.\n\n")
+			assert.Contains(t, body, tc.wantText)
+			assert.Contains(t, body, "```\nschemabot apply -e staging -d orders\n```")
+			assert.NotContains(t, body, "Rollback Failed")
+			assert.NotContains(t, body, "by applying schema files without the change", "the PR comment names the remedy in its own terms, not the API's message")
+		})
+	}
+
 	t.Run("lock held by another PR is terminal", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := recordComments(t, mux)
@@ -852,5 +949,15 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Zero(t, lockStore.acquireCalls, "a denied rollback must not acquire any lock")
 		body := requireComment(t, comments, "authorization denial comment")
 		assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	})
+}
+
+// servePullRequestState serves PR #1 in the given GitHub state; a merged PR is
+// reported as closed with merged set.
+func servePullRequestState(t *testing.T, mux *http.ServeMux, prState string, merged bool, lockReleased func() bool) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		assert.True(t, lockReleased(), "the lock must be released before the PR state is read")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{State: &prState, Merged: &merged})
 	})
 }

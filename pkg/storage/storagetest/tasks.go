@@ -62,11 +62,11 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, 813, owners[0].PullRequest)
 	})
 
-	// A task's planned table size is written once when the task is created
-	// and read back with it. Progress updates rewrite the task's live figures
-	// but never its size, so a drive that does not carry the size cannot
-	// clear it.
-	t.Run("EstimatedBytes_WrittenAtCreate_SurvivesUpdate", func(t *testing.T) {
+	// A task's planned table size and row count are written once when the
+	// task is created and read back with it. Progress updates rewrite the
+	// task's live figures but never the plan's estimates, so a drive that does
+	// not carry them cannot clear them.
+	t.Run("PlanEstimates_WrittenAtCreate_SurvivesUpdate", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "task_bytes_db", storage.DatabaseTypeMySQL)
@@ -76,6 +76,8 @@ func TestTasks(t *testing.T, h Harness) {
 		sized := newTask(apply, "task_bytes_sized", "orders", now)
 		bytes := int64(23_400_000_000)
 		sized.EstimatedBytes = &bytes
+		rows := int64(48_200_000)
+		sized.EstimatedRows = &rows
 		_, err := store.Tasks().Create(ctx, sized)
 		require.NoError(t, err)
 		unsized := newTask(apply, "task_bytes_unsized", "users", now)
@@ -87,8 +89,11 @@ func TestTasks(t *testing.T, h Harness) {
 		require.NotNil(t, got)
 		require.NotNil(t, got.EstimatedBytes)
 		assert.Equal(t, bytes, *got.EstimatedBytes)
+		require.NotNil(t, got.EstimatedRows)
+		assert.Equal(t, rows, *got.EstimatedRows)
 
 		got.EstimatedBytes = nil
+		got.EstimatedRows = nil
 		got.State = state.Task.Running
 		got.RowsCopied = 500
 		got.RowsTotal = 1000
@@ -99,11 +104,14 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, int64(500), updated.RowsCopied)
 		require.NotNil(t, updated.EstimatedBytes, "a progress update never clears the planned size")
 		assert.Equal(t, bytes, *updated.EstimatedBytes)
+		require.NotNil(t, updated.EstimatedRows, "a progress update never clears the planned row count")
+		assert.Equal(t, rows, *updated.EstimatedRows)
 
 		gotUnsized, err := store.Tasks().Get(ctx, unsized.TaskIdentifier)
 		require.NoError(t, err)
 		require.NotNil(t, gotUnsized)
 		assert.Nil(t, gotUnsized.EstimatedBytes, "a task created without an estimate reads back without one")
+		assert.Nil(t, gotUnsized.EstimatedRows, "a task created without a row estimate reads back without one")
 	})
 
 	t.Run("Create_Get_Update", func(t *testing.T) {
@@ -337,6 +345,86 @@ func TestTasks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, reloaded)
 		assert.Equal(t, state.Task.Completed, reloaded.State)
+	})
+
+	// A task row carries no terminal-state guard: the lease fence alone decides
+	// who may write it. A displaced driver's late write over a terminal task is
+	// refused and the row stays terminal, while the driver that now holds the
+	// lease is the one whose write lands.
+	t.Run("Update_DisplacedLeaseCannotWriteOverTerminalTask", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_displaced_db", storage.DatabaseTypeMySQL)
+		first := CreateClaimedApply(t, store, lock, "apply_task_displaced", 907, "driver-a")
+		firstCtx := storage.WithApplyLease(ctx, first.Lease())
+
+		task, err := store.Tasks().Get(ctx, "task_"+first.ApplyIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, task)
+		task.State = state.Task.Completed
+		require.NoError(t, store.Tasks().Update(firstCtx, task))
+
+		released, err := store.Applies().ReleaseClaim(ctx, first.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		second, err := store.Applies().ClaimApplyByID(ctx, first.ID, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, second)
+
+		task.State = state.Task.Running
+		require.ErrorIs(t, store.Tasks().Update(firstCtx, task), storage.ErrApplyLeaseLost)
+		reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Completed, reloaded.State, "a displaced driver must not reopen a terminal task")
+
+		task.State = state.Task.Failed
+		require.NoError(t, store.Tasks().Update(storage.WithApplyLease(ctx, second.Lease()), task))
+		reloaded, err = store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Failed, reloaded.State, "the current lease holder's write lands: the fence, not the row state, decides")
+	})
+
+	// A task an operation drive writes is fenced by the operation's lease. Once
+	// that drive has ended and handed the operation's lease back, a late write
+	// under the old lease is refused and the terminal task stays as it was.
+	t.Run("Update_EndedOperationLeaseCannotWriteOverTerminalTask", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_ended_operation_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_ended_operation", 909)
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "schema",
+		})
+		require.NoError(t, err)
+		task := newTask(apply, "task_ended_operation_users", "users", time.Now().UTC().Truncate(time.Second))
+		task.ApplyOperationID = &opID
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+		task, err = store.Tasks().Get(ctx, "task_ended_operation_users")
+		require.NoError(t, err)
+		require.NotNil(t, task)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, opID, claimed.ID)
+		opCtx := storage.WithOperationLease(ctx, claimed.Lease())
+
+		task.State = state.Task.Completed
+		require.NoError(t, store.Tasks().Update(opCtx, task))
+		require.NoError(t, store.ApplyOperations().MarkCompleted(opCtx, opID))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		task.State = state.Task.Running
+		require.ErrorIs(t, store.Tasks().Update(opCtx, task), storage.ErrApplyLeaseLost)
+		reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Completed, reloaded.State, "a drive that has ended must not reopen a terminal task")
 	})
 
 	t.Run("ExpireRetryable_TerminalizesUnfinishedTasks", func(t *testing.T) {

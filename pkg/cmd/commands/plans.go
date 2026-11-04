@@ -22,8 +22,14 @@ type PlansCmd struct {
 	PR          int    `help:"Pull request filter; requires --repository" name:"pr"`
 	Last        string `help:"Only show plans created within this window, for example 6h or 2d; by default the list is bounded by --limit alone"`
 	Limit       int    `short:"n" help:"Maximum recent plans to show (default 20, max 200)"`
+	After       string `help:"Show the page that follows this plan ID, the last one a previous page showed; repeat that page's filters"`
+	All         bool   `help:"List every matching plan, requesting each page in turn; with --json the pages merge into one plans array"`
 	JSON        bool   `help:"Output as JSON"`
 }
+
+// allPagesPlansLimit is the page size --all asks for when --limit is not set.
+// The server clamps it to its own cap.
+const allPagesPlansLimit = 200
 
 // Run executes the plans command.
 func (cmd *PlansCmd) Run(g *Globals) error {
@@ -33,6 +39,9 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 	}
 
 	if cmd.PlanIDArg != "" {
+		if cmd.After != "" || cmd.All {
+			return fmt.Errorf("--after and --all page the plan list; drop them to show one plan")
+		}
 		return showStoredPlan(ep, cmd.PlanIDArg, cmd.Environment, cmd.JSON)
 	}
 
@@ -48,21 +57,30 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 		last = window
 	}
 
+	opts := client.PlansOptions{
+		Limit:       cmd.Limit,
+		Database:    cmd.Database,
+		Environment: cmd.Environment,
+		Repository:  cmd.Repository,
+		PullRequest: cmd.PR,
+		Last:        last,
+		After:       cmd.After,
+	}
 	var result *apitypes.PlansResponse
 	err = withLoading("Loading plans...", !cmd.JSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetPlans(ep, client.PlansOptions{
-			Limit:       cmd.Limit,
-			Database:    cmd.Database,
-			Environment: cmd.Environment,
-			Repository:  cmd.Repository,
-			PullRequest: cmd.PR,
-			Last:        last,
-		})
+		if cmd.All {
+			result, loadErr = getAllPlansPages(ep, opts)
+		} else {
+			result, loadErr = client.GetPlans(ep, opts)
+		}
 		return loadErr
 	})
 	if err != nil {
 		return err
+	}
+	if result.StartingAfter != cmd.After {
+		return fmt.Errorf("the server did not continue after plan %s; it predates paging, so it cannot show the next page", cmd.After)
 	}
 
 	if cmd.JSON {
@@ -82,14 +100,44 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 			BlockedCount: p.BlockedCount,
 		})
 	}
-	templates.WritePlansList(templates.PlansListData{
+	data := templates.PlansListData{
 		Limit:    result.Limit,
 		MaxLimit: result.MaxLimit,
 		HasMore:  result.HasMore,
 		Last:     cmd.Last,
+		After:    cmd.After,
 		Plans:    rows,
-	})
+	}
+	templates.WritePlansList(data)
 	return nil
+}
+
+// getAllPlansPages fetches the first page for opts and requests each next
+// page after the last plan of the one before, until the server reports no
+// more, merging every page into one response. Plans never change once stored,
+// so no page repeats a plan an earlier one listed.
+func getAllPlansPages(endpoint string, opts client.PlansOptions) (*apitypes.PlansResponse, error) {
+	if opts.Limit == 0 {
+		opts.Limit = allPagesPlansLimit
+	}
+	merged, err := client.GetPlans(endpoint, opts)
+	if err != nil {
+		return nil, err
+	}
+	page := merged
+	for page.HasMore && len(page.Plans) > 0 {
+		opts.After = page.Plans[len(page.Plans)-1].PlanID
+		page, err = client.GetPlans(endpoint, opts)
+		if err != nil {
+			return nil, fmt.Errorf("fetch the plans page after plan %s: %w", opts.After, err)
+		}
+		if page.StartingAfter != opts.After {
+			return nil, fmt.Errorf("the server did not continue after plan %s; it predates paging, so --all cannot list every plan", opts.After)
+		}
+		merged.Plans = append(merged.Plans, page.Plans...)
+	}
+	merged.HasMore = false
+	return merged, nil
 }
 
 // showStoredPlan shows one stored plan: its provenance header plus the stored

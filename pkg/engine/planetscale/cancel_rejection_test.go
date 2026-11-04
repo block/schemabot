@@ -20,9 +20,12 @@ import (
 // expectation table.
 func TestClassifyCancelRejection_EveryDeploymentStateIsClassified(t *testing.T) {
 	expected := map[string]cancelRejectionClass{
-		state.DeployRequest.InProgressCancel: cancelRejectionAlreadyCancelled,
-		state.DeployRequest.CompleteCancel:   cancelRejectionAlreadyCancelled,
-		state.DeployRequest.Cancelled:        cancelRejectionAlreadyCancelled,
+		state.DeployRequest.CompleteCancel: cancelRejectionAlreadyCancelled,
+		state.DeployRequest.Cancelled:      cancelRejectionAlreadyCancelled,
+
+		// Cancel accepted but not yet confirmed: the deploy can still end
+		// failed, so the rejection stays an error until the cancel settles.
+		state.DeployRequest.InProgressCancel: cancelRejectionStateError,
 
 		state.DeployRequest.Complete:  cancelRejectionAlreadyCompleted,
 		state.DeployRequest.NoChanges: cancelRejectionAlreadyCompleted,
@@ -49,10 +52,11 @@ func TestClassifyCancelRejection_EveryDeploymentStateIsClassified(t *testing.T) 
 		state.DeployRequest.CompleteRevert:          cancelRejectionStateError,
 		state.DeployRequest.CompleteRevertError:     cancelRejectionStateError,
 
-		// Closed by failing: keep the failed outcome visible.
-		state.DeployRequest.CompleteError: cancelRejectionStateError,
-		state.DeployRequest.Error:         cancelRejectionStateError,
-		state.DeployRequest.Failed:        cancelRejectionStateError,
+		// Closed by failing: the failure is settled and a cancel must not
+		// replace it.
+		state.DeployRequest.CompleteError: cancelRejectionAlreadyFailed,
+		state.DeployRequest.Error:         cancelRejectionAlreadyFailed,
+		state.DeployRequest.Failed:        cancelRejectionAlreadyFailed,
 	}
 
 	deployStates := reflect.ValueOf(state.DeployRequest)

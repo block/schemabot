@@ -204,9 +204,15 @@ spec:
   template:
     spec:
       restartPolicy: OnFailure
+      volumes:
+        - name: fixtures
+          configMap:
+            name: etre-fixtures
       containers:
         - name: seed
           image: amazon/aws-cli:2.17.0
+          volumeMounts:
+            - { name: fixtures, mountPath: /fixtures }
           env:
             - { name: AWS_ACCESS_KEY_ID, value: "test" }
             - { name: AWS_SECRET_ACCESS_KEY, value: "test" }
@@ -225,9 +231,15 @@ spec:
                   --role-name tern-assumed \
                   --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}'
               fi
-              if ! aws --endpoint-url http://ministack:4566 secretsmanager describe-secret --secret-id "dsid-testapp-staging_ddl_password" >/dev/null 2>&1; then
-                aws --endpoint-url http://ministack:4566 secretsmanager create-secret \
-                  --name "dsid-testapp-staging_ddl_password" \
-                  --secret-string '{"username":"root","password":"testpassword"}'
-              fi
+              # One DDL secret per DSID the Etre fixtures declare, so a suite
+              # resolves every target it seeds without listing them twice.
+              dsids=$(grep -o '"dsid": *"[^"]*"' /fixtures/aurora_cluster.json | sed 's/.*"\([^"]*\)"$/\1/')
+              [ -n "$dsids" ] || { echo "no dsid in /fixtures/aurora_cluster.json"; exit 1; }
+              for dsid in $dsids; do
+                if ! aws --endpoint-url http://ministack:4566 secretsmanager describe-secret --secret-id "${dsid}_ddl_password" >/dev/null 2>&1; then
+                  aws --endpoint-url http://ministack:4566 secretsmanager create-secret \
+                    --name "${dsid}_ddl_password" \
+                    --secret-string '{"username":"root","password":"testpassword"}'
+                fi
+              done
               echo "ministack seeded"

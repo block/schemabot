@@ -54,6 +54,87 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "users_c")
 }
 
+// A resuming rollout's progress output reads as the start under way, even
+// while its targets still report stopped: the state and target counts say
+// resuming, a stopped table reads as resuming, a table that never started
+// stays queued, and no start command is offered.
+func TestWriteProgressMultiDeploymentResumingOffersNoStart(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-resuming",
+			Environment: "staging",
+			State:       state.Apply.Resuming,
+			Operations: []ProgressOperation{
+				{Deployment: "staging", Target: "orders-a", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "staging", Target: "orders-b", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "staging", Target: "orders-a", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 57, RowsCopied: 57, RowsTotal: 100},
+				{Deployment: "staging", Target: "orders-b", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+				{Deployment: "staging", Target: "orders-a", TableName: "accounts", ChangeType: "alter", DDL: "ALTER TABLE `accounts` ADD COLUMN `region` varchar(20)", Status: state.Task.Pending},
+				{Deployment: "staging", Target: "orders-b", TableName: "accounts", ChangeType: "alter", DDL: "ALTER TABLE `accounts` ADD COLUMN `region` varchar(20)", Status: state.Task.Pending},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "State:        "+ANSICyan+"resuming")
+	assert.Contains(t, output, "Targets:      2 resuming")
+	assert.Contains(t, output, "~ users: "+ANSICyan+"🔄 Resuming..."+ANSIReset+"\n")
+	assert.Contains(t, output, "COLUMN `region`", "the table keeps its DDL")
+	assert.Contains(t, output, "~ accounts: ⏳ Queued\n", "a table that never started is not resumed, so it stays queued")
+	assert.NotContains(t, output, "stopped")
+	assert.NotContains(t, output, "schemabot start")
+}
+
+// A rollout whose deployments each address one target renders a section per
+// target. While the apply resumes, each section reads its stopped table as
+// resuming, as the rollup does, rather than as stopped at its old percent.
+func TestWriteProgressMultiDeploymentResumingSingleTargetSections(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-resuming",
+			Environment: "staging",
+			State:       state.Apply.Resuming,
+			Operations: []ProgressOperation{
+				{Deployment: "us", Target: "orders-a", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "eu", Target: "orders-b", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "us", Target: "orders-a", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 57, RowsCopied: 57, RowsTotal: 100},
+				{Deployment: "eu", Target: "orders-b", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+			},
+		})
+	})
+
+	assert.Equal(t, 2, strings.Count(output, "~ users: "+ANSICyan+"🔄 Resuming..."+ANSIReset+"\n"), output)
+	assert.NotContains(t, output, "Stopped at")
+	assert.NotContains(t, output, "57 / 100")
+	assert.NotContains(t, output, "schemabot start")
+}
+
+// A target that finished the table before the stop keeps its outcome beside
+// the resuming line.
+func TestWriteProgressMultiDeploymentResumingKeepsFinishedTargets(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-resuming",
+			Environment: "staging",
+			State:       state.Apply.Resuming,
+			Operations: []ProgressOperation{
+				{Deployment: "staging", Target: "orders-a", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "staging", Target: "orders-b", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "staging", Target: "orders-a", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed, PercentComplete: 100, RowsCopied: 100, RowsTotal: 100},
+				{Deployment: "staging", Target: "orders-b", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "~ users: "+ANSICyan+"🔄 Resuming..."+ANSIReset+" · 1 complete\n")
+	assert.NotContains(t, output, "40 / 100")
+}
+
 // A keyed apply runs many operations on one deployment, distinguished only by
 // operation key. Each section must render its own operation's key and external
 // operation ID — never a sibling's — so an operator can correlate every section
@@ -402,8 +483,30 @@ func TestProgressOperationsForPresentation_SettlesLikeStoredState(t *testing.T) 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			data := ParseProgressResponse(&apitypes.ProgressResponse{State: state.Apply.Failed, Operations: tc.ops})
-			model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+			model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
 			assert.Equal(t, tc.want, model.State)
 		})
 	}
+}
+
+// TestProgressOperationsForPresentation_HeldByARetryingTable: shop-001 still
+// reads running while its orders table retries a failure, and shop-002, a
+// later target of the same deployment, is parked. The cutover claim holds
+// shop-002 on that retry, so the CLI labels it held behind shop-001 rather
+// than ready. A retry on another target's table holds nothing.
+func TestProgressOperationsForPresentation_HeldByARetryingTable(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "shop", Target: "shop-001", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "shop", Target: "shop-002", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel},
+	}
+	label := func(tables []TableProgress) string {
+		return presentation.Derive(ProgressOperationsForPresentation(ops, tables, false)).Deployments[1].Label
+	}
+
+	assert.Equal(t, "ready for cutover — held, shop/shop-001 retrying", label([]TableProgress{
+		{TableName: "orders", Deployment: "shop", Target: "shop-001", Status: state.Task.FailedRetryable},
+	}))
+	assert.Equal(t, "ready for cutover", label([]TableProgress{
+		{TableName: "orders", Deployment: "shop", Target: "shop-other", Status: state.Task.FailedRetryable},
+	}))
 }

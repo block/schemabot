@@ -71,6 +71,24 @@ service Tern {
     };
   }
 
+  // CompareSchemaFileChange reports whether a pull request's edit to one
+  // schema file generates the same schema change on two different bases. The
+  // review gate asks it when a rebase combined the pull request's edit with a
+  // default branch edit to the same file, for a database type whose schema
+  // files can only be understood by running them, so an approval given before
+  // the rebase can keep counting.
+  //
+  // It is read-only: each version of the file is run inside a transaction
+  // that is always rolled back, so nothing persists on the target. An engine
+  // that cannot compare files returns UNIMPLEMENTED, and the caller treats the
+  // file as changed.
+  rpc CompareSchemaFileChange(CompareSchemaFileChangeRequest) returns (CompareSchemaFileChangeResponse) {
+    option (google.api.http) = {
+      post: "/v1/compare-schema-file-change"
+      body: "*"
+    };
+  }
+
   // Apply executes a previously generated plan. Returns immediately with an
   // apply_id; execution happens asynchronously. Use Progress to track status.
   //
@@ -323,6 +341,36 @@ message SchemaFiles {
   map<string, string> files = 1;
 }
 
+// CompareSchemaFileChangeRequest carries one schema file at the four commits
+// the review gate compares.
+message CompareSchemaFileChangeRequest {
+  // Database name from server-side config.
+  string database = 1;
+  // Database type, e.g. "postgres".
+  string type = 2;
+  // Environment whose target runs the comparison.
+  string environment = 3;
+  // Opaque identifier for endpoint discovery. Defaults to database if empty.
+  string target = 4;
+  // The file at the approved commit's merge base.
+  string approved_base = 5;
+  // The file at the approved commit.
+  string approved = 6;
+  // The file at the head's merge base.
+  string head_base = 7;
+  // The file at the head.
+  string head = 8;
+}
+
+// CompareSchemaFileChangeResponse is the comparison's verdict.
+message CompareSchemaFileChangeResponse {
+  // True when the head generates exactly the schema change the approved
+  // commit did.
+  bool same = 1;
+  // Why the change is not the same, for operator logs. Empty when same.
+  string reason = 2;
+}
+
 // PullSchemaRequest requests a live schema export for a database route.
 message PullSchemaRequest {
   // Database name from server-side config.
@@ -493,8 +541,7 @@ message PlanRequest {
   // environment. A control plane forwards it so the target that runs the
   // statement judges it under the policy the control plane's config states.
   // Absent means the caller states no policy and the executing server's own
-  // configuration decides, which with none configured leaves every statement
-  // the engine refuses blocked.
+  // configuration decides, which with none configured is the default policy.
   DirectExecutionPolicy direct_execution = 14;
   // Declared namespaces the caller left out of schema_files because the
   // target's entry in its database's targets list selects only other
@@ -777,6 +824,14 @@ message ApplyRequest {
   // the apply up later — on another pod, or after a restart — routes under
   // the policy the dispatch was admitted under rather than re-deriving one.
   DirectExecutionPolicy direct_execution = 14;
+  // Every change of the plan a table step's dispatch runs part of. A step's
+  // ddl_changes name only its own table, so a deployment that has not stored
+  // the plan builds it from these instead: it verifies the whole plan against
+  // its live schema, stores it once, and runs the step's table from it, so
+  // every later step of the same target finds the plan its own target was
+  // planned with. Empty on a dispatch that is not a table step, whose
+  // ddl_changes already carry its whole plan.
+  repeated TableChange plan_ddl_changes = 15;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a
@@ -924,6 +979,10 @@ message TableProgress {
   // for display beside the row counts. Unset when the plan had no estimate and
   // for a task scoped to one shard, since the estimate covers the whole table.
   optional int64 estimated_bytes = 19;
+  // The plan's approximate row count for the table, so a table that has not
+  // started copying can show how much it will copy. rows_total replaces it
+  // once the engine reports. Unset under the same rules as estimated_bytes.
+  optional int64 estimated_rows = 20;
 }
 
 // SettledControlRequest reports the fate of a durable control request the
@@ -967,6 +1026,12 @@ message ProgressResponse {
   // id: a data plane that ignores the scope answers for the whole apply, and
   // reading that as one member's state reports its siblings' work as its own.
   string apply_operation_id = 12;
+  // The state of the whole apply, set on an answer scoped to one operation.
+  State apply_state = 13;
+  // Set on an answer scoped to one operation when that operation will never
+  // run: no driver has claimed it and its apply has settled, so nothing will
+  // claim it again. The caller settles the operation rather than wait on it.
+  bool operation_never_starts = 14;
 }
 
 // CutoverRequest triggers the cutover phase.
@@ -985,12 +1050,32 @@ message CutoverRequest {
   // members of one deployment share its apply, and one member's turn to cut
   // over is not its siblings' turn. Empty cuts over the apply's parked work.
   string apply_operation_id = 4;
+  // When set, one cutover command for every operation listed: each is cut
+  // over by its own drive once it waits at its cutover, and the request
+  // settles once none of them can still cut over on it. apply_operation_id
+  // names one of them, so a data plane that reads only that field cuts over
+  // that operation alone.
+  repeated string apply_operation_ids = 5;
+  // When set, identifies the operator command this request carries, the same
+  // on every send of it. A data plane that already settled the command
+  // answers a re-send with that outcome instead of recording the command
+  // again, so a re-send never retries a command the data plane failed. A
+  // new operator command carries a new id. An id of the form
+  // "<origin>.<sequence>" orders the commands of one origin: a data plane that
+  // settled a later command answers a send of an earlier one with that
+  // outcome too, since only a delayed re-send can carry it.
+  string command_id = 6;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
 message CutoverResponse {
   bool accepted = 1;
   string error_message = 2;
+  // The command_id the data plane recorded the request under, echoed back.
+  // Empty from a data plane that predates command ids, which records every
+  // send as a new command, so a caller sends such a data plane each command
+  // only once.
+  string command_id = 3;
 }
 
 // RevertRequest reverts a completed schema change.

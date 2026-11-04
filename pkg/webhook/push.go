@@ -208,8 +208,8 @@ func (h *Handler) enqueueDurablePush(ctx context.Context, payload pushPayload, b
 // so a retry after a partial post reconciles rather than duplicates.
 func (h *Handler) processDurablePush(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload pushPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode durable push delivery %s: %w", event.DeliveryID, err)
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
 	}
 
 	repo := storage.CanonicalKey(payload.Repository.FullName)

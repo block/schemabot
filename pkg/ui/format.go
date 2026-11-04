@@ -135,6 +135,20 @@ func FormatTableSizeClause(estimatedBytes *int64) string {
 	return " \u00b7 " + FormatApproxBytes(*estimatedBytes)
 }
 
+// FormatShardedTableSizeClause is a sharded table's planned size beside row
+// figures that cover only some of its shards: the size is the whole table's,
+// so it names the shards it spans rather than reading as theirs. plannedShards
+// is the plan's count, or zero when it recorded none.
+func FormatShardedTableSizeClause(estimatedBytes *int64, plannedShards int) string {
+	if estimatedBytes == nil {
+		return ""
+	}
+	if plannedShards > 0 {
+		return fmt.Sprintf("%s across all %d shards", FormatTableSizeClause(estimatedBytes), plannedShards)
+	}
+	return FormatTableSizeClause(estimatedBytes) + " across all shards"
+}
+
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human
 // label, shared by the CLI progress view and the PR comment so both surfaces
 // describe VSchema application identically.

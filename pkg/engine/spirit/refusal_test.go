@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/block/spirit/pkg/migration/check"
+	"github.com/block/spirit/pkg/check"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -238,7 +238,7 @@ const refusalCanaryNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
 	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 
 // Routing marks a refusal reason publishable to the pull request by category:
-// the engine's statement-scope checks report the statement back, and the
+// the engine's statement-phase checks report the statement back, and the
 // statement is already on the PR. The target's own definition is the other
 // input to that classification, and nothing from it may reach the reason.
 //

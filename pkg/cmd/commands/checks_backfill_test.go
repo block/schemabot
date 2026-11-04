@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -508,4 +510,338 @@ func lineContaining(t *testing.T, rendered, needle string) string {
 	}
 	require.Fail(t, "no rendered line contains "+needle)
 	return ""
+}
+
+// checksBackfillFleetServer serves a fleet sweep: the declared repositories,
+// then each repository's scan pages from scans, and a synthesize that recreates
+// every requested PR's Check Run. A repository listed in scanErrors answers
+// its scan with that server error instead. It records the repositories
+// scanned, in order, and the PRs sent for synthesis.
+type checksBackfillFleetServer struct {
+	*httptest.Server
+
+	mu          sync.Mutex
+	scanned     []string
+	synthesized map[string][]int
+	// optedIn is false once any scan request omitted report_app_not_installed.
+	optedIn bool
+}
+
+func (s *checksBackfillFleetServer) scannedRepos() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.scanned)
+}
+
+func (s *checksBackfillFleetServer) synthesizedPRs() map[string][]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]int, len(s.synthesized))
+	for repo, prs := range s.synthesized {
+		out[repo] = slices.Clone(prs)
+	}
+	return out
+}
+
+func (s *checksBackfillFleetServer) everyScanOptedIn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.optedIn
+}
+
+// singlePage serves each repository's scan as one page.
+func singlePage(scans map[string]apitypes.ChecksScanResponse) map[string][]apitypes.ChecksScanResponse {
+	pages := make(map[string][]apitypes.ChecksScanResponse, len(scans))
+	for repo, scan := range scans {
+		pages[repo] = []apitypes.ChecksScanResponse{scan}
+	}
+	return pages
+}
+
+func newChecksBackfillFleetServer(t *testing.T, declared []string, scans map[string][]apitypes.ChecksScanResponse, scanErrors map[string]string) *checksBackfillFleetServer {
+	fleet := &checksBackfillFleetServer{synthesized: map[string][]int{}, optedIn: true}
+	fleet.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/checks/repos":
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksReposResponse{Repos: declared}))
+		case "/api/checks/scan":
+			var req apitypes.ChecksScanRequest
+			if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&req)) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			fleet.mu.Lock()
+			fleet.scanned = append(fleet.scanned, req.Repo)
+			fleet.optedIn = fleet.optedIn && req.ReportAppNotInstalled
+			fleet.mu.Unlock()
+			if message, ok := scanErrors[req.Repo]; ok {
+				w.WriteHeader(http.StatusInternalServerError)
+				assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ErrorResponse{Error: message}))
+				return
+			}
+			page := max(req.Page, 1)
+			pages := scans[req.Repo]
+			if !assert.LessOrEqual(t, page, len(pages), "unexpected scan of %s page %d", req.Repo, page) {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			assert.NoError(t, json.NewEncoder(w).Encode(pages[page-1]))
+		case "/api/checks/synthesize":
+			var req apitypes.ChecksSynthesizeRequest
+			if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&req)) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			fleet.mu.Lock()
+			fleet.synthesized[req.Repo] = append(fleet.synthesized[req.Repo], req.PRs...)
+			fleet.mu.Unlock()
+			response := apitypes.ChecksSynthesizeResponse{Repo: req.Repo}
+			for _, pr := range req.PRs {
+				response.Results = append(response.Results, apitypes.ChecksSynthesizeResult{PR: pr, Outcome: "created 1 Check Run"})
+			}
+			assert.NoError(t, json.NewEncoder(w).Encode(response))
+		default:
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(fleet.Close)
+	return fleet
+}
+
+// fleetScansWithOneUninstalledRepo is a three-repository fleet whose middle
+// repository is declared on the server but does not have the server's GitHub
+// App installed yet, the state a repository is in while its onboarding PR is
+// still open.
+func fleetScansWithOneUninstalledRepo() ([]string, map[string]apitypes.ChecksScanResponse) {
+	declared := []string{"octo/alpha", "octo/onboarding", "octo/zeta"}
+	scans := map[string]apitypes.ChecksScanResponse{
+		"octo/alpha": {
+			Repo:       "octo/alpha",
+			CheckNames: []string{"SchemaBot (staging)"},
+			Scanned:    2,
+			Missing: []apitypes.MissingCheckPR{
+				{Number: 3, URL: "https://github.com/octo/alpha/pull/3", Title: "add index", HeadSHA: "sha3", MissingNames: []string{"SchemaBot (staging)"}},
+			},
+		},
+		"octo/onboarding": {Repo: "octo/onboarding", AppNotInstalled: true, GitHubApp: "staging"},
+		"octo/zeta": {
+			Repo:       "octo/zeta",
+			CheckNames: []string{"SchemaBot (staging)"},
+			Scanned:    4,
+		},
+	}
+	return declared, scans
+}
+
+// An --all-repos sweep during a GitHub outage reaches a repository the
+// server's GitHub App is not installed on. The sweep skips it, scans every
+// repository after it, and names the skip in the report. Because that
+// repository was never scanned, the run still exits nonzero, after printing
+// the full report.
+func TestChecksBackfillAllReposSkipsRepoWithoutTheAppInstalled(t *testing.T) {
+	declared, scans := fleetScansWithOneUninstalledRepo()
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), nil)
+
+	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", Last: "2h", DryRun: true, StuckAfter: "1h", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	assert.Equal(t, declared, server.scannedRepos(), "the repository after the skipped one is still scanned")
+	assert.True(t, server.everyScanOptedIn(), "every scan tells the server this command handles the not-installed skip")
+	require.Error(t, runErr)
+	assert.EqualError(t, runErr, "checks backfill left 1 PR with missing Check Runs and 1 repository without the GitHub App installed needing attention")
+
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report), "the full report is printed before the exit-code error")
+	assert.Equal(t, []string{"octo/alpha", "octo/zeta"}, report.Repos, "a skipped repository was not scanned and must not appear in the scanned-repo list")
+	assert.Equal(t, []string{"octo/onboarding"}, report.SkippedAppNotInstalled)
+	assert.Empty(t, report.SkippedDisabled)
+	assert.Equal(t, 6, report.Scanned)
+	require.Len(t, report.Actions, 1)
+	assert.Equal(t, "octo/alpha", report.Actions[0].Repo)
+	assert.Equal(t, 3, report.Actions[0].PR)
+}
+
+// The human report names the skipped repository and what to do about it on
+// its own line, beside the scan headline for the repositories that were
+// scanned.
+func TestChecksBackfillAllReposReportsTheUninstalledRepoSkip(t *testing.T) {
+	declared, scans := fleetScansWithOneUninstalledRepo()
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), nil)
+
+	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", DryRun: true, StuckAfter: "1h"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.Error(t, runErr)
+	assert.Contains(t, output, "Scanned 6 open PRs in octo/alpha, octo/zeta for SchemaBot (staging).")
+	assert.Contains(t, output, "Skipped repositories the server's GitHub App is not installed on: octo/onboarding. Install the App on each, or remove it from the server's repos config.")
+	assert.Contains(t, output, "https://github.com/octo/alpha/pull/3")
+}
+
+// A scan failure that is not GitHub confirming the App is not installed (here,
+// a 502 from the installation lookup during a GitHub outage) leaves the
+// repository unread rather than known to be empty. The sweep stops at it with
+// the cause, never scans past it, and prints no report that could read as a
+// clean sweep.
+func TestChecksBackfillAllReposStopsWhenAScanFails(t *testing.T) {
+	declared := []string{"octo/alpha", "octo/flaky", "octo/zeta"}
+	scans := map[string]apitypes.ChecksScanResponse{
+		"octo/alpha": {Repo: "octo/alpha", CheckNames: []string{"SchemaBot (staging)"}, Scanned: 2},
+		"octo/zeta":  {Repo: "octo/zeta", CheckNames: []string{"SchemaBot (staging)"}, Scanned: 4},
+	}
+	scanErrors := map[string]string{
+		"octo/flaky": `resolve GitHub App "staging" installation for octo/flaky: find installation for octo/flaky: GET https://api.github.com/repos/octo/flaky/installation: 502 Bad Gateway []`,
+	}
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), scanErrors)
+
+	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", DryRun: true, StuckAfter: "1h", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "scan octo/flaky open PRs for missing or stuck Check Runs")
+	assert.Contains(t, runErr.Error(), "502 Bad Gateway")
+	assert.Equal(t, []string{"octo/alpha", "octo/flaky"}, server.scannedRepos(), "the sweep stops at the failed repository")
+	assert.Empty(t, output)
+}
+
+// Naming one repository the server's GitHub App is not installed on is the
+// operator asking about that repository, so the command fails with what is
+// wrong and how to fix it instead of reporting a skip.
+func TestChecksBackfillNamedRepoWithoutTheAppInstalledFails(t *testing.T) {
+	declared, scans := fleetScansWithOneUninstalledRepo()
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), nil)
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/onboarding", DryRun: true, StuckAfter: "1h", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.Error(t, runErr)
+	assert.EqualError(t, runErr, `GitHub App "staging" is not installed on octo/onboarding, so SchemaBot cannot read or create its Check Runs; install the App on octo/onboarding, or remove octo/onboarding from the server's repos config`)
+	assert.Equal(t, []string{"octo/onboarding"}, server.scannedRepos())
+	assert.Empty(t, output)
+}
+
+// A sweep in which no declared repository has the App installed scanned
+// nothing, and says so instead of rendering an empty scan headline.
+func TestWriteChecksBackfillReportNoRepoHasTheAppInstalled(t *testing.T) {
+	report := &checksBackfillReport{
+		SkippedDisabled:        []string{"octo/off"},
+		SkippedAppNotInstalled: []string{"octo/new", "octo/newer"},
+		DryRun:                 true,
+		StuckAfter:             "1h",
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	assert.Equal(t, "No repositories scanned.\n"+
+		"Skipped repositories with Check Runs disabled (enable_checks: false): octo/off.\n"+
+		"Skipped repositories the server's GitHub App is not installed on: octo/new, octo/newer. Install the App on each, or remove it from the server's repos config.\n",
+		out.String())
+	assert.EqualError(t, attentionExitError(report), "checks backfill left 2 repositories without the GitHub App installed needing attention")
+}
+
+// A repository can stop being scannable while a sweep is paging through it:
+// the App is uninstalled, or a config reload turns its Check Runs off. The
+// skip then arrives after earlier pages already reported findings. Those
+// findings belong to a repository the sweep no longer covers: they are
+// dropped with the rest of the repository, never sent for synthesis, and the
+// healthy repository after it is still repaired and still named in the
+// report's check scope.
+func TestChecksBackfillDropsTheFindingsOfARepoSkippedMidScan(t *testing.T) {
+	cases := []struct {
+		name string
+		// skip is the page-2 answer for octo/alpha.
+		skip                       apitypes.ChecksScanResponse
+		wantErr                    string
+		wantSkippedAppNotInstalled []string
+		wantSkippedDisabled        []string
+	}{
+		{
+			name:                       "GitHub App uninstalled",
+			skip:                       apitypes.ChecksScanResponse{Repo: "octo/alpha", AppNotInstalled: true, GitHubApp: "staging"},
+			wantErr:                    "checks backfill left 1 repository without the GitHub App installed needing attention",
+			wantSkippedAppNotInstalled: []string{"octo/alpha"},
+		},
+		{
+			name:                "Check Runs disabled",
+			skip:                apitypes.ChecksScanResponse{Repo: "octo/alpha", ChecksDisabled: true},
+			wantSkippedDisabled: []string{"octo/alpha"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			declared := []string{"octo/alpha", "octo/zeta"}
+			scans := map[string][]apitypes.ChecksScanResponse{
+				"octo/alpha": {
+					{
+						Repo:       "octo/alpha",
+						CheckNames: []string{"SchemaBot (staging)"},
+						Scanned:    2,
+						NextPage:   2,
+						Missing: []apitypes.MissingCheckPR{
+							{Number: 3, URL: "https://github.com/octo/alpha/pull/3", Title: "add index", HeadSHA: "sha3", MissingNames: []string{"SchemaBot (staging)"}},
+							{Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4", MissingNames: []string{"SchemaBot (staging)"}},
+						},
+						Stuck: []apitypes.StuckCheckPR{
+							{
+								Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4",
+								Checks: []apitypes.IncompleteCheckRun{{Name: "SchemaBot (production)", CheckRunID: 40, Status: "queued"}},
+							},
+						},
+					},
+					tc.skip,
+				},
+				"octo/zeta": {
+					{
+						Repo:       "octo/zeta",
+						CheckNames: []string{"SchemaBot (staging)"},
+						Scanned:    4,
+						Missing: []apitypes.MissingCheckPR{
+							{Number: 8, URL: "https://github.com/octo/zeta/pull/8", Title: "add column", HeadSHA: "sha8", MissingNames: []string{"SchemaBot (staging)"}},
+						},
+					},
+				},
+			}
+			server := newChecksBackfillFleetServer(t, declared, scans, nil)
+
+			cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", StuckAfter: "1h", JSON: true}
+			var runErr error
+			output := captureStdout(func() {
+				runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+			})
+
+			assert.Equal(t, map[string][]int{"octo/zeta": {8}}, server.synthesizedPRs(), "only the healthy repository's PRs are sent for synthesis")
+			if tc.wantErr == "" {
+				require.NoError(t, runErr)
+			} else {
+				require.EqualError(t, runErr, tc.wantErr)
+			}
+
+			var report checksBackfillReport
+			require.NoError(t, json.Unmarshal([]byte(output), &report))
+			assert.Equal(t, []string{"octo/zeta"}, report.Repos)
+			assert.Equal(t, tc.wantSkippedAppNotInstalled, report.SkippedAppNotInstalled)
+			assert.Equal(t, tc.wantSkippedDisabled, report.SkippedDisabled)
+			assert.Equal(t, []string{"SchemaBot (staging)"}, report.CheckNames, "a check name the skipped repository reported first is still recorded for the repository after it")
+			assert.Equal(t, 4, report.Scanned, "the skipped repository's pages do not count as scanned")
+			assert.Empty(t, report.Stuck, "the skipped repository's stuck runs are dropped with it")
+			require.Len(t, report.Actions, 1)
+			assert.Equal(t, "octo/zeta", report.Actions[0].Repo)
+			assert.Equal(t, 8, report.Actions[0].PR)
+			assert.Equal(t, "created 1 Check Run", report.Actions[0].Outcome)
+		})
+	}
 }

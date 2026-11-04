@@ -24,8 +24,11 @@ const ApplyLeaseStaleAfter = time.Minute
 // ApplyDriveStallAfter bounds how long a drive may go without mirroring any
 // task progress to storage before its driver presumes the drive goroutine is
 // wedged and cancels the run. A healthy drive's poll loop writes every task row
-// on every poll tick, so legitimate silence is far shorter than this window;
-// the window is kept generous so slow pre-poll phases (target schema pulls,
+// on every full poll: every tick, except that a drive held at a deferred
+// cutover runs its full poll only on a slower refresh interval
+// (tern.parkedFullPollInterval). Legitimate silence is therefore far shorter
+// than this window, and tightening the window must keep it well above that
+// refresh interval. The window is kept generous so slow pre-poll phases (target schema pulls,
 // re-planning, engine acceptance) have the full window before their first
 // mirror write.
 //
@@ -121,6 +124,9 @@ type Storage interface {
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
+	// DriverPools returns the driver pool of each server running an operator.
+	DriverPools() DriverPoolStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -147,6 +153,9 @@ type LockStore interface {
 	// pending plan. Any other same-owner state returns ErrLockIntentChanged and
 	// leaves the stored pending plan alone, so a command that planned against
 	// one intent can never overwrite an intent another command pinned since.
+	// A lock released since a non-empty observedPendingPlanID was observed
+	// also returns ErrLockIntentChanged and re-creates nothing: the pin the
+	// caller planned against is gone.
 	AcquireIfPendingPlanID(ctx context.Context, lock *Lock, observedPendingPlanID string) error
 
 	// Release releases a lock. Only succeeds if caller is the owner.
@@ -247,6 +256,26 @@ type CheckStore interface {
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
+	// BlockStaleStartedApply records that the schema change a started apply
+	// owns is gone from the PR: it moves the row onto headSHA with check's
+	// blocking reason and message, keeping an in-progress row in_progress and
+	// turning a settled one into action_required. check is the row as the
+	// caller read it; its HeadSHA and ApplyID pin that read. The status is
+	// decided from the row as stored at write time, under the same row lock
+	// as the write, so a completion that lands after the caller read the row
+	// is never rewound to in_progress. It writes nothing and returns false
+	// when no started apply owns the row any more, when a different apply
+	// owns it than the caller read, or when the stored head is neither the
+	// head the caller read nor headSHA, because a newer write owns the row.
+	// On a landed write, check.HeadSHA, check.Status, and check.Conclusion
+	// hold the values stored.
+	BlockStaleStartedApply(ctx context.Context, check *Check, headSHA string) (bool, error)
+
+	// MarkPlanPending inserts a blocking placeholder or invalidates a successful
+	// result before retrying a failed plan. Existing blocking state and apply
+	// ownership are preserved; only a replacement result may restore success.
+	MarkPlanPending(ctx context.Context, check *Check) error
+
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check
 	// state after the PR-level guards re-verified that the blocking condition
 	// no longer applies. The update is conditional on the head SHA and blocking
@@ -258,7 +287,11 @@ type CheckStore interface {
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another driver changed
-	// the stored state first.
+	// the stored state first. A row stale cleanup already blocked with
+	// SchemaRemovedAfterApplyStartedBlockingReason keeps its head SHA, reason,
+	// and message, and a successful completion of it lands as action_required.
+	// On a landed write, check holds the head SHA, has_changes, conclusion,
+	// blocking reason, and message stored.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required for a
@@ -344,6 +377,41 @@ type SettingsStore interface {
 	// Delete removes a setting by key. It returns ErrSettingNotFound when no
 	// setting with that key exists.
 	Delete(ctx context.Context, key string) error
+}
+
+// DriverPoolLiveWindow is how recently a server must have heartbeated for
+// DriverPoolStore.ListLive to count its drivers. It matches ApplyLeaseStaleAfter, so a server's drivers leave the
+// count at the moment its leases become reclaimable by peers.
+const DriverPoolLiveWindow = ApplyLeaseStaleAfter
+
+// DriverPoolRetention is how long a server's row outlives its last
+// heartbeat before Heartbeat removes it. A server that exits cleanly removes
+// its own row; this bounds the rows a crashed one leaves behind.
+const DriverPoolRetention = time.Hour
+
+// DriverPoolStore holds the driver pool of each server running an operator:
+// how many drivers it runs. Each server heartbeats its own row, so the drivers live
+// across every replica are read from storage rather than configured, and they
+// follow the replica count as it changes.
+type DriverPoolStore interface {
+	// Heartbeat records that server's operator is running now, with its
+	// driver count, creating its row on the first beat. The time recorded is
+	// the database's clock, so servers whose clocks disagree are still
+	// compared on one.
+	Heartbeat(ctx context.Context, server *DriverPool) error
+
+	// PruneStale removes the rows not heard from within
+	// DriverPoolRetention. A stale row already stops counting once it
+	// leaves DriverPoolLiveWindow, so pruning only keeps the table small.
+	PruneStale(ctx context.Context) error
+
+	// Deregister removes server's row. Removing a row that does not exist is
+	// not an error.
+	Deregister(ctx context.Context, serverID string) error
+
+	// ListLive returns the servers that heartbeated within
+	// DriverPoolLiveWindow, ordered by server ID.
+	ListLive(ctx context.Context) ([]*DriverPool, error)
 }
 
 // WebhookEventStore manages durable webhook inbox rows. It is the storage
@@ -530,6 +598,24 @@ type WebhookEventStore interface {
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 
+// PlanListPosition is a plan's place in the newest-first plan listing: its
+// creation time, with its row id breaking ties between plans created in the
+// same instant.
+type PlanListPosition struct {
+	CreatedAt time.Time
+	ID        int64
+}
+
+// PlanListAnchor is a plan named to continue a listing after: its place in
+// the listing and the fields that decide which listings it belongs to.
+type PlanListAnchor struct {
+	Position    PlanListPosition
+	Database    string
+	Environment string
+	Repository  string
+	PullRequest int
+}
+
 // ListPlansOptions filters and bounds a plan listing. Zero-value fields are
 // not applied, so an empty options value with a Limit lists the newest plans
 // across every database and environment.
@@ -552,6 +638,10 @@ type ListPlansOptions struct {
 	// Since, when set, restricts results to plans created at or after this
 	// instant.
 	Since time.Time
+	// StartAfter, when set, lists the plans that follow this one in the
+	// newest-first order, so a caller can walk the listing page by page.
+	// Plans never change once created, so the position is stable.
+	StartAfter *PlanListPosition
 	// Limit bounds the number of plans returned. It must be positive unless
 	// PrimaryPlanIdentifier names one review round, which bounds the listing to
 	// that round's member plans on its own; every other listing is open-ended
@@ -572,6 +662,12 @@ type PlanStore interface {
 
 	// GetByID returns a plan by ID, or nil if not found.
 	GetByID(ctx context.Context, id int64) (*Plan, error)
+
+	// GetListAnchor returns a plan's place in the plan listing and the fields
+	// a listing filters on, or nil if not found. It reads none of the stored
+	// schema or plan data, so a listing can continue after a plan without
+	// loading it.
+	GetListAnchor(ctx context.Context, planIdentifier string) (*PlanListAnchor, error)
 
 	// GetByLock is not implemented: plans carry no direct lock association,
 	// and every implementation returns ErrNotImplemented so a caller can
@@ -629,6 +725,12 @@ type ApplyStore interface {
 	// operation row's ApplyID is set to the new apply ID before insert.
 	// Pending applies become operator-claimable only after every row is
 	// committed, so the operator never observes a partially-populated apply.
+	//
+	// Each apply named in apply.TakesOverApplyIDs is stamped with the new apply's
+	// identifier as its SupersededBy marker in the same transaction, with the
+	// write-once semantics of MarkSuperseded: a holder an earlier successor
+	// already stamped is left alone. A holder that does not exist, or a stamp that
+	// does not land, fails the create and leaves neither the apply nor any marker.
 	CreateWithTasksAndOperations(ctx context.Context, apply *Apply, tasks []*Task, operations []*ApplyOperation) (int64, error)
 
 	// CreateWithGroupedOperations stores a new apply and grouped per-deployment
@@ -650,8 +752,13 @@ type ApplyStore interface {
 	// operations of the apply are not keyed that way, and the reverse, so one
 	// target's work can never attach under two keys. An attach to an apply
 	// whose work a newer generation took over (Apply.SupersededBy) fails with
-	// ErrApplyTakenOver. On success the operation's ID and every
-	// task's ID and ApplyOperationID are populated.
+	// ErrApplyTakenOver. Each apply named in apply.TakesOverApplyIDs is stamped
+	// with apply's identifier as its SupersededBy marker in the same
+	// transaction, with the write-once semantics of MarkSuperseded: a holder an
+	// earlier successor already stamped is left alone. A holder that does not
+	// exist, equals apply itself, or whose stamp does not land fails the attach
+	// and leaves neither the operation nor any marker. On success the operation's
+	// ID and every task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
 	// Get returns an apply by ID, or nil if not found.
@@ -714,15 +821,11 @@ type ApplyStore interface {
 	UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (swapped bool, err error)
 
 	// GetRecent returns applies across all databases for `schemabot status` (no
-	// args), in-flight work first.
-	//
-	// An apply is in flight when a driver is still on it: its latest lease
-	// heartbeat — on the apply row or any of its operations — falls inside the
-	// lease staleness window, and its state is not terminal. So a schema change
-	// still copying rows stays on the first page however long ago it started,
-	// while an abandoned or finished one sinks. In-flight applies are ordered
-	// oldest-started first; everything else by when it last changed, which for a
-	// finished apply is when it finished.
+	// args), newest first by when each was created. The order never changes for
+	// an apply, so a caller pages through it with AfterID without skipping or
+	// repeating an apply whose state moves between pages. A caller that shows
+	// in-flight work first lists it separately with ActiveOnly, and the rest
+	// with FinishedOnly.
 	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
 	// CountRecentByState returns how many applies match the filter, grouped by
@@ -733,6 +836,13 @@ type ApplyStore interface {
 	// GetInProgress returns all applies in non-terminal states.
 	// Note: For recovery, use ClaimApplyByID which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
+
+	// GetUnsettled returns every apply a driver may still claim: the
+	// non-terminal applies GetInProgress returns, and the stopped ones, which
+	// are terminal for claiming but resumable (state.SettledApplyStates). A
+	// reader deciding whether an apply's engine resources are still in use
+	// reads this set, since a stopped apply resumes from them.
+	GetUnsettled(ctx context.Context) ([]*Apply, error)
 
 	// FindStuckPendingApplies returns pending applies that a driver should
 	// already have claimed — pending with child rows (the child-rows arm of
@@ -779,16 +889,17 @@ type ApplyStore interface {
 	// stop reconciliation — pending or one of the active recovery-claimable states
 	// (the claimableApplyStates set); the resumable non-terminal states
 	// failed_retryable and stopped are excluded because they have their own resume
-	// paths — that has a pending stop control request, at least one
+	// paths — that has a pending stop or cancel control request, at least one
 	// pending operation, and no active operation (none being driven and none
 	// awaiting stale recovery), rotating the lease onto it like ClaimApplyByID. It
 	// is the trigger for stop reconciliation when no operation is claimable to
-	// carry it: under on_failure "continue" a failed earlier sibling can leave the
-	// apply with only terminal and pending operations, and the claim gate keeps
-	// the pending ones from starting, so without this path the apply would strand
-	// non-terminal with its stop request pending forever. Skipping applies with
-	// any active operation leaves in-flight (and crash-recovered) drives to settle
-	// the stop themselves. Returns nil when no such apply exists or it is locked
+	// carry the request: the claim gate keeps pending operations from starting
+	// while a stop or cancel is pending, so an apply left with only terminal and
+	// pending operations (a failed earlier sibling under on_failure "continue",
+	// or a handoff between rollout members) would otherwise strand non-terminal
+	// with its request pending forever. Skipping applies with any active
+	// operation leaves in-flight (and crash-recovered) drives to deliver the
+	// request themselves. Returns nil when no such apply exists or it is locked
 	// by a peer.
 	FindNextApplyForStopReconciliation(ctx context.Context, owner string) (*Apply, error)
 
@@ -851,15 +962,18 @@ type ApplyStore interface {
 	// a self-referential handoff would refuse the apply forever while pointing
 	// the operator back at the refused apply itself.
 	//
-	// Callers recording a takeover mark as soon as the successor durably
-	// exists — after its creation, so the marker never names an apply that
-	// does not exist, and before any driver acts on it. The marker does not
-	// carry that window alone: while the successor is active, a claim on the
-	// handed-off apply is refused by the claim-time one-active-apply re-check;
-	// the marker is what keeps refusing once the successor settles and that
-	// re-check has nothing left to catch. A takeover whose mark never lands —
-	// a failed write, or a crash between creating the successor and marking —
-	// therefore leaves an apply that becomes startable again once its
+	// A dispatch that creates its successor, or attaches an operation to an
+	// existing apply, records the takeover through Apply.TakesOverApplyIDs on that
+	// create or attach, in its transaction, rather than with this method: the
+	// marker then never names an apply that does not exist, and no takeover is
+	// left without its marker. This method is for a takeover recorded after the
+	// fact. The marker does not carry the window
+	// alone: while the successor is active, a claim on the handed-off apply is
+	// refused by the claim-time one-active-apply re-check; the marker is what
+	// keeps refusing once the successor settles and that re-check has nothing
+	// left to catch. A takeover recorded through this method whose mark never
+	// lands — a failed write, or a crash between the successor's commit and the
+	// mark — therefore leaves an apply that becomes startable again once its
 	// successor settles; the failed write is logged with both applies named,
 	// and neither case is retried.
 	//
@@ -911,6 +1025,19 @@ type ApplyStore interface {
 	// apply competing for this target waits behind it.
 	WithExclusiveTarget(ctx context.Context, apply *Apply, fn func(context.Context) error) error
 
+	// WithTargetHeld runs fn while holding the advisory lock of the apply
+	// target named by database, dbType, and environment. It is the hold
+	// WithExclusiveTarget gives without its refusal: fn runs alongside the
+	// applies that already own the target, and what the lock gives it is that
+	// no apply is created for, or claimed on, the target until fn returns.
+	//
+	// It is for work that reclaims what no apply owns any more, decided from
+	// the applies in storage: fn reads them under the lock, so the set it reads
+	// is still the set when its last statement runs. Like WithExclusiveTarget it
+	// binds SchemaBot's own applies and nothing else, and fn must be bounded,
+	// because every apply competing for the target waits behind it.
+	WithTargetHeld(ctx context.Context, database, dbType, environment string, fn func(context.Context) error) error
+
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
 	// retry budget or recovery freshness window to permanent failed, settling
 	// their task and operation rows against that verdict. Returns the applies
@@ -930,16 +1057,41 @@ type ApplyStore interface {
 	// concurrent passes would be correct but would each pay the full scan.
 	ExpireRetryable(ctx context.Context, limit int) ([]*RetryableApplyExpiration, error)
 
+	// WithBranchReconcileElection runs fn on the one instance elected to
+	// reconcile engine branches this pass, under an advisory lock held for as
+	// long as fn runs. ErrBranchReconcileBusy reports that another instance
+	// holds the lock, and fn does not run. The lock is an efficiency gate,
+	// not a safety one: it keeps two instances from listing every branch at
+	// once, while each delete is made safe by the apply target hold the
+	// reconcile takes around it.
+	WithBranchReconcileElection(ctx context.Context, fn func(context.Context) error) error
+
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
 	// resumable stop keeps completed_at NULL) but whose progress comment was
 	// never followed by a summary comment — no summary marker exists, the
 	// marker is superseded (a stop's summary consumed by a resume rotation, so
-	// the current terminal state's summary was never posted), or only a claim
+	// the current terminal state's summary was never posted), the posted
+	// marker records a state other than the apply's current one (a summary of
+	// an earlier terminal state, or one a resume rotated past), or only a claim
 	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
-	// publisher that crashed before posting. Used by startup reconciliation to
-	// post missing summary comments after restarts.
-	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
+	// publisher that crashed before posting. "Recently" is MissingSummaryLookback.
+	// An apply qualifies only once it has been terminal for at least settledFor,
+	// so a reconciler never races the live publisher that is still delivering
+	// the summary moments after the terminal write; zero disables the floor.
+	// Returns at most limit applies, most recently updated first.
+	// Used by summary reconciliation, at startup and on every reconcile pass, to
+	// post summary comments a failed or interrupted publisher left missing.
+	FindMissingSummaryComment(ctx context.Context, settledFor time.Duration, limit int) ([]*Apply, error)
+
+	// FindTerminalWithInProgressCheck returns GitHub-backed applies in a
+	// terminal state (stopped excluded: a stop deliberately leaves its check in
+	// progress) that stored check state still names as its in-progress apply,
+	// with no newer apply for the same target. Every terminal check write moves
+	// the stored state out of in_progress, so each result is an apply whose
+	// terminal check refresh never landed. Returns at most limit applies, most
+	// recently updated first.
+	FindTerminalWithInProgressCheck(ctx context.Context, limit int) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)
@@ -969,6 +1121,7 @@ type RecentAppliesFilter struct {
 	Limit       int
 	Environment string
 	Deployment  string
+	Database    string
 	States      []string
 	// ActiveOnly restricts results to applies that have not reached a terminal
 	// state — the ones that still own their target. It is expressed as "not
@@ -976,6 +1129,10 @@ type RecentAppliesFilter struct {
 	// does not know counts as active: a caller asking whether a target is busy
 	// must not be told it is free because a state was missed.
 	ActiveOnly bool
+	// FinishedOnly restricts results to applies in a terminal state: the
+	// complement of ActiveOnly, so the two split every apply between them and
+	// a caller listing both sections lists each apply once.
+	FinishedOnly bool
 	// UpdatedSince, when set, restricts results to applies whose last activity
 	// — the latest lease heartbeat on the apply row or any of its operations —
 	// falls at or after this instant. Windowing on activity rather than start
@@ -983,6 +1140,13 @@ type RecentAppliesFilter struct {
 	// terminal state within it, and those started earlier but still running,
 	// including a fanned-out apply whose heartbeats land only on its operations.
 	UpdatedSince time.Time
+	// AfterID, when set, is the row id of an apply from an earlier page: the
+	// list starts with the applies created before it, rather than at the top,
+	// so a caller walks the list page by page from the last apply each page
+	// showed. The list is ordered by row id alone, which never changes, so the
+	// anchor keeps its place however its state moves during the walk.
+	// CountRecentByState ignores it: counts always cover every matching apply.
+	AfterID int64
 }
 
 // RetryableExpirationReason identifies why operator retry recovery stopped.
@@ -997,6 +1161,11 @@ const (
 // expiry lock, so this pass did no work. It is an expected outcome on every
 // instance but one, not a failure.
 var ErrRetryableExpiryBusy = errors.New("another instance is expiring retryable applies")
+
+// ErrBranchReconcileBusy reports that another instance holds the branch
+// reconcile lock, so this pass did no work. It is an expected outcome on every
+// instance but one, not a failure.
+var ErrBranchReconcileBusy = errors.New("another instance is reconciling engine branches")
 
 // RetryableApplyExpiration is a failed_retryable apply that was made permanent
 // because operator recovery should no longer retry it automatically.
@@ -1035,7 +1204,9 @@ type TaskStore interface {
 	// discovered via SHOW VITESS_MIGRATIONS). It requires the operation lease on
 	// the context: the single lease-holding operator is the only writer of an
 	// operation's per-shard rows, so the lookup-then-write is serialized by that
-	// lease and needs no unique constraint. A displaced operator (lost lease)
+	// lease. The store also assigns a new row's TaskIdentifier from its key, so
+	// storage itself refuses a second row for the same shard; the caller's
+	// TaskIdentifier is not used for a shard row. A displaced operator (lost lease)
 	// fails closed with ErrApplyLeaseLost. On conflict the row is rewritten
 	// through Update: identity is preserved, and the statement text follows
 	// the caller's task like every other mutable column.
@@ -1243,17 +1414,39 @@ type ApplyCommentStore interface {
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
-	// summary comment for an apply by inserting the summary marker as a claim
-	// sentinel (github_comment_id = 0). A superseded marker — a stop's summary
-	// consumed by a resume rotation — does not block the claim: it is converted
-	// back into a claim sentinel, since the summary it recorded belongs to an
-	// earlier terminal state. Exactly one caller wins per terminal state: the
-	// winner posts the summary and records the real comment ID via Upsert; every
-	// loser skips. The claim — not the apply lease — is the exactly-once
-	// authority for the summary, so a writer whose lease was re-claimed (stop
+	// summary comment for an apply in terminalState by inserting the summary
+	// marker as a claim sentinel (github_comment_id = 0). A marker that records
+	// a summary posted for an earlier terminal state does not block the claim:
+	// it is converted back into a claim sentinel. That is a marker a resume
+	// rotation superseded, or an active marker whose SummarizedState names a
+	// different terminal state the apply can leave, such as a stop's summary
+	// when the started apply completes before any rotation consumed it. A
+	// marker for a settled state blocks every claim, since that outcome is
+	// final and a claim for another state comes from a stale read. An active
+	// marker for a different state converts only while the apply is still in
+	// terminalState, so a claim read before the apply was started again cannot
+	// record a summary of a state the apply has left. Exactly one caller wins
+	// per terminal state: the winner posts the summary and records
+	// the real comment ID and the state it describes via Upsert; every loser
+	// skips. The claim — not the apply lease — is the exactly-once authority
+	// for the summary, so a writer whose lease was re-claimed (stop
 	// reconciliation, resume) can still be beaten to the post without a
 	// duplicate. Returns true when this caller won the claim.
-	ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error)
+	ClaimSummaryComment(ctx context.Context, applyID int64, terminalState string) (bool, error)
+
+	// SettleSummaryForResume settles the summary marker a resume rotation
+	// rotated for, in one write decided under a lock on the apply row, and
+	// reports what it did. It touches the marker only while the marker is
+	// active and still records githubCommentID: a terminal publish that came
+	// after the summary the rotation saw owns the marker from then on. While
+	// the apply is active it consumes the marker, so the apply's next terminal
+	// publish claims a fresh summary. Once the apply has reached its next
+	// terminal state it marks the marker SummaryRotatedPast instead: consuming
+	// it would leave the next resume nothing to rotate on, and leaving it
+	// as it was would block the summary that state is owed. With a lease in
+	// context the write requires it, and a lost lease surfaces as
+	// ErrApplyLeaseLost.
+	SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (ResumeSummarySettlement, error)
 
 	// ReclaimStaleSummaryClaim takes over a summary claim sentinel whose holder
 	// crashed between claiming and posting: a sentinel (github_comment_id = 0)
@@ -1303,6 +1496,12 @@ const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 // post, so anything older than this window is a crash, not a slow post.
 const SummaryClaimStaleAfter = 2 * time.Minute
 
+// MissingSummaryLookback is how long after reaching a terminal state an apply
+// stays eligible for summary reconciliation. Reconciliation runs on every
+// reconcile pass, so the window is what lets a summary whose publish failed
+// during a long GitHub outage still be posted once GitHub recovers.
+const MissingSummaryLookback = 24 * time.Hour
+
 // PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
 // for the same database can retire the ones it supersedes — minimizing a
 // comment whose head an apply owns, deleting one no apply acted on. Rows exist
@@ -1351,6 +1550,13 @@ type ApplyOperationStore interface {
 	// Get returns a child row by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*ApplyOperation, error)
 
+	// GetLocked returns a child row by ID read under its row lock, or nil if
+	// not found. A claim holds that lock from the moment it selects the row
+	// until it commits, so the answer reflects any claim in flight on the row
+	// when GetLocked was called: it waits for that claim to commit or roll
+	// back. Use it to confirm a decision a claim racing the read would change.
+	GetLocked(ctx context.Context, id int64) (*ApplyOperation, error)
+
 	// GetByApplyAndDeployment returns the legacy unkeyed child row for
 	// (apply_id, deployment), or nil if not found.
 	GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*ApplyOperation, error)
@@ -1366,10 +1572,38 @@ type ApplyOperationStore interface {
 	// (apply_id, created_at, id) order.
 	ListByApplies(ctx context.Context, applyIDs []int64) ([]*ApplyOperation, error)
 
+	// ListRecentTargets returns each distinct (database, environment, target)
+	// that an apply of databaseType ran an operation against, among applies
+	// last written (updated_at) within lookback of the storage database's
+	// clock, so an apply that settled recently counts however old it is,
+	// ordered by
+	// database, environment, then target, each compared bytewise, so every
+	// dialect returns the same order. Tuples are distinct byte for byte, so
+	// targets that differ only by case are listed separately, as the
+	// resolver keys they are. Operations without a target are skipped. A
+	// lookback under one microsecond is rejected. It
+	// tells a data plane, which resolves targets on demand rather than
+	// listing them in config, which targets it has applied to.
+	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
+
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or
 	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
 	UpdateState(ctx context.Context, id int64, newState string) error
+
+	// MarkStoppedNeverStarted returns an operation claimed out of pending to
+	// stopped before its first dispatch, clearing the started_at its claim
+	// stamped, so the row still reads as never started: a later start requeues
+	// it and a cancel settles it as never started. It is fenced like
+	// UpdateState.
+	MarkStoppedNeverStarted(ctx context.Context, id int64) error
+
+	// MarkResumedRunning moves an operation a start resumed from resuming to
+	// running once its engine is working again, and reports whether it did. It
+	// changes nothing when the row has moved on from resuming. It requires the
+	// operation lease in ctx for this row, and a row that no longer carries
+	// that lease surfaces as ErrApplyLeaseLost.
+	MarkResumedRunning(ctx context.Context, id int64) (bool, error)
 
 	// MarkStarted sets state=running and started_at on a child row.
 	MarkStarted(ctx context.Context, id int64) error
@@ -1379,6 +1613,16 @@ type ApplyOperationStore interface {
 
 	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
+
+	// MarkFailedRetryable pauses a child row for automatic retry: it sets
+	// state=failed_retryable and error_message and leaves completed_at unset,
+	// since the row is resumable rather than terminal. The claim re-leases the
+	// row only while its parent apply is failed_retryable and has retry budget
+	// left, so the pause is bounded by the parent's recovery budget. Use it for
+	// a drive that records its own outcome on a row with no tasks to derive one
+	// from, such as a group_finalizer; a row with tasks derives the state from
+	// them and writes it through UpdateState.
+	MarkFailedRetryable(ctx context.Context, id int64, errMsg string) error
 
 	// MarkTerminal sets a terminal state and stamps completed_at on a child row.
 	// Use for terminal states that record a reconciliation time (cancelled,
@@ -1424,6 +1668,15 @@ type ApplyOperationStore interface {
 	// GetEngineResumeState returns opaque engine resume state for the operation.
 	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
 
+	// ClearEngineResumeState removes the operation's engine resume state, so a
+	// later GetEngineResumeState reports ErrEngineResumeStateNotFound and the
+	// next drive starts the engine work afresh. Use it only when the engine has
+	// proved it holds none of the work the state described; state naming work
+	// that may be live is never cleared. The write takes the same lease guard
+	// as the other operation writes. Returns ErrApplyOperationNotFound if no
+	// row matches the ID.
+	ClearEngineResumeState(ctx context.Context, operationID int64) error
+
 	// SaveProgressMetadata stores the latest engine progress display metadata.
 	// A new attempt can display the prior attempt's position until its first progress save.
 	SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error
@@ -1445,29 +1698,41 @@ type ApplyOperationStore interface {
 	// target) pair, so the targets of one deployment are ordered exactly like the
 	// deployments of a map, while the operations of one member (a sharded
 	// target's per-shard work) do not gate each other's start. Under barrier
-	// and parallel they are still ordered at cutover, by
-	// FindNextApplyOperationCutover; under rolling they cut over in their own
-	// drives. A member's finalizer starts only once the work it finalizes has
-	// completed, and it waits on earlier members as rolling does, for them to
-	// complete, under every policy.
+	// and parallel they cut over through FindNextApplyOperationCutover; under
+	// rolling they cut over in their own drives. A member's finalizer starts
+	// only once the work it finalizes has completed. Under rolling it then
+	// waits for every earlier member to complete; under barrier and parallel it
+	// waits for every earlier deployment to complete, and an earlier target of
+	// its own deployment holds it only while that target has failed, is
+	// retrying, or was stopped, cancelled or reverted, as at cutover.
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
-	// needs work.
-	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
+	// needs work. A row claimed from pending or stopped is returned with the
+	// state it was claimed from, which is how the caller tells a claim that
+	// starts an operation from a retry or a recovery.
+	//
+	// opts narrow what the claim may match; see OperationClaimFilter.
+	FindNextApplyOperation(ctx context.Context, owner string, opts ...OperationClaimOption) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked
-	// at the cutover barrier whose turn it is, in deployment order, and rotates a
-	// fresh operation lease onto it in the same transaction. It is the cutover
+	// at the cutover barrier that no earlier sibling holds, and rotates a fresh
+	// operation lease onto it in the same transaction. It is the cutover
 	// counterpart to FindNextApplyOperation: that primitive gates the copy phase
 	// (claims pending rows → running); this one gates the cutover phase.
 	//
-	// A waiting_for_cutover row is claimed and transitioned to cutting_over only
-	// when every earlier operation of the apply has reached completed (the
-	// cutover gate is completed-only, with the on_failure "continue" exemption
-	// for a terminal-failed earlier sibling) and no pending stop control request
-	// exists for the apply. The gate covers every earlier operation, whichever
-	// member it belongs to, so one member's shards also cut over one at a time.
+	// A waiting_for_cutover row is claimed and transitioned to cutting_over
+	// once it is parked, unless an earlier operation of another deployment has
+	// not completed, so deployments cut over strictly in order; an earlier
+	// operation of its own deployment has failed, is retrying (by its own state
+	// or a task retrying under it), or was stopped, cancelled or reverted (with
+	// the on_failure "continue" exemption for a terminal-failed one); a stop
+	// control request is pending
+	// for the apply, or the apply already has as many cutovers in flight as its
+	// per-apply driver cap allows. The cap is admitted under a lock on the
+	// parent apply row, so concurrent drivers cannot overshoot it. An earlier
+	// target of the same deployment that is still copying or cutting over does
+	// not hold it.
 	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
@@ -1479,16 +1744,17 @@ type ApplyOperationStore interface {
 
 	// CutoverBlocker returns the earliest earlier operation of another rollout
 	// member (deployment, target) that holds the operation's cutover, or nil
-	// when it is that operation's turn. It applies the same rule as
-	// FindNextApplyOperationCutover: an earlier sibling holds until it has
-	// completed, unless the rollout's on_failure policy continues past its
-	// terminal failure. A manually requested cutover uses it so that it lands
-	// on the member whose turn it is, in the order the automatic cutover claim
-	// would follow between members. Operations of the same member, its shards
-	// and tables, never hold each other's requested cutover: the request
+	// when nothing does. It applies the same rule as
+	// FindNextApplyOperationCutover: an earlier operation of another deployment
+	// holds until it has completed, and one of the same deployment holds only
+	// while it has failed, is retrying (by its own state or a task under it),
+	// or was stopped, cancelled or reverted, unless the rollout's on_failure
+	// policy continues past its terminal failure. A
+	// manually requested cutover uses it so that it is held exactly where the
+	// automatic cutover claim would be. Operations of the same member, its
+	// shards and tables, never hold each other's requested cutover: the request
 	// addresses the member's remote apply, which takes whichever of them are
-	// parked. The automatic claim still cuts them over one at a time. It claims
-	// nothing.
+	// parked. It claims nothing.
 	CutoverBlocker(ctx context.Context, operationID int64) (*ApplyOperation, error)
 
 	// ReleaseClaim releases an operation lease the calling driver holds but
@@ -1549,6 +1815,27 @@ type ApplyOperationStore interface {
 	// is resumable, so completed_at is left nil. Apply-lease guarded when a lease
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
+
+	// MarkPendingCancelledByApply transitions every operation of an apply that
+	// never started to cancelled, returning the number of rows changed: the
+	// pending ones, and the stopped ones a stop reached while still pending.
+	// Used once a cancel is pending: an operation that never started changed
+	// nothing on its target, so it settles on the spot rather than outliving a
+	// cancelled rollout. A stopped operation that had started is left to the
+	// drive that delivers the cancel to it. completed_at is stamped, and writes
+	// are lease guarded the same way as MarkPendingStoppedByApply.
+	MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error)
+
+	// RequeueNeverStartedForStartByApply moves every stopped operation of an
+	// apply that never started back to pending, returning the number of rows
+	// changed. A stop reaches such a row while it is still pending, so it has
+	// written nothing to its target; once a start is pending it is queued
+	// work again, and pending is what it is. The write happens only while a
+	// start request is pending and neither a stop nor a cancel request is,
+	// checked in the same transaction under the apply row's lock, so a stop
+	// or cancel accepted after the start keeps every row it reached. The
+	// caller's lease is checked in that transaction too.
+	RequeueNeverStartedForStartByApply(ctx context.Context, applyID int64) (int64, error)
 
 	// ReapStranded mirrors the parent's outcome onto pending, unleased operation
 	// rows whose parent apply settled long enough ago to be quiescent, returning
@@ -1624,8 +1911,51 @@ type ControlRequestStore interface {
 	// returned with alreadyPending=true.
 	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
 
+	// RequestPendingCommand records req as RequestPending does, for the
+	// operator command req carries (ApplyControlRequest.ControlCommandID). A
+	// settled row that already carries that command is returned unchanged,
+	// with alreadyPending false: the command has run, and re-arming the row
+	// would retry it without the operator asking again. The caller tells that
+	// answer apart by the returned row's status. A req that carries no command
+	// is recorded as RequestPending records it.
+	RequestPendingCommand(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
+
+	// RequestPendingSuperseding records req as RequestPending does and, in the
+	// same transaction, completes the apply's pending request for superseded,
+	// whose effect req replaces. Either both writes land or neither does, so a
+	// failed request leaves the superseded one still deliverable.
+	RequestPendingSuperseding(ctx context.Context, req *ApplyControlRequest, superseded ControlOperation) (*ApplyControlRequest, bool, error)
+
+	// StopQueuedStart records stop against a stopped apply whose start request
+	// no driver has acted on yet, completing that start in the same
+	// transaction. It locks the apply and its operation rows, so it is ordered
+	// against every claim that would resume the apply: a claim that already
+	// took the apply out of stopped leaves nothing written and the outcome says
+	// so. The stop is recorded completed when nothing is left to stop, and
+	// pending when operationLease is set and an operation was already claimed,
+	// so the drive that claimed it stands down. operationLease reports whether
+	// the apply's operations are driven under their own leases (see
+	// tern.ApplyDrivesUnderOperationLease).
+	StopQueuedStart(ctx context.Context, stop *ApplyControlRequest, operationLease bool) (*ApplyControlRequest, QueuedStartStop, error)
+
+	// UpdateMetadata rewrites the metadata of the apply's request for operation
+	// under a row lock, so callers that read, change, and write it serialize.
+	// update receives the locked request and returns the metadata to store, or
+	// nil to leave the row as it is. found is false when the apply has no
+	// request for operation. update runs again when a lock conflict retries the
+	// write, so it must decide from the request it is given. The request's
+	// status and timestamps are left as they are.
+	UpdateMetadata(ctx context.Context, applyID int64, operation ControlOperation, update func(*ApplyControlRequest) ([]byte, error)) (found bool, err error)
+
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
+
+	// ListPending returns every pending request for an apply, ordered by
+	// operation ascending, or an empty result when none is pending. A drive
+	// that checks several operations on each poll reads them here once rather
+	// than once per operation; the ordering is lowercase ASCII and so the same
+	// on every dialect, as ListSettled notes.
+	ListPending(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// GetByOperation returns the request for an apply operation regardless of
 	// status (nil if none). Unlike GetPending it does not filter on status, so
@@ -1640,6 +1970,14 @@ type ControlRequestStore interface {
 	// FailPending marks the pending request for an apply operation failed with an
 	// operator-visible reason.
 	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
+
+	// SettlePendingRevision settles req as completed or failed only while its
+	// row is still pending at req's Revision. The row is re-armed in place for
+	// the next command of the same operation, so a writer that evaluated one
+	// command settles that command and never a later one recorded on the same
+	// row. settled is false when the row has moved on. errorMessage is stored
+	// only when status is failed.
+	SettlePendingRevision(ctx context.Context, req *ApplyControlRequest, status ControlRequestStatus, errorMessage string) (settled bool, err error)
 
 	// ListSettled returns every control request for an apply that has reached a
 	// terminal status, ordered by operation ascending, so the plane that
@@ -1667,4 +2005,39 @@ type ControlRequestStore interface {
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)
+
+	// ListStrandedPending returns pending control requests whose apply has
+	// settled with no drive left to answer them, at most limit rows, oldest
+	// first, each with the apply it belongs to. A drive answers the requests of
+	// an apply it settles, but when that answer does not land nothing re-claims
+	// a settled apply to try again, so the request would stay pending forever.
+	// This is the read the operator's reaper sweeps on to answer them instead.
+	//
+	// Only settled applies (completed, failed, cancelled, reverted) quiescent
+	// past the stranded-operation window qualify: a stopped or failed_retryable
+	// apply is resumable, and its pending start is the request that resumes it.
+	// An apply with a fresh operation lease is excluded whatever its state,
+	// because under a fan-out rollout a sibling drive can still be working under
+	// a settled parent, and that drive's own post-drive settlement answers the
+	// request. The rows are read, not written: settlement is left to the caller
+	// so the outcome it discloses matches what a drive would have disclosed.
+	//
+	// One instance lists per pass, guarded by an advisory lock;
+	// ErrStrandedControlRequestReaperBusy reports that another instance holds
+	// it. As with ReapStranded, the lock is an efficiency gate, not a safety one:
+	// every settlement the caller makes is conditional on the row still pending.
+	ListStrandedPending(ctx context.Context, limit int) ([]*StrandedControlRequest, error)
+}
+
+// ErrStrandedControlRequestReaperBusy reports that another instance holds the
+// stranded control-request reaper lock, so this pass did no work. It is an
+// expected outcome on every instance but one, not a failure.
+var ErrStrandedControlRequestReaperBusy = errors.New("another instance is reaping stranded control requests")
+
+// StrandedControlRequest is one pending control request left behind on a
+// settled apply, carrying the apply so callers can settle the request against
+// the recorded outcome and log it with the canonical triage attributes.
+type StrandedControlRequest struct {
+	Request *ApplyControlRequest
+	Apply   *Apply
 }

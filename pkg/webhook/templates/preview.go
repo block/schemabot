@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -921,6 +922,46 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 	})
 }
 
+// PreviewCommentPlanRolloutCopyDiscardedPaused renders the locked comment of
+// an automatic apply on a rollout of independent targets that stopped for
+// confirmation because applying throws away an unfinished copy on a target
+// other than the primary. The copy is named under the plan of the target it
+// is on, and confirming runs every target's plan, that one included.
+func PreviewCommentPlanRolloutCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"us/testapp_1", "us/testapp_2", "us/testapp_3"}, Primary: true, Changes: samplePlanChanges()},
+			},
+			DiscardedCopies: []TargetExistingCopy{{
+				Target: "us/testapp_3",
+				Copy: ExistingCopyData{
+					Namespace: "testapp",
+					Tables:    []string{"products"},
+					Reason:    "statement_differs",
+					Age:       "3h 12m",
+					Statement: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
+				},
+			}},
+		},
+		PendingManualConfirmation: true,
+	})
+}
+
 // PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
 // independent targets that need different work: the primary target and one
 // other need the email column, and the third needs it with an index as well.
@@ -1332,6 +1373,12 @@ func PreviewCommentMissingEnv() string {
 	return RenderMissingEnv(action.Plan)
 }
 
+// PreviewCommentControlMissingEnv renders the reply to a control command that
+// names an apply but omits -e.
+func PreviewCommentControlMissingEnv() string {
+	return RenderControlMissingEnv(action.Stop, "apply-a1b2c3d4e5f6", "staging")
+}
+
 // PreviewCommentInvalidCmd renders the "invalid command" error comment.
 func PreviewCommentInvalidCmd() string {
 	return RenderInvalidCommand()
@@ -1348,6 +1395,7 @@ func PreviewCommentApplyStarted() string {
 		Environment: "staging",
 		RequestedBy: previewRequestedBy,
 		ApplyID:     "apply-a1b2c3d4e5f6",
+		State:       state.Apply.Pending,
 	})
 }
 
@@ -1387,12 +1435,28 @@ func PreviewCommentApplyBlockedByCLI() string {
 // PreviewCommentApplyInProgress renders a sample "apply already in progress" comment.
 func PreviewCommentApplyInProgress() string {
 	return RenderApplyInProgress(ApplyLockConflictData{
-		Database:     "testapp",
-		DatabaseType: "mysql",
-		Environment:  "staging",
-		RequestedBy:  previewRequestedBy,
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		ApplyState:   "running",
+		Database:          "testapp",
+		DatabaseType:      "mysql",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		ApplyID:           "apply-a1b2c3d4e5f6",
+		ApplyState:        "running",
+		ApplyAgainCommand: ApplyCommand("staging", "", ApplyCommandOptions{}),
+	})
+}
+
+// PreviewCommentApplyInProgressLatestCommit renders a sample "apply already in
+// progress" comment where the running apply is applying the PR's latest commit.
+func PreviewCommentApplyInProgressLatestCommit() string {
+	return RenderApplyInProgress(ApplyLockConflictData{
+		Database:            "testapp",
+		DatabaseType:        "mysql",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		ApplyID:             "apply-a1b2c3d4e5f6",
+		ApplyState:          "running",
+		ApplyAgainCommand:   ApplyCommand("staging", "", ApplyCommandOptions{}),
+		AppliesLatestCommit: true,
 	})
 }
 
@@ -1477,7 +1541,9 @@ func PreviewCommentReviewRequiredNoOperators() string {
 
 // PreviewCommentReviewRequiredStaleApproval renders the "review required"
 // comment when an authorized reviewer approved an earlier commit and the PR's
-// schema change differs at the head, so that approval no longer counts.
+// schema change differs at the head, so that approval no longer counts. The
+// author dropped a column comment after the review, and the collapsed block
+// shows the DDL each commit runs.
 func PreviewCommentReviewRequiredStaleApproval() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:          "testapp",
@@ -1487,6 +1553,48 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
 		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
+		ChangedStatements: []ChangedStatements{{
+			Path:        "schema/testapp/orders.sql",
+			Dialect:     schema.DialectMySQL,
+			ApprovedSHA: "4f1c2d9e8b7a",
+			HeadSHA:     "9a3b5c7d1e2f",
+			Approved:    []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL COMMENT 'NULL until a coupon is applied'"},
+			Head:        []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL"},
+		}},
+	})
+}
+
+// PreviewCommentReviewRequiredStaleApprovalOtherBranch renders the "review
+// required" comment for a PR targeting a branch other than the default, where
+// changes that reach that branch count as a change to the PR's schema change.
+func PreviewCommentReviewRequiredStaleApprovalOtherBranch() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
+		BaseRef:           "release-1.2",
+		DefaultBranch:     "main",
+	})
+}
+
+// PreviewCommentReviewRequiredChangedBase renders the rejection of an
+// earlier approval when identical files have different merge-base versions.
+func PreviewCommentReviewRequiredChangedBase() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		ChangedApprovers:  []string{"jdoe"},
+		ChangedBasePaths:  []string{"schema/testapp/orders.sql"},
 	})
 }
 
@@ -1577,6 +1685,12 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 		})
 }
 
+// PreviewCommentApplyBlockedByStoppedPriorEnvApply renders a sample "production
+// blocked by a stopped staging apply" comment.
+func PreviewCommentApplyBlockedByStoppedPriorEnvApply() string {
+	return RenderApplyBlockedByStoppedPriorEnvApply("testapp", "production", "staging")
+}
+
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
 // block for a prior-environment check that could not be read.
 func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
@@ -1664,18 +1778,79 @@ func sampleLintWarnings() []LintViolationData {
 	}
 }
 
+// PreviewCommentPlanPrimaryKeyWarning renders an index addition on an existing
+// table whose unchanged varchar primary key raises an advisory finding.
+func PreviewCommentPlanPrimaryKeyWarning() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `customers` ADD INDEX `idx_created_at` (`created_at`);"},
+		}},
+		LintViolations: []LintViolationData{{
+			Table: "customers", LinterName: "primary_key",
+			Message: `Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
+// PreviewCommentPlanPrimaryKeyIssue renders a new table whose varchar primary
+// key requires explicit acknowledgement, with the same guide beside the issue.
+func PreviewCommentPlanPrimaryKeyIssue() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"CREATE TABLE `customers` (\n  `id` varchar(64) NOT NULL,\n  `created_at` datetime(3) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{{
+			Table: "customers", Reason: `[ERROR] primary_key: Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
+// PreviewCommentPlanRelatedGuidance shows multiple rules contributing distinct
+// guides while repeated primary key warnings contribute only one link.
+func PreviewCommentPlanRelatedGuidance() string {
+	data := PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"rename_column"},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []UnsafeChangeData{{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`}},
+	}
+	change := KeyspaceChangeData{
+		Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;"},
+	}
+	for _, table := range []string{"customers", "orders", "invoices", "shipments", "sessions", "events"} {
+		change.Statements = append(change.Statements, fmt.Sprintf("ALTER TABLE `%s` ADD INDEX `idx_created_at` (`created_at`);", table))
+		data.LintRuleNames = append(data.LintRuleNames, "primary_key")
+		data.LintViolations = append(data.LintViolations, LintViolationData{
+			Table: table, LinterName: "primary_key", Message: `Primary key column "id" has type "varchar"`,
+		})
+	}
+	data.Changes = []KeyspaceChangeData{change}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanManyLintWarnings renders a plan whose lint findings exceed
 // the fold threshold, exercising the collapsed details block grouped by table.
 func PreviewCommentPlanManyLintWarnings() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:     "testapp",
-		SchemaName:   "testapp",
-		Environment:  "staging",
-		HeadSHA:      previewHeadSHA,
-		Repository:   previewRepository,
-		RequestedBy:  previewRequestedBy,
-		IsMySQL:      true,
-		DatabaseType: "mysql",
+		Database:      "testapp",
+		LintRuleNames: []string{"primary_key"},
+		SchemaName:    "testapp",
+		Environment:   "staging",
+		HeadSHA:       previewHeadSHA,
+		Repository:    previewRepository,
+		RequestedBy:   previewRequestedBy,
+		IsMySQL:       true,
+		DatabaseType:  "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -1690,10 +1865,10 @@ func PreviewCommentPlanManyLintWarnings() string {
 			{Table: "order_events", Reason: `Index "idx_events_archived" should be made invisible before dropping to ensure it's not needed`},
 		},
 		LintViolations: []LintViolationData{
-			{Message: `Primary key column "order_ref" has type "varchar"`, Table: "orders", LinterName: "pk_type"},
+			{Message: `Primary key column "order_ref" has type "varchar"`, Table: "orders", LinterName: "primary_key"},
 			{Message: `Index "idx_status_created" has "DATETIME" column "created_at" in position 3 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
 			{Message: `Index "idx_region_created" has "DATETIME" column "created_at" in position 4 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
-			{Message: `Primary key column "event_id" has type "mediumint"`, Table: "order_events", LinterName: "pk_type"},
+			{Message: `Primary key column "event_id" has type "mediumint"`, Table: "order_events", LinterName: "primary_key"},
 			{Message: `Index "idx_status_created" on columns ("status", "region", "created_at", "event_id", "order_pk") has a redundant PRIMARY KEY suffix "order_pk" — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns ("order_pk", "event_id") to secondary indexes, so spelling out part of the PK at the end of the index is redundant.`, Table: "order_events", LinterName: "redundant_indexes"},
 			{Message: `Column "event_id" in table "order_events" has type "mediumint(9)" but 2 other table(s) use type "int(11)" (e.g. shipments, invoices)`, Table: "order_events", LinterName: "type_pedantic"},
 		},
@@ -1818,6 +1993,10 @@ func PreviewCommentLintErrorsBlocked() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"; [WARNING] has_timestamp: Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`},
 			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
+		},
+		LintRuleNames: []string{"primary_key", "has_timestamp", "rename_column"},
+		LintViolations: []LintViolationData{
+			{Message: `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "orders", LinterName: "has_timestamp"},
 		},
 	})
 }
@@ -2262,18 +2441,21 @@ func sampleApplyTables() []TableProgressData {
 			Namespace:      "testapp",
 			TableName:      "orders",
 			EstimatedBytes: new(int64(438_000_000)),
+			EstimatedRows:  new(int64(1_620_000)),
 			DDL:            "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
 		},
 		{
 			Namespace:      "testapp",
 			TableName:      "users",
 			EstimatedBytes: new(int64(391_000_000)),
+			EstimatedRows:  new(int64(1_480_000)),
 			DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
 		},
 		{
 			Namespace:      "testapp",
 			TableName:      "products",
 			EstimatedBytes: new(int64(157_000_000)),
+			EstimatedRows:  new(int64(612_000)),
 			DDL:            "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
 		},
 	}
@@ -2367,6 +2549,21 @@ func PreviewCommentApplyChecksumming() string {
 	tables[1].ChecksumRowsTotal = 1466232
 	tables[2].Status = state.Task.Pending
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Checksumming, tables))
+}
+
+// PreviewCommentApplyChecksummingDeferredCutover renders the checksumming
+// comment for an apply started with --defer-cutover, which carries the
+// deferred-cutover option.
+func PreviewCommentApplyChecksummingDeferredCutover() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Checksumming
+	tables[1].ChecksumRowsChecked = 321450
+	tables[1].ChecksumRowsTotal = 1466232
+	tables[2].Status = state.Task.Pending
+	data := sampleApplyData(state.Apply.Checksumming, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentApplyPostChecksum renders an apply comment where a table has
@@ -3218,6 +3415,26 @@ func PreviewCommentSkipRevertSupersededProgress() string {
 	})
 }
 
+// PreviewCommentCutoverCommandSupersededProgress renders the progress comment
+// that waited at the deferred-cutover gate after the operator's cutover took
+// effect: the waiting-for-cutover rendering collapses into a details block
+// under a pointer to the fresh comment now tracking the cutover.
+func PreviewCommentCutoverCommandSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.WaitingForCutover
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
+	return RenderCutoverCommandSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentCutoverSuperseded renders a spent cutover prompt after a
 // deferred cutover completed into a still-active apply: the prompt collapses
 // into a details block under a pointer to the fresh comment now tracking the
@@ -3229,6 +3446,7 @@ func PreviewCommentCutoverSuperseded() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 100
 	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
 	return RenderCutoverSupersededComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
@@ -3332,6 +3550,18 @@ func PreviewCommentRollbackStatus() string {
 	data := sampleApplyData(state.Apply.Running, tables)
 	data.Rollback = true
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentRollbackOfRolloutUnsupported previews the refusal of a
+// rollback of a schema change across multiple targets.
+func PreviewCommentRollbackOfRolloutUnsupported() string {
+	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
+		Environment:    "staging",
+		Database:       "payments",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RoutingChecked: true,
+		PR:             PRStateOpen,
+	})
 }
 
 // PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
@@ -3446,7 +3676,8 @@ func PreviewCommentSummaryFailedEngineLogs() string {
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 30
 	// The stored reason is what SchemaBot recorded and what its own log line
-	// repeats; the summary renders the version that points at the fold below.
+	// repeats. A reason chosen by code renders as is; only the generic sentence
+	// is rewritten to point at the fold below.
 	stored := mysqlerr.ReasonFromText("(errno 1265)")
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = mysqlerr.PointToRenderedLogs(stored)

@@ -302,9 +302,9 @@ func TestGRPCClient_MemberTargetDispatchRefusesASiblingTargetsEcho(t *testing.T)
 // The targets of one deployment key their generation-zero dispatches on the
 // deployment alone, exactly as its shards do, so they land on one remote
 // apply; that key is the one a single-target deployment has always used, and a
-// whole-apply drive keeps its own. A deliberate retry (the operation's attempt
-// above zero) keys on the operation, so each target's retry gets a remote
-// apply of its own and never lands on the other target's.
+// whole-apply drive keeps its own. A retried target (the operation's attempt
+// above zero) keeps the deployment's key, so the retry lands on the one remote
+// apply its sibling is still running on instead of taking the deployment over.
 func TestRemoteApplyIdempotencyKey_MemberTarget(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-abc123"}
 	legacyKey := func(parts ...string) string {
@@ -331,10 +331,8 @@ func TestRemoteApplyIdempotencyKey_MemberTarget(t *testing.T) {
 		remoteApplyIdempotencyKey(apply, wholeApplyTaskScope()),
 		"a whole-apply drive keeps its whole-apply key")
 
-	firstRetry := remoteApplyIdempotencyKey(apply, scope("payments-001", "payments-001", "payments-001", 1))
-	secondRetry := remoteApplyIdempotencyKey(apply, scope("payments-002", "payments-002", "payments-002", 1))
-	assert.Equal(t, legacyKey("schemabot-remote-apply-v1", "apply-abc123", "deployment", "default", "1", "operation", "payments-001"), firstRetry)
-	assert.NotEqual(t, firstRetry, secondRetry, "a retried target keys on its own operation")
+	assert.Equal(t, deploymentKey, remoteApplyIdempotencyKey(apply, scope("payments-002", "payments-002", "payments-002", 2)),
+		"a retried target keys on its deployment, never on its attempt")
 }
 
 // The claim-time scope decides the member target from the apply's operation

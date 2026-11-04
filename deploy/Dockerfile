@@ -9,8 +9,10 @@
 #     -v ./config:/config \
 #     schemabot
 
-# Build stage
-FROM golang:1.26-alpine AS builder
+# Build stage. It runs on the build machine's own platform and Go cross-compiles
+# for the target, so a multi-arch build does not compile Go under QEMU emulation,
+# which is many times slower.
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS builder
 
 # The Alpine CDN intermittently answers "temporary error (try again later)" and a
 # single failed fetch fails the whole build, so every apk add in this repo's
@@ -38,7 +40,9 @@ COPY . .
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
-RUN CGO_ENABLED=0 GOOS=linux go build \
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" \
     -o /schemabot ./pkg/cmd
 

@@ -1,12 +1,18 @@
 package spirit
 
 import (
+	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"testing"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -104,17 +110,211 @@ func TestClassifyRunnerError(t *testing.T) {
 	})
 }
 
+// copyWarningError builds the error a Spirit copy fails with when the target
+// raises a warning on a chunk it inserted, wrapped the way the runner returns
+// it.
+func copyWarningError(code uint16, message string) error {
+	return fmt.Errorf("failed to execute chunklet insert: %w",
+		&dbconn.UnsafeWarningError{Warning: &mysql.MySQLError{Number: code, Message: message}})
+}
+
+// A runner error is read against the evidence Spirit retained for the run.
+// Once the cutover commits, the target holds the change, so an error from the
+// cleanup after it is not the change's outcome. Before the cutover the target
+// holds none of it, and when Spirit cannot tell whether the cutover committed
+// nothing is proven landed.
+func TestClassifyRunnerErrorCutover(t *testing.T) {
+	tests := []struct {
+		name   string
+		result status.WorkflowResult
+		want   runnerErrorCutover
+	}{
+		{
+			name:   "an error before the cutover committed",
+			result: status.WorkflowResult{},
+			want:   runnerErrorBeforeCutover,
+		},
+		{
+			name:   "cleanup failing after the cutover committed keeps the change landed",
+			result: status.WorkflowResult{DurableMutation: true},
+			want:   runnerErrorAfterCutover,
+		},
+		{
+			name:   "an unverified cutover is not proven landed",
+			result: status.WorkflowResult{TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous},
+			want:   runnerErrorCutoverUnverified,
+		},
+		{
+			name: "ambiguous ownership outranks a durable mutation",
+			result: status.WorkflowResult{
+				DurableMutation:   true,
+				TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,
+			},
+			want: runnerErrorCutoverUnverified,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, classifyRunnerErrorCutover(tt.result))
+		})
+	}
+}
+
+// A runner error settles the ALTER as finished only on Spirit's proof that the
+// cutover committed, whether or not a stop, cancel, or shutdown cancelled the
+// run. Without that proof a cancelled run stays as the stop or cancel left it
+// and an uncancelled one is recorded failed; an unverified cutover is never
+// settled as finished, even when Spirit also recorded a durable mutation.
+func TestSettleRunnerError(t *testing.T) {
+	committed := status.WorkflowResult{DurableMutation: true}
+	unverified := status.WorkflowResult{
+		DurableMutation:   true,
+		TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,
+	}
+	tests := []struct {
+		name      string
+		cancelled bool
+		result    status.WorkflowResult
+		// wantFinished means the ALTER settles as finished (a nil return).
+		wantFinished bool
+		wantStopped  bool
+		wantState    engine.State
+	}{
+		{
+			name:         "cancelled after the cutover committed settles as finished",
+			cancelled:    true,
+			result:       committed,
+			wantFinished: true,
+			wantState:    engine.StateStopped,
+		},
+		{
+			name:        "cancelled with an unverified cutover stays stopped",
+			cancelled:   true,
+			result:      unverified,
+			wantStopped: true,
+			wantState:   engine.StateStopped,
+		},
+		{
+			name:        "cancelled before the cutover stays stopped",
+			cancelled:   true,
+			result:      status.WorkflowResult{},
+			wantStopped: true,
+			wantState:   engine.StateStopped,
+		},
+		{
+			name:         "uncancelled after the cutover committed settles as finished",
+			result:       committed,
+			wantFinished: true,
+			wantState:    engine.StateRunning,
+		},
+		{
+			name:      "uncancelled with an unverified cutover fails",
+			result:    unverified,
+			wantState: engine.StateFailed,
+		},
+		{
+			name:      "uncancelled before the cutover fails",
+			result:    status.WorkflowResult{},
+			wantState: engine.StateFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			// A stop or cancel sets the state to stopped before it cancels the
+			// run's context.
+			initial := engine.StateRunning
+			if tt.cancelled {
+				initial = engine.StateStopped
+			}
+			eng.runningSchemaChange = &runningSchemaChange{database: "app", state: initial}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancelled {
+				cancel()
+			}
+			runErr := errors.New("drop checkpoint table: lock wait timeout exceeded")
+
+			err := eng.settleRunnerError(ctx, runErr, tt.result, "app", []string{"orders"})
+
+			switch {
+			case tt.wantFinished:
+				require.NoError(t, err, "a committed cutover settles the ALTER as finished")
+			case tt.wantStopped:
+				require.ErrorIs(t, err, errSchemaChangeStopped)
+			default:
+				require.ErrorIs(t, err, runErr, "the failure carries the runner's error")
+				assert.NotErrorIs(t, err, errSchemaChangeStopped)
+			}
+			assert.Equal(t, tt.wantState, eng.runningSchemaChange.state)
+		})
+	}
+}
+
+// A row the copy cannot write into the new table definition fails every
+// attempt the same way, because every attempt copies the same rows into the
+// same definition. Those failures are permanent; what a retry can clear — a
+// lock that was held, a connection that dropped — stays retryable.
+func TestClassifyRunnerErrorRowData(t *testing.T) {
+	permanent := []struct {
+		name string
+		err  error
+	}{
+		{"NULL into a NOT NULL column", copyWarningError(1048, "Column 'c' cannot be null")},
+		{"value out of range for the new type", copyWarningError(1264, "Out of range value for column 'amount' at row 1")},
+		{"value truncated by the new type", copyWarningError(1265, "Data truncated for column 'status' at row 1")},
+		{"value the new type cannot represent", copyWarningError(1366, "Incorrect integer value: 'abc' for column 'n' at row 1")},
+		{"value longer than the new column", copyWarningError(1406, "Data too long for column 'name' at row 1")},
+		{"row data error raised as an error rather than a warning", fmt.Errorf("failed to execute upsert: %w",
+			&mysql.MySQLError{Number: 1048, Message: "Column 'c' cannot be null"})},
+	}
+	for _, tc := range permanent {
+		t.Run(tc.name+" is permanent", func(t *testing.T) {
+			classifiedErr := classifyRunnerError(tc.err)
+
+			assert.False(t, engine.IsRetryable(classifiedErr))
+			var permanentErr *engine.PermanentError
+			assert.ErrorAs(t, classifiedErr, &permanentErr)
+			assert.Equal(t, tc.err.Error(), classifiedErr.Error())
+		})
+	}
+
+	retryable := []struct {
+		name string
+		err  error
+	}{
+		{"lock wait timeout", fmt.Errorf("failed to execute chunklet insert: %w",
+			&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded; try restarting transaction"})},
+		{"deadlock", fmt.Errorf("failed to execute upsert: %w",
+			&mysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock; try restarting transaction"})},
+		{"lost connection", fmt.Errorf("failed to execute chunklet insert: %w", mysql.ErrInvalidConn)},
+		{"bad connection", fmt.Errorf("failed to execute chunklet insert: %w", driver.ErrBadConn)},
+		{"server gone away", fmt.Errorf("failed to execute chunklet insert: %w",
+			&mysql.MySQLError{Number: 2013, Message: "Lost connection to MySQL server during query"})},
+	}
+	for _, tc := range retryable {
+		t.Run(tc.name+" stays retryable", func(t *testing.T) {
+			classifiedErr := classifyRunnerError(tc.err)
+
+			require.Same(t, tc.err, classifiedErr)
+			assert.True(t, engine.IsRetryable(classifiedErr))
+		})
+	}
+}
+
 // A runner failure's retry classification reaches the drive through progress.
 // A copy whose checksum keeps finding rows it would lose fails the same way on
 // every attempt, so progress reports it failed and not retryable, and the drive
 // settles it instead of spending its recovery attempts re-copying the table. A
-// failure that could succeed on a later attempt stays retryable. Both answers
+// failure that could succeed on a later attempt stays retryable. The same holds
+// for a row the copy cannot store under the new definition. Both answers
 // hold before and after the engine drains the finished change.
 func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 	cases := []struct {
 		name      string
 		err       error
 		retryable bool
+		reason    string // the operator-facing reason, when the case pins one
 	}{
 		{
 			name: "ALTER whose checksum keeps finding differences is not retryable",
@@ -135,6 +335,26 @@ func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 			retryable: true,
 		},
 		{
+			name: "ALTER that cannot store a NULL row under NOT NULL is not retryable",
+			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(
+				copyWarningError(1048, "Column 'c' cannot be null"))),
+			retryable: false,
+			reason:    "A row held NULL in a column that cannot be null",
+		},
+		{
+			name: "ALTER that would truncate a stored value is not retryable",
+			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(
+				copyWarningError(1265, "Data truncated for column 'nickname' at row 1"))),
+			retryable: false,
+			reason:    "An existing value would be truncated by the column's target type or length",
+		},
+		{
+			name: "ALTER that timed out on a lock wait stays retryable",
+			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(fmt.Errorf("failed to execute chunklet insert: %w",
+				&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded; try restarting transaction"}))),
+			retryable: true,
+		},
+		{
 			name:      "ALTER that lost its connection stays retryable",
 			err:       fmt.Errorf("schema change failed: %w", classifyRunnerError(errors.New("connection reset"))),
 			retryable: true,
@@ -151,6 +371,9 @@ func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 			assert.Equal(t, engine.StateFailed, live.State)
 			assert.NotEmpty(t, live.ErrorMessage)
 			assert.Equal(t, tc.retryable, live.Retryable, "live progress")
+			if tc.reason != "" {
+				assert.Contains(t, live.ErrorMessage, tc.reason)
+			}
 
 			eng.Drain()
 

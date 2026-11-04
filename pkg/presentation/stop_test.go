@@ -13,7 +13,8 @@ import (
 // the same targets is refused until then, and until then stop is offered
 // even when the only live member waits for cutover. A rollout whose live
 // members only wait for cutover otherwise keeps the cutover as its one
-// command, and a terminal apply offers no stop.
+// command, a member still copying keeps stop on offer after its sibling
+// stopped, and a terminal apply offers no stop.
 func TestRolloutFooterPredicates(t *testing.T) {
 	so := state.ApplyOperation
 	for name, tc := range map[string]struct {
@@ -41,8 +42,12 @@ func TestRolloutFooterPredicates(t *testing.T) {
 			ops:  []Operation{{Deployment: "us", State: so.Running}, {Deployment: "eu", State: so.Pending}},
 			stop: true,
 		},
+		"stop landed on one member while another still copies": {
+			ops:  []Operation{{Deployment: "us", State: so.Stopped}, {Deployment: "eu", State: so.Running}},
+			stop: true,
+		},
 		"stopped": {
-			ops: []Operation{{Deployment: "us", State: so.Stopped}, {Deployment: "eu", State: so.Running}},
+			ops: []Operation{{Deployment: "us", State: so.Stopped}, {Deployment: "eu", State: so.Stopped}},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

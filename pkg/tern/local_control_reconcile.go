@@ -114,7 +114,7 @@ func (c *LocalClient) reconcileEngineTerminalTruthBeforeCommands(ctx context.Con
 	// of them is stopped, the one state that keeps a cancel deliverable). The
 	// adopted state is the engine's terminal truth, so a cancel it overtook is
 	// failed with that reason rather than reported applied.
-	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+	if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 		return true, err
 	}
 	c.notifyTerminalObserver(apply, tasks)
@@ -137,7 +137,7 @@ func adoptableEngineTerminalStates(s engine.State, retryable bool) (applyState, 
 	case engine.StateCompleted:
 		return state.Apply.Completed, state.Task.Completed, true
 	case engine.StateFailed:
-		if retryable {
+		if !failureIsSettled(s, retryable) {
 			return "", "", false
 		}
 		return state.Apply.Failed, state.Task.Failed, true
@@ -148,6 +148,14 @@ func adoptableEngineTerminalStates(s engine.State, retryable bool) (applyState, 
 	default:
 		return "", "", false
 	}
+}
+
+// failureIsSettled reports whether an engine's progress state is a failure
+// with no retry path left: the outcome a pending cancel must never replace,
+// whether the drive adopts it before consuming the cancel or the cancel's
+// fallback refuses over it.
+func failureIsSettled(s engine.State, retryable bool) bool {
+	return s == engine.StateFailed && !retryable
 }
 
 // firstTaskWithLiveEngineWork returns the first task whose state says the
@@ -211,6 +219,7 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 			skippedCount++
 			continue
 		}
+		asStored := *task
 		if state.IsState(taskState, state.Task.Completed) {
 			task.ProgressPercent = 100
 		}
@@ -218,8 +227,25 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 			task.ErrorMessage = progress.ErrorMessage
 		}
 		task.CompletedAt = &now
-		c.transitionTaskState(ctx, task, task.ApplyID, taskState,
-			fmt.Sprintf("Task %s adopted the engine's %s outcome (the engine reached it before the pending command was consumed)", task.TaskIdentifier, taskState))
+		// The apply's outcome is recorded only over task rows that carry it: a
+		// task left active under a settled apply is work storage still offers to
+		// a drive. A refused write puts the in-memory task back to what storage
+		// holds and returns with the apply untouched, for the next claim to
+		// reconcile again. Tasks adopted before it stay adopted. refusedTaskVerdict
+		// classifies the refusal as the failure helpers do and wraps
+		// ErrTaskVerdictRefused so an operation drive's row is not derived from
+		// the partly settled set; a cancelled drive, which it hands back with nil,
+		// returns the cancellation here instead, since the reconcile that called
+		// this must not go on to settle the commands the outcome would moot.
+		if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, taskState,
+			fmt.Sprintf("Task %s adopted the engine's %s outcome (the engine reached it before the pending command was consumed)", task.TaskIdentifier, taskState)); err != nil {
+			*task = asStored
+			if verdictErr := c.refusedTaskVerdict(ctx, apply, task, taskState, progress.ErrorMessage, err); verdictErr != nil {
+				return fmt.Errorf("adopt engine terminal state %s for task %s: %w", taskState, task.TaskIdentifier, verdictErr)
+			}
+			return fmt.Errorf("adopt engine terminal state %s for task %s of apply %s (database %s) on a cancelled drive: %w",
+				taskState, task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, context.Cause(ctx))
+		}
 		settledCount++
 	}
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
@@ -246,6 +272,7 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("adopt engine terminal state %s for apply %s (database %s): %w", applyState, apply.ApplyIdentifier, apply.Database, err)
 	}
+	releaseActiveApplyForDriveOutcome(ctx, apply, previousState)
 	c.logger.Warn("engine reached a terminal state before a pending stop/cancel was consumed; apply settled to the engine's outcome",
 		append(apply.LogAttrs(),
 			"engine_state", string(progress.State),

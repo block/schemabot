@@ -1,8 +1,14 @@
 package spirit
 
 import (
+	"context"
+	"errors"
+	"net"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -154,6 +160,328 @@ func TestStopKeepsOutcomeThatLandsDuringCheckpoint(t *testing.T) {
 			tc.checkErr(t, err)
 			assert.False(t, cancelCalled, "a change that already settled has nothing left to cancel")
 			assert.Equal(t, tc.wantState, rm.state)
+		})
+	}
+}
+
+// An operator stops or cancels a schema change whose Spirit cutover commits
+// just before the cancel reaches the runner. The runner then returns having
+// finished the change, and the run records it completed. Once the runner has
+// returned, the stop or cancel reads that outcome and answers that the change
+// completed, so the caller reconciles to the completed outcome rather than
+// recording a stop or cancel of a change the target already holds. A runner
+// that returns without finishing leaves the stop or cancel in effect.
+func TestControlKeepsACompletionThatLandsAfterTheCancel(t *testing.T) {
+	controls := map[string]struct {
+		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+		wantState engine.State
+	}{
+		"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Stop(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Cancel(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateCancelled},
+	}
+	for name, control := range controls {
+		t.Run(name+"/the change completes after the cancel", func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			runCtx, cancelRun := context.WithCancel(t.Context())
+			rm.cancelFunc = cancelRun
+			rm.wg.Go(func() {
+				<-runCtx.Done()
+				eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
+			})
+
+			result, err := control.run(eng, t.Context())
+
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.True(t, engine.IsAlreadyCompleted(err), "the caller reconciles to the completed outcome, got %v", err)
+			assert.Contains(t, err.Error(), "completed before the "+name+" took effect")
+			assert.Equal(t, engine.StateCompleted, rm.state)
+		})
+
+		t.Run(name+"/the runner returns without finishing", func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			runCtx, cancelRun := context.WithCancel(t.Context())
+			rm.cancelFunc = cancelRun
+			rm.wg.Go(func() { <-runCtx.Done() })
+
+			_, err := control.run(eng, t.Context())
+
+			if name == "cancel" {
+				// The cancel goes on to release artifacts against a target this
+				// fixture does not run, so only the state it settled matters here.
+				assert.False(t, engine.IsAlreadyCompleted(err))
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, control.wantState, rm.state)
+		})
+	}
+}
+
+// A stop that arrives while an earlier stop is still waiting for the runner
+// finds the change marked stopped, but that mark is provisional until the
+// runner returns: the runner can still finish the change on its way out. The
+// second stop waits the runner out and answers from its outcome, so a change
+// that lands is rejected as completed by both stops rather than reported
+// stopped by the second.
+func TestSecondStopDuringFirstStopWaitDoesNotReportAlreadyStopped(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	rm.cancelFunc = cancelRun
+	release := make(chan struct{})
+	rm.wg.Go(func() {
+		<-runCtx.Done()
+		<-release
+		eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
+	})
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+		first <- err
+	}()
+	require.Eventually(t, func() bool {
+		eng.mu.Lock()
+		defer eng.mu.Unlock()
+		return rm.state == engine.StateStopped
+	}, 5*time.Second, 5*time.Millisecond, "the first stop marks the change stopped before waiting for the runner")
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+		second <- err
+	}()
+	// The second stop must not answer from the provisional mark: it is still
+	// waiting when the runner has not returned.
+	select {
+	case err := <-second:
+		t.Fatalf("the second stop answered %v before the runner returned", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+
+	assert.True(t, engine.IsAlreadyCompleted(<-first), "the first stop reconciles to the completed outcome")
+	assert.True(t, engine.IsAlreadyCompleted(<-second), "the second stop reconciles to the completed outcome too")
+	assert.Equal(t, engine.StateCompleted, rm.state)
+}
+
+// A stop that finds the change stopped with no runner alive answers at once:
+// there is nothing to wait out, and the change really is paused.
+func TestStopOfAStoppedChangeWithNoRunnerAnswersAlreadyStopped(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.state = engine.StateStopped
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "Already stopped", result.Message)
+	assert.Equal(t, engine.StateStopped, rm.state)
+}
+
+// silentTarget returns the address of a TCP listener that accepts connections
+// and never sends the MySQL handshake, so any connection attempt against it
+// blocks until its context is cancelled. The returned channel closes once the
+// first connection has been accepted.
+func silentTarget(t *testing.T) (string, <-chan struct{}) {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	accepted := make(chan struct{})
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if len(conns) == 0 {
+				close(accepted)
+			}
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		utils.CloseAndLog(ln)
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			utils.CloseAndLog(conn)
+		}
+	})
+	return ln.Addr().String(), accepted
+}
+
+// deadTarget returns the address of a TCP port nothing listens on, so any
+// connection attempt against it is refused at once.
+func deadTarget(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+	return addr
+}
+
+// controlDuringConnectDeadline bounds each wait in the tests that interrupt a
+// connection attempt with a control: for the phase to reach the target, and
+// for the stop or cancel to return once it has interrupted the connection.
+const controlDuringConnectDeadline = 30 * time.Second
+
+// connectPhases runs each phase of a schema change that connects to the target
+// before it executes anything: the ALTER routing that reads the current table
+// definitions, and the connect that opens the pool a direct-routed ALTER runs
+// on. Each returns whether the caller may proceed to later phases.
+func connectPhases() map[string]func(eng *Engine, ctx context.Context, host string) bool {
+	return map[string]func(eng *Engine, ctx context.Context, host string) bool{
+		"ALTER routing": func(eng *Engine, ctx context.Context, host string) bool {
+			return eng.executeAlterPhase(ctx, host, "root", "", "testdb", []string{connectPhaseAlter}, false, directPolicy{})
+		},
+		"direct execution connect": func(eng *Engine, ctx context.Context, host string) bool {
+			target := &lazyTargetDB{dsn: targetDSN(host, "root", "", "testdb")}
+			defer target.close()
+			stmts := []directRouted{{stmt: connectPhaseAlter, table: "users", reason: "refused by the schema change engine"}}
+			return eng.executeDirectStatements(ctx, target, "testdb", stmts, directPolicy{Enabled: true})
+		},
+	}
+}
+
+const connectPhaseAlter = "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL"
+
+// An operator stops or cancels a schema change while the engine is still
+// connecting to the target, either to read the current table definitions it
+// routes each ALTER by or to open the pool a direct-routed ALTER runs on. The
+// connection attempt returns because the stop or cancel cancelled its context,
+// not because the target failed, so the change keeps the stopped or cancelled
+// state the operator asked for: progress never reports it as a retryable
+// failure.
+func TestControlDuringTargetConnectionKeepsTheControlOutcome(t *testing.T) {
+	controls := map[string]struct {
+		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+		wantState engine.State
+	}{
+		"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Stop(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Cancel(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateCancelled},
+	}
+	for phaseName, runPhase := range connectPhases() {
+		for controlName, control := range controls {
+			t.Run(controlName+" during "+phaseName, func(t *testing.T) {
+				host, accepted := silentTarget(t)
+				eng := New(Config{})
+				rm := registerRunningSchemaChange(eng)
+				runCtx, cancelRun := context.WithCancel(t.Context())
+				rm.cancelFunc = cancelRun
+				finished := make(chan bool, 1)
+				rm.wg.Go(func() {
+					finished <- runPhase(eng, runCtx, host)
+				})
+				select {
+				case <-accepted:
+				case <-time.After(controlDuringConnectDeadline):
+					t.Fatal("the phase never connected to the target")
+				}
+
+				type controlOutcome struct {
+					result *engine.ControlResult
+					err    error
+				}
+				controlled := make(chan controlOutcome, 1)
+				go func() {
+					result, err := control.run(eng, t.Context())
+					controlled <- controlOutcome{result: result, err: err}
+				}()
+				var result *engine.ControlResult
+				var err error
+				select {
+				case outcome := <-controlled:
+					result, err = outcome.result, outcome.err
+				case <-time.After(controlDuringConnectDeadline):
+					require.FailNow(t, "the "+controlName+" did not return after interrupting the "+phaseName)
+				}
+
+				if controlName == "cancel" {
+					// The cancel settles the state and then goes on to release
+					// artifacts against the registered host, which nothing
+					// listens on, so it fails at that cleanup and nowhere earlier.
+					assert.ErrorContains(t, err, "clean up cancelled schema change artifacts")
+				} else {
+					require.NoError(t, err)
+					assert.True(t, result.Accepted)
+				}
+				assert.False(t, <-finished, "a phase interrupted by a "+controlName+" must not let later phases run")
+				progress := pollProgress(t, eng)
+				assert.Equal(t, control.wantState, progress.State)
+				assert.Empty(t, progress.ErrorMessage)
+				assert.False(t, progress.Retryable)
+			})
+		}
+	}
+}
+
+// The target refuses the connection while the schema change is running
+// undisturbed. That is the target failing, not a control taking effect, so the
+// change fails with a reason and does not sit in running with nothing behind it.
+func TestRefusedTargetConnectionFailsTheChange(t *testing.T) {
+	for phaseName, runPhase := range connectPhases() {
+		t.Run(phaseName, func(t *testing.T) {
+			eng := New(Config{})
+			registerRunningSchemaChange(eng)
+			assert.False(t, runPhase(eng, t.Context(), deadTarget(t)))
+			progress := pollProgress(t, eng)
+			assert.Equal(t, engine.StateFailed, progress.State)
+			assert.NotEmpty(t, progress.ErrorMessage)
+		})
+	}
+}
+
+// A stop or cancel has taken effect, and the run then records a failure on
+// its way out: the control's outcome stands, so an accepted stop never turns
+// into a failure the drive would retry.
+func TestFailureAfterControlKeepsTheControlOutcome(t *testing.T) {
+	controls := map[string]struct {
+		run       func(t *testing.T, eng *Engine)
+		wantState engine.State
+	}{
+		"stop": {run: func(t *testing.T, eng *Engine) {
+			result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+			require.NoError(t, err)
+			assert.True(t, result.Accepted)
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(t *testing.T, eng *Engine) {
+			// The cancel settles the state and then fails releasing artifacts
+			// against the registered host, which nothing listens on.
+			_, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
+			assert.ErrorContains(t, err, "clean up cancelled schema change artifacts")
+		}, wantState: engine.StateCancelled},
+	}
+	for name, control := range controls {
+		t.Run(name, func(t *testing.T) {
+			eng := New(Config{})
+			registerRunningSchemaChange(eng)
+			control.run(t, eng)
+
+			eng.setSchemaChangeFailed(errors.New("connection reset by peer"))
+
+			progress := pollProgress(t, eng)
+			assert.Equal(t, control.wantState, progress.State)
+			assert.Empty(t, progress.ErrorMessage)
+			assert.False(t, progress.Retryable)
 		})
 	}
 }

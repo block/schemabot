@@ -45,7 +45,7 @@ import (
 // environment is the dispatch's own environment. It plays no part in what
 // blocks — a namesake's active work on the shared database name still refuses
 // the dispatch — but it decides which released holders the dispatch may later
-// mark superseded (see markSupersededHolders): only work attributable to the
+// mark superseded (see supersededTakeovers): only work attributable to the
 // same environment and target is the dispatch's to take over.
 func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder, error) {
 	memo := newConflictScanMemo()
@@ -609,8 +609,11 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
 // If the engine reports a terminal state, or reports no active work for a task that
-// storage believes is in-flight, the task is updated in storage and no longer blocks.
-// Resting tasks (Stopped, FailedRetryable) are left untouched.
+// storage believes is in-flight, the task is updated in storage and no longer blocks;
+// a terminal report that maps to a resting state (a retryable failure, or a stop) is
+// stored in that state instead, which keeps blocking like any resting task under a
+// claimable apply. Resting tasks (Stopped, FailedRetryable)
+// are left untouched.
 //
 // The engine probe answers from this process's own memory of the work: it
 // reports what this process ran, not the task's actual cross-process state. The
@@ -708,13 +711,31 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		// check retries the settlement cleanly. The write carries the
 		// operation lease absence guard, so a drive that claimed the
 		// operation after the lease was read refuses it the same way.
+		//
+		// The report is settled the way the drive would have settled it: a
+		// failure the engine marks retryable rests as failed_retryable and a
+		// stopped report rests as stopped, neither with a completion stamp, so
+		// a later drive of the apply picks the task up again. A failure keeps
+		// the engine's reason unless the task already carries one, which the
+		// drive that owned the task wrote and outranks this process's memory.
 		previous := *t
-		settledState := engineStateToStorage(result.State)
-		now := time.Now()
-		t.CompletedAt = &now
+		settledState := taskStateFromProgressResult(result)
+		rests := staleTaskSettlementRests(settledState)
+		if !rests {
+			now := time.Now()
+			t.CompletedAt = &now
+		}
+		if result.State == engine.StateFailed && t.ErrorMessage == "" {
+			t.ErrorMessage = progressFailureMessage(result)
+		}
 		if err := c.persistTaskStateTransition(settlementCtx, t, 0, settledState, ""); err != nil {
 			*t = previous
 			c.logStaleTaskSettlementRefused(t, apply, settledState, err)
+			return false
+		}
+		if rests {
+			c.logger.Info("conflict check: settled a stale task into a resting state; it keeps blocking the database while its apply is still claimable",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error_message", t.ErrorMessage)...)
 			return false
 		}
 		return true
@@ -756,6 +777,19 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	}
 
 	return false
+}
+
+// staleTaskSettlementRests reports whether a stale task settled from an engine
+// terminal report rests rather than ends. Every engine terminal report maps to
+// a terminal task state except a retryable failure (failed_retryable) and a
+// stopped report (stopped). Both rest under an apply that is still claimable,
+// so a later drive of the apply picks the task up again, and the task keeps the
+// hold every later conflict check gives it: a failed_retryable task always
+// blocks, and a stopped one blocks until its apply is terminal. Any other
+// non-terminal state rests too, so a report that maps to a state this
+// predicate does not name keeps blocking rather than admitting a new apply.
+func staleTaskSettlementRests(settledState string) bool {
+	return !state.IsTerminalTaskState(settledState)
 }
 
 // logStaleTaskSettlementRefused records why tryResolveStaleTask left a task
@@ -1001,17 +1035,25 @@ func (c *LocalClient) persistTaskStateTransition(ctx context.Context, task *stor
 	return nil
 }
 
-// markTasksRunning sets DDL tasks to running state with a start timestamp.
-func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) {
+// markTasksRunning sets DDL tasks to running state with a start timestamp. The
+// first refused write stops the loop and is returned: the task it was writing
+// is put back to the values it arrived with, so nothing downstream reads a
+// running task storage does not hold. Tasks written before it stay running in
+// storage and in memory, for the caller's settlement to move on.
+func (c *LocalClient) markTasksRunning(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	now := time.Now()
 	for _, task := range tasks {
+		previous := *task
 		task.State = state.Task.Running
 		task.StartedAt = &now
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+			*task = previous
+			return fmt.Errorf("mark task %s running for apply %s (database %s): %w",
+				task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, err)
 		}
 	}
+	return nil
 }
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic
@@ -1026,8 +1068,8 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 		c.logger.Error(errMsg, apply.LogAttrs()...)
 		if failErr := c.failApplyWithTasks(ctx, apply, tasks, errMsg); failErr != nil {
 			// The panic is what the operator acts on (AV-5); its containment
-			// marks the apply failed from the reloaded row.
-			c.logger.Error("failed to record the panicked drive's apply failed; the operator's panic containment records it instead",
+			// marks the tasks and the apply failed from the reloaded rows.
+			c.logger.Error("failed to record the panicked drive's failure; the operator's panic containment records it instead",
 				append(apply.LogAttrs(), "error", failErr)...)
 		}
 		return recovered
@@ -1069,7 +1111,7 @@ func (c *LocalClient) usesGroupedApply(apply *storage.Apply, options map[string]
 	return storage.GroupsEngineExecution(apply.DatabaseType, storage.ApplyOptionsFromMap(options).DeferCutover)
 }
 
-func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) uint64 {
+func (c *LocalClient) setApplyCancel(cancel context.CancelCauseFunc) uint64 {
 	c.cancelMu.Lock()
 	c.cancelApplyGeneration++
 	generation := c.cancelApplyGeneration
@@ -1092,9 +1134,12 @@ func (c *LocalClient) currentApplyCancel() applyCancelHandle {
 	return applyCancelHandle{generation: c.cancelApplyGeneration, cancel: c.cancelApply}
 }
 
-func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
+// cancelApplyHandle cancels the drive the handle was taken from, with cause as
+// the drive context's cause: engine.ErrCancelledByOperator when the command
+// ends the schema change for good, nil when another drive may resume it.
+func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle, cause error) {
 	if handle.cancel != nil {
-		handle.cancel()
+		handle.cancel(cause)
 	}
 	c.cancelMu.Lock()
 	if c.cancelApplyGeneration == handle.generation {

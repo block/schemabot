@@ -5,6 +5,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
@@ -53,6 +54,19 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 	if last > 0 {
 		opts.Since = time.Now().Add(-last)
 	}
+	startingAfter := r.URL.Query().Get("starting_after")
+	if startingAfter != "" {
+		position, status, err := s.plansListAnchor(r.Context(), startingAfter, opts)
+		if err != nil {
+			code := apitypes.ErrCodeInvalidRequest
+			if status == http.StatusInternalServerError {
+				code = apitypes.ErrCodeStorageError
+			}
+			s.writeErrorCode(w, status, code, err.Error())
+			return
+		}
+		opts.StartAfter = position
+	}
 
 	plans, err := s.storage.Plans().List(r.Context(), opts)
 	if err != nil {
@@ -61,6 +75,7 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 			"environment", opts.Environment,
 			"repository", opts.Repository,
 			"pull_request", opts.PullRequest,
+			"starting_after", startingAfter,
 			"error", err)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to list plans")
 		return
@@ -71,10 +86,11 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := &apitypes.PlansResponse{
-		Limit:    limit,
-		MaxLimit: maxPlansLimit,
-		HasMore:  hasMore,
-		Plans:    make([]*apitypes.PlanSummaryResponse, 0, len(plans)),
+		Limit:         limit,
+		MaxLimit:      maxPlansLimit,
+		HasMore:       hasMore,
+		StartingAfter: startingAfter,
+		Plans:         make([]*apitypes.PlanSummaryResponse, 0, len(plans)),
 	}
 	if last > 0 {
 		resp.Last = last.String()
@@ -83,6 +99,46 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 		resp.Plans = append(resp.Plans, planSummaryFromStorage(plan))
 	}
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// plansListAnchor resolves the starting_after plan of a plans page to its
+// place in the newest-first listing. The plan must exist and match the
+// request's database, environment, repository, and pull request, which never
+// change for a plan, so a page continues the listing the anchor came from
+// rather than one with different filters. It returns the HTTP status to
+// answer with alongside any error.
+func (s *Service) plansListAnchor(ctx context.Context, planIdentifier string, opts storage.ListPlansOptions) (*storage.PlanListPosition, int, error) {
+	anchor, err := s.storage.Plans().GetListAnchor(ctx, planIdentifier)
+	if err != nil {
+		s.logger.Error("look up plans page anchor failed",
+			"plan_id", planIdentifier,
+			"database", opts.Database,
+			"environment", opts.Environment,
+			"repository", opts.Repository,
+			"pull_request", opts.PullRequest,
+			"error", err)
+		return nil, http.StatusInternalServerError, fmt.Errorf("failed to look up starting_after plan %s", planIdentifier)
+	}
+	if anchor == nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("starting_after plan %s does not exist; pass the last plan ID from the previous page", planIdentifier)
+	}
+	if opts.Database != "" && storage.CanonicalKey(anchor.Database) != opts.Database {
+		return nil, http.StatusBadRequest, fmt.Errorf("starting_after plan %s is for database %s, not %s; repeat the previous page's filters",
+			planIdentifier, anchor.Database, opts.Database)
+	}
+	if opts.Environment != "" && storage.CanonicalKey(anchor.Environment) != opts.Environment {
+		return nil, http.StatusBadRequest, fmt.Errorf("starting_after plan %s is in environment %s, not %s; repeat the previous page's filters",
+			planIdentifier, anchor.Environment, opts.Environment)
+	}
+	if opts.Repository != "" && storage.CanonicalKey(anchor.Repository) != opts.Repository {
+		return nil, http.StatusBadRequest, fmt.Errorf("starting_after plan %s is from repository %s, not %s; repeat the previous page's filters",
+			planIdentifier, anchor.Repository, opts.Repository)
+	}
+	if opts.PullRequest > 0 && anchor.PullRequest != opts.PullRequest {
+		return nil, http.StatusBadRequest, fmt.Errorf("starting_after plan %s is from pull request %d, not %d; repeat the previous page's filters",
+			planIdentifier, anchor.PullRequest, opts.PullRequest)
+	}
+	return &anchor.Position, http.StatusOK, nil
 }
 
 // handlePlanGet handles GET /api/plans/{plan_identifier} requests: one stored
