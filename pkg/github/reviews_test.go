@@ -2,15 +2,48 @@ package github
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hmarr/codeowners"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// A CODEOWNERS rule the parser accepts but cannot match, such as a bare
+// `/ @owner`, yields an error rather than a panic, so the review gate can fail
+// closed with a reason. The error text names the path and the fix but not the
+// panic, which travels separately with its stack for server-side logging.
+// Rules the parser handles still match normally.
+func TestMatchCodeownersPathReturnsAnErrorForAnUnmatchableRule(t *testing.T) {
+	broken, err := codeowners.ParseFile(strings.NewReader("/ @platform-admins\n"))
+	require.NoError(t, err)
+	owners, err := MatchCodeownersPath(broken, "schema/orders/.schema")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema/orders/.schema")
+	assert.Contains(t, err.Error(), "fix the rule on the base branch")
+	assert.NotContains(t, err.Error(), "index out of range")
+	assert.Nil(t, owners)
+
+	var unmatchable *UnmatchableCodeownersRuleError
+	require.ErrorAs(t, err, &unmatchable)
+	assert.Equal(t, "schema/orders/.schema", unmatchable.Path)
+	require.NotNil(t, unmatchable.Panic)
+	assert.Contains(t, fmt.Sprint(unmatchable.Panic.Value), "index out of range")
+	assert.NotEmpty(t, unmatchable.Panic.Stack)
+
+	working, err := codeowners.ParseFile(strings.NewReader("/schema/orders/ @orders-team\n"))
+	require.NoError(t, err)
+	owners, err = MatchCodeownersPath(working, "schema/orders/.schema")
+	require.NoError(t, err)
+	require.Len(t, owners, 1)
+	assert.Equal(t, "orders-team", owners[0].Value)
+}
 
 func TestGetApprovedReviewers(t *testing.T) {
 	sameSecond := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)

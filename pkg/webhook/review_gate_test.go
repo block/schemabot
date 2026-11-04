@@ -2228,6 +2228,65 @@ func TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors(t *testi
 	assert.Equal(t, "schema/payments", noOwnersLog["schema_path"])
 }
 
+// TestCheckReviewGate_UnmatchableCodeownersRuleFailsClosed pins that a
+// CODEOWNERS rule the parser accepts but cannot match, such as a bare
+// `/ @owner`, makes the gate fail closed with an evaluation error rather than
+// approve, block, or crash the handler. The error names the base branch and
+// says how to fix it without carrying the panic text; the panic value and
+// stack land in a server log carrying the PR, head commit, base branch and
+// schema directory, so the rule can be found from logs alone.
+func TestCheckReviewGate_UnmatchableCodeownersRuleFailsClosed(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.IncludeCodeowners = true
+		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
+		cfg.ReviewPolicy.AdminUsers = []string{"zoe"}
+	}))
+	var logs syncBuffer
+	h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+	registerPREndpoint(mux, "alice")
+	registerCodeownersEndpoint(mux, "/ @platform-admins\n", true)
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{
+			User:        &gh.User{Login: new("zoe")},
+			State:       new(ghclient.ReviewApproved),
+			CommitID:    new(reviewGateTestHeadSHA),
+			SubmittedAt: &gh.Timestamp{Time: time.Now()},
+		},
+	})
+
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	var result *ReviewGateResult
+	require.NotPanics(t, func() {
+		result, err = h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/payments", reviewGateTestHeadSHA))
+	})
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), `the CODEOWNERS file on base branch "main" holds a rule that cannot be matched`)
+	assert.Contains(t, err.Error(), "fix the rule on the base branch")
+	assert.NotContains(t, err.Error(), "index out of range")
+	assert.NotContains(t, err.Error(), "panic")
+
+	var panicLog map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		if entry["msg"] == "review gate: CODEOWNERS holds a rule the parser cannot match; the gate fails closed until the rule is fixed" {
+			panicLog = entry
+		}
+	}
+	require.NotNil(t, panicLog, "no log line carries the recovered panic")
+	assert.Equal(t, "octocat/hello-world", panicLog["repo"])
+	assert.InDelta(t, 1, panicLog["pr"], 0)
+	assert.Equal(t, reviewGateTestHeadSHA, panicLog["head_sha"])
+	assert.Equal(t, "main", panicLog["base_ref"])
+	assert.Equal(t, "schema/payments", panicLog["schema_path"])
+	assert.Contains(t, fmt.Sprint(panicLog["panic"]), "index out of range")
+	assert.Contains(t, fmt.Sprint(panicLog["stack"]), "codeowners")
+}
+
 func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
