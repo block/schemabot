@@ -762,7 +762,7 @@ func shardedTableStatusPhrase(status string) string {
 	case state.Task.Reverted:
 		return "↩️ Reverted"
 	case state.Task.WaitingForDeploy:
-		return "🟡 Waiting for deploy"
+		return ui.WaitingForDeploy
 	default:
 		return "🔄 In progress"
 	}

@@ -1159,7 +1159,7 @@ specific state. The bar is 20 squares wide; filled squares represent percent com
 
 **Waiting for cutover** — yellow bar at 100%:
 ```
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
 ```
 
