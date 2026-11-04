@@ -21,12 +21,16 @@ func ShardCounts(applyState string, ops []ProgressOperation, tables []TableProgr
 	return presentation.ShardCounts(labels)
 }
 
-// ShardsStoppedAtCutoverNote explains the shards of a sharded apply that
-// SchemaBot stopped at the cutover because another shard failed, and that
-// applying again resumes their saved copies, or "" when no shard was stopped
-// at the cutover.
-func ShardsStoppedAtCutoverNote(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) string {
-	statuses, _ := shardStatuses(applyState, ops, tables, released)
+// ShardedStoppedAtCutoverNote explains the work of a sharded apply that
+// SchemaBot stopped at the cutover because other work failed, and that applying
+// again resumes the saved copies, or "" when nothing was stopped at the
+// cutover. It counts shards, or tables when every keyspace runs on its only
+// shard, the way the PR comment counts them.
+func ShardedStoppedAtCutoverNote(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) string {
+	statuses, sharded := shardStatuses(applyState, ops, tables, released)
+	if !sharded {
+		return tablesStoppedAtCutover(ops).Note(presentation.TableNoun, func(name string) string { return name })
+	}
 	var stopped presentation.StoppedAtCutover
 	for _, s := range statuses {
 		if s.Presentation == presentation.StateStoppedAtCutover {
@@ -34,6 +38,25 @@ func ShardsStoppedAtCutoverNote(applyState string, ops []ProgressOperation, tabl
 		}
 	}
 	return stopped.Note(presentation.ShardNoun, func(name string) string { return name })
+}
+
+// tablesStoppedAtCutover counts the table operations, where every keyspace
+// runs on its only shard, that SchemaBot stopped at the cutover because
+// another failed, naming that other operation's table when it is listed.
+func tablesStoppedAtCutover(ops []ProgressOperation) presentation.StoppedAtCutover {
+	tableByRef := make(map[presentation.OperationRef]string, len(ops))
+	for _, op := range ops {
+		if _, _, table, ok := state.ShardWorkKey(op.OperationKey); ok {
+			tableByRef[presentation.OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = table
+		}
+	}
+	var stopped presentation.StoppedAtCutover
+	for _, op := range ops {
+		if op.EndedBy != nil && state.IsState(op.State, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable) {
+			stopped.Add(tableByRef[*op.EndedBy])
+		}
+	}
+	return stopped
 }
 
 // shardStatuses derives one status per keyspace shard of the apply's shard

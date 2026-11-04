@@ -276,7 +276,37 @@ func TestParseProgressResponseCountsShardsStoppedAtCutover(t *testing.T) {
 			assert.Equal(t, tc.wantRef, *data.Operations[2].EndedBy)
 			assert.Equal(t, tc.wantCounts, ShardCounts(data.State, data.Operations, data.Tables, data.Released))
 			assert.Equal(t, tc.wantNoteCause+" Their copies are saved, so applying again resumes them.",
-				ShardsStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released))
+				ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released))
 		})
 	}
+}
+
+// A deferred apply changes orders and users on a keyspace that runs on its
+// only shard, and orders failed, so SchemaBot stopped users at the cutover and
+// failed it for orders (ended_by). With no shard to count, the CLI counts the
+// table instead, and notes that its copy is saved.
+func TestParseProgressResponseCountsTablesStoppedAtCutoverOnTheOnlyShard(t *testing.T) {
+	const response = `{
+		"state": "failed",
+		"sharded": true,
+		"options": {"defer_cutover": "true"},
+		"operations": [
+			{"deployment": "default", "operation_key": "commerce/-/orders", "state": "failed", "cutover_policy": "parallel", "error_message": "lock wait timeout exceeded"},
+			{"deployment": "default", "operation_key": "commerce/-/users", "state": "failed", "cutover_policy": "parallel", "ended_by": {"deployment": "default", "operation_key": "commerce/-/orders"}}
+		],
+		"tables": [
+			{"table_name": "orders", "keyspace": "commerce", "status": "failed", "rows_copied": 400, "rows_total": 1000},
+			{"table_name": "users", "keyspace": "commerce", "status": "stopped", "rows_copied": 1000, "rows_total": 1000}
+		]
+	}`
+	var result apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal([]byte(response), &result))
+
+	data := ParseProgressResponse(&result)
+
+	require.True(t, data.Sharded)
+	require.Len(t, data.Operations, 2)
+	assert.Empty(t, ShardCounts(data.State, data.Operations, data.Tables, data.Released), "the only shard needs no count")
+	assert.Equal(t, "1 table stopped at the cutover because orders failed. Its copy is saved, so applying again resumes it.",
+		ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released))
 }

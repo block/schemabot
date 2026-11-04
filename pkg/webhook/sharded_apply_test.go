@@ -700,7 +700,7 @@ func TestBuildSingleShardApplyCommentData_StoppedAtCutoverNamesTheFailedTable(t 
 		{ID: 1, ApplyID: 1, ApplyOperationID: &mutesID, Shard: "-", Namespace: "ks", TableName: "mutes", State: state.Task.Stopped, RowsCopied: 1000, RowsTotal: 1000, ProgressPercent: 100},
 		{ID: 2, ApplyID: 1, ApplyOperationID: &usersID, Shard: "-", Namespace: "ks", TableName: "users", State: state.Task.Failed, RowsCopied: 400, RowsTotal: 1000, ProgressPercent: 40},
 	}
-	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Failed}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "commerce", Environment: "staging", State: state.Apply.Failed}
 
 	data := buildSingleShardApplyCommentData(apply, ops, tasks, nil, &shardedPlanView{}, "")
 
