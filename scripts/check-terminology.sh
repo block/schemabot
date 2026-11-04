@@ -47,14 +47,29 @@ fi
 
 # "cutover" is one word in the docs, the generated TEMPLATES.md included, so
 # the PR comment and CLI text it previews are held to the rule too. The verb
-# forms are what get split, so those are what is matched. "cutting over" is
-# exempt: it is the name of the cutting_over state that the PR comment and
-# CLI show. URLs are stripped first, so a link that happens to contain the
-# words is not a hit, and AGENTS.md is skipped because it quotes the forms.
-cutover_hits=$(tolerate_no_match git grep -n -I -i -E 'cut[ -]over|cuts over' -- '*.md' \
-        ':!AGENTS.md' \
-    | perl -pe 's{https?://\S+}{}g' \
-    | tolerate_no_match grep -i -E '(^|[^A-Za-z_])(cut[ -]over|cuts over)([^A-Za-z]|$)')
+# forms are what get split, so those are what is matched, joined by a hyphen
+# or by any run of spaces that stays inside one Markdown block: a line break
+# within a paragraph renders as a space, so "cut" ending one line and "over"
+# starting the next is a hit, while a blank line between them separates two
+# blocks and is not. "cutting over" is exempt: it is the name of the
+# cutting_over state that the PR comment and CLI show. URLs are blanked
+# first, keeping offsets so each hit reports its own line, and AGENTS.md is
+# skipped because it quotes the forms.
+find_split_cutover() {
+    git ls-files -z -- '*.md' ':!AGENTS.md' | xargs -0 perl -0777 -ne '
+        my $text = $_;
+        $text =~ s{https?://\S+}{" " x length($&)}ge;
+        while ($text =~ /(?<![A-Za-z_])cuts?(?:-|[ \t]+\n?[ \t]*|\n[ \t]*)over(?![A-Za-z])/gi) {
+            my $start = $-[0];
+            my $line = 1 + (substr($text, 0, $start) =~ tr/\n//);
+            my $from = rindex($text, "\n", $start) + 1;
+            my $to = index($text, "\n", $start);
+            $to = length($text) if $to < 0;
+            print "$ARGV:$line:", substr($_, $from, $to - $from), "\n";
+        }
+    '
+}
+cutover_hits=$(find_split_cutover)
 
 if [ -n "$cutover_hits" ]; then
     echo "$cutover_hits"
