@@ -321,6 +321,11 @@ jobs:
       # Only the tree the discovery below reads. A full checkout of this
       # repository takes most of the job's one-minute budget on a slow runner
       # and cancels the job; a sparse, blobless one takes seconds.
+      # The sparse path must cover every path the discovery step greps: a
+      # path outside it is absent from the checkout, so grep exits 2 and the
+      # job fails as an unusable tree rather than discovering nothing. The
+      # filter is spelled out, rather than left to the action's default for
+      # a sparse checkout, so the clone stays blobless across action bumps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
         with:
           sparse-checkout: pkg/localscale
@@ -635,7 +640,8 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
-      # Sparse and blobless for the reason given on the LocalScale Matrix job.
+      # Sparse and blobless for the reasons given on the LocalScale Matrix job;
+      # the sparse path must cover what the discovery step below greps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
         with:
           sparse-checkout: e2e/local
@@ -939,7 +945,8 @@ jobs:
     outputs:
       shards: ${{ steps.gen.outputs.shards }}
     steps:
-      # Sparse and blobless for the reason given on the LocalScale Matrix job.
+      # Sparse and blobless for the reasons given on the LocalScale Matrix job;
+      # the sparse path must cover what the discovery step below greps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
         with:
           sparse-checkout: e2e/k8s
