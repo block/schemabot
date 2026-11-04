@@ -110,22 +110,36 @@ func requestControlBy(t *testing.T, store storage.Storage, applyID int64, operat
 	require.NoError(t, err)
 }
 
-// spendRetryBudget claims and releases a failed_retryable apply until its
-// attempt counter reaches the recovery budget. The parity suite spends it
+// spendRetryBudget spends the retry budget of each given apply's one
+// failed_retryable operation. Each round redispatches every one of those
+// operations, which spends one attempt of its budget and raises its apply's
+// attempt to it, then fails each retryably again and hands its lease back, as
+// a drive whose retry failed does. The applies share each round because a
+// deferred apply's waiting operation holds back the redispatch of a later
+// deferred apply's until it is claimed. The parity suite spends the budget
 // through the storage interface because it cannot backdate the counter with
 // dialect-specific SQL.
-func spendRetryBudget(t *testing.T, store storage.Storage, applyID int64) {
+func spendRetryBudget(t *testing.T, store storage.Storage, applyIDs ...int64) {
 	t.Helper()
 	ctx := t.Context()
 	for range storage.MaxRecoveryAttempts {
-		claimed, err := store.Applies().ClaimApplyByID(ctx, applyID, "test-driver")
-		require.NoError(t, err)
-		require.NotNil(t, claimed)
-		claimed.State = state.Apply.FailedRetryable
-		require.NoError(t, store.Applies().Update(storage.WithApplyLease(ctx, claimed.Lease()), claimed))
-		released, err := store.Applies().ReleaseClaim(ctx, claimed.Lease())
-		require.NoError(t, err)
-		require.True(t, released)
+		claims := make([]*storage.ApplyOperation, 0, len(applyIDs))
+		claimedApplies := make([]int64, 0, len(applyIDs))
+		for range applyIDs {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "retry-driver")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "the waiting operation is redispatched")
+			claims = append(claims, claimed)
+			claimedApplies = append(claimedApplies, claimed.ApplyID)
+		}
+		require.ElementsMatch(t, applyIDs, claimedApplies, "each apply's waiting operation is redispatched once a round")
+		for _, claimed := range claims {
+			require.NoError(t, store.ApplyOperations().MarkFailedRetryable(
+				storage.WithOperationLease(ctx, claimed.Lease()), claimed.ID, "data plane unavailable"))
+			released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+			require.NoError(t, err)
+			require.True(t, released)
+		}
 	}
 }
 
@@ -593,10 +607,9 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 			{shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
 		}
 		held, _ := createEndedOperationApply(t, store, "apply_ended_expiry_held", 962, state.Apply.FailedRetryable, true, ops...)
-		spendRetryBudget(t, store, held.ID)
-		requestControlBy(t, store, held.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
 		plain, _ := createEndedOperationApply(t, store, "apply_ended_expiry_plain", 963, state.Apply.FailedRetryable, true, ops...)
-		spendRetryBudget(t, store, plain.ID)
+		spendRetryBudget(t, store, held.ID, plain.ID)
+		requestControlBy(t, store, held.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
 
 		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)

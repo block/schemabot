@@ -3326,6 +3326,8 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 		OnFailure: storage.OnFailureContinue,
 	})
 	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, failedOpID)
+	require.NoError(t, err)
 	parkedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
 		OnFailure: storage.OnFailureContinue,
@@ -3403,10 +3405,12 @@ func TestApplyStore_ExpireRetryable_TakesTheOldestUpToTheLimit(t *testing.T) {
 //
 // Declining costs the apply a pass, not the expiry: expiry is a sweep, so once
 // the lease goes stale the next pass takes the apply and its rows together.
-// The single-operation parent claim and expiry have complementary recovery
-// budget predicates. This pins that contract, but does not establish exclusion
-// for operation-only drivers; expiry_claims_test.go covers their row locks and
-// the lease recheck required before expiry can write.
+// For an apply with no failed_retryable operation, the single-operation parent
+// claim and expiry have complementary recovery budget predicates. This pins
+// that contract, but does not establish exclusion for operation-only drivers,
+// or for an operation whose own spent budget lets expiry take the apply;
+// expiry_claims_test.go covers their row locks and the lease recheck required
+// before expiry can write.
 func TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3542,8 +3546,8 @@ func TestApplyStore_ExpireRetryable_DefersUntilARetryableOperationsLeaseIsStale(
 
 	// The lease and heartbeat the drive's own settling write left behind.
 	settled := leasedOperationFor(t, store, apply, "region-a")
-	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ?, updated_at = NOW() WHERE id = ?`,
-		state.ApplyOperation.FailedRetryable, settled)
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ?, attempt = ?, updated_at = NOW() WHERE id = ?`,
+		state.ApplyOperation.FailedRetryable, maxRecoveryAttempts, settled)
 	require.NoError(t, err)
 
 	failedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_failed", "users", state.Task.FailedRetryable, "copy failed")

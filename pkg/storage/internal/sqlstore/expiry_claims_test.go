@@ -72,10 +72,14 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		// The drives that settled the tree handed their leases back, as a
 		// finished drive does. A leftover fresh lease would hold its slot under
 		// the driver cap until it went stale, and the redispatch would wait.
+		// Each operation has also spent all but its last attempt, so the
+		// redispatch raises the parent to the operation's final attempt.
 		_, err := store.db.ExecContext(ctx, `
-			UPDATE apply_operations SET lease_owner = '', lease_token = '', lease_acquired_at = NULL
+			UPDATE apply_operations
+			SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+			    attempt = ?
 			WHERE apply_id = ?
-		`, apply.ID)
+		`, maxRecoveryAttempts-1, apply.ID)
 		require.NoError(t, err)
 
 		// The redispatch claim rotates a lease onto one operation and spends the
@@ -287,9 +291,10 @@ func leaseTokenFor(index int) string { return "token-" + seededDeployments[index
 var seededDeployments = []string{"region-a", "region-b"}
 
 // seedExhaustedRetryableTree builds the row shape a fan-out apply comes to rest
-// in after a retryable failure: a failed_retryable parent at the given attempt
-// count, two failed_retryable operations each carrying the lease its drive left
-// behind, and the failed and still-queued task under the first of them.
+// in after a retryable failure: a failed_retryable parent and two
+// failed_retryable operations at the given attempt count, each operation
+// carrying the lease its drive left behind, and the failed and still-queued
+// task under the first of them.
 func seedExhaustedRetryableTree(t *testing.T, ctx context.Context, store *Storage, name string, attempt int) (*storage.Apply, []int64, []*storage.Task) {
 	t.Helper()
 	lock := createTestLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
@@ -309,10 +314,10 @@ func seedExhaustedRetryableTree(t *testing.T, ctx context.Context, store *Storag
 		// client's clock into the comparison.
 		_, err = store.db.ExecContext(ctx, `
 			UPDATE apply_operations
-			SET state = ?, on_failure = ?, lease_owner = ?, lease_token = ?,
+			SET state = ?, on_failure = ?, attempt = ?, lease_owner = ?, lease_token = ?,
 			    lease_acquired_at = NOW(), updated_at = NOW()
 			WHERE id = ?
-		`, state.ApplyOperation.FailedRetryable, storage.OnFailureContinue,
+		`, state.ApplyOperation.FailedRetryable, storage.OnFailureContinue, attempt,
 			"driver-"+deployment, "token-"+deployment, id)
 		require.NoError(t, err)
 		opIDs = append(opIDs, id)

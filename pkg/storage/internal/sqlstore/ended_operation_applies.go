@@ -69,18 +69,21 @@ var settleableOperationStates = append(append([]string{}, quietOperationStates..
 // endedOperationSQL matches an operation, aliased op, of the apply in the
 // enclosing query that ended before its cutover. An operation has ended when
 // it failed under the halt policy, or when it is waiting on a retry that will
-// never come because the apply spent its retry budget or freshness window. The
-// second arm is the expiry selection of expireRetryable, read for one
-// operation. A failure under continue or pause has not ended the apply: the
-// policy says the other operations go on without it.
+// never come because an operation of the apply spent its retry budget or the
+// apply's freshness window passed. The second arm is the expiry selection of
+// expireRetryable, read for one operation. A failure under continue or pause
+// has not ended the apply: the policy says the other operations go on without
+// it.
 func (s *applyStore) endedOperationSQL(op string) (string, []any) {
 	stale := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
 	clause := fmt.Sprintf(`((%[1]s.state = ? AND %[1]s.on_failure = ?)
-			OR (%[1]s.state = ? AND applies.state = ? AND (applies.attempt >= ? OR applies.updated_at < %[2]s)))`, op, stale)
+			OR (%[1]s.state = ? AND applies.state = ? AND (%[2]s OR applies.updated_at < %[3]s)))`, op, retryBudgetSpentSQL, stale)
 	args := []any{
 		state.ApplyOperation.Failed, storage.OnFailureHalt,
-		state.ApplyOperation.FailedRetryable, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays,
+		state.ApplyOperation.FailedRetryable, state.Apply.FailedRetryable,
 	}
+	args = append(args, retryBudgetSpentArgs()...)
+	args = append(args, retryableRecoveryFreshnessDays)
 	return clause, args
 }
 

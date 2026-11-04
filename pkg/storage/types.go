@@ -20,6 +20,12 @@ import (
 // is terminalized as failed. The original apply attempt is separate. Surfaced
 // in operator-facing progress (the PR comment's retry counter) and enforced by
 // the storage claim/expiry paths.
+//
+// The budget is per operation. Each operation of an apply counts its own
+// redispatches, and the apply's attempt records the highest of them, so the
+// apply is terminalized once any one operation has spent its budget. One
+// interruption that reaches every operation at once costs each of them one
+// attempt, rather than costing the apply one attempt per operation.
 const MaxRecoveryAttempts = 10
 
 // ApplyTargetLockWait is how long a claim blocks waiting for another instance
@@ -1503,12 +1509,15 @@ type ApplyOperation struct {
 	// the operation is failed_retryable and so is its parent apply. It does not
 	// advance on a crash-recovery re-lease (a still-active parent with a stale
 	// heartbeat, or an in-flight drive whose driver died), so the
-	// count records only retries. It is the operation-local counterpart to
-	// applies.attempt: a sibling operation's retry advances the shared parent
-	// attempt but never this row's. It is a record for triage, not a dispatch
-	// generation: the operation-scoped idempotency key ignores it, so every
-	// dispatch of a deployment, retries included, carries the same key and
-	// lands on the deployment's one remote apply (OW-5).
+	// count records only retries. It is the operation's retry budget: a
+	// deliberate redispatch is admitted only while it is below
+	// MaxRecoveryAttempts. It is never reset, so the budget counts every
+	// redispatch in the operation's life. applies.attempt records the highest
+	// of any of its operations; a sibling's retry raises that but never this
+	// row's. It is not a dispatch generation: the operation-scoped
+	// idempotency key ignores it, so every dispatch of a deployment, retries
+	// included, carries the same key and lands on the deployment's one remote
+	// apply (OW-5).
 	Attempt int
 
 	// AlreadyConverged is true for an operation recorded completed when its

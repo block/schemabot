@@ -3196,15 +3196,16 @@ func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopType
 		held, heldArgs := s.heldByEndedOperationSQL(endedOperationStopTypes)
 		endedOperationStop, endedOperationStopArgs = "AND NOT ("+held+")", heldArgs
 	}
-	args := []any{state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays,
-		storage.ControlOperationStop, storage.ControlRequestPending, storage.EndedOperationStopCaller}
+	args := append([]any{state.Apply.FailedRetryable}, retryBudgetSpentArgs()...)
+	args = append(args, retryableRecoveryFreshnessDays,
+		storage.ControlOperationStop, storage.ControlRequestPending, storage.EndedOperationStopCaller)
 	args = append(args, endedOperationStopArgs...)
 	args = append(args, limit)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
 		WHERE state = ? AND (
-			attempt >= ?
+			`+retryBudgetSpentSQL+`
 			OR updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)+`
 		)
 			AND NOT EXISTS (
@@ -3259,30 +3260,41 @@ func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopType
 		return nil, nil
 	}
 
+	budgetSpent, err := retryBudgetSpentApplies(ctx, tx, applies)
+	if err != nil {
+		return nil, err
+	}
 	applyIDs := make([]any, 0, len(applies))
 	expirations := make([]*storage.RetryableApplyExpiration, 0, len(applies))
 	for _, apply := range applies {
 		applyIDs = append(applyIDs, apply.ID)
 		expirations = append(expirations, &storage.RetryableApplyExpiration{
 			Apply:  apply,
-			Reason: retryableExpirationReason(apply),
+			Reason: retryableExpirationReason(budgetSpent[apply.ID]),
 		})
 	}
 
 	// The writes below carry no gate of their own, and each way a drive can be
 	// claimed is excluded by a different thing.
 	//
-	// A parent-lease drive cannot start here, because starting one means passing
-	// ClaimApplyByID, whose predicate is the complement of this selection term
-	// for term: expiry takes attempt >= maxRecoveryAttempts OR a lapsed freshness
-	// window, and the claim's retryable clause requires attempt <
-	// maxRecoveryAttempts AND a live one. failed_retryable is also absent from
-	// claimableApplyStates(), so the claim's stale-lease clause cannot reach one
-	// either. That disjointness is pinned as a pair rather than per side — see
-	// TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply. The
-	// parent FOR UPDATE is its backstop: ClaimApplyByID reads the same row FOR
-	// UPDATE SKIP LOCKED, so a driver that had already taken an operation row
-	// releases that lease instead of driving it (reconcileUnclaimableParent).
+	// A parent-lease drive cannot start here. Starting one means first claiming
+	// its operation and then passing ClaimApplyByID. For an apply with no
+	// failed_retryable operation, the claim's predicate is the complement of
+	// this selection term for term: expiry takes attempt >= maxRecoveryAttempts
+	// OR a lapsed freshness window, and the claim's retryable clause requires
+	// attempt < maxRecoveryAttempts AND a live one. failed_retryable is also
+	// absent from claimableApplyStates(), so the claim's stale-lease clause
+	// cannot reach one either. That disjointness is pinned as a pair rather than
+	// per side — see
+	// TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply.
+	// Once a failed_retryable operation has spent its own budget, expiry takes
+	// the apply whatever the parent's attempt reads, and the claim may still
+	// admit it: the operation's final redispatch spends its last attempt before
+	// the parent claim runs. The operation lease that redispatch holds is what
+	// excludes expiry then, through the lease gate rechecked above. The parent
+	// FOR UPDATE is the backstop: ClaimApplyByID reads the same row FOR UPDATE
+	// SKIP LOCKED, so a driver that had already taken an operation row releases
+	// that lease instead of driving it (reconcileUnclaimableParent).
 	//
 	// An operation-lease drive is excluded by the locks taken just above instead,
 	// because the parent FOR UPDATE says nothing about it: a multi-operation
@@ -3479,11 +3491,76 @@ func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, appl
 	return undriven, nil
 }
 
-func retryableExpirationReason(apply *storage.Apply) storage.RetryableExpirationReason {
-	if apply.Attempt >= maxRecoveryAttempts {
+func retryableExpirationReason(budgetSpent bool) storage.RetryableExpirationReason {
+	if budgetSpent {
 		return storage.RetryableExpirationAttemptBudget
 	}
 	return storage.RetryableExpirationRecoveryWindow
+}
+
+// retryBudgetSpentSQL, correlated to an applies row, holds when the apply's
+// retry budget is spent. The budget is each operation's own, so it is spent
+// when a failed_retryable operation has used all of its retries, which no
+// redispatch can then run again, whatever the apply's attempt reads: the
+// operation's attempt advances when it is claimed, before the parent claim
+// that raises the apply's, so a parent claim that then fails leaves the apply
+// behind. With no failed_retryable operation, the apply's own attempt decides.
+// A sibling that spent its retries and then succeeded raises the apply's
+// attempt, which records the highest of any operation, but spends nothing for
+// a failed_retryable operation that has retries left. Bind it with
+// retryBudgetSpentArgs.
+const retryBudgetSpentSQL = `(
+	EXISTS (
+		SELECT 1 FROM apply_operations o
+		WHERE o.apply_id = applies.id AND o.state = ? AND o.attempt >= ?
+	)
+	OR (
+		applies.attempt >= ?
+		AND NOT EXISTS (
+			SELECT 1 FROM apply_operations o
+			WHERE o.apply_id = applies.id AND o.state = ? AND o.attempt < ?
+		)
+	)
+)`
+
+// retryBudgetSpentArgs returns the arguments retryBudgetSpentSQL binds, in
+// placeholder order.
+func retryBudgetSpentArgs() []any {
+	return []any{
+		state.ApplyOperation.FailedRetryable, maxRecoveryAttempts,
+		maxRecoveryAttempts,
+		state.ApplyOperation.FailedRetryable, maxRecoveryAttempts,
+	}
+}
+
+// retryBudgetSpentApplies reports which of applies have spent their retry
+// budget (retryBudgetSpentSQL), so an expiry can say whether the budget or
+// the recovery window ended the apply.
+func retryBudgetSpentApplies(ctx context.Context, tx *rebindTx, applies []*storage.Apply) (map[int64]bool, error) {
+	args := retryBudgetSpentArgs()
+	for _, apply := range applies {
+		args = append(args, apply.ID)
+	}
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT id FROM applies
+		WHERE `+retryBudgetSpentSQL+` AND id IN (%s)
+	`, placeholders(len(applies))), args...)
+	if err != nil {
+		return nil, fmt.Errorf("read which expiring applies spent their retry budget: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+	spent := make(map[int64]bool, len(applies))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan expiring apply that spent its retry budget: %w", err)
+		}
+		spent[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read which expiring applies spent their retry budget: %w", err)
+	}
+	return spent, nil
 }
 
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.

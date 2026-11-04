@@ -40,15 +40,18 @@ func TestPostgresEndedOperationStopAndRetryExpiry(t *testing.T) {
 // shard's copy saved and -40 named as its cause.
 //
 // The retry can never come for either of two reasons, and both survive the
-// stop's delivery: a spent budget, and a failure older than the recovery
-// window, which the stop never refreshes.
+// stop's delivery: -40 spent its own retry budget, or the failure is older
+// than the recovery window, which the stop never refreshes.
 func testEndedOperationStopAndRetryExpiry(t *testing.T, newStore func(*testing.T) *Storage) {
 	causes := []struct {
 		name  string
 		spend func(t *testing.T, store *Storage, applyID int64)
 	}{
 		{"spent budget", func(t *testing.T, store *Storage, applyID int64) {
-			_, err := store.db.ExecContext(t.Context(), "UPDATE applies SET attempt = ? WHERE id = ?", maxRecoveryAttempts, applyID)
+			_, err := store.db.ExecContext(t.Context(), "UPDATE apply_operations SET attempt = ? WHERE apply_id = ? AND state = ?",
+				maxRecoveryAttempts, applyID, state.ApplyOperation.FailedRetryable)
+			require.NoError(t, err)
+			_, err = store.db.ExecContext(t.Context(), "UPDATE applies SET attempt = ? WHERE id = ?", maxRecoveryAttempts, applyID)
 			require.NoError(t, err)
 		}},
 		{"recovery window passed", func(t *testing.T, store *Storage, applyID int64) {

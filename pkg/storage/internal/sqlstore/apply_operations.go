@@ -2088,7 +2088,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND (
 							(
 								a.state = ?
-								AND a.attempt < ?
+								-- The budget is the operation's own: a sibling
+								-- that spent its retries leaves this one's intact.
+								AND apply_operations.attempt < ?
 								AND a.updated_at >= %s
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
@@ -2207,22 +2209,27 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			return nil, fmt.Errorf("refresh heartbeat for claimed apply_operation %d: %w", ad.ID, err)
 		}
 
-		// Re-claiming a failed_retryable operation is a redispatch, so consume one
-		// unit of the parent apply's retry budget. Only operations the operator
-		// drives under the operation lease are charged here (see
-		// redispatchDrivesUnderOperationLease): a parent-lease drive increments the
-		// parent attempt in the ClaimApplyByID it performs, so bumping here too
-		// would double-count. Without this, an operation-lease retry never
-		// advances applies.attempt, so ExpireRetryable's budget path never fires
-		// and a permanently failing deployment retries forever — stranding a
-		// healthy sibling parked at the cutover barrier under on_failure
+		// Re-claiming a failed_retryable operation is a redispatch, so it spends
+		// one unit of that operation's retry budget, and the parent apply's
+		// attempt is raised to the operation's new attempt. The budget is per
+		// operation: the parent records the highest attempt of any of its
+		// operations, so one interruption that reaches every operation at once
+		// costs each of them one attempt instead of costing the apply one per
+		// operation, and the apply still expires once any one operation has
+		// spent its budget. Only operations the operator drives under the
+		// operation lease raise the parent here (see
+		// redispatchDrivesUnderOperationLease): a parent-lease drive increments
+		// the parent attempt in the ClaimApplyByID it performs, so raising it
+		// here too would double-count. Without this, an operation-lease retry
+		// never advances applies.attempt, so ExpireRetryable's budget path never
+		// fires and a permanently failing deployment retries forever — stranding
+		// a healthy sibling parked at the cutover barrier under on_failure
 		// "continue". The failed_retryable parent guard keeps this to genuine
 		// redispatches (a terminal-failed parent never re-leases its operations).
-		// The attempt < budget guard makes the increment idempotent once the
-		// budget is spent: two operators can claim different failed_retryable
-		// operations of the same apply concurrently, and the row lock this UPDATE
-		// takes serializes them, so the second sees the already-incremented
-		// attempt and does not overshoot maxRecoveryAttempts.
+		// GREATEST makes concurrent redispatches commute: two operators can claim
+		// different failed_retryable operations of the same apply at once, the
+		// row lock this UPDATE takes serializes them, and the parent ends at the
+		// higher of the two attempts whichever commits first.
 		if ad.State == state.ApplyOperation.FailedRetryable {
 			// Advance the operation's own attempt only on a genuine deliberate
 			// redispatch — the parent apply is still failed_retryable. A
@@ -2262,11 +2269,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			if underOperationLease {
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE applies
-					SET attempt = attempt + 1, updated_at = NOW()
+					SET attempt = GREATEST(attempt, ?), updated_at = NOW()
 					WHERE id = ?
 						AND state = ?
-						AND attempt < ?
-				`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts); err != nil {
+				`, ad.Attempt, ad.ApplyID, state.Apply.FailedRetryable); err != nil {
 					return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
 				}
 

@@ -178,28 +178,50 @@ hands its claims back and leaves the apply active, so a peer driver resumes it
 without the apply ever passing through `failed_retryable` or spending budget.
 
 Each automatic pickup consumes one **recovery attempt** from a fixed budget —
-currently **10 attempts**, on top of the original run. The attempt counter is
-visible in the PR progress comment, so you can watch how much budget an apply
-has burned.
+currently **10 attempts**, on top of the original run. The budget belongs to
+each operation, not to the apply as a whole: every shard or deployment of an
+apply gets its own 10. When one interruption reaches all of them at once (the
+data plane restarting, say), each spends one attempt, rather than the apply
+spending one per shard. The apply's attempt counter is the highest any of its
+operations has reached, and it is visible in the PR progress comment, so you
+can watch how much budget the worst-hit operation has burned.
+
+The count is never reset: an operation that recovered at its third attempt
+and fails again hours later has seven attempts left.
+
+In a rollout, an operation that is retrying a failure holds every member after
+it in the rollout order until the retry resolves. Members before it are not held, and
+the shards of one target never wait on each other. Under `parallel`, the
+default for a `targets` list, the later members keep starting and copying
+while it retries: each finishes its copy, parks at the cutover barrier, which
+frees its driver, and runs its cutover once the retry succeeds. Under `barrier` and
+`rolling` they wait to start. An operation that fails every time holds them
+for its whole budget and then fails, and `on_failure` decides what the rest
+of the rollout does ([Multi-Target
+Environment](configuration.md#multi-target-environment-preview)). Stop or
+cancel the apply to end it sooner.
 
 ```
  running --(recoverable failure)--> failed_retryable
     ^                                     |
     |     recovery driver reclaims,       |
-    +---- attempt counter +1, resume <----+
-          from checkpoints                |
-                                          |  budget spent (10 attempts),
-                                          |  or the failure is older than
-                                          |  the recovery window (1 day)
+    +---- operation's attempt +1,    <----+
+          resume from checkpoints         |
+                                          |  an operation's budget spent
+                                          |  (10 attempts), or the failure
+                                          |  is older than the recovery
+                                          |  window (1 day)
                                           v
                                    failed  (permanent)
 ```
 
 Two things end the loop:
 
-- **The budget runs out.** Ten consecutive recoveries that each failed again
-  is a strong signal the problem is not transient — retrying an eleventh time
-  would just burn resources on the same wall.
+- **The budget runs out.** Ten recoveries of one operation that each failed
+  again is a strong signal the problem is not transient — retrying an
+  eleventh time would just burn resources on the same wall. A sibling that
+  spent its budget and then succeeded spends nothing for an operation that
+  has attempts left.
 - **The recovery window closes.** A `failed_retryable` apply that has been
   sitting for more than a day is no longer picked up automatically, even with
   budget to spare. This prevents a surprise: an old paused failure silently
@@ -208,8 +230,8 @@ Two things end the loop:
   automatic redispatch.
 
 Either way, the apply is then terminalized as permanent `failed`, and the
-normal recovery path applies: fix the cause, fresh plan, fresh apply. The
-budget and window are per-apply — a new apply starts with a full budget.
+normal recovery path applies: fix the cause, fresh plan, fresh apply. A new
+apply starts every operation with a full budget.
 
 ## Refused before an apply exists
 

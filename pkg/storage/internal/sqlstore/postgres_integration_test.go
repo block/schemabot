@@ -1532,13 +1532,14 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), abandonedOpID)
 	require.NoError(t, err)
 
-	// A third deployment whose drive settled it into failed_retryable and left
-	// its lease behind: indistinguishable from a newly claimed retry, so the
-	// gate must defer until that lease is stale too.
+	// A third deployment whose redispatches spent its own budget, and whose
+	// drive settled it into failed_retryable and left its lease behind:
+	// indistinguishable from a newly claimed retry, so the gate must defer
+	// until that lease is stale too.
 	settledOpID := insertOperation(t, "region-c", "op-3")
 	_, err = db.ExecContext(t.Context(),
-		`UPDATE apply_operations SET state = $1, updated_at = NOW() WHERE id = $2`,
-		state.ApplyOperation.FailedRetryable, settledOpID)
+		`UPDATE apply_operations SET state = $1, attempt = $2, updated_at = NOW() WHERE id = $3`,
+		state.ApplyOperation.FailedRetryable, maxRecoveryAttempts, settledOpID)
 	require.NoError(t, err)
 
 	insertTask := func(t *testing.T, identifier, table string, opID int64, taskState string) {
