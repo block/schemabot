@@ -31,9 +31,9 @@ import (
 
 // mockStorage implements storage.Storage for testing.
 type mockStorage struct {
-	pingErr         error
-	webhookEvents   storage.WebhookEventStore
-	operatorServers memoryOperatorServers
+	pingErr       error
+	webhookEvents storage.WebhookEventStore
+	driverPools   memoryDriverPools
 }
 
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
@@ -48,19 +48,19 @@ func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
 func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
-func (m *mockStorage) OperatorServers() storage.OperatorServerStore {
-	return &m.operatorServers
+func (m *mockStorage) DriverPools() storage.DriverPoolStore {
+	return &m.driverPools
 }
 func (m *mockStorage) Ping(ctx context.Context) error { return m.pingErr }
 func (m *mockStorage) Close() error                   { return nil }
 
-// memoryOperatorServers is an in-memory operator server registry whose
+// memoryDriverPools is an in-memory driver pool store whose
 // heartbeats are always live. With hang set, a heartbeat answers only when its
 // context ends, as a storage call that stops responding would. With pruneErr
 // or listErr set, every prune or list fails with it.
-type memoryOperatorServers struct {
+type memoryDriverPools struct {
 	mu       sync.Mutex
-	servers  map[string]storage.OperatorServer
+	servers  map[string]storage.DriverPool
 	beats    int
 	prunes   int
 	hang     bool
@@ -68,7 +68,7 @@ type memoryOperatorServers struct {
 	listErr  error
 }
 
-func (m *memoryOperatorServers) Heartbeat(ctx context.Context, server *storage.OperatorServer) error {
+func (m *memoryDriverPools) Heartbeat(ctx context.Context, server *storage.DriverPool) error {
 	m.mu.Lock()
 	hang := m.hang
 	m.mu.Unlock()
@@ -79,34 +79,34 @@ func (m *memoryOperatorServers) Heartbeat(ctx context.Context, server *storage.O
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.servers == nil {
-		m.servers = map[string]storage.OperatorServer{}
+		m.servers = map[string]storage.DriverPool{}
 	}
 	m.servers[server.ServerID] = *server
 	m.beats++
 	return nil
 }
 
-func (m *memoryOperatorServers) PruneStale(context.Context) error {
+func (m *memoryDriverPools) PruneStale(context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.prunes++
 	return m.pruneErr
 }
 
-func (m *memoryOperatorServers) Deregister(_ context.Context, serverID string) error {
+func (m *memoryDriverPools) Deregister(_ context.Context, serverID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.servers, serverID)
 	return nil
 }
 
-func (m *memoryOperatorServers) ListLive(context.Context) ([]*storage.OperatorServer, error) {
+func (m *memoryDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
-	servers := make([]*storage.OperatorServer, 0, len(m.servers))
+	servers := make([]*storage.DriverPool, 0, len(m.servers))
 	for _, server := range m.servers {
 		servers = append(servers, &server)
 	}

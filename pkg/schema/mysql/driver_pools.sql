@@ -1,4 +1,4 @@
-CREATE TABLE `operator_servers` (
+CREATE TABLE `driver_pools` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `server_id` varchar(255) NOT NULL,
   `drivers` int NOT NULL,

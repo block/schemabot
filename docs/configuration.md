@@ -898,7 +898,7 @@ An apply started with `--defer-cutover` copies each table and then waits for som
 
 If there aren't enough drivers, some operations wait and the rest never start, so the apply can never be cut over. It would hold its drivers until the waiting-for-cutover timeout ended it. SchemaBot refuses such an apply when it starts instead.
 
-**How SchemaBot counts drivers.** Each server that runs drivers writes how many it has to the `operator_servers` table when it starts, updates the row every 15 seconds, and deletes the row when it stops. A server that hasn't updated its row in the last minute isn't counted. That is the same amount of time after which other servers take over its work. Each server keeps one driver free for other work, so a server with `drivers: 4` adds three, and four such servers give twelve. Adding or removing servers changes the total, with no setting to update.
+**How SchemaBot counts drivers.** Each server that runs drivers writes how many it has to the `driver_pools` table when it starts, updates the row every 15 seconds, and deletes the row when it stops. A server that hasn't updated its row in the last minute isn't counted. That is the same amount of time after which other servers take over its work. Each server keeps one driver free for other work, so a server with `drivers: 4` adds three, and four such servers give twelve. Adding or removing servers changes the total, with no setting to update.
 
 **When SchemaBot refuses.** A deferred apply of two or more operations is refused when either of these is true:
 
