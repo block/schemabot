@@ -845,7 +845,7 @@ canonical task states:
 Only the mid-flight phases refine a running task (`tablePhaseTaskState` accepts
 `catching_up`, `checksumming`, `post_checksum`, `cutting_over`). A per-table
 `"completed"` never completes the task — for Spirit it means only that the
-table's copy finished, not that it cut over.
+table's copy finished, not that its cutover ran.
 
 Because polling is asynchronous, refinement goes through
 `taskStateWithNoBackwardProgress` (`pkg/tern/local_client.go`), which orders the

@@ -527,12 +527,12 @@ a repository whose tree GitHub truncates.
 An apply that keeps its drivers until an operator cuts it over is admitted only if SchemaBot's
 servers can hold all of it at once, and such applies take drivers in turn: none starts an operation
 while one ahead of it still has an operation waiting to start. The apply at the front therefore
-always gets every driver it needs and can be cut over, and the rest follow it. An apply's place is
+always gets every driver it needs and can reach its cutover, and the rest follow it. An apply's place is
 when it last started, so one that was stopped and started again goes behind every apply that started
 while it held no drivers.
 
 *Breaks if violated:* two applies each hold part of the drivers with the rest of their operations
-queued behind the other, neither can be cut over, and both wait until the waiting-for-cutover
+queued behind the other, neither can reach its cutover, and both wait until the waiting-for-cutover
 timeout fails them. *Enforced:* the width refusal at apply and at apply creation
 (`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
 (`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
@@ -933,8 +933,8 @@ the cutover barrier under `barrier`, while `parallel` does not order copy start 
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
 work held behind an earlier table that settled without completing can never start, so it holds no target. Under
-`barrier` and `parallel` cutover follows deployment order: an operation cuts over only once every
-operation of every earlier deployment has completed. Within one deployment, an operation cuts over
+`barrier` and `parallel` cutover follows deployment order: an operation's cutover runs only once every
+operation of every earlier deployment has completed. Within one deployment, an operation's cutover runs
 as soon as its own copy is ready: an earlier operation of the same deployment holds it only while it
 is in a state the rollout halts on (failed, retrying a failure, stopped, cancelled, or reverted),
 never while it is still copying or cutting over. A member's finalizer publishes its change without

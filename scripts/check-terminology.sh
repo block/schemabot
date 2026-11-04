@@ -1,9 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# Fail when "schema change" appears hyphenated in prose. The rule and its
-# rationale live in AGENTS.md (Terminology); this makes it self-maintaining
-# instead of relying on the next sweep to notice.
+# Fail when "schema change" appears hyphenated in prose, or when "cutover"
+# is written as two words in the docs. The rules and their rationale live in
+# AGENTS.md (Terminology); this makes them self-maintaining instead of
+# relying on the next sweep to notice.
 #
 # Identifiers are exempt and are carved out mechanically rather than by
 # judgement: URLs and markdown anchor targets are stripped before matching,
@@ -44,4 +45,21 @@ if [ -n "$hits" ]; then
     exit 1
 fi
 
-echo 'terminology check passed: no hyphenated "schema-change" in prose'
+# "cutover" is one word in the docs, the generated TEMPLATES.md included, so
+# the PR comment and CLI text it previews are held to the rule too. The verb
+# forms are what get split, so those are what is matched. "cutting over" is
+# exempt: it is the name of the cutting_over state that the PR comment and
+# CLI show. URLs are stripped first, so a link that happens to contain the
+# words is not a hit, and AGENTS.md is skipped because it quotes the forms.
+cutover_hits=$(tolerate_no_match git grep -n -I -i -E 'cut[ -]over|cuts over' -- '*.md' \
+        ':!AGENTS.md' \
+    | perl -pe 's{https?://\S+}{}g' \
+    | tolerate_no_match grep -i -E '(^|[^A-Za-z_])(cut[ -]over|cuts over)([^A-Za-z]|$)')
+
+if [ -n "$cutover_hits" ]; then
+    echo "$cutover_hits"
+    echo 'error: write "cutover" as one word in the docs, rewording a verb around the noun (see AGENTS.md, Terminology)' >&2
+    exit 1
+fi
+
+echo 'terminology check passed: no hyphenated "schema-change" in prose, no two-word "cut over" in the docs'

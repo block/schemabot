@@ -87,8 +87,8 @@ removed fails too: the drop is final, and the message says so and asks for the
 schema change to be planned again against the live schema.
 
 **Cancelling a schema change quarantines its copy too.** A cancelled change
-leaves a shadow table holding every row copied so far, and — if it had already
-cut over — the original table it swapped out. Both hold data the change may
+leaves a shadow table holding every row copied so far, and — if its cutover had already
+run — the original table it swapped out. Both hold data the change may
 have spent days producing, so both go through the same quarantine as a table an
 operator deleted from a schema file, under the same retention. The metadata
 describing where the copy had got to (the checkpoint tables and the deferred

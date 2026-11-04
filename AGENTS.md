@@ -158,6 +158,21 @@ The rule is about prose only. Identifiers keep whatever form they need: file and
 
 `make check-terminology` (`scripts/check-terminology.sh`) enforces this in CI on every PR, docs-only ones included. It strips URLs and anchor targets, matches only at a word boundary, and allowlists the identifiers above by value, so a new legitimate hyphenated identifier means extending that allowlist, not weakening the rule.
 
+**"cutover" is one word.** In docs, write "cutover", never "cut over", "cuts over", or "cut-over". The `schemabot cutover` command, the `cutover_policy` setting, and the `waiting_for_cutover` state all spell it as one word, so the prose around them does too. That holds for the PR comment and CLI text the docs preview, since TEMPLATES.md is generated from them.
+
+"cutover" is a noun, so a sentence that needs a verb is reworded around it rather than split:
+
+| Write | Not |
+|---|---|
+| each target's cutover runs as soon as its copy is ready | each target cuts over as soon as its copy is ready |
+| SchemaBot will run the cutover for `eu` next | SchemaBot will cut over `eu` next |
+| the apply can never reach its cutover | the apply can never be cut over |
+| the cutover GTID position | the cut-over GTID position |
+
+"cutting over" is the one exception: it is the name of the `cutting_over` state that the PR comment and CLI show, so it stays when it names that state.
+
+`make check-terminology` enforces this on every markdown file in CI. It strips URLs first, so a link that contains the words is not a hit.
+
 **Driver terminology:** A *driver* is the operator worker that claims an apply via `FOR UPDATE SKIP LOCKED`, holds its lease (`LeaseOwner` / `LeaseToken`), and *drives* it to a terminal state. Use *driver* (noun) and *drive* (verb) — not *worker* — in new code, comments, logs, docs, and tests for the lease-holding goroutine and the work it performs. This is distinct from the **Go MySQL driver** (`github.com/go-sql-driver/mysql`, `database/sql/driver`): always refer to that as the "Go MySQL driver" or "SQL driver" and keep it import-qualified so the two senses never collide.
 
 **OSS-ready code:** Never reference internal company names or proprietary details in code or comments.

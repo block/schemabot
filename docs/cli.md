@@ -665,7 +665,7 @@ resumes each stopped target from its own checkpoint:
 
 ![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)
 
-### Choose when to cut over
+### Choose when to run the cutover
 
 For engines that support deferred cutover, start the apply with
 `--defer-cutover` to hold the final swap. Copying can finish while the live
@@ -687,7 +687,7 @@ the swap has finished.
 
 ### Manage PlanetScale deploy requests
 
-For a Vitess database using PlanetScale, use the CLI to deploy, cut over,
+For a Vitess database using PlanetScale, use the CLI to deploy, run the cutover,
 revert, or close the revert window while following progress across shards.
 This example uses
 `shop` registered as a Vitess database, `type: vitess` in `schema/schemabot.yaml`,
@@ -701,7 +701,7 @@ prompt. During copying, **Esc** detaches and **c** cancels the deploy request
 permanently; PlanetScale cancellation cannot be resumed.
 
 The CLI and PlanetScale console control the same deployment, with PlanetScale
-as the source of truth. You can cut over, revert, or close the revert window
+as the source of truth. You can run the cutover, revert, or close the revert window
 from either interface. If you act in the console, the CLI watcher follows
 along automatically; there is no need to repeat the action.
 
@@ -1223,7 +1223,7 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 | Cutting over | `Cutover in progress - please wait...` |
 | Stopped | `To resume from where it stopped:` followed by `schemabot start <id> -e <env>` |
 
-A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target SchemaBot cuts over next, and a stopped rollout ends on the same resume command as a single target.
+A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target whose cutover SchemaBot runs next, and a stopped rollout ends on the same resume command as a single target.
 
 </details>
 
