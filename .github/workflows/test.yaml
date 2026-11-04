@@ -378,7 +378,11 @@ jobs:
 
   localscale:
     name: "LocalScale Tests (${{ matrix.shard }})"
-    needs: [changes, build, localscale-matrix]
+    # Restores the Go cache directly, like the Integration and E2E jobs, rather
+    # than waiting for Build to save it. The cache already on the default
+    # branch covers everything but this change's own packages, and compiling
+    # those here costs far less than waiting for Build to finish.
+    needs: [changes, localscale-matrix]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
