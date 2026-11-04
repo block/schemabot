@@ -5,12 +5,11 @@ package webhook
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,33 +17,92 @@ import (
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	ghclient "github.com/block/schemabot/pkg/github"
 )
 
-// A pull request in a large repository changes one schema file and hundreds of
-// files outside any schema directory, each by a single line. SchemaBot plans
-// it with exactly the GitHub requests it uses when the PR changes one file
-// outside its schema directory, so a monorepo's routine edits cannot multiply
-// the requests every delivery makes and exhaust the App's rate limit for every
-// repository it serves (AV-15).
-func TestE2EAutoPlanGitHubRequestsDoNotGrowWithNonSchemaFiles(t *testing.T) {
+// A pull request in a large repository edits hundreds of files outside any
+// schema directory, each by a single line. Every way SchemaBot plans that PR
+// makes exactly the GitHub requests it makes when the PR edits one such file,
+// so a monorepo's routine edits cannot multiply the requests every delivery
+// makes and exhaust the App's rate limit for every repository it serves
+// (AV-15). The paths covered are an auto-plan when the PR opens and when a push
+// lands, a plan command, and a plan command in a repository whose tree GitHub
+// truncates, where config discovery falls back to the configured schema
+// directories.
+func TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles(t *testing.T) {
 	const dbName = "webhook_github_cost"
-	var few, many map[string]int
-	t.Run("one non-schema file", func(t *testing.T) {
-		few = autoPlanGitHubRequests(t, dbName, 1)
-	})
-	t.Run("many non-schema files", func(t *testing.T) {
-		many = autoPlanGitHubRequests(t, dbName, 400)
-	})
-	require.NotEmpty(t, few, "the plan flow made GitHub requests to count")
-	assert.Equal(t, few, many, "GitHub requests by method and path, for one non-schema file vs many")
+	for _, delivery := range githubCostDeliveries(dbName) {
+		t.Run(delivery.name, func(t *testing.T) {
+			var few, many map[string]int
+			t.Run("one non-schema file", func(t *testing.T) {
+				few = githubRequestsToPlan(t, dbName, delivery, 1)
+			})
+			t.Run("many non-schema files", func(t *testing.T) {
+				many = githubRequestsToPlan(t, dbName, delivery, 400)
+			})
+			require.NotEmpty(t, few, "the plan flow made GitHub requests to count")
+			// The fake lists every changed file in one page, so the listing
+			// request counts the same for one file and for four hundred. Any
+			// difference, the listing included, is a request made per file.
+			assert.Equal(t, few, many, "GitHub requests by method and path, for one non-schema file vs many")
+		})
+	}
 }
 
-// autoPlanGitHubRequests auto-plans a PR that adds one schema file and edits
-// nonSchemaFiles files outside the schema directory by one line each, and
-// returns every GitHub request the delivery made, counted by method and path.
-func autoPlanGitHubRequests(t *testing.T, dbName string, nonSchemaFiles int) map[string]int {
+// githubCostDelivery is one way a webhook delivery makes SchemaBot plan a PR.
+type githubCostDelivery struct {
+	name string
+	// monorepo serves a repository too large for GitHub to list recursively.
+	// The PR then changes no schema file, so the plan command has to find the
+	// database's config through the server-configured schema directories.
+	monorepo bool
+	// request builds the delivery once the fake GitHub serves the PR's files.
+	request func(t *testing.T, mux *http.ServeMux, result *planFlowResult, prFiles []*gh.CommitFile) *http.Request
+}
+
+func githubCostDeliveries(dbName string) []githubCostDelivery {
+	planCommand := func(comment string) func(*testing.T, *http.ServeMux, *planFlowResult, []*gh.CommitFile) *http.Request {
+		return func(t *testing.T, _ *http.ServeMux, _ *planFlowResult, _ []*gh.CommitFile) *http.Request {
+			return buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
+		}
+	}
+	return []githubCostDelivery{
+		{
+			name: "auto-plan on open",
+			request: func(t *testing.T, _ *http.ServeMux, _ *planFlowResult, _ []*gh.CommitFile) *http.Request {
+				return buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened"}, nil)
+			},
+		},
+		{
+			name: "auto-plan on push",
+			request: func(t *testing.T, mux *http.ServeMux, result *planFlowResult, prFiles []*gh.CommitFile) *http.Request {
+				result.HeadSHAs = []string{"newsha"}
+				registerCompareFiles(t, mux, "oldsha", "newsha", prFiles)
+				registerFreshBaseComparison(t, mux, "newsha")
+				return buildPRWebhookRequest(t, prWebhookPayloadOpts{
+					action:    "synchronize",
+					beforeSHA: "oldsha",
+					headSHA:   "newsha",
+					headRef:   "feature-branch",
+				}, nil)
+			},
+		},
+		{
+			name:    "plan command",
+			request: planCommand("schemabot plan -e staging"),
+		},
+		{
+			name:     "plan command in a monorepo",
+			monorepo: true,
+			request:  planCommand(fmt.Sprintf("schemabot plan -e staging -d %s", dbName)),
+		},
+	}
+}
+
+// githubRequestsToPlan plans a PR that edits nonSchemaFiles files outside the
+// schema directory by one line each through delivery, and returns every GitHub
+// request the delivery made, counted by method and path. Outside a monorepo the
+// PR also adds the database's one schema file.
+func githubRequestsToPlan(t *testing.T, dbName string, delivery githubCostDelivery, nonSchemaFiles int) map[string]int {
 	t.Helper()
 	svc := setupE2EService(t, dbName)
 
@@ -61,10 +119,13 @@ func autoPlanGitHubRequests(t *testing.T, dbName string, nonSchemaFiles int) map
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
-	prFiles := []*gh.CommitFile{{
-		Filename: new(schemaFixturePath(dbName, "users.sql")),
-		Status:   new("added"),
-	}}
+	var prFiles []*gh.CommitFile
+	if !delivery.monorepo {
+		prFiles = append(prFiles, &gh.CommitFile{
+			Filename: new(schemaFixturePath(dbName, "users.sql")),
+			Status:   new("added"),
+		})
+	}
 	var otherFiles []string
 	for i := range nonSchemaFiles {
 		// A one-line edit several directories deep is the most common change
@@ -83,31 +144,36 @@ func autoPlanGitHubRequests(t *testing.T, dbName string, nonSchemaFiles int) map
 	configs := map[string]string{"schema/schemabot.yaml": fmt.Sprintf("database: %s\ntype: mysql\n", dbName)}
 	result := setupFakeGitHubForPlanInRepository(t, mux, schemaFiles, configs, dbName, prFiles, otherFiles)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger)
+	var h *Handler
+	if delivery.monorepo {
+		result.TruncateRecursiveTrees.Store(true)
+		serverConfig := svc.Config()
+		dbConfig := serverConfig.Databases[dbName]
+		dbConfig.AllowedDirs = []string{"schema"}
+		serverConfig.Databases[dbName] = dbConfig
+		h = newE2EHandlerWithConfigDirHints(t, svc, client)
+	} else {
+		h = newE2EHandler(t, svc, client)
+	}
 
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened"}, nil))
+	h.ServeHTTP(rr, delivery.request(t, mux, result, prFiles))
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	select {
-	case body := <-result.comments:
-		assert.Contains(t, body, "CREATE TABLE")
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		require.Fail(t, "timed out waiting for the auto-plan comment")
-	}
-	select {
-	case cr := <-result.checkRuns:
-		assert.Equal(t, "completed", cr.Status)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		require.Fail(t, "timed out waiting for the auto-plan check run")
+	deadline := time.After(webhookIntegrationCheckRunDeadline)
+	for planned := false; !planned; {
+		select {
+		case body := <-result.comments:
+			planned = strings.Contains(body, "CREATE TABLE")
+		case <-deadline:
+			require.Fail(t, "timed out waiting for the plan comment")
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), webhookIntegrationCheckRunDeadline)
 	defer cancel()
 	h.DrainInProcessWebhookWork(ctx)
-	require.NoError(t, ctx.Err(), "auto-plan work was still running when the requests were counted")
+	require.NoError(t, ctx.Err(), "plan work was still running when the requests were counted")
 	return requests.snapshot()
 }
 

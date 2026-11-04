@@ -387,6 +387,11 @@ type planFlowResult struct {
 	// headTreeEntries is the repository at head, as the fixture described it.
 	headTreeEntries []*gh.TreeEntry
 
+	// TruncateRecursiveTrees serves the repository the way GitHub serves a
+	// monorepo: every recursive tree read comes back truncated with no
+	// entries, while shallow reads still list one directory level at a time.
+	TruncateRecursiveTrees atomic.Bool
+
 	// BaseRef overrides the base branch served by /pulls/1. Nil (the default)
 	// serves "main". Tests that model a PR being retargeted install the new ref,
 	// optionally partway through a flow so the base a plan was computed against
@@ -630,6 +635,9 @@ type repositoryTreeFixture struct {
 	// defaultTip is the commit the default branch resolves to. Nil serves the
 	// PR's base commit, so the base branch appears unmoved.
 	defaultTip func() string
+	// truncateRecursive reports whether the repository is too large for GitHub
+	// to list in one recursive read. Nil means it never is.
+	truncateRecursive func() bool
 }
 
 func (f repositoryTreeFixture) base() []*gh.TreeEntry {
@@ -685,13 +693,37 @@ func registerRepositoryTrees(t *testing.T, mux *http.ServeMux, fixture repositor
 	})
 
 	serveTree := func(w http.ResponseWriter, r *http.Request, sha string) {
-		entries := fixture.headEntries
 		if r.URL.Query().Get("recursive") == "" {
-			entries = fixture.shallowTreeLevel(sha)
+			require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
+				SHA:       &sha,
+				Entries:   fixture.shallowTreeLevel(sha),
+				Truncated: new(false),
+			}))
+			return
+		}
+		if dir, isSubtree := strings.CutPrefix(sha, headSubtreeSHAPrefix); isSubtree {
+			// One directory's own subtree is small enough to list in full
+			// even when the whole repository is not.
+			require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
+				SHA:       &sha,
+				Entries:   entriesUnder(fixture.headEntries, strings.ReplaceAll(dir, "~", "/")),
+				Truncated: new(false),
+			}))
+			return
+		}
+		if fixture.truncateRecursive != nil && fixture.truncateRecursive() {
+			// GitHub answers a recursive read of a repository too large to list
+			// as truncated, and a caller must not trust the partial entries.
+			require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
+				SHA:       &sha,
+				Entries:   []*gh.TreeEntry{},
+				Truncated: new(true),
+			}))
+			return
 		}
 		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
 			SHA:       &sha,
-			Entries:   entries,
+			Entries:   fixture.headEntries,
 			Truncated: new(false),
 		}))
 	}
@@ -736,6 +768,22 @@ func treeLevelFrom(entries []*gh.TreeEntry, dir, subtreePrefix string) []*gh.Tre
 		level = append(level, &gh.TreeEntry{Path: new(segment), Type: new("blob"), SHA: new(entry.GetSHA())})
 	}
 	return level
+}
+
+// entriesUnder returns the entries below dir, at every depth, with paths
+// relative to dir, as a recursive read of that directory's tree lists them.
+func entriesUnder(entries []*gh.TreeEntry, dir string) []*gh.TreeEntry {
+	var under []*gh.TreeEntry
+	for _, entry := range entries {
+		rest, ok := strings.CutPrefix(entry.GetPath(), dir+"/")
+		if !ok {
+			continue
+		}
+		relative := *entry
+		relative.Path = &rest
+		under = append(under, &relative)
+	}
+	return under
 }
 
 // schemaFixturePath resolves a schemaSQL key to its repository path: plain
@@ -915,6 +963,7 @@ func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schema
 			}
 			return "def456"
 		},
+		truncateRecursive: result.TruncateRecursiveTrees.Load,
 	})
 
 	// Blob content

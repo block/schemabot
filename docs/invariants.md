@@ -516,9 +516,11 @@ or from one request that covers them all, never by a lookup per file.
 repository it serves, so routine edits in one large repository use it up and required checks stop
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
 configs, probing each directory once (`pkg/github/config.go`), and
-`TestE2EAutoPlanGitHubRequestsDoNotGrowWithNonSchemaFiles`
+`TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
 (`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
-hundred one-line edits outside its schema directory and requires the same GitHub requests.
+hundred one-line edits outside its schema directory and requires the same GitHub requests. It
+covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
+a repository whose tree GitHub truncates.
 
 ## Merge gate (MG)
 
@@ -2054,8 +2056,9 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
 
 - **GitHub request cost.** An integration test plans the same pull request with one and with
   hundreds of edits outside its schema directory and fails on any GitHub request the second makes
-  that the first does not, so a lookup per changed file fails CI instead of exhausting the rate
-  limit in production (AV-15).
+  that the first does not. It drives the auto-plan on open and on push, the plan command, and the
+  plan command in a repository whose tree GitHub truncates, so a lookup per changed file on those
+  paths fails CI instead of exhausting the rate limit in production (AV-15).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.
