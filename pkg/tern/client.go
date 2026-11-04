@@ -302,3 +302,27 @@ type ShutdownHalter interface {
 	// halts stay active for reclaim.
 	HaltForShutdown(ctx context.Context) error
 }
+
+// DriverCapacity is the drivers a deployment's live servers run.
+type DriverCapacity struct {
+	// LiveServers is how many of the deployment's servers reported their
+	// drivers within its live window.
+	LiveServers int
+	// Drivers is how many drivers those servers run, together.
+	Drivers int
+	// DeferredCutoverDrivers is how many of those drivers may hold an
+	// operation waiting at a deferred cutover.
+	DeferredCutoverDrivers int
+	// MaxDriversPerApply is how many operations of one apply the deployment
+	// runs at once.
+	MaxDriversPerApply int
+}
+
+// DriverCapacityReader is a client for a deployment whose operators run its
+// operations on another plane. Every operation sent there runs on one of that
+// plane's drivers, so a deferred apply is checked against that plane's drivers
+// as well as this one's. A nil capacity with no error is a deployment that
+// does not report it, and a deferred apply that needs it is refused there.
+type DriverCapacityReader interface {
+	DriverCapacity(ctx context.Context) (*DriverCapacity, error)
+}

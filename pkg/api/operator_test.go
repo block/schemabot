@@ -2832,13 +2832,6 @@ func TestWakesReachThePoolAndTheReservedDriver(t *testing.T) {
 	})
 }
 
-func TestDeferredCutoverDriversLeavesOneDriverPerPod(t *testing.T) {
-	assert.Equal(t, 0, deferredCutoverDrivers(0))
-	assert.Equal(t, 1, deferredCutoverDrivers(1), "a single driver is not reserved")
-	assert.Equal(t, 1, deferredCutoverDrivers(2))
-	assert.Equal(t, 3, deferredCutoverDrivers(4))
-}
-
 // A panic in the pre-claim stop-reconciliation probe is contained the same
 // way: the driver survives and probes again on the next tick instead of
 // crashing the process.

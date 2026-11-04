@@ -47,8 +47,6 @@ const (
 	retryableRecoveryFreshnessDays = 1
 )
 
-const applyTargetLockReleaseTimeout = 5 * time.Second
-
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
 	db         *rebindDB
@@ -376,54 +374,11 @@ func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedl
 }
 
 func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, conn *rebindConn, lockName, operation string) {
-	if conn == nil {
-		return
-	}
-
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
-	defer cancel()
-
-	released, err := locker.Release(releaseCtx, conn.lockerConn(), lockName)
-	switch {
-	case err != nil:
-		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", err)
-		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-	case !released:
-		slog.WarnContext(releaseCtx, "apply target lock was not held by this session; discarding connection",
-			"operation", operation,
-			"lock", lockName)
-		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-	}
-
-	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-}
-
-// discardApplyTargetLockConn marks the pinned connection as bad so the pool
-// destroys it instead of reusing a session whose advisory-lock state is
-// uncertain.
-func discardApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	if err := conn.discardBadConn(); err != nil {
-		slog.WarnContext(ctx, "failed to discard apply target lock connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", err)
-	}
+	releaseLockConn(ctx, locker, conn, lockName, "apply target lock", "operation", operation, "lock", lockName)
 }
 
 func closeApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	err := conn.Close()
-	if err == nil || errors.Is(err, sql.ErrConnDone) {
-		// ErrConnDone means the session was already retired by a preceding
-		// discard; there is nothing left to release.
-		return
-	}
-	slog.WarnContext(ctx, "failed to close apply target lock connection",
-		"operation", operation,
-		"lock", lockName,
-		"error", err)
+	closeLockConn(ctx, conn, "apply target lock", "operation", operation, "lock", lockName)
 }
 
 // dedupeDeployments returns the input deployments as a sorted, de-duplicated
@@ -2907,6 +2862,103 @@ func (s *applyStore) ReleaseClaim(ctx context.Context, lease storage.ApplyLease)
 		return false, fmt.Errorf("read release claim rows affected for apply %d: %w", lease.ApplyID, err)
 	}
 	return rows > 0, nil
+}
+
+// MarkStaleApplyRetryable moves a stale, still-active apply, and the named
+// operation with it, to failed_retryable in one transaction. See
+// storage.ApplyStore for the contract.
+func (s *applyStore) MarkStaleApplyRetryable(ctx context.Context, req storage.StaleRetryableRequest) (bool, error) {
+	if req.ApplyID <= 0 {
+		return false, fmt.Errorf("mark stale apply retryable: apply id must be positive, got %d", req.ApplyID)
+	}
+	if req.OperationID < 0 {
+		return false, fmt.Errorf("mark stale apply %d retryable: operation id must not be negative, got %d", req.ApplyID, req.OperationID)
+	}
+	var moved bool
+	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("mark stale apply %d retryable", req.ApplyID), func() error {
+		var err error
+		moved, err = s.markStaleApplyRetryableOnce(ctx, req)
+		return err
+	})
+	return moved, err
+}
+
+// markStaleApplyRetryableOnce runs one attempt of MarkStaleApplyRetryable.
+//
+// The operation row is written before the apply row, the order the operation
+// claim takes them in (it locks the operation, then charges the parent's
+// budget), so the two never wait on each other in opposite orders.
+//
+// The apply's fresh-operation-lease gate is a candidate filter rather than a
+// fence, for the reason undrivenApplyGate gives: it keeps the parent from
+// moving under a sibling drive that already holds its lease, but a sibling
+// claim can still commit right after it is evaluated.
+func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storage.StaleRetryableRequest) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin mark stale apply %d retryable transaction: %w", req.ApplyID, err)
+	}
+	defer rollbackTx(ctx, tx, "mark stale apply retryable")
+
+	activeStates := claimableApplyStates()
+	activeStatePlaceholders := placeholders(len(activeStates))
+	staleCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	// A lease is fresh only while it has an owner and a heartbeat inside the
+	// staleness window, the reading Apply.HasFreshLease and
+	// ApplyOperation.HasFreshLease give it.
+	notFreshlyLeased := fmt.Sprintf("(lease_owner = '' OR updated_at < %s)", staleCutoff)
+
+	if req.OperationID != 0 {
+		opArgs := []any{state.ApplyOperation.FailedRetryable, nullString(req.ErrorMessage), req.OperationID, req.ApplyID}
+		opArgs = append(opArgs, stringArgs(activeStates)...)
+		opArgs = append(opArgs, req.OperationLeaseToken)
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE apply_operations
+			SET state = ?, error_message = ?, completed_at = NULL,
+			    lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+			    updated_at = NOW()
+			WHERE id = ? AND apply_id = ? AND state IN (%s) AND lease_token = ?
+				AND %s
+		`, activeStatePlaceholders, notFreshlyLeased), opArgs...)
+		if err != nil {
+			return false, fmt.Errorf("mark stale apply_operation %d of apply %d retryable: %w", req.OperationID, req.ApplyID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("read mark stale apply_operation %d retryable rows affected: %w", req.OperationID, err)
+		}
+		if rows == 0 {
+			return false, nil
+		}
+	}
+
+	applyArgs := []any{state.Apply.FailedRetryable, req.ErrorMessage, req.ApplyID}
+	applyArgs = append(applyArgs, stringArgs(activeStates)...)
+	applyArgs = append(applyArgs, req.ApplyLeaseToken)
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE applies
+		SET state = ?, error_message = ?, completed_at = NULL,
+		    lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+		    updated_at = NOW()
+		WHERE id = ? AND state IN (%s) AND lease_token = ?
+			AND %s
+			AND %s
+	`, activeStatePlaceholders, notFreshlyLeased, undrivenApplyGate(s.dialect)), applyArgs...)
+	if err != nil {
+		return false, fmt.Errorf("mark stale apply %d retryable: %w", req.ApplyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read mark stale apply %d retryable rows affected: %w", req.ApplyID, err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit mark stale apply %d retryable: %w", req.ApplyID, err)
+	}
+	return true, nil
 }
 
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {

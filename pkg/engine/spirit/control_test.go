@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -514,6 +515,30 @@ func TestStatelessControlDatabase(t *testing.T) {
 		_, err := statelessControlDatabase("not a dsn", "bikeshare")
 		require.Error(t, err)
 	})
+}
+
+// A sentinel drop whose connection broke while the statement was in flight may
+// have run, so it is reported as an unknown outcome; a drop the database refused
+// is a plain failure. Either way the driver's error stays reachable.
+func TestSentinelDropErrorReportsAnUnknownOutcomeOnlyForABrokenConnection(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		unknown bool
+	}{
+		{name: "invalid connection", err: mysql.ErrInvalidConn, unknown: true},
+		{name: "connection reset", err: errors.New("read tcp 10.0.0.1:3306: connection reset by peer"), unknown: true},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, unknown: true},
+		{name: "access denied", err: &mysql.MySQLError{Number: 1142, Message: "DROP command denied to user"}, unknown: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sentinelDropError(tc.err)
+			assert.Equal(t, tc.unknown, engine.IsOutcomeUnknown(err))
+			assert.ErrorIs(t, err, tc.err, "the driver error stays reachable for triage")
+			assert.Contains(t, err.Error(), "drop sentinel table")
+		})
+	}
 }
 
 // The revert-window controls decline with a typed unsupported-operation error.

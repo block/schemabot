@@ -79,24 +79,6 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			wantReason:   "ADD COLUMN \\\"note\\\" character varying(10)",
 		},
 		{
-			name:         "a storage parameter the default branch added beside the PR's column",
-			approvedBase: orders("id bigint PRIMARY KEY"),
-			approved:     orders("id bigint PRIMARY KEY, note text"),
-			headBase:     "CREATE TABLE orders (id bigint PRIMARY KEY) WITH (fillfactor = 70);",
-			head:         "CREATE TABLE orders (id bigint PRIMARY KEY, note text) WITH (fillfactor = 70);",
-			wantSame:     true,
-		},
-		{
-			// The diff does not act on this clause, so the head runs only the
-			// approved ADD COLUMN.
-			name:         "a storage parameter the head adds beyond the PR's edit",
-			approvedBase: orders("id bigint PRIMARY KEY"),
-			approved:     orders("id bigint PRIMARY KEY, note text"),
-			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
-			head:         "CREATE TABLE orders (id bigint PRIMARY KEY, total bigint, note text) WITH (autovacuum_enabled = false);",
-			wantSame:     true,
-		},
-		{
 			// The diff does not act on this clause, so the head runs only the
 			// approved ADD COLUMN.
 			name:         "a tablespace the head adds beyond the PR's edit",
@@ -104,16 +86,6 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			approved:     orders("id bigint PRIMARY KEY, note text"),
 			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
 			head:         "CREATE TABLE orders (id bigint PRIMARY KEY, total bigint, note text) TABLESPACE pg_default;",
-			wantSame:     true,
-		},
-		{
-			// The diff does not act on this clause, so the head runs only the
-			// approved ADD COLUMN.
-			name:         "identity sequence options the head changes beyond the PR's edit",
-			approvedBase: orders("id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY"),
-			approved:     orders("id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, note text"),
-			headBase:     orders("id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, total bigint"),
-			head:         orders("id bigint GENERATED ALWAYS AS IDENTITY (START WITH 1000) PRIMARY KEY, total bigint, note text"),
 			wantSame:     true,
 		},
 		{
@@ -212,11 +184,14 @@ func TestEngineCompareSchemaFileChangeRejectsFilesItCannotRun(t *testing.T) {
 
 	tests := []struct {
 		name string
-		// approved defaults to the file with the PR's column; a case that
-		// must reach the target with matching files sets it to its head.
-		approved string
-		head     string
-		wantErr  string
+		// approvedBase and headBase default to the shared base; approved
+		// defaults to the file with the PR's column. A case that must reach
+		// the target with matching files sets approved to its head, and a
+		// case whose uncomparable property sits on one base sets that base.
+		approvedBase, headBase string
+		approved               string
+		head                   string
+		wantErr                string
 	}{
 		{
 			name:    "a file that does not parse",
@@ -239,6 +214,33 @@ func TestEngineCompareSchemaFileChangeRejectsFilesItCannotRun(t *testing.T) {
 			wantErr: "diff the head against its base: table persistence (unlogged) differs",
 		},
 		{
+			// The diff refuses a storage parameter difference, so the head's
+			// statements cannot be derived and the comparison proves nothing.
+			name:    "a storage parameter the head adds beyond the PR's edit",
+			head:    "CREATE TABLE orders (id bigint PRIMARY KEY, note text) WITH (autovacuum_enabled = false);",
+			wantErr: "diff the head against its base: table storage parameters differ",
+		},
+		{
+			// The default branch declared a storage parameter the approved
+			// commit's base lacks; the move between the two bases is the diff
+			// the comparison cannot derive, even though the head and its base
+			// agree on the parameter.
+			name:     "a storage parameter the default branch added beside the PR's column",
+			headBase: "CREATE TABLE orders (id bigint PRIMARY KEY) WITH (fillfactor = 70);",
+			head:     "CREATE TABLE orders (id bigint PRIMARY KEY, note text) WITH (fillfactor = 70);",
+			wantErr:  "diff the head's base against the approved commit's base: table storage parameters differ",
+		},
+		{
+			// The diff refuses an identity sequence option difference the
+			// same way.
+			name:         "identity sequence options the head changes beyond the PR's edit",
+			approvedBase: "CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY);",
+			approved:     "CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, note text);",
+			headBase:     "CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY);",
+			head:         "CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 1000) PRIMARY KEY, note text);",
+			wantErr:      `diff the head against its base: unsupported schema change: column "id" identity sequence differs`,
+		},
+		{
 			name:     "a file the target rejects",
 			approved: "CREATE TABLE orders (id bigint PRIMARY KEY, note no_such_type);",
 			head:     "CREATE TABLE orders (id bigint PRIMARY KEY, note no_such_type);",
@@ -251,9 +253,16 @@ func TestEngineCompareSchemaFileChangeRejectsFilesItCannotRun(t *testing.T) {
 			if tt.approved != "" {
 				caseApproved = tt.approved
 			}
+			approvedBase, headBase := base, base
+			if tt.approvedBase != "" {
+				approvedBase = tt.approvedBase
+			}
+			if tt.headBase != "" {
+				headBase = tt.headBase
+			}
 			resp, err := eng.CompareSchemaFileChange(t.Context(), &ternv1.CompareSchemaFileChangeRequest{
 				Database: "compare_reject_test", Type: "postgres", Environment: "test",
-				ApprovedBase: base, Approved: caseApproved, HeadBase: base, Head: tt.head,
+				ApprovedBase: approvedBase, Approved: caseApproved, HeadBase: headBase, Head: tt.head,
 			})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
