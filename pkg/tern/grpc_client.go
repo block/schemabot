@@ -1586,7 +1586,7 @@ type undispatchedTerminalization struct {
 
 // stopUndispatchedTerminalization is how a stop settles undispatched work. A
 // stop is resumable on database types that can pause a change and terminal on
-// those that cannot, so the states follow stopTerminatesChange.
+// those that cannot, so the states follow StopTerminatesChange.
 func stopUndispatchedTerminalization(databaseType string) undispatchedTerminalization {
 	terminalization := undispatchedTerminalization{
 		taskState:        state.Task.Stopped,
@@ -1596,7 +1596,7 @@ func stopUndispatchedTerminalization(databaseType string) undispatchedTerminaliz
 		verb:             "stopped",
 		controlOperation: storage.ControlOperationStop,
 	}
-	if stopTerminatesChange(databaseType) {
+	if StopTerminatesChange(databaseType) {
 		terminalization.taskState = state.Task.Cancelled
 		terminalization.applyState = state.Apply.Cancelled
 		terminalization.operationState = state.ApplyOperation.Cancelled
