@@ -47,8 +47,6 @@ const (
 	retryableRecoveryFreshnessDays = 1
 )
 
-const applyTargetLockReleaseTimeout = 5 * time.Second
-
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
 	db         *rebindDB
@@ -376,54 +374,11 @@ func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedl
 }
 
 func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, conn *rebindConn, lockName, operation string) {
-	if conn == nil {
-		return
-	}
-
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
-	defer cancel()
-
-	released, err := locker.Release(releaseCtx, conn.lockerConn(), lockName)
-	switch {
-	case err != nil:
-		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", err)
-		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-	case !released:
-		slog.WarnContext(releaseCtx, "apply target lock was not held by this session; discarding connection",
-			"operation", operation,
-			"lock", lockName)
-		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-	}
-
-	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-}
-
-// discardApplyTargetLockConn marks the pinned connection as bad so the pool
-// destroys it instead of reusing a session whose advisory-lock state is
-// uncertain.
-func discardApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	if err := conn.discardBadConn(); err != nil {
-		slog.WarnContext(ctx, "failed to discard apply target lock connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", err)
-	}
+	releaseLockConn(ctx, locker, conn, lockName, "apply target lock", "operation", operation, "lock", lockName)
 }
 
 func closeApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	err := conn.Close()
-	if err == nil || errors.Is(err, sql.ErrConnDone) {
-		// ErrConnDone means the session was already retired by a preceding
-		// discard; there is nothing left to release.
-		return
-	}
-	slog.WarnContext(ctx, "failed to close apply target lock connection",
-		"operation", operation,
-		"lock", lockName,
-		"error", err)
+	closeLockConn(ctx, conn, "apply target lock", "operation", operation, "lock", lockName)
 }
 
 // dedupeDeployments returns the input deployments as a sorted, de-duplicated
