@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -89,7 +90,8 @@ func GetApprovedReviewers(reviews []*ReviewInfo) []string {
 // GetApprovedReviews returns, for each user whose latest decisive review is
 // APPROVED, that approving review, so callers can see which commit each
 // approval was given on. Latest-decisive-review semantics match
-// GetApprovedReviewers.
+// GetApprovedReviewers. Approvals come in the order they were given, so
+// comments that name approvers name them the same way every time.
 func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
 	latest := make(map[string]*ReviewInfo)
 	for _, r := range reviews {
@@ -111,6 +113,12 @@ func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
 			approved = append(approved, r)
 		}
 	}
+	slices.SortFunc(approved, func(a, b *ReviewInfo) int {
+		if c := a.SubmittedAt.Compare(b.SubmittedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(strings.ToLower(a.User), strings.ToLower(b.User))
+	})
 	return approved
 }
 

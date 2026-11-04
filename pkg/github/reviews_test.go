@@ -177,6 +177,25 @@ func TestGetApprovedReviewsCarriesCommit(t *testing.T) {
 	assert.Equal(t, "bbb222", approvals[0].CommitID)
 }
 
+// Approvals come in the order they were given, with the login breaking ties,
+// so a comment that names several approvers names them the same way each time.
+func TestGetApprovedReviewsOrdersBySubmission(t *testing.T) {
+	now := time.Now()
+	reviews := []*ReviewInfo{
+		{User: "dave", State: ReviewApproved, SubmittedAt: now},
+		{User: "carol", State: ReviewApproved, SubmittedAt: now.Add(-time.Hour)},
+		{User: "Bob", State: ReviewApproved, SubmittedAt: now},
+		{User: "alice", State: ReviewApproved, SubmittedAt: now.Add(-2 * time.Hour)},
+	}
+
+	var users []string
+	for _, approval := range GetApprovedReviews(reviews) {
+		users = append(users, approval.User)
+	}
+
+	assert.Equal(t, []string{"alice", "carol", "Bob", "dave"}, users)
+}
+
 func TestIsTeamMember(t *testing.T) {
 	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 	tests := []struct {

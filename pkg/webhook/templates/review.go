@@ -2,9 +2,13 @@ package templates
 
 import (
 	"fmt"
+	"html"
+	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // ReviewGateData contains data for rendering review gate PR comments.
@@ -28,6 +32,10 @@ type ReviewGateData struct {
 	// ChangedBasePaths have unchanged approved/head content but different
 	// merge-base versions, so they need a base-aware explanation.
 	ChangedBasePaths []string
+	// ChangedStatements show, for changed schema files, the DDL the approved
+	// commit runs beside the DDL the head runs, so the reader can see what
+	// changed without opening either commit.
+	ChangedStatements []ChangedStatements
 	// UncomparedApprovers are authorized reviewers whose approval was given
 	// on an earlier commit the review gate could not compare with the head.
 	UncomparedApprovers []string
@@ -37,21 +45,39 @@ type ReviewGateData struct {
 	DefaultBranch string
 }
 
+// ChangedStatements is the DDL a schema file's change runs at an approved
+// commit and at the head.
+type ChangedStatements struct {
+	Path        string
+	Dialect     schema.Dialect
+	ApprovedSHA string
+	HeadSHA     string
+	// Approved and Head are the statements each commit runs for the file;
+	// empty means the commit runs none.
+	Approved []string
+	Head     []string
+}
+
 // RenderReviewRequired renders a PR comment when the review gate blocks an apply.
 // The database's own operators lead in their own section so the author knows
 // who to ping first; the broader principals follow as an explicit fallback.
 func RenderReviewRequired(data ReviewGateData) string {
-	var sb strings.Builder
+	return renderWithinCommentLimit(changedStatementBlocks(data), 0, func(budget *ddlBlockBudget) string {
+		var sb strings.Builder
 
-	sb.WriteString("## Review Required\n\n")
-	writeDBEnvLine(&sb, data.Database, data.Environment)
-	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+		sb.WriteString("## Review Required\n\n")
+		writeDBEnvLine(&sb, data.Database, data.Environment)
+		writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
-	sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
-	writeChangedApprovers(&sb, data)
-	writeReviewersAndNextSteps(&sb, data)
+		if len(data.ChangedApprovers) == 0 {
+			sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
+		}
+		writeChangedApprovers(&sb, data)
+		writeChangedStatements(&sb, data.ChangedStatements, budget)
+		writeReviewersAndNextSteps(&sb, data)
 
-	return sb.String()
+		return sb.String()
+	})
 }
 
 // RenderReviewGateError renders the PR comment for a review gate that blocks
@@ -60,41 +86,130 @@ func RenderReviewRequired(data ReviewGateData) string {
 // approval of the latest commit needs no check — so the comment names who can
 // give it and what to run next.
 func RenderReviewGateError(data ReviewGateData) string {
-	var sb strings.Builder
+	return renderWithinCommentLimit(changedStatementBlocks(data), 0, func(budget *ddlBlockBudget) string {
+		var sb strings.Builder
 
-	sb.WriteString("## " + glyph.Failed + " Review Gate Error\n\n")
-	writeDBEnvLine(&sb, data.Database, data.Environment)
-	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+		sb.WriteString("## " + glyph.Failed + " Review Gate Error\n\n")
+		writeDBEnvLine(&sb, data.Database, data.Environment)
+		writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
-	fmt.Fprintf(&sb, "\n**This apply needs an approval of the latest commit.** %s approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.\n",
-		mentionList(data.UncomparedApprovers))
-	writeChangedApprovers(&sb, data)
-	writeReviewersAndNextSteps(&sb, data)
+		writeUncomparedApprovers(&sb, data.UncomparedApprovers)
+		writeChangedApprovers(&sb, data)
+		writeChangedStatements(&sb, data.ChangedStatements, budget)
+		writeReviewersAndNextSteps(&sb, data)
 
-	return sb.String()
+		return sb.String()
+	})
 }
 
-// writeChangedApprovers says which approvals no longer count. A PR that
-// targets a branch other than the default also learns that changes reaching
-// its base branch count as a change, since only default branch content is
-// trusted to have had its own review.
+// writeUncomparedApprovers says who approved an earlier commit the gate could
+// not compare with the head, and why that approval does not count.
+func writeUncomparedApprovers(sb *strings.Builder, approvers []string) {
+	commits, approvals := "an earlier commit", "that approval does"
+	if len(approvers) > 1 {
+		commits, approvals = "earlier commits", "those approvals do"
+	}
+	fmt.Fprintf(sb, "\n**This apply needs an approval of the latest commit.** %s approved %s. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so %s not count. Operators can find the error in the server logs.\n",
+		joinWithAnd(mentions(approvers)), commits, approvals)
+}
+
+// writeChangedApprovers says who approved an earlier commit, what changed
+// since, and that those approvals no longer count. A PR that targets a branch
+// other than the default also learns that changes reaching its base branch
+// count as a change, since only default branch content is trusted to have had
+// its own review.
 func writeChangedApprovers(sb *strings.Builder, data ReviewGateData) {
 	if len(data.ChangedApprovers) == 0 {
 		return
 	}
-	fmt.Fprintf(sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s.",
-		mentionList(data.ChangedApprovers))
-	if len(data.ChangedPaths) > 0 {
-		fmt.Fprintf(sb, " Changed since the approval: %s.", strings.Join(inlineCodeList(data.ChangedPaths), ", "))
+	plural := len(data.ChangedApprovers) > 1
+	commits, approvals, count := "an earlier commit", "That approval", "counts"
+	if plural {
+		commits, approvals, count = "earlier commits", "Those approvals", "count"
+	}
+	who := joinWithAnd(mentions(data.ChangedApprovers))
+
+	fmt.Fprintf(sb, "\n%s approved %s", who, commits)
+	switch {
+	case len(data.ChangedPaths) > 0:
+		fmt.Fprintf(sb, ", but %s.", changedPathsClause(data.ChangedPaths))
+	case len(data.ChangedBasePaths) == 0:
+		sb.WriteString(", but this PR's schema change is different now.")
+	default:
+		sb.WriteString(".")
 	}
 	if len(data.ChangedBasePaths) > 0 {
-		fmt.Fprintf(sb, " Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: %s.", strings.Join(inlineCodeList(data.ChangedBasePaths), ", "))
+		fmt.Fprintf(sb, " %s", changedBaseClause(data.ChangedBasePaths))
 	}
 	if targetsOtherThanDefaultBranch(data) {
-		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` count as a change too.",
+		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` also count as changes to this PR.",
 			data.BaseRef, data.DefaultBranch, data.BaseRef)
 	}
-	sb.WriteString(" Ask for an approval of the latest commit.\n")
+	fmt.Fprintf(sb, " %s no longer %s, so the latest commit needs a new approval.\n", approvals, count)
+}
+
+// changedPathsClause says the PR changes paths differently than it did when
+// it was approved.
+func changedPathsClause(paths []string) string {
+	if len(paths) == 1 {
+		return "this PR's change to " + inlineCodeList(paths)[0] + " is different now"
+	}
+	return "this PR's changes to " + joinWithAnd(inlineCodeList(paths)) + " are different now"
+}
+
+// changedBaseClause says paths are unchanged since the approval but now build
+// on a different version of the base branch, so they run different DDL.
+func changedBaseClause(paths []string) string {
+	names := joinWithAnd(inlineCodeList(paths))
+	if len(paths) == 1 {
+		return names + " has not changed since then, but the base branch it builds on has, so applying it now would run different DDL."
+	}
+	return names + " have not changed since then, but the base branch they build on has, so applying them now would run different DDL."
+}
+
+// changedStatementBlocks counts the DDL blocks writeChangedStatements takes
+// from the budget: one per commit that runs DDL for a changed file.
+func changedStatementBlocks(data ReviewGateData) int {
+	blocks := 0
+	for _, change := range data.ChangedStatements {
+		for _, stmts := range [][]string{change.Approved, change.Head} {
+			if len(stmts) > 0 {
+				blocks++
+			}
+		}
+	}
+	return blocks
+}
+
+// writeChangedStatements folds, per changed schema file, the DDL the approved
+// commit runs and the DDL the head runs into a collapsed block, so the reader
+// can expand it to see exactly what differs.
+func writeChangedStatements(sb *strings.Builder, changes []ChangedStatements, budget *ddlBlockBudget) {
+	for _, change := range changes {
+		// GitHub renders <summary> content as HTML, not markdown, so the
+		// path goes in a <code> tag and is escaped as HTML.
+		fmt.Fprintf(sb, "\n<details>\n<summary>How <code>%s</code> changed since the approval</summary>\n\n",
+			html.EscapeString(flattenIdentifier(change.Path)))
+		writeCommitStatements(sb, "Approved at "+inlineCode(shortSHA(change.ApprovedSHA)), change.Dialect, change.Approved, budget)
+		sb.WriteString("\n")
+		writeCommitStatements(sb, "Latest commit "+inlineCode(shortSHA(change.HeadSHA)), change.Dialect, change.Head, budget)
+		sb.WriteString("\n</details>\n")
+	}
+}
+
+// writeCommitStatements writes the DDL one commit runs for a schema file
+// under label, or says it runs none.
+func writeCommitStatements(sb *strings.Builder, label string, dialect schema.Dialect, stmts []string, budget *ddlBlockBudget) {
+	if len(stmts) == 0 {
+		fmt.Fprintf(sb, "%s runs no DDL for this file.\n", label)
+		return
+	}
+	fmt.Fprintf(sb, "%s:\n\n", label)
+	formatted := make([]string, 0, len(stmts))
+	for _, stmt := range stmts {
+		formatted = append(formatted, ddl.FormatDDLForDialect(dialect, stmt))
+	}
+	writeSQLFencedBlocks(sb, formatted, budget)
 }
 
 // targetsOtherThanDefaultBranch reports whether the PR is known to target a
@@ -122,11 +237,14 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 	}
 
 	sb.WriteString("\n### Next steps\n")
+	earlierApprovers := slices.Concat(data.UncomparedApprovers, data.ChangedApprovers)
 	switch {
-	case len(data.UncomparedApprovers) > 0 && (hasOperators || hasOthers):
-		sb.WriteString("1. Ask anyone listed above to approve the latest commit\n")
-	case len(data.UncomparedApprovers) > 0:
-		sb.WriteString("1. Ask a database operator or admin to approve the latest commit\n")
+	case len(earlierApprovers) > 0 && (hasOperators || hasOthers):
+		// Whoever approved an earlier commit already knows the change, so
+		// they lead.
+		fmt.Fprintf(sb, "1. Ask %s to approve the latest commit\n", joinWithOr(append(mentions(earlierApprovers), "anyone listed above")))
+	case len(earlierApprovers) > 0:
+		fmt.Fprintf(sb, "1. Ask %s to approve the latest commit\n", joinWithOr(append(mentions(earlierApprovers), "another authorized reviewer")))
 	case hasOperators || hasOthers:
 		sb.WriteString("1. Request a review from anyone listed above\n")
 	default:
@@ -144,11 +262,19 @@ func writeMentionList(sb *strings.Builder, logins []string) {
 	}
 }
 
-// mentionList renders logins as comma-separated @-mentions.
-func mentionList(logins []string) string {
-	mentions := make([]string, 0, len(logins))
+// mentions renders each login as an @-mention.
+func mentions(logins []string) []string {
+	out := make([]string, 0, len(logins))
 	for _, login := range logins {
-		mentions = append(mentions, "@"+login)
+		out = append(out, "@"+login)
 	}
-	return strings.Join(mentions, ", ")
+	return out
+}
+
+// joinWithOr joins items as prose: "a", "a or b", "a, b or c".
+func joinWithOr(items []string) string {
+	if len(items) <= 1 {
+		return strings.Join(items, "")
+	}
+	return strings.Join(items[:len(items)-1], ", ") + " or " + items[len(items)-1]
 }
