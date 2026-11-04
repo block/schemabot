@@ -303,7 +303,7 @@ type ShutdownHalter interface {
 	HaltForShutdown(ctx context.Context) error
 }
 
-// DriverCapacity is the drivers a deployment's live operator servers run.
+// DriverCapacity is the drivers a deployment's live servers run.
 type DriverCapacity struct {
 	// LiveServers is how many of the deployment's servers reported their
 	// drivers within its live window.

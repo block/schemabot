@@ -440,28 +440,28 @@ func TestServerRegisterGRPCThreadsStorageSchemaService(t *testing.T) {
 	}
 }
 
-// operatorServersStorage is storage whose operator servers registry answers
+// driverPoolsStorage is storage whose driver pools answer
 // ListLive with fixed servers.
-type operatorServersStorage struct {
+type driverPoolsStorage struct {
 	storage.Storage
-	servers []*storage.OperatorServer
+	servers []*storage.DriverPool
 }
 
-func (s operatorServersStorage) OperatorServers() storage.OperatorServerStore {
-	return liveOperatorServers{servers: s.servers}
+func (s driverPoolsStorage) DriverPools() storage.DriverPoolStore {
+	return liveDriverPools{servers: s.servers}
 }
 
-type liveOperatorServers struct {
-	storage.OperatorServerStore
-	servers []*storage.OperatorServer
+type liveDriverPools struct {
+	storage.DriverPoolStore
+	servers []*storage.DriverPool
 }
 
-func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServer, error) {
+func (s liveDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
 	return s.servers, nil
 }
 
 // A control plane checks a deferred apply against what this instance reports
-// over gRPC, so the registration an embedder gets reports the live operator servers of
+// over gRPC, so the registration an embedder gets reports the live servers of
 // its own storage and the max_drivers_per_apply its own drivers run one apply
 // under, the default when the config leaves it unset.
 func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
@@ -476,7 +476,7 @@ func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logger := slog.New(slog.DiscardHandler)
 			cfg := &api.ServerConfig{MaxDriversPerApply: tc.maxDriversPerApply}
-			store := operatorServersStorage{servers: []*storage.OperatorServer{
+			store := driverPoolsStorage{servers: []*storage.DriverPool{
 				{ServerID: "host-a/1/operator", Drivers: 4},
 			}}
 			srv := &Server{

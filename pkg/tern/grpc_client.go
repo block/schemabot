@@ -1745,7 +1745,7 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// DriverCapacity reads the drivers the deployment's live operator servers run.
+// DriverCapacity reads the drivers the deployment's live servers run.
 // It returns nil without an error when the deployment answers Unimplemented,
 // which a deployment running an older SchemaBot does.
 func (c *GRPCClient) DriverCapacity(ctx context.Context) (*DriverCapacity, error) {

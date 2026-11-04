@@ -4201,7 +4201,7 @@ func (*DriverCapacityRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{41}
 }
 
-// DriverCapacityResponse is the drivers a deployment's live operator servers
+// DriverCapacityResponse is the drivers a deployment's live servers
 // run, counted from the servers that reported within the live window.
 type DriverCapacityResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`

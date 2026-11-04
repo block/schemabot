@@ -233,7 +233,7 @@ func (s *Service) deferredCutoverDataPlaneRefusal(ctx context.Context, plan *sto
 				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
 				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 				"deployment", deployment, "operations", operations, "max_drivers_per_apply", refused.PerApplyCap,
-				"drivers", refused.Drivers, "live_operator_servers", refused.LiveServers)
+				"drivers", refused.Drivers, "live_servers", refused.LiveServers)
 			refused.Database = plan.Database
 			refused.Environment = environment
 			refused.Deployment = deployment

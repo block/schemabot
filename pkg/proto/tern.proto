@@ -1111,7 +1111,7 @@ message HealthResponse {
 // DriverCapacityRequest asks a deployment for the drivers its operators run.
 message DriverCapacityRequest {}
 
-// DriverCapacityResponse is the drivers a deployment's live operator servers
+// DriverCapacityResponse is the drivers a deployment's live servers
 // run, counted from the servers that reported within the live window.
 message DriverCapacityResponse {
   // live_servers is how many of the deployment's servers reported their

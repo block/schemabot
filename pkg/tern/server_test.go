@@ -368,15 +368,15 @@ func TestServerHealthDoesNotLogWhenHealthy(t *testing.T) {
 	assert.Empty(t, logs.String())
 }
 
-// liveOperatorServers is an operator servers registry that answers ListLive
+// liveDriverPools is a driver pool store that answers ListLive
 // with fixed servers, or with err.
-type liveOperatorServers struct {
-	storage.OperatorServerStore
-	servers []*storage.OperatorServer
+type liveDriverPools struct {
+	storage.DriverPoolStore
+	servers []*storage.DriverPool
 	err     error
 }
 
-func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServer, error) {
+func (s liveDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
 	return s.servers, s.err
 }
 
@@ -385,7 +385,7 @@ func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServe
 // may hold a deferred cutover (all but the one each server keeps for other
 // work), and the max_drivers_per_apply it runs one apply under.
 func TestDriverCapacitySumsTheLiveServersDrivers(t *testing.T) {
-	servers := liveOperatorServers{servers: []*storage.OperatorServer{
+	servers := liveDriverPools{servers: []*storage.DriverPool{
 		{ServerID: "host-a/1/operator", Drivers: 4},
 		{ServerID: "host-b/1/operator", Drivers: 6},
 		{ServerID: "host-c/1/operator", Drivers: 1},
@@ -411,13 +411,13 @@ func TestDriverCapacityIsNilWhenTheDeploymentDoesNotReportIt(t *testing.T) {
 	assert.Nil(t, capacity)
 }
 
-// A deployment that cannot read its own operator servers registry answers
+// A deployment that cannot read its own driver pools answers
 // Unavailable, which the client returns as an error, so apply creation refuses
 // a deferred apply with that error rather than admitting it against an
 // unknown capacity. Health is unaffected, so the deployment keeps serving
 // every apply that does not defer its cutover.
-func TestDriverCapacityFailsWhenTheRegistryCannotBeRead(t *testing.T) {
-	servers := liveOperatorServers{err: errors.New("read operator servers: connection refused")}
+func TestDriverCapacityFailsWhenDriverPoolsCannotBeRead(t *testing.T) {
+	servers := liveDriverPools{err: errors.New("read driver pools: connection refused")}
 	server := NewServer(healthErrorClient{}, slog.Default(), WithDriverCapacity(servers, 2))
 	client := newRetryTestClient(t, server)
 
