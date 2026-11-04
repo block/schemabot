@@ -127,6 +127,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
+	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, rolloutMemberNoun(groups))
 
 	// Flat per-deployment summary (always visible — survives any later size
 	// trimming of the detail sections).
@@ -164,13 +165,13 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
 	if g, ok := presentation.SoleTargetRollout(groups); ok {
-		writeTargetRolloutStatus(&sb, data, g)
 		writeTargetRolloutSummaryDetails(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		return sb.String()
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
+	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, rolloutMemberNoun(groups))
 
 	writeDeploymentSummaryList(&sb, data.Model, groups)
 
@@ -189,19 +190,36 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 }
 
 // writeTargetRolloutSummaryDetails writes a sole multi-target deployment's
-// rolled-up table lines in its final summary. A completed rollout folds them
-// into the same "Apply details" block a single-target completed summary uses,
-// since nothing in them needs the reader's attention; any other outcome leaves
-// them open so the failed or unfinished targets stay in view.
+// final summary body. A completed rollout folds its rolled-up table lines into
+// the same "Apply details" block a single-target completed summary uses, since
+// nothing in them needs the reader's attention, and the block's label carries
+// the outcome in place of a status line: "Apply details (2 tables done on 4
+// targets)". Any other outcome leaves the status line and the table lines open
+// so the failed or unfinished targets stay in view.
 func writeTargetRolloutSummaryDetails(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
 	tables := targetRolloutTables(data, g)
 	if !state.IsState(data.Model.State, state.Apply.Completed) || len(tables) == 0 {
+		writeTargetRolloutStatus(sb, data, g)
 		writeTargetRollup(sb, data, g, budget)
 		return
 	}
-	fmt.Fprintf(sb, "<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(ApplyStatusCommentData{Tables: tables}))
+	fmt.Fprintf(sb, "\n<details><summary>Apply details (%s)</summary>\n\n", completedTargetRolloutOutcome(data, g, tables))
 	writeTargetRollup(sb, data, g, budget)
 	sb.WriteString("</details>\n")
+}
+
+// completedTargetRolloutOutcome states a completed multi-target rollout in the
+// words its table-step headline uses once every table is done: "2 tables done
+// on 4 targets", or "rolled back" for a rollback. A target that already had
+// the change ran no table, so it is not counted.
+func completedTargetRolloutOutcome(data MultiDeploymentApplyData, g presentation.Group, tables []TableProgressData) string {
+	verb := "done"
+	if data.Rollback {
+		verb = "rolled back"
+	}
+	progress := data.Model.TargetProgress(g)
+	changing := progress.Total - progress.AlreadyHad
+	return fmt.Sprintf("%d %s %s on %s", len(tables), pluralize(progressUnit(tables), len(tables)), verb, presentation.TargetNoun.Count(changing))
 }
 
 // targetRolloutTables is one row per rolled-up line of a target rollout, so
@@ -234,6 +252,7 @@ func writeTargetRolloutStatus(sb *strings.Builder, data MultiDeploymentApplyData
 	}
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
+	writeStoppedAtCutoverNote(sb, data.Model.Deployments, targetNoun)
 	sb.WriteString("\n")
 }
 
@@ -357,6 +376,27 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
 }
 
+// writeStoppedAtCutoverNote explains, under the first failure, the members
+// SchemaBot stopped at the cutover because that failure meant the cutover
+// could never run, and that applying again resumes their saved copies. It
+// writes nothing when no member was stopped at the cutover.
+func writeStoppedAtCutoverNote(sb *strings.Builder, deps []presentation.Deployment, noun presentation.Noun) {
+	note := presentation.StoppedAtCutoverOf(deps).Note(noun, summaryCode)
+	if note == "" {
+		return
+	}
+	fmt.Fprintf(sb, "\n> ⏹️ %s\n", note)
+}
+
+// rolloutMemberNoun is what the rollout's counts call its members: targets
+// when a deployment addresses several of them, deployments otherwise.
+func rolloutMemberNoun(groups []presentation.Group) presentation.Noun {
+	if hasMultiTargetGroup(groups) {
+		return targetNoun
+	}
+	return deploymentNoun
+}
+
 // writeRolloutFooter writes the rollout's footer at the bottom, where the
 // single-deployment comment keeps its footer: every control command addresses
 // the whole apply. A pending rollup action leads; otherwise the footer is the
@@ -456,11 +496,11 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		// and offering the command would contradict that.
 		if !rolloutOptions(data.Details).DeferCutover {
 			sb.WriteString("\n---\n\n")
-			fmt.Fprintf(sb, "SchemaBot will cut over %s next — no action needed.\n", inlineCode(na.Name))
+			fmt.Fprintf(sb, "SchemaBot will run the cutover for %s next — no action needed.\n", inlineCode(na.Name))
 			return
 		}
 		writeFooterAction(sb,
-			fmt.Sprintf("To cut over %s:", inlineCode(na.Name)),
+			fmt.Sprintf("To run the cutover for %s:", inlineCode(na.Name)),
 			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))

@@ -33,6 +33,7 @@ import (
 type mockStorage struct {
 	pingErr       error
 	webhookEvents storage.WebhookEventStore
+	driverPools   memoryDriverPools
 }
 
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
@@ -47,8 +48,70 @@ func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
 func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
-func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
-func (m *mockStorage) Close() error                                 { return nil }
+func (m *mockStorage) DriverPools() storage.DriverPoolStore {
+	return &m.driverPools
+}
+func (m *mockStorage) Ping(ctx context.Context) error { return m.pingErr }
+func (m *mockStorage) Close() error                   { return nil }
+
+// memoryDriverPools is an in-memory driver pool store whose
+// heartbeats are always live. With hang set, a heartbeat answers only when its
+// context ends, as a storage call that stops responding would. With pruneErr
+// or listErr set, every prune or list fails with it.
+type memoryDriverPools struct {
+	mu       sync.Mutex
+	servers  map[string]storage.DriverPool
+	beats    int
+	prunes   int
+	hang     bool
+	pruneErr error
+	listErr  error
+}
+
+func (m *memoryDriverPools) Heartbeat(ctx context.Context, server *storage.DriverPool) error {
+	m.mu.Lock()
+	hang := m.hang
+	m.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return fmt.Errorf("heartbeat %s: %w", server.ServerID, ctx.Err())
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.servers == nil {
+		m.servers = map[string]storage.DriverPool{}
+	}
+	m.servers[server.ServerID] = *server
+	m.beats++
+	return nil
+}
+
+func (m *memoryDriverPools) PruneStale(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prunes++
+	return m.pruneErr
+}
+
+func (m *memoryDriverPools) Deregister(_ context.Context, serverID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.servers, serverID)
+	return nil
+}
+
+func (m *memoryDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	servers := make([]*storage.DriverPool, 0, len(m.servers))
+	for _, server := range m.servers {
+		servers = append(servers, &server)
+	}
+	return servers, nil
+}
 
 type mockPlanLookupStore struct {
 	plan *storage.Plan
@@ -151,19 +214,24 @@ func (m *mockStorageWithApplyStores) ApplyOperations() storage.ApplyOperationSto
 // the bare interface. Embedding the interface alone leaves every method a double
 // does not implement as a nil call, which is the behavior wanted for a method
 // the scenario never reaches — it fails loudly. The handback a drive performs on
-// its way out is the exception: every drive makes that call, so with a bare
-// interface every double would have to implement it, and any that did not would
-// panic inside the drive's own recovery rather than fail its test.
+// its way out, and the requeue for a pending start it performs on its way in,
+// are the exceptions: every drive makes those calls, so with a bare interface
+// every double would have to implement them, and any that did not would panic
+// inside the drive rather than fail its test.
 //
-// The default reports nothing cleared, which is what a real store returns when
-// no row is in an ended state under the drive's lease. A double whose scenario
-// turns on the handback overrides it.
+// The defaults report nothing cleared and nothing requeued, which is what a
+// real store returns when no row is in an ended state under the drive's lease
+// and no start is pending. A double whose scenario turns on either overrides it.
 type stubApplyOperationStore struct {
 	storage.ApplyOperationStore
 }
 
 func (stubApplyOperationStore) ReleaseFinishedClaim(context.Context, storage.OperationLease) (bool, error) {
 	return false, nil
+}
+
+func (stubApplyOperationStore) RequeueNeverStartedForStartByApply(context.Context, int64) (int64, error) {
+	return 0, nil
 }
 
 type staticApplyOperationStore struct {
@@ -447,6 +515,7 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 			existing.ErrorMessage = ""
 			existing.Metadata = append(existing.Metadata[:0], req.Metadata...)
 			existing.CompletedAt = nil
+			existing.Revision++
 			return cloneControlRequest(existing), false, nil
 		}
 	}
@@ -455,6 +524,23 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 	stored.ID = s.nextID
 	s.requests = append(s.requests, stored)
 	return cloneControlRequest(stored), false, nil
+}
+
+func (s *memoryControlRequestStore) RequestPendingCommand(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	commandID, err := req.ControlCommandID()
+	if err != nil {
+		return nil, false, err
+	}
+	existing, err := s.GetByOperation(ctx, req.ApplyID, req.Operation)
+	if err != nil {
+		return nil, false, err
+	}
+	if settled, err := existing.SettledByControlCommand(commandID); err != nil {
+		return nil, false, err
+	} else if settled {
+		return existing, false, nil
+	}
+	return s.RequestPending(ctx, req)
 }
 
 func (s *memoryControlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
@@ -513,6 +599,22 @@ func (s *memoryControlRequestStore) FailPending(_ context.Context, applyID int64
 		}
 	}
 	return nil
+}
+
+func (s *memoryControlRequestStore) SettlePendingRevision(_ context.Context, target *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, req := range s.requests {
+		if req.ID != target.ID || req.Revision != target.Revision || req.Status != storage.ControlRequestPending {
+			continue
+		}
+		req.Status = status
+		if status == storage.ControlRequestFailed {
+			req.ErrorMessage = errorMessage
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func cloneControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
@@ -678,7 +780,15 @@ func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) er
 	return nil
 }
 
-func (s *capturingApplyStore) ExpireRetryable(context.Context, int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *capturingApplyStore) ExpireRetryable(context.Context, []string, int) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) ListAppliesHeldByEndedOperation(context.Context, []string, int) ([]*storage.EndedOperationApply, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) SettleAppliesStoppedForEndedOperation(context.Context, int) ([]*storage.EndedOperationApply, error) {
 	return nil, nil
 }
 
@@ -714,7 +824,7 @@ func (s *queuedOperationClaimStore) FindNextApplyOperationCutover(context.Contex
 	return nil, nil
 }
 
-func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, owner string, _ ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
 	s.applies.mu.Lock()
 	findCh := s.applies.findCh
 	s.applies.mu.Unlock()

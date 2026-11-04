@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/presentation"
@@ -102,7 +103,7 @@ func singleOpDisplay(ops []*storage.ApplyOperation, displayByOp map[int64]operat
 func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant, cliName string) templates.MultiDeploymentApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 
-	model := deriveApplyPresentation(ops, tasksByOp, released)
+	model := deriveApplyPresentation(apply.State, ops, tasksByOp, released)
 	// Derive returns one presentation per rollout member, so the details are
 	// built member by member and consumed positionally. A deployment can own
 	// several members, which a name-keyed map could not tell apart. A
@@ -142,15 +143,46 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 // presentation inputs and derives the rollup. Rows are already in resolved order.
 // released is the apply-level release latch applied to every operation.
 // tasksByOp marks a row retrying while one of its tasks retries a failure, the
-// task evidence the cutover claim holds a later member on.
-func deriveApplyPresentation(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, released bool) presentation.Apply {
+// task evidence the cutover claim holds a later member on. applyState is the
+// apply's own state, so a resuming apply's still-stopped rows read as the
+// start under way (presentation.ResumeClaimed).
+func deriveApplyPresentation(applyState string, ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, released bool) presentation.Apply {
 	inputs := make([]presentation.Operation, 0, len(ops))
+	endedBy := endedByRefs(ops)
 	for _, op := range ops {
 		input := applyOperationToPresentation(op, released)
 		input.Retrying = storage.TasksRetrying(tasksByOp[op.ID])
+		input.EndedBy = endedBy[op.ID]
 		inputs = append(inputs, input)
 	}
-	return presentation.Derive(inputs)
+	return presentation.Derive(presentation.ResumeClaimed(applyState, inputs))
+}
+
+// endedByRefs maps each row failed for another row of the apply
+// (ended_by_operation_id) to that row's deployment and operation key, the
+// reference presentation resolves to a member name. A row the apply does not
+// list maps to an empty reference, which still reads as stopped at the
+// cutover without naming the row that ended.
+func endedByRefs(ops []*storage.ApplyOperation) map[int64]*presentation.OperationRef {
+	byID := make(map[int64]*storage.ApplyOperation, len(ops))
+	for _, op := range ops {
+		byID[op.ID] = op
+	}
+	refs := make(map[int64]*presentation.OperationRef)
+	for _, op := range ops {
+		if op.EndedByOperationID == 0 {
+			continue
+		}
+		ended, ok := byID[op.EndedByOperationID]
+		if !ok {
+			slog.Warn("apply comment names no operation for a row failed for another: the ended operation is not listed",
+				append(op.LogAttrs(), "ended_by_operation_id", op.EndedByOperationID)...)
+			refs[op.ID] = &presentation.OperationRef{}
+			continue
+		}
+		refs[op.ID] = &presentation.OperationRef{Deployment: ended.Deployment, OperationKey: ended.OperationKey}
+	}
+	return refs
 }
 
 // applyOperationToPresentation maps one storage operation row to the neutral

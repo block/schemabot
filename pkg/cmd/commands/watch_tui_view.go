@@ -128,8 +128,11 @@ func (m WatchModel) progressSections() (string, string) {
 	}
 
 	if m.sharded {
-		if counts := templates.ShardCounts(m.operations, m.tables, m.released); counts != "" {
+		if counts := templates.ShardCounts(m.state, m.operations, m.tables, m.released); counts != "" {
 			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
+		}
+		if note := templates.ShardedStoppedAtCutoverNote(m.state, m.operations, m.tables, m.released); note != "" {
+			fmt.Fprintf(&b, "  ⏹️ %s\n", note)
 		}
 	}
 

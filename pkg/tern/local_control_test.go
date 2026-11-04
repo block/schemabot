@@ -673,7 +673,7 @@ func TestLocalClient_CutoverRequiresEngineResumeState(t *testing.T) {
 	eng := &controlValidatingCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
 
-	_, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "")
+	_, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "", false)
 
 	require.ErrorContains(t, err, "no active schema change")
 	assert.Nil(t, eng.cutoverReq, "cutover should not call the engine without resume state")
@@ -731,7 +731,7 @@ func TestLocalClient_CutoverRequiresCompleteEngineResumeState(t *testing.T) {
 			resumeState := maybeEngineResumeStateFromPlanetScaleData(operationID, tc.resumeData)
 			client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-			_, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "")
+			_, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "", false)
 
 			require.ErrorContains(t, err, "cutover control resume state is incomplete")
 			require.ErrorContains(t, err, tc.missingPart)
@@ -764,7 +764,7 @@ func TestLocalClient_CutoverPassesEngineResumeState(t *testing.T) {
 	eng := &controlCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-	resp, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "")
+	resp, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "", false)
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)

@@ -148,3 +148,44 @@ func TestChangesCovered(t *testing.T) {
 		})
 	}
 }
+
+// An ADD CONSTRAINT ... USING INDEX or a VALIDATE CONSTRAINT names only the
+// index or constraint it takes over, so the approved commit and the head can
+// generate the same statement over different live definitions. Approval
+// covers the definition that was reviewed, not the name, and the reason
+// names both definitions so the reviewer sees what moved.
+func TestChangesCoveredComparesAdoptedAndValidatedDefinitions(t *testing.T) {
+	const (
+		adopt    = `ALTER TABLE "public"."orders" ADD CONSTRAINT "orders_pkey" PRIMARY KEY USING INDEX "orders_id_idx"`
+		validate = `ALTER TABLE "public"."orders" VALIDATE CONSTRAINT "orders_total_check"`
+		idxA     = `CREATE UNIQUE INDEX orders_id_idx ON orders USING btree (id)`
+		idxB     = `CREATE UNIQUE INDEX orders_id_idx ON orders USING btree (id, placed_at)`
+		chkA     = `CHECK ((total >= 0)) NOT VALID`
+		chkB     = `CHECK ((total > 0)) NOT VALID`
+	)
+	adopting := func(def string) schemadiff.Change {
+		return schemadiff.Change{SQL: adopt, Adopts: &schemadiff.IndexAdoption{Index: "orders_id_idx", Def: def}}
+	}
+	validating := func(def string) schemadiff.Change {
+		return schemadiff.Change{SQL: validate, Validates: &schemadiff.ConstraintValidation{Constraint: "orders_total_check", Def: def}}
+	}
+	tests := []struct {
+		name           string
+		approved, head schemadiff.Change
+		want           bool
+	}{
+		{name: "the same index adopted", approved: adopting(idxA), head: adopting(idxA), want: true},
+		{name: "another index definition behind the same adoption", approved: adopting(idxA), head: adopting(idxB)},
+		{name: "the same constraint validated", approved: validating(chkA), head: validating(chkA), want: true},
+		{name: "another constraint definition behind the same validation", approved: validating(chkA), head: validating(chkB)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := changesCovered([]schemadiff.Change{tt.approved}, []schemadiff.Change{tt.head}, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+	assert.Equal(t, []string{adopt + " adopting " + idxB}, changeSQL([]schemadiff.Change{adopting(idxB)}))
+	assert.Equal(t, []string{validate + " validating " + chkB}, changeSQL([]schemadiff.Change{validating(chkB)}))
+}

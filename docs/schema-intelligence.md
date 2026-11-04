@@ -330,7 +330,9 @@ A database whose environment lists `targets` addresses several targets at once,
 and each holds its own schema. There is no single live schema to return, so a
 pull returns the primary target's — the one a caller materializes — plus a
 `targets` array naming every target the environment addresses and how each of
-the others differs from the primary.
+the others differs from the primary. Where targets hold different namespaces,
+each namespace comes from the first target holding it; see
+[targets that hold different namespaces](#targets-that-hold-different-namespaces).
 
 ```sh
 schemabot pull -d shop -e production
@@ -377,9 +379,9 @@ Content-Type: application/json
 </details>
 
 Read the array as the environment's whole member set. Exactly one entry carries
-`"primary": true`, and it is the target whose schema is in `namespaces`; it
-never carries `diverged_tables`, because it is the baseline the others are
-compared against. A reconciling caller can take the member set straight from
+`"primary": true`, and it is the target whose schema is in `namespaces` for
+every namespace it holds; it never carries `diverged_tables`, because it is the
+baseline the others are compared against. A reconciling caller can take the member set straight from
 this array rather than deriving it from target names.
 
 `difference` is one of:
@@ -387,7 +389,7 @@ this array rather than deriving it from target names.
 | Value | Meaning |
 |---|---|
 | `differs` | both targets hold the table, with different DDL |
-| `only_on_primary` | only the primary target holds the table |
+| `only_on_primary` | only the baseline target holds the table: the primary, or for a namespace the primary does not hold, the first target holding it |
 | `only_on_target` | only this target holds the table |
 
 An empty `diverged_tables` means the two targets genuinely agree. It never means
@@ -401,12 +403,71 @@ indexes in a different order are reported as `differs`. The comparison errs
 toward reporting: it will send you to look at a table that turns out to agree,
 but it will not call two different schemas equal.
 
+#### Targets that hold different namespaces
+
 A target whose entry [selects namespaces](configuration.md#selecting-namespaces-per-target)
-is pulled for exactly those namespaces, by name, and an explicitly requested
-namespace it does not select is left out of its pull. When every entry of the
-environment selects namespaces, a requested namespace none of them selects is
-rejected with `400` naming it and the selectable ones, rather than answered
-with an empty schema:
+holds exactly those, and is pulled for them by name; an entry selecting nothing
+holds every namespace. Each namespace in `namespaces` comes from its baseline
+target, the first target in rollout order holding it, and every later target
+holding the namespace is compared with that baseline. A target is compared only
+on the namespaces it holds, so a shard target is never reported as missing the
+unsharded schema. Each entry in `targets` carries the `namespaces` its entry
+selects, omitted when it selects none.
+
+Here `shop` sits on `shop-001`, one shard schema sits on each of `shop-002` and
+`shop-003`, and `shop-004` holds a second copy of `shop_0`:
+
+```sh
+schemabot pull -d shop -e production
+```
+
+```sql
+-- Target `shop-001` — primary target, schema below for `shop`
+-- Target `shop-002` — schema below for `shop_0`
+-- Target `shop-003` — schema below for `shop_1`
+-- Target `shop-004` — 1 table differs from the schema below
+--   shop_0.line_items: differs
+```
+
+<details>
+<summary>API equivalent</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production"}
+```
+
+```json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "production",
+  "table_count": 5,
+  "namespaces": {
+    "shop": {"tables": {"…": "CREATE TABLE …"}},
+    "shop_0": {"tables": {"…": "CREATE TABLE …"}},
+    "shop_1": {"tables": {"…": "CREATE TABLE …"}}
+  },
+  "targets": [
+    {"deployment": "commerce-a", "target": "shop-001", "table_count": 1, "primary": true, "namespaces": ["shop"]},
+    {"deployment": "commerce-a", "target": "shop-002", "table_count": 2, "namespaces": ["shop_0"]},
+    {"deployment": "commerce-a", "target": "shop-003", "table_count": 2, "namespaces": ["shop_1"]},
+    {"deployment": "commerce-a", "target": "shop-004", "table_count": 2, "namespaces": ["shop_0"], "diverged_tables": [
+      {"namespace": "shop_0", "table": "line_items", "difference": "differs"}
+    ]}
+  ]
+}
+```
+
+</details>
+
+A pull naming namespaces returns each from the target holding it, so
+`--namespace shop_1` returns `shop_1`'s schema from `shop-003` even though the
+primary does not hold it. When every entry of the environment selects
+namespaces, a requested namespace none of them selects is rejected with `400`
+naming it and the selectable ones, rather than answered with an empty schema:
 
 ```json
 {
@@ -414,11 +475,6 @@ with an empty schema:
   "error_code": ""
 }
 ```
-
-The response shape does not change, but the comparison is still keyed by namespace and table: two
-targets holding different namespaces report each other's tables as
-`only_on_primary` and `only_on_target`, because neither holds the other's
-namespace.
 
 An environment that does not list `targets` carries no `targets` array at all.
 
@@ -799,6 +855,33 @@ failed `refunds` on `shop-002` reads `1 of 2 tables done on 2 targets · 1 targe
 failed`. A table lists its targets while it is in flight on any of them or any of
 them stopped, even when another target's failure makes the table read as
 failed; any other table counts them on its own line.
+
+`ended_by` is set on a failed operation that did not fail on its own. Its
+apply deferred the cutover, which runs for all of a target's operations
+together, and another operation of the same deployment and target failed, so
+the cutover could never run. SchemaBot stopped that target's operations
+waiting at the cutover, saved their copies, and failed them. Other targets are
+not stopped: they wait at the rollout's barrier. `ended_by` names the
+operation that failed, by `deployment` and `operation_key`. It is empty (`{}`)
+when that operation's row is no longer listed. A new apply of the same change
+resumes from the saved copies. Response excerpt for shard `-40` failing while
+shards `40-80` and `80-` waited at the cutover:
+
+```json
+{
+  "state": "failed",
+  "operations": [
+    {"deployment": "commerce-a", "operation_key": "commerce/-40/orders", "state": "failed", "cutover_policy": "parallel", "error_message": "lock wait timeout exceeded; try restarting transaction"},
+    {"deployment": "commerce-a", "operation_key": "commerce/40-80/orders", "state": "failed", "cutover_policy": "parallel", "ended_by": {"deployment": "commerce-a", "operation_key": "commerce/-40/orders"}},
+    {"deployment": "commerce-a", "operation_key": "commerce/80-/orders", "state": "failed", "cutover_policy": "parallel", "ended_by": {"deployment": "commerce-a", "operation_key": "commerce/-40/orders"}}
+  ]
+}
+```
+
+The CLI and the PR comment count such a shard as stopped at cutover, not
+failed: both read `Shards: 1 failed, 2 stopped at cutover`, name only `-40`
+as the failure, and note that the two stopped shards' copies are saved, so
+applying again resumes them.
 
 </details>
 

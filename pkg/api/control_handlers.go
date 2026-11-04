@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -590,6 +592,9 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		return nil, 0, err
 	}
 	if controlReq != nil {
+		if err := s.rejectPendingCutoverMissingMembers(ctx, apply, controlReq, caller); err != nil {
+			return nil, 0, err
+		}
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
 			"Cutover requested by user while cutover request already pending")
@@ -635,8 +640,15 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 			return nil, 0, err
 		}
+		if turn.notReady != "" {
+			s.logger.Info("cutover request rejected because not every member of a deferred apply waits at its cutover",
+				append(apply.LogAttrs(), "requested_by", caller, "reason", turn.notReady)...)
+			err := controlConflictf("%s", turn.notReady)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+			return nil, 0, err
+		}
 		switch {
-		case turn.taker != nil:
+		case len(turn.takers) > 0:
 			readiness = cutoverRequestReady
 		case turn.inProgress:
 			readiness = cutoverRequestAlreadyInProgress
@@ -670,16 +682,31 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		Status:      storage.ControlRequestPending,
 		RequestedBy: caller,
 	}
-	if turn.taker != nil {
-		// Bind the request to the member that takes it, so this one command
-		// cuts over that member and cannot pass on to the next one.
-		cutoverReq.Metadata = storage.CutoverRequestMetadata(turn.taker.ID)
+	if len(turn.takers) > 0 {
+		// Bind the request to the members that take it, so this one command
+		// cuts over each member free to cut over now and cannot pass on to a
+		// member that becomes free later.
+		metadata, err := storage.CutoverRequestSetMetadata(operationIDs(turn.takers))
+		if err != nil {
+			err := fmt.Errorf("bind cutover request for apply %s to its members: %w", apply.ApplyIdentifier, err)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+			return nil, 0, err
+		}
+		cutoverReq.Metadata = metadata
 	}
-	_, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
+	recorded, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
 	if err != nil {
 		err := fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, err
+	}
+	if alreadyPending {
+		// Another command was recorded first, bound to the members free when
+		// it was issued. This one is acknowledged by it only if it covers
+		// every member free now.
+		if err := s.rejectPendingCutoverMissingMembers(ctx, apply, recorded, caller); err != nil {
+			return nil, 0, err
+		}
 	}
 	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 	message := "Cutover requested by user"
@@ -695,6 +722,51 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
 	return &apitypes.ControlResponse{Accepted: true}, http.StatusOK, nil
+}
+
+// rejectPendingCutoverMissingMembers refuses a cutover that a pending cutover
+// would acknowledge without carrying: the pending request is bound to the
+// members that were free when it was issued, and a member free now that it
+// does not name would never be cut over by it. A pending request bound to no
+// member is taken by whichever member's drive reaches it, as it always was. A
+// deferred apply with a member that has not reached its cutover is refused as
+// a first cutover would be.
+func (s *Service) rejectPendingCutoverMissingMembers(ctx context.Context, apply *storage.Apply, pending *storage.ApplyControlRequest, caller string) error {
+	boundIDs, err := pending.CutoverOperationIDs()
+	if err != nil {
+		err := fmt.Errorf("read the members the pending cutover of apply %s is bound to: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return err
+	}
+	if len(boundIDs) == 0 {
+		return nil
+	}
+	turn, err := s.cutoverTurnForRequest(ctx, apply)
+	if err != nil {
+		err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return err
+	}
+	if turn.notReady != "" {
+		s.logger.Info("cutover request rejected because not every member of a deferred apply waits at its cutover",
+			append(apply.LogAttrs(), "requested_by", caller, "original_requested_by", pending.RequestedBy, "reason", turn.notReady)...)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return controlConflictf("%s", turn.notReady)
+	}
+	var missing []string
+	for _, op := range turn.takers {
+		if !slices.Contains(boundIDs, op.ID) {
+			missing = append(missing, cutoverOperationName(op))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	s.logger.Info("cutover request rejected because the pending cutover does not include every member free to cut over",
+		append(apply.LogAttrs(), "requested_by", caller, "original_requested_by", pending.RequestedBy,
+			"cutover_operation_ids", boundIDs, "not_included", missing)...)
+	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+	return controlConflictf("a cutover sent earlier is still pending and does not include %s; run cutover again once it settles", strings.Join(missing, ", "))
 }
 
 type cutoverRequestReadiness int
@@ -807,7 +879,7 @@ func (h *cutoverTurnHold) message() string {
 		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
 			h.blocker, h.parked)
 	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not run their cutover; stop the schema change and apply again",
 			h.blocker, h.blockerState, h.parked)
 	default:
 		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",
@@ -816,18 +888,24 @@ func (h *cutoverTurnHold) message() string {
 }
 
 // cutoverTurn is the intake's answer for a cutover request on a
-// multi-operation apply. taker is the first parked operation whose cutover has
+// multi-operation apply. takers are the parked operations whose cutover has
 // not started and that no earlier member holds, which the request is bound
-// to; hold is set instead when an earlier member holds every such operation.
+// to: every such operation of an apply that deferred its cutover, so one
+// command cuts over each member free to cut over when it was issued, and the
+// first of them otherwise. hold is set instead when an earlier member holds
+// every such operation.
 // inProgress reports, under an ordered policy with no taker and no hold, that
 // a member's cutover has already started, so the request has nothing left to
-// start. All are unset when the apply's cutover is unordered, or when no
-// member is parked by task evidence, which leaves the decision to the
-// caller's readiness check.
+// start. All are unset when the cutover of an apply that did not defer it is
+// unordered, or when no member is parked by task evidence, which leaves the
+// decision to the caller's readiness check.
 type cutoverTurn struct {
-	taker      *storage.ApplyOperation
+	takers     []*storage.ApplyOperation
 	hold       *cutoverTurnHold
 	inProgress bool
+	// notReady refuses the request on an apply that deferred its cutover
+	// while an operation free to cut over has not reached it.
+	notReady string
 }
 
 // cutoverTurnForRequest decides which member of a multi-operation apply that
@@ -835,9 +913,12 @@ type cutoverTurn struct {
 // apply-level and only a parked member no earlier member holds may take it
 // (the drive's own gate, operationCutoverRequestTurn in pkg/tern), so
 // accepting one while an earlier member holds every parked member would queue
-// it for a consumer that is not there yet. A parked member under an unordered cutover
-// policy takes the request as it always has. The turn is decided by storage
-// CutoverBlocker, the rule the automatic cutover claim follows.
+// it for a consumer that is not there yet. A parked member under an unordered
+// cutover policy takes an unbound request as it always has, unless the apply
+// deferred its cutover: the shards of one member drive in parallel under every
+// policy, so they all park, and the request is bound to each of them. The turn
+// is decided by storage CutoverBlocker, the rule the automatic cutover claim
+// follows.
 func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Apply) (cutoverTurn, error) {
 	opStore := s.storage.ApplyOperations()
 	ops, err := opStore.ListByApply(ctx, apply.ID)
@@ -860,6 +941,12 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 		tasksByOp[*task.ApplyOperationID] = append(tasksByOp[*task.ApplyOperationID], task)
 	}
 	names := memberDisplayNames(ops)
+	// An apply started with --defer-cutover holds every member until the
+	// operator acts, so one command releases every member free to cut over,
+	// the way the automatic cutover would have released each of them. Without
+	// it a member waits only where the rollout parks it, and each command
+	// cuts over the next member in turn.
+	releasesEveryFreeMember := apply.GetOptions().DeferCutover
 	var turn cutoverTurn
 	cutoverStarted := false
 	for i, op := range ops {
@@ -870,7 +957,7 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 		if !parkedOnTasks(tasksByOp[op.ID]) {
 			continue
 		}
-		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) {
+		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) && !releasesEveryFreeMember {
 			return cutoverTurn{}, nil
 		}
 		blocker, err := opStore.CutoverBlocker(ctx, op.ID)
@@ -878,7 +965,11 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 			return cutoverTurn{}, fmt.Errorf("check cutover order for member %s of apply %s: %w", names[i], apply.ApplyIdentifier, err)
 		}
 		if blocker == nil {
-			return cutoverTurn{taker: op}, nil
+			turn.takers = append(turn.takers, op)
+			if !releasesEveryFreeMember {
+				return cutoverTurn{takers: turn.takers}, nil
+			}
+			continue
 		}
 		if turn.hold == nil {
 			turn.hold = &cutoverTurnHold{
@@ -889,10 +980,31 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 			}
 		}
 	}
+	if releasesEveryFreeMember {
+		waiting, notReached, err := deferredCutoverReadiness(ctx, opStore, ops, tasksByOp)
+		if err != nil {
+			return cutoverTurn{}, fmt.Errorf("check every member of apply %s waits at its cutover: %w", apply.ApplyIdentifier, err)
+		}
+		if len(notReached) > 0 {
+			return cutoverTurn{notReady: deferredCutoverNotReadyMessage(waiting, notReached)}, nil
+		}
+	}
+	if len(turn.takers) > 0 {
+		return cutoverTurn{takers: turn.takers}, nil
+	}
 	if turn.hold == nil {
 		turn.inProgress = cutoverStarted
 	}
 	return turn, nil
+}
+
+// operationIDs returns the identifiers of ops, in order.
+func operationIDs(ops []*storage.ApplyOperation) []int64 {
+	ids := make([]int64, 0, len(ops))
+	for _, op := range ops {
+		ids = append(ids, op.ID)
+	}
+	return ids
 }
 
 // parkedOnTasks reports whether an operation's tasks are parked at the
@@ -995,6 +1107,16 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
+	// SchemaBot's own stop of an apply whose deferred cutover can no longer
+	// run is told apart by its caller: the drive tail leaves it for the settle
+	// and retry expiry skips the apply. A stop sent under that caller would
+	// hold the apply open with nothing to settle it, so it is refused.
+	if caller == storage.EndedOperationStopCaller {
+		s.logger.Warn("operator: refused a stop sent under the caller SchemaBot reserves for its own stop",
+			append(apply.LogAttrs(), "caller", caller)...)
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for SchemaBot's own stop; send the stop under your own name", caller)
+	}
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -1915,14 +2037,33 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 	if err != nil {
 		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	neverStarted := neverStartedStoppedOperationIDs(ops)
 	var startedCount int64
 	var skippedCount int64
+	operationsWithTasks := make(map[int64]bool)
 	for _, task := range tasks {
+		if task.ApplyOperationID != nil {
+			operationsWithTasks[*task.ApplyOperationID] = true
+		}
 		switch {
 		case state.IsState(task.State, state.Task.Stopped):
 			startedCount++
+		case taskQueuedUnderNeverStartedStop(task, neverStarted):
+			startedCount++
 		case state.IsTerminalTaskState(task.State):
 			skippedCount++
+		}
+	}
+	// An operation with no tasks, such as a finalizer that publishes the
+	// change once its shards complete, is resumable work of its own when a
+	// stop caught it before it began.
+	for id := range neverStarted {
+		if !operationsWithTasks[id] {
+			startedCount++
 		}
 	}
 	if startedCount == 0 {
@@ -1940,6 +2081,29 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 		}
 	}
 	return s.persistStartRequestForOperator(ctx, apply, caller, startedCount, skippedCount)
+}
+
+// neverStartedStoppedOperationIDs returns the operations a stop caught before
+// any engine took them up: stopped, never claimed, and holding no remote
+// apply. Their tasks, if they have any, are still pending, because nothing ran
+// them, and a start queues them again (RequeueNeverStartedForStartByApply), so
+// their work is stopped work the start resumes.
+func neverStartedStoppedOperationIDs(ops []*storage.ApplyOperation) map[int64]bool {
+	ids := make(map[int64]bool)
+	for _, op := range ops {
+		if state.IsState(op.State, state.ApplyOperation.Stopped) && op.StartedAt == nil && op.ExternalID == "" {
+			ids[op.ID] = true
+		}
+	}
+	return ids
+}
+
+// taskQueuedUnderNeverStartedStop reports whether a task is pending work of an
+// operation a stop caught before it started.
+func taskQueuedUnderNeverStartedStop(task *storage.Task, neverStarted map[int64]bool) bool {
+	return task.ApplyOperationID != nil &&
+		neverStarted[*task.ApplyOperationID] &&
+		state.IsState(task.State, state.Task.Pending)
 }
 
 // queueRemoteStoppedApplyForOperator validates remote stopped state before

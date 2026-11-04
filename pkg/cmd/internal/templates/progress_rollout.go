@@ -110,6 +110,15 @@ func RolloutCoverage(model presentation.Apply, groups []presentation.Group) stri
 	return presentation.CoveragePhrase(rolloutNoun(label), n, n)
 }
 
+// RolloutStoppedAtCutoverNote explains the rollout's members that SchemaBot
+// stopped at the cutover because another member failed, and that applying
+// again resumes their saved copies, or "" when none was stopped at the
+// cutover. It names the members as the rollout's counts do.
+func RolloutStoppedAtCutoverNote(model presentation.Apply, groups []presentation.Group) string {
+	noun := rolloutNoun(RolloutCountsUnit(groups))
+	return presentation.StoppedAtCutoverOf(model.Deployments).Note(noun, func(name string) string { return name })
+}
+
 // rolloutNoun is the noun for what RolloutCountsUnit's label counts.
 func rolloutNoun(label string) presentation.Noun {
 	if label == "Targets" {
@@ -208,8 +217,10 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	}
 	rolled := rolledTargetTables(v, byMember, listed)
 	settled := v.Model.RolloutSettled(g)
+	resuming := state.IsState(v.Model.State, state.Apply.Resuming)
 	for i := range rolled {
 		rolled[i].RolloutSettled = settled
+		rolled[i].Resuming = resuming
 		if len(rolled[i].Shards) < len(g.Members)-converged {
 			rolled[i].OnTargets = targetSubsetLabel(rolled[i].Shards, len(g.Members)-converged)
 		}
@@ -376,7 +387,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			// A target that has not reported counts toward where the table
 			// stands, so a halt there is never hidden under its siblings'
 			// progress.
-			status := presentation.UnreportedTargetStatus(d.State)
+			status := presentation.RolloutTableStatus(v.Model.State, presentation.UnreportedTargetStatus(d.State))
 			statuses = append(statuses, status)
 			rolled.Shards = append(rolled.Shards, ShardProgress{Shard: memberTargetName(d), Status: status})
 			// Its plan's estimates are not known, so a sum of the rest would
@@ -388,7 +399,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			if t.Namespace != table.Namespace || t.TableName != table.TableName || t.DDL != table.DDL {
 				continue
 			}
-			status := state.NormalizeTaskStatus(t.Status)
+			status := presentation.RolloutTableStatus(v.Model.State, state.NormalizeTaskStatus(t.Status))
 			statuses = append(statuses, status)
 			var plannedRows *int64
 			if t.RowsTotal == 0 && presentation.CopyStillAhead(status) {
@@ -706,6 +717,16 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 		// The list counts the targets, so the line does not repeat them.
 		coverage = ""
 	}
+	if stoppedBeforeAnyTargetStarted(t) {
+		// Every target would only repeat that it stopped, so the line says it
+		// once, as the PR comment does.
+		writeTableLine(&b, t, "%s", haltedAcrossTargetsPhrase(t))
+		if t.DDL != "" {
+			b.WriteString(formatTableDDL(t))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
 	stopped, ok := stoppedAcrossTargets(t.Shards)
 	if !ok || !state.IsState(t.Status, state.Task.Stopped) || !anyTargetStarted(t.Shards) {
 		writeTableLine(&b, t, "%s%s", haltedAcrossTargetsPhrase(t), coverage)
@@ -804,6 +825,17 @@ func haltedAcrossTargetsPhrase(t TableProgress) string {
 	}
 }
 
+// stoppedBeforeAnyTargetStarted reports whether a table across targets
+// stopped on every target before any of them started it
+// (presentation.EveryTargetStopped).
+func stoppedBeforeAnyTargetStarted(t TableProgress) bool {
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return presentation.EveryTargetStopped(statuses) && !anyTargetStarted(t.Shards)
+}
+
 // anyTargetStarted reports whether any target completed the change or copied
 // at least one row of it.
 func anyTargetStarted(targets []ShardProgress) bool {
@@ -872,11 +904,12 @@ func rollupTaskStatus(statuses []string) string {
 
 // writeTargetAttention names each failed or retrying target with its error
 // and the data-plane operation and apply to look at, the way a sharded apply
-// names a failed shard.
+// names a failed shard. A target stopped at the cutover for another's failure
+// does not need attention of its own.
 func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Group) {
 	var attention []int
 	for _, i := range g.Members {
-		if isTargetFailureState(v.Model.Deployments[i].State) {
+		if v.Model.Deployments[i].FailedOrRetrying() {
 			attention = append(attention, i)
 		}
 	}
@@ -905,12 +938,6 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 	if more := len(attention) - rolloutAttentionLimit; more > 0 {
 		fmt.Fprintf(b, "    %s…and %d more%s\n", ANSIDim, more, ANSIReset)
 	}
-}
-
-// isTargetFailureState reports whether a target's operation failed, or failed
-// and is being retried.
-func isTargetFailureState(opState string) bool {
-	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
 // memberTargetName is a member's target, or its name when it carries none.
@@ -942,10 +969,10 @@ func FormatRolloutFooter(v RolloutView) string {
 		// each cutover; otherwise SchemaBot cuts the ready member over itself,
 		// and offering the command would contradict that.
 		if !v.DeferCutover {
-			fmt.Fprintf(&b, "SchemaBot will cut over %s next — no action needed.\n", next.Name)
+			fmt.Fprintf(&b, "SchemaBot will run the cutover for %s next — no action needed.\n", next.Name)
 			break
 		}
-		writeRolloutCommand(&b, fmt.Sprintf("To cut over %s", next.Name), applyCommand("cutover"))
+		writeRolloutCommand(&b, fmt.Sprintf("To run the cutover for %s", next.Name), applyCommand("cutover"))
 	case presentation.NextActionResume:
 		writeRolloutCommand(&b, ResumeLabel, applyCommand("start"))
 	case presentation.NextActionReviewFailure:

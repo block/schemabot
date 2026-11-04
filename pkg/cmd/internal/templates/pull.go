@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +31,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	}
 	rows = append(rows, BoxRow{Label: "Tables", Value: strconv.Itoa(int(resp.TableCount))})
 	WriteBox(rows, "", nil)
-	writeTargetDivergence(resp.Targets)
+	writeTargetDivergence(resp)
 
 	for _, name := range sortedKeys(resp.Namespaces) {
 		ns := resp.Namespaces[name]
@@ -60,9 +61,8 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	}
 }
 
-// divergenceLabels phrases each difference for a reader looking at the primary
-// target's schema: the DDL printed below is the primary's, so the wording says
-// what the other target has instead.
+// divergenceLabels phrases each difference for a reader looking at the schema
+// printed below, so the wording says what the other target has instead.
 var divergenceLabels = map[string]string{
 	apitypes.DivergenceDiffers:       "differs",
 	apitypes.DivergenceOnlyOnPrimary: "missing",
@@ -96,9 +96,9 @@ func targetDivergenceNames(targets []*apitypes.TargetDivergence) []string {
 }
 
 // writeTargetDivergence lists every target the environment addresses and how
-// each differs from the primary, whose schema is the DDL printed below. It
-// renders as "--" comments like the rest of the pull output, so redirecting a
-// multi-target pull into a .sql file still produces valid SQL.
+// each differs from the schema printed below. It renders as "--" comments like
+// the rest of the pull output, so redirecting a multi-target pull into a .sql
+// file still produces valid SQL.
 //
 // A target with no diverged tables is still listed: "these two hold the same
 // schema" is the answer an operator is usually looking for, and omitting the
@@ -107,27 +107,58 @@ func targetDivergenceNames(targets []*apitypes.TargetDivergence) []string {
 // counting targets against what they expect the environment to hold should not
 // have to add one back. An environment whose targets are expected to hold the
 // same schema carries no member list at all and prints nothing.
-func writeTargetDivergence(targets []*apitypes.TargetDivergence) {
+//
+// When every namespace below is the primary's, the schema below is the primary
+// target's and each line says how a target differs from it. When targets hold
+// different namespaces, each target that supplied part of the schema below
+// names the namespaces it supplied, and a difference is from the schema below.
+func writeTargetDivergence(resp *apitypes.PullSchemaResponse) {
+	targets := resp.Targets
 	if len(targets) == 0 {
 		return
 	}
+	supplied := make([][]string, len(targets))
+	for _, namespace := range sortedKeys(resp.Namespaces) {
+		if i := apitypes.BaselineTarget(targets, namespace); i >= 0 {
+			supplied[i] = append(supplied[i], namespace)
+		}
+	}
+	split := slices.ContainsFunc(supplied[1:], func(namespaces []string) bool { return len(namespaces) > 0 }) ||
+		reportsNonPrimaryBaseline(targets)
+	baseline := "the primary target"
+	if split {
+		baseline = "the schema below"
+	}
+
 	names := targetDivergenceNames(targets)
 	for i, target := range targets {
 		name := emphasis("`" + names[i] + "`")
+		var parts []string
+		switch {
+		case target.Primary && !split:
+			parts = append(parts, "primary target, whose schema is below")
+		case len(supplied[i]) > 0:
+			prefix := ""
+			if target.Primary {
+				prefix = "primary target, "
+			}
+			parts = append(parts, fmt.Sprintf("%sschema below for %s", prefix, backtickList(supplied[i])))
+		case target.Primary:
+			parts = append(parts, "primary target, holds none of the namespaces below")
+		}
+		if n := len(target.DivergedTables); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s %s from %s",
+				n, ui.Pluralize("table", n), ui.PluralizeLabel("differs", "differ", n), baseline))
+		}
+		if len(parts) == 0 {
+			if holdsAny(target, resp.Namespaces) {
+				parts = append(parts, "same schema as "+baseline)
+			} else {
+				parts = append(parts, "holds none of the namespaces below")
+			}
+		}
 		fmt.Println()
-		if target.Primary {
-			fmt.Println(annotation(fmt.Sprintf("-- Target %s — primary target, whose schema is below", name)))
-			continue
-		}
-		if len(target.DivergedTables) == 0 {
-			fmt.Println(annotation(fmt.Sprintf("-- Target %s — same schema as the primary target", name)))
-			continue
-		}
-		fmt.Println(annotation(fmt.Sprintf("-- Target %s — %d %s %s from the primary target",
-			name,
-			len(target.DivergedTables),
-			ui.Pluralize("table", len(target.DivergedTables)),
-			ui.PluralizeLabel("differs", "differ", len(target.DivergedTables)))))
+		fmt.Println(annotation(fmt.Sprintf("-- Target %s — %s", name, strings.Join(parts, "; "))))
 		for _, table := range target.DivergedTables {
 			label, ok := divergenceLabels[table.Difference]
 			if !ok {
@@ -138,6 +169,41 @@ func writeTargetDivergence(targets []*apitypes.TargetDivergence) {
 			fmt.Println(annotation(fmt.Sprintf("--   %s.%s: %s", table.Namespace, table.Table, label)))
 		}
 	}
+}
+
+// reportsNonPrimaryBaseline reports whether any difference listed is against a
+// namespace whose baseline is not the primary. A table filter can drop such a
+// namespace from the schema below while keeping a difference inside it, and
+// that difference is still from the namespace's baseline rather than from the
+// primary.
+func reportsNonPrimaryBaseline(targets []*apitypes.TargetDivergence) bool {
+	for _, target := range targets {
+		for _, table := range target.DivergedTables {
+			if apitypes.BaselineTarget(targets, table.Namespace) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// holdsAny reports whether a target holds any of the pulled namespaces.
+func holdsAny(target *apitypes.TargetDivergence, namespaces map[string]*apitypes.PulledNamespace) bool {
+	for namespace := range namespaces {
+		if target.Holds(namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+// backtickList renders names as a comma-separated list of code spans.
+func backtickList(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = "`" + name + "`"
+	}
+	return strings.Join(quoted, ", ")
 }
 
 // tableKindView is the catalog kind an engine reports for a view rather than

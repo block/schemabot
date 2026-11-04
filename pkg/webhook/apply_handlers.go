@@ -221,15 +221,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			if a.Database == database && !state.IsTerminalApplyState(a.State) {
 				h.logger.Info("apply blocked by in-progress apply", "repo", repo, "pr", pr, "database", database, "apply_id", a.ApplyIdentifier, "state", a.State)
 				h.postComment(repo, pr, installationID, templates.RenderApplyInProgress(templates.ApplyLockConflictData{
-					Database:          database,
-					Environment:       environment,
-					RequestedBy:       requestedBy,
-					ApplyID:           a.ApplyIdentifier,
-					ApplyState:        a.State,
-					ApplyEnvironment:  a.Environment,
-					DeferCutover:      a.GetOptions().DeferCutover,
-					Tenant:            h.deploymentTenant(),
-					ApplyAgainCommand: templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
+					Database:            database,
+					Environment:         environment,
+					RequestedBy:         requestedBy,
+					ApplyID:             a.ApplyIdentifier,
+					ApplyState:          a.State,
+					ApplyEnvironment:    a.Environment,
+					DeferCutover:        a.GetOptions().DeferCutover,
+					Tenant:              h.deploymentTenant(),
+					ApplyAgainCommand:   templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
+					ApplyAgainConsent:   templates.UnsafeReconsent(applyCommandOptionsOf(result)),
+					AppliesLatestCommit: h.activeApplyAppliesLatestCommit(ctx, environment, prInfo.HeadSHA, a),
 				}))
 				return false, nil
 			}
@@ -284,8 +286,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.logger.Info("apply rejected: stale lock intent changed before release; keeping the current lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"observed_pending_plan_id", existingLock.PendingPlanID)
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
+			h.postComment(repo, pr, installationID, templates.RenderApplyLockIntentChanged(
+				applyLockIntentChangedRefusal(action.Apply, database, environment, requestedBy, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 	}
@@ -503,6 +505,36 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				msgDeferCutoverAllDirect)
 			return false, nil
 		}
+		// An apply that would keep more drivers waiting at its cutover than it
+		// can have is refused before the operator is asked to confirm it, so
+		// the remedy is to re-run this command without the flag. Apply
+		// creation checks again, so this only moves the refusal earlier.
+		refused, capacityErr := h.service.DeferredCutoverCapacityRefusal(ctx, api.ApplyRequest{
+			PlanID:      planResp.PlanID,
+			Environment: environment,
+			Options:     map[string]string{"defer_cutover": "true"},
+			Caller:      formatGitHubCaller(requestedBy, repo, pr),
+			Target:      result.Target,
+		})
+		if capacityErr != nil {
+			h.logger.Error("apply rejected: could not check whether the fleet has the drivers --defer-cutover would keep waiting",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", capacityErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					msgDeferredCutoverCapacityUnverified)
+			}
+			return true, fmt.Errorf("apply command deferred cutover capacity check %s#%d: %w", repo, pr, capacityErr)
+		}
+		if refused != nil {
+			h.logger.Info("apply rejected: --defer-cutover would keep more drivers waiting at the cutover than the apply can have",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "operations", refused.Operations, "drivers", refused.Drivers,
+				"live_servers", refused.LiveServers, "max_drivers_per_apply", refused.PerApplyCap)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				deferredCutoverCapacityMessage(refused, action.Apply, environment, h.deploymentTenant()))
+			return false, nil
+		}
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified, on every target
@@ -514,9 +546,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Acquire lock. PendingPlanID pins the confirmation plan this lock was
 	// posted with so apply-confirm can load the exact plan the human reviewed
 	// (not whatever happens to be newest in the plans table at confirm time).
-	// DisclosedCopyDiscard records whether that plan's comment tells the operator
-	// a copy is destroyed, so the apply can later tell a discard they agreed to
-	// from one that appeared after they were asked.
+	// DisclosedCopies records which copies that plan's comment tells the
+	// operator are destroyed, so the apply can later tell a discard they agreed
+	// to from one that appeared after they were asked.
 	//
 	// The apply saw no lock of its own before planning: either none was held or
 	// it released this PR's stale one above. The acquire is conditional on that
@@ -524,13 +556,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// lock while this one plans, and the pin it holds must not be replaced by a
 	// plan the operator never saw alongside it.
 	lock := &storage.Lock{
-		DatabaseName:         database,
-		DatabaseType:         dbType,
-		Owner:                lockOwner,
-		Repository:           repo,
-		PullRequest:          pr,
-		PendingPlanID:        planResp.PlanID,
-		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
+		DatabaseName:    database,
+		DatabaseType:    dbType,
+		Owner:           lockOwner,
+		Repository:      repo,
+		PullRequest:     pr,
+		PendingPlanID:   planResp.PlanID,
+		DisclosedCopies: rolloutDisclosedCopies(planResp, rollout, runsMemberWork),
 	}
 	if err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, lock, ""); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
@@ -547,8 +579,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.logger.Info("apply rejected: this PR's lock was pinned to another plan while the apply was planning",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID)
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
+			h.postComment(repo, pr, installationID, templates.RenderApplyLockIntentChanged(
+				applyLockIntentChangedRefusal(action.Apply, database, environment, requestedBy, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
@@ -604,10 +636,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// two-step confirm against the locked comment that discloses what is being
 	// thrown away: the operator spends the hours, so the operator decides, and
 	// there is no flag that converts an automatic apply into that consent.
-	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
+	if discarded := rolloutDiscardedCopies(planResp, rollout, runsMemberWork); discarded > 0 {
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
-			"discarded_copies", len(discarded))
+			"discarded_copies", discarded)
 		// Store the check record before posting the paused comment: the pause
 		// is acknowledged only once the stored check state blocks the merge
 		// gate on the pending changes. A storage failure releases the lock
@@ -699,7 +731,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies)
 	return false, nil
 }
 
@@ -1039,26 +1071,24 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
-	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
+	disclosedCopies := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies)
 	return false, nil
 }
 
-// disclosureDescribesThisApply reports whether the consent recorded on the
-// pending confirmation was earned for the apply about to run. The lock carries
-// no environment dimension, so a disclosure the operator was shown confirming
-// one environment must not disarm the copy gate in another: the pinned plan
-// names the environment they actually saw. A missing plan never counts as
-// consent, though apply-confirm rejects that state before reaching this helper.
-func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
-	if !lock.DisclosedCopyDiscard {
-		return false
+// disclosureDescribesThisApply returns the consent recorded on the pending
+// confirmation when it was earned for the apply about to run, and none when it
+// was not. The lock carries no environment dimension, so a disclosure the
+// operator was shown confirming one environment must not disarm the copy gate
+// in another: the pinned plan names the environment they actually saw. A
+// missing plan never counts as consent, though apply-confirm rejects that state
+// before reaching this helper.
+func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) []storage.DisclosedCopy {
+	if plan == nil || plan.Environment != environment {
+		return nil
 	}
-	if plan == nil {
-		return false
-	}
-	return plan.Environment == environment
+	return lock.DisclosedCopies
 }
 
 // isSamePRRollbackLock reports whether this PR holds the lock for a rollback
@@ -1117,15 +1147,17 @@ func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) st
 }
 
 // applyLockIntentChangedRefusal tells the operator that another command pinned
-// or released the lock while this apply was checking or planning against it.
-// The apply leaves the lock as that command set it; a retry finds it and
-// reports which command holds the lock and how to settle it, or plans afresh
-// when the lock is free. command is the apply to re-run, scoped and optioned
-// as the operator sent it.
-func applyLockIntentChangedRefusal(database, command string) string {
-	return fmt.Sprintf("Another SchemaBot command changed the lock on `%s` while this apply was running, "+
-		"so the apply was rejected to leave the lock as that command set it. Re-run `%s`; "+
-		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database, command)
+// or released the lock while this apply was checking or planning against it,
+// with the apply to re-run, scoped and optioned as the operator sent it.
+func applyLockIntentChangedRefusal(commandName, database, environment, requestedBy, scopedDatabase string, opts templates.ApplyCommandOptions) templates.ApplyLockIntentChangedData {
+	return templates.ApplyLockIntentChangedData{
+		CommandName:       commandName,
+		Database:          database,
+		Environment:       environment,
+		RequestedBy:       requestedBy,
+		ApplyAgainCommand: templates.ApplyCommand(environment, scopedDatabase, opts),
+		ApplyAgainConsent: templates.UnsafeReconsent(opts),
+	}
 }
 
 // applyCommandOptionsOf carries the target and option flags the operator typed
@@ -1593,4 +1625,60 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		return "", unlockRejection(errors.New("no database found in SchemaBot config"))
 	}
 	return config.Database, nil
+}
+
+// activeApplyLeavesWork names why an active apply, even one planned from the
+// PR's latest commit, leaves work for another apply once it ends, or returns
+// "" when it applies the whole change. A rollback and a reverting apply undo
+// the change rather than apply it, and an apply narrowed to one target leaves
+// the environment's other targets to a later apply.
+func activeApplyLeavesWork(active *storage.Apply) string {
+	switch {
+	case active.IsRollback():
+		return "rollback"
+	case state.IsState(active.State, state.Apply.Reverting):
+		return "reverting"
+	case storage.ParseApplyOptions(active.Options).NarrowedTo != "":
+		return "narrowed to one target"
+	}
+	return ""
+}
+
+// activeApplyAppliesLatestCommit reports whether this PR's active apply was
+// planned from the PR's latest commit in the requested environment. Such an
+// apply is already applying the change the requester asked for, so applying
+// again once it ends would plan nothing. When the apply's plan cannot be read,
+// it reports false, and the comment offers the apply again as it would for
+// an older commit: that apply is harmless, since it plans first.
+func (h *Handler) activeApplyAppliesLatestCommit(ctx context.Context, environment, headSHA string, active *storage.Apply) bool {
+	if active.Environment != environment {
+		return false
+	}
+	if reason := activeApplyLeavesWork(active); reason != "" {
+		h.logger.Debug("active apply leaves part of the change to a later apply; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA, "reason", reason)...)
+		return false
+	}
+	if active.PlanID == 0 {
+		h.logger.Warn("active apply has no plan to compare with the PR's latest commit; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA)...)
+		return false
+	}
+	plan, err := h.service.Storage().Plans().GetByID(ctx, active.PlanID)
+	if err != nil {
+		h.logger.Warn("could not load the active apply's plan to compare with the PR's latest commit; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA, "error", err)...)
+		return false
+	}
+	if plan == nil {
+		h.logger.Warn("active apply's plan no longer exists to compare with the PR's latest commit; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA)...)
+		return false
+	}
+	if plan.NarrowedTo != "" {
+		h.logger.Debug("active apply's plan was narrowed to one target, leaving the others to a later apply; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA, "narrowed_to", plan.NarrowedTo)...)
+		return false
+	}
+	return plan.HeadSHA != "" && plan.HeadSHA == headSHA
 }

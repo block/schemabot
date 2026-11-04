@@ -341,7 +341,7 @@ func TestE2EReplanNewlyDirectDowngradesToConfirm(t *testing.T) {
 
 	f.h.executeApply(t.Context(), f.client, "octocat/hello-world", 1, f.schemaResult, "staging", 1, "testuser",
 		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true, AllowUnsafe: true},
-		shown, shown, f.directPlan.PlanID, false)
+		shown, shown, f.directPlan.PlanID, nil)
 
 	body := f.awaitComment(t, "Confirmation required")
 	requireNewlyDirectDisclosure(t, body)
@@ -413,7 +413,7 @@ func TestE2EApplyConfirmNewlyDirectStopKeepsRollbackPinnedAfterItsRead(t *testin
 	requireNewlyDirectDisclosure(t, f.awaitComment(t, "Changes run differently"))
 	refusal := f.awaitComment(t, "changed the lock on")
 	assert.Contains(t, refusal, "`"+dbName+"`")
-	assert.Contains(t, refusal, "Re-run `schemabot apply -e staging --allow-unsafe`")
+	assert.Contains(t, refusal, "Re-run the apply with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging\n```")
 	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 	assert.Equal(t, locks.pin.PendingPlanID, f.pendingPlanID(t), "the concurrent rollback's pin must survive the stop")

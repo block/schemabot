@@ -58,6 +58,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	}
 	changing := changingMembers(data.Model, g)
 	settled := data.Model.RolloutSettled(g)
+	resuming := state.IsState(data.Model.State, state.Apply.Resuming)
 	rankTargetTableLines(lines)
 	for _, line := range lines {
 		first := memberDetail(data.Details, line.members[0])
@@ -69,15 +70,38 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		// target's stored plan and says which other targets run the same.
 		restoreScope := planScopeForLine(budget, line.targets, subset, silent)
 		restorePlan := budget.pointAt(first.storedPlan())
-		strip := targetStrip(line.listed, line.listedTargets)
-		writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, budget, func() {
-			writeTargetLineDDL(sb, dialect, line, subset, changing, budget)
-		})
+		writeDDL := func() { writeTargetLineDDL(sb, dialect, line, subset, changing, budget) }
+		if coverage, ok := lineAwaitsResume(line, resuming); ok {
+			// The stopped progress is from before the stop, and whether the
+			// copy continues from its checkpoint is not known until a target
+			// reports it, so the line says the start is under way, as the
+			// single-deployment comment does (renderResumingTable).
+			fmt.Fprintf(sb, "**%s**: \U0001f504 Resuming…%s\n", inlineCode(line.table.TableName), coverage)
+			writeDDL()
+		} else {
+			strip := targetStrip(line.listed, line.listedTargets)
+			writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, budget, writeDDL)
+		}
 		sb.WriteString("\n")
 		restorePlan()
 		restoreScope()
 	}
 	writeFailedTargets(sb, data.Model, g)
+}
+
+// lineAwaitsResume reports whether a table line of a resuming apply is one the
+// start has yet to pick back up on any of its targets
+// (presentation.AwaitingResume), and the coverage its line keeps for the
+// targets that finished or are still queued.
+func lineAwaitsResume(line targetTableLine, resuming bool) (string, bool) {
+	if !resuming {
+		return "", false
+	}
+	statuses := make([]string, len(line.listed))
+	for i, c := range line.listed {
+		statuses[i] = c.Status
+	}
+	return presentation.AwaitingResume(statuses)
 }
 
 // writeTargetLineDDL writes a table line's DDL under its headline, headed by
@@ -166,7 +190,8 @@ func lineTargets(data MultiDeploymentApplyData, g presentation.Group, line targe
 			continue
 		}
 		if includeUnreported && targetUnreported(data, i) {
-			cells = append(cells, TableProgressData{Status: presentation.UnreportedTargetStatus(data.Model.Deployments[i].State)})
+			status := presentation.UnreportedTargetStatus(data.Model.Deployments[i].State)
+			cells = append(cells, TableProgressData{Status: presentation.RolloutTableStatus(data.Model.State, status)})
 			targets = append(targets, memberTarget(data.Model.Deployments[i]))
 		}
 	}
@@ -189,6 +214,7 @@ func targetTableLines(data MultiDeploymentApplyData, g presentation.Group) []tar
 			continue
 		}
 		for _, t := range detail.Tables {
+			t.Status = presentation.RolloutTableStatus(data.Model.State, t.Status)
 			key := tableChangeKey(t)
 			li, seen := byKey[key]
 			if !seen {
@@ -276,9 +302,10 @@ func rankTargetTableLines(lines []targetTableLine) {
 // queued.
 func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported, estimated int
-	// cancelled counts the targets a cancel stopped part-way through the
-	// table, and unbegun the ones it reached before they began it.
-	var cancelled, unbegun int
+	// cancelled counts the targets where a cancel stopped the table part-way
+	// through, and neverStarted the targets where it was cancelled before it
+	// started.
+	var cancelled, neverStarted int
 	var copied, total, planned, eta int64
 	var running int
 	for _, c := range cells {
@@ -305,7 +332,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			if tableBegan(c) {
 				cancelled++
 			} else {
-				unbegun++
+				neverStarted++
 			}
 			continue
 		case state.Task.Running:
@@ -397,9 +424,14 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase, coverage = "⊘ Not started", ""
 	}
 	lists := listsTargets(strip)
+	if status == state.Task.Stopped && stoppedBeforeAnyTargetBegan(cells) {
+		// Every target would only repeat that it stopped, so the line says it
+		// once, the way the CLI's progress view does.
+		phrase, coverage, lists = "⏹️ Stopped (not started)", "", false
+	}
 	if status == state.Task.Cancelled {
 		phrase, coverage = cancelledTargetsLine(cancelledTargets{
-			done: done, cancelled: cancelled, unbegun: unbegun, pending: pending, targets: len(cells),
+			done: done, cancelled: cancelled, neverStarted: neverStarted, pending: pending, targets: len(cells),
 		}, settled, lists)
 	}
 	if lists {
@@ -418,12 +450,30 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 }
 
+// stoppedBeforeAnyTargetBegan reports whether a table stopped on every
+// target before any of them began it (presentation.EveryTargetStopped).
+func stoppedBeforeAnyTargetBegan(cells []TableProgressData) bool {
+	statuses := make([]string, len(cells))
+	for i, c := range cells {
+		statuses[i] = c.Status
+	}
+	return presentation.EveryTargetStopped(statuses) && !anyTargetBegan(cells)
+}
+
+// anyTargetBegan reports whether any target completed a table or began
+// working on it, so a halt there leaves the change partly or wholly live.
+func anyTargetBegan(cells []TableProgressData) bool {
+	return slices.ContainsFunc(cells, func(c TableProgressData) bool {
+		return tableBegan(c) || state.IsState(c.Status, state.Task.Completed, state.Task.RevertWindow)
+	})
+}
+
 // cancelledTargets counts where a table stands on each of its targets when
 // the cancel reached it: done completed it first, cancelled were stopped
-// part-way through it, unbegun were cancelled before they began it, and
-// pending have not begun it and were not cancelled.
+// part-way through it, neverStarted were cancelled before they started it,
+// and pending have not started it and were not cancelled.
 type cancelledTargets struct {
-	done, cancelled, unbegun, pending, targets int
+	done, cancelled, neverStarted, pending, targets int
 }
 
 // cancelledTargetsLine is the phrase and coverage of a table line whose
@@ -436,7 +486,7 @@ type cancelledTargets struct {
 // other targets carry on. Until the rollout settles those targets are counted
 // as queued, apart from the ones that will never begin the table.
 func cancelledTargetsLine(t cancelledTargets, settled, lists bool) (string, string) {
-	notStarted, queued := t.unbegun, 0
+	notStarted, queued := t.neverStarted, 0
 	if settled {
 		notStarted += t.pending
 	} else {
@@ -595,11 +645,12 @@ func rollupTaskStatus(cells []TableProgressData) string {
 }
 
 // writeFailedTargets names each failed or retrying target and its error, the
-// way the sharded comment names a failed shard.
+// way the sharded comment names a failed shard. A target stopped at the
+// cutover for another's failure is not listed or counted as failed.
 func writeFailedTargets(sb *strings.Builder, model presentation.Apply, g presentation.Group) {
 	var failed []presentation.Deployment
 	for _, i := range g.Members {
-		if d := model.Deployments[i]; isShardFailureState(d.State) {
+		if d := model.Deployments[i]; d.FailedOrRetrying() {
 			failed = append(failed, d)
 		}
 	}

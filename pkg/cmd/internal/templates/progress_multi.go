@@ -13,7 +13,7 @@ import (
 )
 
 func writeMultiDeploymentProgress(data ProgressData) {
-	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
+	model := presentation.Derive(presentation.ResumeClaimed(data.State, ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released)))
 	groups := model.Groups()
 	view := RolloutView{
 		ApplyID:      data.ApplyID,
@@ -27,6 +27,9 @@ func writeMultiDeploymentProgress(data ProgressData) {
 
 	writeMultiDeploymentHeader(data, model, groups)
 	writeMultiDeploymentFirstFailure(model.FirstFailure)
+	if note := RolloutStoppedAtCutoverNote(model, groups); note != "" {
+		fmt.Printf("\n  ⏹️ %s\n", note)
+	}
 	fmt.Println()
 
 	// A deployment that addresses several targets renders as one rollup
@@ -67,6 +70,7 @@ func ProgressOperationsForPresentation(ops []ProgressOperation, tables []TablePr
 			Finalizer:           op.OperationKind == storage.ApplyOperationKindGroupFinalizer,
 			NeverStarted:        op.StartedAt == "",
 			AlreadyConverged:    op.AlreadyConverged,
+			EndedBy:             op.EndedBy,
 			RolloutStep:         op.RolloutStep,
 			Barrier:             op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:            op.CutoverPolicy == storage.CutoverPolicyParallel,
@@ -165,6 +169,7 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 	// header shows: a table row carries whatever its own operation carried, so
 	// matching an inherited value would look for a target the rows do not have.
 	tables := activeTablesForMember(data.Tables, deployment.Deployment, deployment.Target)
+	MarkResuming(tables, deployment.State)
 	if len(tables) > 0 && !state.IsSetupPhase(data.State) {
 		sortActiveTables(tables)
 		if hasTableNamespaces(tables) {
@@ -252,6 +257,17 @@ func activeTablesForMember(tables []TableProgress, deployment, target string) []
 		}
 	}
 	return activeTables
+}
+
+// MarkResuming marks a member's tables as those of a resuming member
+// (TableProgress.Resuming) when its state, as the rollout reads it
+// (presentation.ResumeClaimed), is resuming, so a section of its own reads
+// the same as the member does in a rollup.
+func MarkResuming(tables []TableProgress, memberState string) {
+	resuming := state.IsState(memberState, state.Apply.Resuming)
+	for i := range tables {
+		tables[i].Resuming = resuming
+	}
 }
 
 func sortActiveTables(tables []TableProgress) {

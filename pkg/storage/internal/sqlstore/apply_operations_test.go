@@ -1994,14 +1994,24 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
 }
 
-// TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesParentBudget
-// verifies OC-5 Part B2: an operation-only redispatch of a failed_retryable
-// operation in a multi-deployment apply consumes one unit of the parent apply's
-// retry budget (applies.attempt += 1). Without this the operation-only retry
-// path never advances applies.attempt, so ExpireRetryable's budget gate never
-// fires and a permanently failing deployment retries forever — stranding a
-// healthy sibling parked at the cutover barrier under on_failure "continue".
-func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesParentBudget(t *testing.T) {
+// setOperationAttempt gives an operation an attempt count, as if it had been
+// redispatched that many times.
+func setOperationAttempt(t *testing.T, id int64, attempt int) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE apply_operations SET attempt = ? WHERE id = ?
+	`, attempt, id)
+	require.NoError(t, err)
+}
+
+// A multi-deployment apply's operation-lease redispatch raises the parent's
+// attempt to the redispatched operation's own attempt, so the parent records
+// the highest attempt of any operation. Once one operation has spent its
+// budget, the parent reads exhausted and the expiry sweep fails the apply,
+// which keeps a permanently failing deployment from retrying forever and
+// stranding a healthy sibling parked at the cutover barrier under on_failure
+// "continue".
+func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchRaisesParentToOperationAttempt(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -2010,13 +2020,14 @@ func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesPar
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_multiop_budget", 1, state.Apply.FailedRetryable, "staging")
 	_, err := testDB.ExecContext(ctx, `
 		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
-	`, maxRecoveryAttempts-1, apply.ID)
+	`, 2, apply.ID)
 	require.NoError(t, err)
 
 	redispatchID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	setOperationAttempt(t, redispatchID, maxRecoveryAttempts-1)
 	// A sibling operation makes this a genuine multi-deployment apply.
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
@@ -2027,11 +2038,23 @@ func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesPar
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "the failed_retryable operation within budget must be reclaimable")
 	assert.Equal(t, redispatchID, claimed.ID)
+	assert.Equal(t, maxRecoveryAttempts, claimed.Attempt)
 
 	persistedApply, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, persistedApply)
-	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a multi-op redispatch must consume one unit of the parent retry budget")
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "the parent records the highest attempt of any operation")
+
+	ownedCtx := storage.WithOperationLease(ctx, claimed.Lease())
+	require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, redispatchID, "dispatch failed"))
+	released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "an operation that spent its budget fails the apply")
+	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget
@@ -2073,8 +2096,8 @@ func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotCon
 // A lone attached operation is still driven under the operation lease when its
 // generation manifest expects another operation that has not attached, or when
 // it has no tasks to drive a parent claim from. The parent stays owned by the
-// rollout projection in both cases, so its redispatch claim charges the parent
-// budget and moves the row to running exactly as a multi-operation one does.
+// rollout projection in both cases, so its redispatch claim raises the parent's
+// attempt and moves the row to running exactly as a multi-operation one does.
 // Left failed_retryable, the row would be re-leased on every poll and the
 // budget would never advance, so the retry would never expire.
 func TestApplyOperationStore_FindNextApplyOperation_OperationLeaseRedispatchOfALoneOperation(t *testing.T) {
@@ -2109,6 +2132,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OperationLeaseRedispatchOfAL
 				State: state.ApplyOperation.FailedRetryable, ErrorMessage: "dispatch failed",
 			})
 			require.NoError(t, err)
+			setOperationAttempt(t, id, maxRecoveryAttempts-1)
 			if tc.withTask {
 				task := createRetryableReapTask(t, store, apply, "task_op_lone_lease", "users", state.Task.FailedRetryable, "copy failed")
 				attachTaskToOperation(t, task.TaskIdentifier, id)
@@ -2129,7 +2153,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OperationLeaseRedispatchOfAL
 			persistedApply, err := store.Applies().Get(ctx, apply.ID)
 			require.NoError(t, err)
 			require.NotNil(t, persistedApply)
-			assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "an operation-lease redispatch consumes one unit of the parent retry budget")
+			assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "an operation-lease redispatch raises the parent to the operation's own attempt")
 
 			again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 			require.NoError(t, err)
@@ -2216,8 +2240,8 @@ func TestApplyOperationStore_FindNextApplyOperation_RedispatchAdvancesOperationA
 
 // TestApplyOperationStore_FindNextApplyOperation_SiblingRedispatchLeavesOperationAttempt
 // verifies the operation attempt is operation-local: redispatching one
-// failed_retryable operation advances the shared parent attempt but never a
-// sibling operation's own attempt. This is what keeps a sibling's idempotency
+// failed_retryable operation advances its own attempt but never a sibling
+// operation's, and the parent keeps the higher attempt it already recorded. This is what keeps a sibling's idempotency
 // key stable while it sits in its dispatch-then-crash window, so it is not
 // dispatched a second time when an unrelated operation retries.
 func TestApplyOperationStore_FindNextApplyOperation_SiblingRedispatchLeavesOperationAttempt(t *testing.T) {
@@ -2252,7 +2276,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SiblingRedispatchLeavesOpera
 	persistedApply, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, persistedApply)
-	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "the shared parent attempt advances on the redispatch")
+	assert.Equal(t, maxRecoveryAttempts-1, persistedApply.Attempt, "a redispatch raises the parent only to the redispatched operation's own attempt")
 
 	sibling, err := store.ApplyOperations().Get(ctx, siblingID)
 	require.NoError(t, err)
@@ -2343,7 +2367,7 @@ func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecovery
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted
-// verifies the recovery budget is enforced: once the parent apply's attempt
+// verifies the recovery budget is enforced: once the operation's own attempt
 // count reaches the limit, the failed_retryable operation is no longer
 // reclaimable and stays quiet rather than being re-claimed forever.
 func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted(t *testing.T) {
@@ -2358,10 +2382,11 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetEx
 	`, maxRecoveryAttempts, apply.ID)
 	require.NoError(t, err)
 
-	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	setOperationAttempt(t, id, maxRecoveryAttempts)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -5284,6 +5309,55 @@ func TestApplyOperationStore_FindNextApplyOperation_PendingStopGateHaltsSibling(
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "a pending stop must halt the next sibling even under on_failure continue")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_PendingCancelGateHoldsSibling
+// verifies that a pending cancel keeps the next member of a rollout from
+// starting: when one deployment completes and hands off to the next while a
+// cancel is pending, the pending sibling is not claimed, so no engine work
+// begins on a rollout the operator has asked to cancel.
+func TestApplyOperationStore_FindNextApplyOperation_PendingCancelGateHoldsSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_cancel_gate", 1, state.Apply.Running, "staging")
+
+	completed, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Completed, OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+	// Backdate the completed row so staleness can't be the reason region-b is held.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, completed)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "without a cancel, region-b is the next member to claim")
+	require.Equal(t, "region-b", claimed.Deployment)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET state = ?, lease_owner = '', lease_token = '', started_at = NULL WHERE id = ?
+	`, state.ApplyOperation.Pending, claimed.ID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pending cancel must keep the next member from starting")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_PendingStopDoesNotBlockStaleRecovery

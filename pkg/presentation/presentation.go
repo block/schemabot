@@ -125,6 +125,16 @@ type Operation struct {
 	// needs attention.
 	ExternalID          string
 	ExternalOperationID string
+
+	// EndedBy is set on a failed row that did not fail on its own: it waited
+	// at a deferred cutover that another row's end meant could never run, so
+	// SchemaBot stopped it, saved its copy, and failed it for that row. It
+	// names the row that ended, and reads as stopped at cutover rather than
+	// failed.
+	EndedBy *OperationRef
+
+	// endedByName is the member name EndedBy resolves to, set by Derive.
+	endedByName string
 }
 
 // continuesPastFailure reports whether a terminal-failed earlier sibling stops
@@ -182,6 +192,10 @@ const (
 	// StateResuming is a stopped member a start has claimed again; its drive
 	// is picking the work back up.
 	StateResuming
+	// StateStoppedAtCutover is a member SchemaBot stopped at a deferred
+	// cutover once another member's failure meant the cutover could never
+	// run. Its copy is saved for a new apply to resume.
+	StateStoppedAtCutover
 
 	// presentationStateCount is one past the last state, so a test can visit
 	// every state and fail when a new one has no histogram category.
@@ -241,6 +255,11 @@ type Deployment struct {
 	// AlreadyConverged is whether the member's operation was recorded as a
 	// target that already held the change when the apply was created.
 	AlreadyConverged bool
+
+	// EndedBy names the member whose failure stopped this one at the
+	// cutover, when its status is StateStoppedAtCutover. Empty when that
+	// member is not among the apply's operations.
+	EndedBy string
 
 	// Rows are the indexes, into the operations Derive was given, of the rows
 	// this member's work spans, in input order. Row is the one that speaks for
@@ -415,7 +434,7 @@ func (a Apply) group(deployment string, members []int) Group {
 // than with a stopped member that invites a second one.
 var attentionOrder = []PresentationState{
 	StateFailed, StateRetrying, StatePaused, StateHalted, StateResuming, StateStopped,
-	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
+	StateStoppedAtCutover, StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
 	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
 	StateCancelled, StateReverted, StateCompleted, StateAlreadyApplied,
 }
@@ -473,6 +492,7 @@ func Derive(ops []Operation) Apply {
 		}
 	}
 	names := memberNames(members)
+	resolveEndedBy(ops, members, names, memberOf)
 	deployments := make([]Deployment, len(members))
 	for j := range members {
 		deployments[j] = deriveDeployment(members, names, j)
@@ -493,13 +513,68 @@ func Derive(ops []Operation) Apply {
 	}
 }
 
+// AwaitingResume reports whether a table of a resuming apply still stands
+// where the stop left it on every part that runs it, each in the status at the
+// same index of statuses: stopped on at least one, and every other one either
+// finished it before the stop or has not begun it. Its stopped progress is from
+// before the stop, so the table reads as resuming, and coverage counts the
+// parts that finished or are still queued so the line keeps them. Once any
+// part moves the table on, its own progress speaks for the table instead.
+func AwaitingResume(statuses []string) (coverage string, ok bool) {
+	var stopped, done, queued int
+	for _, s := range statuses {
+		switch state.NormalizeTaskStatus(s) {
+		case state.Task.Stopped:
+			stopped++
+		case state.Task.Completed:
+			done++
+		case state.Task.Pending:
+			queued++
+		default:
+			return "", false
+		}
+	}
+	if stopped == 0 {
+		return "", false
+	}
+	return TargetCoverage(done, 0, queued, 0, 0, PendingQueued), true
+}
+
+// ResumeClaimed reads the operations of an apply in applyState. A start moves
+// a stopped apply to resuming before its operations leave stopped: a drive
+// claims them one at a time, and a remote data plane can report them stopped
+// until it acts on the start. Every stopped operation of a resuming apply is
+// one that start resumes, so it reads as resuming; rendered stopped, it would
+// ask the operator for the start they already sent. One the stop reached
+// before it began has nothing to resume: the start runs it in its turn, so it
+// reads as still to run, behind the members ahead of it. Operations of an
+// apply in any other state are returned as they are.
+func ResumeClaimed(applyState string, ops []Operation) []Operation {
+	if !state.IsState(applyState, state.Apply.Resuming) {
+		return ops
+	}
+	claimed := slices.Clone(ops)
+	for i := range claimed {
+		if claimed[i].State != state.ApplyOperation.Stopped {
+			continue
+		}
+		if claimed[i].NeverStarted {
+			claimed[i].State = state.ApplyOperation.Pending
+			continue
+		}
+		claimed[i].State = state.ApplyOperation.Resuming
+	}
+	return claimed
+}
+
 // firstFailure returns the deployment of the first row, in resolved order,
 // whose raw operation state is terminally failed, or nil when none failed. A
 // folded member's failure is placed by its failed row, so a target that
 // failed a later table comes after one that failed an earlier one. memberOf
 // maps each row to its deployment. failed_retryable
 // is excluded: a retrying deployment is still in progress and surfaces no
-// operator-facing failure. The result is a copy, not an alias into Deployments,
+// operator-facing failure. So is a member stopped at the cutover for another
+// member's failure: the failure it names is that member's. The result is a copy, not an alias into Deployments,
 // so a caller that later re-slices or sorts Deployments cannot turn it into a
 // stale pointer.
 func firstFailure(ops []Operation, deps []Deployment, memberOf []int) *Deployment {
@@ -507,7 +582,7 @@ func firstFailure(ops []Operation, deps []Deployment, memberOf []int) *Deploymen
 		if op.State != state.ApplyOperation.Failed {
 			continue
 		}
-		if failed := deps[memberOf[i]]; failed.State == state.ApplyOperation.Failed {
+		if failed := deps[memberOf[i]]; failed.Presentation == StateFailed {
 			return &failed
 		}
 	}
@@ -550,6 +625,11 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	case state.ApplyOperation.CuttingOver:
 		d.set(StateCuttingOver, "cutting over", "🔁", true)
 	case state.ApplyOperation.Failed:
+		if op.EndedBy != nil {
+			d.EndedBy = op.endedByName
+			d.set(StateStoppedAtCutover, stoppedAtCutoverLabel(op.endedByName), "⏹️", true)
+			break
+		}
 		d.set(StateFailed, "failed", glyph.Failed, true)
 	case state.ApplyOperation.FailedRetryable:
 		d.set(StateRetrying, "retrying", "🔁", true)
@@ -1049,6 +1129,7 @@ var summaryCategoryOrder = []struct {
 	{"failed", []PresentationState{StateFailed}},
 	{"retrying", []PresentationState{StateRetrying}},
 	{"stopped", []PresentationState{StateStopped}},
+	{StoppedAtCutoverLabel, []PresentationState{StateStoppedAtCutover}},
 	{"in revert window", []PresentationState{StateRevertWindow}},
 	{"cancelled", []PresentationState{StateCancelled}},
 	{"reverted", []PresentationState{StateReverted}},
@@ -1104,6 +1185,14 @@ const AlreadyAppliedLabel = "already had it"
 // have received the change.
 func (d Deployment) AlreadyApplied() bool {
 	return state.IsState(d.State, state.ApplyOperation.Completed) && d.AlreadyConverged
+}
+
+// FailedOrRetrying reports whether the member failed on its own or is
+// retrying after a failure: the members an operator acts on. A member
+// SchemaBot stopped at the cutover for another member's failure is not one of
+// them, although its stored state is failed.
+func (d Deployment) FailedOrRetrying() bool {
+	return d.Presentation == StateFailed || d.Presentation == StateRetrying
 }
 
 func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {
@@ -1168,7 +1257,7 @@ func (a Apply) TargetProgress(g Group) TargetProgress {
 // run again. Every other status, an unknown one included, can still change.
 func (s PresentationState) final() bool {
 	switch s {
-	case StateCompleted, StateAlreadyApplied, StateFailed, StateHalted, StateCancelled, StateReverted:
+	case StateCompleted, StateAlreadyApplied, StateFailed, StateStoppedAtCutover, StateHalted, StateCancelled, StateReverted:
 		return true
 	default:
 		return false

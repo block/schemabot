@@ -20,6 +20,11 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
+// endedOperationStopTypes is the database type list retry expiry is passed in
+// these tests: the MySQL fixtures' type, as the reaper passes the types the
+// ended operation sweep stops.
+var endedOperationStopTypes = []string{storage.DatabaseTypeMySQL}
+
 func TestMySQLRetryableExpiryOperationFence(t *testing.T) {
 	testRetryableExpiryOperationFence(t, func(t *testing.T) *Storage {
 		clearTables(t)
@@ -67,10 +72,14 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		// The drives that settled the tree handed their leases back, as a
 		// finished drive does. A leftover fresh lease would hold its slot under
 		// the driver cap until it went stale, and the redispatch would wait.
+		// Each operation has also spent all but its last attempt, so the
+		// redispatch raises the parent to the operation's final attempt.
 		_, err := store.db.ExecContext(ctx, `
-			UPDATE apply_operations SET lease_owner = '', lease_token = '', lease_acquired_at = NULL
+			UPDATE apply_operations
+			SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+			    attempt = ?
 			WHERE apply_id = ?
-		`, apply.ID)
+		`, maxRecoveryAttempts-1, apply.ID)
 		require.NoError(t, err)
 
 		// The redispatch claim rotates a lease onto one operation and spends the
@@ -94,7 +103,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		require.Equal(t, state.Apply.FailedRetryable, parent.State,
 			"an operation-only drive never claims the parent, so its state cannot carry the signal")
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "the lease of a drive that was just admitted must keep expiry out")
 		assertRetryableTreeIntact(t, ctx, store, apply.ID, opIDs, tasks, claimed.ID)
@@ -106,7 +115,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		store := newStore(t)
 		apply, opIDs, tasks := seedExhaustedRetryableTree(t, ctx, store, "expiry_settled_drive", maxRecoveryAttempts)
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "a settled drive's leftover lease is indistinguishable from a live one until it goes stale")
 		assertRetryableTreeIntact(t, ctx, store, apply.ID, opIDs, tasks)
@@ -117,7 +126,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 
 		// The declined apply kept its state, so the next sweep sees it again and
 		// settles the parent, every operation, and every task in one pass.
-		expired, err = store.Applies().ExpireRetryable(ctx, 10)
+		expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -177,7 +186,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 				"handing the lease back must carry the settling write's heartbeat forward unchanged")
 		}
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -204,7 +213,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 			state.ApplyOperation.Completed, opIDs[0])
 		require.NoError(t, err)
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Empty(t, expired, "both leases are still held, so the apply is deferred")
 
@@ -216,7 +225,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 			assert.True(t, released, "a completed drive has ended as surely as a settling one")
 		}
 
-		expired, err = store.Applies().ExpireRetryable(ctx, 10)
+		expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1, "no lease is left to defer the apply")
 	})
@@ -260,7 +269,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 
 		// Both leases survived, so the apply is still deferred rather than
 		// half-released into a state expiry would admit.
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired)
 		parent, err := store.Applies().Get(ctx, apply.ID)
@@ -282,9 +291,10 @@ func leaseTokenFor(index int) string { return "token-" + seededDeployments[index
 var seededDeployments = []string{"region-a", "region-b"}
 
 // seedExhaustedRetryableTree builds the row shape a fan-out apply comes to rest
-// in after a retryable failure: a failed_retryable parent at the given attempt
-// count, two failed_retryable operations each carrying the lease its drive left
-// behind, and the failed and still-queued task under the first of them.
+// in after a retryable failure: a failed_retryable parent and two
+// failed_retryable operations at the given attempt count, each operation
+// carrying the lease its drive left behind, and the failed and still-queued
+// task under the first of them.
 func seedExhaustedRetryableTree(t *testing.T, ctx context.Context, store *Storage, name string, attempt int) (*storage.Apply, []int64, []*storage.Task) {
 	t.Helper()
 	lock := createTestLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
@@ -304,10 +314,10 @@ func seedExhaustedRetryableTree(t *testing.T, ctx context.Context, store *Storag
 		// client's clock into the comparison.
 		_, err = store.db.ExecContext(ctx, `
 			UPDATE apply_operations
-			SET state = ?, on_failure = ?, lease_owner = ?, lease_token = ?,
+			SET state = ?, on_failure = ?, attempt = ?, lease_owner = ?, lease_token = ?,
 			    lease_acquired_at = NOW(), updated_at = NOW()
 			WHERE id = ?
-		`, state.ApplyOperation.FailedRetryable, storage.OnFailureContinue,
+		`, state.ApplyOperation.FailedRetryable, storage.OnFailureContinue, attempt,
 			"driver-"+deployment, "token-"+deployment, id)
 		require.NoError(t, err)
 		opIDs = append(opIDs, id)
@@ -422,12 +432,12 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 				defer rollbackTx(ctx, busy, "test busy expiry sibling")
 				var id int64
 				require.NoError(t, busy.QueryRowContext(ctx, "SELECT id FROM apply_operations WHERE id = ? FOR UPDATE", opIDs[1]).Scan(&id))
-				expired, err := store.Applies().ExpireRetryable(ctx, 10)
+				expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 				require.NoError(t, err)
 				assert.Empty(t, expired)
 				assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
 				require.NoError(t, busy.Rollback())
-				expired, err = store.Applies().ExpireRetryable(ctx, 10)
+				expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 				require.NoError(t, err)
 				require.Len(t, expired, 1)
 				assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
@@ -467,7 +477,9 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 					"renewed lease must exclude expiry even though selection saw it stale")
 			case "expiry wins", "expiry blocks cutover":
 				require.True(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID))
-				claim := store.ApplyOperations().FindNextApplyOperation
+				claim := func(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+					return store.ApplyOperations().FindNextApplyOperation(ctx, owner)
+				}
 				if scenario == "expiry blocks cutover" {
 					claim = store.ApplyOperations().FindNextApplyOperationCutover
 				}
@@ -518,7 +530,7 @@ func testRetryableExpiryDecidesEachCandidateAlone(t *testing.T, newStore func(*t
 			backdateOperationLease(t, ctx, store, id, storage.ApplyLeaseStaleAfter+time.Minute)
 		}
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1, "the candidate the live lease does not cover still settles")
 		assert.Equal(t, free.ID, expired[0].Apply.ID)
@@ -528,7 +540,7 @@ func testRetryableExpiryDecidesEachCandidateAlone(t *testing.T, newStore func(*t
 
 		// The deferral costs the apply a pass, not its expiry.
 		backdateOperationLease(t, ctx, store, heldOps[0], storage.ApplyLeaseStaleAfter+time.Minute)
-		expired, err = store.Applies().ExpireRetryable(ctx, 10)
+		expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, held.ID, expired[0].Apply.ID)
@@ -608,7 +620,7 @@ func testRetryableExpiryDecidesEachCandidateAlone(t *testing.T, newStore func(*t
 		require.NoError(t, busyTx.QueryRowContext(ctx,
 			"SELECT id FROM apply_operations WHERE id = ? FOR UPDATE", busyOps[1]).Scan(&lockedID))
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1, "an unlocked candidate settles alongside a locked one")
 		assert.Equal(t, free.ID, expired[0].Apply.ID)
@@ -617,7 +629,7 @@ func testRetryableExpiryDecidesEachCandidateAlone(t *testing.T, newStore func(*t
 		assertTaskState(t, store, freeTasks[1].TaskIdentifier, state.Task.Cancelled)
 
 		require.NoError(t, busyTx.Rollback())
-		expired, err = store.Applies().ExpireRetryable(ctx, 10)
+		expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, busyApply.ID, expired[0].Apply.ID)

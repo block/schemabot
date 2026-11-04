@@ -92,7 +92,7 @@ func TestApplyMetadata_HoldSet(t *testing.T) {
 func TestApplyMetadata_HoldSeparatesActFromWait(t *testing.T) {
 	assert.Equal(t, "it holds the database until it is started or cancelled", Hold(Apply.Stopped))
 	assert.Equal(t, "it holds the database until it is retried or cancelled", Hold(Apply.FailedRetryable))
-	assert.Equal(t, "it holds the database until it is cut over or cancelled", Hold(Apply.WaitingForCutover))
+	assert.Equal(t, "it holds the database until its cutover runs or it is cancelled", Hold(Apply.WaitingForCutover))
 	assert.Equal(t, "it holds the database until it is reverted or skip-reverted", Hold(Apply.RevertWindow))
 	assert.Equal(t, holdUntilRevertFinishes, Hold(Apply.Reverting))
 	assert.Equal(t, holdUntilApplyFinishes, Hold(Apply.Running))

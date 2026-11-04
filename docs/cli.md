@@ -665,7 +665,7 @@ resumes each stopped target from its own checkpoint:
 
 ![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)
 
-### Choose when to cut over
+### Choose when to run the cutover
 
 For engines that support deferred cutover, start the apply with
 `--defer-cutover` to hold the final swap. Copying can finish while the live
@@ -687,7 +687,7 @@ the swap has finished.
 
 ### Manage PlanetScale deploy requests
 
-For a Vitess database using PlanetScale, use the CLI to deploy, cut over,
+For a Vitess database using PlanetScale, use the CLI to deploy, run the cutover,
 revert, or close the revert window while following progress across shards.
 This example uses
 `shop` registered as a Vitess database, `type: vitess` in `schema/schemabot.yaml`,
@@ -701,7 +701,7 @@ prompt. During copying, **Esc** detaches and **c** cancels the deploy request
 permanently; PlanetScale cancellation cannot be resumed.
 
 The CLI and PlanetScale console control the same deployment, with PlanetScale
-as the source of truth. You can cut over, revert, or close the revert window
+as the source of truth. You can run the cutover, revert, or close the revert window
 from either interface. If you act in the console, the CLI watcher follows
 along automatically; there is no need to repeat the action.
 
@@ -754,8 +754,27 @@ Pick the operation for the current state and engine:
 | `rollback` | Plan a new change toward the schema stored before an earlier apply |
 
 Support and timing differ by engine; see the [engine capability matrix](engines.md).
-A request being accepted does not mean its effect has landed. Check progress
-until you see the resulting state. For example, a completed apply returns:
+A request being accepted does not mean its effect has landed. `revert` and
+`skip-revert` say so directly: each reports the operation as requested, not
+done, and prints the `progress` command that follows it. Repeating a request
+that is already pending reports it as already requested:
+
+```console
+$ schemabot revert -e staging apply-example-73
+Revert requested for shop/staging (apply apply-example-73) — SchemaBot will undo this schema change
+To watch and manage: schemabot progress apply-example-73 -e staging
+
+$ schemabot skip-revert -e staging apply-example-73
+Skip-revert requested for shop/staging (apply apply-example-73) — SchemaBot will close the revert window and make this schema change permanent
+To watch and manage: schemabot progress apply-example-73 -e staging
+
+$ schemabot skip-revert -e staging apply-example-73
+Skip-revert already requested for shop/staging (apply apply-example-73) — SchemaBot will finish the existing request
+To watch and manage: schemabot progress apply-example-73 -e staging
+```
+
+Check progress until you see the resulting state. For example, a completed
+apply returns:
 
 ```console
 $ schemabot status apply-example-73
@@ -1140,7 +1159,7 @@ specific state. The bar is 20 squares wide; filled squares represent percent com
 
 **Waiting for cutover** — yellow bar at 100%:
 ```
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
 ```
 
@@ -1204,7 +1223,7 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 | Cutting over | `Cutover in progress - please wait...` |
 | Stopped | `To resume from where it stopped:` followed by `schemabot start <id> -e <env>` |
 
-A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target SchemaBot cuts over next, and a stopped rollout ends on the same resume command as a single target.
+A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target whose cutover SchemaBot runs next, and a stopped rollout ends on the same resume command as a single target.
 
 </details>
 
@@ -1238,6 +1257,14 @@ $ schemabot databases --json
 for the entire command, which also prints the plan and other messages.
 For fully structured writes, use the API. `progress` has no JSON output flag;
 use `status --json` for a structured snapshot.
+
+`plan` exits non-zero when any environment's plan is one `apply` refuses
+whatever its flags: the plan reports errors, a rollout member needs attention,
+or a change is blocked by the engine. stdout still carries the whole plan, as
+text or as the single `--json` document, and nothing is added to it. Refusals a
+flag or a narrowed apply lifts, such as unsafe changes or rollout members that
+run under their own plans, leave the exit status at 0, as does a plan that
+finds changes to apply.
 
 For agents and automated processes, `apply --no-watch` and `rollback --no-watch`
 return after submission without opening an interactive watcher. Retain the new

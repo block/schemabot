@@ -874,7 +874,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 // takeover path transfers it instead. Losing both means another writer posted
 // or is actively posting the summary, so the repair is skipped.
 func (h *Handler) claimSummaryForReconciliation(ctx context.Context, apply *storage.Apply) bool {
-	won, err := h.service.Storage().ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := h.service.Storage().ApplyComments().ClaimSummaryComment(ctx, apply.ID, apply.State)
 	if err != nil {
 		h.logger.Error("failed to claim summary comment for reconciliation; apply skipped until the next pass",
 			append(apply.LogAttrs(), "error", err)...)
@@ -921,10 +921,12 @@ func (h *Handler) postClaimedSummaryComment(ctx context.Context, apply *storage.
 
 	metrics.RecordSummaryCommentRepaired(ctx, apply.Repository, apply.State)
 
+	summarized := apply.State
 	marker := &storage.ApplyComment{
 		ApplyID:         apply.ID,
 		CommentState:    state.Comment.Summary,
 		GitHubCommentID: commentID,
+		SummarizedState: &summarized,
 	}
 	if err := h.service.Storage().ApplyComments().Upsert(ctx, marker); err != nil {
 		h.logger.Error("posted reconciled summary comment but failed to record its comment ID",

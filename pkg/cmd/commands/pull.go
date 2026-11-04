@@ -130,7 +130,7 @@ func filterPullSchemaTables(resp *apitypes.PullSchemaResponse, filter string) er
 		}
 	}
 	resp.TableCount = kept
-	filterPullTargetDivergence(resp.Targets, needle, kept)
+	filterPullTargetDivergence(resp, needle)
 	return nil
 }
 
@@ -141,16 +141,18 @@ func filterPullSchemaTables(resp *apitypes.PullSchemaResponse, filter string) er
 // pulled DDL described a different set.
 //
 // Each target's table count is recomputed over what remains, which the filtered
-// response already determines: a target holds the tables the primary holds,
-// less the ones only the primary has and plus the ones only it has.
-func filterPullTargetDivergence(targets []*apitypes.TargetDivergence, needle string, primaryKept int32) {
-	for _, target := range targets {
-		if target.Primary {
-			target.TableCount = primaryKept
-			continue
+// response already determines: a target holds the filtered tables of every
+// namespace it holds, less the ones only the namespace's baseline has and plus
+// the ones only it has.
+func filterPullTargetDivergence(resp *apitypes.PullSchemaResponse, needle string) {
+	for _, target := range resp.Targets {
+		var count int32
+		for name, ns := range resp.Namespaces {
+			if target.Holds(name) {
+				count += int32(len(ns.Tables))
+			}
 		}
 		kept := make([]apitypes.DivergedTable, 0, len(target.DivergedTables))
-		count := primaryKept
 		for _, table := range target.DivergedTables {
 			if !strings.Contains(strings.ToLower(table.Table), needle) {
 				continue
@@ -165,7 +167,7 @@ func filterPullTargetDivergence(targets []*apitypes.TargetDivergence, needle str
 		}
 		if len(kept) == 0 {
 			// Absent rather than empty: a target with nothing left to report
-			// holds the same filtered schema as the primary, which is what an
+			// holds the same filtered schema as its baselines, which is what an
 			// unset list already says.
 			kept = nil
 		}

@@ -2,7 +2,10 @@
 // targets into execution targets.
 package routing
 
-import "context"
+import (
+	"context"
+	"slices"
+)
 
 // Request identifies the logical database/environment a caller wants to target.
 // Schema files are intentionally not part of this request: resolving where work
@@ -27,6 +30,14 @@ type ExecutionTarget struct {
 	// schema files declare. It narrows what the member plans and pulls and is
 	// not part of its identity: MemberID stays the deployment and target.
 	Namespaces []string
+}
+
+// Holds reports whether this target holds a namespace: one its entry selects,
+// or any namespace when the entry selects none. Planning, pulling, and coverage
+// checks all ask this one question, so they cannot disagree about what an entry
+// without a selection places on its target.
+func (t ExecutionTarget) Holds(namespace string) bool {
+	return len(t.Namespaces) == 0 || slices.Contains(t.Namespaces, namespace)
 }
 
 // MemberID is the rollout-member identity of this execution target: the

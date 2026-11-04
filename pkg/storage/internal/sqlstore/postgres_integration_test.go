@@ -467,7 +467,7 @@ func testPostgresApplyCommentReclaimStaleSummaryClaim(t *testing.T, h postgresHa
 	require.NoError(t, err)
 	assert.False(t, reclaimed, "missing marker is not reclaimable")
 
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won)
 
@@ -591,7 +591,7 @@ func testPostgresApplyCommentClaimConversionRestartsStaleWindow(t *testing.T, h 
 	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
 	backdatePostgresSummaryClaim(t, h.db, apply.ID)
 
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won, "the superseded posted marker converts back into a claim sentinel")
 
@@ -1532,13 +1532,14 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), abandonedOpID)
 	require.NoError(t, err)
 
-	// A third deployment whose drive settled it into failed_retryable and left
-	// its lease behind: indistinguishable from a newly claimed retry, so the
-	// gate must defer until that lease is stale too.
+	// A third deployment whose redispatches spent its own budget, and whose
+	// drive settled it into failed_retryable and left its lease behind:
+	// indistinguishable from a newly claimed retry, so the gate must defer
+	// until that lease is stale too.
 	settledOpID := insertOperation(t, "region-c", "op-3")
 	_, err = db.ExecContext(t.Context(),
-		`UPDATE apply_operations SET state = $1, updated_at = NOW() WHERE id = $2`,
-		state.ApplyOperation.FailedRetryable, settledOpID)
+		`UPDATE apply_operations SET state = $1, attempt = $2, updated_at = NOW() WHERE id = $3`,
+		state.ApplyOperation.FailedRetryable, maxRecoveryAttempts, settledOpID)
 	require.NoError(t, err)
 
 	insertTask := func(t *testing.T, identifier, table string, opID int64, taskState string) {
@@ -1566,7 +1567,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		return got
 	}
 
-	expired, err := store.Applies().ExpireRetryable(t.Context(), 10)
+	expired, err := store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
 	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-abandoned"))
@@ -1580,7 +1581,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID, settledOpID)
 	require.NoError(t, err)
 
-	expired, err = store.Applies().ExpireRetryable(t.Context(), 10)
+	expired, err = store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
 	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)

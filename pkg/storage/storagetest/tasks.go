@@ -347,6 +347,86 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, state.Task.Completed, reloaded.State)
 	})
 
+	// A task row carries no terminal-state guard: the lease fence alone decides
+	// who may write it. A displaced driver's late write over a terminal task is
+	// refused and the row stays terminal, while the driver that now holds the
+	// lease is the one whose write lands.
+	t.Run("Update_DisplacedLeaseCannotWriteOverTerminalTask", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_displaced_db", storage.DatabaseTypeMySQL)
+		first := CreateClaimedApply(t, store, lock, "apply_task_displaced", 907, "driver-a")
+		firstCtx := storage.WithApplyLease(ctx, first.Lease())
+
+		task, err := store.Tasks().Get(ctx, "task_"+first.ApplyIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, task)
+		task.State = state.Task.Completed
+		require.NoError(t, store.Tasks().Update(firstCtx, task))
+
+		released, err := store.Applies().ReleaseClaim(ctx, first.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		second, err := store.Applies().ClaimApplyByID(ctx, first.ID, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, second)
+
+		task.State = state.Task.Running
+		require.ErrorIs(t, store.Tasks().Update(firstCtx, task), storage.ErrApplyLeaseLost)
+		reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Completed, reloaded.State, "a displaced driver must not reopen a terminal task")
+
+		task.State = state.Task.Failed
+		require.NoError(t, store.Tasks().Update(storage.WithApplyLease(ctx, second.Lease()), task))
+		reloaded, err = store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Failed, reloaded.State, "the current lease holder's write lands: the fence, not the row state, decides")
+	})
+
+	// A task an operation drive writes is fenced by the operation's lease. Once
+	// that drive has ended and handed the operation's lease back, a late write
+	// under the old lease is refused and the terminal task stays as it was.
+	t.Run("Update_EndedOperationLeaseCannotWriteOverTerminalTask", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_ended_operation_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_ended_operation", 909)
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "schema",
+		})
+		require.NoError(t, err)
+		task := newTask(apply, "task_ended_operation_users", "users", time.Now().UTC().Truncate(time.Second))
+		task.ApplyOperationID = &opID
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+		task, err = store.Tasks().Get(ctx, "task_ended_operation_users")
+		require.NoError(t, err)
+		require.NotNil(t, task)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, opID, claimed.ID)
+		opCtx := storage.WithOperationLease(ctx, claimed.Lease())
+
+		task.State = state.Task.Completed
+		require.NoError(t, store.Tasks().Update(opCtx, task))
+		require.NoError(t, store.ApplyOperations().MarkCompleted(opCtx, opID))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		task.State = state.Task.Running
+		require.ErrorIs(t, store.Tasks().Update(opCtx, task), storage.ErrApplyLeaseLost)
+		reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Completed, reloaded.State, "a drive that has ended must not reopen a terminal task")
+	})
+
 	t.Run("ExpireRetryable_TerminalizesUnfinishedTasks", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -384,7 +464,7 @@ func TestTasks(t *testing.T, h Harness) {
 			require.True(t, released)
 		}
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)

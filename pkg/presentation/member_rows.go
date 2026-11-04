@@ -97,6 +97,7 @@ func foldMember(ops []Operation, rows []int) (Operation, int) {
 		member.Retrying = member.Retrying || ops[i].Retrying
 	}
 	member.State = state.DeriveApplyState(states)
+	member.EndedBy = endedByAll(ops, rows, lead)
 	if member.State == state.ApplyOperation.Pending && parkedAtEarliestUnfinishedTable(ops, rows) {
 		member.State = state.ApplyOperation.WaitingForCutover
 	}

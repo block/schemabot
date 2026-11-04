@@ -40,6 +40,13 @@ func newGitHubMetricsTestReader(t *testing.T) *sdkmetric.ManualReader {
 	return reader
 }
 
+// The diff fetch and the GraphQL directory listing only read, so they are
+// counted against the read category rather than falling into unknown.
+func TestGitHubRequestCategoryClassifiesSymlinkModeOperationsAsReads(t *testing.T) {
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, gitHubRequestCategory(metrics.GitHubOperationFetchDiff))
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, gitHubRequestCategory(metrics.GitHubOperationGraphQLTreeEntries))
+}
+
 func TestGitHubRateLimitTransportRecordsHeaders(t *testing.T) {
 	reader := newGitHubMetricsTestReader(t)
 

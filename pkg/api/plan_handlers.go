@@ -297,18 +297,25 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	)
 	defer span.End()
 
-	// Pull the live schema from the primary deployment (first in rollout order:
-	// explicit deployment_order when set, otherwise alphabetical). For a
-	// multi-deployment environment the primary is the canonical source for the
-	// schema diff; the apply itself fans out across every deployment. This
-	// matches the route ExecutePlan resolves and the deployment
-	// createStoredApply records.
-	resolvedTarget, err := s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
+	// The member set is read once and everything below works from that read: the
+	// primary is its first member (explicit deployment_order when set, otherwise
+	// alphabetical), the route ExecutePlan resolves and the deployment
+	// createStoredApply records, and every other member is pulled from the same
+	// list, so a config reloaded mid-pull cannot pair one placement's primary
+	// with another's members.
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve target")
 		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
+	if len(targets) == 0 {
+		err := fmt.Errorf("database %q environment %q resolved no deployments", req.Database, req.Environment)
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve target")
+		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	resolvedTarget := targets[0]
 	if req.Type != "" && req.Type != resolvedTarget.DatabaseType {
 		typeErr := &databaseTypeMismatchError{Database: req.Database, RequestType: req.Type, ConfigType: resolvedTarget.DatabaseType}
 		span.RecordError(typeErr)
@@ -328,12 +335,6 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
 		return nil, err
 	}
-	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "resolve targets")
-		return nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
-	}
 	if err := requireSelectablePullNamespaces(req, targets, namespaces); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "unselected namespaces")
@@ -346,21 +347,36 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		return nil, err
 	}
 
-	merged, err := s.pullTargetSchema(ctx, req, resolvedTarget, namespaces, catalogDetail)
+	planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve member planning")
+		return nil, fmt.Errorf("resolve member planning for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	// An environment whose targets each hold their own schema has no one target
+	// whose schema is the environment's, so every member is pulled: each
+	// namespace comes from the first member holding it, and each member is
+	// reported with how it differs.
+	// Members expected to hold the same schema are not compared: pulling them
+	// would cost one round trip per member to learn what the deployments
+	// contract already asserts, and any difference there is drift for the
+	// review-time rollup to block on, not divergence for a pull to describe.
+	var merged *ternv1.PullSchemaResponse
+	var members []*apitypes.TargetDivergence
+	if planning == PlanIndependent {
+		merged, members, err = s.pullRolloutMembers(ctx, req, targets, namespaces, catalogDetail)
+	} else {
+		s.logger.Debug("pull reads only the primary target; this environment's members are expected to hold the same schema",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", resolvedTarget.Deployment,
+			"target", resolvedTarget.Target)
+		merged, err = s.pullTargetSchema(ctx, req, resolvedTarget, namespaces, catalogDetail)
+	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "pull schema failed")
-		return nil, err
-	}
-
-	// An environment whose targets each hold their own schema has no single live
-	// schema, so the primary's is reported alongside how the others differ from
-	// it. Comparing here, rather than leaving it to the caller, keeps a pull from
-	// presenting one target's schema as the environment's.
-	members, err := s.pullMemberDivergence(ctx, req, resolvedTarget, merged, namespaces, catalogDetail)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "compare rollout members")
 		return nil, err
 	}
 
@@ -1500,6 +1516,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		if refused, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
+			s.writeErrorCode(w, deferredCutoverRefusalStatus(refused), apitypes.ErrCodeDeferredCutoverCapacity, "apply rejected: "+err.Error())
+			return
+		}
 		if storageErr, ok := errors.AsType[*applyStorageError](err); ok {
 			s.logger.Error("apply failed: storage failure while queueing the apply",
 				append(storageErr.LogAttrs(), "environment", req.Environment, "error", err)...)
@@ -1530,6 +1550,10 @@ func applyMetricStatusForError(err error) string {
 	}
 	// A rollout shape the apply cannot run is the request's to change.
 	if _, ok := errors.AsType[*RolloutShapeRefusedError](err); ok {
+		return applyMetricStatusRejected
+	}
+	// So is a deferred cutover wider than the drivers that can run it.
+	if _, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -2161,6 +2185,21 @@ func (s *Service) createStoredApply(
 			"operation_group_count", len(groups))
 	}
 	logRolloutShape(s.logger, plan, req.Environment, members, groups, shardedFanout)
+	if applyOpts.DeferCutover {
+		refused, err := s.deferredCutoverCapacityRefusal(ctx, plan, req.Environment, applyIdentifier, caller, groups)
+		if err != nil {
+			return nil, 0, &applyStorageError{
+				Operation:       "admit deferred cutover",
+				Plan:            plan,
+				ApplyIdentifier: applyIdentifier,
+				Caller:          caller,
+				Err:             err,
+			}
+		}
+		if refused != nil {
+			return nil, 0, refused
+		}
+	}
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
