@@ -171,6 +171,11 @@ type GRPCClient struct {
 	// a data plane that echoes the command id answers with the request it
 	// holds or the outcome it settled.
 	cutoverSharesTaken sync.Map // cutoverShareKey -> remoteCutoverShareSend
+
+	// progressBatches answers the poll loop's scoped progress polls for
+	// operations that share a remote apply with one BatchProgress call per
+	// round (see pollRemoteProgress).
+	progressBatches remoteProgressBatcher
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -236,8 +241,8 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 // stays within its command timeout only for a handful of environments — the
 // exhausted calls fail closed either way.
 //
-// Fast polls (Progress, Health, DriverCapacity) keep a sub-second budget:
-// Progress is called on tight drive loops that own their own failure
+// Fast polls (Progress, BatchProgress, Health, DriverCapacity) keep a
+// sub-second budget: Progress and BatchProgress are called on tight drive loops that own their own failure
 // handling, Health feeds the remote-deployment outage monitor, which must
 // observe an outage promptly rather than ride it out, and DriverCapacity is
 // read while apply creation waits on it.
@@ -264,6 +269,7 @@ const retryServiceConfig = `{
 	}, {
 		"name": [
 			{"service": "tern.v1.Tern", "method": "Progress"},
+			{"service": "tern.v1.Tern", "method": "BatchProgress"},
 			{"service": "tern.v1.Tern", "method": "Health"},
 			{"service": "tern.v1.Tern", "method": "DriverCapacity"}
 		],
@@ -425,8 +431,9 @@ func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
 	}
 }
 
-// Close closes the gRPC connection.
+// Close stops batching progress polls and closes the gRPC connection.
 func (c *GRPCClient) Close() error {
+	c.progressBatches.close()
 	return c.conn.Close()
 }
 
@@ -2180,11 +2187,46 @@ func (c *GRPCClient) logProgressReadFromWholeApply(ctx context.Context, apply *s
 // operation is refused rather than read as this operation's state, and so is
 // an unscoped one unless acceptsUnscopedProgressAnswer allows it.
 func (c *GRPCClient) remoteProgress(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (*ternv1.ProgressResponse, error) {
+	return c.remoteProgressFrom(ctx, apply, scope, remoteID, c.directProgress)
+}
+
+// pollRemoteProgress is remoteProgress for the drive's poll loop. A poll
+// scoped to an operation joins this client's next batched round for its
+// remote apply, so the drives of every target that shares the remote apply
+// ask the data plane once per round between them rather than once each. The
+// answer is checked against the drive's scope exactly as a direct one is.
+func (c *GRPCClient) pollRemoteProgress(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (*ternv1.ProgressResponse, error) {
+	return c.remoteProgressFrom(ctx, apply, scope, remoteID, c.batchedProgress)
+}
+
+// progressFetch asks the data plane for one Progress answer.
+type progressFetch func(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error)
+
+func (c *GRPCClient) directProgress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	return c.client.Progress(ctx, req)
+}
+
+// batchedProgress answers a scoped Progress request from the remote apply's
+// next batched round, and asks directly when the request is unscoped or the
+// round could not answer it.
+func (c *GRPCClient) batchedProgress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	if req.GetApplyOperationId() == "" {
+		return c.directProgress(ctx, req)
+	}
+	key := progressBatchKey{remoteApplyID: req.GetApplyId(), environment: req.GetEnvironment()}
+	resp, err := c.progressBatches.progress(ctx, c.client, c.baseLogger(), key, req.GetApplyOperationId())
+	if errors.Is(err, errProgressBatchFallback) {
+		return c.directProgress(ctx, req)
+	}
+	return resp, err
+}
+
+func (c *GRPCClient) remoteProgressFrom(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string, fetch progressFetch) (*ternv1.ProgressResponse, error) {
 	remoteOperationID, err := scope.remoteOperationScope()
 	if err != nil {
 		return nil, fmt.Errorf("poll remote apply %s for %s: %w", remoteID, apply.ApplyIdentifier, err)
 	}
-	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+	resp, err := fetch(ctx, &ternv1.ProgressRequest{
 		ApplyId:          remoteID,
 		Environment:      apply.Environment,
 		ApplyOperationId: remoteOperationID,
@@ -5196,7 +5238,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 			// Poll progress from remote Tern
 			remoteID := scope.remoteApplyID(apply)
-			resp, err := c.remoteProgress(ctx, apply, scope, remoteID)
+			resp, err := c.pollRemoteProgress(ctx, apply, scope, remoteID)
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
 					message := fmt.Sprintf("remote apply %s was not found by data plane", remoteID)
