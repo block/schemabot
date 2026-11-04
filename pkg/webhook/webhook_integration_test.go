@@ -765,6 +765,15 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 // touch more than one database.
 func setupFakeGitHubForPlanWithConfigs(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, configs map[string]string, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
+	return setupFakeGitHubForPlanInRepository(t, mux, schemaSQL, configs, ns, prFiles, nil)
+}
+
+// setupFakeGitHubForPlanInRepository is setupFakeGitHubForPlanWithConfigs in a
+// repository that also holds otherFiles, outside any schema directory, at both
+// the head and the default branch, so a lookup of a file the PR changes
+// outside its schema inputs descends the directories a real repository has.
+func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, configs map[string]string, ns string, prFiles []*gh.CommitFile, otherFiles []string) *planFlowResult {
+	t.Helper()
 
 	result := &planFlowResult{
 		comments:  make(chan string, 10),
@@ -866,6 +875,14 @@ func setupFakeGitHubForPlanWithConfigs(t *testing.T, mux *http.ServeMux, schemaS
 			Size: new(len(content)),
 		})
 	}
+	for i, path := range otherFiles {
+		treeEntries = append(treeEntries, &gh.TreeEntry{
+			Path: new(path),
+			Mode: new("100644"),
+			Type: new("blob"),
+			SHA:  new(fmt.Sprintf("othersha%04d", i)),
+		})
+	}
 	result.headTreeEntries = treeEntries
 
 	// The default branch already has the schema directory and the config in it,
@@ -873,10 +890,13 @@ func setupFakeGitHubForPlanWithConfigs(t *testing.T, mux *http.ServeMux, schemaS
 	// branch tip then descends the directory levels a real repository has instead
 	// of stopping at an empty root, and still finds none of the PR's own files
 	// there — so every changed file remains the PR's own proposal.
-	if len(configs) > 0 {
-		held := make(map[string]string, len(configs))
+	if len(configs) > 0 || len(otherFiles) > 0 {
+		held := make(map[string]string, len(configs)+len(otherFiles))
 		for path := range configs {
 			held[path] = "baseconfigsha~" + path
+		}
+		for _, path := range otherFiles {
+			held[path] = "baseothersha~" + path
 		}
 		result.baseFiles.Store(&held)
 	}
