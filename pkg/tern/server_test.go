@@ -36,6 +36,24 @@ func (c logsErrorClient) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.Log
 	return nil, c.err
 }
 
+type startErrorClient struct {
+	Client
+	err error
+}
+
+func (c startErrorClient) Start(context.Context, *ternv1.StartRequest) (*ternv1.StartResponse, error) {
+	return nil, c.err
+}
+
+type stopErrorClient struct {
+	Client
+	err error
+}
+
+func (c stopErrorClient) Stop(context.Context, *ternv1.StopRequest) (*ternv1.StopResponse, error) {
+	return nil, c.err
+}
+
 type applyErrorClient struct {
 	Client
 	err error
@@ -87,23 +105,43 @@ func TestServerProgressMapsMissingApplyDataToNotFound(t *testing.T) {
 	}
 }
 
-func TestServerLogsMapsErrorsToStatusCode(t *testing.T) {
+// A remote caller of logs, start, or stop must be able to tell an apply that
+// does not exist from a storage failure by status code alone: the two cases
+// call for different operator actions and the error text is the only other
+// thing that crosses the gRPC boundary.
+func TestServerApplyLookupsMapErrorsToStatusCode(t *testing.T) {
+	calls := map[string]func(ctx context.Context, err error) error{
+		"logs": func(ctx context.Context, err error) error {
+			_, callErr := NewServer(logsErrorClient{err: err}, slog.Default()).Logs(ctx, &ternv1.LogsRequest{ApplyId: "apply-123"})
+			return callErr
+		},
+		"start": func(ctx context.Context, err error) error {
+			_, callErr := NewServer(startErrorClient{err: err}, slog.Default()).Start(ctx, &ternv1.StartRequest{ApplyId: "apply-123"})
+			return callErr
+		},
+		"stop": func(ctx context.Context, err error) error {
+			_, callErr := NewServer(stopErrorClient{err: err}, slog.Default()).Stop(ctx, &ternv1.StopRequest{ApplyId: "apply-123"})
+			return callErr
+		},
+	}
 	testCases := []struct {
 		name string
 		err  error
 		want codes.Code
 	}{
-		{name: "missing apply", err: fmt.Errorf("get apply missing: %w", storage.ErrApplyNotFound), want: codes.NotFound},
-		{name: "storage failure", err: errors.New("storage unavailable"), want: codes.Internal},
+		{name: "missing apply", err: fmt.Errorf("load apply apply-123: %w", storage.ErrApplyNotFound), want: codes.NotFound},
+		{name: "storage failure", err: errors.New("load apply apply-123: read applies row: i/o timeout"), want: codes.Internal},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(logsErrorClient{err: tc.err}, slog.Default())
-			_, err := server.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-123"})
-			require.Error(t, err)
-			assert.Equal(t, tc.want, status.Code(err))
-		})
+	for name, call := range calls {
+		for _, tc := range testCases {
+			t.Run(name+" "+tc.name, func(t *testing.T) {
+				err := call(t.Context(), tc.err)
+				require.Error(t, err)
+				assert.Equal(t, tc.want, status.Code(err))
+				assert.Contains(t, status.Convert(err).Message(), "apply-123")
+			})
+		}
 	}
 }
 
