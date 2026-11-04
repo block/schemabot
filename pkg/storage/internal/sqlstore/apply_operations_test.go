@@ -2098,6 +2098,78 @@ func TestApplyOperationStore_FindNextApplyOperation_DegradedRolloutRedispatchCon
 	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a redispatch under a degraded rollout raises the parent to the operation's own attempt")
 }
 
+// A deployment that pauses on a retryable failure just now, under a rollout
+// that has been degraded for two days, is still inside its retry window. The
+// window is the age of the pause, and a degraded parent's updated_at is the
+// age of the sibling's failure, not of this pause: the projection leaves a
+// state it re-derives unchanged, so nothing wrote the parent when region-b
+// paused. The paused row's own updated_at did move, and that is what the
+// window reads.
+func TestApplyOperationStore_FindNextApplyOperation_DegradedRolloutFreshPauseInsideRecoveryWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_old_parent", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() - INTERVAL ? DAY WHERE id = ?
+	`, retryableRecoveryFreshnessDays+1, apply.ID)
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, retryID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a fresh pause with its budget intact is retried however long the rollout has been degraded")
+	assert.Equal(t, retryID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+	assert.Equal(t, 1, claimed.Attempt)
+}
+
+// The converse: a pause that is itself older than the window is not retried
+// under a degraded rollout, even when the parent was written more recently.
+// The parent's timestamp is not the pause's, in either direction.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsDegradedRolloutStalePauseOutsideRecoveryWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_old_pause", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL ? DAY WHERE id = ?
+	`, retryableRecoveryFreshnessDays+1, retryID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pause older than the recovery window is not retried, whatever the parent's timestamp says")
+	assertApplyOperationState(t, store, retryID, state.ApplyOperation.FailedRetryable)
+}
+
 // Once a degraded rollout's retry budget is spent, its paused operation is left
 // alone even when the parent and the row are both stale: the row is a retry
 // nobody admitted, so there is no crashed drive to recover and crash recovery

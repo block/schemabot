@@ -1450,6 +1450,28 @@ func crashRecoveryParentStates() []string {
 	return states
 }
 
+// redispatchRecoveryWindowSQL renders the predicate that keeps a deliberate
+// redispatch inside the recovery window, and returns it with its positional
+// arguments. The parent is aliased a and the paused row is apply_operations.
+//
+// The window is the age of the pause, and which row carries that age depends
+// on the parent state. A failed_retryable parent entered that state when the
+// pause happened, so its own updated_at is the age. A running_degraded parent
+// was not written by the pause: the projection leaves a state it re-derives
+// unchanged and an operation-lease drive never heartbeats the parent, so its
+// updated_at is the age of the sibling's failure, which can be days older than
+// a pause under it. The paused row's own updated_at is the pause time for that
+// parent — a parked row is not heartbeated — so the window reads it there.
+func redispatchRecoveryWindowSQL(cutoff string) (string, []any) {
+	return `(
+		(a.state = ? AND a.updated_at >= ` + cutoff + `)
+		OR (a.state = ? AND apply_operations.updated_at >= ` + cutoff + `)
+	)`, []any{
+			state.Apply.FailedRetryable, retryableRecoveryFreshnessDays,
+			state.Apply.RunningDegraded, retryableRecoveryFreshnessDays,
+		}
+}
+
 // driverCapClause renders the fan-out cap predicate and returns it with its
 // positional arguments, so an arm can be gated by appending both together.
 //
@@ -1917,11 +1939,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, driverCapArgs...)
 	redispatchParents := redispatchParentStates()
 	redispatchParentPlaceholders := placeholders(len(redispatchParents))
+	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+	redispatchWindow, redispatchWindowArgs := redispatchRecoveryWindowSQL(retryFreshnessCutoff)
 	crashRecoveryParents := crashRecoveryParentStates()
 	crashRecoveryParentPlaceholders := placeholders(len(crashRecoveryParents))
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, stringArgs(redispatchParents)...)
-	queryArgs = append(queryArgs, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	queryArgs = append(queryArgs, maxRecoveryAttempts)
+	queryArgs = append(queryArgs, redispatchWindowArgs...)
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs, stringArgs(crashRecoveryParents)...)
@@ -1960,11 +1985,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     path drives the parent apply, so the operation row is a shadow of the
 	//     parent: gating on the parent's claimability (not just its retry budget)
 	//     is what keeps a healthy retry from being re-claimed every poll. The two
-	//     sub-conditions mirror the parent clauses in ApplyStore.ClaimApplyByID:
+	//     sub-conditions follow the parent clauses in ApplyStore.ClaimApplyByID,
+	//     and the first admits one parent state that clause never sees, because
+	//     only a rollout's operation rows can hold a retry under it:
 	//       * parent in a redispatch state (redispatchParentStates: still
 	//         failed_retryable, or running_degraded with this row the retry it
 	//         holds open), within recovery budget (attempt < max) and recent — a
-	//         fresh bounded retry; and
+	//         fresh bounded retry. Recent is measured from the pause, which
+	//         redispatchRecoveryWindowSQL reads from whichever row the pause
+	//         wrote; and
 	//       * parent already claimed into an active state but its lease has gone
 	//         stale — crash recovery, with no budget gate (the attempt was already
 	//         admitted and counted when the parent was claimed), and gated on this
@@ -2012,7 +2041,6 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// non-completed, and
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
-	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
 	// The guarded arms differ in the equal-timestamp case for the same reason
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
 	// out of stopped atomically with its lease rotation, so no peer can match it
@@ -2133,7 +2161,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- The budget is the operation's own: a sibling
 								-- that spent its retries leaves this one's intact.
 								AND apply_operations.attempt < ?
-								AND a.updated_at >= %s
+								AND `+redispatchWindow+`
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
 								-- it is capped; crash recovery below is not.
@@ -2156,7 +2184,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
 	`, applyOperationColumns, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders,
-		redispatchParentPlaceholders, retryFreshnessCutoff, crashRecoveryParentPlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
+		redispatchParentPlaceholders, crashRecoveryParentPlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
