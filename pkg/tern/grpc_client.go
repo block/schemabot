@@ -151,6 +151,10 @@ type GRPCClient struct {
 	observerMu      sync.RWMutex
 	observers       map[int64]ProgressObserver
 	pendingObserver ProgressObserver
+	// observerPollInterval overrides the observer notification cadence; zero
+	// selects the production default. Tests set a short interval so poll-loop
+	// behavior is observable without real-time waits.
+	observerPollInterval time.Duration
 
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
@@ -159,6 +163,14 @@ type GRPCClient struct {
 	// unrecognizedStatuses reports remote-reported statuses with no task-state
 	// mapping at the drive's ingest points. Zero value is ready.
 	unrecognizedStatuses unrecognizedStatusReporter
+
+	// cutoverSharesTaken records the cutover request sets this client's drives
+	// have sent to their remote apply and how each is sent from then on
+	// (remoteCutoverShareSend). The durable request in storage stays the
+	// source of truth: after a restart the drive sends its share again, which
+	// a data plane that echoes the command id answers with the request it
+	// holds or the outcome it settled.
+	cutoverSharesTaken sync.Map // cutoverShareKey -> remoteCutoverShareSend
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -224,10 +236,11 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 // stays within its command timeout only for a handful of environments — the
 // exhausted calls fail closed either way.
 //
-// Fast polls (Progress, Health) keep a sub-second budget: Progress is called
-// on tight drive loops that own their own failure handling, and Health feeds
-// the remote-deployment outage monitor, which must observe an outage promptly
-// rather than ride it out.
+// Fast polls (Progress, Health, DriverCapacity) keep a sub-second budget:
+// Progress is called on tight drive loops that own their own failure
+// handling, Health feeds the remote-deployment outage monitor, which must
+// observe an outage promptly rather than ride it out, and DriverCapacity is
+// read while apply creation waits on it.
 //
 // State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
@@ -251,7 +264,8 @@ const retryServiceConfig = `{
 	}, {
 		"name": [
 			{"service": "tern.v1.Tern", "method": "Progress"},
-			{"service": "tern.v1.Tern", "method": "Health"}
+			{"service": "tern.v1.Tern", "method": "Health"},
+			{"service": "tern.v1.Tern", "method": "DriverCapacity"}
 		],
 		"retryPolicy": {
 			"maxAttempts": 3,
@@ -508,6 +522,22 @@ func (c *GRPCClient) clearObserver(applyID int64) {
 	delete(c.observers, applyID)
 }
 
+// clearObserverIfCurrent removes the observer for applyID only if obs is still
+// the registered one, and reports whether it removed it. SetObserver treats an
+// existing registration as proof that a poller is already running, so a poller
+// that is about to exit must not blindly delete the map entry — a newer
+// observer may have replaced its own between reads, and deleting that
+// replacement would leave it registered-looking but never polled.
+func (c *GRPCClient) clearObserverIfCurrent(applyID int64, obs ProgressObserver) bool {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	if c.observers[applyID] != obs {
+		return false
+	}
+	delete(c.observers, applyID)
+	return true
+}
+
 // logApplyEvent appends a control-plane apply log entry for gRPC applies. The
 // remote Tern service writes its own local logs, but operators read SchemaBot's
 // control-plane apply history from SchemaBot storage.
@@ -604,7 +634,11 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 // until the apply reaches a terminal state, the observer is cleared, or the
 // apply row disappears.
 func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
-	ticker := time.NewTicker(5 * time.Second)
+	interval := c.observerPollInterval
+	if interval == 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Captured from the first successful load so a later transient load failure
@@ -624,6 +658,23 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 			// Observer was cleared — apply reached terminal state and
 			// OnTerminal already ran. Stop polling.
 			return
+		}
+
+		// An observer that permanently lost its apply lease to a newer owner
+		// will never publish again — the new owner's observer carries the
+		// apply from here — so ticking it further is pure storage load and log
+		// noise. Clear it and stop, but only while it is still the registered
+		// observer: if a newer registration already replaced it, leave the
+		// replacement in place and drive it on the next tick.
+		if sup, ok := obs.(supersededObserver); ok && sup.Superseded() {
+			if c.clearObserverIfCurrent(applyID, obs) {
+				c.baseLogger().Info("observer poll: observer superseded by a newer apply owner; stopping poll",
+					identArgs()...)
+				return
+			}
+			c.baseLogger().Info("observer poll: superseded observer already replaced by a newer registration; continuing with the replacement",
+				identArgs()...)
+			continue
 		}
 
 		// Load failures here are transient — the ticker retries on the next
@@ -714,6 +765,13 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return nil
 	}
 	logger := c.applyLogger(apply)
+	boundIDs, err := controlReq.CutoverOperationIDs()
+	if err != nil {
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(boundIDs) > 1 {
+		return c.processPendingRemoteCutoverSet(ctx, apply, scope, controlReq, boundIDs, logger)
+	}
 	if cutoverRequestResolvedByApplyState(apply.State) {
 		logger.InfoContext(ctx, "completing pending gRPC cutover request for resolved apply",
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
@@ -1586,7 +1644,7 @@ type undispatchedTerminalization struct {
 
 // stopUndispatchedTerminalization is how a stop settles undispatched work. A
 // stop is resumable on database types that can pause a change and terminal on
-// those that cannot, so the states follow stopTerminatesChange.
+// those that cannot, so the states follow StopTerminatesChange.
 func stopUndispatchedTerminalization(databaseType string) undispatchedTerminalization {
 	terminalization := undispatchedTerminalization{
 		taskState:        state.Task.Stopped,
@@ -1596,7 +1654,7 @@ func stopUndispatchedTerminalization(databaseType string) undispatchedTerminaliz
 		verb:             "stopped",
 		controlOperation: storage.ControlOperationStop,
 	}
-	if stopTerminatesChange(databaseType) {
+	if StopTerminatesChange(databaseType) {
 		terminalization.taskState = state.Task.Cancelled
 		terminalization.applyState = state.Apply.Cancelled
 		terminalization.operationState = state.ApplyOperation.Cancelled
@@ -1741,6 +1799,26 @@ func (c *GRPCClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertReque
 func (c *GRPCClient) Health(ctx context.Context) error {
 	_, err := c.client.Health(ctx, &ternv1.HealthRequest{})
 	return err
+}
+
+// DriverCapacity reads the drivers the deployment's live servers run.
+// It returns nil without an error when the deployment answers Unimplemented,
+// which a deployment running an older SchemaBot does.
+func (c *GRPCClient) DriverCapacity(ctx context.Context) (*DriverCapacity, error) {
+	resp, err := c.client.DriverCapacity(ctx, &ternv1.DriverCapacityRequest{})
+	if status.Code(err) == codes.Unimplemented {
+		c.baseLogger().DebugContext(ctx, "deployment does not report its driver capacity", "address", c.address)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read driver capacity: %w", err)
+	}
+	return &DriverCapacity{
+		LiveServers:            int(resp.GetLiveServers()),
+		Drivers:                int(resp.GetDrivers()),
+		DeferredCutoverDrivers: int(resp.GetDeferredCutoverDrivers()),
+		MaxDriversPerApply:     int(resp.GetMaxDriversPerApply()),
+	}, nil
 }
 
 // applyTaskScope selects which task rows the remote drive re-queries and where

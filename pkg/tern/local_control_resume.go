@@ -2426,7 +2426,7 @@ func isFinalizerHandoffRecordOnly(stored *storage.EngineResumeState) bool {
 // later start resumes the finalizer, except on an engine whose stop is
 // permanent, where the single stop-terminality decision makes it cancelled.
 func finalizerSettledStateForControl(operation storage.ControlOperation, databaseType string) string {
-	if operation == storage.ControlOperationStop && !stopTerminatesChange(databaseType) {
+	if operation == storage.ControlOperationStop && !StopTerminatesChange(databaseType) {
 		return state.ApplyOperation.Stopped
 	}
 	return state.ApplyOperation.Cancelled

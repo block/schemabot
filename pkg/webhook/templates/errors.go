@@ -640,6 +640,18 @@ schemabot %s -e staging
 `+"```", action, action))
 }
 
+// RenderControlMissingEnv answers a control command that names an apply but
+// omits -e. The apply's own environment is known, so the reply gives the
+// exact command to run rather than a placeholder.
+func RenderControlMissingEnv(action, applyID, environment string) string {
+	return offerSupportChannel(fmt.Sprintf("## "+glyph.Failed+` Missing Argument
+
+`+"`schemabot %s`"+` needs the environment of the apply it controls. Apply `+"`%s`"+` runs in `+"`%s`"+`, so comment:
+`+"```"+`
+schemabot %s %s -e %s
+`+"```", action, applyID, environment, action, applyID, environment))
+}
+
 func renderTemplate(tmpl *template.Template, data SchemaErrorData) string {
 	var sb strings.Builder
 	if err := tmpl.Execute(&sb, data); err != nil {

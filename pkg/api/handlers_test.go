@@ -33,6 +33,7 @@ import (
 type mockStorage struct {
 	pingErr       error
 	webhookEvents storage.WebhookEventStore
+	driverPools   memoryDriverPools
 }
 
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
@@ -47,8 +48,70 @@ func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
 func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
-func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
-func (m *mockStorage) Close() error                                 { return nil }
+func (m *mockStorage) DriverPools() storage.DriverPoolStore {
+	return &m.driverPools
+}
+func (m *mockStorage) Ping(ctx context.Context) error { return m.pingErr }
+func (m *mockStorage) Close() error                   { return nil }
+
+// memoryDriverPools is an in-memory driver pool store whose
+// heartbeats are always live. With hang set, a heartbeat answers only when its
+// context ends, as a storage call that stops responding would. With pruneErr
+// or listErr set, every prune or list fails with it.
+type memoryDriverPools struct {
+	mu       sync.Mutex
+	servers  map[string]storage.DriverPool
+	beats    int
+	prunes   int
+	hang     bool
+	pruneErr error
+	listErr  error
+}
+
+func (m *memoryDriverPools) Heartbeat(ctx context.Context, server *storage.DriverPool) error {
+	m.mu.Lock()
+	hang := m.hang
+	m.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return fmt.Errorf("heartbeat %s: %w", server.ServerID, ctx.Err())
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.servers == nil {
+		m.servers = map[string]storage.DriverPool{}
+	}
+	m.servers[server.ServerID] = *server
+	m.beats++
+	return nil
+}
+
+func (m *memoryDriverPools) PruneStale(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prunes++
+	return m.pruneErr
+}
+
+func (m *memoryDriverPools) Deregister(_ context.Context, serverID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.servers, serverID)
+	return nil
+}
+
+func (m *memoryDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	servers := make([]*storage.DriverPool, 0, len(m.servers))
+	for _, server := range m.servers {
+		servers = append(servers, &server)
+	}
+	return servers, nil
+}
 
 type mockPlanLookupStore struct {
 	plan *storage.Plan
@@ -461,6 +524,23 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 	stored.ID = s.nextID
 	s.requests = append(s.requests, stored)
 	return cloneControlRequest(stored), false, nil
+}
+
+func (s *memoryControlRequestStore) RequestPendingCommand(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	commandID, err := req.ControlCommandID()
+	if err != nil {
+		return nil, false, err
+	}
+	existing, err := s.GetByOperation(ctx, req.ApplyID, req.Operation)
+	if err != nil {
+		return nil, false, err
+	}
+	if settled, err := existing.SettledByControlCommand(commandID); err != nil {
+		return nil, false, err
+	} else if settled {
+		return existing, false, nil
+	}
+	return s.RequestPending(ctx, req)
 }
 
 func (s *memoryControlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {

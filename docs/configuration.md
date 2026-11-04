@@ -892,6 +892,31 @@ The listener binds `:9102` by default; set `metrics_port` to move it. The API po
 
 **Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. One driver on each server with two or more never starts, resumes, or recovers work for an apply that defers its cutover, whether it was started with `--defer-cutover` or is a rollout member a control plane dispatched with its cutover deferred, so a server whose other drivers are all waiting on an operator's cutover still picks up other databases' applies, recoveries, and stops. That driver still delivers stop and cancel requests to a deferred apply, including recovering a crashed drive of one to deliver them, and then hands the apply back so another driver resumes it if the request did not end it. Count it out when sizing for deferred applies: `drivers: 4` across four replicas runs up to twelve deferred operations at once. A server with a single driver reserves nothing. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
 
+### Deferred cutover capacity
+
+An apply started with `--defer-cutover` copies each table and then waits for someone to run `schemabot cutover`. While an operation (one shard, or one deployment) waits, it keeps its driver. SchemaBot accepts the cutover command only once every operation of the apply is waiting, so the apply needs a driver for each of them at the same time. Under `barrier` and `parallel` that is every shard of every deployment. Under `rolling` it is the shards of one deployment at a time.
+
+If there aren't enough drivers, some operations wait and the rest never start, so the apply can never be cut over. It would hold its drivers until the waiting-for-cutover timeout ended it. SchemaBot refuses such an apply when it starts instead.
+
+**How SchemaBot counts drivers.** Each server that runs drivers writes how many it has to the `driver_pools` table when it starts, updates the row every 15 seconds, and deletes the row when it stops. A server that hasn't updated its row in the last minute isn't counted. That is the same amount of time after which other servers take over its work. Each server keeps one driver free for other work, so a server with `drivers: 4` adds three, and four such servers give twelve. Adding or removing servers changes the total, with no setting to update.
+
+**When SchemaBot refuses.** A deferred apply of two or more operations is refused when either of these is true:
+
+- It has more operations than [`max_drivers_per_apply`](#per-apply-driver-cap). The default is 2, so a deferred apply of more than two shards is refused until you raise it to at least the size of the largest deferred apply you run.
+- It has more operations than all the servers' drivers can hold together, counted as above.
+
+The check is about the apply's own size. It counts every driver the servers have, not only the free ones, so waiting for other applies to finish does not change the answer. The refusal says what to raise and by how much: `max_drivers_per_apply`, the servers' `drivers` setting, or how many servers you run. You can always run the apply without `--defer-cutover` instead.
+
+A deferred apply of a single operation is never refused, since one cutover command reaches all of it. On a pull request, `schemabot apply` checks before it asks you to confirm, so nothing is locked when it refuses. Creating the apply checks again.
+
+**Sharing drivers with other applies.** Other applies don't count against the check. They use drivers as usual, and an operation that finds none free waits for one. Deferred applies get drivers in the order they started: a deferred apply doesn't start an operation while an earlier deferred apply still has one waiting for a driver. Without that order, two deferred applies could each hold part of the drivers, and neither could be cut over. An apply that was stopped and then started again goes behind the deferred applies that started while it was stopped, because it gave up its drivers when it stopped. The one driver each server keeps free is what stops deferred applies, all together, from leaving every driver waiting on a person.
+
+**Deployments on a remote data plane.** When a deployment runs its operations on a remote data plane, each operation holds a driver there too. So for a deferred apply of two or more operations, SchemaBot also asks each such deployment how many drivers its servers run, how many of those can wait, and what its own `max_drivers_per_apply` is. It refuses the apply the same way if the operations it would send to that deployment are more than either, and the refusal names the deployment. The data plane gives drivers to deferred applies in the order they started, the same way. SchemaBot asks once per check, with the same time limit as a health check but separately from it, so a deployment that doesn't answer only refuses deferred applies and keeps running every other apply. A deployment on an older SchemaBot doesn't answer, so deferred applies to it are refused until it is upgraded.
+
+Upgrade the data planes before the control plane. A control plane only defers the cutover of operations it sends to a deployment that answers, because answering also tells it that the deployment runs the cutover of every operation a cutover command names and records each command only once.
+
+**If a server goes away later.** SchemaBot counts the drivers when the apply starts. If a server stops after that, the apply has fewer drivers than it counted on, and its waiting operations move to the other servers' drivers. If those aren't enough, nothing is cut over: the apply waits until someone cancels it or the waiting-for-cutover timeout ends it.
+
 ### Per-apply driver cap
 
 A single apply that fans out across many deployments or shards claims its operations like any other work. Without a bound it takes every driver on the plane and holds them for as long as its slowest operation runs, so no other database's work — and no stop or cancel — is picked up until it finishes.
@@ -906,7 +931,7 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 **The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
 
-A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Cutting over such an apply therefore takes one `cutover` per capped batch rather than one for the whole fan-out, and shards that have not yet advanced are still subject to the manual-inaction timeout.
+A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Its cutover is accepted only once every operation waits, which takes a cap no smaller than the apply's width, so a deferred apply that would hold more operations at once than `max_drivers_per_apply` is [refused at the start](#deferred-cutover-capacity). Run it without `--defer-cutover`, or raise `max_drivers_per_apply` to at least its width.
 
 ## Rate Limits
 

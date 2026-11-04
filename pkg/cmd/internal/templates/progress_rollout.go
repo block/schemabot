@@ -378,7 +378,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			// A target that has not reported counts toward where the table
 			// stands, so a halt there is never hidden under its siblings'
 			// progress.
-			status := presentation.UnreportedTargetStatus(d.State)
+			status := presentation.RolloutTableStatus(v.Model.State, presentation.UnreportedTargetStatus(d.State))
 			statuses = append(statuses, status)
 			rolled.Shards = append(rolled.Shards, ShardProgress{Shard: memberTargetName(d), Status: status})
 			// Its plan's estimates are not known, so a sum of the rest would
@@ -390,7 +390,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			if t.Namespace != table.Namespace || t.TableName != table.TableName || t.DDL != table.DDL {
 				continue
 			}
-			status := state.NormalizeTaskStatus(t.Status)
+			status := presentation.RolloutTableStatus(v.Model.State, state.NormalizeTaskStatus(t.Status))
 			statuses = append(statuses, status)
 			var plannedRows *int64
 			if t.RowsTotal == 0 && presentation.CopyStillAhead(status) {
@@ -708,6 +708,16 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 		// The list counts the targets, so the line does not repeat them.
 		coverage = ""
 	}
+	if stoppedBeforeAnyTargetStarted(t) {
+		// Every target would only repeat that it stopped, so the line says it
+		// once, as the PR comment does.
+		writeTableLine(&b, t, "%s", haltedAcrossTargetsPhrase(t))
+		if t.DDL != "" {
+			b.WriteString(formatTableDDL(t))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
 	stopped, ok := stoppedAcrossTargets(t.Shards)
 	if !ok || !state.IsState(t.Status, state.Task.Stopped) || !anyTargetStarted(t.Shards) {
 		writeTableLine(&b, t, "%s%s", haltedAcrossTargetsPhrase(t), coverage)
@@ -804,6 +814,17 @@ func haltedAcrossTargetsPhrase(t TableProgress) string {
 	default:
 		return t.Status
 	}
+}
+
+// stoppedBeforeAnyTargetStarted reports whether a table across targets
+// stopped on every target before any of them started it
+// (presentation.EveryTargetStopped).
+func stoppedBeforeAnyTargetStarted(t TableProgress) bool {
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return presentation.EveryTargetStopped(statuses) && !anyTargetStarted(t.Shards)
 }
 
 // anyTargetStarted reports whether any target completed the change or copied

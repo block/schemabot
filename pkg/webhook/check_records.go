@@ -104,10 +104,14 @@ type memberWork struct {
 	// against, the first in rollout order, whether or not it has work. Empty
 	// when no rollup was run.
 	primary string
-	// copyAtStake names a member other than the primary whose apply would
-	// discard an unfinished copy, or could not say whether it would, and why.
-	// Zero when no member with work puts a copy at stake.
+	// copyAtStake names a member other than the primary with work whose data
+	// plane could not say whether applying its plan discards an unfinished
+	// copy, and why. Zero when every such member reported its copies.
 	copyAtStake memberRefusal
+	// discarded are the unfinished copies applying the other members' plans
+	// discards, in rollout order, each naming its target. The primary plan
+	// carries the primary's own.
+	discarded []memberDiscardedCopy
 	// others counts the members with work other than the primary target,
 	// whose work runs from plans of their own rather than the primary plan.
 	others int
@@ -139,10 +143,29 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 		}
 	}
 	work.pending = len(work.names)
-	if at, reason := rollup.MemberCopyAtStake(); at >= 0 {
+	if at, reason := rollup.MemberCopiesUnreported(); at >= 0 {
 		work.copyAtStake = memberRefusal{target: names[at], reason: reason}
 	}
+	for _, d := range rollup.MemberDiscardedCopies() {
+		entry := rollup.Entries[d.Entry]
+		work.discarded = append(work.discarded, memberDiscardedCopy{
+			target: names[d.Entry],
+			member: routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID(),
+			copy:   d.Copy,
+		})
+	}
 	return work
+}
+
+// memberDiscardedCopy is an unfinished copy on a rollout member other than
+// the primary that applying the member's plan discards.
+type memberDiscardedCopy struct {
+	// target names the member the way an operator addresses it.
+	target string
+	// member is the member's ID, which names it the same way however the rest
+	// of the rollout changes.
+	member string
+	copy   *apitypes.ExistingCopyResponse
 }
 
 // maxNamedPendingTargets bounds how many targets a check's Change column names
