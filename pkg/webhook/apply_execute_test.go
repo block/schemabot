@@ -846,3 +846,29 @@ func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 		"This rollback can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
 }
+
+// A deferred apply refused by a deployment that runs its operations on another
+// plane names that deployment, so the operator knows whose drivers or setting
+// to look at. A deployment that does not report its drivers is told apart from
+// one with no live servers, since upgrading it is the remedy.
+func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
+	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Unreported: true, Operations: 4}
+	assert.Equal(t,
+		"This apply can't defer its cutover: the `east` deployment doesn't report its drivers. To defer it, upgrade SchemaBot there. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(unreported, action.Apply, "production", ""))
+
+	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 16, PerApplyCap: 8, LiveServers: 8}
+	assert.Equal(t,
+		"This apply can't defer its cutover: it would keep 16 drivers waiting for the cutover on the `east` deployment, and one apply can use at most 8 there (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` on that deployment to 16. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(overCap, action.Apply, "production", ""))
+
+	noServers := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 4}
+	assert.Equal(t,
+		"This apply can't defer its cutover: no SchemaBot server running drivers on the `east` deployment has checked in during the last minute. Apply again once its drivers are running, or run `schemabot apply -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(noServers, action.Apply, "production", ""))
+
+	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 40, Drivers: 32, LiveServers: 8}
+	assert.Equal(t,
+		"This rollback can't defer its cutover: it would keep 40 drivers waiting for the cutover on the `east` deployment, and its servers have 32 drivers that can wait. To defer it, give that deployment's servers 8 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
+}

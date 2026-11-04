@@ -1227,8 +1227,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
-`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
-`pkg/storage/internal/sqlstore/reaper.go`).
+`releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1750,8 +1750,8 @@ re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), whi
 the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
-validates the branch against the declared schema before creating the deploy request. The
-cross-deployment comparison a plan is reviewed against
+validates the branch against the declared schema before creating or adopting the deploy request.
+The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced

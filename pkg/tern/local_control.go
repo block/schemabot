@@ -194,7 +194,28 @@ func (c *LocalClient) resolveControlApply(ctx context.Context, applyID, operatio
 	return apply, nil
 }
 
-func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, caller string) (*ternv1.CutoverResponse, error) {
+// cutover sends the cutover to the engine and records the attempt in the
+// timeline. resend reports that an earlier send of the same request lost its
+// answer: that send may have started the cutover, so any error from this one,
+// whether it came from the engine or from the way to it (storage, credentials,
+// the engine lookup), is returned as an unknown outcome rather than a failure,
+// since none of them proves the earlier send did not start the cutover. A
+// not-ready answer stays not ready; the caller keeps it inside the window. No
+// timeline entry is written for a resend: the timeline already records the
+// unknown outcome. A recovering apply is answered as not accepted, resend or
+// not, and the caller waits for recovery.
+func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, caller string, resend bool) (*ternv1.CutoverResponse, error) {
+	resp, err := c.sendCutover(ctx, req, caller, resend)
+	if resend && err != nil && !engine.IsNotReady(err) && !engine.IsOutcomeUnknown(err) {
+		return nil, &engine.OutcomeUnknownError{Err: fmt.Errorf("resend cutover: %w", err)}
+	}
+	return resp, err
+}
+
+// sendCutover resolves the task, apply, credentials, and engine the cutover is
+// for, sends it, and records the attempt in the timeline. resend suppresses
+// the timeline entries for an attempt that errs; cutover classifies the error.
+func (c *LocalClient) sendCutover(ctx context.Context, req *ternv1.CutoverRequest, caller string, resend bool) (*ternv1.CutoverResponse, error) {
 	var task *storage.Task
 	var apply *storage.Apply
 	var err error
@@ -296,6 +317,12 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 		return nil, fmt.Errorf("cutover not accepted yet: %w", err)
 	}
 
+	if resend && err != nil {
+		// The timeline already records the unknown outcome of the send that
+		// lost its answer; the outcome of this one is read as unknown as well.
+		return nil, fmt.Errorf("send cutover: %w", err)
+	}
+
 	// The trigger event is recorded once the backend has accepted the attempt
 	// into flight or definitively failed it, so the timeline shows one trigger
 	// per effective attempt rather than one per not-ready retry.
@@ -306,6 +333,13 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 	c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 		logMessage, "", "")
 
+	if engine.IsOutcomeUnknown(err) {
+		// The backend may have taken the cutover, so the timeline must not
+		// report it failed; the caller keeps the request pending and resends it.
+		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Cutover outcome unknown, SchemaBot will send it again: %v", err), "", "")
+		return nil, fmt.Errorf("cutover outcome unknown: %w", err)
+	}
 	if err != nil {
 		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover failed: %v", err), "", "")
@@ -531,11 +565,17 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
+	// An unbound request is sent for the apply as a whole, so its unknown
+	// outcome is stamped under operation 0.
+	unknownSince, err := controlReq.CutoverOutcomeUnknownSince(0)
+	if err != nil {
+		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
-	}, controlRequestCaller(controlReq))
-	if engine.IsNotReady(err) {
+	}, controlRequestCaller(controlReq), !unknownSince.IsZero())
+	if engine.IsNotReady(err) && unknownSince.IsZero() {
 		// The engine's backend has not finished staging the cutover; the
 		// rejection clears on its own. Leave the request pending so the next
 		// progress tick retries it — terminally failing it would strand a
@@ -543,6 +583,26 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
 		return nil
+	}
+	if cutoverOutcomeStillUnknown(err, unknownSince) {
+		// The engine cannot tell whether its backend took the cutover. Failing
+		// the request would tell the operator the cutover failed while it may be
+		// completing; the request stays pending, the next progress tick sends it
+		// again, and progress reports the cutover if it already took. A window
+		// bounds the wait for a database that stays unreachable.
+		settle, holdErr := holdCutoverRequestWithUnknownOutcome(ctx, c.storage, apply, controlReq, 0, unknownSince, time.Now(), err, logger)
+		if holdErr != nil {
+			return fmt.Errorf("process pending cutover for apply %s: %w; %w", apply.ApplyIdentifier, err, holdErr)
+		}
+		if !settle {
+			return nil
+		}
+		if settleErr := c.settleCutoverRequestUnconfirmed(ctx, apply, func(reason string) error {
+			return failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, reason, logger)
+		}); settleErr != nil {
+			return fmt.Errorf("process pending cutover for apply %s: %s: %w", apply.ApplyIdentifier, cutoverOutcomeUnconfirmedMessage, settleErr)
+		}
+		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, cutoverOutcomeUnconfirmedMessage)
 	}
 	// Each branch where the engine did not take the cutover restores the
 	// pre-cutover state before failing the request, so the apply is not left
@@ -2923,10 +2983,13 @@ func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storag
 
 // cutOverBoundOperation triggers the cutover of one operation for a pending
 // request, from that operation's own drive. accepted reports that the engine
-// took the cutover. A recovering apply and an engine that is not ready yet
-// leave the request pending for the next tick; a pending stop blocks it; any
-// other refusal or failure fails the request through failRequest, since the
-// command can no longer take effect as accepted.
+// took the cutover. A recovering apply, an engine that is not ready yet, and a
+// cutover whose outcome is unknown leave the request pending for the next
+// tick; a pending stop blocks it; any other refusal or failure fails the
+// request through failRequest, since the command can no longer take effect as
+// accepted. Once a send for this operation has lost its answer, its stamp on
+// the request bounds every later tick, a not-ready answer included, so the
+// request settles as unconfirmed when the window closes.
 func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, logger *slog.Logger, failRequest func(reason string) error) (accepted bool, err error) {
 	if state.IsState(apply.State, state.Apply.Recovering) {
 		// The cutover path refuses a recovering apply, and settling the
@@ -2941,15 +3004,32 @@ func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.
 	} else if stopReq != nil {
 		return false, fmt.Errorf("process pending cutover for apply %s: schema change has a pending stop request; cutover is blocked until stop is processed", apply.ApplyIdentifier)
 	}
+	unknownSince, err := controlReq.CutoverOutcomeUnknownSince(operationID)
+	if err != nil {
+		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %w", apply.ApplyIdentifier, operationID, err)
+	}
 	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:          apply.ApplyIdentifier,
 		Environment:      apply.Environment,
 		ApplyOperationId: strconv.FormatInt(operationID, 10),
-	}, controlRequestCaller(controlReq))
-	if engine.IsNotReady(err) {
+	}, controlRequestCaller(controlReq), !unknownSince.IsZero())
+	if engine.IsNotReady(err) && unknownSince.IsZero() {
 		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
 			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", operationID, "error", err)
 		return false, nil
+	}
+	if cutoverOutcomeStillUnknown(err, unknownSince) {
+		settle, holdErr := holdCutoverRequestWithUnknownOutcome(ctx, c.storage, apply, controlReq, operationID, unknownSince, time.Now(), err, logger, "bound_operation_id", operationID)
+		if holdErr != nil {
+			return false, fmt.Errorf("process pending cutover for apply %s operation %d: %w; %w", apply.ApplyIdentifier, operationID, err, holdErr)
+		}
+		if !settle {
+			return false, nil
+		}
+		if settleErr := c.settleCutoverRequestUnconfirmed(ctx, apply, failRequest); settleErr != nil {
+			return false, fmt.Errorf("process pending cutover for apply %s operation %d: %s: %w", apply.ApplyIdentifier, operationID, cutoverOutcomeUnconfirmedMessage, settleErr)
+		}
+		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, operationID, cutoverOutcomeUnconfirmedMessage)
 	}
 	if err != nil {
 		if failErr := failRequest(err.Error()); failErr != nil {
