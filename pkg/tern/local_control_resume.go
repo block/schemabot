@@ -860,7 +860,10 @@ type replanResult struct {
 // whose own statement already landed, are marked completed. Remaining tasks get
 // their DDL updated from the re-plan result. A task a previous drive failed
 // permanently is neither settled nor re-planned: it stays active as stored for
-// the drive to read as the apply's verdict. Used by the resume paths that pick
+// the drive to read as the apply's verdict. A task whose change landed but
+// whose engine accepted work the resume must reattach to
+// (taskReattachesToAcceptedWork) is not settled either: it stays active as
+// stored, and engine progress decides its outcome. Used by the resume paths that pick
 // up an apply whose tables may have completed before a stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
 	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
@@ -936,6 +939,15 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		}
 		replanned := replanDDL[replanKey]
 		if verdict == replanChangeLanded {
+			reattach, err := c.taskReattachesToAcceptedWork(ctx, task)
+			if err != nil {
+				return nil, err
+			}
+			if reattach {
+				c.keepAcceptedWorkTaskActive(task)
+				activeTasks = append(activeTasks, task)
+				continue
+			}
 			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
 			// this shard's live schema. A table dropping out of that diff means
 			// live already matches the reviewed target, so there is no remaining
@@ -979,6 +991,15 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 				continue
 			}
 			if landed {
+				reattach, err := c.taskReattachesToAcceptedWork(ctx, task)
+				if err != nil {
+					return nil, err
+				}
+				if reattach {
+					c.keepAcceptedWorkTaskActive(task)
+					activeTasks = append(activeTasks, task)
+					continue
+				}
 				// The table is still in the diff, but only for the reviewed
 				// DDL of siblings that will still run it: this task's own
 				// statement executed before its outcome was recorded. Settle
@@ -1022,6 +1043,56 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 // revert already landed.
 func taskInRevertPhase(task *storage.Task) bool {
 	return state.IsState(task.State, state.Task.RevertWindow, state.Task.Reverting)
+}
+
+// taskReattachesToAcceptedWork reports whether a resume must reattach to
+// engine work the task's stored resume state names, instead of settling the
+// task from a schema comparison. It holds for a non-terminal task on an engine
+// whose recovery reattaches to accepted work (recoveryReattachesToAcceptedWork)
+// when the task's operation has persisted resume state naming a deploy
+// request: the engine accepted the work, and it keeps running at the provider
+// whatever this drive concludes.
+//
+// After an accepted cutover the live schema matches the reviewed target, so a
+// schema match cannot tell a finished change from one whose revert window is
+// open. The task states that would say so are not reliable here: the polls
+// that record the revert window can fail and pause the apply, which rewrites
+// the tasks as failed_retryable, and a crashed drive leaves them cutting_over.
+// Settling such a task completed would finish the apply with its revert
+// window never offered. Keeping it active lets the resume reattach to the
+// deploy request, and engine progress decides the task's terminal state.
+//
+// The deploy request is read from the PlanetScale resume blob through
+// psMetadataForStorage, the projection tern already reads that blob through
+// for display and revert deadlines; only the Vitess database type reaches the
+// read. A storage read failure and an undecodable blob are errors, so the
+// resume fails rather than settles a task whose engine work it cannot rule out.
+func (c *LocalClient) taskReattachesToAcceptedWork(ctx context.Context, task *storage.Task) (bool, error) {
+	if !recoveryReattachesToAcceptedWork(c.config.Type) {
+		return false, nil
+	}
+	if state.IsTerminalTaskState(task.State) {
+		return false, nil
+	}
+	stored, err := c.loadStoredEngineResumeState(ctx, task, "resume re-plan settlement")
+	if err != nil {
+		return false, fmt.Errorf("load engine resume state before settling task %s from the resume re-plan: %w", task.TaskIdentifier, err)
+	}
+	if stored == nil {
+		return false, nil
+	}
+	meta, err := decodePSMetadataForStorage(stored.Metadata)
+	if err != nil {
+		return false, fmt.Errorf("decode engine resume state before settling task %s from the resume re-plan: %w", task.TaskIdentifier, err)
+	}
+	return meta != nil && meta.DeployRequestID != 0, nil
+}
+
+// keepAcceptedWorkTaskActive logs why a task the resume re-plan would have
+// settled stays active instead: taskReattachesToAcceptedWork holds for it.
+func (c *LocalClient) keepAcceptedWorkTaskActive(task *storage.Task) {
+	c.logger.Info("keeping task active through resume re-plan although the re-plan finds its change landed: its stored resume state names a deploy request the engine accepted, so the resume reattaches and engine progress decides its terminal state",
+		task.LogAttrs()...)
 }
 
 // applyInRevertPhase reports whether the apply dwells in an engine-monitored
