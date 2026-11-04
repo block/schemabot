@@ -252,6 +252,10 @@ type LocalClient struct {
 	cancelApply           context.CancelCauseFunc
 	cancelApplyGeneration uint64
 
+	// pendingControlReads lets the drives of one apply share their reads of
+	// its pending control requests.
+	pendingControlReads sharedPendingControlReads
+
 	// observers holds per-apply progress observers. The progress poller notifies
 	// the observer on state changes and terminal state. Cleared on terminal state.
 	// Protected by observerMu.

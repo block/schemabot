@@ -403,6 +403,8 @@ stale heartbeat makes the apply claimable through the normal operator recovery
 path, and the next driver processes the pending control request before resuming
 or dispatching more work.
 
+Every drive checks its apply's pending control requests on each poll, and the drives of one apply on one process share that check. A drive answers it from a read another drive started within the last half poll interval, or from one still in flight, and it never answers two checks from the same read. The one check that always queries is the one a grouped drive makes after its progress sync, which must see a stop before an automatic cutover starts. The read only decides which processors run, and each processor reloads its own request before acting, so a shared read can delay a request by at most one poll and never changes what is done with it.
+
 The gRPC Tern path has additional remote-vs-stored reconciliation cases because
 control RPC acknowledgements and subsequent progress samples can arrive at
 different times. [`grpc-control-edge-cases.md`](grpc-control-edge-cases.md)
