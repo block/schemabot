@@ -915,6 +915,38 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "blocking-outcome-unknown",
 			cause:  fmt.Sprintf("whether the blocking statement for %s committed is unknown", quotedTable(table)),
 			remedy: "inspect the target catalog before re-running"}, true
+	case executor.CodeCommitOutcomeUnknown:
+		// The bounded attempt's COMMIT did not answer and may have landed;
+		// the same retry hazard as the blocking case, so the apply fails
+		// closed until an operator has read the catalog.
+		return &refusal{reason: "commit-outcome-unknown",
+			cause:  fmt.Sprintf("whether the statement for %s committed is unknown", quotedTable(table)),
+			remedy: "inspect the target catalog before re-running"}, true
+	case executor.CodeReplicaIdentityDrop:
+		// Nothing was dropped: the engine re-read the catalog under the
+		// table's lock and found the drop would remove what a replica
+		// identity index is built on. Retrying unchanged meets the same
+		// identity, so the operator has to point it elsewhere first.
+		return &refusal{reason: "replica-identity-drop",
+			cause:  fmt.Sprintf("the planned drop on %s would remove what its replica identity index is built on", quotedTable(table)),
+			remedy: "point REPLICA IDENTITY elsewhere, then " + replanRemedy}, true
+	case executor.CodeAdoptedIndexDrift, executor.CodeValidatedConstraintDrift,
+		executor.CodeRenamedIndexDrift:
+		// The index or constraint the planned statement names changed after
+		// planning — dropped, replaced, left invalid, or now backing a
+		// constraint — read again under the table's lock; nothing was
+		// applied. The plan is stale, so only a re-plan changes the outcome.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodeDataFault:
+		// The server rejected the table's rows as the statement would shape
+		// them (a value the new type will not hold, a constraint the rows
+		// break). Any rerun meets the same rows, so the data or the
+		// statement has to change first.
+		return &refusal{reason: "data-fault",
+			cause:  fmt.Sprintf("the rows of %s do not fit the shape the planned statement gives them", quotedTable(table)),
+			remedy: "correct the data or the statement, then " + replanRemedy}, true
 	case executor.CodeBudgetStatementExceeded:
 		// Normally consumed upstream by the typed BudgetError arm, which
 		// renders the budget's own figures; this mapping keeps the outcome

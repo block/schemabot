@@ -208,6 +208,12 @@ type ApplyStatusCommentData struct {
 	// command there would tell the operator to act when no action is needed.
 	DeferCutover bool
 
+	// StoppedAtCutover counts the tables SchemaBot stopped at a deferred
+	// cutover because another table's failure meant the cutover could never
+	// run. A failed apply notes them under its error, saying their copies are
+	// saved and a new apply resumes them.
+	StoppedAtCutover presentation.StoppedAtCutover
+
 	// SkipRevert reports whether the apply was started with --skip-revert (the
 	// apply's durable skip-revert option). Before cutover it is listed on the
 	// options line beside DeferCutover, as the plan listed it.
@@ -309,6 +315,9 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 		case state.IsState(data.State, state.Apply.Stopped):
 			writeErrorBlock(&sb, glyph.Attention, data.ErrorMessage)
 		}
+	}
+	if state.IsState(data.State, state.Apply.Failed) {
+		writeTablesStoppedAtCutover(&sb, data)
 	}
 
 	// Footer with next actions
@@ -1603,6 +1612,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	if data.ErrorMessage != "" {
 		writeErrorBlock(sb, glyph.Failed, data.ErrorMessage)
 	}
+	writeTablesStoppedAtCutover(sb, data)
 
 	if completedCount > 0 {
 		fmt.Fprintf(sb, "\n%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
@@ -1610,6 +1620,15 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 
 	writeSummaryTableList(sb, data, budget)
 	writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+}
+
+// writeTablesStoppedAtCutover explains, under a failed apply's error, the
+// tables SchemaBot stopped at the cutover because another table's failure
+// meant the cutover could never run, and that applying again resumes them.
+func writeTablesStoppedAtCutover(sb *strings.Builder, data ApplyStatusCommentData) {
+	if note := data.StoppedAtCutover.Note(presentation.TableNoun, summaryCode); note != "" {
+		fmt.Fprintf(sb, "\n> ⏹️ %s\n", note)
+	}
 }
 
 func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int, budget *ddlBlockBudget) {
@@ -2000,7 +2019,7 @@ func taskOutcomeLabel(normalized string) string {
 	case state.Task.RevertWindow:
 		return "Completed (revert window open)"
 	case state.Task.PostChecksum:
-		return "Data verified, not cut over"
+		return "Data verified, cutover not run"
 	case state.Task.FailedRetryable:
 		return "Interrupted"
 	}

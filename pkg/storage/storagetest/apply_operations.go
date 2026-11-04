@@ -2858,6 +2858,61 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		_, err := store.ApplyOperations().ListRecentTargets(t.Context(), storage.DatabaseTypeVitess, time.Hour)
 		require.Error(t, err)
 	})
+
+	// An interruption reaches both shards of an apply at once, as a data plane
+	// restart does. Each shard spends one attempt of its own budget, so the
+	// apply's attempt reads 1 rather than 2. When a shard fails again, it
+	// spends its second attempt and the apply records 2.
+	t.Run("FailedRetryableRedispatch_PerOperationBudget", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_redispatch_budget_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_operation_redispatch_budget", 914, state.Apply.FailedRetryable, "staging")
+		shardIDs := map[int64]bool{}
+		for _, shard := range []string{"-80", "80-"} {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", OperationKey: shard, Target: shard,
+				State: state.ApplyOperation.FailedRetryable, ErrorMessage: "data plane unavailable",
+			})
+			require.NoError(t, err)
+			shardIDs[id] = true
+		}
+
+		var first *storage.ApplyOperation
+		for range shardIDs {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "each shard is redispatched")
+			assert.True(t, shardIDs[claimed.ID])
+			assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+			assert.Equal(t, 1, claimed.Attempt)
+			if first == nil {
+				first = claimed
+			}
+		}
+
+		reloaded, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, 1, reloaded.Attempt, "each shard spends its own budget, so the apply records the highest attempt, not their sum")
+
+		ownedCtx := storage.WithOperationLease(ctx, first.Lease())
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, first.ID, "data plane unavailable"))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, first.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, again, "a shard that failed again is redispatched again")
+		assert.Equal(t, first.ID, again.ID)
+		assert.Equal(t, 2, again.Attempt)
+
+		reloaded, err = store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, 2, reloaded.Attempt, "the apply records the shard's second attempt")
+	})
 }
 
 // testOneTargetsShardsCutOverWhenReady seeds one target with two shards of

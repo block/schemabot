@@ -132,6 +132,25 @@ service Tern {
     };
   }
 
+  // BatchProgress answers Progress for several operations of one apply in a
+  // single call. The rollout members of one deployment share its apply, each
+  // with its own operation, so a caller driving many of them asks once per
+  // poll instead of once per member, and the apply, its tasks, and its
+  // operations are read once for all of them.
+  //
+  // Each entry of the answer is what Progress scoped to that operation would
+  // return, or the error it would fail with. An error that concerns the whole
+  // apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+  //
+  // A deployment that answers Unimplemented predates the RPC, and the caller
+  // asks Progress once per operation.
+  rpc BatchProgress(BatchProgressRequest) returns (BatchProgressResponse) {
+    option (google.api.http) = {
+      post: "/v1/batch-progress"
+      body: "*"
+    };
+  }
+
   // Logs returns a bounded recent window of durable apply logs. It is read-only.
   rpc Logs(LogsRequest) returns (LogsResponse) {
     option (google.api.http) = {
@@ -186,6 +205,20 @@ service Tern {
   rpc Health(HealthRequest) returns (HealthResponse) {
     option (google.api.http) = {
       get: "/v1/health"
+    };
+  }
+
+  // DriverCapacity reports the drivers this deployment's operators run, so a
+  // caller can refuse up front an apply that could never have all its
+  // operations here waiting at a deferred cutover at once.
+  //
+  // A deployment that answers also runs the cutover of every operation a
+  // CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+  // must not send an apply started with defer_cutover to a deployment that
+  // answers Unimplemented.
+  rpc DriverCapacity(DriverCapacityRequest) returns (DriverCapacityResponse) {
+    option (google.api.http) = {
+      get: "/v1/driver-capacity"
     };
   }
 
@@ -905,6 +938,36 @@ message ProgressRequest {
   string apply_operation_id = 3;
 }
 
+message BatchProgressRequest {
+  // Apply ID for the schema change to inspect.
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
+  // The operations to answer for: apply_operation_id values a dispatch
+  // returned in ApplyResponse. Each is answered as a ProgressRequest scoped
+  // to it would be.
+  repeated string apply_operation_ids = 3;
+}
+
+message BatchProgressResponse {
+  string apply_id = 1;
+  // One entry per requested operation, in request order.
+  repeated OperationProgress operations = 2;
+}
+
+// OperationProgress is the answer for one operation of a BatchProgress call.
+message OperationProgress {
+  // The apply_operation_id this entry answers for, echoed from the request.
+  string apply_operation_id = 1;
+  // What Progress scoped to this operation returns. Unset when error_code is.
+  ProgressResponse progress = 2;
+  // The gRPC status code Progress scoped to this operation fails with, or 0
+  // (OK) when progress is set.
+  int32 error_code = 3;
+  // The message of that failure.
+  string error_message = 4;
+}
+
 message LogsRequest {
   string apply_id = 1;
   string target = 2;
@@ -1050,12 +1113,32 @@ message CutoverRequest {
   // members of one deployment share its apply, and one member's turn to cut
   // over is not its siblings' turn. Empty cuts over the apply's parked work.
   string apply_operation_id = 4;
+  // When set, one cutover command for every operation listed: each is cut
+  // over by its own drive once it waits at its cutover, and the request
+  // settles once none of them can still cut over on it. apply_operation_id
+  // names one of them, so a data plane that reads only that field cuts over
+  // that operation alone.
+  repeated string apply_operation_ids = 5;
+  // When set, identifies the operator command this request carries, the same
+  // on every send of it. A data plane that already settled the command
+  // answers a re-send with that outcome instead of recording the command
+  // again, so a re-send never retries a command the data plane failed. A
+  // new operator command carries a new id. An id of the form
+  // "<origin>.<sequence>" orders the commands of one origin: a data plane that
+  // settled a later command answers a send of an earlier one with that
+  // outcome too, since only a delayed re-send can carry it.
+  string command_id = 6;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
 message CutoverResponse {
   bool accepted = 1;
   string error_message = 2;
+  // The command_id the data plane recorded the request under, echoed back.
+  // Empty from a data plane that predates command ids, which records every
+  // send as a new command, so a caller sends such a data plane each command
+  // only once.
+  string command_id = 3;
 }
 
 // RevertRequest reverts a completed schema change.
@@ -1092,6 +1175,29 @@ message HealthRequest {}
 // HealthResponse is the health check response.
 message HealthResponse {
   string status = 1;
+}
+
+// DriverCapacityRequest asks a deployment for the drivers its operators run.
+message DriverCapacityRequest {}
+
+// DriverCapacityResponse is the drivers a deployment's live servers
+// run, counted from the servers that reported within the live window.
+message DriverCapacityResponse {
+  // live_servers is how many of the deployment's servers reported their
+  // drivers within the live window.
+  int32 live_servers = 1;
+  // drivers is how many drivers those servers run, together.
+  int32 drivers = 2;
+  // deferred_cutover_drivers is how many of those drivers may hold an
+  // operation waiting at a deferred cutover: each server's drivers less the
+  // one it keeps for other work. A waiting operation keeps its driver until
+  // its cutover runs.
+  int32 deferred_cutover_drivers = 3;
+  // max_drivers_per_apply is how many operations of one apply the deployment
+  // runs at once. An operation waiting at its cutover keeps counting, so an
+  // apply that sends the deployment more operations than this can never have
+  // all of them waiting together.
+  int32 max_drivers_per_apply = 4;
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.

@@ -1382,13 +1382,13 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			want: []string{"table xfers", "task-holding", "failed_retryable", "retried or cancelled"},
 		},
 		{
-			name: "an apply parked at the cutover barrier holds its database until cut over",
+			name: "an apply parked at the cutover barrier holds its database until its cutover runs",
 			blocking: blockingTask{
 				taskIdentifier: "task-holding",
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.WaitingForCutover},
 			},
-			want: []string{"table xfers", "task-holding", "waiting_for_cutover", "cut over or cancelled"},
+			want: []string{"table xfers", "task-holding", "waiting_for_cutover", "until its cutover runs or it is cancelled"},
 		},
 		{
 			name: "an apply in its revert window rests holding its database, so a decision is owed",

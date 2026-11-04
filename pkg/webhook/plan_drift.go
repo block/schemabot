@@ -133,7 +133,23 @@ func reviewDriftPreview(rollup api.PlanRollup, logAttrs ...any) *templates.Deplo
 		return preview
 	}
 	preview.TableSizes = targetTableSizes(rollup, logAttrs...)
+	preview.DiscardedCopies = targetDiscardedCopies(rollup)
 	return preview
+}
+
+// targetDiscardedCopies lists the unfinished copies applying the other
+// targets' own plans discards, each naming its target the way the rest of the
+// comment does.
+func targetDiscardedCopies(rollup api.PlanRollup) []templates.TargetExistingCopy {
+	names := rollupMemberNames(rollup)
+	var out []templates.TargetExistingCopy
+	for _, d := range rollup.MemberDiscardedCopies() {
+		discarded, _, _ := splitExistingCopies([]*apitypes.ExistingCopyResponse{d.Copy})
+		for _, c := range discarded {
+			out = append(out, templates.TargetExistingCopy{Target: names[d.Entry], Copy: c})
+		}
+	}
+	return out
 }
 
 // deploymentDriftPreview turns a computed rollup into the PR-preview rendering

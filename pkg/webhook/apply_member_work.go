@@ -39,6 +39,55 @@ func rolloutRunsMemberWork(outcome reviewDriftOutcome, preview *templates.Deploy
 	return !outcome.blocks() && outcome.work.others > 0 && templates.RendersTargetPlans(preview)
 }
 
+// rolloutDiscardedCopies counts the unfinished copies the apply discards on
+// every target it runs: the primary plan's own, and the other targets' when the
+// apply runs their plans too. Each is work already done on a target, so the
+// consent to discard is asked for and recorded over all of them (RV-3), never
+// over the primary target's alone.
+func rolloutDiscardedCopies(planResp *apitypes.PlanResponse, rollout reviewDriftOutcome, runsMemberWork bool) int {
+	return len(rolloutDisclosedCopies(planResp, rollout, runsMemberWork))
+}
+
+// rolloutDisclosedCopies names the copies rolloutDiscardedCopies counts, each
+// with the target it is on, as the comment rendering this plan discloses them.
+// It is what a pending confirmation records as consent, and what the re-plan
+// before an apply is checked against copy by copy.
+func rolloutDisclosedCopies(planResp *apitypes.PlanResponse, rollout reviewDriftOutcome, runsMemberWork bool) []storage.DisclosedCopy {
+	var copies []storage.DisclosedCopy
+	for _, c := range planResp.DiscardedCopies() {
+		copies = append(copies, disclosedCopyOf("", c))
+	}
+	if runsMemberWork {
+		for _, d := range rollout.work.discarded {
+			copies = append(copies, disclosedCopyOf(d.member, d.copy))
+		}
+	}
+	return copies
+}
+
+// disclosedCopyOf names a copy on the member with ID member, the empty member
+// being the target the apply's own plan was planned against. Its tables are sorted so two readings
+// of the same copy name it the same way.
+func disclosedCopyOf(member string, c *apitypes.ExistingCopyResponse) storage.DisclosedCopy {
+	tables := slices.Clone(c.Tables)
+	slices.Sort(tables)
+	return storage.DisclosedCopy{Target: member, Namespace: c.Namespace, Tables: tables, Statement: c.Statement}
+}
+
+// undisclosedDiscards counts the copies applying would discard that the
+// confirmation did not disclose. A copy that came to be discarded after the
+// operator was asked, on any target, is one they never agreed to lose, however
+// many others they were shown.
+func undisclosedDiscards(discarding, disclosed []storage.DisclosedCopy) int {
+	n := 0
+	for _, c := range discarding {
+		if !slices.ContainsFunc(disclosed, c.Equal) {
+			n++
+		}
+	}
+	return n
+}
+
 // refusePendingRollout answers an apply that cannot run what the rollout has
 // pending: drift blocks, the rest of the rollout is not known to be at the
 // desired schema, or the other targets' work is not what the operator was shown.
@@ -134,19 +183,19 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 //
 // The apply runs each member's stored plan, and the comment behind the apply
 // renders those plans' statements with each target's direct and unsafe changes
-// under it. So work the apply cannot run as planned, and
-// anything whose consent rests on a disclosure that comment does not carry,
-// refuses here: an unfinished copy the apply would discard. A direct-execution
-// or unsafe change is not refused: the comment discloses it under the target
-// that runs it, and an unsafe one needs --allow-unsafe as the primary plan's
-// own does. It is asked before the apply takes its lock, so a refusal never
-// pins a confirmation that could not succeed, and again against the re-plan the
-// apply runs from.
+// and discarded copies under it. So only work the apply cannot run as planned,
+// or whose consent rests on a disclosure that comment cannot carry, refuses
+// here: a member whose data plane could not say whether its plan discards an
+// unfinished copy. A direct-execution, unsafe, or copy-discarding change is not
+// refused: the comment discloses it under the target that runs it, an unsafe
+// one needs --allow-unsafe as the primary plan's own does, and a discarded copy
+// needs the two-step confirm the primary plan's own does. It is asked before
+// the apply takes its lock, so a refusal never pins a confirmation that could
+// not succeed, and again against the re-plan the apply runs from.
 //
-// A copy at stake refuses whether or not the primary target has work, since
-// the comment discloses only the primary plan's discarded copies. The rest is
-// what apply creation asks of each member, which depends on the primary plan:
-// an empty one can carry only per-member table work
+// An unreported copy refuses whether or not the primary target has work. The
+// rest is what apply creation asks of each member, which depends on the primary
+// plan: an empty one can carry only per-member table work
 // (api.MemberWorkAConvergedPrimaryPlanCannotRun), and one with work holds each
 // member to its shape (api.MemberWorkThePrimaryPlanCannotRun). Neither refuses
 // a blocked change any less.

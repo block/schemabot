@@ -145,7 +145,7 @@ func TestInFlightCancelDoesNotRewindACutoverWait(t *testing.T) {
 func TestLocalClient_CutoverDuringAnInFlightCancelSurfacesTheRejection(t *testing.T) {
 	fx := newCancelInFlightFixture(t)
 
-	resp, err := fx.client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: fx.apply.ApplyIdentifier}, "github:alice")
+	resp, err := fx.client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: fx.apply.ApplyIdentifier}, "github:alice", false)
 
 	require.Error(t, err)
 	assert.Nil(t, resp)

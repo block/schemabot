@@ -503,6 +503,41 @@ locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `p
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
 in-flight storage convergence as the deliberate stop AV-13 permits.
 
+### AV-15: A pull request's GitHub cost grows with its schema inputs, not with the rest of the PR
+
+The GitHub requests SchemaBot makes to handle a pull request grow with schema inputs: the schema
+files and configs the PR changes, and the schema inputs of each database those changes reach,
+changed or not. They never grow with the other files the PR changes or with the rest of the
+repository. Listing the changed files is the one cost that grows with the whole PR, and it is a
+paged list, not a read per file. A question about every changed file is answered from that list,
+or from one request that covers them all, never by a lookup per file.
+
+*Breaks if violated:* an App installation's rate limit is shared by every pull request in every
+repository it serves, so routine edits in one large repository use it up and required checks stop
+posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
+configs, probing each directory once (`pkg/github/config.go`), and
+`TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
+(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
+hundred one-line edits outside its schema directory and requires the same GitHub requests. It
+covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
+a repository whose tree GitHub truncates.
+
+### AV-16: Applies that wait on a person never wait on each other
+
+An apply that keeps its drivers until an operator cuts it over is admitted only if SchemaBot's
+servers can hold all of it at once, and such applies take drivers in turn: none starts an operation
+while one ahead of it still has an operation waiting to start. The apply at the front therefore
+always gets every driver it needs and can reach its cutover, and the rest follow it. An apply's place is
+when it last started, so one that was stopped and started again goes behind every apply that started
+while it held no drivers.
+
+*Breaks if violated:* two applies each hold part of the drivers with the rest of their operations
+queued behind the other, neither can reach its cutover, and both wait until the waiting-for-cutover
+timeout fails them. *Enforced:* the width refusal at apply and at apply creation
+(`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
+(`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
+place recorded with a start request (`markResumed`, `pkg/storage/internal/sqlstore/control_requests.go`).
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
@@ -884,7 +919,9 @@ starts again a task another run held the table from (`pkg/tern/local_apply_seque
 resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
 retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the per-operation budget in
+the redispatch claim (`FindNextApplyOperation`,
+`pkg/storage/internal/sqlstore/apply_operations.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -898,8 +935,8 @@ the cutover barrier under `barrier`, while `parallel` does not order copy start 
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
 work held behind an earlier table that settled without completing can never start, so it holds no target. Under
-`barrier` and `parallel` cutover follows deployment order: an operation cuts over only once every
-operation of every earlier deployment has completed. Within one deployment, an operation cuts over
+`barrier` and `parallel` cutover follows deployment order: an operation's cutover runs only once every
+operation of every earlier deployment has completed. Within one deployment, an operation's cutover runs
 as soon as its own copy is ready: an earlier operation of the same deployment holds it only while it
 is in a state the rollout halts on (failed, retrying a failure, stopped, cancelled, or reverted),
 never while it is still copying or cutting over. A member's finalizer publishes its change without
@@ -939,7 +976,7 @@ arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker`
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
 dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
 `pkg/storage/internal/sqlstore/apply_operations.go`), and each member's progress and cutover are scoped to its own operation
-(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+(`progressReads.scopeOperation` in `pkg/tern/local_progress_reads.go`, `boundCutoverRequestTurn` in
 `pkg/tern/local_control.go`); for a manually deferred cutover, the turn
 check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
@@ -954,6 +991,24 @@ projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/a
 `StopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
 (`pkg/tern/control_requests.go`, reached from `pkg/api/control_handlers.go` and `pkg/tern/local_control.go`, through `RequestPendingSuperseding` in
 `pkg/storage/internal/sqlstore/control_requests.go`).
+
+### ST-11: An apply whose cutover can never run is ended, not left waiting
+
+When an apply holds its operations for a cutover that runs for all of them, and one operation ends
+before it gets there, by failing under a policy that halts the rollout or by waiting on a retry that
+will never come, SchemaBot ends the apply rather than leaving the rest holding their targets until
+the wait times out. It stops the others so each one saves its work, then settles the apply failed
+once nothing drives it, and each stopped operation records the operation it failed for. It does
+this only where a stop pauses the work: where a stop would end the change, the apply waits as
+before. An apply an operator already stopped or cancelled is left to that request.
+*Enforced:* the reaper's ended-operation pass and the stoppable types it passes
+(`runEndedOperationPass`, `endedOperationStoppableDatabaseTypes`, `pkg/api/reaper.go`), its two
+sweeps (`ListAppliesHeldByEndedOperation`, `SettleAppliesStoppedForEndedOperation`,
+`pkg/storage/internal/sqlstore/ended_operation_applies.go`), and retry expiry leaving such an apply
+to the settle (`expireRetryable`, `pkg/storage/internal/sqlstore/applies.go`), pinned on both
+dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_applies.go`). The
+drive tail leaves SchemaBot's stop pending for the settle (`completeLandedStopForHeldOpenApply`,
+`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 
@@ -1174,8 +1229,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
-`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
-`pkg/storage/internal/sqlstore/reaper.go`).
+`releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1308,7 +1363,7 @@ in the write that records the stop, under the locks the resuming claims take (`S
 and failing the cutover a stop superseded before the stop's
 request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
 `pkg/tern/control_requests.go`, reached from both clients and from
-`pkg/api/control_handlers.go` and `pkg/api/operator.go`).
+`pkg/api/control_handlers.go`, `pkg/api/operator.go`, and `pkg/api/reaper.go`).
 
 ### CO-5: The revert phase owns the outcome
 
@@ -1697,8 +1752,8 @@ re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), whi
 the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
-validates the branch against the declared schema before creating the deploy request. The
-cross-deployment comparison a plan is reviewed against
+validates the branch against the declared schema before creating or adopting the deploy request.
+The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
@@ -1724,7 +1779,7 @@ after the confirmation stops rather than running something the operator never sa
 (`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the re-check that the work of every rollout member, the
 primary target's included, is what the confirmation, or the comment an automatic apply posted,
 was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
+`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where every member's discarded copies take the same two-step confirm as the primary plan's, consent being recorded copy by copy with the target each is on and a copy the confirmation did not name stopping the apply again (`rolloutDiscardedCopies`, `rolloutDisclosedCopies` and `undisclosedDiscards` in `pkg/webhook/apply_member_work.go`, recorded on the lock as `DisclosedCopies`, disclosed under each target's plan by `writeTargetDiscardedCopies` in `pkg/webhook/templates/plan.go`) and a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopiesUnreported` and `MemberDiscardedCopies` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
 member's unsafe change requiring the same opt-in as the primary plan's, both at the PR gate
 (`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
 `TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation
@@ -1963,8 +2018,9 @@ corrected into something executable, especially one carrying `--allow-unsafe`. E
 receives a response, and silence only ever means another instance owns the reply or the comment
 issues no command: a line that opens with the product name but reads as a sentence about it, not a
 command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
-unowned-command policy (`pkg/webhook/commands.go`), and the fan-out silence predicates
-(`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
+unowned-command policy (`pkg/webhook/commands.go`), the stored-apply answer to a control command
+that omits its environment (`pkg/webhook/control_missing_env.go`), and the fan-out silence
+predicates (`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
 its own registry lacks under no expected participant's path: the leader serving the command's
 environment, or the first environment in the promotion order when the command names none.
 
@@ -2034,6 +2090,12 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   of the list and is named here as such: it runs from the pre-commit hook over staged packages
   rather than in CI, so it is bypassable and does not see the repository as a whole. Wiring it
   into the lint workflow is what would make it a peer of the others.
+
+- **GitHub request cost.** An integration test plans the same pull request with one and with
+  hundreds of edits outside its schema directory and fails on any GitHub request the second makes
+  that the first does not. It drives the auto-plan on open and on push, the plan command, and the
+  plan command in a repository whose tree GitHub truncates, so a lookup per changed file on those
+  paths fails CI instead of exhausting the rate limit in production (AV-15).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.

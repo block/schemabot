@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -921,6 +922,46 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 	})
 }
 
+// PreviewCommentPlanRolloutCopyDiscardedPaused renders the locked comment of
+// an automatic apply on a rollout of independent targets that stopped for
+// confirmation because applying throws away an unfinished copy on a target
+// other than the primary. The copy is named under the plan of the target it
+// is on, and confirming runs every target's plan, that one included.
+func PreviewCommentPlanRolloutCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"us/testapp_1", "us/testapp_2", "us/testapp_3"}, Primary: true, Changes: samplePlanChanges()},
+			},
+			DiscardedCopies: []TargetExistingCopy{{
+				Target: "us/testapp_3",
+				Copy: ExistingCopyData{
+					Namespace: "testapp",
+					Tables:    []string{"products"},
+					Reason:    "statement_differs",
+					Age:       "3h 12m",
+					Statement: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
+				},
+			}},
+		},
+		PendingManualConfirmation: true,
+	})
+}
+
 // PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
 // independent targets that need different work: the primary target and one
 // other need the email column, and the third needs it with an index as well.
@@ -1332,6 +1373,12 @@ func PreviewCommentMissingEnv() string {
 	return RenderMissingEnv(action.Plan)
 }
 
+// PreviewCommentControlMissingEnv renders the reply to a control command that
+// names an apply but omits -e.
+func PreviewCommentControlMissingEnv() string {
+	return RenderControlMissingEnv(action.Stop, "apply-a1b2c3d4e5f6", "staging")
+}
+
 // PreviewCommentInvalidCmd renders the "invalid command" error comment.
 func PreviewCommentInvalidCmd() string {
 	return RenderInvalidCommand()
@@ -1395,6 +1442,21 @@ func PreviewCommentApplyInProgress() string {
 		ApplyID:           "apply-a1b2c3d4e5f6",
 		ApplyState:        "running",
 		ApplyAgainCommand: ApplyCommand("staging", "", ApplyCommandOptions{}),
+	})
+}
+
+// PreviewCommentApplyInProgressLatestCommit renders a sample "apply already in
+// progress" comment where the running apply is applying the PR's latest commit.
+func PreviewCommentApplyInProgressLatestCommit() string {
+	return RenderApplyInProgress(ApplyLockConflictData{
+		Database:            "testapp",
+		DatabaseType:        "mysql",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		ApplyID:             "apply-a1b2c3d4e5f6",
+		ApplyState:          "running",
+		ApplyAgainCommand:   ApplyCommand("staging", "", ApplyCommandOptions{}),
+		AppliesLatestCommit: true,
 	})
 }
 
@@ -1479,7 +1541,9 @@ func PreviewCommentReviewRequiredNoOperators() string {
 
 // PreviewCommentReviewRequiredStaleApproval renders the "review required"
 // comment when an authorized reviewer approved an earlier commit and the PR's
-// schema change differs at the head, so that approval no longer counts.
+// schema change differs at the head, so that approval no longer counts. The
+// author dropped a column comment after the review, and the collapsed block
+// shows the DDL each commit runs.
 func PreviewCommentReviewRequiredStaleApproval() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:          "testapp",
@@ -1490,6 +1554,14 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		PRAuthor:          previewRequestedBy,
 		ChangedApprovers:  []string{"jdoe"},
 		ChangedPaths:      []string{"schema/testapp/orders.sql"},
+		ChangedStatements: []ChangedStatements{{
+			Path:        "schema/testapp/orders.sql",
+			Dialect:     schema.DialectMySQL,
+			ApprovedSHA: "4f1c2d9e8b7a",
+			HeadSHA:     "9a3b5c7d1e2f",
+			Approved:    []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL COMMENT 'NULL until a coupon is applied'"},
+			Head:        []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL"},
+		}},
 	})
 }
 
@@ -3586,6 +3658,27 @@ func PreviewCommentSummaryFailed() string {
 		RenderFailureLogs([]LogGroupData{
 			{Entries: sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value")},
 		}, GitHubIssueCommentMaxChars)
+}
+
+// PreviewCommentSummaryStoppedAtCutoverOnOnlyShard renders the final summary
+// of an apply on a keyspace's only shard that deferred its cutover across
+// three tables. users failed while orders and products had copied and waited
+// at the cutover, which could then never run, so SchemaBot stopped them,
+// saved their copies, and failed the apply. The error is users' alone, and a
+// note says a new apply resumes the stopped tables.
+func PreviewCommentSummaryStoppedAtCutoverOnOnlyShard() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Stopped
+	tables[1].Status = state.Task.Failed
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[2].Status = state.Task.Stopped
+	data := sampleSummaryData(state.Apply.Failed, tables)
+	data.DeferCutover = true
+	data.ErrorMessage = "lock wait timeout exceeded; try restarting transaction"
+	data.StoppedAtCutover = presentation.StoppedAtCutover{Count: 2, EndedBy: "users"}
+	return RenderApplySummaryComment(data)
 }
 
 // PreviewCommentSummaryFailedEngineLogs renders a failed summary for an apply

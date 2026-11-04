@@ -101,7 +101,7 @@ var applyMetadata = map[string]ApplyStateInfo{
 	},
 	Apply.WaitingForCutover: {
 		Label: "Waiting for cutover",
-		Hold:  "it holds the database until it is cut over or cancelled",
+		Hold:  "it holds the database until its cutover runs or it is cancelled",
 	},
 	Apply.Recovering: {
 		Label: "Recovering",

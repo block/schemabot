@@ -499,10 +499,12 @@ type expiringApplyStore struct {
 	expirations []*storage.RetryableApplyExpiration
 	expireErr   error
 	limit       int
+	stopTypes   []string
 }
 
-func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {
 	s.limit = limit
+	s.stopTypes = endedOperationStopTypes
 	// Expirations and an error are mutually exclusive, and deliberately so: the
 	// real pass settles its whole batch in one transaction, so a failure rolls
 	// back everything it had matched. A double that could hand back both would
@@ -682,4 +684,5 @@ func TestRunRetryableExpiryPassBoundsTheBatch(t *testing.T) {
 	svc.runRetryableExpiryPass(t.Context())
 
 	assert.Equal(t, retryableExpiryBatch, applies.limit)
+	assert.Equal(t, endedOperationStoppableDatabaseTypes, applies.stopTypes, "expiry passes over what the ended operation sweep stops")
 }

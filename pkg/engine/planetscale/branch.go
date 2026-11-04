@@ -811,6 +811,34 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 	})
 }
 
+// openDeployRequests returns the open deploy requests that carry branch into
+// intoBranch. The response is filtered again here rather than trusted to the
+// request's filters, so a deploy request from another branch, into another
+// branch, or already closed is never taken for one of them.
+func (e *Engine) openDeployRequests(ctx context.Context, client psclient.PSClient, org, database, branch, intoBranch string) ([]*ps.DeployRequest, error) {
+	listed, err := client.ListDeployRequests(ctx, &ps.ListDeployRequestsRequest{
+		Organization: org,
+		Database:     database,
+		Branch:       branch,
+		IntoBranch:   intoBranch,
+		State:        deployRequestOpen,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list open deploy requests from branch %s into %s of %s/%s: %w", branch, intoBranch, org, database, err)
+	}
+	var open []*ps.DeployRequest
+	for _, dr := range listed {
+		if dr.Branch != branch || dr.IntoBranch != intoBranch || dr.State != deployRequestOpen {
+			e.logger.Debug("skipping a listed deploy request that is not open from this branch into the target branch",
+				"organization", org, "database", database, "branch", branch, "into_branch", intoBranch,
+				"deploy_request", dr.Number, "deploy_request_branch", dr.Branch, "deploy_request_into_branch", dr.IntoBranch, "deploy_request_state", dr.State)
+			continue
+		}
+		open = append(open, dr)
+	}
+	return open, nil
+}
+
 // operatorBranch returns the development branch the operator supplied for this
 // apply, or "" when SchemaBot creates its own. The apply's options are stored
 // with the apply and handed back on every resume, so a fresh drive and a
@@ -872,16 +900,62 @@ func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.A
 //
 // Fails closed, including when the setting cannot be read — the deploy has not
 // started, so refusing costs a re-run, while proceeding costs the decision the
-// operator kept for themselves.
-//
-// A read that does not answer is read again before it is treated as a refusal.
-// Auto-cutover on is an answer and stops the deploy immediately; anything else —
-// a request that did not arrive, a response carrying no deployment, a body that
-// did not decode — leaves the question open, and none of those can be told apart
-// from a moment's lag from here. Seconds of re-reading is cheap next to failing
-// an apply that would have been fine, and a gate that refuses at random is one
-// operators learn to re-run past, which is how a gate stops being one.
+// operator kept for themselves. A read that does not answer is read again
+// before it is treated as a refusal (readCutoverSetting).
 func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient, org, database string, number uint64) error {
+	autoCutover, err := e.readCutoverSetting(ctx, client, org, database, number)
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and reading the cutover setting was interrupted: %w", number, err)
+		}
+		return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and SchemaBot could not confirm the cutover is held: %w", number, err)
+	}
+	if autoCutover {
+		return fmt.Errorf("deploy request #%d was not deployed: its cutover was deferred, but the deploy request holds auto-cutover on and would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so re-run the schema change to get a deploy request that holds the cutover", number)
+	}
+	e.logger.Info("the deploy request holds the cutover for the operator",
+		"database", database, "deploy_request", number)
+	return nil
+}
+
+// verifyAdoptedDeployRequestHoldsCutover checks that a deploy request the
+// resume adopted, rather than created, holds auto-cutover off before it is
+// deployed.
+//
+// Every deploy request this engine creates asks for auto-cutover off, and the
+// drive is the only actor that cuts over (CO-4). An adopted deploy request was
+// created by someone else, so that holds only if its setting is read back.
+// Fails closed, including when the setting cannot be read, and permanently:
+// the setting cannot be changed after creation, so no later drive would find
+// it any different. The deploy request is left open for whoever opened it.
+func (e *Engine) verifyAdoptedDeployRequestHoldsCutover(ctx context.Context, client psclient.PSClient, org, database string, number uint64) error {
+	autoCutover, err := e.readCutoverSetting(ctx, client, org, database, number)
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("adopted deploy request #%d was not deployed because reading its auto-cutover setting was interrupted: %w", number, err)
+		}
+		return engine.NewPermanentError("adopted deploy request #%d was not deployed because SchemaBot did not create it and could not confirm it holds auto-cutover off; close it in PlanetScale, then plan and apply again: %w", number, err)
+	}
+	if autoCutover {
+		return engine.NewPermanentError("adopted deploy request #%d was not deployed: SchemaBot did not create it, and it holds auto-cutover on, so it would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so close it in PlanetScale, then plan and apply again to get a deploy request that holds the cutover", number)
+	}
+	e.logger.Info("the adopted deploy request holds auto-cutover off",
+		"database", database, "deploy_request", number)
+	return nil
+}
+
+// readCutoverSetting reads back a deploy request's auto-cutover setting.
+//
+// A read that does not answer is read again before it is given up on.
+// Auto-cutover on is an answer and is returned immediately; anything else —
+// a request that did not arrive, a response carrying no deployment, a body
+// that did not decode — leaves the question open, and none of those can be
+// told apart from a moment's lag from here. Seconds of re-reading is cheap
+// next to failing an apply that would have been fine, and a gate that refuses
+// at random is one operators learn to re-run past, which is how a gate stops
+// being one. The error returned is the last read's, or the context's when the
+// wait between reads was interrupted.
+func (e *Engine) readCutoverSetting(ctx context.Context, client psclient.PSClient, org, database string, number uint64) (bool, error) {
 	const maxAttempts = 3
 	const pollInterval = 2 * time.Second
 
@@ -890,7 +964,7 @@ func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and reading the cutover setting was interrupted: %w", number, ctx.Err())
+				return false, ctx.Err()
 			case <-time.After(pollInterval):
 			}
 		}
@@ -902,14 +976,9 @@ func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient
 				"database", database, "deploy_request", number, "attempt", attempt+1, "error", err)
 			continue
 		}
-		if autoCutover {
-			return fmt.Errorf("deploy request #%d was not deployed: its cutover was deferred, but the deploy request holds auto-cutover on and would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so re-run the schema change to get a deploy request that holds the cutover", number)
-		}
-		e.logger.Info("the deploy request holds the cutover for the operator",
-			"database", database, "deploy_request", number, "attempts", attempt+1)
-		return nil
+		return autoCutover, nil
 	}
-	return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and SchemaBot could not confirm the cutover is held: %w", number, lastErr)
+	return false, lastErr
 }
 
 // useInstantDDL decides whether to run an eligible schema change as instant DDL.
