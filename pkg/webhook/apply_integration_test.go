@@ -1051,16 +1051,52 @@ func TestE2EUnlockNoLocks(t *testing.T) {
 	}
 }
 
-// An operator comments an apply with --allow-unsafe while this PR's own apply
-// is still running. SchemaBot answers that the apply is in progress and offers
-// the apply to run once it finishes, without --allow-unsafe: that apply plans
-// again, so its unsafe changes are confirmed by typing the flag, not by pasting
-// it from the earlier command.
+// An operator comments an apply with --allow-unsafe while this PR's own apply,
+// planned from an earlier commit, is still running. SchemaBot answers that the
+// apply is in progress and offers the apply to run once it finishes, without
+// --allow-unsafe: that apply plans again, so its unsafe changes are confirmed
+// by typing the flag, not by pasting it from the earlier command.
 func TestE2EApplySamePRActiveApply(t *testing.T) {
-	dbName := "webhook_apply_active"
+	body := commentApplyWhileThisPRApplies(t, "webhook_apply_active", "earlier-commit")
+	assert.Contains(t, body, "Apply Already In Progress")
+	assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`)")
+	assert.Contains(t, body, "Once it finishes, apply again with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging\n```\n")
+	assert.NotContains(t, body, "schemabot apply -e staging --allow-unsafe")
+}
+
+// An operator comments an apply again while this PR's apply of its latest
+// commit is still running, as when the first comment seemed slow to answer.
+// The running apply is already applying that change, so SchemaBot points at
+// its progress comment for the outcome rather than offering an apply that
+// would plan nothing once it finishes.
+func TestE2EApplyWhileThisPRAppliesItsLatestCommit(t *testing.T) {
+	body := commentApplyWhileThisPRApplies(t, "webhook_apply_active_latest", "abc123")
+	assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`), so a second apply cannot start.")
+	assert.Contains(t, body, "It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.\n")
+	assert.NotContains(t, body, "schemabot apply", "no apply is offered, since it would plan nothing")
+}
+
+// This PR's apply of its latest commit was planned for one target of the
+// staging rollout, so the rest of the environment still needs the change. A
+// second apply is refused, and the comment keeps offering the apply for once
+// the narrowed one ends.
+func TestE2EApplyWhileThisPRAppliesOneTargetOfItsLatestCommit(t *testing.T) {
+	body := commentApplyWhileThisPRApplies(t, "webhook_apply_active_narrowed", "abc123", func(p *storage.Plan, _ *storage.Apply) {
+		p.NarrowedTo = "staging/us"
+	})
+	assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`), so a second apply cannot start.")
+	assert.Contains(t, body, "schemabot apply -e staging", "the other targets still need an apply")
+	assert.NotContains(t, body, "already applying this PR's latest commit")
+}
+
+// commentApplyWhileThisPRApplies comments `schemabot apply -e staging
+// --allow-unsafe` while this PR holds the lock and its apply, planned from
+// planHeadSHA, is running, and returns the comment SchemaBot answers with. The
+// PR's latest commit is abc123.
+func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string, shape ...func(*storage.Plan, *storage.Apply)) string {
+	t.Helper()
 	svc := setupE2EService(t, dbName)
 
-	// Acquire a lock from this PR
 	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName: dbName,
 		DatabaseType: "mysql",
@@ -1072,16 +1108,22 @@ func TestE2EApplySamePRActiveApply(t *testing.T) {
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
-
-	// Get the lock to obtain its ID
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 
-	// Create a non-terminal apply record linked to this lock
-	_, err = svc.Storage().Applies().Create(t.Context(), &storage.Apply{
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-active-" + dbName,
+		Database:       dbName,
+		DatabaseType:   "mysql",
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		Environment:    "staging",
+		HeadSHA:        planHeadSHA,
+		CreatedAt:      time.Now(),
+	}
+	apply := &storage.Apply{
 		ApplyIdentifier: "apply-active-test-001",
 		LockID:          lock.ID,
-		PlanID:          0,
 		Database:        dbName,
 		DatabaseType:    "mysql",
 		Repository:      "octocat/hello-world",
@@ -1089,7 +1131,14 @@ func TestE2EApplySamePRActiveApply(t *testing.T) {
 		Environment:     "staging",
 		Engine:          "spirit",
 		State:           "running",
-	})
+	}
+	for _, f := range shape {
+		f(plan, apply)
+	}
+	planID, err := svc.Storage().Plans().Create(t.Context(), plan)
+	require.NoError(t, err)
+	apply.PlanID = planID
+	_, err = svc.Storage().Applies().Create(t.Context(), apply)
 	require.NoError(t, err)
 
 	mux := http.NewServeMux()
@@ -1119,17 +1168,14 @@ func TestE2EApplySamePRActiveApply(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
-
 	require.Equal(t, http.StatusOK, rr.Code)
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Apply Already In Progress")
-		assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`)")
-		assert.Contains(t, body, "Once it finishes, apply again with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging\n```\n")
-		assert.NotContains(t, body, "schemabot apply -e staging --allow-unsafe")
+		return body
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for active-apply comment")
+		return ""
 	}
 }
 

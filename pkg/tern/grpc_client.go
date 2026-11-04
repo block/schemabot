@@ -159,6 +159,14 @@ type GRPCClient struct {
 	// unrecognizedStatuses reports remote-reported statuses with no task-state
 	// mapping at the drive's ingest points. Zero value is ready.
 	unrecognizedStatuses unrecognizedStatusReporter
+
+	// cutoverSharesTaken records the cutover request sets this client's drives
+	// have sent to their remote apply and how each is sent from then on
+	// (remoteCutoverShareSend). The durable request in storage stays the
+	// source of truth: after a restart the drive sends its share again, which
+	// a data plane that echoes the command id answers with the request it
+	// holds or the outcome it settled.
+	cutoverSharesTaken sync.Map // cutoverShareKey -> remoteCutoverShareSend
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -716,6 +724,13 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return nil
 	}
 	logger := c.applyLogger(apply)
+	boundIDs, err := controlReq.CutoverOperationIDs()
+	if err != nil {
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(boundIDs) > 1 {
+		return c.processPendingRemoteCutoverSet(ctx, apply, scope, controlReq, boundIDs, logger)
+	}
 	if cutoverRequestResolvedByApplyState(apply.State) {
 		logger.InfoContext(ctx, "completing pending gRPC cutover request for resolved apply",
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
@@ -1588,7 +1603,7 @@ type undispatchedTerminalization struct {
 
 // stopUndispatchedTerminalization is how a stop settles undispatched work. A
 // stop is resumable on database types that can pause a change and terminal on
-// those that cannot, so the states follow stopTerminatesChange.
+// those that cannot, so the states follow StopTerminatesChange.
 func stopUndispatchedTerminalization(databaseType string) undispatchedTerminalization {
 	terminalization := undispatchedTerminalization{
 		taskState:        state.Task.Stopped,
@@ -1598,7 +1613,7 @@ func stopUndispatchedTerminalization(databaseType string) undispatchedTerminaliz
 		verb:             "stopped",
 		controlOperation: storage.ControlOperationStop,
 	}
-	if stopTerminatesChange(databaseType) {
+	if StopTerminatesChange(databaseType) {
 		terminalization.taskState = state.Task.Cancelled
 		terminalization.applyState = state.Apply.Cancelled
 		terminalization.operationState = state.ApplyOperation.Cancelled

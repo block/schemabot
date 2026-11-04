@@ -526,6 +526,23 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 	return cloneControlRequest(stored), false, nil
 }
 
+func (s *memoryControlRequestStore) RequestPendingCommand(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	commandID, err := req.ControlCommandID()
+	if err != nil {
+		return nil, false, err
+	}
+	existing, err := s.GetByOperation(ctx, req.ApplyID, req.Operation)
+	if err != nil {
+		return nil, false, err
+	}
+	if settled, err := existing.SettledByControlCommand(commandID); err != nil {
+		return nil, false, err
+	} else if settled {
+		return existing, false, nil
+	}
+	return s.RequestPending(ctx, req)
+}
+
 func (s *memoryControlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
 	if err := s.CompletePending(ctx, req.ApplyID, superseded); err != nil {
 		return nil, false, err

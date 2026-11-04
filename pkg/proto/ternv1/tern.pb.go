@@ -3751,8 +3751,23 @@ type CutoverRequest struct {
 	// members of one deployment share its apply, and one member's turn to cut
 	// over is not its siblings' turn. Empty cuts over the apply's parked work.
 	ApplyOperationId string `protobuf:"bytes,4,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// When set, one cutover command for every operation listed: each is cut
+	// over by its own drive once it waits at its cutover, and the request
+	// settles once none of them can still cut over on it. apply_operation_id
+	// names one of them, so a data plane that reads only that field cuts over
+	// that operation alone.
+	ApplyOperationIds []string `protobuf:"bytes,5,rep,name=apply_operation_ids,json=applyOperationIds,proto3" json:"apply_operation_ids,omitempty"`
+	// When set, identifies the operator command this request carries, the same
+	// on every send of it. A data plane that already settled the command
+	// answers a re-send with that outcome instead of recording the command
+	// again, so a re-send never retries a command the data plane failed. A
+	// new operator command carries a new id. An id of the form
+	// "<origin>.<sequence>" orders the commands of one origin: a data plane that
+	// settled a later command answers a send of an earlier one with that
+	// outcome too, since only a delayed re-send can carry it.
+	CommandId     string `protobuf:"bytes,6,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CutoverRequest) Reset() {
@@ -3813,11 +3828,30 @@ func (x *CutoverRequest) GetApplyOperationId() string {
 	return ""
 }
 
+func (x *CutoverRequest) GetApplyOperationIds() []string {
+	if x != nil {
+		return x.ApplyOperationIds
+	}
+	return nil
+}
+
+func (x *CutoverRequest) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
 // CutoverResponse indicates whether the cutover was accepted.
 type CutoverResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
-	ErrorMessage  string                 `protobuf:"bytes,2,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Accepted     bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	ErrorMessage string                 `protobuf:"bytes,2,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// The command_id the data plane recorded the request under, echoed back.
+	// Empty from a data plane that predates command ids, which records every
+	// send as a new command, so a caller sends such a data plane each command
+	// only once.
+	CommandId     string `protobuf:"bytes,3,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3862,6 +3896,13 @@ func (x *CutoverResponse) GetAccepted() bool {
 func (x *CutoverResponse) GetErrorMessage() string {
 	if x != nil {
 		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *CutoverResponse) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
 	}
 	return ""
 }
@@ -5599,15 +5640,20 @@ const file_tern_proto_rawDesc = "" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\t\x10\n" +
-	"R\x06volume\"\x93\x01\n" +
+	"R\x06volume\"\xe2\x01\n" +
 	"\x0eCutoverRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
 	"\x06caller\x18\x03 \x01(\tR\x06caller\x12,\n" +
-	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\"R\n" +
+	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\x12.\n" +
+	"\x13apply_operation_ids\x18\x05 \x03(\tR\x11applyOperationIds\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x06 \x01(\tR\tcommandId\"q\n" +
 	"\x0fCutoverResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
-	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"L\n" +
+	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x03 \x01(\tR\tcommandId\"L\n" +
 	"\rRevertRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\"Q\n" +

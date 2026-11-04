@@ -1064,12 +1064,32 @@ message CutoverRequest {
   // members of one deployment share its apply, and one member's turn to cut
   // over is not its siblings' turn. Empty cuts over the apply's parked work.
   string apply_operation_id = 4;
+  // When set, one cutover command for every operation listed: each is cut
+  // over by its own drive once it waits at its cutover, and the request
+  // settles once none of them can still cut over on it. apply_operation_id
+  // names one of them, so a data plane that reads only that field cuts over
+  // that operation alone.
+  repeated string apply_operation_ids = 5;
+  // When set, identifies the operator command this request carries, the same
+  // on every send of it. A data plane that already settled the command
+  // answers a re-send with that outcome instead of recording the command
+  // again, so a re-send never retries a command the data plane failed. A
+  // new operator command carries a new id. An id of the form
+  // "<origin>.<sequence>" orders the commands of one origin: a data plane that
+  // settled a later command answers a send of an earlier one with that
+  // outcome too, since only a delayed re-send can carry it.
+  string command_id = 6;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
 message CutoverResponse {
   bool accepted = 1;
   string error_message = 2;
+  // The command_id the data plane recorded the request under, echoed back.
+  // Empty from a data plane that predates command ids, which records every
+  // send as a new command, so a caller sends such a data plane each command
+  // only once.
+  string command_id = 3;
 }
 
 // RevertRequest reverts a completed schema change.
