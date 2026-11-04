@@ -24,7 +24,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, plan_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
-	cutover_policy, on_failure, attempt, already_converged, rollout_step, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, on_failure, attempt, already_converged, rollout_step, ended_by_operation_id, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, progress_metadata, created_at, updated_at`
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
@@ -3493,11 +3493,11 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var externalOperationID sql.NullString
 	var engineResumeContext, engineResumeMetadata, progressMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
-	var planID sql.NullInt64
+	var planID, endedByOperationID sql.NullInt64
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &planID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
-		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &ad.AlreadyConverged, &ad.RolloutStep, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &ad.AlreadyConverged, &ad.RolloutStep, &endedByOperationID, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &progressMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -3505,6 +3505,9 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 
 	if planID.Valid {
 		ad.PlanID = planID.Int64
+	}
+	if endedByOperationID.Valid {
+		ad.EndedByOperationID = endedByOperationID.Int64
 	}
 	if errMsg.Valid {
 		ad.ErrorMessage = errMsg.String

@@ -1567,7 +1567,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		return got
 	}
 
-	expired, err := store.Applies().ExpireRetryable(t.Context(), 10)
+	expired, err := store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
 	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-abandoned"))
@@ -1581,7 +1581,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID, settledOpID)
 	require.NoError(t, err)
 
-	expired, err = store.Applies().ExpireRetryable(t.Context(), 10)
+	expired, err = store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
 	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)

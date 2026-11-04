@@ -25,6 +25,7 @@ CREATE TABLE apply_operations (
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   already_converged boolean NOT NULL DEFAULT FALSE,
   rollout_step integer NOT NULL DEFAULT 0,
+  ended_by_operation_id bigint DEFAULT NULL,
   PRIMARY KEY (id)
 );
 CREATE UNIQUE INDEX idx_apply_operations_apply_deployment_key ON apply_operations (apply_id, deployment, operation_key);

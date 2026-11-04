@@ -780,7 +780,15 @@ func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) er
 	return nil
 }
 
-func (s *capturingApplyStore) ExpireRetryable(context.Context, int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *capturingApplyStore) ExpireRetryable(context.Context, []string, int) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) ListAppliesHeldByEndedOperation(context.Context, []string, int) ([]*storage.EndedOperationApply, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) SettleAppliesStoppedForEndedOperation(context.Context, int) ([]*storage.EndedOperationApply, error) {
 	return nil, nil
 }
 

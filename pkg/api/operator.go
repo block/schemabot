@@ -126,6 +126,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 	s.maintenanceWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, expiryEvery, "ended operation", s.runEndedOperationPass)
+	})
+	s.maintenanceWg.Go(func() {
 		s.operatorHeartbeatLoop(driverCtx, stop, heartbeatEvery, server)
 	})
 	if pass, ok := s.branchReconcilePass(); ok {
@@ -2531,6 +2534,15 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger
 		return fmt.Errorf("load pending stop request for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
 	}
 	if controlReq == nil {
+		return nil
+	}
+	// The stop SchemaBot records for an ended operation marks the apply as the
+	// ended-operation settle's, which fails the apply and then answers the
+	// stop. Completing it here would leave the apply open with nothing to
+	// settle it.
+	if controlReq.RequestedBy == storage.EndedOperationStopCaller {
+		logger.Debug("operator: leaving SchemaBot's stop for an ended operation to the settle that fails the apply",
+			apply.LogAttrs()...)
 		return nil
 	}
 

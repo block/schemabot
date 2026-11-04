@@ -3131,10 +3131,10 @@ func (s *applyStore) WithBranchReconcileElection(ctx context.Context, fn func(co
 
 // ExpireRetryable elects one instance per pass and expires under the lock. See
 // storage.ApplyStore for the contract.
-func (s *applyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *applyStore) ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {
 	return reapUnderElection(ctx, s.db, s.locker, retryableExpirySweep,
 		func(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
-			return s.expireRetryable(ctx, limit)
+			return s.expireRetryable(ctx, endedOperationStopTypes, limit)
 		})
 }
 
@@ -3142,7 +3142,7 @@ func (s *applyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage
 // retry budget or recovery freshness window to permanent failed, without
 // electing an instance. ExpireRetryable is the entry point that holds the lock;
 // this is separate so the expiry itself can be exercised on its own.
-func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("expire retryable applies: limit must be positive, got %d", limit)
 	}
@@ -3182,6 +3182,25 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 	// ordering's own direction the sort has to see every failed_retryable row
 	// before it can take the first page, so the lease gate below would be
 	// evaluated once per row in the state rather than once per row returned.
+	//
+	// An apply SchemaBot stopped because an operation ended before a deferred
+	// cutover is settled by SettleAppliesStoppedForEndedOperation instead. That
+	// settlement keeps the stopped operations' tasks stopped, with their saved
+	// work, where this one would fail them. An apply that sweep is about to
+	// stop is passed over too: its held operations may all be parked at the
+	// cutover, which leaves no driver to keep this pass off it, and expiring it
+	// first would fail the apply with those operations still holding their
+	// targets.
+	endedOperationStop, endedOperationStopArgs := "", []any(nil)
+	if len(endedOperationStopTypes) > 0 {
+		held, heldArgs := s.heldByEndedOperationSQL(endedOperationStopTypes)
+		endedOperationStop, endedOperationStopArgs = "AND NOT ("+held+")", heldArgs
+	}
+	args := append([]any{state.Apply.FailedRetryable}, retryBudgetSpentArgs()...)
+	args = append(args, retryableRecoveryFreshnessDays,
+		storage.ControlOperationStop, storage.ControlRequestPending, storage.EndedOperationStopCaller)
+	args = append(args, endedOperationStopArgs...)
+	args = append(args, limit)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
@@ -3189,12 +3208,16 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 			`+retryBudgetSpentSQL+`
 			OR updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)+`
 		)
+			AND NOT EXISTS (
+				SELECT 1 FROM apply_control_requests req
+				WHERE req.apply_id = applies.id AND req.operation = ? AND req.status = ? AND req.requested_by = ?
+			)
+			`+endedOperationStop+`
 			AND `+undrivenApply+`
 		ORDER BY updated_at
 		LIMIT ?
 		FOR UPDATE
-	`, append(append([]any{state.Apply.FailedRetryable}, retryBudgetSpentArgs()...),
-		retryableRecoveryFreshnessDays, limit)...)
+	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query expired retryable applies: %w", err)
 	}

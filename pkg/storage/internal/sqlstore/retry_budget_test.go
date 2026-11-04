@@ -45,7 +45,7 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 		insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.Completed, maxRecoveryAttempts, 0)
 		shardB := insertOperationAtAttempt(t, store, apply, "region-b", state.ApplyOperation.FailedRetryable, 0, 0)
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "a failed_retryable shard with retries left keeps the apply alive")
 
@@ -80,7 +80,7 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "an operation that spent its budget is not redispatched")
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, apply.ID, expired[0].Apply.ID)

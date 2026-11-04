@@ -20,6 +20,8 @@ import (
 // create/get/update lifecycle, claimability and lease rotation, stale-lease
 // recovery, lease-guarded writes, and concurrent claim exclusion.
 func TestApplies(t *testing.T, h Harness) {
+	t.Run("EndedOperation", func(t *testing.T) { testEndedOperationApplies(t, h) })
+
 	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -562,7 +564,7 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "a spent retry budget stops recovery claims")
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, apply.ID, expired[0].Apply.ID)
@@ -2110,7 +2112,15 @@ func TestApplies(t *testing.T, h Harness) {
 			return store.CheckLease(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
 		},
 		"ExpireRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			_, err := store.ExpireRetryable(t.Context(), 10)
+			_, err := store.ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
+			return err
+		},
+		"ListAppliesHeldByEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ListAppliesHeldByEndedOperation(t.Context(), []string{storage.DatabaseTypeMySQL}, 10)
+			return err
+		},
+		"SettleAppliesStoppedForEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.SettleAppliesStoppedForEndedOperation(t.Context(), 10)
 			return err
 		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {

@@ -2051,7 +2051,7 @@ func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchRaisesParen
 	require.NoError(t, err)
 	require.True(t, released)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1, "an operation that spent its budget fails the apply")
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
