@@ -3,6 +3,7 @@ package planetscale
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -1996,11 +1997,14 @@ func declineEventMessages(events []engine.ApplyEvent) []string {
 // live PlanetScale API. The branch is ready, its schema already matches the
 // desired files (no remaining DDL to run), and the deploy request this resume
 // creates is instant-DDL eligible so the instant decision is actually reached.
+// Listing deploy requests returns listed and records the request.
 type branchResumeClient struct {
 	psclient.PSClient
 	deployCalls int
 	lastDeploy  *ps.PerformDeployRequest
 	lastCreate  *ps.CreateDeployRequestRequest
+	listed      []*ps.DeployRequest
+	lastList    *ps.ListDeployRequestsRequest
 }
 
 func (c *branchResumeClient) GetBranch(_ context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
@@ -2009,6 +2013,23 @@ func (c *branchResumeClient) GetBranch(_ context.Context, req *ps.GetDatabaseBra
 
 func (c *branchResumeClient) CreateBranchPassword(context.Context, *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error) {
 	return &ps.DatabaseBranchPassword{}, nil
+}
+
+func (c *branchResumeClient) ListDeployRequests(_ context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error) {
+	c.lastList = req
+	return c.listed, nil
+}
+
+// GetDeployRequest reads back a listed deploy request, as a reattach to an
+// adopted one does.
+func (c *branchResumeClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	for _, dr := range c.listed {
+		if dr.Number == req.Number {
+			read := *dr
+			return &read, nil
+		}
+	}
+	return nil, &ps.Error{Code: ps.ErrNotFound}
 }
 
 func (c *branchResumeClient) CreateDeployRequest(_ context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
@@ -2124,6 +2145,94 @@ func TestResumeApply_BranchResumeDeletesOnlySchemaBotBranch(t *testing.T) {
 			assert.Equal(t, tt.branch, client.lastCreate.Branch)
 			assert.Equal(t, "main", client.lastCreate.IntoBranch)
 			assert.Equal(t, tt.wantAutoDelete, client.lastCreate.AutoDeleteBranch)
+		})
+	}
+}
+
+// A drive that opened the deploy request and ended before any save naming it
+// landed leaves stored state that names only the branch. The resume that
+// follows finds that deploy request open on the branch and adopts it: it
+// records and deploys it instead of opening a second deploy request beside it.
+// When the earlier drive had already started its deploy, the adopted deploy
+// request is recorded and reattached to, as a recorded one is, and never
+// deployed a second time. Only a deploy request that is open, from the resumed
+// branch, into the main branch is adopted; with none, the resume creates one
+// as it always does.
+func TestResumeApply_AdoptsTheOpenDeployRequestOnItsBranch(t *testing.T) {
+	shortenEngineWaits(t)
+	const branch = "schemabot-testdb-crash"
+	const adoptedURL = "https://app/dr/58"
+	adoptable := &ps.DeployRequest{Number: 58, Branch: branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.Ready, HtmlURL: adoptedURL}
+	fromAnotherBranch := &ps.DeployRequest{Number: 59, Branch: "schemabot-testdb-other", IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.Ready}
+	intoAnotherBranch := &ps.DeployRequest{Number: 60, Branch: branch, IntoBranch: "staging", State: deployRequestOpen, DeploymentState: deployState.Ready}
+	closed := &ps.DeployRequest{Number: 61, Branch: branch, IntoBranch: "main", State: deployRequestClosed, DeploymentState: deployState.Ready}
+	deployedAt := time.Date(2026, 10, 15, 9, 30, 0, 0, time.UTC)
+	inProgress := &ps.DeployRequest{Number: 62, Branch: branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.InProgress, HtmlURL: "https://app/dr/62"}
+	pendingCutover := &ps.DeployRequest{Number: 63, Branch: branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.PendingCutover, HtmlURL: "https://app/dr/63"}
+	readyButDeployed := &ps.DeployRequest{Number: 64, Branch: branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.Ready, DeployedAt: &deployedAt, HtmlURL: "https://app/dr/64"}
+
+	tests := []struct {
+		name       string
+		listed     []*ps.DeployRequest
+		wantCreate bool
+		wantNumber uint64
+		wantURL    string
+		// wantReattach is set when the adopted deploy request's deploy has
+		// started, so the resume reattaches to it rather than deploying it.
+		wantReattach bool
+	}{
+		{name: "the one open deploy request on the branch is adopted",
+			listed: []*ps.DeployRequest{adoptable}, wantNumber: 58, wantURL: adoptedURL},
+		{name: "deploy requests from another branch, into another branch, or closed are not adopted",
+			listed: []*ps.DeployRequest{fromAnotherBranch, intoAnotherBranch, closed}, wantCreate: true, wantNumber: 77, wantURL: "https://app/dr/77"},
+		{name: "a branch with no deploy request gets a new one",
+			wantCreate: true, wantNumber: 77, wantURL: "https://app/dr/77"},
+		{name: "an adopted deploy request already deploying is reattached, not deployed again",
+			listed: []*ps.DeployRequest{inProgress}, wantNumber: 62, wantURL: "https://app/dr/62", wantReattach: true},
+		{name: "an adopted deploy request waiting at its cutover is reattached, not deployed again",
+			listed: []*ps.DeployRequest{pendingCutover}, wantNumber: 63, wantURL: "https://app/dr/63", wantReattach: true},
+		{name: "an adopted deploy request that reads ready but carries a deploy timestamp is reattached, not deployed again",
+			listed: []*ps.DeployRequest{readyButDeployed}, wantNumber: 64, wantURL: "https://app/dr/64", wantReattach: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &branchResumeClient{listed: tt.listed}
+			req := resumeRequest(t, &psMetadata{BranchName: branch}, "apply-1a2b3c4d5e6f7890")
+			var saved []*psMetadata
+			req.OnStateChange = func(rs *engine.ResumeState) error {
+				meta, err := decodePSMetadata(rs.Metadata)
+				require.NoError(t, err)
+				saved = append(saved, meta)
+				return nil
+			}
+
+			result, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.True(t, result.Accepted)
+			require.NotNil(t, client.lastList)
+			assert.Equal(t, ps.ListDeployRequestsRequest{Organization: "org", Database: "testdb", Branch: branch, IntoBranch: "main", State: "open"}, *client.lastList)
+			if tt.wantCreate {
+				require.NotNil(t, client.lastCreate)
+				assert.Equal(t, branch, client.lastCreate.Branch)
+			} else {
+				assert.Nil(t, client.lastCreate, "no deploy request is created beside the adopted one")
+			}
+			if tt.wantReattach {
+				assert.Zero(t, client.deployCalls, "a deploy request whose deploy started is never deployed again")
+				assert.Equal(t, fmt.Sprintf("Resumed deploy request #%d (state: %s)", tt.wantNumber, tt.listed[0].DeploymentState), result.Message)
+			} else {
+				require.Equal(t, 1, client.deployCalls)
+				assert.Equal(t, tt.wantNumber, client.lastDeploy.Number)
+			}
+			require.NotEmpty(t, saved)
+			assert.Equal(t, tt.wantNumber, saved[0].DeployRequestID, "the deploy request is recorded before the resume waits on it")
+			assert.Equal(t, tt.wantURL, saved[0].DeployRequestURL)
+			assert.Equal(t, branch, saved[0].BranchName)
+			stored, err := decodePSMetadata(result.ResumeState.Metadata)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantNumber, stored.DeployRequestID)
 		})
 	}
 }

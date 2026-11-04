@@ -811,6 +811,34 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 	})
 }
 
+// openDeployRequests returns the open deploy requests that carry branch into
+// intoBranch. The response is filtered again here rather than trusted to the
+// request's filters, so a deploy request from another branch, into another
+// branch, or already closed is never taken for one of them.
+func (e *Engine) openDeployRequests(ctx context.Context, client psclient.PSClient, org, database, branch, intoBranch string) ([]*ps.DeployRequest, error) {
+	listed, err := client.ListDeployRequests(ctx, &ps.ListDeployRequestsRequest{
+		Organization: org,
+		Database:     database,
+		Branch:       branch,
+		IntoBranch:   intoBranch,
+		State:        deployRequestOpen,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list open deploy requests from branch %s into %s of %s/%s: %w", branch, intoBranch, org, database, err)
+	}
+	var open []*ps.DeployRequest
+	for _, dr := range listed {
+		if dr.Branch != branch || dr.IntoBranch != intoBranch || dr.State != deployRequestOpen {
+			e.logger.Debug("skipping a listed deploy request that is not open from this branch into the target branch",
+				"organization", org, "database", database, "branch", branch, "into_branch", intoBranch,
+				"deploy_request", dr.Number, "deploy_request_branch", dr.Branch, "deploy_request_into_branch", dr.IntoBranch, "deploy_request_state", dr.State)
+			continue
+		}
+		open = append(open, dr)
+	}
+	return open, nil
+}
+
 // operatorBranch returns the development branch the operator supplied for this
 // apply, or "" when SchemaBot creates its own. The apply's options are stored
 // with the apply and handed back on every resume, so a fresh drive and a
