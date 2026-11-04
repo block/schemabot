@@ -193,6 +193,62 @@ func TestLocalClient_BatchProgressAnswersAnUnknownOperationWithItsOwnError(t *te
 	assert.Contains(t, unknown.ErrorMessage, "apply_operation 99 does not exist")
 }
 
+// A member whose operation has no tasks, such as one that only changes a
+// VSchema, is answered from its own operation row in a batch exactly as a
+// scoped Progress request answers it, and a member with tasks beside it keeps
+// only its own table.
+func TestLocalClient_BatchProgressAnswersATasklessMemberAsItsOwnProgressWould(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Running, state.ApplyOperation.Running, state.Task.Running, state.Task.Running)
+	taskless := &storage.ApplyOperation{ID: 13, ApplyID: fx.apply.ID, Deployment: "default", Target: "payments-003", State: state.ApplyOperation.Completed}
+	ops := fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore).exactProgressApplyOperationStore
+	ops.ops = append(ops.ops, taskless)
+
+	batch, err := fx.client.BatchProgress(t.Context(), batchProgressRequest(fx, "12", "13"))
+	require.NoError(t, err)
+	require.Len(t, batch.Operations, 2)
+
+	for i, id := range []string{"12", "13"} {
+		scoped, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: id})
+		require.NoError(t, err)
+		require.NotNil(t, batch.Operations[i].Progress, "operation %s", id)
+		assert.True(t, proto.Equal(scoped, batch.Operations[i].Progress), "operation %s: the batch entry is its scoped answer", id)
+	}
+	member := batch.Operations[0].Progress
+	require.Len(t, member.Tables, 1)
+	assert.Equal(t, "users", member.Tables[0].TableName)
+	assert.Empty(t, batch.Operations[1].Progress.Tables, "the task-less member reports no table of its sibling's")
+	assert.Equal(t, "13", batch.Operations[1].Progress.ApplyOperationId)
+}
+
+// An id naming an operation that exists but belongs to another apply is
+// refused for its entry with the error a scoped Progress request gets, even
+// when the operation turns up among the apply's listed operations. The member
+// beside it is still answered with only its own table.
+func TestLocalClient_BatchProgressRefusesAnotherApplysOperation(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Running, state.ApplyOperation.Running, state.Task.Running, state.Task.Running)
+	foreign := &storage.ApplyOperation{ID: 21, ApplyID: fx.apply.ID + 1, Deployment: "default", Target: "billing-001", State: state.ApplyOperation.Running}
+	ops := fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore).exactProgressApplyOperationStore
+	ops.ops = append(ops.ops, foreign)
+
+	batch, err := fx.client.BatchProgress(t.Context(), batchProgressRequest(fx, "12", "21"))
+	require.NoError(t, err)
+	require.Len(t, batch.Operations, 2)
+
+	member := batch.Operations[0].Progress
+	require.NotNil(t, member)
+	require.Len(t, member.Tables, 1)
+	assert.Equal(t, "users", member.Tables[0].TableName)
+
+	_, scopedErr := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: "21"})
+	require.Error(t, scopedErr)
+	refused := batch.Operations[1]
+	assert.Equal(t, "21", refused.ApplyOperationId)
+	assert.Nil(t, refused.Progress, "another apply's operation is never answered with this apply's progress")
+	assert.Equal(t, int32(progressErrorCode(scopedErr)), refused.ErrorCode)
+	assert.Equal(t, scopedErr.Error(), refused.ErrorMessage)
+	assert.Contains(t, refused.ErrorMessage, "apply_operation 21 belongs to another apply")
+}
+
 // A batch entry with no operation id is refused with InvalidArgument rather
 // than answered for the whole apply, which would report every member's work as
 // one member's. The members the call does name are still answered.
