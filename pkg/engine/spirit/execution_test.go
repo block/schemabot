@@ -263,6 +263,7 @@ func TestClassifyRunnerErrorRowData(t *testing.T) {
 		{"NULL into a NOT NULL column", copyWarningError(1048, "Column 'c' cannot be null")},
 		{"value out of range for the new type", copyWarningError(1264, "Out of range value for column 'amount' at row 1")},
 		{"value truncated by the new type", copyWarningError(1265, "Data truncated for column 'status' at row 1")},
+		{"NOT NULL column added without a default", copyWarningError(1364, "Field 'region' doesn't have a default value")},
 		{"value the new type cannot represent", copyWarningError(1366, "Incorrect integer value: 'abc' for column 'n' at row 1")},
 		{"value longer than the new column", copyWarningError(1406, "Data too long for column 'name' at row 1")},
 		{"row data error raised as an error rather than a warning", fmt.Errorf("failed to execute upsert: %w",
@@ -297,6 +298,61 @@ func TestClassifyRunnerErrorRowData(t *testing.T) {
 			classifiedErr := classifyRunnerError(tc.err)
 
 			require.Same(t, tc.err, classifiedErr)
+			assert.True(t, engine.IsRetryable(classifiedErr))
+		})
+	}
+}
+
+// A statement the target refuses whatever the moment, for a missing grant, an
+// unsupported feature, or a check constraint it cannot find, is refused the
+// same way on every attempt, so it fails on the first one instead of spending
+// the retry budget, whether Spirit ran it or SchemaBot ran it directly. A lock
+// wait on the same statement stays retryable.
+func TestClassifyRunnerErrorStatement(t *testing.T) {
+	permanent := []struct {
+		name string
+		err  error
+	}{
+		{"privilege the change needs", fmt.Errorf("failed to execute ddl: %w",
+			&mysql.MySQLError{Number: 1142, Message: "ALTER command denied to user 'app'@'10.0.0.1' for table 'orders'"})},
+		{"feature the server does not support", fmt.Errorf("failed to execute ddl: %w",
+			&mysql.MySQLError{Number: 1235, Message: "This version of MySQL doesn't yet support 'ALTER TABLE ... with this combination of options'"})},
+		{"system function unsafe for the binary log", copyWarningError(1674, "Statement is unsafe because it uses a system function that may return a different value on the replica.")},
+		{"check constraint the table does not have", fmt.Errorf("failed to execute ddl: %w",
+			&mysql.MySQLError{Number: 3821, Message: "Check constraint 'chk_amount' is not found in the table."})},
+		{"check constraint name already in use", fmt.Errorf("failed to execute ddl: %w",
+			&mysql.MySQLError{Number: 3822, Message: "Duplicate check constraint name 'chk_amount'."})},
+	}
+	for _, tc := range permanent {
+		t.Run(tc.name+" is permanent", func(t *testing.T) {
+			classifiedErr := classifyRunnerError(tc.err)
+
+			assert.False(t, engine.IsRetryable(classifiedErr))
+			var permanentErr *engine.PermanentError
+			assert.ErrorAs(t, classifiedErr, &permanentErr)
+			assert.Equal(t, tc.err.Error(), classifiedErr.Error())
+		})
+	}
+
+	for _, tc := range permanent {
+		t.Run(tc.name+" is permanent on a direct ALTER", func(t *testing.T) {
+			classifiedErr := classifyDirectError(tc.err)
+
+			assert.False(t, engine.IsRetryable(classifiedErr))
+			assert.Equal(t, tc.err.Error(), classifiedErr.Error())
+		})
+	}
+	t.Run("a row an in-place ALTER cannot store is permanent on a direct ALTER", func(t *testing.T) {
+		assert.False(t, engine.IsRetryable(classifyDirectError(fmt.Errorf("force exec: %w",
+			&mysql.MySQLError{Number: 1265, Message: "Data truncated for column 'status' at row 1"}))))
+	})
+
+	lockWait := fmt.Errorf("failed to execute ddl: %w",
+		&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded; try restarting transaction"})
+	for name, classify := range map[string]func(error) error{"runner": classifyRunnerError, "direct ALTER": classifyDirectError} {
+		t.Run("lock wait stays retryable on the "+name+" path", func(t *testing.T) {
+			classifiedErr := classify(lockWait)
+			require.Same(t, lockWait, classifiedErr)
 			assert.True(t, engine.IsRetryable(classifiedErr))
 		})
 	}
