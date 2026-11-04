@@ -900,6 +900,28 @@ type ApplyStore interface {
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease ApplyLease) (bool, error)
 
+	// MarkStaleApplyRetryable moves an apply whose driver is gone from an
+	// active state to failed_retryable, together with the operation named in
+	// req when one is, so its next recovery goes through the retryable claim,
+	// which charges and enforces the retry budget (attempt). The stale-active
+	// claim that would otherwise re-lease it charges nothing, so work that keeps
+	// failing without a driver to record it would retry forever.
+	//
+	// Each row moves only while it is in an active, recovery-claimable state,
+	// still carries the lease token the caller observed, and that lease is not
+	// fresh (no owner, or a heartbeat older than ApplyLeaseStaleAfter). The
+	// apply additionally moves only while no operation under it holds a fresh
+	// lease, and the operation must belong to the apply. Both rows clear their
+	// lease, record ErrorMessage, and keep no completion time; nothing else is
+	// written, so attempt is left for the claim to charge and the takeover
+	// marker and tasks are untouched.
+	//
+	// The rows move together or not at all, in one transaction. Reports false,
+	// with nothing written, when either row does not match: a newer claim
+	// rotated the token, a live drive holds a lease, or the row has left the
+	// active states. A terminal or resting apply is never reopened.
+	MarkStaleApplyRetryable(ctx context.Context, req StaleRetryableRequest) (bool, error)
+
 	// SetRevertSkipped records when skip-revert was dispatched for an apply, so
 	// progress consumers can show that revert was skipped and finalization is in
 	// progress. It is a targeted write of revert_skipped_at that preserves the
@@ -1134,6 +1156,19 @@ var ErrBranchReconcileBusy = errors.New("another instance is reconciling engine 
 type RetryableApplyExpiration struct {
 	Apply  *Apply
 	Reason RetryableExpirationReason
+}
+
+// StaleRetryableRequest names the rows ApplyStore.MarkStaleApplyRetryable moves
+// to failed_retryable and the lease tokens the caller observed on them. An
+// observed token may be empty, for a row whose lease was already handed back;
+// it still has to match the stored token. OperationID is zero when no
+// operation row moves with the apply.
+type StaleRetryableRequest struct {
+	ApplyID             int64
+	ApplyLeaseToken     string
+	OperationID         int64
+	OperationLeaseToken string
+	ErrorMessage        string
 }
 
 // TaskStore manages schema change tasks (individual DDLs within an apply).
