@@ -341,7 +341,7 @@ func TestE2EReplanNewlyDirectDowngradesToConfirm(t *testing.T) {
 
 	f.h.executeApply(t.Context(), f.client, "octocat/hello-world", 1, f.schemaResult, "staging", 1, "testuser",
 		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true, AllowUnsafe: true},
-		shown, shown, f.directPlan.PlanID, false)
+		shown, shown, f.directPlan.PlanID, nil)
 
 	body := f.awaitComment(t, "Confirmation required")
 	requireNewlyDirectDisclosure(t, body)

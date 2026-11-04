@@ -190,7 +190,8 @@ func lineTargets(data MultiDeploymentApplyData, g presentation.Group, line targe
 			continue
 		}
 		if includeUnreported && targetUnreported(data, i) {
-			cells = append(cells, TableProgressData{Status: presentation.UnreportedTargetStatus(data.Model.Deployments[i].State)})
+			status := presentation.UnreportedTargetStatus(data.Model.Deployments[i].State)
+			cells = append(cells, TableProgressData{Status: presentation.RolloutTableStatus(data.Model.State, status)})
 			targets = append(targets, memberTarget(data.Model.Deployments[i]))
 		}
 	}
@@ -213,6 +214,7 @@ func targetTableLines(data MultiDeploymentApplyData, g presentation.Group) []tar
 			continue
 		}
 		for _, t := range detail.Tables {
+			t.Status = presentation.RolloutTableStatus(data.Model.State, t.Status)
 			key := tableChangeKey(t)
 			li, seen := byKey[key]
 			if !seen {
@@ -300,9 +302,10 @@ func rankTargetTableLines(lines []targetTableLine) {
 // queued.
 func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported, estimated int
-	// cancelled counts the targets a cancel stopped part-way through the
-	// table, and unbegun the ones it reached before they began it.
-	var cancelled, unbegun int
+	// cancelled counts the targets where a cancel stopped the table part-way
+	// through, and neverStarted the targets where it was cancelled before it
+	// started.
+	var cancelled, neverStarted int
 	var copied, total, planned, eta int64
 	var running int
 	for _, c := range cells {
@@ -329,7 +332,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			if tableBegan(c) {
 				cancelled++
 			} else {
-				unbegun++
+				neverStarted++
 			}
 			continue
 		case state.Task.Running:
@@ -421,9 +424,14 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase, coverage = "⊘ Not started", ""
 	}
 	lists := listsTargets(strip)
+	if status == state.Task.Stopped && stoppedBeforeAnyTargetBegan(cells) {
+		// Every target would only repeat that it stopped, so the line says it
+		// once, the way the CLI's progress view does.
+		phrase, coverage, lists = "⏹️ Stopped (not started)", "", false
+	}
 	if status == state.Task.Cancelled {
 		phrase, coverage = cancelledTargetsLine(cancelledTargets{
-			done: done, cancelled: cancelled, unbegun: unbegun, pending: pending, targets: len(cells),
+			done: done, cancelled: cancelled, neverStarted: neverStarted, pending: pending, targets: len(cells),
 		}, settled, lists)
 	}
 	if lists {
@@ -442,12 +450,30 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 }
 
+// stoppedBeforeAnyTargetBegan reports whether a table stopped on every
+// target before any of them began it (presentation.EveryTargetStopped).
+func stoppedBeforeAnyTargetBegan(cells []TableProgressData) bool {
+	statuses := make([]string, len(cells))
+	for i, c := range cells {
+		statuses[i] = c.Status
+	}
+	return presentation.EveryTargetStopped(statuses) && !anyTargetBegan(cells)
+}
+
+// anyTargetBegan reports whether any target completed a table or began
+// working on it, so a halt there leaves the change partly or wholly live.
+func anyTargetBegan(cells []TableProgressData) bool {
+	return slices.ContainsFunc(cells, func(c TableProgressData) bool {
+		return tableBegan(c) || state.IsState(c.Status, state.Task.Completed, state.Task.RevertWindow)
+	})
+}
+
 // cancelledTargets counts where a table stands on each of its targets when
 // the cancel reached it: done completed it first, cancelled were stopped
-// part-way through it, unbegun were cancelled before they began it, and
-// pending have not begun it and were not cancelled.
+// part-way through it, neverStarted were cancelled before they started it,
+// and pending have not started it and were not cancelled.
 type cancelledTargets struct {
-	done, cancelled, unbegun, pending, targets int
+	done, cancelled, neverStarted, pending, targets int
 }
 
 // cancelledTargetsLine is the phrase and coverage of a table line whose
@@ -460,7 +486,7 @@ type cancelledTargets struct {
 // other targets carry on. Until the rollout settles those targets are counted
 // as queued, apart from the ones that will never begin the table.
 func cancelledTargetsLine(t cancelledTargets, settled, lists bool) (string, string) {
-	notStarted, queued := t.unbegun, 0
+	notStarted, queued := t.neverStarted, 0
 	if settled {
 		notStarted += t.pending
 	} else {

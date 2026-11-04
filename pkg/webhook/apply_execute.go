@@ -34,17 +34,17 @@ import (
 // apply-confirm. A re-plan that routes a statement to direct execution that
 // disclosedPlan did not stops on either path, since no comment disclosed it.
 //
-// disclosedCopyDiscard is what the comment behind this apply told the operator
-// about an unfinished copy on the target, read from the lock's pending
-// confirmation. It is the consent this re-plan is checked against: the plan
-// decided whether to stop, and the same decision is made again here, against the
-// target as it is now.
+// disclosedCopies are the unfinished copies the comment behind this apply told
+// the operator it discards, read from the lock's pending confirmation. They are
+// the consent this re-plan is checked against: the plan decided whether to
+// stop, and the same decision is made again here, copy by copy, against the
+// targets as they are now.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
-	disclosedCopyDiscard bool,
+	disclosedCopies []storage.DisclosedCopy,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -261,8 +261,8 @@ func (h *Handler) executeApply(
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
 				return
 			}
-			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
 				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
 				}
@@ -396,8 +396,8 @@ func (h *Handler) executeApply(
 			}
 			// The comment just posted renders this re-plan, so it discloses
 			// whatever unfinished copy the re-plan would discard.
-			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+			disclosed := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosed); err != nil {
 				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
 				}
@@ -421,11 +421,15 @@ func (h *Handler) executeApply(
 	//
 	// A discard the operator was already shown proceeds. They agreed to that
 	// cost, and asking again on every confirm would make the stop unpassable.
-	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 && !disclosedCopyDiscard {
+	// Consent is to the copies named, on the targets they were named on, so a
+	// copy the disclosure did not name stops the apply even when it named
+	// others.
+	discarding := rolloutDisclosedCopies(planResp, rollout, runsMemberWork)
+	if undisclosed := undisclosedDiscards(discarding, disclosedCopies); undisclosed > 0 {
 		h.logger.Info("apply stopped for confirmation: re-plan discards an existing copy the disclosure did not show",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "action", actionName,
-			"plan_id", planResp.PlanID, "discarded_copies", len(discarded))
+			"plan_id", planResp.PlanID, "discarded_copies", len(discarding), "undisclosed_copies", undisclosed)
 		// The disclosure is posted before it is recorded. The record's whole
 		// claim is that the operator was shown the copy, so a post that never
 		// lands must leave no consent behind: the next attempt stops and asks
@@ -437,7 +441,7 @@ func (h *Handler) executeApply(
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
 			return
 		}
-		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, true); err != nil {
+		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, discarding); err != nil {
 			if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 				return
 			}
@@ -986,7 +990,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 // depend on when the lock changed. Declining leaves the copy gate armed, so
 // the next apply-confirm stops and discloses again rather than proceeding on
 // consent that was never recorded.
-func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, environment, actionName, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
+func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, environment, actionName, expectedPendingPlanID, planID string, disclosedCopies []storage.DisclosedCopy) error {
 	// An empty observed intent asks the conditional acquire for a free lock,
 	// which would re-create a released one, so there is nothing safe to move.
 	if expectedPendingPlanID == "" {
@@ -994,13 +998,13 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 			database, dbType, planID)
 	}
 	err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, &storage.Lock{
-		DatabaseName:         database,
-		DatabaseType:         dbType,
-		Owner:                fmt.Sprintf("%s#%d", repo, pr),
-		Repository:           repo,
-		PullRequest:          pr,
-		PendingPlanID:        planID,
-		DisclosedCopyDiscard: disclosedCopyDiscard,
+		DatabaseName:    database,
+		DatabaseType:    dbType,
+		Owner:           fmt.Sprintf("%s#%d", repo, pr),
+		Repository:      repo,
+		PullRequest:     pr,
+		PendingPlanID:   planID,
+		DisclosedCopies: disclosedCopies,
 	}, expectedPendingPlanID)
 	if errors.Is(err, storage.ErrLockIntentChanged) {
 		h.logPreservedLockIntent(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planID)
