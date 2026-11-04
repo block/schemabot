@@ -67,7 +67,7 @@ func (e *DeferredCutoverCapacityError) Error() string {
 		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting for the cutover, and one apply can use at most %d (max_drivers_per_apply). To defer it, raise max_drivers_per_apply to %d; otherwise apply without --defer-cutover",
 			e.Database, e.Environment, e.Operations, e.PerApplyCap, e.Operations)
 	case e.NoLiveServers():
-		return fmt.Sprintf("%s/%s can't defer its cutover yet: no SchemaBot server has reported its drivers in the last %s. Try again shortly, or apply without --defer-cutover",
+		return fmt.Sprintf("%s/%s can't defer its cutover: no SchemaBot server running drivers has checked in during the last %s. Apply again once SchemaBot's drivers are running, or apply without --defer-cutover",
 			e.Database, e.Environment, LiveWindowText())
 	default:
 		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting for the cutover, and SchemaBot's servers have %d drivers that can wait. To defer it, give the servers %d more by raising drivers or running more servers; otherwise apply without --defer-cutover",
@@ -86,7 +86,7 @@ func deferredCutoverRefusalStatus(refused *DeferredCutoverCapacityError) int {
 }
 
 // LiveWindowText names storage.OperatorServerLiveWindow for a sentence ending
-// "in the last ...".
+// "during the last ...".
 func LiveWindowText() string {
 	if storage.OperatorServerLiveWindow == time.Minute {
 		return "minute"

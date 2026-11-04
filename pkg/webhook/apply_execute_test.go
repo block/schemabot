@@ -839,7 +839,7 @@ func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 
 	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4}
 	assert.Equal(t,
-		"This apply can't defer its cutover yet: no SchemaBot server has reported its drivers in the last minute. Try again in a minute, or run `schemabot apply -e production` without `--defer-cutover`.",
+		"This apply can't defer its cutover: no SchemaBot server running drivers has checked in during the last minute. Apply again once SchemaBot's drivers are running, or run `schemabot apply -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
 
 	assert.Equal(t,

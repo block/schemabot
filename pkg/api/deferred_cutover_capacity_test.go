@@ -142,7 +142,7 @@ func TestDeferredCutoverCapacityErrorMessages(t *testing.T) {
 		{
 			name:    "no live server",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4},
-			want:    "commerce/production can't defer its cutover yet: no SchemaBot server has reported its drivers in the last minute. Try again shortly, or apply without --defer-cutover",
+			want:    "commerce/production can't defer its cutover: no SchemaBot server running drivers has checked in during the last minute. Apply again once SchemaBot's drivers are running, or apply without --defer-cutover",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -165,7 +165,7 @@ func TestDeferredCutoverRefusalStatusAndCode(t *testing.T) {
 		message     string
 	}{
 		{name: "no live server", perApplyCap: 3, status: http.StatusConflict,
-			message: "apply rejected: testdb/staging can't defer its cutover yet: no SchemaBot server has reported its drivers in the last minute. Try again shortly, or apply without --defer-cutover"},
+			message: "apply rejected: testdb/staging can't defer its cutover: no SchemaBot server running drivers has checked in during the last minute. Apply again once SchemaBot's drivers are running, or apply without --defer-cutover"},
 		{name: "wider than the fleet", perApplyCap: 3, servers: []int{2, 2}, status: http.StatusUnprocessableEntity,
 			message: "apply rejected: testdb/staging can't defer its cutover: it would keep 3 drivers waiting for the cutover, and SchemaBot's servers have 2 drivers that can wait. To defer it, give the servers 1 more by raising drivers or running more servers; otherwise apply without --defer-cutover"},
 		{name: "wider than max_drivers_per_apply", servers: []int{8}, status: http.StatusUnprocessableEntity,

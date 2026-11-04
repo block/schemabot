@@ -959,7 +959,7 @@ func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, c
 		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and one apply can use at most %d (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to %d. Otherwise run `%s` without `--defer-cutover`.",
 			work, refused.Operations, refused.PerApplyCap, refused.Operations, rerun)
 	case refused.NoLiveServers():
-		return fmt.Sprintf("This %s can't defer its cutover yet: no SchemaBot server has reported its drivers in the last %s. Try again in a minute, or run `%s` without `--defer-cutover`.",
+		return fmt.Sprintf("This %s can't defer its cutover: no SchemaBot server running drivers has checked in during the last %s. Apply again once SchemaBot's drivers are running, or run `%s` without `--defer-cutover`.",
 			work, api.LiveWindowText(), rerun)
 	default:
 		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and SchemaBot's servers have %d drivers that can wait. To defer it, give the servers %d more by raising `drivers` or running more servers. Otherwise run `%s` without `--defer-cutover`.",
