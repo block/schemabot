@@ -3105,6 +3105,20 @@ schemabot plan -e staging
 </details>
 
 <details>
+<summary><a name="missing-e-flag-on-a-control-command"></a><strong>Missing -e Flag On A Control Command</strong></summary>
+
+
+## ❌ Missing Argument
+
+`schemabot stop` needs the environment of the apply it controls. Apply `apply-a1b2c3d4e5f6` runs in `staging`, so comment:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="invalid-command"></a><strong>Invalid Command</strong></summary>
 
 

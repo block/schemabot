@@ -27,6 +27,7 @@ func previewCommentErrorsOutput() {
 		{"GENERIC ERROR", webhooktemplates.PreviewCommentErrorGeneric},
 		{"AUTO-PLAN: GENERIC ERROR", webhooktemplates.PreviewCommentErrorGenericAutoPlan},
 		{"MISSING -e FLAG", webhooktemplates.PreviewCommentMissingEnv},
+		{"MISSING -e FLAG ON A CONTROL COMMAND", webhooktemplates.PreviewCommentControlMissingEnv},
 		{"INVALID COMMAND", webhooktemplates.PreviewCommentInvalidCmd},
 	}
 
@@ -127,6 +128,7 @@ func previewCommentAllOutput() {
 		{"GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGeneric()) }},
 		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
+		{"MISSING -E FLAG ON A CONTROL COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentControlMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"APPLY ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
@@ -269,6 +271,7 @@ func previewCommentPlanAllOutput() {
 		{"GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGeneric()) }},
 		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
+		{"MISSING -E FLAG ON A CONTROL COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentControlMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
 	}
 	printSections(sections)
