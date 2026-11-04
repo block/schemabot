@@ -2404,9 +2404,15 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 	// Any operation not in a terminal state can still move the parent on its own,
 	// so the parent is not stranded and this path leaves it alone. That includes
 	// pending operations: a pending row under a non-terminal parent is queued
-	// work for the operation claim, not residue.
+	// work for the operation claim, not residue. The exception is a row no claim
+	// will ever start — a finalizer whose work failed, or a table step behind
+	// one that can never pass. The derivation this claim hands the parent to
+	// settles the rollout without those rows (state.RolloutChildren marks them
+	// Orphaned), so the selection has to read them as settled too, or a parent
+	// whose last live row failed waits forever on a row that never moves.
 	settledOpStates := terminalApplyStates()
 	settledOpStatePlaceholders := placeholders(len(settledOpStates))
+	orphanedOp := orphanedOperationSQL(s.dialect, "unsettled")
 
 	// The staleness gate is what keeps this off live rollouts. A driver that is
 	// mid-projection still holds a fresh lease, so only a parent whose owner has
@@ -2415,6 +2421,7 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 
 	queryArgs := stringArgs(parentStates)
 	queryArgs = append(queryArgs, stringArgs(settledOpStates)...)
+	queryArgs = append(queryArgs, orphanedOperationArgs()...)
 
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
@@ -2431,11 +2438,12 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 				FROM apply_operations unsettled
 				WHERE unsettled.apply_id = a.id
 					AND unsettled.state NOT IN (%s)
+					AND NOT %s
 			)
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, parentStatePlaceholders, staleClaimCutoff, settledOpStatePlaceholders), queryArgs...)
+	`, applyColumns, parentStatePlaceholders, staleClaimCutoff, settledOpStatePlaceholders, orphanedOp), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

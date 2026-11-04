@@ -3782,6 +3782,51 @@ func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjection(t *
 	assert.Equal(t, state.Apply.RunningDegraded, claimed.State, "the projection, not expiry, writes the verdict")
 }
 
+// A paused deployment whose namespace work carries a group_finalizer hands the
+// rollout to the projection the same way. Expiry fails the work and leaves the
+// finalizer pending: its claim waits for that work to complete, which a failed
+// row never does, so the row is one nothing will ever start. The projection
+// reads it that way and claims the rollout rather than waiting on it.
+func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjectionPastAnOrphanedFinalizer(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_finalizer", 535)
+	_, err := testDB.ExecContext(ctx, `DELETE FROM apply_operations WHERE id = ?`, rollout.queued)
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET operation_key = ? WHERE id = ?`,
+		"commerce/-80/users", rollout.paused)
+	require.NoError(t, err)
+	backdateOperationHeartbeat(t, rollout.paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	finalizer, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: rollout.apply.ID, Deployment: "region-b", Target: rollout.apply.Database,
+		OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		State: state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?
+	`, maxRecoveryAttempts, int64((2 * storage.ApplyLeaseStaleAfter).Seconds()), rollout.apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.Nil(t, claimed, "while the work is paused the finalizer is queued behind a retry, not orphaned")
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, rollout.paused, expired[0].Operation.ID, "only the paused work row is expired")
+	assertOperationState(t, store, finalizer, state.ApplyOperation.Pending, "the finalizer is left as it was")
+
+	claimed, err = store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a finalizer whose work failed never starts, so it does not hold the rollout from the projection")
+	assert.Equal(t, rollout.apply.ID, claimed.ID)
+	assertOperationState(t, store, finalizer, state.ApplyOperation.Pending, "the claim writes the parent's lease, not the orphaned row")
+}
+
 // Oldest rollout first, and no more than limit of them per pass, so a backlog
 // drains in order rather than leaving the same tail unexpired every time.
 func TestApplyStore_ExpireRetryableOperations_TakesTheOldestUpToTheLimit(t *testing.T) {
@@ -4929,6 +4974,149 @@ func TestApplyStore_FindNextApplyForOperationProjection_SkipsLiveAndUnsettledApp
 			claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
 			require.NoError(t, err)
 			assert.Nil(t, claimed, tc.reason)
+		})
+	}
+}
+
+// TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettled
+// verifies the claim agrees with the rollout derivation about which pending
+// rows hold a rollout open. A group_finalizer whose work failed, and a table
+// step behind one that settled without completing, are rows no claim arm will
+// ever start, and the derivation settles the parent without them; the claim
+// reads them as settled so that parent is reached. The same rows behind work
+// that completed, or under another deployment, are queued work and still hold
+// the parent back.
+func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettled(t *testing.T) {
+	work := func(deployment, key, opState string, step int) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			Deployment: deployment, OperationKey: key, OperationKind: storage.ApplyOperationKindWork,
+			RolloutStep: step, State: opState,
+		}
+	}
+	finalizer := func(deployment, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			Deployment: deployment, OperationKey: key, OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			State: opState,
+		}
+	}
+	cases := []struct {
+		name      string
+		ops       []*storage.ApplyOperation
+		claimable bool
+		reason    string
+	}{
+		{
+			name: "pending finalizer behind failed work",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: true,
+			reason:    "a finalizer waits for its work to complete, and failed work never does",
+		},
+		{
+			name: "stopped finalizer behind failed work",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Stopped),
+			},
+			claimable: true,
+			reason:    "a stop caught the finalizer before it started, and a start would hold it to the same gate",
+		},
+		{
+			name: "pending finalizer behind completed work",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "commerce/-80/users", state.ApplyOperation.Completed, 0),
+				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: false,
+			reason:    "the finalizer is the operation claim's next row, not residue",
+		},
+		{
+			name: "pending finalizer behind another deployment's failed work",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				work("region-b", "commerce/-80/users", state.ApplyOperation.Completed, 0),
+				finalizer("region-b", "commerce/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: false,
+			reason:    "a finalizer is orphaned only by work of its own deployment",
+		},
+		{
+			name: "pending finalizer of another namespace",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				work("region-a", "billing/-80/invoices", state.ApplyOperation.Completed, 0),
+				finalizer("region-a", "billing/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: false,
+			reason:    "a finalizer is orphaned only by the work it finalizes",
+		},
+		{
+			name: "pending step behind a failed earlier step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Failed, 1),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: true,
+			reason:    "a later step starts only once every earlier step completed, and a failed step never does",
+		},
+		{
+			name: "pending step behind a cancelled earlier step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Cancelled, 1),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: true,
+			reason:    "a cancelled step ends its deployment's rollout the same way a failed one does",
+		},
+		{
+			name: "pending step behind a completed earlier step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Completed, 1),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: false,
+			reason:    "the next step is the operation claim's next row, not residue",
+		},
+		{
+			name: "pending step behind another deployment's failed step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Failed, 1),
+				work("region-b", "users", state.ApplyOperation.Completed, 1),
+				work("region-b", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: false,
+			reason:    "the step gate orders steps within a deployment, so another deployment's failure does not end this one's",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_projection_orphan_rows", 1, state.Apply.RunningDegraded, "staging")
+			for _, op := range tc.ops {
+				op.ApplyID = apply.ID
+				op.Target = apply.Database
+				_, err := store.ApplyOperations().Insert(ctx, op)
+				require.NoError(t, err)
+			}
+			_, err := testDB.ExecContext(ctx,
+				`UPDATE applies SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?`,
+				int64((2 * storage.ApplyLeaseStaleAfter).Seconds()), apply.ID)
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+			require.NoError(t, err)
+			if tc.claimable {
+				require.NotNil(t, claimed, tc.reason)
+				assert.Equal(t, apply.ID, claimed.ID)
+			} else {
+				assert.Nil(t, claimed, tc.reason)
+			}
 		})
 	}
 }

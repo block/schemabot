@@ -874,11 +874,13 @@ type ApplyStore interface {
 	// finish the projection — every operation is terminal, so no operation-level
 	// claim arm matches, and the one-active-apply guard keeps that target blocked
 	// until the parent settles. Requiring a stale heartbeat is what keeps this off
-	// live rollouts: a driver mid-projection still holds a fresh lease. Applies
-	// with no operation rows are excluded (there is nothing to project from), as
-	// are pending, stopped, and failed_retryable parents, which have their own
-	// resume paths. Returns nil when no such apply exists or it is locked by a
-	// peer.
+	// live rollouts: a driver mid-projection still holds a fresh lease. A row no
+	// claim will ever start — a finalizer whose work failed, or a table step
+	// behind one that can never pass — counts as settled, because the rollout
+	// derivation settles the parent without it. Applies with no operation rows
+	// are excluded (there is nothing to project from), as are pending, stopped,
+	// and failed_retryable parents, which have their own resume paths. Returns
+	// nil when no such apply exists or it is locked by a peer.
 	FindNextApplyForOperationProjection(ctx context.Context, owner string) (*Apply, error)
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.

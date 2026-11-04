@@ -1703,6 +1703,71 @@ func TestPostgresExpireRetryableOperationsDefersToTheOperationLease(t *testing.T
 	assert.Equal(t, state.Task.Running, taskState(t, "task-op-live"))
 }
 
+// Once expiry fails a paused deployment's work, the group_finalizer queued
+// behind that work is a row nothing will ever start, and the operation
+// projection reads it as settled so the rollout reaches it. The clause that
+// says so is rendered SQL PostgreSQL has to execute, binary collation and all:
+// while the work is still paused the finalizer holds the rollout back, and once
+// the work has failed the rollout is claimable over it.
+func TestPostgresOperationProjectionReadsAnOrphanedFinalizerAsSettled(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_projection_orphan")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, error_message, updated_at)
+		VALUES ('apply-projection-orphan', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, $2, '{}', '',
+			NOW() - make_interval(secs => $3))
+		RETURNING id`, state.Apply.RunningDegraded, maxRecoveryAttempts,
+		int64((2*storage.ApplyLeaseStaleAfter).Seconds())).Scan(&applyID))
+
+	insertOperation := func(t *testing.T, deployment, key, kind, opState string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, operation_kind, state, updated_at)
+			VALUES ($1, $2, $3, $4, $5, NOW() - make_interval(secs => $6))
+			RETURNING id`, applyID, deployment, key, kind, opState,
+			int64((storage.ApplyLeaseStaleAfter+time.Minute).Seconds())).Scan(&id))
+		return id
+	}
+	insertOperation(t, "region-a", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Failed)
+	pausedOpID := insertOperation(t, "region-b", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.FailedRetryable)
+	finalizerOpID := insertOperation(t, "region-b", "commerce/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending)
+
+	operationState := func(t *testing.T, opID int64) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM apply_operations WHERE id = $1`, opID).Scan(&got))
+		return got
+	}
+
+	claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+	require.NoError(t, err)
+	require.Nil(t, claimed, "while the work is paused the finalizer is queued behind a retry, not orphaned")
+
+	expired, err := store.Applies().ExpireRetryableOperations(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, pausedOpID, expired[0].Operation.ID)
+	assert.Equal(t, state.ApplyOperation.Pending, operationState(t, finalizerOpID), "the finalizer is left as it was")
+
+	claimed, err = store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a finalizer whose work failed never starts, so it does not hold the rollout from the projection")
+	assert.Equal(t, applyID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Pending, operationState(t, finalizerOpID), "the claim writes the parent's lease, not the orphaned row")
+}
+
 // The conflict check settles an abandoned task only while no drive holds the
 // task's operation, and the guard that decides that is rendered SQL PostgreSQL
 // has to execute: a live operation lease refuses the write, and a lease that
