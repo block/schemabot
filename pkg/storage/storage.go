@@ -1077,7 +1077,42 @@ type ApplyStore interface {
 	// ErrRetryableExpiryBusy reports that another instance holds it. The lock is
 	// an efficiency gate, not a safety one: the selection is guarded, so
 	// concurrent passes would be correct but would each pay the full scan.
-	ExpireRetryable(ctx context.Context, limit int) ([]*RetryableApplyExpiration, error)
+	//
+	// It passes over every apply ListAppliesHeldByEndedOperation takes for
+	// endedOperationStopTypes, so the two sweeps never select one apply
+	// between them. Empty passes over none.
+	ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*RetryableApplyExpiration, error)
+
+	// ListAppliesHeldByEndedOperation returns applies that deferred their
+	// cutover, have an operation that ended before the cutover, and still have
+	// other operations running, waiting for the cutover, or not yet started,
+	// oldest first, at most limit of them. An operation has ended when it
+	// failed under the halt policy, or when it waits on a retry the apply has
+	// spent its budget or freshness window for. Such an apply can never run its
+	// cutover for every operation, so the caller stops it. An apply with a
+	// pending stop or cancel is left out: that request is already ending it.
+	// Only applies of the given database types are listed: the caller names the
+	// types whose stop pauses the work, since stopping any other would end the
+	// work it is meant to save.
+	//
+	// One instance lists per pass, guarded by an advisory lock;
+	// ErrEndedOperationStopBusy reports that another instance holds it.
+	ListAppliesHeldByEndedOperation(ctx context.Context, databaseTypes []string, limit int) ([]*EndedOperationApply, error)
+
+	// SettleAppliesStoppedForEndedOperation settles failed the applies that
+	// ListAppliesHeldByEndedOperation found and SchemaBot then stopped (a
+	// pending stop requested by EndedOperationStopCaller), once no operation is
+	// running or driven any more. Each stopped operation settles failed with
+	// EndedByOperationID naming the ended operation, and its tasks stay stopped
+	// so a new apply resumes the work they saved. Returns the applies settled,
+	// oldest first, at most limit of them.
+	//
+	// An apply is taken whole or not at all, under the same lease gate as
+	// ExpireRetryable. The pending stop and any pending cutover are left for
+	// the caller to answer now that the apply is failed. One instance settles
+	// per pass; ErrEndedOperationSettleBusy reports that another instance holds
+	// the lock.
+	SettleAppliesStoppedForEndedOperation(ctx context.Context, limit int) ([]*EndedOperationApply, error)
 
 	// WithBranchReconcileElection runs fn on the one instance elected to
 	// reconcile engine branches this pass, under an advisory lock held for as
@@ -1188,6 +1223,27 @@ var ErrRetryableExpiryBusy = errors.New("another instance is expiring retryable 
 // reconcile lock, so this pass did no work. It is an expected outcome on every
 // instance but one, not a failure.
 var ErrBranchReconcileBusy = errors.New("another instance is reconciling engine branches")
+
+// ErrEndedOperationStopBusy reports that another instance holds the lock for
+// listing applies held by an ended operation this pass.
+var ErrEndedOperationStopBusy = errors.New("another instance is listing applies held by an ended operation")
+
+// ErrEndedOperationSettleBusy reports that another instance holds the lock for
+// settling applies stopped for an ended operation this pass.
+var ErrEndedOperationSettleBusy = errors.New("another instance is settling applies stopped for an ended operation")
+
+// EndedOperationApply is an apply that deferred its cutover and had an
+// operation end before the cutover ran.
+type EndedOperationApply struct {
+	Apply *Apply
+	// EndedOperation is the operation that ended the apply: the first, by id,
+	// that failed under the halt policy, else the first waiting on a spent
+	// retry.
+	EndedOperation *ApplyOperation
+	// SettledFrom is the state the apply was in when the settle sweep took it,
+	// set only on what that sweep returns; Apply then reads failed.
+	SettledFrom string
+}
 
 // RetryableApplyExpiration is a failed_retryable apply that was made permanent
 // because operator recovery should no longer retry it automatically.
