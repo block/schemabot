@@ -15,6 +15,12 @@ const (
 
 const barWidth = 20
 
+// WaitingForDeploy is the phrase a table row shows while its deploy request
+// waits for the operator to deploy it. Nothing has run on the target yet, so
+// it takes the place of a progress bar: a bar would read as a copy underway.
+// The CLI progress table and both PR comment layouts render this one phrase.
+const WaitingForDeploy = "⏸️ Waiting for deploy"
+
 // EstimateExceededTooltip explains why an active row copy no longer shows a percentage.
 const EstimateExceededTooltip = "More rows than initially estimated, copying is still active and will continue"
 

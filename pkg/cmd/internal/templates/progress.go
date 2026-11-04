@@ -632,10 +632,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Task.WaitingForDeploy:
-		// The deploy request is staged and waits for the operator to deploy
-		// it. Nothing has run on the target yet, so no bar: a bar would read
-		// as a copy underway.
-		writeTableLine(&b, t, "⏸️ Waiting for deploy")
+		writeTableLine(&b, t, "%s", ui.WaitingForDeploy)
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}

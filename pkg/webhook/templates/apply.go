@@ -1080,10 +1080,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.WaitingForDeploy:
-		// The deploy request is staged and waits for the operator to deploy it.
-		// Nothing has run on the target yet, so no bar: a bar would read as a
-		// copy underway.
-		fmt.Fprintf(sb, "**%s**: ⏸️ Waiting for deploy\n", inlineCode(table.TableName))
+		fmt.Fprintf(sb, "**%s**: %s\n", inlineCode(table.TableName), ui.WaitingForDeploy)
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Recovering:

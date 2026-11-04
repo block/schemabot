@@ -995,7 +995,7 @@ func TestShardedTableStatusPhrase_RevertWindowWithoutCheckmark(t *testing.T) {
 // misstates a state the operator has to act on.
 func TestShardedTableStatusPhrase_TerminalStatesNamed(t *testing.T) {
 	assert.Equal(t, "↩️ Reverted", shardedTableStatusPhrase(state.Task.Reverted))
-	assert.Equal(t, "🟡 Waiting for deploy", shardedTableStatusPhrase(state.Task.WaitingForDeploy))
+	assert.Equal(t, "⏸️ Waiting for deploy", shardedTableStatusPhrase(state.Task.WaitingForDeploy))
 }
 
 // A stopped table reads with the stop glyph the comment's title and the CLI's
