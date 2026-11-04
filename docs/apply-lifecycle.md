@@ -169,8 +169,7 @@ recovery driver reclaims the apply and continues it from where it left off,
 using engine checkpoints so completed work is not redone. Failures where
 retrying cannot help skip this state and go straight to permanent `failed`.
 These include the engine rejecting a statement, the target refusing the change
-(a missing privilege, an unsupported feature, a check constraint it cannot
-find), and a row already in the table that cannot be stored under the new
+(a missing privilege, an unsupported feature), and a row already in the table that cannot be stored under the new
 definition (a NULL in a column the change makes `NOT NULL`). Any failure
 SchemaBot does not recognize as one of these keeps its retry budget.
 

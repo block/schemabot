@@ -115,8 +115,6 @@ var statementErrorCodes = []uint16{
 	1142, // ER_TABLEACCESS_DENIED_ERROR: the target's user lacks a privilege the change needs.
 	1235, // ER_NOT_SUPPORTED_YET: the server does not support the statement's feature or combination.
 	1674, // ER_BINLOG_UNSAFE_SYSTEM_FUNCTION: the copy uses a system function the binary log cannot replicate safely.
-	3821, // ER_CHECK_CONSTRAINT_NOT_FOUND: the statement names a check constraint the table does not have.
-	3822, // ER_CHECK_CONSTRAINT_DUP_NAME: the statement adds a check constraint under a name already in use.
 }
 
 // isRowDataError reports whether err is a MySQL error saying a row cannot be
