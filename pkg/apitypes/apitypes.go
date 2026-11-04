@@ -77,21 +77,22 @@ type DeploymentLogError struct {
 // constants rather than parsing error_message strings or HTTP status codes.
 // Use IsRetryableErrorCode to determine whether a given code is retryable.
 const (
-	ErrCodeInvalidRequest       = "invalid_request"        // Malformed request (missing params, bad values)
-	ErrCodeNotFound             = "not_found"              // Resource doesn't exist (unknown apply ID, database)
-	ErrCodeDeploymentNotFound   = "deployment_not_found"   // No tern deployment configured for database/environment
-	ErrCodeEngineError          = "engine_error"           // Schema change engine failure during execution
-	ErrCodeEngineErrorRetryable = "engine_error_retryable" // Schema change engine failure that may recover on retry
-	ErrCodeStorageError         = "storage_error"          // Storage backend (MySQL) read/write failure
-	ErrCodeEngineUnavailable    = "engine_unavailable"     // Schema change engine (Tern) unreachable or RPC error
-	ErrCodeStateSyncFailed      = "state_sync_failed"      // Operation succeeded but local state sync failed
-	ErrCodeActiveApplyExists    = "active_apply_exists"    // Another active apply already exists for the target
-	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
-	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
-	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
-	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
-	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
-	ErrCodeAlreadyStopped       = "already_stopped"        // Stop refused: the schema change is already stopped and no start is queued behind it
+	ErrCodeInvalidRequest          = "invalid_request"           // Malformed request (missing params, bad values)
+	ErrCodeNotFound                = "not_found"                 // Resource doesn't exist (unknown apply ID, database)
+	ErrCodeDeploymentNotFound      = "deployment_not_found"      // No tern deployment configured for database/environment
+	ErrCodeEngineError             = "engine_error"              // Schema change engine failure during execution
+	ErrCodeEngineErrorRetryable    = "engine_error_retryable"    // Schema change engine failure that may recover on retry
+	ErrCodeStorageError            = "storage_error"             // Storage backend (MySQL) read/write failure
+	ErrCodeEngineUnavailable       = "engine_unavailable"        // Schema change engine (Tern) unreachable or RPC error
+	ErrCodeStateSyncFailed         = "state_sync_failed"         // Operation succeeded but local state sync failed
+	ErrCodeActiveApplyExists       = "active_apply_exists"       // Another active apply already exists for the target
+	ErrCodeSourcePolicyDenied      = "source_policy_denied"      // Source repo/path is not authorized for the database
+	ErrCodeLockNotOwned            = "lock_not_owned"            // Lock release denied because the caller is not the owner
+	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
+	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
+	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
+	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
+	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 )
 
 var retryableErrorCodes = map[string]bool{

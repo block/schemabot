@@ -1047,6 +1047,29 @@ func TestWriteProgress_SettledTableByTableRolloutReadsLikeThePRComment(t *testin
 	assert.Contains(t, out, "❌ payments-002 — failed", "the failed target is still named for attention:\n%s", out)
 }
 
+// A rollout of `bikes` then `docks` table by table is stopped while both
+// targets are copying `bikes`. Nothing begins `docks` until the apply is
+// started again, so it reads as stopped and not started rather than queued,
+// the way the PR comment does.
+func TestWriteProgress_StoppedTableByTableRolloutTableNotBegunReadsStopped(t *testing.T) {
+	data := tableStepProgress(state.Apply.Stopped, []tableStepRow{
+		{"payments-001", "bikes", 1, state.ApplyOperation.Stopped, state.Task.Stopped, 300, false},
+		{"payments-002", "bikes", 1, state.ApplyOperation.Stopped, state.Task.Stopped, 400, false},
+		{"payments-001", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+		{"payments-002", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+	})
+
+	out := renderRollout(t, data)
+
+	assert.Contains(t, out, "docks: ⏹️ Stopped (not started)\n", "%s", out)
+	_, docks, found := strings.Cut(out, "docks: ")
+	require.True(t, found, "%s", out)
+	assert.NotContains(t, docks, "Targets:", "each target would only repeat that it stopped: %s", out)
+	assert.NotContains(t, docks, "payments-00", "each target would only repeat that it stopped: %s", out)
+	assert.NotContains(t, out, "Queued", "%s", out)
+	assert.NotContains(t, out, "queued", "%s", out)
+}
+
 // payments-000 already held the change, so the rollout gave it one settled row
 // in the first step and it ran no table. The deployment line counts the two
 // targets that run the tables, as the PR comment's headline does.

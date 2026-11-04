@@ -471,6 +471,80 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.Equal(t, first.Revision+1, second.Revision, "re-arming advances the revision")
 	})
 
+	// RequestPendingCommand_LeavesTheCommandsSettledRowSettled verifies a
+	// request that names its operator command is recorded once per command:
+	// a re-send while it is pending is the pending row, a re-send after it
+	// failed returns the failed row unchanged instead of re-arming it, only a
+	// new command re-arms the row, and a delayed send of an earlier command
+	// after a newer one failed leaves the newer failure in place.
+	t.Run("RequestPendingCommand_LeavesTheCommandsSettledRowSettled", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		applyID := createControlRequestApply(t, store, "control_command_db", "apply_control_command")
+		send := func(commandID string) (*storage.ApplyControlRequest, bool) {
+			t.Helper()
+			metadata, err := storage.WithControlCommandID([]byte(`{"apply_operation_id":11}`), commandID)
+			require.NoError(t, err)
+			req, alreadyPending, err := store.ControlRequests().RequestPendingCommand(ctx, &storage.ApplyControlRequest{
+				ApplyID:     applyID,
+				Operation:   storage.ControlOperationCutover,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "tern-grpc",
+				Metadata:    metadata,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, req)
+			return req, alreadyPending
+		}
+
+		first, alreadyPending := send("7.0")
+		require.False(t, alreadyPending)
+		commandID, err := first.ControlCommandID()
+		require.NoError(t, err)
+		assert.Equal(t, "7.0", commandID)
+
+		resent, alreadyPending := send("7.0")
+		assert.True(t, alreadyPending, "a re-send while the command is pending is the pending request")
+		assert.Equal(t, first.ID, resent.ID)
+
+		require.NoError(t, store.ControlRequests().FailPending(ctx, applyID, storage.ControlOperationCutover, "engine refused the cutover"))
+
+		afterFailure, alreadyPending := send("7.0")
+		assert.False(t, alreadyPending)
+		assert.Equal(t, storage.ControlRequestFailed, afterFailure.Status, "a re-send of a failed command returns the failure")
+		assert.Equal(t, "engine refused the cutover", afterFailure.ErrorMessage)
+		assert.Equal(t, first.Revision, afterFailure.Revision, "the failed command is not re-armed")
+		stored, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, storage.ControlRequestFailed, stored.Status)
+
+		next, alreadyPending := send("7.1")
+		assert.False(t, alreadyPending)
+		assert.Equal(t, storage.ControlRequestPending, next.Status, "a new command re-arms the row")
+		assert.Equal(t, first.Revision+1, next.Revision)
+		commandID, err = next.ControlCommandID()
+		require.NoError(t, err)
+		assert.Equal(t, "7.1", commandID)
+
+		require.NoError(t, store.ControlRequests().FailPending(ctx, applyID, storage.ControlOperationCutover, "engine refused the second cutover"))
+
+		delayed, alreadyPending := send("7.0")
+		assert.False(t, alreadyPending)
+		assert.Equal(t, storage.ControlRequestFailed, delayed.Status, "a delayed send of the earlier command returns the newer command's failure")
+		assert.Equal(t, "engine refused the second cutover", delayed.ErrorMessage)
+		assert.Equal(t, next.Revision, delayed.Revision, "a delayed send of the earlier command does not re-arm the row")
+		commandID, err = delayed.ControlCommandID()
+		require.NoError(t, err)
+		assert.Equal(t, "7.1", commandID, "the row keeps the newer command")
+		stored, err = store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, storage.ControlRequestFailed, stored.Status)
+		assert.Equal(t, next.Revision, stored.Revision)
+	})
+
 	// CompletePending verifies the happy-path resolution: a pending request
 	// is visible through GetPending until completed, after which GetPending
 	// hides it and GetByOperation shows the settled row with its completion

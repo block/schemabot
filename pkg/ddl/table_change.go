@@ -92,6 +92,48 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 	return true, "", nil
 }
 
+// TableChangeStatements returns the DDL a pull request's edit to a
+// single-table MySQL schema file runs, as SameTableChange compares it: the
+// diff from base to file, with no difference ignored. An empty base means the
+// file is added, so its DDL is the CREATE TABLE itself in the parser's
+// canonical form; an empty file means it is removed, so its DDL drops the
+// table. Each non-empty side must hold exactly one CREATE TABLE.
+func TableChangeStatements(base, file string) ([]string, error) {
+	switch {
+	case base == "" && file == "":
+		return nil, nil
+	case base == "":
+		ct, err := parseComparableTable("commit", file)
+		if err != nil {
+			return nil, err
+		}
+		create, err := restoreNode(ct.Raw)
+		if err != nil {
+			return nil, fmt.Errorf("restore table %s: %w", ct.TableName, err)
+		}
+		return []string{create}, nil
+	case file == "":
+		ct, err := parseComparableTable("base", base)
+		if err != nil {
+			return nil, err
+		}
+		return []string{"DROP TABLE `" + strings.ReplaceAll(ct.TableName, "`", "``") + "`"}, nil
+	}
+	source, err := parseComparableTable("base", base)
+	if err != nil {
+		return nil, err
+	}
+	target, err := parseComparableTable("commit", file)
+	if err != nil {
+		return nil, err
+	}
+	stmts, err := strictTableDiff(source, target)
+	if err != nil {
+		return nil, fmt.Errorf("diff table %s against its base: %w", source.TableName, err)
+	}
+	return stmts, nil
+}
+
 // sameCreateTable reports whether the head adds the table with the same
 // CREATE TABLE the approved commit adds. The statement runs as written, so
 // every clause counts, including any the diff does not model.
