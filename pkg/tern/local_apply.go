@@ -612,8 +612,9 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 // storage believes is in-flight, the task is updated in storage and no longer blocks;
 // a terminal report that maps to a resting state (a retryable failure, or a stop) is
 // stored in that state instead, which keeps blocking like any resting task under a
-// claimable apply. Resting tasks (Stopped, FailedRetryable)
-// are left untouched.
+// claimable apply. A retryable failure also pauses the apply for retry
+// (pauseStaleApplyForRetry), so its recovery is charged against the retry
+// budget. Resting tasks (Stopped, FailedRetryable) are left untouched.
 //
 // The engine probe answers from this process's own memory of the work: it
 // reports what this process ran, not the task's actual cross-process state. The
@@ -736,6 +737,9 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		if rests {
 			c.logger.Info("conflict check: settled a stale task into a resting state; it keeps blocking the database while its apply is still claimable",
 				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error_message", t.ErrorMessage)...)
+			if state.IsState(settledState, state.Task.FailedRetryable) {
+				c.pauseStaleApplyForRetry(ctx, t, apply, op)
+			}
 			return false
 		}
 		return true
@@ -790,6 +794,74 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 // predicate does not name keeps blocking rather than admitting a new apply.
 func staleTaskSettlementRests(settledState string) bool {
 	return !state.IsTerminalTaskState(settledState)
+}
+
+// pauseStaleApplyForRetry moves the apply of a stale task the conflict check
+// has just settled as failed_retryable to failed_retryable too, together with
+// the task's operation, so the apply's next recovery goes through the
+// retryable claim, which charges and enforces the retry budget (attempt).
+// Left active, the apply is re-leased by the stale-active claim, which charges
+// nothing, so a retryable failure that recurs with no live driver to record it
+// would be retried forever.
+//
+// The task settlement has already landed in its own transaction; this is a
+// second one, guarded on the lease tokens the conflict check read. A refused
+// or failed move leaves the apply where it was, which is the behaviour without
+// this step: the task still blocks the database and the stale-active claim
+// recovers the apply. Either way the task keeps blocking, so nothing here
+// changes what the conflict check reports.
+//
+// Multi-operation applies move the same way. The rollout projection derives a
+// failed_retryable parent from any failed_retryable operation, so the pair this
+// writes is the state the projection would reach once the operation recorded
+// its failure, its compare-and-swap reads that state like any other, and the
+// operation claim resumes a failed_retryable operation and charges the parent's
+// budget under either drive mode. The store refuses the move while any sibling
+// operation holds a fresh lease, so a live sibling drive is never paused under
+// it, and siblings that are pending or done are left as they are.
+//
+// An operation parked at the cutover barrier is left as today: its copy is
+// done and it is reserved for the cutover claim, so routing it through the
+// retryable copy claim would take it out of the barrier's ordering.
+func (c *LocalClient) pauseStaleApplyForRetry(ctx context.Context, t *storage.Task, apply *storage.Apply, op *storage.ApplyOperation) {
+	if op != nil && state.IsState(op.State, state.ApplyOperation.WaitingForCutover) {
+		c.logger.Info("conflict check: the stale task's operation is parked at the cutover barrier, so its apply is left for the cutover claim rather than paused for retry",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "operation_deployment", op.Deployment)...)
+		return
+	}
+	req := storage.StaleRetryableRequest{
+		ApplyID:         apply.ID,
+		ApplyLeaseToken: apply.LeaseToken,
+		ErrorMessage:    t.ErrorMessage,
+	}
+	if op != nil {
+		req.OperationID = op.ID
+		req.OperationLeaseToken = op.LeaseToken
+	}
+	moved, err := c.storage.Applies().MarkStaleApplyRetryable(ctx, req)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to pause the stale task's apply for retry; the apply stays active and its next recovery is not charged against the retry budget",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", req.OperationID, "error", err)...)
+		return
+	}
+	if !moved {
+		c.logger.Info("conflict check: the stale task's apply was not paused for retry, because another writer moved it first or a live drive holds a lease under it; it is left to that writer",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", req.OperationID)...)
+		return
+	}
+
+	previousState := apply.State
+	apply.State = state.Apply.FailedRetryable
+	apply.ErrorMessage = req.ErrorMessage
+	apply.CompletedAt = nil
+	apply.LeaseOwner = ""
+	apply.LeaseToken = ""
+	apply.LeaseAcquiredAt = nil
+	c.logger.Info("conflict check: paused the stale task's apply for retry, so its next recovery is charged against the retry budget",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", req.OperationID,
+			"previous_state", previousState, "attempt", apply.Attempt, "error_message", req.ErrorMessage)...)
+	c.logApplyPausedForRetry(ctx, apply, previousState, req.ErrorMessage)
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 }
 
 // logStaleTaskSettlementRefused records why tryResolveStaleTask left a task

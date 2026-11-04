@@ -902,9 +902,11 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
 resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
-retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
-[apply-lifecycle.md](apply-lifecycle.md).
+retrying can cure instead of failing it (`driveGroupFinalizer`, same file), the conflict check,
+which pauses a stale apply for retry when its engine reports a retryable failure so the next
+recovery is charged against the budget (`pauseStaleApplyForRetry` in `pkg/tern/local_apply.go`),
+and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget
+semantics in [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
 

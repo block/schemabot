@@ -614,7 +614,8 @@ func TestConflictCheckStampsOwnProcessTerminalReport(t *testing.T) {
 // engine's reason and no completion stamp, so the drive that reclaims its apply
 // requeues it as a retry and the task keeps holding the database until then; a
 // non-retryable failure ends as failed with the same reason and admits the new
-// apply.
+// apply. Only the retryable failure asks for its apply to be paused for retry,
+// and a task that records no operation names none in that request.
 func TestConflictCheckSettlesOwnProcessFailureReportLikeTheDrive(t *testing.T) {
 	for name, tc := range map[string]struct {
 		retryable bool
@@ -630,7 +631,8 @@ func TestConflictCheckSettlesOwnProcessFailureReportLikeTheDrive(t *testing.T) {
 				DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Running,
 			}
 			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
-			client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")}
+			applies := &mockApplyStore{apply: staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")}
+			client.storage.(*exactProgressStorage).applies = applies
 			client.spiritEngine = &fakeControlEngine{progressResult: &engine.ProgressResult{
 				State: engine.StateFailed, Message: "Failed", ErrorMessage: "lost connection to the target during the copy",
 				Retryable: tc.retryable,
@@ -648,8 +650,132 @@ func TestConflictCheckSettlesOwnProcessFailureReportLikeTheDrive(t *testing.T) {
 			}
 			assert.Equal(t, tc.wantState, running.State)
 			assert.Equal(t, "lost connection to the target during the copy", running.ErrorMessage, "the engine's failure reason must be kept")
+			if tc.retryable {
+				assert.Equal(t, []storage.StaleRetryableRequest{{
+					ApplyID: 151, ApplyLeaseToken: "token-stale",
+					ErrorMessage: "lost connection to the target during the copy",
+				}}, applies.staleRetryableRequests, "the apply is paused for retry under the lease token the check read, with no operation")
+			} else {
+				assert.Empty(t, applies.staleRetryableRequests, "a permanent failure does not pause its apply for retry")
+			}
 		})
 	}
+}
+
+// staleOperationOf is operation 151 of apply 151 in opState, last leased by a
+// driver whose heartbeat has gone stale.
+func staleOperationOf(opState string) *mockApplyOperationStore {
+	return &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		151: {
+			ID: 151, ApplyID: 151, Deployment: "testdb", State: opState,
+			LeaseOwner: storage.LeaseOwnerProcess() + "/driver-0", LeaseToken: "op-token-stale",
+			UpdatedAt: time.Now().Add(-2 * storage.ApplyLeaseStaleAfter),
+		},
+	}}
+}
+
+// retryableCopyFailure is this process's report of a copy that failed with an
+// error the engine marks retryable.
+var retryableCopyFailure = &engine.ProgressResult{
+	State: engine.StateFailed, Message: "Failed", ErrorMessage: "lost connection to the target during the copy",
+	Retryable: true,
+}
+
+// A drive in this process was copying `events` for an operation and died: the
+// apply and the operation both hold stale leases this process wrote, and the
+// engine remembers the copy failing with a retryable error. The conflict check
+// settles the task failed_retryable and pauses the apply for retry with it,
+// naming the operation and the lease tokens it read, so the apply's next
+// recovery is charged against the retry budget. The task keeps holding the
+// database and the refusal names the apply's new state.
+func TestConflictCheckPausesStaleApplyForRetryOnARetryableFailure(t *testing.T) {
+	running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", staleOperationOf(state.ApplyOperation.Running))
+	applies := client.storage.(*exactProgressStorage).applies.(*mockApplyStore)
+	applies.staleRetryableMoves = true
+	client.spiritEngine = &fakeControlEngine{progressResult: retryableCopyFailure}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+	require.Error(t, err, "a task paused for retry keeps holding the database")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Contains(t, err.Error(), state.Apply.FailedRetryable, "the refusal names the apply's paused state")
+	assert.Equal(t, state.Task.FailedRetryable, running.State)
+	assert.Equal(t, []storage.StaleRetryableRequest{{
+		ApplyID: 151, ApplyLeaseToken: "token-stale",
+		OperationID: 151, OperationLeaseToken: "op-token-stale",
+		ErrorMessage: "lost connection to the target during the copy",
+	}}, applies.staleRetryableRequests, "the apply is paused once, with its operation, under the lease tokens the check read")
+	assert.Equal(t, state.Apply.FailedRetryable, applies.apply.State)
+}
+
+// tryResolveStaleTask never reports a task it paused for retry as resolved:
+// the task rests failed_retryable under a claimable apply and keeps blocking,
+// and the in-memory apply carries the stored transition.
+func TestTryResolveStaleTaskKeepsBlockingAfterPausingTheApplyForRetry(t *testing.T) {
+	running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", staleOperationOf(state.ApplyOperation.Running))
+	applies := client.storage.(*exactProgressStorage).applies.(*mockApplyStore)
+	applies.staleRetryableMoves = true
+	client.spiritEngine = &fakeControlEngine{progressResult: retryableCopyFailure}
+	apply := staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")
+
+	resolved := client.tryResolveStaleTask(t.Context(), running, apply, "testdb", newConflictScanMemo())
+
+	assert.False(t, resolved, "a task paused for retry keeps blocking the database")
+	assert.Equal(t, state.Task.FailedRetryable, running.State)
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
+	assert.Equal(t, "lost connection to the target during the copy", apply.ErrorMessage)
+	assert.Empty(t, apply.LeaseOwner)
+	assert.Empty(t, apply.LeaseToken)
+	require.Len(t, applies.staleRetryableRequests, 1)
+}
+
+// When the apply cannot be paused for retry — another writer moved a row first,
+// a live drive holds a lease under it, or the write fails — the conflict check
+// behaves as it does without the pause: the task rests failed_retryable, the
+// apply stays running for the stale-active claim, and the dispatch is refused.
+func TestConflictCheckLeavesTheApplyActiveWhenThePauseIsRefused(t *testing.T) {
+	for name, pauseErr := range map[string]error{
+		"refused": nil,
+		"failed":  errors.New("deadlock found when trying to get lock"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", staleOperationOf(state.ApplyOperation.Running))
+			applies := client.storage.(*exactProgressStorage).applies.(*mockApplyStore)
+			applies.staleRetryableErr = pauseErr
+			client.spiritEngine = &fakeControlEngine{progressResult: retryableCopyFailure}
+
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+			require.Error(t, err, "the task keeps holding the database")
+			assert.Contains(t, err.Error(), "schema change already in progress")
+			assert.Equal(t, state.Task.FailedRetryable, running.State)
+			assert.Len(t, applies.staleRetryableRequests, 1)
+			assert.Equal(t, state.Apply.Running, applies.apply.State, "the apply is left for the stale-active claim")
+			assert.Equal(t, "token-stale", applies.apply.LeaseToken)
+		})
+	}
+}
+
+// An operation parked at the cutover barrier is reserved for the cutover
+// claim. A retryable failure reported for its task rests the task
+// failed_retryable as before, but the apply is not paused for retry, so the
+// parked operation stays where the barrier expects it.
+func TestConflictCheckLeavesAnApplyAtTheCutoverBarrierUnpaused(t *testing.T) {
+	running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", staleOperationOf(state.ApplyOperation.WaitingForCutover))
+	applies := client.storage.(*exactProgressStorage).applies.(*mockApplyStore)
+	applies.staleRetryableMoves = true
+	client.spiritEngine = &fakeControlEngine{progressResult: retryableCopyFailure}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.FailedRetryable, running.State)
+	assert.Empty(t, applies.staleRetryableRequests, "an apply whose operation is parked at the barrier is not paused for retry")
+	assert.Equal(t, state.Apply.Running, applies.apply.State)
 }
 
 // An own-process stopped report settles a stale task as stopped, a resting
@@ -663,7 +789,8 @@ func TestConflictCheckSettlesOwnProcessStoppedReportAsResting(t *testing.T) {
 		DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Running,
 	}
 	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
-	client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")}
+	applies := &mockApplyStore{apply: staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0"), staleRetryableMoves: true}
+	client.storage.(*exactProgressStorage).applies = applies
 	client.spiritEngine = &fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateStopped, Message: "Stopped"}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
@@ -673,6 +800,8 @@ func TestConflictCheckSettlesOwnProcessStoppedReportAsResting(t *testing.T) {
 	assert.Equal(t, state.Task.Stopped, running.State)
 	assert.Nil(t, running.CompletedAt, "a stopped task rests and is not stamped complete")
 	assert.Empty(t, running.ErrorMessage, "a stop is not a failure")
+	assert.Empty(t, applies.staleRetryableRequests, "a stop is not a failure, so its apply is not paused for retry")
+	assert.Equal(t, state.Apply.Running, applies.apply.State)
 }
 
 // A settled report writes the engine's failure reason only for a failure, falls
