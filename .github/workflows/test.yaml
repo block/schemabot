@@ -318,7 +318,18 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # Only the tree the discovery below reads. A full checkout of this
+      # repository takes most of the job's one-minute budget on a slow runner
+      # and cancels the job; a sparse, blobless one takes seconds.
+      # The sparse path must cover every path the discovery step greps: a
+      # path outside it is absent from the checkout, so grep exits 2 and the
+      # job fails as an unusable tree rather than discovering nothing. The
+      # filter is spelled out, rather than left to the action's default for
+      # a sparse checkout, so the clone stays blobless across action bumps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: pkg/localscale
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -378,7 +389,11 @@ jobs:
 
   localscale:
     name: "LocalScale Tests (${{ matrix.shard }})"
-    needs: [changes, build, localscale-matrix]
+    # Restores the Go cache directly, like the Integration and E2E jobs, rather
+    # than waiting for Build to save it. The cache already on the default
+    # branch covers everything but this change's own packages, and compiling
+    # those here costs far less than waiting for Build to finish.
+    needs: [changes, localscale-matrix]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -629,7 +644,12 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # Sparse and blobless for the reasons given on the LocalScale Matrix job;
+      # the sparse path must cover what the discovery step below greps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/local
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -929,7 +949,12 @@ jobs:
     outputs:
       shards: ${{ steps.gen.outputs.shards }}
     steps:
+      # Sparse and blobless for the reasons given on the LocalScale Matrix job;
+      # the sparse path must cover what the discovery step below greps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/k8s
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         run: |
@@ -1234,7 +1259,10 @@ jobs:
 
   localscale-rollup:
     name: "LocalScale Tests"
-    needs: [changes, localscale-matrix, localscale]
+    # Build is not a required check of its own; no test job waits for it, so
+    # this rollup is what keeps a change that fails to compile out of the
+    # merge queue.
+    needs: [changes, build, localscale-matrix, localscale]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -1244,6 +1272,7 @@ jobs:
           CHANGES_CODE: ${{ needs.changes.outputs.code }}
           EVENT_NAME: ${{ github.event_name }}
           FULL: ${{ needs.changes.outputs.full }}
+          BUILD_RESULT: ${{ needs.build.result }}
           LS_MODE: ${{ needs.localscale-matrix.outputs.mode }}
           LS_SHARD_COUNT: ${{ needs.localscale-matrix.outputs.shard_count }}
           LOCALSCALE_RESULT: ${{ needs.localscale.result }}
@@ -1256,6 +1285,10 @@ jobs:
           if [ "$CHANGES_CODE" != "true" ]; then
             echo "Docs-only PR; LocalScale intentionally skipped."
             exit 0
+          fi
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::build result=$BUILD_RESULT"
+            exit 1
           fi
           # Fail closed: a merge-gating event must run the full matrix, and the
           # matrix that was actually instantiated must match the claimed mode.
