@@ -117,7 +117,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		if err := writeJSON(allResults); err != nil {
 			return err
 		}
-		return planErrorsExit(allResults)
+		return planRefusalExit(allResults)
 	}
 
 	// Disclose ignore_namespaces once per distinct resolution: entries resolve
@@ -140,20 +140,44 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	if cmd.Target != "" {
 		writeNarrowedTo(allResults[cmd.Environment])
 	}
-	return planErrorsExit(allResults)
+	return planRefusalExit(allResults)
 }
 
-// planErrorsExit returns the error that fails the command when any
-// environment's plan reported errors, and nil otherwise. The plan output has
-// already said what the errors are, so the error is silent: only the exit
+// planRefusalExit returns the error that fails the command when any
+// environment's plan is one apply refuses whatever its flags, and nil
+// otherwise. Those are the plans apply rejects before it prompts or locks:
+// a plan that reported errors, a rollout with members that need attention,
+// and a plan carrying a blocked change. Refusals an operator can lift with a
+// flag or a narrowed apply, such as unsafe changes or members apply runs
+// under their own plans, leave the exit status alone. The plan output has
+// already said what the refusal is, so the error is silent: only the exit
 // status is left to report, and stdout stays the plan alone.
-func planErrorsExit(results map[string]*apitypes.PlanResponse) error {
+func planRefusalExit(results map[string]*apitypes.PlanResponse) error {
 	for _, env := range slices.Sorted(maps.Keys(results)) {
-		if result := results[env]; result != nil && len(result.Errors) > 0 {
-			return fmt.Errorf("plan for environment %s has errors: %w", env, ErrSilent)
+		if refusal := planRefusal(results[env]); refusal != "" {
+			return fmt.Errorf("plan for environment %s %s: %w", env, refusal, ErrSilent)
 		}
 	}
 	return nil
+}
+
+// planRefusal names why apply would refuse the plan, or returns "" when it
+// would not. The order follows apply's own checks, so the reason named is the
+// one apply would give first.
+func planRefusal(plan *apitypes.PlanResponse) string {
+	if plan == nil {
+		return ""
+	}
+	if len(plan.Errors) > 0 {
+		return "has errors"
+	}
+	if rollout := plan.WholeRollout(); rollout != nil && len(rollout.Attention) > 0 {
+		return "has rollout members that need attention"
+	}
+	if plan.HasBlockedChanges() {
+		return "has a blocked change"
+	}
+	return ""
 }
 
 func outputPlanRequestError(database, environment string, err error) bool {
