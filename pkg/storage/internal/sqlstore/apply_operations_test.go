@@ -2034,6 +2034,87 @@ func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesPar
 	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a multi-op redispatch must consume one unit of the parent retry budget")
 }
 
+// A rollout under on_failure "continue" whose region-a halt-failed while
+// region-b paused retryable is derived running_degraded, and the projection
+// holds it there: nothing moves the parent back to failed_retryable. Claiming
+// region-b's row is still a deliberate retry, so it is charged like one — the
+// row moves to running, its attempt advances, and the parent's retry budget is
+// consumed — rather than being re-leased for free as crash recovery.
+func TestApplyOperationStore_FindNextApplyOperation_DegradedRolloutRedispatchConsumesParentBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_budget", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the paused operation under a degraded rollout must be reclaimable within budget")
+	assert.Equal(t, retryID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Running, claimed.State, "a deliberate redispatch moves the row to running")
+	assert.Equal(t, 1, claimed.Attempt, "a deliberate redispatch advances the operation attempt")
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a redispatch under a degraded rollout consumes one unit of the parent retry budget")
+}
+
+// Once a degraded rollout's retry budget is spent, its paused operation is left
+// alone even when the parent and the row are both stale: the row is a retry
+// nobody admitted, so there is no crashed drive to recover and crash recovery
+// must not re-lease it on every staleness window. It parks for the operator
+// instead.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsDegradedRolloutRetryBudgetExhausted(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_spent", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, retryID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a paused operation under a degraded rollout must park once the retry budget is spent, however stale its rows")
+
+	assertApplyOperationState(t, store, retryID, state.ApplyOperation.FailedRetryable)
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a parked retry is not charged again")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget
 // verifies OC-5 Part B2's guard: a single-operation apply with tasks is driven
 // under the parent lease, whose ClaimApplyByID increments the parent attempt,
