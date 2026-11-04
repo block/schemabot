@@ -186,10 +186,10 @@ operations has reached, and it is visible in the PR progress comment, so you
 can watch how much budget the worst-hit operation has burned.
 
 An operation's first pickup is immediate. Each one after that waits twice as
-long as the one before, starting at 5 seconds and capped at 5 minutes,
+long as the one before, starting at 5 seconds and capped at 1 minute,
 measured from when the operation last failed. An outage of a few minutes
-therefore costs a handful of attempts instead of the whole budget, and the 10
-attempts together span about 20 minutes. The count is never reset: an
+therefore spends part of the budget instead of all of it, and the 10
+attempts together span about 6 minutes. The count is never reset: an
 operation that recovered at its third attempt and fails again hours later
 waits 20 seconds, and has seven attempts left.
 
@@ -205,7 +205,7 @@ default for a `targets` list, the later members keep starting and copying
 while it retries: each finishes its copy, parks at the cutover barrier, which
 frees its driver, and cuts over once the retry succeeds. Under `barrier` and
 `rolling` they wait to start. An operation that fails every time holds them
-for its whole budget, about 20 minutes, and then fails, and `on_failure`
+for its whole budget, about 6 minutes, and then fails, and `on_failure`
 decides what the rest of the rollout does ([Multi-Target
 Environment](configuration.md#multi-target-environment-preview)). That wait is
 the cost of riding out a data plane restart instead of failing the rollout on

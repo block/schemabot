@@ -33,7 +33,7 @@ const (
 	// redispatch. See RecoveryBackoff.
 	RecoveryBackoffBase = 5 * time.Second
 	// MaxRecoveryBackoff caps the wait between automatic redispatches.
-	MaxRecoveryBackoff = 5 * time.Minute
+	MaxRecoveryBackoff = time.Minute
 )
 
 // RecoveryBackoff is how long a failed_retryable operation waits, from the

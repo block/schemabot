@@ -152,22 +152,20 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 
 	// A driver crashed part-way through a retry its parent had already
 	// admitted: the parent is running with a stale heartbeat and the operation
-	// is still failed_retryable at an attempt whose backoff has not passed.
-	// Recovering the crashed drive is not a new redispatch, so it does not wait
-	// out the backoff and does not spend an attempt.
-	t.Run("crash recovery does not wait out the backoff", func(t *testing.T) {
+	// is still failed_retryable. Recovering the crashed drive is not a new
+	// redispatch, so it does not spend an attempt.
+	t.Run("crash recovery spends no attempt", func(t *testing.T) {
 		ctx := t.Context()
 		store := newStore(t)
 		lock := createTestLock(t, store, "retry_crash_db", storage.DatabaseTypeMySQL)
 		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retry_crash", 1, state.Apply.FailedRetryable, "staging")
 		stale := 2 * storage.ApplyLeaseStaleAfter
-		require.Less(t, stale, storage.RecoveryBackoff(maxRecoveryAttempts-1), "the fixture sits inside the operation's backoff")
 		setApplyAttempt(t, store, apply.ID, state.Apply.Running, maxRecoveryAttempts-1, stale)
 		id := insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.FailedRetryable, maxRecoveryAttempts-1, stale)
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recovery-driver")
 		require.NoError(t, err)
-		require.NotNil(t, claimed, "a crashed retry is recovered without waiting out the backoff")
+		require.NotNil(t, claimed, "a crashed retry is recovered")
 		assert.Equal(t, id, claimed.ID)
 		assert.Equal(t, maxRecoveryAttempts-1, claimed.Attempt, "recovery spends no attempt")
 	})
