@@ -299,16 +299,40 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	return nil
 }
 
+// handleListDeployRequests serves GET /deploy-requests. It honors the branch,
+// into_branch and state query filters PlanetScale accepts, so a client that
+// asks for the open deploy requests from one branch into another gets exactly
+// those: the engine lists that way to find a deploy request an earlier drive
+// opened before creating a second one on the same branch. state is "open" or
+// "closed", as for a single deploy request.
 func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request) error {
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 
-	rows, err := s.metadataDB.QueryContext(r.Context(),
-		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at
+	query := `SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at, closed_at
 		 FROM localscale_deploy_requests
-		 WHERE org = ? AND database_name = ?
-		 ORDER BY number DESC`,
-		org, database)
+		 WHERE org = ? AND database_name = ?`
+	args := []any{org, database}
+	if branch := r.URL.Query().Get("branch"); branch != "" {
+		query += " AND branch = ?"
+		args = append(args, branch)
+	}
+	if intoBranch := r.URL.Query().Get("into_branch"); intoBranch != "" {
+		query += " AND into_branch = ?"
+		args = append(args, intoBranch)
+	}
+	switch state := r.URL.Query().Get("state"); state {
+	case "":
+	case deployRequestOpen:
+		query += " AND closed_at IS NULL"
+	case deployRequestClosed:
+		query += " AND closed_at IS NOT NULL"
+	default:
+		return newHTTPError(http.StatusBadRequest, "unknown deploy request state %q: expected %q or %q", state, deployRequestOpen, deployRequestClosed)
+	}
+	query += " ORDER BY number DESC"
+
+	rows, err := s.metadataDB.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "query deploy requests: %v", err)
 	}
@@ -319,7 +343,8 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 		var number int64
 		var branch, intoBranch, state, createdAtRaw string
 		var instantEligible, instantDDL, autoCutover bool
-		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw); err != nil {
+		var closedAtRaw sql.NullString
+		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw, &closedAtRaw); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "scan deploy request: %v", err)
 		}
 		createdAt, err := deployRequestCreatedAt(createdAtRaw)
@@ -330,6 +355,7 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 			"number":           number,
 			"branch":           branch,
 			"into_branch":      intoBranch,
+			"state":            deployRequestStateFor(closedAtRaw),
 			"deployment_state": state,
 			"created_at":       createdAt,
 			"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
