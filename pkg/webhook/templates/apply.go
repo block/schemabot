@@ -2000,7 +2000,7 @@ func taskOutcomeLabel(normalized string) string {
 	case state.Task.RevertWindow:
 		return "Completed (revert window open)"
 	case state.Task.PostChecksum:
-		return "Data verified, not cut over"
+		return "Data verified, cutover not run"
 	case state.Task.FailedRetryable:
 		return "Interrupted"
 	}

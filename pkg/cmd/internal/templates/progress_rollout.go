@@ -965,10 +965,10 @@ func FormatRolloutFooter(v RolloutView) string {
 		// each cutover; otherwise SchemaBot cuts the ready member over itself,
 		// and offering the command would contradict that.
 		if !v.DeferCutover {
-			fmt.Fprintf(&b, "SchemaBot will cut over %s next — no action needed.\n", next.Name)
+			fmt.Fprintf(&b, "SchemaBot will run the cutover for %s next — no action needed.\n", next.Name)
 			break
 		}
-		writeRolloutCommand(&b, fmt.Sprintf("To cut over %s", next.Name), applyCommand("cutover"))
+		writeRolloutCommand(&b, fmt.Sprintf("To run the cutover for %s", next.Name), applyCommand("cutover"))
 	case presentation.NextActionResume:
 		writeRolloutCommand(&b, ResumeLabel, applyCommand("start"))
 	case presentation.NextActionReviewFailure:

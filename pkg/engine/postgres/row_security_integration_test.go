@@ -127,6 +127,57 @@ func TestEnginePullDisabledRowSecurityPolicies(t *testing.T) {
 	assert.True(t, plan.NoChanges)
 }
 
+// A row security declaration in a schema other than public is materialized
+// on a scratch path that resolves the schema's own types, so the pulled
+// definition of a table whose column uses an enum declared beside it
+// converges with no changes, and a changed policy on it still plans as one
+// atomic operation.
+func TestEngineRowSecurityInOwnSchemaResolvesItsTypes(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_own_schema")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+		CREATE SCHEMA app;
+		CREATE TYPE app.doc_state AS ENUM ('draft', 'published');
+		CREATE TABLE app.documents (
+			id bigint PRIMARY KEY,
+			state app.doc_state NOT NULL
+		);
+		ALTER TABLE app.documents ENABLE ROW LEVEL SECURITY;
+		CREATE POLICY readers ON app.documents FOR SELECT USING (id = 1);
+	`)
+	require.NoError(t, err)
+	eng := NewForTarget(0, 0, "rls_own_schema", &engine.Credentials{DSN: dsn})
+	pulled, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "app"})
+	require.NoError(t, err)
+	definition := pulled.Namespaces["app"].Tables["documents"]
+	assert.Contains(t, definition, "doc_state")
+	assert.Contains(t, definition, "CREATE POLICY")
+	req := &engine.PlanRequest{Database: "rls_own_schema", Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"app": {Files: map[string]string{"documents.sql": definition}}}}
+	plan, err := eng.Plan(ctx, req)
+	require.NoError(t, err)
+	assert.True(t, plan.NoChanges)
+
+	req.SchemaFiles["app"].Files["documents.sql"] = `
+		CREATE TABLE documents (
+			id bigint PRIMARY KEY,
+			state doc_state NOT NULL
+		);
+		ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+		CREATE POLICY readers ON documents FOR SELECT USING (true);
+	`
+	plan, err = eng.Plan(ctx, req)
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	tc := plan.Changes[0].TableChanges[0]
+	assert.Equal(t, "documents", tc.Table)
+	assert.True(t, tc.IsUnsafe)
+	assert.Contains(t, tc.DDL, "DROP POLICY")
+	assert.Contains(t, tc.DDL, "USING (true)")
+}
+
 // Legacy files and rollback originals manage table shape without claiming
 // ownership of access rules. Exercise every live security state.
 func TestEngineTableOnlyDefinitionPreservesRowSecurity(t *testing.T) {

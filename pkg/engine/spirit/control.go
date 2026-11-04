@@ -9,6 +9,7 @@ package spirit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -474,7 +475,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	// The caller should poll Progress() for state transitions.
 	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", sqlescape.EscapeIdentifier(database), sqlescape.EscapeIdentifier(deferredCutoverSentinelTable)))
 	if err != nil {
-		return nil, fmt.Errorf("drop sentinel table: %w", err)
+		return nil, sentinelDropError(err)
 	}
 
 	e.schemaChangeLogger(rm).Info("sentinel table dropped, cutover will proceed", "database", database, "stateless", rm == nil)
@@ -484,6 +485,19 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 		Message:     "Cutover triggered - schema change will complete shortly",
 		ResumeState: req.ResumeState,
 	}, nil
+}
+
+// sentinelDropError classifies a failed sentinel drop. A connection that broke
+// while the statement was in flight leaves it unknown whether the drop ran, and
+// so whether Spirit is already cutting over: that is reported as an unknown
+// outcome, and sending the cutover again is safe because the drop is
+// idempotent. Any other error is a cutover the database refused.
+func sentinelDropError(err error) error {
+	wrapped := fmt.Errorf("drop sentinel table: %w", err)
+	if errors.Is(err, mysql.ErrInvalidConn) || errors.Is(err, context.DeadlineExceeded) || engine.IsTransientTransportError(err) {
+		return &engine.OutcomeUnknownError{Err: wrapped}
+	}
+	return wrapped
 }
 
 // DeferredCutoverSignalExists reports whether Spirit's deferred-cutover signal

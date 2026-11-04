@@ -257,16 +257,21 @@ An apply started with `--defer-cutover` that would keep more drivers waiting
 at its cutover than `max_drivers_per_apply` gives one apply, or than the
 fleet's servers have, is refused with `deferred_cutover_capacity`
 ([Deferred cutover capacity](configuration.md#deferred-cutover-capacity)).
-Its status says whether a retry can help:
+The check covers this server's operators and, for a deployment that runs its
+operations on a remote data plane, that data plane's, and the `error` names
+the deployment when a data plane refused it. Its status says whether a retry
+can help:
 
 - `409 deferred_cutover_capacity` means no server running drivers has
   checked in during the last minute. Retry once SchemaBot's drivers are
   running, or apply without `--defer-cutover`.
 - `422 deferred_cutover_capacity` means the apply is wider than
-  `max_drivers_per_apply`, or than every live server's drivers together. The
-  `error` names which to raise and by how much: `max_drivers_per_apply`, or
-  the servers' `drivers` or replica count. Otherwise apply without
-  `--defer-cutover`.
+  `max_drivers_per_apply`, or than every live server's drivers together, or a
+  deployment it runs on does not report its drivers because it runs an older
+  SchemaBot. The `error` names the deployment when it names one, and what to
+  raise and by how much: `max_drivers_per_apply`, or the servers' `drivers` or
+  replica count, or that the deployment needs upgrading. Otherwise apply
+  without `--defer-cutover`.
 
 No apply record is created for any of these refusals. Match `error_code`
 rather than parsing the human-readable `error` field.

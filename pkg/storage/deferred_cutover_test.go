@@ -59,3 +59,10 @@ func TestDeferredCutoverHeldAtOnceCountsOperationsHeldAtOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestDeferredCutoverDriversLeavesOneDriverPerServer(t *testing.T) {
+	assert.Equal(t, 0, DeferredCutoverDrivers(0))
+	assert.Equal(t, 1, DeferredCutoverDrivers(1), "a single driver is not reserved")
+	assert.Equal(t, 1, DeferredCutoverDrivers(2))
+	assert.Equal(t, 3, DeferredCutoverDrivers(4))
+}

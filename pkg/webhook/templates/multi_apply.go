@@ -472,11 +472,11 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		// and offering the command would contradict that.
 		if !rolloutOptions(data.Details).DeferCutover {
 			sb.WriteString("\n---\n\n")
-			fmt.Fprintf(sb, "SchemaBot will cut over %s next — no action needed.\n", inlineCode(na.Name))
+			fmt.Fprintf(sb, "SchemaBot will run the cutover for %s next — no action needed.\n", inlineCode(na.Name))
 			return
 		}
 		writeFooterAction(sb,
-			fmt.Sprintf("To cut over %s:", inlineCode(na.Name)),
+			fmt.Sprintf("To run the cutover for %s:", inlineCode(na.Name)),
 			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))

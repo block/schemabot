@@ -189,6 +189,20 @@ service Tern {
     };
   }
 
+  // DriverCapacity reports the drivers this deployment's operators run, so a
+  // caller can refuse up front an apply that could never have all its
+  // operations here waiting at a deferred cutover at once.
+  //
+  // A deployment that answers also runs the cutover of every operation a
+  // CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+  // must not send an apply started with defer_cutover to a deployment that
+  // answers Unimplemented.
+  rpc DriverCapacity(DriverCapacityRequest) returns (DriverCapacityResponse) {
+    option (google.api.http) = {
+      get: "/v1/driver-capacity"
+    };
+  }
+
   // Stop pauses all non-terminal tasks for a schema change.
   //
   // Transitions: any non-terminal state -> stopped.
@@ -1112,6 +1126,29 @@ message HealthRequest {}
 // HealthResponse is the health check response.
 message HealthResponse {
   string status = 1;
+}
+
+// DriverCapacityRequest asks a deployment for the drivers its operators run.
+message DriverCapacityRequest {}
+
+// DriverCapacityResponse is the drivers a deployment's live servers
+// run, counted from the servers that reported within the live window.
+message DriverCapacityResponse {
+  // live_servers is how many of the deployment's servers reported their
+  // drivers within the live window.
+  int32 live_servers = 1;
+  // drivers is how many drivers those servers run, together.
+  int32 drivers = 2;
+  // deferred_cutover_drivers is how many of those drivers may hold an
+  // operation waiting at a deferred cutover: each server's drivers less the
+  // one it keeps for other work. A waiting operation keeps its driver until
+  // its cutover runs.
+  int32 deferred_cutover_drivers = 3;
+  // max_drivers_per_apply is how many operations of one apply the deployment
+  // runs at once. An operation waiting at its cutover keeps counting, so an
+  // apply that sends the deployment more operations than this can never have
+  // all of them waiting together.
+  int32 max_drivers_per_apply = 4;
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.

@@ -9016,7 +9016,7 @@ _No details available yet._
 
 ---
 
-SchemaBot will cut over `eu` next — no action needed.
+SchemaBot will run the cutover for `eu` next — no action needed.
 
 To stop this schema change:
 ```
@@ -9365,7 +9365,7 @@ _No details available yet._
 
 ---
 
-To cut over `eu`:
+To run the cutover for `eu`:
 ```
 schemabot cutover apply-a1b2c3d4e5f6 -e production
 ```
@@ -10409,7 +10409,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-SchemaBot will cut over us-east next — no action needed.
+SchemaBot will run the cutover for us-east next — no action needed.
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 
@@ -10613,7 +10613,7 @@ To stop this schema change:
        • Targets: 1 (1 waiting for cutover)
            ● payments-003: waiting for cutover
 
-To cut over prod/payments-001:
+To run the cutover for prod/payments-001:
   schemabot cutover apply-multi-a1b2c3d4 -e production
 
 ```
@@ -11374,7 +11374,7 @@ ESC detach • s stop
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-SchemaBot will cut over us-east next — no action needed.
+SchemaBot will run the cutover for us-east next — no action needed.
 
 ESC detach • s stop
 ```

@@ -527,12 +527,12 @@ a repository whose tree GitHub truncates.
 An apply that keeps its drivers until an operator cuts it over is admitted only if SchemaBot's
 servers can hold all of it at once, and such applies take drivers in turn: none starts an operation
 while one ahead of it still has an operation waiting to start. The apply at the front therefore
-always gets every driver it needs and can be cut over, and the rest follow it. An apply's place is
+always gets every driver it needs and can reach its cutover, and the rest follow it. An apply's place is
 when it last started, so one that was stopped and started again goes behind every apply that started
 while it held no drivers.
 
 *Breaks if violated:* two applies each hold part of the drivers with the rest of their operations
-queued behind the other, neither can be cut over, and both wait until the waiting-for-cutover
+queued behind the other, neither can reach its cutover, and both wait until the waiting-for-cutover
 timeout fails them. *Enforced:* the width refusal at apply and at apply creation
 (`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
 (`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
@@ -935,8 +935,8 @@ the cutover barrier under `barrier`, while `parallel` does not order copy start 
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
 work held behind an earlier table that settled without completing can never start, so it holds no target. Under
-`barrier` and `parallel` cutover follows deployment order: an operation cuts over only once every
-operation of every earlier deployment has completed. Within one deployment, an operation cuts over
+`barrier` and `parallel` cutover follows deployment order: an operation's cutover runs only once every
+operation of every earlier deployment has completed. Within one deployment, an operation's cutover runs
 as soon as its own copy is ready: an earlier operation of the same deployment holds it only while it
 is in a state the rollout halts on (failed, retrying a failure, stopped, cancelled, or reverted),
 never while it is still copying or cutting over. A member's finalizer publishes its change without
@@ -1211,8 +1211,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
-`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
-`pkg/storage/internal/sqlstore/reaper.go`).
+`releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1734,8 +1734,8 @@ re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), whi
 the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
-validates the branch against the declared schema before creating the deploy request. The
-cross-deployment comparison a plan is reviewed against
+validates the branch against the declared schema before creating or adopting the deploy request.
+The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced

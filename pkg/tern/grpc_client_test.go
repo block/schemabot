@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10496,6 +10497,70 @@ func TestGRPCClient_StoppedTasklessOperationStaysStoppedWithoutAStartRequest(t *
 		"the operation stays stopped, but is %q", operations.ops[operationID].State)
 }
 
+// supersededFakeObserver is a ProgressObserver whose publish authority can be
+// permanently lost, mirroring a comment observer whose apply lease was taken
+// over by a newer owner.
+type supersededFakeObserver struct {
+	superseded    atomic.Bool
+	progressCalls atomic.Int32
+}
+
+func (o *supersededFakeObserver) OnProgress(*storage.Apply, []*storage.Task) {
+	o.progressCalls.Add(1)
+}
+
+func (o *supersededFakeObserver) OnTerminal(*storage.Apply, []*storage.Task) {}
+
+func (o *supersededFakeObserver) Superseded() bool { return o.superseded.Load() }
+
+// A poller must only clear the observer it was driving. When a newer
+// registration replaced the superseded observer between reads, the replacement
+// stays registered so the running poller keeps driving it; clearing blindly
+// would leave the replacement registered-looking but never polled.
+func TestClearObserverIfCurrent(t *testing.T) {
+	oldObs := &supersededFakeObserver{}
+	newObs := &supersededFakeObserver{}
+	client := &GRPCClient{observers: map[int64]ProgressObserver{1: oldObs}}
+
+	client.observers[1] = newObs
+	assert.False(t, client.clearObserverIfCurrent(1, oldObs),
+		"a replaced observer must not clear its replacement")
+	assert.Same(t, newObs, client.getObserver(1), "the replacement stays registered")
+
+	assert.True(t, client.clearObserverIfCurrent(1, newObs),
+		"the current observer clears itself")
+	assert.Nil(t, client.getObserver(1))
+}
+
+// A superseded observer never publishes again — the new apply owner's observer
+// carries the apply — so its poll loop unregisters it and exits instead of
+// re-reading storage and re-logging the lost lease on every tick for the rest
+// of the apply.
+func TestObserverPollStopsForSupersededObserver(t *testing.T) {
+	const applyID int64 = 77
+	obs := &supersededFakeObserver{}
+	obs.superseded.Store(true)
+	// The apply is live and readable: only the supersession check, not a
+	// terminal state or a storage failure, may stop this poll.
+	client := &GRPCClient{
+		storage: &mockStorage{
+			applies: &mockApplyStore{apply: &storage.Apply{
+				ID: applyID, ApplyIdentifier: "apply-superseded", State: state.Apply.Running,
+			}},
+			tasks: &mockTaskStore{},
+		},
+		observerPollInterval: 10 * time.Millisecond,
+	}
+
+	client.SetObserver(applyID, obs)
+
+	require.Eventually(t, func() bool {
+		return client.getObserver(applyID) == nil
+	}, 5*time.Second, 10*time.Millisecond,
+		"the poll loop must unregister a superseded observer and stop")
+	assert.Zero(t, obs.progressCalls.Load(), "a superseded observer receives no further progress callbacks")
+}
+
 // A rollout member planned against its own live schema names its plan on its
 // operation row, and the dispatch must run that plan rather than the apply's —
 // the apply's plan describes the primary's target, so dispatching it would send
@@ -10667,13 +10732,14 @@ func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 		ternv1.Tern_StorageSchemaPlan_FullMethodName:       true,
 	}
 	control := map[string]bool{
-		ternv1.Tern_Progress_FullMethodName: true,
-		ternv1.Tern_Logs_FullMethodName:     true,
-		ternv1.Tern_Cutover_FullMethodName:  true,
-		ternv1.Tern_Health_FullMethodName:   true,
-		ternv1.Tern_Stop_FullMethodName:     true,
-		ternv1.Tern_Cancel_FullMethodName:   true,
-		ternv1.Tern_Start_FullMethodName:    true,
+		ternv1.Tern_Progress_FullMethodName:       true,
+		ternv1.Tern_Logs_FullMethodName:           true,
+		ternv1.Tern_Cutover_FullMethodName:        true,
+		ternv1.Tern_Health_FullMethodName:         true,
+		ternv1.Tern_Stop_FullMethodName:           true,
+		ternv1.Tern_Cancel_FullMethodName:         true,
+		ternv1.Tern_Start_FullMethodName:          true,
+		ternv1.Tern_DriverCapacity_FullMethodName: true,
 	}
 
 	require.Empty(t, ternv1.Tern_ServiceDesc.Streams, "streaming RPCs bypass the unary deadline interceptor")
