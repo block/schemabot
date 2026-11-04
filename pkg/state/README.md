@@ -108,12 +108,12 @@ Per-table execution state. Mostly mirrors Apply state, with per-table scheduler/
 `failed_retryable` exists at both task and apply levels, but each level answers a different question:
 
 - A **task** in `failed_retryable` means one table's work hit a retryable engine error. The task is not terminal because scheduler recovery may run that table work again.
-- An **apply** in `failed_retryable` means the whole apply is paused and waiting for scheduler recovery. The apply owns the retry attempt counter and retry budget.
+- An **apply** in `failed_retryable` means the whole apply is paused and waiting for scheduler recovery. Each operation owns its retry attempt counter and retry budget; the apply's attempt records the highest of any of its operations.
 - A **pending task** is unfinished work that is not currently running. It remains attached to the apply and is eligible to run the next time the apply is dispatched.
 
 The apply state rolls up from task state: any `failed_retryable` task makes the apply `failed_retryable` unless a permanent `failed` task is present. Atomic execution can also mark the apply `failed_retryable` while updating the affected tasks from the same retryable engine result.
 
-When the scheduler claims a retryable apply, it refreshes the apply heartbeat as a lease, increments the apply attempt, and re-dispatches the apply. That attempt count is the apply-level dispatch count for the whole retry cycle; it is not a per-task counter.
+When the scheduler claims a retryable operation, it refreshes the operation heartbeat as a lease, increments that operation's attempt, raises the apply's attempt to it if it is higher, and re-dispatches the operation once its backoff has passed. The attempt counts the operation's redispatches; it is not a per-task counter.
 
 The scheduler does not claim tasks directly. It claims the `failed_retryable` apply, reloads that apply's tasks, then prepares the retry by clearing only the tasks in `failed_retryable`. Those tasks move back to `pending`, their error message is cleared, and their task attempt count increments. Completed tasks are left alone because their table work already succeeded.
 

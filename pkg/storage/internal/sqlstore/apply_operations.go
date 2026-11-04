@@ -2025,7 +2025,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND (
 							(
 								a.state = ?
-								AND a.attempt < ?
+								-- The budget is the operation's own: a sibling
+								-- that spent its retries leaves this one's intact.
+								AND apply_operations.attempt < ?
 								AND a.updated_at >= %s
 								-- Names no column of a, but belongs to this arm
 								-- alone: the backoff spaces deliberate
@@ -2669,6 +2671,13 @@ func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID in
 // re-leases active rows without changing their state. Reports false when the
 // lease no longer matches, meaning another writer already rotated or cleared
 // it and the row has moved on.
+//
+// A failed_retryable row under a failed_retryable parent keeps its heartbeat
+// instead: the deliberate redispatch arm offers it again without reading its
+// staleness, and its updated_at is the failure time the redispatch backoff
+// counts from, so a backdate would skip the backoff for an operation whose
+// drive was handed back on shutdown. Under an active parent the row is crash
+// recovery's, which needs the stale heartbeat.
 func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
 	if !lease.Valid() {
 		return false, fmt.Errorf("release claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
@@ -2681,9 +2690,15 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE apply_operations
 		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
-		    updated_at = %s
+		    updated_at = CASE
+		        WHEN state = ? AND EXISTS (
+		            SELECT 1 FROM applies a
+		            WHERE a.id = apply_operations.apply_id AND a.state = ?
+		        ) THEN updated_at
+		        ELSE %s
+		    END
 		WHERE id = ? AND lease_token = ?
-	`, staleHeartbeat), lease.OperationID, lease.Token)
+	`, staleHeartbeat), state.ApplyOperation.FailedRetryable, state.Apply.FailedRetryable, lease.OperationID, lease.Token)
 	if err != nil {
 		return false, fmt.Errorf("release claim for apply_operation %d: %w", lease.OperationID, err)
 	}

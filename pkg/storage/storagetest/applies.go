@@ -1325,8 +1325,9 @@ func TestApplies(t *testing.T, h Harness) {
 	// A deployment-keyed generation declared two targets and only target-002
 	// attached before the data plane failed. The operator drives that lone row
 	// under its operation lease because the manifest still expects target-001,
-	// so the redispatch claim charges the parent's retry budget and moves the
-	// row to running, the same as when a sibling has attached.
+	// so the redispatch claim charges the operation's retry budget, raises the
+	// parent's attempt to it, and moves the row to running, the same as when a
+	// sibling has attached.
 	t.Run("FindNextApplyOperation_ManifestExpectedRedispatchMovesTheRowToRunning", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1345,7 +1346,7 @@ func TestApplies(t *testing.T, h Harness) {
 		parent, err := store.Applies().Get(ctx, rollout.ID)
 		require.NoError(t, err)
 		require.NotNil(t, parent)
-		assert.Equal(t, 1, parent.Attempt, "the redispatch consumes one unit of the parent retry budget")
+		assert.Equal(t, 1, parent.Attempt, "the redispatch raises the parent attempt to the operation's")
 
 		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 		require.NoError(t, err)

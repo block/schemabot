@@ -185,11 +185,13 @@ spending one per shard. The apply's attempt counter is the highest any of its
 operations has reached, and it is visible in the PR progress comment, so you
 can watch how much budget the worst-hit operation has burned.
 
-The first pickup after a failure is immediate. Each one after that waits
-twice as long as the one before, starting at 5 seconds and capped at 5 minutes,
-measured from when the operation failed. An outage of a few minutes therefore
-costs a handful of attempts instead of the whole budget, and the 10 attempts
-together span about 20 minutes.
+An operation's first pickup is immediate. Each one after that waits twice as
+long as the one before, starting at 5 seconds and capped at 5 minutes,
+measured from when the operation last failed. An outage of a few minutes
+therefore costs a handful of attempts instead of the whole budget, and the 10
+attempts together span about 20 minutes. The count is never reset: an
+operation that recovered at its third attempt and fails again hours later
+waits 20 seconds, and has seven attempts left.
 
 A pending `stop` or `cancel` does not wait out the backoff. The operation is
 picked up at once so the command takes effect, and that pickup spends an
@@ -212,10 +214,11 @@ attempt like any other.
 
 Two things end the loop:
 
-- **The budget runs out.** Ten consecutive recoveries of one operation that
-  each failed again, spread over about 20 minutes, is a strong signal the
-  problem is not transient — retrying an eleventh time would just burn
-  resources on the same wall.
+- **The budget runs out.** Ten recoveries of one operation that each failed
+  again is a strong signal the problem is not transient — retrying an
+  eleventh time would just burn resources on the same wall. A sibling that
+  spent its budget and then succeeded spends nothing for an operation that
+  has attempts left.
 - **The recovery window closes.** A `failed_retryable` apply that has been
   sitting for more than a day is no longer picked up automatically, even with
   budget to spare. This prevents a surprise: an old paused failure silently

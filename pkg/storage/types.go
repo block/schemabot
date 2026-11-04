@@ -1488,12 +1488,16 @@ type ApplyOperation struct {
 	// the operation is failed_retryable and so is its parent apply. It does not
 	// advance on a crash-recovery re-lease (a still-active parent with a stale
 	// heartbeat, or an in-flight drive whose driver died), so the
-	// count records only retries. It is the operation-local counterpart to
-	// applies.attempt: a sibling operation's retry advances the shared parent
-	// attempt but never this row's. It is a record for triage, not a dispatch
-	// generation: the operation-scoped idempotency key ignores it, so every
-	// dispatch of a deployment, retries included, carries the same key and
-	// lands on the deployment's one remote apply (OW-5).
+	// count records only retries. It is the operation's retry budget: a
+	// deliberate redispatch is admitted only while it is below
+	// MaxRecoveryAttempts, and it picks the redispatch backoff
+	// (RecoveryBackoff). It is never reset, so the budget counts every
+	// redispatch in the operation's life. applies.attempt records the highest
+	// of any of its operations; a sibling's retry raises that but never this
+	// row's. It is not a dispatch generation: the operation-scoped
+	// idempotency key ignores it, so every dispatch of a deployment, retries
+	// included, carries the same key and lands on the deployment's one remote
+	// apply (OW-5).
 	Attempt int
 
 	// AlreadyConverged is true for an operation recorded completed when its
