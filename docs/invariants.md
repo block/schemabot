@@ -503,6 +503,22 @@ locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `p
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
 in-flight storage convergence as the deliberate stop AV-13 permits.
 
+### AV-15: Applies that wait on a person never wait on each other
+
+An apply that keeps its drivers until an operator cuts it over is admitted only if SchemaBot's
+servers can hold all of it at once, and such applies take drivers in turn: none starts an operation
+while one ahead of it still has an operation waiting to start. The apply at the front therefore
+always gets every driver it needs and can be cut over, and the rest follow it. An apply's place is
+when it last started, so one that was stopped and started again goes behind every apply that started
+while it held no drivers.
+
+*Breaks if violated:* two applies each hold part of the drivers with the rest of their operations
+queued behind the other, neither can be cut over, and both wait until the waiting-for-cutover
+timeout fails them. *Enforced:* the width refusal at apply and at apply creation
+(`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
+(`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
+place recorded with a start request (`markResumed`, `pkg/storage/internal/sqlstore/control_requests.go`).
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR

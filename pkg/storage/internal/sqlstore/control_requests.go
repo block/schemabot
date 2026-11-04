@@ -174,6 +174,25 @@ func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *
 	return controlReq, alreadyPending, nil
 }
 
+// markResumed records when a start request resumes a stopped apply. A stopped
+// apply holds no driver, so a resumed one queues for drivers behind every
+// deferred apply that started while it was stopped (deferredCutoverQueueSQL).
+// A start against an apply that is not stopped resumes nothing and leaves its
+// place alone. The write keeps updated_at, the apply's heartbeat, as it was:
+// recording a request is not a driver touching the apply.
+func markResumed(ctx context.Context, tx *rebindTx, req *storage.ApplyControlRequest) error {
+	if req.Operation != storage.ControlOperationStart {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE applies SET resumed_at = NOW(), updated_at = updated_at
+		WHERE id = ? AND state = ?
+	`, req.ApplyID, state.Apply.Stopped); err != nil {
+		return fmt.Errorf("record resume of stopped apply %d: %w", req.ApplyID, err)
+	}
+	return nil
+}
+
 func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
 	metadata := nullJSON(req.Metadata)
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -215,6 +234,9 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 			return nil, false, fmt.Errorf("commit pending control request read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 		}
 		return existing, true, nil
+	}
+	if err := markResumed(ctx, tx, req); err != nil {
+		return nil, false, err
 	}
 	if existing != nil {
 		_, err := tx.ExecContext(ctx, `
