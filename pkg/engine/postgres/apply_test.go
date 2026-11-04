@@ -1054,6 +1054,13 @@ func TestAcceptedBlockingOutcomesCarryTheirOwnRemedies(t *testing.T) {
 	assert.Equal(t, "blocking-outcome-unknown", unknown.reason)
 	assert.Contains(t, unknown.cause, `whether the blocking statement for "users" committed is unknown`)
 	assert.Contains(t, unknown.remedy, "inspect the target catalog before re-running")
+
+	commit, known := refusalForOutcome(executor.CodeCommitOutcomeUnknown, "users")
+	require.True(t, known)
+	require.NotNil(t, commit, "an unknown commit outcome must not fall into the retryable tail")
+	assert.Equal(t, "commit-outcome-unknown", commit.reason)
+	assert.Contains(t, commit.cause, `whether the statement for "users" committed is unknown`)
+	assert.Equal(t, unknown.remedy, commit.remedy)
 }
 
 // The unverified cause carries only the table name, so like the collision
@@ -2458,6 +2465,9 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// DDL onto its own result, so the apply waits for an operator to
 		// read the catalog instead.
 		executor.CodeBlockingOutcomeUnknown: "a retry replays a statement that may have committed",
+		// The bounded attempt's COMMIT did not answer; the same retry hazard
+		// as the blocking case, so the apply waits for an operator.
+		executor.CodeCommitOutcomeUnknown: "a retry replays a statement that may have committed",
 		// Keep the outcome vocabulary total. pg-sprite requires catalog inspection
 		// before retrying an unknown commit outcome.
 		executor.CodeRowSecurityOutcomeUnknown: "inspect the catalog before deciding whether to retry",
