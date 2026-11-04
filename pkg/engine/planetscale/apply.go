@@ -942,11 +942,19 @@ func (e *Engine) saveResumeState(req *engine.ApplyRequest, rs *engine.ResumeStat
 // adopted in meta and saves it as the apply's resume state, reporting whether
 // the save landed. adopted is recorded with it, so a later drive that
 // recovers the deploy request knows it was not created by this engine and
-// reads back the settings it would otherwise rely on by construction.
-func (e *Engine) recordDeployRequestOnResume(req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, adopted bool) (bool, error) {
+// reads back the settings it would otherwise rely on by construction. The
+// record carries what the fresh drive's does: the plan's VSchema diffs, so
+// the apply renders its VSchema change from stored state, and
+// existingContexts, the baseline of Vitess contexts the deploy's own context
+// is discovered against. A deploy that may already have started is recorded
+// with a nil baseline, since one captured now would hold its own context and
+// hide it from the reattach's discovery, which then selects without one.
+func (e *Engine) recordDeployRequestOnResume(req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, adopted bool, existingContexts map[string]MigrationContextTimestamps) (bool, error) {
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
 	meta.DeployRequestAdopted = adopted
+	meta.VSchemaDiffs = vschemaDiffsFromChanges(req.Changes)
+	meta.ExistingMigrationCtxs = existingContexts
 	recordedMeta, err := encodePSMetadata(meta)
 	if err != nil {
 		return false, fmt.Errorf("encode metadata for deploy request #%d on resume: %w", dr.Number, err)
@@ -1314,7 +1322,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// deploy request it opens, and then reattached exactly as a recorded one
 	// is.
 	if adopted != nil && deployMayHaveStarted(adopted) {
-		saved, err := e.recordDeployRequestOnResume(req, meta, adopted, true)
+		saved, err := e.recordDeployRequestOnResume(req, meta, adopted, true, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1322,6 +1330,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			recordedDeployRequest = adopted.Number
 		}
 		reattachedDeployRequest = true
+		emitEvent(deployRequestAdoptedEvent(adopted, meta.BranchName, ""))
 		e.logger.Info("the adopted deploy request's deploy may already have started; reattaching to it instead of deploying it",
 			"organization", org,
 			"database", req.Database,
@@ -1389,6 +1398,11 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	deferDeploy := req.Options["defer_deploy"] == "true"
 	deferCutover := req.Options["defer_cutover"] == "true"
 
+	// The baseline of Vitess contexts is captured before the deploy is
+	// started, as the fresh path captures it before the deploy request exists,
+	// so the deploy's own context is never part of it.
+	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
+
 	// The branch has just been validated against the declared schema, so the
 	// deploy request adopted from it carries exactly what this resume would
 	// deploy. With none to adopt, the resume creates the deploy request the
@@ -1408,16 +1422,20 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			return nil, fmt.Errorf("create deploy request on resume: %w", err)
 		}
 		heldDeployRequest = dr.Number
+		emitEvent(deployRequestCreatedEvent(dr, meta.BranchName))
 	}
 	// Record the deploy request before waiting on it, as a fresh drive does,
 	// so a drive that ends during the wait leaves its successor resuming this
 	// deploy request rather than opening a second one on the same branch.
-	saved, err := e.recordDeployRequestOnResume(req, meta, dr, adoptedDeployRequest)
+	saved, err := e.recordDeployRequestOnResume(req, meta, dr, adoptedDeployRequest, existingContexts)
 	if err != nil {
 		return nil, err
 	}
 	if saved {
 		recordedDeployRequest = dr.Number
+	}
+	if adoptedDeployRequest {
+		emitEvent(deployRequestAdoptedEvent(dr, meta.BranchName, state.Apply.ValidatingDeployRequest))
 	}
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
@@ -1506,10 +1524,6 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}, "deploy request created on resume") {
 		recordedDeployRequest = dr.Number
 	}
-
-	// Capture the migration_context baseline before deploying so the new Vitess
-	// context can be identified once Vitess creates migrations for this deploy.
-	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
 	// Either save naming the deploy request lets recovery re-read it, so a
 	// deploy whose outcome is unknown pauses when the first save landed even
