@@ -505,11 +505,12 @@ in-flight storage convergence as the deliberate stop AV-13 permits.
 
 ### AV-15: A pull request's GitHub cost grows with its schema inputs, not with the rest of the PR
 
-The GitHub requests SchemaBot makes to handle a pull request grow with the files it changes that
-could be schema inputs, meaning schema files and configs, and never with the other files it
-changes or the size of the repository. Listing the changed files is the one cost that grows with
-the whole PR, and it is a paged list, not a read per file. A question about every changed file is
-answered from that list, or from one request that covers them all, never by a lookup per file.
+The GitHub requests SchemaBot makes to handle a pull request grow with schema inputs: the schema
+files and configs the PR changes, and the schema inputs of each database those changes reach,
+changed or not. They never grow with the other files the PR changes or with the rest of the
+repository. Listing the changed files is the one cost that grows with the whole PR, and it is a
+paged list, not a read per file. A question about every changed file is answered from that list,
+or from one request that covers them all, never by a lookup per file.
 
 *Breaks if violated:* an App installation's rate limit is shared by every pull request in every
 repository it serves, so routine edits in one large repository use it up and required checks stop
