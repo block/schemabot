@@ -292,10 +292,32 @@ func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*te
 	}
 	resp, err := s.client.Progress(ctx, req)
 	if err != nil {
-		if errors.Is(err, storage.ErrApplyNotFound) || errors.Is(err, storage.ErrTaskNotFound) {
-			return nil, status.Error(codes.NotFound, err.Error())
+		return nil, status.Error(progressErrorCode(err), err.Error())
+	}
+	return resp, nil
+}
+
+// BatchProgress answers Progress for several operations of one apply. A
+// client that cannot batch is reported Unimplemented, which tells the caller
+// to ask Progress once per operation.
+func (s *Server) BatchProgress(ctx context.Context, req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+	if err := requireApplyID(req.GetApplyId()); err != nil {
+		return nil, err
+	}
+	batcher, ok := s.client.(BatchProgressClient)
+	if !ok {
+		s.logger.DebugContext(ctx, "batch progress requested from an endpoint whose client does not batch; the caller will ask once per operation",
+			"apply_id", req.GetApplyId())
+		return nil, status.Error(codes.Unimplemented, "this endpoint does not answer batch progress")
+	}
+	resp, err := batcher.BatchProgress(ctx, req)
+	if err != nil {
+		if errors.Is(err, ErrBatchProgressUnsupported) {
+			s.logger.DebugContext(ctx, "batch progress requested for an apply whose client does not batch; the caller will ask once per operation",
+				"apply_id", req.GetApplyId())
+			return nil, status.Error(codes.Unimplemented, err.Error())
 		}
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(progressErrorCode(err), err.Error())
 	}
 	return resp, nil
 }

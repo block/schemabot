@@ -188,6 +188,13 @@ func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
 			},
 		},
 		{
+			name: "batch progress",
+			call: func(ctx context.Context) error {
+				_, err := server.BatchProgress(ctx, &ternv1.BatchProgressRequest{})
+				return err
+			},
+		},
+		{
 			name: "cutover",
 			call: func(ctx context.Context) error {
 				_, err := server.Cutover(ctx, &ternv1.CutoverRequest{})

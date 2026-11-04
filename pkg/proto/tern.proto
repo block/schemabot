@@ -132,6 +132,25 @@ service Tern {
     };
   }
 
+  // BatchProgress answers Progress for several operations of one apply in a
+  // single call. The rollout members of one deployment share its apply, each
+  // with its own operation, so a caller driving many of them asks once per
+  // poll instead of once per member, and the apply, its tasks, and its
+  // operations are read once for all of them.
+  //
+  // Each entry of the answer is what Progress scoped to that operation would
+  // return, or the error it would fail with. An error that concerns the whole
+  // apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+  //
+  // A deployment that answers Unimplemented predates the RPC, and the caller
+  // asks Progress once per operation.
+  rpc BatchProgress(BatchProgressRequest) returns (BatchProgressResponse) {
+    option (google.api.http) = {
+      post: "/v1/batch-progress"
+      body: "*"
+    };
+  }
+
   // Logs returns a bounded recent window of durable apply logs. It is read-only.
   rpc Logs(LogsRequest) returns (LogsResponse) {
     option (google.api.http) = {
@@ -917,6 +936,36 @@ message ProgressRequest {
   // so a member's progress is its operation's state and tables rather than
   // the whole apply's. Empty asks about the whole apply.
   string apply_operation_id = 3;
+}
+
+message BatchProgressRequest {
+  // Apply ID for the schema change to inspect.
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
+  // The operations to answer for: apply_operation_id values a dispatch
+  // returned in ApplyResponse. Each is answered as a ProgressRequest scoped
+  // to it would be.
+  repeated string apply_operation_ids = 3;
+}
+
+message BatchProgressResponse {
+  string apply_id = 1;
+  // One entry per requested operation, in request order.
+  repeated OperationProgress operations = 2;
+}
+
+// OperationProgress is the answer for one operation of a BatchProgress call.
+message OperationProgress {
+  // The apply_operation_id this entry answers for, echoed from the request.
+  string apply_operation_id = 1;
+  // What Progress scoped to this operation returns. Unset when error_code is.
+  ProgressResponse progress = 2;
+  // The gRPC status code Progress scoped to this operation fails with, or 0
+  // (OK) when progress is set.
+  int32 error_code = 3;
+  // The message of that failure.
+  string error_message = 4;
 }
 
 message LogsRequest {
