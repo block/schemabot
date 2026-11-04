@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -150,10 +151,23 @@ func TestGRPCClient_LostDispatchReplayWithoutAVerdictLeavesTheWorkUntouched(t *t
 	testCases := []struct {
 		name          string
 		applyErr      error
+		applyResponse *ternv1.ApplyResponse
 		failPlanReads bool
 		wantSent      bool
 		wantError     string
 	}{
+		{
+			name:          "rejection without a named conflict",
+			applyResponse: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "read active tasks: storage unavailable"},
+			wantSent:      true,
+			wantError:     "read active tasks: storage unavailable",
+		},
+		{
+			name:          "accepted without a remote apply id",
+			applyResponse: &ternv1.ApplyResponse{Accepted: true},
+			wantSent:      true,
+			wantError:     "remote apply accepted without apply_id",
+		},
 		{
 			name:      "retryable rejection",
 			applyErr:  status.Error(codes.Unavailable, "data plane restarting"),
@@ -174,7 +188,7 @@ func TestGRPCClient_LostDispatchReplayWithoutAVerdictLeavesTheWorkUntouched(t *t
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server := &capturingTernServer{applyErr: tc.applyErr}
+			server := &capturingTernServer{applyErr: tc.applyErr, applyResponse: tc.applyResponse}
 			client, cleanup := testCapturingGRPCClient(t, server)
 			defer cleanup()
 			fixture := newLostDispatchFixture(state.Apply.Running, storage.ControlOperationCancel)
@@ -186,6 +200,7 @@ func TestGRPCClient_LostDispatchReplayWithoutAVerdictLeavesTheWorkUntouched(t *t
 			err := resumeLostDispatch(t, client, fixture.apply)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.wantError)
+			assert.ErrorIs(t, err, ErrRemoteDispatchUnresolved, "the drive loop counts a replay without a verdict by this error")
 
 			if tc.wantSent {
 				assert.NotNil(t, server.getApplyRequest(), "the dispatch must have been re-sent")
@@ -210,26 +225,117 @@ func TestGRPCClient_LostDispatchReplayRefusedFailsClosedWithPendingControlReques
 	// A re-sent dispatch the data plane refuses outright can never succeed as
 	// sent, so the apply fails closed. A failed apply is never claimed again, so
 	// the operator's pending stop and cancel fail with it rather than waiting
-	// forever on a drive that will not come.
-	server := &capturingTernServer{applyErr: status.Error(codes.InvalidArgument, "plan no longer matches the target")}
+	// forever on a drive that will not come. A named conflict is such a
+	// refusal: the data plane resolves the idempotency key before it checks
+	// for conflicts, so the conflict proves no remote apply carries the key.
+	testCases := []struct {
+		name          string
+		applyErr      error
+		applyResponse *ternv1.ApplyResponse
+		wantError     string
+	}{
+		{
+			name:      "permanent rejection",
+			applyErr:  status.Error(codes.InvalidArgument, "plan no longer matches the target"),
+			wantError: "plan no longer matches the target",
+		},
+		{
+			name: "named conflict",
+			applyResponse: &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: "another schema change is running on users",
+				Conflict:     &ternv1.ApplyConflict{Table: "users", BlockingState: "running"},
+			},
+			wantError: "Table users is held by a schema change",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &capturingTernServer{applyErr: tc.applyErr, applyResponse: tc.applyResponse}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+			fixture := newLostDispatchFixture(state.Apply.Running, storage.ControlOperationCancel, storage.ControlOperationStop)
+			client.storage = fixture.storage
+
+			err := resumeLostDispatch(t, client, fixture.apply)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantError)
+			assert.NotErrorIs(t, err, ErrRemoteDispatchUnresolved, "a refusal is a verdict")
+
+			assert.Equal(t, state.Apply.Failed, fixture.apply.State)
+			assert.Contains(t, fixture.apply.ErrorMessage, tc.wantError)
+			assert.Empty(t, fixture.apply.ExternalID)
+			assert.Equal(t, state.Task.Failed, fixture.task.State)
+			for _, op := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+				req, err := fixture.controlRequests.GetByOperation(t.Context(), fixture.apply.ID, op)
+				require.NoError(t, err)
+				require.NotNilf(t, req, "the %s request must exist", op)
+				assert.Equalf(t, storage.ControlRequestFailed, req.Status, "the refused replay must fail the pending %s", op)
+				assert.Contains(t, req.ErrorMessage, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestGRPCClient_LostDispatchReplayDeliversAPendingStopBeforePolling(t *testing.T) {
+	// The operator stopped an apply whose remote apply id never reached
+	// storage. The replay recovers the id of the remote apply that is still
+	// copying, and the drive hands it the stop at once rather than waiting for
+	// the first progress poll, so the change halts as soon as the drive can
+	// address it.
+	// The remote apply reports running until the stop lands, then stopped.
+	server := &capturingTernServer{
+		remoteApplyID:    "remote-still-copying",
+		progressStates:   []ternv1.State{ternv1.State_STATE_RUNNING},
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+	}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
-	fixture := newLostDispatchFixture(state.Apply.Running, storage.ControlOperationCancel, storage.ControlOperationStop)
+	fixture := newLostDispatchFixture(state.Apply.Running, storage.ControlOperationStop)
 	client.storage = fixture.storage
 
-	err := resumeLostDispatch(t, client, fixture.apply)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "plan no longer matches the target")
+	require.NoError(t, resumeLostDispatch(t, client, fixture.apply))
 
-	assert.Equal(t, state.Apply.Failed, fixture.apply.State)
-	assert.Contains(t, fixture.apply.ErrorMessage, "plan no longer matches the target")
-	assert.Empty(t, fixture.apply.ExternalID)
-	assert.Equal(t, state.Task.Failed, fixture.task.State)
-	for _, op := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
-		req, err := fixture.controlRequests.GetByOperation(t.Context(), fixture.apply.ID, op)
-		require.NoError(t, err)
-		require.NotNilf(t, req, "the %s request must exist", op)
-		assert.Equalf(t, storage.ControlRequestFailed, req.Status, "the refused replay must fail the pending %s", op)
-		assert.Contains(t, req.ErrorMessage, "plan no longer matches the target")
+	assert.Equal(t, "remote-still-copying", fixture.apply.ExternalID)
+	assert.Equal(t, "remote-still-copying", server.getStopApplyID(), "the stop must reach the recovered remote apply")
+	assert.Zero(t, server.getProgressCallsAtFirstStop(), "the stop must be delivered before any progress poll")
+	assert.Equal(t, state.Apply.Stopped, fixture.apply.State)
+	stopReq, err := fixture.controlRequests.GetByOperation(t.Context(), fixture.apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+}
+
+func TestGRPCClient_LostDispatchReplayCompletesAPendingStart(t *testing.T) {
+	// A stop caught a whole apply before its first dispatch, and a start then
+	// claimed it into resuming with its tasks still stopped. The replay
+	// dispatches the work, and the drive then reconciles the start the way it
+	// does for any resumed apply: the data plane already reports the work
+	// running, so no remote start is sent, the stopped tasks are requeued, and
+	// the start request completes before the drive settles into polling.
+	server := &capturingTernServer{
+		remoteApplyID:    "remote-after-start",
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
 	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fixture := newLostDispatchFixture(state.Apply.Resuming, storage.ControlOperationStart)
+	fixture.task.State = state.Task.Stopped
+	client.storage = fixture.storage
+
+	// The remote apply keeps running, so the drive polls until the deadline.
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	require.Error(t, client.ResumeApply(ctx, fixture.apply))
+
+	assert.Equal(t, "remote-after-start", fixture.apply.ExternalID)
+	assert.False(t, server.startWasCalled(), "the data plane already runs the work, so no remote start is sent")
+	assert.Equal(t, state.Apply.Running, fixture.apply.State)
+	assert.NotEqual(t, state.Task.Stopped, fixture.task.State, "the stopped task must be requeued for the start")
+	startReq, err := fixture.controlRequests.GetByOperation(t.Context(), fixture.apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, storage.ControlRequestCompleted, startReq.Status)
 }

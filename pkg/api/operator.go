@@ -3205,6 +3205,22 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			}
 			return false, err
 		}
+		if errors.Is(err, tern.ErrRemoteDispatchUnresolved) && ctx.Err() == nil {
+			// The drive re-sent a dispatch whose remote apply id never reached
+			// storage and got no verdict. It wrote nothing, so the apply stays
+			// active with its attempt unchanged, and the next claim re-sends the
+			// same idempotency key; repeats can never create a second remote
+			// apply. This reason makes a data plane that keeps giving no answer
+			// visible as a rate. Until it answers, the apply holds its database
+			// and a pending stop or cancel waits for the remote apply id it needs.
+			logger.Error("operator: re-sent gRPC dispatch got no verdict; the apply stays active and the next claim re-sends the same idempotency key",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "remote_dispatch_unresolved")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
 		if errors.Is(err, tern.ErrPostTerminalReconcile) {
 			// The drive stored the apply's terminal outcome; only an answer owed
 			// after it did not land. The stored outcome stands, and the request

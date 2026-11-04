@@ -516,9 +516,12 @@ func TestGRPCClient_Close(t *testing.T) {
 // server defaults to STATE_COMPLETED.
 type capturingTernServer struct {
 	ternv1.UnimplementedTernServer
-	mu                sync.Mutex
-	applyReq          *ternv1.ApplyRequest
-	applyErr          error
+	mu       sync.Mutex
+	applyReq *ternv1.ApplyRequest
+	applyErr error
+	// applyResponse, when set, is the answer to every Apply in place of an
+	// accepted dispatch.
+	applyResponse     *ternv1.ApplyResponse
 	remoteApplyID     string
 	remoteOperationID string
 	cancelApplyID     string
@@ -555,13 +558,16 @@ type capturingTernServer struct {
 	startCaller            string
 	// startHook, when set, runs on every Start with the call's 1-based number
 	// and returns that call's error in place of startErr.
-	startHook        func(call int) error
-	stopCalls        int
-	cancelCalls      int
-	stopRefusal      string // when set, Stop answers Accepted=false with this reason
-	cancelRefusal    string // when set, Cancel answers Accepted=false with this reason
-	omitOperationKey bool   // emulate a data plane that does not echo the operation key
-	echoOperationKey string // when set, echoed in place of the derived key, emulating a response for another operation
+	startHook func(call int) error
+	stopCalls int
+	// progressCallsAtFirstStop is how many Progress calls came before the
+	// first Stop, so a test can tell when a drive delivered its stop.
+	progressCallsAtFirstStop int
+	cancelCalls              int
+	stopRefusal              string // when set, Stop answers Accepted=false with this reason
+	cancelRefusal            string // when set, Cancel answers Accepted=false with this reason
+	omitOperationKey         bool   // emulate a data plane that does not echo the operation key
+	echoOperationKey         string // when set, echoed in place of the derived key, emulating a response for another operation
 	// omitProgressScope emulates a data plane that ignores a progress
 	// request's apply_operation_id and answers for the whole apply.
 	omitProgressScope bool
@@ -629,9 +635,13 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 	omitOperationKey := s.omitOperationKey
 	echoOperationKey := s.echoOperationKey
 	err := s.applyErr
+	applyResponse := s.applyResponse
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if applyResponse != nil {
+		return applyResponse, nil
 	}
 	operationKey := ""
 	switch {
@@ -668,6 +678,9 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 	s.stopApplyID = req.ApplyId
 	s.stopCaller = req.Caller
 	s.stopCalls++
+	if s.stopCalls == 1 {
+		s.progressCallsAtFirstStop = s.progressCalls
+	}
 	err := s.stopErr
 	refusal := s.stopRefusal
 	s.mu.Unlock()
@@ -796,6 +809,12 @@ func (s *capturingTernServer) startWasCalled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.startCalled
+}
+
+func (s *capturingTernServer) getProgressCallsAtFirstStop() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.progressCallsAtFirstStop
 }
 
 func (s *capturingTernServer) getStopApplyID() string {
