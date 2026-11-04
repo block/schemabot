@@ -254,6 +254,11 @@ var (
 		subject:       "expired retryable applies",
 		failureReason: "expire_retryable_error",
 	}
+	degradedRetryExpirySweep = reapSweep{
+		busy:          storage.ErrRetryableExpiryBusy,
+		subject:       "expired retryable operations under degraded rollouts",
+		failureReason: "expire_degraded_retry_error",
+	}
 )
 
 // recordSweepOutcome handles how a sweep ended, after its settlements have
@@ -311,6 +316,51 @@ func (s *Service) runRetryableExpiryPass(ctx context.Context) {
 	}
 
 	s.recordSweepOutcome(ctx, retryableExpirySweep, len(expired), err)
+
+	s.expireDegradedRetries(ctx)
+}
+
+// expireDegradedRetries settles the paused retry under a running_degraded
+// rollout once the rollout's retry budget or freshness window is spent. The
+// rollout itself stays as it is: it is a parent whose other deployments may
+// still be working, and the rollout projection derives its verdict and
+// publishes the terminal summary once its last row settles, as it would had a
+// drive settled that row. So unlike an expired apply, an expired operation
+// gets its log line, its metric, and its durable apply log entry here, and
+// nothing else.
+func (s *Service) expireDegradedRetries(ctx context.Context) {
+	expired, err := s.storage.Applies().ExpireRetryableOperations(ctx, retryableExpiryBatch)
+
+	for _, expiration := range expired {
+		apply, op := expiration.Apply, expiration.Operation
+		s.logger.Error("operator: retryable operation expired under degraded rollout",
+			append(apply.LogAttrs(),
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"attempt", apply.Attempt,
+				"reason", expiration.Reason)...)
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, op.Deployment, apply.Environment, string(expiration.Reason))
+		s.logOperationExpiration(ctx, apply, op, expiration.Reason)
+	}
+
+	s.recordSweepOutcome(ctx, degradedRetryExpirySweep, len(expired), err)
+}
+
+// logOperationExpiration appends a durable apply log entry recording that
+// operator recovery gave up on one deployment of a rollout. The entry carries
+// no state transition because the apply does not transition here; the rollout
+// settles once its remaining deployments do. Best-effort on the same terms as
+// logApplyExpiration.
+func (s *Service) logOperationExpiration(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, reason storage.RetryableExpirationReason) {
+	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelError,
+		EventType: storage.LogEventError,
+		Source:    storage.LogSourceSchemaBot,
+		Message: fmt.Sprintf("Operator recovery gave up on deployment %s after %d of %d attempts (%s); it will not be retried automatically, and the rollout settles once its remaining deployments do",
+			op.Deployment, apply.Attempt, storage.MaxRecoveryAttempts, reason),
+		CreatedAt: s.clock.Now(),
+	}, "why recovery stopped", append(apply.LogAttrs(), "operation_deployment", op.Deployment)...)
 }
 
 // logApplyExpiration appends a durable apply log entry recording that operator

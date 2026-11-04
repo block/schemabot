@@ -704,6 +704,10 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context, int) ([]*storage.
 	return nil, nil
 }
 
+func (s *capturingApplyStore) ExpireRetryableOperations(context.Context, int) ([]*storage.RetryableOperationExpiration, error) {
+	return nil, nil
+}
+
 // queuedOperationLeaseToken is the token this double rotates onto the operation
 // row it leases out, standing in for the real store's generated token.
 const queuedOperationLeaseToken = "op-lease-token"

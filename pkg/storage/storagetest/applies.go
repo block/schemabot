@@ -1871,6 +1871,10 @@ func TestApplies(t *testing.T, h Harness) {
 			_, err := store.ExpireRetryable(t.Context(), 10)
 			return err
 		},
+		"ExpireRetryableOperations_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ExpireRetryableOperations(t.Context(), 10)
+			return err
+		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.FindMissingSummaryComment(t.Context(), 0, 10)
 			return err

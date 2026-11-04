@@ -3565,6 +3565,250 @@ func TestApplyStore_ExpireRetryable_DefersUntilARetryableOperationsLeaseIsStale(
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Cancelled)
 }
 
+// degradedRollout is the fixture every ExpireRetryableOperations test starts
+// from: a rollout held at running_degraded because one deployment halt-failed
+// for good while another paused failed_retryable, with a third deployment
+// still queued behind it. Every lease on it has gone stale, so no driver holds
+// any of its rows.
+type degradedRollout struct {
+	apply      *storage.Apply
+	halted     int64
+	paused     int64
+	queued     int64
+	pausedTask *storage.Task
+	queuedTask *storage.Task
+}
+
+func stageDegradedRollout(t *testing.T, store *Storage, applyID string, planID int64) degradedRollout {
+	t.Helper()
+	ctx := t.Context()
+
+	lock := createTestLock(t, store, "degraded_"+applyID, storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.RunningDegraded, "staging")
+
+	halted := leasedOperationFor(t, store, apply, "region-a")
+	_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ?, completed_at = NOW() WHERE id = ?`,
+		state.ApplyOperation.Failed, halted)
+	require.NoError(t, err)
+	backdateOperationHeartbeat(t, halted, storage.ApplyLeaseStaleAfter+time.Minute)
+	haltedTask := createRetryableReapTask(t, store, apply, applyID+"_halted", "users", state.Task.Failed, "halt failed")
+	attachTaskToOperation(t, haltedTask.TaskIdentifier, halted)
+
+	paused := leasedOperationFor(t, store, apply, "region-b")
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ? WHERE id = ?`,
+		state.ApplyOperation.FailedRetryable, paused)
+	require.NoError(t, err)
+	backdateOperationHeartbeat(t, paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	pausedTask := createRetryableReapTask(t, store, apply, applyID+"_paused", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, pausedTask.TaskIdentifier, paused)
+	pausedQueuedTask := createRetryableReapTask(t, store, apply, applyID+"_paused_queued", "orders", state.Task.Pending, "")
+	attachTaskToOperation(t, pausedQueuedTask.TaskIdentifier, paused)
+
+	queued, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-c", Target: apply.Database, State: state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+	queuedTask := createRetryableReapTask(t, store, apply, applyID+"_queued", "users", state.Task.Pending, "")
+	attachTaskToOperation(t, queuedTask.TaskIdentifier, queued)
+
+	return degradedRollout{
+		apply:      apply,
+		halted:     halted,
+		paused:     paused,
+		queued:     queued,
+		pausedTask: pausedTask,
+		queuedTask: pausedQueuedTask,
+	}
+}
+
+func assertOperationState(t *testing.T, store *Storage, id int64, want string, msgAndArgs ...any) {
+	t.Helper()
+	op, err := store.ApplyOperations().Get(t.Context(), id)
+	require.NoError(t, err)
+	require.NotNil(t, op, "apply_operation %d", id)
+	assert.Equal(t, want, op.State, msgAndArgs...)
+}
+
+// A rollout whose retry budget is spent keeps its paused deployment parked for
+// good: the paused row and the tasks under it settle, while the parent, the
+// deployment that already halt-failed, and the deployment queued behind the
+// pause are left as they were. The parent is not transitioned here, so the
+// rollout settles through its own projection once every deployment has.
+func TestApplyStore_ExpireRetryableOperations_SettlesOnlyThePausedDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_budget", 530)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, rollout.apply.ID)
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "one paused deployment under the rollout")
+	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+	assert.Equal(t, rollout.apply.ApplyIdentifier, expired[0].Apply.ApplyIdentifier)
+	assert.Equal(t, state.Apply.RunningDegraded, expired[0].Apply.State, "the parent handed back is the parent as it stands")
+	assert.Equal(t, rollout.paused, expired[0].Operation.ID)
+	assert.Equal(t, "region-b", expired[0].Operation.Deployment)
+	assert.Equal(t, state.ApplyOperation.Failed, expired[0].Operation.State)
+	assert.NotNil(t, expired[0].Operation.CompletedAt)
+
+	persisted, err := store.Applies().Get(ctx, rollout.apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.RunningDegraded, persisted.State, "the rollout is left to settle through its projection")
+	assert.Nil(t, persisted.CompletedAt)
+
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.Failed)
+	assertOperationState(t, store, rollout.halted, state.ApplyOperation.Failed)
+	assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending)
+	assertTaskState(t, store, rollout.pausedTask.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, rollout.queuedTask.TaskIdentifier, state.Task.Cancelled)
+	assertTaskState(t, store, "apply_degraded_budget_queued", state.Task.Pending)
+
+	again, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, again, "nothing retryable is left under the rollout")
+}
+
+// The freshness window is the other way a rollout's recovery ends: a parent
+// nobody has written to for longer than the window is expired on that alone,
+// however many attempts remain.
+func TestApplyStore_ExpireRetryableOperations_ExpiresAStaleRolloutUnderBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_window", 531)
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = 1, updated_at = NOW() - INTERVAL 2 DAY WHERE id = ?
+	`, rollout.apply.ID)
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, storage.RetryableExpirationRecoveryWindow, expired[0].Reason)
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.Failed)
+	assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending)
+}
+
+// A rollout with attempts left and a recent write is one the operation claim
+// may still redispatch, so expiry leaves it alone. The predicates are each
+// other's complement: a paused row is either still the claim's to retry or
+// expiry's to retire, never both and never neither.
+func TestApplyStore_ExpireRetryableOperations_LeavesARolloutStillWithinBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_fresh", 532)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?`,
+		maxRecoveryAttempts-1, rollout.apply.ID)
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired, "a rollout with attempts left and a live window is still recoverable")
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.FailedRetryable)
+	assertTaskState(t, store, rollout.pausedTask.TaskIdentifier, state.Task.FailedRetryable)
+	assertTaskState(t, store, rollout.queuedTask.TaskIdentifier, state.Task.Pending)
+}
+
+// A driver holding any deployment under the rollout holds the whole rollout:
+// the paused row is not written while a sibling's lease is fresh, and is
+// offered again once that lease has gone stale.
+func TestApplyStore_ExpireRetryableOperations_DefersWhileASiblingIsDriven(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_driven", 533)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, rollout.apply.ID)
+	require.NoError(t, err)
+	// The queued deployment is picked up and driven while the pause ages out.
+	held := leasedOperationFor(t, store, rollout.apply, "region-d")
+	liveTask := createRetryableReapTask(t, store, rollout.apply, "apply_degraded_driven_live", "users", state.Task.Running, "")
+	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired, "a live sibling lease defers the whole rollout")
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.FailedRetryable)
+	assertTaskState(t, store, rollout.pausedTask.TaskIdentifier, state.Task.FailedRetryable)
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
+
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	expired, err = store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "a deferred rollout is offered again on the next pass")
+	assert.Equal(t, rollout.paused, expired[0].Operation.ID)
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.Failed)
+	assertOperationState(t, store, held, state.ApplyOperation.Running, "the sibling's row is the operation claim's to recover, not expiry's")
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
+}
+
+// Once expiry has settled the last unsettled deployment, the rollout is a parent
+// behind its children and the operation projection claims it to record the
+// verdict. The paused deployment is the only one that was unsettled here, so
+// expiring it is what makes the rollout claimable.
+func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjection(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_project", 534)
+	_, err := testDB.ExecContext(ctx, `DELETE FROM apply_operations WHERE id = ?`, rollout.queued)
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?
+	`, maxRecoveryAttempts, int64((2 * storage.ApplyLeaseStaleAfter).Seconds()), rollout.apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.Nil(t, claimed, "a paused deployment is unsettled work, so the rollout is not yet the projection's")
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+
+	claimed, err = store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "with every deployment settled the rollout is the projection's to record")
+	assert.Equal(t, rollout.apply.ID, claimed.ID)
+	assert.Equal(t, state.Apply.RunningDegraded, claimed.State, "the projection, not expiry, writes the verdict")
+}
+
+// Oldest rollout first, and no more than limit of them per pass, so a backlog
+// drains in order rather than leaving the same tail unexpired every time.
+func TestApplyStore_ExpireRetryableOperations_TakesTheOldestUpToTheLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	newest := stageDegradedRollout(t, store, "apply_degraded_newest", 535)
+	oldest := stageDegradedRollout(t, store, "apply_degraded_oldest", 536)
+	for _, rollout := range []degradedRollout{newest, oldest} {
+		_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, rollout.apply.ID)
+		require.NoError(t, err)
+	}
+	backdateApplyUpdatedAt(t, oldest.apply.ID, time.Hour)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, oldest.apply.ID, expired[0].Apply.ID)
+	assertOperationState(t, store, newest.paused, state.ApplyOperation.FailedRetryable)
+
+	expired, err = store.Applies().ExpireRetryableOperations(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, newest.apply.ID, expired[0].Apply.ID)
+}
+
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
