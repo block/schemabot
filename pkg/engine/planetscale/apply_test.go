@@ -1997,14 +1997,24 @@ func declineEventMessages(events []engine.ApplyEvent) []string {
 // live PlanetScale API. The branch is ready, its schema already matches the
 // desired files (no remaining DDL to run), and the deploy request this resume
 // creates is instant-DDL eligible so the instant decision is actually reached.
-// Listing deploy requests returns listed and records the request.
+// Listing deploy requests returns listed and records the request. Reading a
+// deploy request's auto-cutover setting answers autoCutover, or fails with
+// autoCutoverErr, and is counted.
 type branchResumeClient struct {
 	psclient.PSClient
-	deployCalls int
-	lastDeploy  *ps.PerformDeployRequest
-	lastCreate  *ps.CreateDeployRequestRequest
-	listed      []*ps.DeployRequest
-	lastList    *ps.ListDeployRequestsRequest
+	deployCalls      int
+	lastDeploy       *ps.PerformDeployRequest
+	lastCreate       *ps.CreateDeployRequestRequest
+	listed           []*ps.DeployRequest
+	lastList         *ps.ListDeployRequestsRequest
+	autoCutover      bool
+	autoCutoverErr   error
+	autoCutoverReads int
+}
+
+func (c *branchResumeClient) DeployRequestAutoCutover(context.Context, string, string, uint64) (bool, error) {
+	c.autoCutoverReads++
+	return c.autoCutover, c.autoCutoverErr
 }
 
 func (c *branchResumeClient) GetBranch(_ context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
@@ -2230,9 +2240,159 @@ func TestResumeApply_AdoptsTheOpenDeployRequestOnItsBranch(t *testing.T) {
 			assert.Equal(t, tt.wantNumber, saved[0].DeployRequestID, "the deploy request is recorded before the resume waits on it")
 			assert.Equal(t, tt.wantURL, saved[0].DeployRequestURL)
 			assert.Equal(t, branch, saved[0].BranchName)
+			assert.Equal(t, !tt.wantCreate, saved[0].DeployRequestAdopted, "the record says whether the deploy request was adopted rather than created")
 			stored, err := decodePSMetadata(result.ResumeState.Metadata)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantNumber, stored.DeployRequestID)
+			assert.Equal(t, !tt.wantCreate, stored.DeployRequestAdopted)
+			if tt.wantCreate {
+				assert.Zero(t, client.autoCutoverReads, "a deploy request this engine created holds auto-cutover off by construction")
+			} else if !tt.wantReattach {
+				assert.Equal(t, 1, client.autoCutoverReads, "an adopted deploy request's auto-cutover setting is read back before it is deployed")
+			}
+		})
+	}
+}
+
+// An open deploy request found on the branch was not created by this engine, so
+// the resume does not know it was created with auto-cutover off. It deploys
+// only after reading that setting back, and refuses one that holds auto-cutover
+// on, since PlanetScale would then swap the schema without SchemaBot's cutover
+// (CO-4). A setting that cannot be read is refused the same way. The refusal
+// is permanent, since the setting cannot change, and leaves the deploy request
+// open with its branch, on an operator-supplied branch and a generated one
+// alike: whoever opened it chose that setting.
+func TestResumeApply_RefusesToDeployAnAdoptedDeployRequestHoldingAutoCutover(t *testing.T) {
+	shortenEngineWaits(t)
+	tests := []struct {
+		name           string
+		branch         string
+		options        map[string]string
+		autoCutover    bool
+		autoCutoverErr error
+		wantErr        string
+	}{
+		{name: "auto-cutover on, on an operator-supplied branch",
+			branch: "feature-add-phone", options: map[string]string{"branch": "feature-add-phone"}, autoCutover: true,
+			wantErr: "adopted deploy request #58 was not deployed: SchemaBot did not create it, and it holds auto-cutover on"},
+		{name: "auto-cutover on, on a branch SchemaBot generated",
+			branch: "schemabot-testdb-crash", autoCutover: true,
+			wantErr: "adopted deploy request #58 was not deployed: SchemaBot did not create it, and it holds auto-cutover on"},
+		{name: "the auto-cutover setting cannot be read",
+			branch: "schemabot-testdb-crash", autoCutoverErr: errors.New("planetscale unavailable"),
+			wantErr: "adopted deploy request #58 was not deployed because SchemaBot did not create it and could not confirm it holds auto-cutover off"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adopted := &ps.DeployRequest{Number: 58, Branch: tt.branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.Ready}
+			client := &branchResumeClient{listed: []*ps.DeployRequest{adopted}, autoCutover: tt.autoCutover, autoCutoverErr: tt.autoCutoverErr}
+			req := resumeRequest(t, &psMetadata{BranchName: tt.branch}, "apply-1a2b3c4d5e6f7890")
+			req.Options = tt.options
+			logRecord := captureApplyLogs(t, req)
+
+			_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+			require.ErrorContains(t, err, tt.wantErr)
+			assert.Contains(t, err.Error(), "auto-cutover")
+			assert.False(t, engine.IsRetryable(err), "the setting cannot change after creation, so no later drive would find it different")
+			assert.Zero(t, client.deployCalls, "a deploy request that would cut over on its own is never deployed")
+			assert.Nil(t, client.lastCreate, "no deploy request is created beside the adopted one")
+			record := logRecord("resumed apply refused to deploy the open deploy request it adopted because it holds auto-cutover; leaving it open with its branch, since whoever opened it chose that setting; close it in PlanetScale if it should not deploy")
+			require.NotNil(t, record, "the refusal is logged on the apply's logger")
+			assert.Equal(t, "WARN", record["level"])
+			assert.Equal(t, float64(58), record["deploy_request"])
+			assert.Equal(t, tt.branch, record["branch"])
+		})
+	}
+}
+
+// A drive that adopted a deploy request, recorded it, and ended before
+// deploying it leaves stored state naming the deploy request as adopted. The
+// drive that recovers it reads its auto-cutover setting back before deploying,
+// as the adopting drive would have, and refuses one that holds auto-cutover
+// on. A recorded deploy request this engine created is deployed without the
+// read: it holds auto-cutover off by construction.
+func TestResumeExistingDeployRequest_RefusesToDeployAnAdoptedDeployRequestHoldingAutoCutover(t *testing.T) {
+	tests := []struct {
+		name        string
+		adopted     bool
+		autoCutover bool
+		wantDeploys int
+		wantErr     string
+	}{
+		{name: "an adopted deploy request holding auto-cutover on is refused", adopted: true, autoCutover: true,
+			wantErr: "adopted deploy request #58 was not deployed: SchemaBot did not create it, and it holds auto-cutover on"},
+		{name: "an adopted deploy request holding auto-cutover off is deployed", adopted: true, wantDeploys: 1},
+		{name: "a deploy request this engine created is deployed without reading the setting", autoCutover: true, wantDeploys: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumeDeployClient{
+				recovered:   &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/58"},
+				autoCutover: tt.autoCutover,
+			}
+			meta := &psMetadata{BranchName: "schemabot-testdb-crash", DeployRequestID: 58, DeployRequestAdopted: tt.adopted}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+
+			result, err := conformanceEngine(client).resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			assert.Equal(t, tt.wantDeploys, client.deployCalls)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+			assert.False(t, engine.IsRetryable(err))
+			assert.Empty(t, client.closed, "the refused deploy request is left open for whoever opened it")
+			assert.Empty(t, client.deletedBranches)
+		})
+	}
+}
+
+// An adopted deploy request deployed under a deferred cutover goes through the
+// same gate as a created one: the cutover is confirmed held before the deploy,
+// instant DDL is declined so the deploy parks at the cutover rather than
+// swapping the schema as it runs. The adoption
+// read and the deferral read are the same setting, so one that holds
+// auto-cutover on is refused before either deploys it.
+func TestResumeApply_AdoptedDeployRequestWithDeferredCutoverIsHeldAtTheCutover(t *testing.T) {
+	shortenEngineWaits(t)
+	const branch = "schemabot-testdb-crash"
+	tests := []struct {
+		name        string
+		autoCutover bool
+		wantErr     string
+	}{
+		{name: "a held cutover deploys with a row copy and parks at the cutover"},
+		{name: "a cutover the deploy request would take itself is refused", autoCutover: true,
+			wantErr: "adopted deploy request #58 was not deployed: SchemaBot did not create it, and it holds auto-cutover on"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adopted := &ps.DeployRequest{Number: 58, Branch: branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.Ready,
+				HtmlURL: "https://app/dr/58", Deployment: &ps.Deployment{InstantDDLEligible: true}}
+			client := &branchResumeClient{listed: []*ps.DeployRequest{adopted}, autoCutover: tt.autoCutover}
+			req := resumeRequest(t, &psMetadata{BranchName: branch}, "apply-1a2b3c4d5e6f7890")
+			req.Options = map[string]string{"defer_cutover": "true"}
+
+			result, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				assert.Zero(t, client.deployCalls)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, 1, client.deployCalls)
+			assert.Equal(t, uint64(58), client.lastDeploy.Number)
+			assert.False(t, client.lastDeploy.InstantDDL, "instant DDL would swap the schema as the deploy runs, past the cutover the operator holds")
+			assert.Nil(t, client.lastCreate, "no deploy request is created beside the adopted one")
+			stored, err := decodePSMetadata(result.ResumeState.Metadata)
+			require.NoError(t, err)
+			assert.True(t, stored.DeployRequestAdopted)
+			assert.False(t, stored.IsInstant)
 		})
 	}
 }
