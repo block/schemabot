@@ -24,6 +24,18 @@ type Server struct {
 	// WithStorageSchemaService, and while it is nil those RPCs are refused
 	// rather than answered against something else.
 	storageSchema StorageSchemaService
+	// driverCapacity answers DriverCapacity from this instance's own driver_pools
+	// table. It is nil unless the embedder supplies it with
+	// WithDriverCapacity, and while it is nil the RPC answers Unimplemented,
+	// which tells a caller not to count on this deployment's drivers.
+	driverCapacity *driverCapacitySource
+}
+
+// driverCapacitySource is what DriverCapacity reads: the live operator
+// servers and this instance's per-apply driver cap.
+type driverCapacitySource struct {
+	servers            storage.DriverPoolStore
+	maxDriversPerApply int
 }
 
 var _ ternv1.TernServer = (*Server)(nil)
@@ -38,6 +50,18 @@ type ServerOption func(*Server)
 // plane rather than leaving it to read some other database's schema.
 func WithStorageSchemaService(service StorageSchemaService) ServerOption {
 	return func(s *Server) { s.storageSchema = service }
+}
+
+// WithDriverCapacity lets this endpoint report the drivers its operators run,
+// read from driver_pools in this instance's own storage, and
+// how many operations of one apply they run at once. Every operation a control
+// plane sends here runs on one of these drivers, so the control plane refuses
+// a deferred apply that could never have all its operations here waiting at
+// once.
+func WithDriverCapacity(servers storage.DriverPoolStore, maxDriversPerApply int) ServerOption {
+	return func(s *Server) {
+		s.driverCapacity = &driverCapacitySource{servers: servers, maxDriversPerApply: maxDriversPerApply}
+	}
 }
 
 // NewServer creates a gRPC server wrapping a Client. The logger carries the
@@ -145,6 +169,30 @@ func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
 	return &ternv1.HealthResponse{Status: "ok"}, nil
+}
+
+// DriverCapacity reports the drivers this instance's live servers
+// run, the ones of them that may hold a deferred cutover, and how many
+// operations of one apply they run at once.
+func (s *Server) DriverCapacity(ctx context.Context, req *ternv1.DriverCapacityRequest) (*ternv1.DriverCapacityResponse, error) {
+	if s.driverCapacity == nil {
+		s.logger.DebugContext(ctx, "driver capacity requested from an endpoint that does not report it")
+		return nil, status.Error(codes.Unimplemented, "this endpoint does not report its driver capacity")
+	}
+	servers, err := s.driverCapacity.servers.ListLive(ctx)
+	if err != nil {
+		s.logger.WarnContext(ctx, "could not read the live servers; deferred applies sent to this deployment will be refused until it answers", "error", err)
+		return nil, status.Error(codes.Unavailable, "driver capacity unavailable")
+	}
+	resp := &ternv1.DriverCapacityResponse{
+		LiveServers:        int32(len(servers)),
+		MaxDriversPerApply: int32(s.driverCapacity.maxDriversPerApply),
+	}
+	for _, server := range servers {
+		resp.Drivers += int32(server.Drivers)
+		resp.DeferredCutoverDrivers += int32(storage.DeferredCutoverDrivers(server.Drivers))
+	}
+	return resp, nil
 }
 
 // callerAbandonedHealthCheck reports whether a failed health check ended because
