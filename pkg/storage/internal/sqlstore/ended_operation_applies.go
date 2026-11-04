@@ -108,6 +108,7 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 	args = append(args, endedArgs...)
 	args = append(args, stringArgs(quietOperationStates)...)
 	args = append(args, state.ApplyOperation.Pending)
+	args = append(args, state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
 	args = append(args, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending, limit)
 
 	// The cutover runs for one rollout member, a deployment and target, at a
@@ -116,13 +117,16 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 	// leaves the decision to the operator, so an apply with any such member is
 	// not this sweep's.
 	//
-	// Every held operation that started must be held by a live drive, since
-	// the drive is what delivers the stop and saves the copy. A started
+	// Every held operation that is copying must be held by a live drive,
+	// since the drive is what delivers the stop and saves the copy. A copying
 	// operation nobody drives is left to recovery, which claims it again and
 	// brings it back here, or, under a spent retry, to retry expiry. That
 	// makes the two sweeps disjoint: expiry takes only applies no driver
-	// holds. A pending operation needs no drive; stop reconciliation settles
-	// it stopped.
+	// holds. An operation parked at the cutover needs no live drive: recovery
+	// never claims it again on its own, but the claim of a parked operation
+	// takes it once a stop is pending, and that drive delivers the stop. A
+	// pending operation needs no drive; stop reconciliation settles it
+	// stopped.
 	//
 	// A pending stop or cancel is already ending the apply, whoever asked for
 	// it, so the apply is left to that request.
@@ -150,6 +154,7 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 			AND NOT EXISTS (
 				SELECT 1 FROM apply_operations held
 				WHERE held.apply_id = applies.id AND held.state NOT IN (%s) AND held.state <> ?
+					AND NOT (held.state = ? AND held.cutover_policy IN (?, ?))
 					AND NOT (%s)
 			)
 			AND NOT EXISTS (

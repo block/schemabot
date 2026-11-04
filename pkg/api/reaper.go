@@ -398,6 +398,11 @@ func (s *Service) stopApplyHeldByEndedOperation(ctx context.Context, held *stora
 			append(attrs, "error_message", resp.ErrorMessage, "response_status", responseStatus)...)
 		return
 	}
+	if responseStatus == stopResponseStatusAlreadyRequested {
+		s.logger.Info("operator: an apply whose deferred cutover can no longer run already has a stop pending; leaving the apply to that stop",
+			append(attrs, "response_status", responseStatus)...)
+		return
+	}
 	s.logger.Info("operator: stopping an apply whose deferred cutover can no longer run because an operation ended before it",
 		append(attrs, "response_status", responseStatus)...)
 	s.logControlOperationForApply(ctx, apply, storage.EndedOperationStopCaller, storage.LogEventStopRequested,

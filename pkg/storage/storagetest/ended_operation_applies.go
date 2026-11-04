@@ -253,23 +253,36 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		assert.Equal(t, []string{sameMember.ApplyIdentifier}, endedApplyIdentifiers(listed))
 	})
 
-	// The drive holding a shard is what delivers the stop and saves the copy,
-	// so a waiting shard nobody drives is left to recovery, which claims it
-	// again. The same apply with the shard's drive alive is listed.
-	t.Run("ListAppliesHeldByEndedOperation_SkipsStartedShardNobodyDrives", func(t *testing.T) {
+	// The drive holding a copying shard is what delivers the stop and saves
+	// the copy, so a copying shard nobody drives is left to recovery, which
+	// claims it again. A shard parked at the cutover is listed with or without
+	// a live drive: once SchemaBot's stop is recorded, the claim of a parked
+	// shard takes it, so a drive delivers the stop even after the server that
+	// drove it restarted.
+	t.Run("ListAppliesHeldByEndedOperation_ParkedShardNeedsNoLiveDrive", func(t *testing.T) {
 		store := h.NewStorage(t)
-		createEndedOperationApply(t, store, "apply_ended_undriven", 967, state.Apply.RunningDegraded, true,
+		createEndedOperationApply(t, store, "apply_ended_undriven_copy", 967, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Running, taskState: state.Task.Running, claimed: true},
+		)
+		parked, parkedOps := createEndedOperationApply(t, store, "apply_ended_undriven_parked", 968, state.Apply.RunningDegraded, true,
 			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, claimed: true},
 		)
-		driven, _ := createEndedOperationApply(t, store, "apply_ended_driven", 968, state.Apply.RunningDegraded, true,
+		driven, _ := createEndedOperationApply(t, store, "apply_ended_driven", 969, state.Apply.RunningDegraded, true,
 			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
 		)
 
 		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
 		require.NoError(t, err)
-		assert.Equal(t, []string{driven.ApplyIdentifier}, endedApplyIdentifiers(listed))
+		assert.ElementsMatch(t, []string{parked.ApplyIdentifier, driven.ApplyIdentifier}, endedApplyIdentifiers(listed))
+
+		requestControlBy(t, store, parked.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver-recovery")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the parked shard is claimed once the stop is pending")
+		assert.Equal(t, parkedOps["40-80"], claimed.ID)
 	})
 
 	// Once SchemaBot's stop has reached every shard, the settle fails the
