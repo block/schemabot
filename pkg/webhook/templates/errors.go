@@ -593,9 +593,141 @@ func RenderGenericError(data SchemaErrorData) string {
 	return offerSupportChannel(renderTemplate(tmplGenericError, data))
 }
 
-// RenderInvalidCommand generates an error message for unrecognized commands.
-func RenderInvalidCommand() string {
-	return offerSupportChannel("## " + glyph.Failed + " Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference())
+// CommandProblem is what is wrong with the token that got a command line
+// rejected.
+type CommandProblem int
+
+const (
+	// CommandProblemNone means no single token is to blame, as for a bare
+	// `schemabot`; the reply lists the commands without a reason.
+	CommandProblemNone CommandProblem = iota
+	// CommandProblemUnknownCommand is a command word SchemaBot does not have.
+	CommandProblemUnknownCommand
+	// CommandProblemPunctuatedCommand is a command word with sentence
+	// punctuation typed after it, such as `plan.`.
+	CommandProblemPunctuatedCommand
+	// CommandProblemUnknownFlag is a dash-led token that is no flag, such as
+	// `--foo`, `--allow-unsafe=true`, or a bare `--`.
+	CommandProblemUnknownFlag
+	// CommandProblemPunctuatedFlag is a flag with sentence punctuation typed
+	// after it, such as `--allow-unsafe.`.
+	CommandProblemPunctuatedFlag
+	// CommandProblemAutocorrectedDash is a flag whose leading dash became an
+	// en dash, em dash, or minus sign, such as `—allow-unsafe`.
+	CommandProblemAutocorrectedDash
+	// CommandProblemMissingDashes is a flag name typed without its leading
+	// dashes, such as `allow-unsafe`.
+	CommandProblemMissingDashes
+	// CommandProblemRepeatedFlag is a value flag given more than once, so
+	// which value was meant is ambiguous.
+	CommandProblemRepeatedFlag
+	// CommandProblemMissingValue is a value flag with no value after it.
+	CommandProblemMissingValue
+	// CommandProblemInvalidDatabase is a -d value that is not a database name.
+	CommandProblemInvalidDatabase
+	// CommandProblemInvalidApplyID is a token that starts like an apply ID but
+	// is not one, such as `apply-abc123.`.
+	CommandProblemInvalidApplyID
+	// CommandProblemSecondApplyID is an apply ID after the line already has one.
+	CommandProblemSecondApplyID
+	// CommandProblemUsageNotation is optional-argument brackets copied from
+	// usage text, such as `[-e`.
+	CommandProblemUsageNotation
+
+	// numCommandProblems counts the problems above, so a test can check that
+	// every one renders a reason.
+	numCommandProblems
+)
+
+// CommandRejection says why SchemaBot rejected a command line: the first
+// token it does not accept exactly, and what is wrong with that token.
+type CommandRejection struct {
+	Problem CommandProblem
+	// Token is the rejected token as the commenter typed it.
+	Token string
+	// Accepted is the spelling SchemaBot accepts that Token is closest to: the
+	// command word or flag for a punctuated, autocorrected, or dashless token,
+	// and the flag for a repeated or missing value. It names the spelling for
+	// the commenter to type; the reply never offers a corrected command.
+	Accepted string
+}
+
+// maxRejectedTokenRunes bounds how much of a rejected token the reply quotes,
+// so a pasted blob cannot flood the comment.
+const maxRejectedTokenRunes = 64
+
+// sentence renders the rejection as one line naming the token and what is
+// wrong with it, or "" when there is no single token to blame. The token is
+// the commenter's own text, so it is clamped and rendered as a code span it
+// cannot break out of.
+func (r CommandRejection) sentence() string {
+	token := inlineCode(clampRunes(r.Token, maxRejectedTokenRunes))
+	accepted := inlineCode(r.Accepted)
+	switch r.Problem {
+	case CommandProblemNone:
+		return ""
+	case CommandProblemUnknownCommand:
+		return token + " is not a SchemaBot command."
+	case CommandProblemPunctuatedCommand:
+		return token + " has punctuation after it; the command is " + accepted + "."
+	case CommandProblemUnknownFlag:
+		return token + " is not a SchemaBot flag."
+	case CommandProblemPunctuatedFlag:
+		return token + " has punctuation after it; the flag is " + accepted + "."
+	case CommandProblemAutocorrectedDash:
+		return token + " starts with an autocorrected dash; the flag is " + accepted + "."
+	case CommandProblemMissingDashes:
+		return token + " is missing its dashes; the flag is " + accepted + "."
+	case CommandProblemRepeatedFlag:
+		return token + " is given more than once."
+	case CommandProblemMissingValue:
+		return token + " needs " + missingValueNoun(r.Accepted) + " after it."
+	case CommandProblemInvalidDatabase:
+		return token + " is not a valid database name."
+	case CommandProblemInvalidApplyID:
+		return token + " is not a valid apply ID."
+	case CommandProblemSecondApplyID:
+		return token + " is a second apply ID; a command takes one."
+	case CommandProblemUsageNotation:
+		return token + " is usage notation from the help text; leave out the brackets."
+	}
+	return ""
+}
+
+// missingValueNoun names what a value flag takes, by its canonical spelling.
+func missingValueNoun(flag string) string {
+	switch flag {
+	case "-e":
+		return "an environment name"
+	case "-d":
+		return "a database name"
+	case "--target":
+		return "a target name"
+	case "-t":
+		return "a tenant name"
+	}
+	return "a value"
+}
+
+// clampRunes cuts s to at most n runes, marking a cut with an ellipsis.
+func clampRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
+}
+
+// RenderInvalidCommand generates an error message for a comment that
+// addresses SchemaBot without a command it accepts. When one token is to
+// blame, the reply opens by naming it and what is wrong with it, so the
+// commenter does not have to find their typo in the command table.
+func RenderInvalidCommand(rejection CommandRejection) string {
+	lead := "That command wasn't recognized. Available commands:"
+	if reason := rejection.sentence(); reason != "" {
+		lead = reason + "\n\nAvailable commands:"
+	}
+	return offerSupportChannel("## " + glyph.Failed + " Invalid Command\n\n" + lead + "\n\n" + commandReference())
 }
 
 // RenderInvalidEnv generates an error message when the -e value does not name
