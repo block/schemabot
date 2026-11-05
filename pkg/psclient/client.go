@@ -203,7 +203,7 @@ func NewPSClient(tokenName, tokenValue string) (PSClient, error) {
 // ps.WithBaseURL among them cannot send SDK calls somewhere the raw calls do
 // not go. The two resolve paths differently: the SDK resolves its relative
 // endpoints against the URL, and the raw calls append an absolute path to it.
-// So trailing slashes are trimmed once, the raw calls get the trimmed URL, and
+// So every trailing slash is trimmed, the raw calls get the trimmed URL, and
 // the SDK gets it with exactly one trailing slash. That way a base URL with a
 // trailing slash or a path prefix reaches the same path root on both.
 func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string, opts ...ps.ClientOption) (PSClient, error) {
@@ -537,7 +537,16 @@ func (w *psClientWrapper) doRawJSON(ctx context.Context, method, path string, bo
 	httpReq.Header.Set("Authorization", w.tokenName+":"+w.tokenValue)
 	resp, err := w.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("send %s %s request: %w", method, path, err)
+		// The client reports a failed send as a *url.Error, whose message is the
+		// full request URL, host and query string included. It is rebuilt with
+		// the path in place of the URL, so callers can still match its type and
+		// its cause while the host stays out of the message.
+		endpoint, _, _ := strings.Cut(path, "?")
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = &url.Error{Op: urlErr.Op, URL: endpoint, Err: urlErr.Err}
+		}
+		return nil, fmt.Errorf("send %s %s request: %w", method, endpoint, err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)

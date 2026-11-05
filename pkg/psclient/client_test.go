@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -638,8 +639,21 @@ func TestListKeyspacesCallerDeadlineWins(t *testing.T) {
 	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at the caller's deadline")
 }
 
-// requestedURL makes one SDK call and one raw-HTTP call on a cancelled context,
-// so neither leaves the process, and returns the URL each was addressed to.
+// urlCapturingTransport records the URL of the request it is handed and fails
+// it, so a raw-HTTP call never leaves the process.
+type urlCapturingTransport struct {
+	url string
+}
+
+func (ct *urlCapturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ct.url = req.URL.String()
+	return nil, errors.New("request captured")
+}
+
+// requestedURL makes one SDK call on a cancelled context and one raw-HTTP call
+// through a capturing transport, so neither leaves the process, and returns the
+// URL each was addressed to. The raw call's error names only the path, so its
+// URL is read from the request itself.
 func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -649,11 +663,76 @@ func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
 	var sdkErr *url.Error
 	require.ErrorAs(t, err, &sdkErr)
 
-	_, err = client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
-	var rawErr *url.Error
-	require.ErrorAs(t, err, &rawErr)
+	wrapper, ok := client.(*psClientWrapper)
+	require.True(t, ok)
+	capture := &urlCapturingTransport{}
+	wrapper.httpClient = &http.Client{Transport: capture}
+	_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+	require.Error(t, err)
 
-	return sdkErr.URL, rawErr.URL
+	return sdkErr.URL, capture.url
+}
+
+// errDialFailed stands in for whatever the network returns when the API host
+// cannot be reached.
+var errDialFailed = errors.New("dial failed")
+
+// unreachableWrapper addresses a host that every connection attempt fails to
+// reach, so the request fails in the transport before any response.
+func unreachableWrapper() *psClientWrapper {
+	return &psClientWrapper{
+		httpClient: &http.Client{Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return nil, errDialFailed
+			},
+		}},
+		baseURL:    "https://secret-host.example",
+		tokenName:  "token-name",
+		tokenValue: "token-value",
+	}
+}
+
+// A raw-HTTP call that never reaches the API fails with an error that travels
+// up into apply failure messages and logs. It names the method and the
+// endpoint path, but not the API host or the request's query string, and the
+// network's own error stays in the chain for callers that classify it.
+func TestRawRequestTransportFailureNamesOnlyThePath(t *testing.T) {
+	const keyspacesPath = "/v1/organizations/block/databases/orders/branches/main/keyspaces"
+	for _, tc := range []struct {
+		name    string
+		ctx     func(t *testing.T) context.Context
+		wantErr error
+	}{
+		{
+			name:    "the host cannot be reached",
+			ctx:     func(t *testing.T) context.Context { return t.Context() },
+			wantErr: errDialFailed,
+		},
+		{
+			name: "the caller's context is cancelled",
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			wantErr: context.Canceled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unreachableWrapper().ListKeyspaces(tc.ctx(t), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "send GET "+keyspacesPath+" request")
+			assert.NotContains(t, err.Error(), "secret-host.example", "the API host does not belong in an operator-facing message")
+			assert.NotContains(t, err.Error(), "per_page", "the query string does not belong in an operator-facing message")
+			assert.NotContains(t, err.Error(), "?")
+			assert.ErrorIs(t, err, tc.wantErr)
+
+			var urlErr *url.Error
+			require.ErrorAs(t, err, &urlErr)
+			assert.Equal(t, keyspacesPath, urlErr.URL)
+		})
+	}
 }
 
 // A database configured without an API base URL is a real PlanetScale one, so
