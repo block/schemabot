@@ -111,6 +111,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
@@ -247,6 +248,10 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 // observe an outage promptly rather than ride it out, and DriverCapacity is
 // read while apply creation waits on it.
 //
+// A retry budget only counts attempts. Every attempt waits on the same
+// connection attempt while the data plane is unreachable, so the connection
+// attempt is bounded separately by grpcMinConnectTimeout.
+//
 // State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
 // duplicate work or advance an apply twice, and the operator's durable
@@ -282,6 +287,16 @@ const retryServiceConfig = `{
 		}
 	}]
 }`
+
+// grpcMinConnectTimeout bounds one attempt to connect to the data plane. When
+// a data-plane pod is replaced, a connection to it can hang rather than fail,
+// and every RPC on the connection waits until the attempt gives up. gRPC's own
+// default waits twenty seconds. A drive delivers pending control requests
+// between its progress polls, so a stop accepted during a data-plane rollout
+// would wait out that hang while the new pods resume the copy. A fresh
+// connection reaches the replacement pod, so give up on a silent one sooner.
+// Connecting needs only a TCP dial and the server's HTTP/2 preface.
+const grpcMinConnectTimeout = 5 * time.Second
 
 // Default per-RPC deadlines, applied only when the caller's context carries
 // none. A driver runs on a context with no deadline while a separate heartbeat
@@ -359,6 +374,10 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff:           backoff.DefaultConfig,
+			MinConnectTimeout: grpcMinConnectTimeout,
+		}),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),
 		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(grpcMethodDeadline)),
 	)
