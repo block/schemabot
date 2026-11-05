@@ -141,8 +141,9 @@ database gets a libpq URL built the same way as on a
 read from `dbname` (set `config_paths.dbname` to change it; `config_paths.database`
 is rejected), the port defaults to 5432, and the URL always carries
 `sslmode=verify-full`. `params` accepts only `sslmode: verify-full`. The host
-must be an RDS endpoint, verified against the embedded RDS CA bundle; for any
-other host use `dsn`.
+must be an RDS endpoint, verified against the embedded RDS CA bundle unless
+`PGSSLROOTCERT` in SchemaBot's environment names other roots, as for any
+verify-full DSN; for any other host use `dsn`.
 
 ```yaml
 databases:

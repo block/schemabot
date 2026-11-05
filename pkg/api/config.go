@@ -4279,10 +4279,12 @@ func (c *DSNFromConfig) Resolve(databaseType string) (string, error) {
 // target_resolver target's dsn_from uses, so both blocks escape, require a
 // database name, and pin sslmode=verify-full identically. No CA reference is
 // configured, so the assembler resolves one only for an RDS host, to the
-// embedded RDS bundle the connection layer already verifies a verify-full RDS
-// DSN against; any other host fails here rather than falling back to ambient
-// trust. That makes the returned metadata safe to drop: it carries nothing the
-// local connection does not already enforce.
+// embedded RDS bundle; any other host fails here rather than falling back to
+// ambient trust. The returned metadata is safe to drop because the connection
+// layer makes the same choice for a verify-full RDS URL without sslrootcert:
+// it verifies against the embedded bundle unless the process's libpq
+// environment (PGSSLROOTCERT) names other roots, exactly as it does for a
+// target_resolver target.
 func (c *DSNFromConfig) assemblePostgres(endpoint externalDatabaseEndpoint, password string) (string, error) {
 	assembler := inventory.PostgresConnectionAssembler{Params: c.Params}
 	attrs := map[string]string{inventory.PostgresDBNameAttribute: endpoint.Database}
