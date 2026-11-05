@@ -319,7 +319,9 @@ remaining/limit headers, and a future reset time. They disappear from collection
 when older than 120 seconds or when their reset time passes. Repeated scrapes,
 local quota refusals and secondary cooldown waits do not refresh observation age.
 Older reset windows and delayed larger allowances within a window cannot replace
-a newer depleted snapshot. A new window can increase the allowance.
+a depleted snapshot. Within one window, a lower allowance wins even when it is
+recorded out of receipt order; its original receipt time still controls expiry.
+A new window can increase the allowance.
 
 `schemabot.github.rate_limit.observation_age_seconds` continues increasing after
 snapshot expiry. Above 120 seconds the budget is unknown; idle installations

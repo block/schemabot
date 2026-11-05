@@ -118,13 +118,15 @@ func TestGitHubQuotaSnapshotOrderingAndIdentity(t *testing.T) {
 	newer := delayed
 	newer.ResetAt = sample.ResetAt.Add(time.Hour)
 	RecordGitHubRateLimit(t.Context(), newer)
-	RecordGitHubRateLimit(t.Context(), sample)
+	olderWindow := sample
+	olderWindow.ObservedAt = now.Add(time.Second)
+	RecordGitHubRateLimit(t.Context(), olderWindow)
 	assert.Equal(t, newer, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
 	delayed = newer
 	delayed.ObservedAt = delayed.ObservedAt.Add(-time.Millisecond)
 	delayed.Remaining = 1000
 	RecordGitHubRateLimit(t.Context(), delayed)
-	assert.Equal(t, newer, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
+	assert.Equal(t, delayed, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
 	for _, change := range []func(*GitHubRateLimitSample){
 		func(s *GitHubRateLimitSample) { s.InstallationID++ },
 		func(s *GitHubRateLimitSample) { s.GitHubApp = "another-app" },
@@ -216,4 +218,46 @@ func TestGitHubQuotaInvalidResponsesDoNotRefreshAge(t *testing.T) {
 	lines := snapshotLines(body, "schemabot_github_rate_limit_observation_age_seconds")
 	require.Len(t, lines, 1)
 	assert.True(t, strings.HasSuffix(lines[0], " 121"), lines[0])
+}
+
+// Concurrent responses report the same quota window. A lower allowance must
+// survive either recording order, with freshness measured from its own receipt.
+func TestGitHubQuotaSnapshotLowerAllowanceAcrossRecordingOrders(t *testing.T) {
+	for _, lowFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("low_first_%t", lowFirst), func(t *testing.T) {
+			recorder, scrape := newQuotaRegistry(t)
+			received := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			low := quotaSample(received, 1999)
+			high := quotaSample(received.Add(time.Second), 6000)
+			now := high.ObservedAt
+			recorder.now = func() time.Time { return now }
+			if lowFirst {
+				RecordGitHubRateLimit(t.Context(), low)
+				RecordGitHubRateLimit(t.Context(), high)
+			} else {
+				RecordGitHubRateLimit(t.Context(), high)
+				RecordGitHubRateLimit(t.Context(), low)
+			}
+			key := githubRateLimitIdentity{"example-app", 42, "core"}
+			assert.Equal(t, low, recorder.snapshots[key])
+			lines := snapshotLines(scrape(), "schemabot_github_rate_limit_remaining")
+			require.Len(t, lines, 1)
+			assert.True(t, strings.HasSuffix(lines[0], " 1999"), lines[0])
+			// An equally low but older receipt cannot move the timestamp backward.
+			olderEqual := low
+			olderEqual.ObservedAt = received.Add(-time.Second)
+			RecordGitHubRateLimit(t.Context(), olderEqual)
+			assert.Equal(t, low, recorder.snapshots[key])
+			now = received.Add(120*time.Second + time.Nanosecond)
+			body := scrape()
+			assert.Empty(t, snapshotLines(body, "schemabot_github_rate_limit_remaining"))
+			ages := snapshotLines(body, "schemabot_github_rate_limit_observation_age_seconds")
+			require.Len(t, ages, 1)
+			assert.True(t, strings.HasSuffix(ages[0], " 120.000000001"), ages[0])
+			// A fresh response confirming the same allowance restores visibility.
+			low.ObservedAt = now
+			RecordGitHubRateLimit(t.Context(), low)
+			assert.Len(t, snapshotLines(scrape(), "schemabot_github_rate_limit_remaining"), 1)
+		})
+	}
 }

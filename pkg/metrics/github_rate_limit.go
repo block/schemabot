@@ -121,15 +121,22 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 	}
 	key := githubRateLimitIdentity{sample.GitHubApp, sample.InstallationID, sample.Resource}
 	if previous, ok := r.snapshots[key]; ok {
-		if sample.ResetAt.Before(previous.ResetAt) || sample.ObservedAt.Before(previous.ObservedAt) {
-			slog.Debug("Ignoring older GitHub quota observation", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
+		if sample.ResetAt.Before(previous.ResetAt) {
+			slog.Debug("Ignoring older GitHub quota window", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
 			return
 		}
-		// Concurrent responses can arrive out of order within a window. A delayed
-		// larger allowance must not erase depletion or refresh a stale low sample.
-		if sample.ResetAt.Equal(previous.ResetAt) && sample.Remaining > previous.Remaining {
-			slog.Debug("Ignoring out-of-order GitHub quota allowance", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
-			return
+		// Within one window, depletion takes precedence over receipt order.
+		// Keep the lower observation's original timestamp so recording it late
+		// cannot extend its export lifetime.
+		if sample.ResetAt.Equal(previous.ResetAt) {
+			if sample.Remaining > previous.Remaining {
+				slog.Debug("Ignoring out-of-order GitHub quota allowance", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
+				return
+			}
+			if sample.Remaining == previous.Remaining && !sample.ObservedAt.After(previous.ObservedAt) {
+				slog.Debug("Ignoring older identical GitHub quota observation", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
+				return
+			}
 		}
 	}
 	r.snapshots[key] = sample
