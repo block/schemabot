@@ -1000,12 +1000,14 @@ func (s *noopApplyLogStore) Append(context.Context, *storage.ApplyLog) error {
 // chronological order, recording the limit each read asked for.
 type windowedApplyLogStore struct {
 	storage.ApplyLogStore
-	available int
-	lastLimit int
+	available  int
+	lastLimit  int
+	lastFilter storage.ApplyLogFilter
 }
 
 func (s *windowedApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
 	s.lastLimit = filter.Limit
+	s.lastFilter = filter
 	count := min(s.available, filter.Limit)
 	logs := make([]*storage.ApplyLog, 0, count)
 	for id := s.available - count + 1; id <= s.available; id++ {
@@ -1324,6 +1326,73 @@ func TestHandleDeploymentLogsKeepsTruncationDetectableAtTheRemoteCap(t *testing.
 	assert.True(t, response.Sources[0].Truncated, "a window at the remote cap still reports its older entries")
 	require.Len(t, response.Sources[0].Logs, tern.MaxLogsLimit-1)
 	assert.Equal(t, "entry 2", response.Sources[0].Logs[0].Message)
+}
+
+// A rollout across two targets reads one target's control-plane history on
+// its own: the read is narrowed to that target's operations, and a target the
+// apply never ran on is refused with the targets it does run on, so a typo is
+// corrected from the error rather than mistaken for a quiet target.
+func TestHandleLogsScopesToTarget(t *testing.T) {
+	apply := &storage.Apply{ID: 15, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001"},
+		{ID: 2, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002"},
+	}
+	logStore := &windowedApplyLogStore{available: 2}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  logStore,
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&target=shop-002", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{2}, logStore.lastFilter.OperationIDs)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&target=shop-003", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations in apply \"apply-control\"; its targets are shop-001, shop-002`)
+}
+
+// A deployment read scoped to one target fetches only that target's
+// data-plane source and asks the data plane for that target's entries; a
+// target with no operations on the deployment is refused before any fetch.
+func TestHandleDeploymentLogsScopesToTarget(t *testing.T) {
+	apply := &storage.Apply{ID: 16, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-b", OperationKind: storage.ApplyOperationKindWork, Target: "shop-003", ExternalID: "remote-b"},
+	}
+	client := &mockTernClient{isRemote: true}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-002", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "shop-002", client.logsReqs[0].Target)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	require.Len(t, response.Sources[0].Operations, 1)
+	assert.Equal(t, "shop-002", response.Sources[0].Operations[0].Target)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-003", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations on deployment \"region-a\" in apply \"apply-control\"; its targets there are shop-001, shop-002`)
+	assert.Len(t, client.logsReqs, 1, "a refused target fetches nothing")
 }
 
 func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
