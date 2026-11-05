@@ -135,6 +135,66 @@ func TestGitHubPrimaryQuotaMetrics(t *testing.T) {
 	assert.Equal(t, map[string]int64{"http": 2, "local": 1}, origins)
 }
 
+// Quota responses remain countable when their bucket is absent or unfamiliar.
+// The limiter still returns these responses without caching a local refusal.
+func TestGitHubPrimaryQuotaUnknownResource(t *testing.T) {
+	for _, resource := range []string{"", "search_v2"} {
+		for _, tc := range []struct {
+			name, remaining, httpStatus string
+			status                      int
+			quota                       bool
+		}{
+			{"forbidden", "0", "error", http.StatusForbidden, true},
+			{"too_many_requests", "0", "error", http.StatusTooManyRequests, true},
+			{"permission", "100", "error", http.StatusForbidden, false},
+			{"success_at_zero", "0", "success", http.StatusOK, false},
+		} {
+			t.Run(resource+"/"+tc.name, func(t *testing.T) {
+				reader := newGitHubMetricsTestReader(t)
+				calls := 0
+				rt := metricTestTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					header := http.Header{}
+					if resource != "" {
+						header.Set("X-RateLimit-Resource", resource)
+					}
+					header.Set("X-RateLimit-Remaining", tc.remaining)
+					header.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10))
+					return &http.Response{StatusCode: tc.status, Header: header, Request: req, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+				}))
+				req := throttlingRequest(t, t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/example/pulls/1")
+				for range 2 {
+					resp, err := rt.RoundTrip(req)
+					require.NoError(t, err)
+					require.Equal(t, tc.status, resp.StatusCode)
+					require.NoError(t, resp.Body.Close())
+				}
+				assert.Equal(t, 2, calls)
+				data := throttlingData(t, reader)
+				quota, exists := data[quotaMetric]
+				if tc.quota {
+					require.True(t, exists)
+					points := quota.Data.(metricdata.Sum[int64]).DataPoints
+					require.Len(t, points, 1)
+					assert.Equal(t, int64(2), points[0].Value)
+					for key, want := range map[string]string{"origin": "http", "resource": "unknown", "operation": metrics.GitHubOperationFetchPullRequest, "github_app": "test-app", "installation_id": "42"} {
+						value, ok := points[0].Attributes.Value(attribute.Key(key))
+						require.True(t, ok, key)
+						assert.Equal(t, want, value.AsString(), key)
+					}
+				} else {
+					assert.False(t, exists)
+				}
+				httpPoints := data["schemabot.github.requests_total"].Data.(metricdata.Sum[int64]).DataPoints
+				require.Len(t, httpPoints, 1)
+				assert.Equal(t, int64(2), httpPoints[0].Value)
+				status, _ := httpPoints[0].Attributes.Value("status")
+				assert.Equal(t, tc.httpStatus, status.AsString())
+			})
+		}
+	}
+}
+
 func secondaryResponse(req *http.Request, retryAfter string) *http.Response {
 	header := http.Header{}
 	header.Set("X-RateLimit-Resource", "core")

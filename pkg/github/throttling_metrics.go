@@ -49,6 +49,11 @@ func newGitHubRateLimitTransportWithTotalAllowance(base http.RoundTripper, total
 		github_primary_ratelimit.WithLimitDetectedCallback(func(c *github_primary_ratelimit.CallbackContext) {
 			metrics.RecordGitHubPrimaryRateLimitRejection(c.Request.Context(), t.sample(c.Request, string(c.Category)), metrics.GitHubRejectionOriginHTTP)
 		}),
+		github_primary_ratelimit.WithUnknownCategoryCallback(func(c *github_primary_ratelimit.CallbackContext) {
+			// This branch has verified quota exhaustion but cannot track its bucket.
+			// Keep the rejection visible without exporting an unbounded header value.
+			metrics.RecordGitHubPrimaryRateLimitRejection(c.Request.Context(), t.sample(c.Request, ""), metrics.GitHubRejectionOriginHTTP)
+		}),
 		github_primary_ratelimit.WithRequestPreventedCallback(func(c *github_primary_ratelimit.CallbackContext) {
 			if observation, ok := c.Request.Context().Value(primaryRejectionObservationKey{}).(*primaryRejectionObservation); ok {
 				observation.preventedResponse = c.Response

@@ -612,6 +612,8 @@ HTTP attempt metrics remain unchanged. A primary quota rejection increments
 request. A bypass advisory is not a local rejection. Generic permission failures
 remain HTTP errors. HTTP-origin quota rejections intentionally overlap HTTP
 errors; never add these counters together into one error total.
+Quota refusals with a missing or unrecognized resource header still count as
+HTTP-origin rejections with `resource=unknown`; their response handling is unchanged.
 
 Secondary limiter callbacks emit one report and `max(0, reset - observed_at)`
 seconds using the same attributes and disposition: `accepted`,
