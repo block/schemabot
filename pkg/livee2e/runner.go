@@ -579,6 +579,9 @@ func (r *Runner) poll(ctx context.Context, check func(context.Context) (bool, er
 	for {
 		done, err := check(ctx)
 		switch {
+		case err != nil && ctx.Err() != nil:
+			// The read failed because the wait ended mid-call.
+			return r.pollExpired(run, ctx, transient)
 		case err != nil && githubUnavailable(err):
 			r.logger.Warn("GitHub call failed; retrying", "error", err)
 			transient = err
