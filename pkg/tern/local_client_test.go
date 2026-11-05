@@ -262,9 +262,10 @@ func TestLocalClientLogsScopesToShard(t *testing.T) {
 
 	t.Run("one shard across targets", func(t *testing.T) {
 		client, logs := newLogsClient(sharded...)
-		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Shard: "-80"})
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Shard: "-80"})
 		require.NoError(t, err)
 		assert.ElementsMatch(t, []int64{1, 4}, logs.lastFilter.OperationIDs)
+		assert.Equal(t, "-80", resp.Shard, "the response names the shard it was narrowed to")
 	})
 
 	t.Run("one shard of one target", func(t *testing.T) {

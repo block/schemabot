@@ -33,33 +33,37 @@ func TestLogOperationsOnShard(t *testing.T) {
 		{ID: 3, Target: "shop-002", OperationKey: ShardOperationKey("main", "-80", "orders")},
 		{ID: 4, Target: "shop-002", OperationKey: "main/group_finalizer", OperationKind: ApplyOperationKindGroupFinalizer},
 		{ID: 5, Target: "shop-003", OperationKey: TargetOperationKey("shop-003", "")},
+		{ID: 6, Target: "shop-001", OperationKey: TargetOperationKey("shop-001", "main/group_finalizer"), OperationKind: ApplyOperationKindGroupFinalizer},
 	}
 
 	assert.Equal(t, []int64{1, 3}, LogOperationsOnShard(sharded, "-80"))
 	assert.Equal(t, []int64{1}, LogOperationsOnShard(OperationsOnTarget(sharded, "shop-001"), "-80"),
 		"a shard name repeats across targets, so naming the target narrows to its own")
 	assert.Nil(t, LogOperationsOnShard(sharded, "c0-"))
+	assert.Nil(t, LogOperationsOnShard(sharded, "main"), "a finalizer behind its target names a namespace, not a shard")
 	assert.Equal(t, []string{"-80", "80-"}, DistinctOperationShards(sharded))
 	assert.Nil(t, DistinctOperationShards(OperationsOnTarget(sharded, "shop-003")))
 }
 
-func TestOperationKeyShard(t *testing.T) {
+func TestOperationShard(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
+		kind   string
 		key    string
 		target string
 		shard  string
 		ok     bool
 	}{
-		{"shard key", ShardOperationKey("main", "-80", "orders"), "shop-001", "-80", true},
-		{"shard key behind its target", TargetOperationKey("shop-001", ShardOperationKey("main", "-80", "orders")), "shop-001", "-80", true},
-		{"whole-target key", TargetOperationKey("shop-001", ""), "shop-001", "", false},
-		{"rollout step", TargetOperationKey("shop-001", RolloutStepOperationKey(2)), "shop-001", "", false},
-		{"group finalizer", "main/group_finalizer", "shop-001", "", false},
-		{"four components behind another target", "shop-002/main/-80/orders", "shop-001", "", false},
+		{"shard key", ApplyOperationKindWork, ShardOperationKey("main", "-80", "orders"), "shop-001", "-80", true},
+		{"shard key behind its target", ApplyOperationKindWork, TargetOperationKey("shop-001", ShardOperationKey("main", "-80", "orders")), "shop-001", "-80", true},
+		{"whole-target key", ApplyOperationKindWork, TargetOperationKey("shop-001", ""), "shop-001", "", false},
+		{"rollout step", ApplyOperationKindWork, TargetOperationKey("shop-001", RolloutStepOperationKey(2)), "shop-001", "", false},
+		{"group finalizer", ApplyOperationKindGroupFinalizer, "main/group_finalizer", "shop-001", "", false},
+		{"group finalizer behind its target", ApplyOperationKindGroupFinalizer, TargetOperationKey("shop-001", "main/group_finalizer"), "shop-001", "", false},
+		{"four components behind another target", ApplyOperationKindWork, "shop-002/main/-80/orders", "shop-001", "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			shard, ok := OperationKeyShard(tc.key, tc.target)
+			shard, ok := OperationShard(tc.kind, tc.key, tc.target)
 			assert.Equal(t, tc.ok, ok)
 			assert.Equal(t, tc.shard, shard)
 		})

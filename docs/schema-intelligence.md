@@ -2115,6 +2115,35 @@ unsharded target's, returns `400` too, rather than its whole log:
 
 </details>
 
+A data plane that predates shard reads cannot narrow its log to one shard. A
+deployment read never shows its entries as the shard's log: that source moves
+to `errors` with reason `upgrade_required`, and the other sources still return.
+
+<details>
+<summary>Shard read from a data plane that predates shard reads</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&deployment=us-east&shard=-80
+```
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "deployment": "us-east",
+  "shard": "-80",
+  "sources": [],
+  "errors": [{
+    "external_id": "remote-apply-example-73",
+    "operations": [{"operation_key": "main/-80/orders", "target": "shop-production", "operation_kind": "work"}],
+    "code": "UnsupportedCapability",
+    "reason": "upgrade_required",
+    "message": "The selected data plane does not support reading one shard's logs; upgrade it or omit --shard."
+  }]
+}
+```
+
+</details>
+
 ### Read deployment logs
 
 In local mode, omit `--deployment`. In [gRPC mode](release.md#two-planes-and-deploy-ordering),

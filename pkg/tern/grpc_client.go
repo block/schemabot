@@ -3862,7 +3862,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	// control-plane error — turns a version/data skew into an actionable message
 	// instead of a confusing data-plane failure.
 	targetShards := taskTargetShards(tasks)
-	if scope.operation != nil && isShardWorkOperationKey(scope.operation.OperationKey, scope.operation.Target) && len(targetShards) != 1 {
+	if scope.operation != nil && isShardWorkOperation(scope.operation) && len(targetShards) != 1 {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: shard operation %q resolved %d target shards, expected exactly 1 — its tasks carry no shard, so refusing to dispatch (the data plane would reject with \"expected exactly one target shard, got 0\"); this indicates a version or data skew", scope.operation.OperationKey, len(targetShards))
 		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after shard-scope guard: %w", apply.ApplyIdentifier, markErr)
@@ -4127,16 +4127,14 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 	return changes
 }
 
-// isShardWorkOperationKey reports whether an operation key is a sharded work
-// key ("namespace/shard/table") — the per-shard fan-out's unit — either on its
-// own or behind the operation's target ("orders-001/namespace/shard/table"),
-// the shape a deployment addressing several targets gives it. None of the
-// components can contain the delimiter, so four components are always a target
-// and a shard key. A whole-target key (empty, or the target alone) and a
-// finalizer key ("namespace/group_finalizer") are not, so the shard-scope guard
-// applies only to per-shard work.
-func isShardWorkOperationKey(key, target string) bool {
-	_, ok := storage.OperationKeyShard(key, target)
+// isShardWorkOperation reports whether an operation is sharded work keyed
+// "namespace/shard/table" — the per-shard fan-out's unit — either on its own or
+// behind the operation's target ("orders-001/namespace/shard/table"), the shape
+// a deployment addressing several targets gives it. A whole-target key (empty,
+// or the target alone) and a group finalizer, with or without its target in
+// front, are not, so the shard-scope guard applies only to per-shard work.
+func isShardWorkOperation(op *storage.ApplyOperation) bool {
+	_, ok := storage.OperationShard(op.OperationKind, op.OperationKey, op.Target)
 	return ok
 }
 

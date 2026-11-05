@@ -998,6 +998,11 @@ message ApplyLog {
 message LogsResponse {
   string apply_id = 1;
   repeated ApplyLog logs = 2;
+  // The shard the read was narrowed to, echoing LogsRequest.shard; empty when
+  // the read covers every shard. A data plane that predates LogsRequest.shard
+  // ignores the field and leaves this empty, so a caller that asked for one
+  // shard must treat a missing or different echo as an unnarrowed read.
+  string shard = 3;
 }
 
 // ShardProgress contains progress information for a single Vitess shard.

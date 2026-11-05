@@ -331,7 +331,7 @@ func fetchesOnShard(fetches map[string]*deploymentLogFetch, undispatched []*stor
 	for key, fetch := range fetches {
 		var onShard []*apitypes.LogOperationProvenance
 		for _, op := range fetch.operations {
-			if opShard, ok := storage.OperationKeyShard(op.OperationKey, op.Target); ok && opShard == shard {
+			if opShard, ok := storage.OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && opShard == shard {
 				onShard = append(onShard, op)
 			}
 		}
@@ -341,7 +341,7 @@ func fetchesOnShard(fetches map[string]*deploymentLogFetch, undispatched []*stor
 	}
 	var keptUndispatched []*storage.ApplyOperation
 	for _, op := range undispatched {
-		if opShard, ok := storage.OperationKeyShard(op.OperationKey, op.Target); ok && opShard == shard {
+		if opShard, ok := storage.OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && opShard == shard {
 			keptUndispatched = append(keptUndispatched, op)
 		}
 	}
@@ -448,6 +448,16 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 			result.Errors = append(result.Errors, deploymentLogError(fetch, fetchErr))
 			continue
 		}
+		if resp.GetShard() != scope.shard {
+			// A data plane that predates shard reads ignores the shard and
+			// returns every shard's entries, which must not be shown as one
+			// shard's log.
+			s.logger.Warn("data plane did not narrow a log read to the requested shard; refusing its entries",
+				append(apply.LogAttrs(),
+					"operation", deploymentLogsOperation, "operation_deployment", deployment, "target", fetch.target, "external_id", fetch.externalID, "shard", scope.shard, "echoed_shard", resp.GetShard())...)
+			result.Errors = append(result.Errors, deploymentLogShardUnsupportedError(fetch))
+			continue
+		}
 		remoteLogs, truncated := clampLogWindow(resp.Logs, limit)
 		source := &apitypes.DeploymentLogSource{ExternalID: fetch.externalID, Operations: fetch.operations, Logs: []*apitypes.LogEntry{}, Truncated: truncated}
 		for _, log := range remoteLogs {
@@ -504,6 +514,10 @@ const (
 // deploymentLogRecordError reports a source whose log records could not be
 // decoded. Unlike a transport failure, retrying cannot help — the data plane
 // returned records the control plane does not understand.
+func deploymentLogShardUnsupportedError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
+	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "UnsupportedCapability", Reason: "upgrade_required", Message: "The selected data plane does not support reading one shard's logs; upgrade it or omit --shard."}
+}
+
 func deploymentLogRecordError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
 	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "MalformedRemoteLog", Reason: "malformed_remote_log", Message: "The data plane returned log records SchemaBot could not decode; check server logs."}
 }

@@ -3345,9 +3345,14 @@ func (x *ApplyLog) GetCreatedAt() string {
 }
 
 type LogsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ApplyId       string                 `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
-	Logs          []*ApplyLog            `protobuf:"bytes,2,rep,name=logs,proto3" json:"logs,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	ApplyId string                 `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Logs    []*ApplyLog            `protobuf:"bytes,2,rep,name=logs,proto3" json:"logs,omitempty"`
+	// The shard the read was narrowed to, echoing LogsRequest.shard; empty when
+	// the read covers every shard. A data plane that predates LogsRequest.shard
+	// ignores the field and leaves this empty, so a caller that asked for one
+	// shard must treat a missing or different echo as an unnarrowed read.
+	Shard         string `protobuf:"bytes,3,opt,name=shard,proto3" json:"shard,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3394,6 +3399,13 @@ func (x *LogsResponse) GetLogs() []*ApplyLog {
 		return x.Logs
 	}
 	return nil
+}
+
+func (x *LogsResponse) GetShard() string {
+	if x != nil {
+		return x.Shard
+	}
+	return ""
 }
 
 // ShardProgress contains progress information for a single Vitess shard.
@@ -5788,10 +5800,11 @@ const file_tern_proto_rawDesc = "" +
 	"created_at\x18\n" +
 	" \x01(\tR\tcreatedAtB\n" +
 	"\n" +
-	"\b_task_id\"P\n" +
+	"\b_task_id\"f\n" +
 	"\fLogsResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12%\n" +
-	"\x04logs\x18\x02 \x03(\v2\x11.tern.v1.ApplyLogR\x04logs\"\x94\x02\n" +
+	"\x04logs\x18\x02 \x03(\v2\x11.tern.v1.ApplyLogR\x04logs\x12\x14\n" +
+	"\x05shard\x18\x03 \x01(\tR\x05shard\"\x94\x02\n" +
 	"\rShardProgress\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1f\n" +

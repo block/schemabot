@@ -2789,12 +2789,17 @@ func OperationsOnTarget(ops []*ApplyOperation, target string) []*ApplyOperation 
 	return onTarget
 }
 
-// OperationKeyShard returns the shard a sharded work operation's key scopes it
-// to: the shard of a ShardOperationKey, on its own or behind the operation's
-// target. A key that covers no single shard (a whole-target key, a rollout
-// step, a group finalizer) reports false. No component can contain the
-// delimiter, so the component count alone tells the shapes apart.
-func OperationKeyShard(key, target string) (string, bool) {
+// OperationShard returns the shard a sharded work operation runs on: the shard
+// of its ShardOperationKey, on its own or behind the operation's target. An
+// operation that covers no single shard (a whole-target key, a rollout step, a
+// group finalizer) reports false. No component can contain the delimiter, so
+// the component count tells the key shapes apart, with one exception: a group
+// finalizer behind its target ("shop-002/main/group_finalizer") has as many
+// components as a shard key on its own, so the operation's kind rules it out.
+func OperationShard(kind, key, target string) (string, bool) {
+	if kind == ApplyOperationKindGroupFinalizer {
+		return "", false
+	}
 	parts := strings.Split(key, OperationKeyDelimiter)
 	if len(parts) == 4 && target != "" && parts[0] == target {
 		parts = parts[1:]
@@ -2812,7 +2817,7 @@ func OperationKeyShard(key, target string) (string, bool) {
 func LogOperationsOnShard(ops []*ApplyOperation, shard string) []int64 {
 	var operationIDs []int64
 	for _, op := range ops {
-		if opShard, ok := OperationKeyShard(op.OperationKey, op.Target); ok && opShard == shard {
+		if opShard, ok := OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && opShard == shard {
 			operationIDs = append(operationIDs, op.ID)
 		}
 	}
@@ -2825,7 +2830,7 @@ func DistinctOperationShards(ops []*ApplyOperation) []string {
 	seen := make(map[string]bool, len(ops))
 	var shards []string
 	for _, op := range ops {
-		if shard, ok := OperationKeyShard(op.OperationKey, op.Target); ok && !seen[shard] {
+		if shard, ok := OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && !seen[shard] {
 			seen[shard] = true
 			shards = append(shards, shard)
 		}
