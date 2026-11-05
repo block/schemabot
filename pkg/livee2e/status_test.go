@@ -265,8 +265,13 @@ func TestUnansweredApplyFindsAnApplyCommandWithNoReply(t *testing.T) {
 
 	started := Comment{ID: 4, IsBot: true, Body: renderStatus("apply-bbbbbbbbbbbbbbbb", state.Apply.WaitingForCutover)}
 	assert.False(t, unansweredApply([]Comment{earlier, command, started}, isBot, "schemabot"))
-	refused := Comment{ID: 4, IsBot: true, Body: renderAlreadyFinished(state.Apply.Completed)}
-	assert.False(t, unansweredApply([]Comment{earlier, command, refused}, isBot, "schemabot"),
-		"any other reply answers the command")
+	unrelated := Comment{ID: 4, IsBot: true, Body: renderAlreadyFinished(state.Apply.Completed)}
+	assert.True(t, unansweredApply([]Comment{earlier, command, unrelated}, isBot, "schemabot"),
+		"a reply that neither starts an apply nor refuses this one does not answer it")
+	blocked := Comment{ID: 4, IsBot: true, Body: templates.RenderApplyBlockedByNonPassingChecks("development", []templates.BlockingCheck{{Name: "lint", State: "failure"}})}
+	assert.False(t, unansweredApply([]Comment{earlier, command, blocked}, isBot, "schemabot"),
+		"a refusal before the engine answers the command")
+	closed := Comment{ID: 4, IsBot: true, Body: templates.RenderApplyBlockedClosedPR("development", "octocat", false)}
+	assert.False(t, unansweredApply([]Comment{earlier, command, closed}, isBot, "schemabot"))
 	assert.False(t, unansweredApply([]Comment{earlier}, isBot, "schemabot"), "no apply command, nothing unanswered")
 }
