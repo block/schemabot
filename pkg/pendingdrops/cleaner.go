@@ -140,24 +140,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		metrics.RecordPendingDropsCleanupLockSkipped(ctx, target.Database, target.Environment)
 		return nil
 	}
-	defer func() {
-		released, err := target.Locker.Release(context.WithoutCancel(ctx), conn, lockName)
-		switch {
-		case err != nil:
-			c.logger.Warn("failed to release pending drops cleanup lock; the lock releases when the session closes",
-				"database", target.Database,
-				"environment", target.Environment,
-				"lock_name", lockName,
-				"error", err,
-			)
-		case !released:
-			c.logger.Warn("pending drops cleanup lock was no longer held at release; another instance may have run concurrently against this target",
-				"database", target.Database,
-				"environment", target.Environment,
-				"lock_name", lockName,
-			)
-		}
-	}()
+	defer c.releaseCleanupLock(ctx, target, conn, lockName)
 
 	exists, err := pendingDropsDatabaseExists(ctx, conn)
 	if err != nil {
@@ -272,6 +255,46 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		errs = append(errs, fmt.Errorf("prune %s.%s on %s/%s: %w", Database, LogTable, target.Database, target.Environment, logErr))
 	}
 	return errors.Join(errs...)
+}
+
+// lockReleaseTimeout bounds how long a pass may spend releasing its cleanup
+// lock. A release stuck on a half-open connection would otherwise never
+// return, and the pass's own context may already be cancelled by the time
+// the release runs.
+//
+// The bound ends this instance's wait, not the lock. The pinned connection
+// is closed with the pass's pool, and a server that never sees that close
+// keeps the lock with its old session until it notices the session is gone.
+//
+// A variable so tests can shorten it.
+var lockReleaseTimeout = 5 * time.Second
+
+// releaseCleanupLock releases the advisory lock held on conn's session within
+// lockReleaseTimeout. It runs after the pass's context may have been
+// cancelled, so it does not inherit that cancellation. A release that fails,
+// times out, or reports the lock was not held is logged, not returned: the
+// pass's outcome is already decided, and the pinned connection is closed with
+// the pass's pool either way, which releases the lock server-side.
+func (c *Cleaner) releaseCleanupLock(ctx context.Context, target Target, conn *sql.Conn, lockName string) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockReleaseTimeout)
+	defer cancel()
+
+	released, err := target.Locker.Release(releaseCtx, conn, lockName)
+	switch {
+	case err != nil:
+		c.logger.Warn("failed to release pending drops cleanup lock; the lock releases when the session closes",
+			"database", target.Database,
+			"environment", target.Environment,
+			"lock_name", lockName,
+			"error", err,
+		)
+	case !released:
+		c.logger.Warn("pending drops cleanup lock was no longer held at release; another instance may have run concurrently against this target",
+			"database", target.Database,
+			"environment", target.Environment,
+			"lock_name", lockName,
+		)
+	}
 }
 
 // pruneQuarantineLog deletes the quarantine log records of copies past
