@@ -31,7 +31,7 @@ type Target interface {
 }
 
 // runTableName matches the tables the runner creates, and only those, so the
-// sweep can never drop a table it does not own.
+// client never writes to or drops a table it does not own.
 var runTableName = regexp.MustCompile(`^e2e_[0-9]{14}$`)
 
 // seedBatchRows bounds each seeding transaction so one statement never holds
@@ -42,6 +42,9 @@ type mysqlTarget struct {
 	db       *sql.DB
 	database string
 	logger   *slog.Logger
+	// batchRows is seedBatchRows outside tests, which shrink it to cross a
+	// batch boundary with a small seed table.
+	batchRows int64
 }
 
 // OpenMySQLTarget connects to the test database named database. It confirms
@@ -63,7 +66,7 @@ func OpenMySQLTarget(ctx context.Context, dsn, database string, logger *slog.Log
 	if n == 0 {
 		return nil, errors.Join(fmt.Errorf("test database %s does not exist or this connection cannot see it", database), db.Close())
 	}
-	return &mysqlTarget{db: db, database: database, logger: logger}, nil
+	return &mysqlTarget{db: db, database: database, logger: logger, batchRows: seedBatchRows}, nil
 }
 
 func (t *mysqlTarget) Close() error {
@@ -104,6 +107,9 @@ func (t *mysqlTarget) RowCount(ctx context.Context, table string) (int64, error)
 }
 
 func (t *mysqlTarget) Seed(ctx context.Context, table, source string, rows int64) error {
+	if !runTableName.MatchString(table) {
+		return fmt.Errorf("refusing to seed %s.%s: a run did not create it", t.database, table)
+	}
 	existing, err := t.RowCount(ctx, table)
 	if err != nil {
 		return err
@@ -114,7 +120,7 @@ func (t *mysqlTarget) Seed(ctx context.Context, table, source string, rows int64
 	}
 	var lastID int64
 	for copied := int64(0); copied < needed; {
-		batch := min(seedBatchRows, needed-copied)
+		batch := min(t.batchRows, needed-copied)
 		var maxID sql.NullInt64
 		err := t.db.QueryRowContext(ctx,
 			"SELECT MAX(id) FROM (SELECT id FROM "+t.qualified(source)+" WHERE id > ? ORDER BY id LIMIT ?) AS batch",

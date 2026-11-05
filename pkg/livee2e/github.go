@@ -237,3 +237,21 @@ func (g *apiGitHub) CheckRun(ctx context.Context, sha, name, appSlug string) (*C
 		Title:      newest.GetOutput().GetTitle(),
 	}, nil
 }
+
+// githubUnavailable reports whether err is GitHub refusing or failing a call
+// for reasons of its own: a primary or secondary rate limit, or a server
+// error. Such a failure says nothing about SchemaBot. The client does not
+// retry these itself, because retrying a comment could post a command twice.
+func githubUnavailable(err error) bool {
+	var rateLimit *github.RateLimitError
+	var secondary *github.AbuseRateLimitError
+	if errors.As(err, &rateLimit) || errors.As(err, &secondary) {
+		return true
+	}
+	var resp *github.ErrorResponse
+	if !errors.As(err, &resp) || resp.Response == nil {
+		return false
+	}
+	code := resp.Response.StatusCode
+	return code == http.StatusTooManyRequests || code >= http.StatusInternalServerError
+}

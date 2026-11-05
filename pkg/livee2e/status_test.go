@@ -1,7 +1,10 @@
 package livee2e
 
 import (
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -175,7 +178,7 @@ func TestParseFinalSummaryReadsTheRenderedTemplate(t *testing.T) {
 		state.Apply.Completed: StatusApplied,
 		state.Apply.Failed:    StatusFailed,
 		state.Apply.Cancelled: StatusCancelled,
-		state.Apply.Reverted:  "Reverted",
+		state.Apply.Reverted:  StatusReverted,
 	}
 	for applyState, want := range cases {
 		t.Run(applyState, func(t *testing.T) {
@@ -184,6 +187,82 @@ func TestParseFinalSummaryReadsTheRenderedTemplate(t *testing.T) {
 			assert.Equal(t, ApplyStatus{ApplyID: "apply-0123456789abcdef", Status: want}, got)
 		})
 	}
+}
+
+// renderRollback renders the comment SchemaBot posts for a rollback apply in
+// applyState: the status comment, or the summary when summary is set.
+func renderRollback(applyState string, summary bool) string {
+	data := templates.ApplyStatusCommentData{
+		ApplyID:     "apply-0123456789abcdef",
+		Database:    "testdb",
+		Environment: "development",
+		RequestedBy: "octocat",
+		State:       applyState,
+		Engine:      "spirit",
+		Rollback:    true,
+	}
+	if summary {
+		return templates.RenderApplySummaryComment(data)
+	}
+	return templates.RenderApplyStatusComment(data)
+}
+
+func TestParseApplyStatusReadsARollbackStatusComment(t *testing.T) {
+	cases := map[string]string{
+		state.Apply.Running:   StatusInProgress,
+		state.Apply.Stopped:   StatusStopped,
+		state.Apply.Completed: StatusRolledBack,
+	}
+	for applyState, want := range cases {
+		t.Run(applyState, func(t *testing.T) {
+			got, ok := ParseApplyStatus(renderRollback(applyState, false))
+			require.True(t, ok, "the rollback status comment for %s should parse", applyState)
+			assert.Equal(t, ApplyStatus{ApplyID: "apply-0123456789abcdef", Status: want}, got)
+		})
+	}
+	assert.True(t, isTerminalStatus(StatusRolledBack))
+}
+
+func TestParseFinalSummaryReadsARollbackSummary(t *testing.T) {
+	cases := map[string]string{
+		state.Apply.Completed: StatusRolledBack,
+		state.Apply.Failed:    StatusFailed,
+		state.Apply.Cancelled: StatusCancelled,
+	}
+	for applyState, want := range cases {
+		t.Run(applyState, func(t *testing.T) {
+			got, ok := parseFinalSummary(renderRollback(applyState, true))
+			require.True(t, ok, "the rollback summary for %s should parse", applyState)
+			assert.Equal(t, ApplyStatus{ApplyID: "apply-0123456789abcdef", Status: want}, got)
+		})
+	}
+	_, ok := parseFinalSummary(renderRollback(state.Apply.Stopped, true))
+	assert.False(t, ok, "a start can resume a stopped rollback, so its summary is not final")
+}
+
+func TestParseApplyStatusCutsTheRevertWindowCountdown(t *testing.T) {
+	body := templates.RenderApplyStatusComment(templates.ApplyStatusCommentData{
+		ApplyID:         "apply-0123456789abcdef",
+		Database:        "testdb",
+		Environment:     "development",
+		RequestedBy:     "octocat",
+		State:           state.Apply.RevertWindow,
+		Engine:          "spirit",
+		RevertExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	})
+	require.Contains(t, body, " | Closes in", "the rendered status line carries the countdown")
+	got, ok := ParseApplyStatus(body)
+	require.True(t, ok)
+	assert.Equal(t, ApplyStatus{ApplyID: "apply-0123456789abcdef", Status: "Revert Window"}, got)
+}
+
+func TestParseApplyStatusTakesAnOpaqueApplyID(t *testing.T) {
+	got, ok := ParseApplyStatus(renderStatus("apply-2026_Nov-05.a1", state.Apply.Running))
+	require.True(t, ok)
+	assert.Equal(t, "apply-2026_Nov-05.a1", got.ApplyID)
+	summary, ok := parseFinalSummary(renderSummary("apply-2026_Nov-05.a1", state.Apply.Completed))
+	require.True(t, ok)
+	assert.Equal(t, "apply-2026_Nov-05.a1", summary.ApplyID)
 }
 
 func TestParseFinalSummaryIgnoresAStoppedSummary(t *testing.T) {
@@ -274,4 +353,93 @@ func TestUnansweredApplyFindsAnApplyCommandWithNoReply(t *testing.T) {
 	closed := Comment{ID: 4, IsBot: true, Body: templates.RenderApplyBlockedClosedPR("development", "octocat", false)}
 	assert.False(t, unansweredApply([]Comment{earlier, command, closed}, isBot, "schemabot"))
 	assert.False(t, unansweredApply([]Comment{earlier}, isBot, "schemabot"), "no apply command, nothing unanswered")
+}
+
+// renderApplyRejections renders every reply SchemaBot posts to refuse an apply
+// command before it reaches the engine.
+func renderApplyRejections() map[string]string {
+	schemaErr := templates.SchemaErrorData{
+		CommandName:  "apply",
+		Environment:  "development",
+		RequestedBy:  "octocat",
+		DatabaseName: "testdb",
+	}
+	unregistered := schemaErr
+	unregistered.UnregisteredConfigs = []templates.UnregisteredSchemaConfigData{
+		{Database: "testdb", SchemaPath: "schema/testdb"},
+		{Database: "otherdb", SchemaPath: "schema/otherdb"},
+	}
+	plan := schemaErr
+	plan.CommandName = "plan"
+	lock := templates.ApplyLockConflictData{
+		Database:    "testdb",
+		Environment: "development",
+		RequestedBy: "octocat",
+		LockOwner:   "hubot",
+		LockRepo:    "octo/other",
+		LockPR:      3,
+		LockCreated: time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC),
+	}
+	actor := templates.ActorAuthorizationCommentData{RequestedBy: "octocat", CommandName: "apply", Database: "testdb", Environment: "development"}
+	review := templates.ReviewGateData{Database: "testdb", Environment: "development", RequestedBy: "octocat"}
+	failing := []templates.BlockingCheck{{Name: "lint", State: "failure"}}
+	return map[string]string{
+		"lock held by another PR":         templates.RenderApplyBlockedByOtherPR(lock),
+		"apply already in progress":       templates.RenderApplyInProgress(lock),
+		"closed PR":                       templates.RenderApplyBlockedClosedPR("development", "octocat", false),
+		"failing checks":                  templates.RenderApplyBlockedByNonPassingChecks("development", failing),
+		"pending checks":                  templates.RenderApplyBlockedByInProgressChecks("development", failing, nil),
+		"check status error":              templates.RenderApplyBlockedByCheckStatusError("development", errors.New("unavailable"), nil),
+		"prior environment":               templates.RenderApplyBlockedByPriorEnv("testdb", "production", "staging", "pending", "apply"),
+		"prior environment check error":   templates.RenderApplyBlockedByPriorEnvCheckError("staging", "unavailable"),
+		"prior environment check missing": templates.RenderApplyBlockedByMissingPriorEnvCheck("staging"),
+		"prior environment check stale":   templates.RenderApplyBlockedByStalePriorEnvCheck("staging", "aaaaaaa", "bbbbbbb"),
+		"prior environment untrusted":     templates.RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"other-app"}),
+		"prior environment in progress":   templates.RenderApplyBlockedByPriorEnvInProgress("testdb", "production", "staging"),
+		"prior environment stopped":       templates.RenderApplyBlockedByStoppedPriorEnvApply("testdb", "production", "staging"),
+		"unlisted environment":            templates.RenderApplyBlockedByUnlistedEnvironment("qa", []string{"staging", "production"}),
+		"stale schema":                    templates.RenderStaleSchemaRejection(templates.StaleSchemaRejectionData{RequestedBy: "octocat", Database: "testdb", Environment: "development", DiscoverySHA: "aaaaaaa", CurrentSHA: "bbbbbbb", Action: "apply"}),
+		"newer base schema":               templates.RenderBaseSchemaFreshnessRejection(templates.BaseSchemaFreshnessRejectionData{RequestedBy: "octocat", Database: "testdb", Environment: "development", SchemaPath: "schema/testdb"}),
+		"review required":                 templates.RenderReviewRequired(review),
+		"review gate error":               templates.RenderReviewGateError(review),
+		"command not authorized":          templates.RenderPRCommandNotAuthorized(actor),
+		"authorization database":          templates.RenderPRCommandDatabaseNotConfigured(actor),
+		"authorization unavailable":       templates.RenderPRCommandAuthorizationUnavailable(actor),
+		"database not found":              templates.RenderDatabaseNotFound(schemaErr),
+		"database not configured":         templates.RenderDatabaseNotConfigured(schemaErr),
+		"database not registered":         templates.RenderDatabaseNotRegistered(schemaErr),
+		"databases not registered":        templates.RenderDatabaseNotRegistered(unregistered),
+		"database repository not allowed": templates.RenderDatabaseRepoNotAllowed(schemaErr),
+		"no schema files changed":         templates.RenderNoManagedSchemaChanges(schemaErr),
+		"invalid environment":             templates.RenderInvalidEnv("apply", []string{"staging"}),
+		"missing environment":             templates.RenderMissingEnv("apply"),
+	}
+}
+
+func TestIsApplyRejectionReadsEveryRenderedRefusal(t *testing.T) {
+	bodies := renderApplyRejections()
+	for name, body := range bodies {
+		assert.True(t, isApplyRejection(body), "%s should read as a refusal: %q", name, firstLine(body))
+	}
+	for _, entry := range applyRejections {
+		matched := false
+		for _, body := range bodies {
+			if strings.Contains(firstLine(body), entry) {
+				matched = true
+				break
+			}
+		}
+		assert.True(t, matched, "no rendered refusal has the headline %q", entry)
+	}
+}
+
+func TestIsApplyRejectionSkipsAFailureAfterTheEngine(t *testing.T) {
+	failed := templates.RenderGenericError(templates.SchemaErrorData{
+		CommandName: "apply",
+		Environment: "development",
+		RequestedBy: "octocat",
+		ErrorDetail: "the apply was not accepted",
+	})
+	assert.False(t, isApplyRejection(failed), "SchemaBot can post Apply Failed after the engine accepted the apply")
+	assert.False(t, isApplyRejection(renderStatus("apply-0123456789abcdef", state.Apply.Running)))
 }
