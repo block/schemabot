@@ -2,6 +2,7 @@ CREATE TABLE `apply_logs` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `apply_id` bigint unsigned NOT NULL,
   `task_id` bigint unsigned DEFAULT NULL,
+  `apply_operation_id` bigint unsigned DEFAULT NULL,
   `level` varchar(20) NOT NULL DEFAULT 'info',
   `event_type` varchar(100) NOT NULL,
   `source` varchar(100) NOT NULL DEFAULT 'schemabot',
