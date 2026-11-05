@@ -1002,9 +1002,10 @@ type PRFile struct {
 	Symlink         bool
 	PreviousSymlink bool
 	// VacatedDirectoryLink is true when the path this change vacated, the
-	// Filename it removes or the PreviousFilename it renames away, was a
-	// schema symlink at the base that could name a namespace: one to a
-	// directory, or to a target the read could not resolve.
+	// Filename it removes or replaces with something that is not a schema
+	// symlink, or the PreviousFilename it renames away, was a schema symlink
+	// at the base that declared a namespace: one to a directory holding a
+	// schema file, or to a target the read could not resolve.
 	VacatedDirectoryLink bool
 }
 
@@ -1091,9 +1092,11 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 		opts.Page = readResult.resp.NextPage
 	}
 
-	if !slices.ContainsFunc(allFiles, mayBeSymlink) {
-		// Every path is named like a schema input or changed by more than
-		// one line, so none can be a symlink and no mode is read.
+	scope := ic.schemaSymlinkScope(repo)
+	if !slices.ContainsFunc(allFiles, func(file PRFile) bool { return mayBeSchemaSymlink(file, scope) }) {
+		// Every path is named like a schema input, changed by more than one
+		// line, or outside every configured schema directory, so none can be
+		// a schema symlink and no mode is read.
 		return allFiles, nil
 	}
 	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
@@ -1111,7 +1114,7 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 		return nil, fmt.Errorf("find the merge base of PR %s#%d to read which changed files are symlinks: %w", repo, pr, err)
 	}
 	change := ChangeRange{PR: pr, Base: mergeBase, Head: prInfo.HeadSHA}
-	if err := ic.markSymlinks(ctx, repo, change, allFiles); err != nil {
+	if err := ic.markSymlinks(ctx, repo, change, allFiles, scope); err != nil {
 		return nil, fmt.Errorf("find which files PR %s#%d changes are symlinks: %w", repo, pr, err)
 	}
 	return allFiles, nil
@@ -1150,7 +1153,7 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 	}
 	// The comparison is linear, so base is the commit the change was made
 	// from.
-	if err := ic.markSymlinks(ctx, repo, ChangeRange{Base: base, Head: head}, files); err != nil {
+	if err := ic.markSymlinks(ctx, repo, ChangeRange{Base: base, Head: head}, files, ic.schemaSymlinkScope(repo)); err != nil {
 		return nil, fmt.Errorf("find which files changed between %s and %s in %s are symlinks: %w", base, head, repo, err)
 	}
 	return files, nil
@@ -1174,11 +1177,56 @@ func (ic *InstallationClient) prBaseCommit(ctx context.Context, repo string, pr 
 	return tip, nil
 }
 
-// mayBeSymlink reports whether any of a changed file's paths could name a
-// symlink (see symlinkCandidates).
-func mayBeSymlink(file PRFile) bool {
-	atHead, atBase, previousAtBase := symlinkCandidates(file)
+// pathScope is the set of directories a changed path must sit in or under
+// to be a schema symlink. An unbounded scope admits every path.
+type pathScope struct {
+	dirs    []string
+	bounded bool
+}
+
+func (s pathScope) contains(p string) bool {
+	return !s.bounded || pathInsideAny(p, s.dirs)
+}
+
+// schemaSymlinkScope returns where a changed path can be a schema symlink in
+// repo. A schema symlink sits in a config directory or under its schema root,
+// which stays inside the config directory, and every config directory a
+// database accepts from the repo lies in one of the database's configured
+// schema directories. So when the server's directory configuration provably
+// covers every config location for the repo, a path outside those
+// directories is not a schema symlink, and its mode is never read. Without
+// such configuration every path is admitted.
+func (ic *InstallationClient) schemaSymlinkScope(repo string) pathScope {
+	if ic.configDirHints == nil {
+		return pathScope{}
+	}
+	dirs, exhaustive := ic.configDirHints.SchemaDirHintsForRepo(repo)
+	if !exhaustive {
+		ic.logger.Debug("a database accepts configs from the repository outside any configured schema directory, so every changed path that could be a symlink is read",
+			"repo", repo, "schema_dirs", len(dirs))
+		return pathScope{}
+	}
+	return pathScope{dirs: dirs, bounded: true}
+}
+
+// mayBeSchemaSymlink reports whether any of a changed file's paths could name
+// a schema symlink (see schemaSymlinkCandidates).
+func mayBeSchemaSymlink(file PRFile, scope pathScope) bool {
+	atHead, atBase, previousAtBase := schemaSymlinkCandidates(file, scope)
 	return atHead || atBase || previousAtBase
+}
+
+// schemaSymlinkCandidates narrows symlinkCandidates to the paths inside
+// scope, where a symlink can be a schema input.
+func schemaSymlinkCandidates(file PRFile, scope pathScope) (atHead, atBase, previousAtBase bool) {
+	atHead, atBase, previousAtBase = symlinkCandidates(file)
+	if !scope.contains(file.Filename) {
+		atHead, atBase = false, false
+	}
+	if !scope.contains(file.PreviousFilename) {
+		previousAtBase = false
+	}
+	return atHead, atBase, previousAtBase
 }
 
 // symlinkCandidates reports which of a changed file's paths could name a
@@ -1204,15 +1252,15 @@ func symlinkCandidates(file PRFile) (atHead, atBase, previousAtBase bool) {
 
 // markSymlinks sets Symlink, PreviousSymlink, and VacatedDirectoryLink on
 // every file in files whose paths name a schema symlink (see PRFile). The
-// modes of every path symlinkCandidates admits (the current path at head and
-// at the base, and a vacated path at the base) come from one SymlinkModes
-// call, so the cost does not grow with the number of candidates. Only a path
-// that is a symlink is then read from the tree, to classify its target. A
-// path absent at its commit is not a symlink.
-func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, change ChangeRange, files []PRFile) error {
+// modes of every path schemaSymlinkCandidates admits (the current path at
+// head and at the base, and a vacated path at the base) come from one
+// SymlinkModes call, so the cost does not grow with the number of candidates.
+// Only a path that is a symlink is then read from the tree, to classify its
+// target. A path absent at its commit is not a symlink.
+func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, change ChangeRange, files []PRFile, scope pathScope) error {
 	var probes []SymlinkProbe
 	for _, file := range files {
-		atHead, atBase, previousAtBase := symlinkCandidates(file)
+		atHead, atBase, previousAtBase := schemaSymlinkCandidates(file, scope)
 		if atHead || atBase {
 			probes = append(probes, SymlinkProbe{Path: file.Filename, AtHead: atHead, AtBase: atBase})
 		}
@@ -1221,8 +1269,8 @@ func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, cha
 		}
 	}
 	if len(probes) == 0 {
-		ic.logger.Debug("no changed file could be a symlink, so no file modes are read",
-			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head)
+		ic.logger.Debug("no changed file could be a schema symlink, so no file modes are read",
+			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "scoped_to_schema_dirs", scope.bounded)
 		return nil
 	}
 	modes, err := ic.SymlinkModes(ctx, repo, change, probes)
@@ -1233,41 +1281,53 @@ func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, cha
 	levelCache := make(map[string][]TreeEntry)
 	// classify reads a path the diff showed as a symlink from the tree, to
 	// learn whether it can name a schema root or a namespace.
-	classify := func(ref, filePath string, symlink bool) (schemaSymlinkKind, error) {
+	classify := func(ref, filePath string, symlink bool) (schemaSymlinkKind, string, error) {
 		if !symlink {
-			return notSchemaSymlink, nil
+			return notSchemaSymlink, "", nil
 		}
-		kind, err := ic.schemaSymlinkKind(ctx, repo, ref, filePath, levelCache)
+		kind, targetDir, err := ic.schemaSymlinkKind(ctx, repo, ref, filePath, levelCache)
 		if err != nil {
-			return notSchemaSymlink, fmt.Errorf("classify symlink %s at %s: %w", filePath, ref, err)
+			return notSchemaSymlink, "", fmt.Errorf("classify symlink %s at %s: %w", filePath, ref, err)
 		}
-		return kind, nil
+		return kind, targetDir, nil
+	}
+	// vacates reports whether the change takes a directory symlink at the
+	// base out of the namespaces the base declared.
+	vacates := func(linkPath string, kind schemaSymlinkKind, targetDir string) (bool, error) {
+		if kind != directorySchemaSymlink {
+			return false, nil
+		}
+		return ic.directoryLinkDeclaresNamespace(ctx, repo, change.Base, linkPath, targetDir, levelCache)
 	}
 	for i := range files {
 		file := &files[i]
-		atHead, atBase, previousAtBase := symlinkCandidates(*file)
+		atHead, atBase, previousAtBase := schemaSymlinkCandidates(*file, scope)
 		if atHead {
-			kind, err := classify(change.Head, file.Filename, modes[file.Filename].Head)
+			kind, _, err := classify(change.Head, file.Filename, modes[file.Filename].Head)
 			if err != nil {
 				return err
 			}
 			file.Symlink = kind != notSchemaSymlink
 		}
 		if !file.Symlink && atBase {
-			kind, err := classify(change.Base, file.Filename, modes[file.Filename].Base)
+			kind, targetDir, err := classify(change.Base, file.Filename, modes[file.Filename].Base)
 			if err != nil {
 				return err
 			}
 			file.Symlink = kind != notSchemaSymlink
-			file.VacatedDirectoryLink = isRemovedPRFile(file.Status) && kind == directorySchemaSymlink
+			if file.VacatedDirectoryLink, err = vacates(file.Filename, kind, targetDir); err != nil {
+				return err
+			}
 		}
 		if previousAtBase {
-			kind, err := classify(change.Base, file.PreviousFilename, modes[file.PreviousFilename].Base)
+			kind, targetDir, err := classify(change.Base, file.PreviousFilename, modes[file.PreviousFilename].Base)
 			if err != nil {
 				return err
 			}
 			file.PreviousSymlink = kind != notSchemaSymlink
-			file.VacatedDirectoryLink = kind == directorySchemaSymlink
+			if file.VacatedDirectoryLink, err = vacates(file.PreviousFilename, kind, targetDir); err != nil {
+				return err
+			}
 		}
 		if file.Symlink || file.PreviousSymlink {
 			ic.logger.Debug("changed file is or was a schema symlink, so it counts as a schema input",
@@ -1302,86 +1362,154 @@ const maxSymlinkHops = 8
 
 // schemaSymlinkKind reports whether filePath at ref is a schema symlink: one
 // that names an environment's schema root or a namespace, or sits where one
-// would. Environment and namespace symlinks name directories, so a symlink
-// whose target is a file, such as a link between two documentation files or a
-// tool's bin link, is not one, unless it sits directly in a config directory,
-// where planning reads it as an environment's schema root and fails. A target
-// that cannot be resolved (outside the repository, missing, reached through
-// another symlinked directory, or behind a long chain) is treated as a
-// directory, so an unreadable link is never mistaken for one that changes
-// nothing.
-func (ic *InstallationClient) schemaSymlinkKind(ctx context.Context, repo, ref, filePath string, levelCache map[string][]TreeEntry) (schemaSymlinkKind, error) {
+// would. Both sit under a config directory: an environment's schema root
+// symlink directly in it, and a namespace symlink directly in a schema root,
+// which schema.ResolveEnvironmentSchemaRoot keeps inside the config
+// directory. A symlink with no config file in any directory above it is
+// therefore not one, and its target is never read. Environment and namespace
+// symlinks name directories, so a symlink whose target is a file, such as a
+// link between two documentation files or a tool's bin link, is not one,
+// unless it sits directly in a config directory, where planning reads it as
+// an environment's schema root and fails. A target that cannot be resolved
+// (outside the repository, missing, reached through another symlinked
+// directory, or behind a long chain) is treated as a directory, so an
+// unreadable link is never mistaken for one that changes nothing.
+//
+// targetDir is the repository-relative directory a directorySchemaSymlink
+// resolves to, or "" when the target could not be resolved.
+func (ic *InstallationClient) schemaSymlinkKind(ctx context.Context, repo, ref, filePath string, levelCache map[string][]TreeEntry) (kind schemaSymlinkKind, targetDir string, err error) {
 	entry, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, filePath, levelCache)
 	if errors.Is(err, errGitPathThroughNonTree) {
 		// A path below a file is not an entry of its own at ref.
-		return notSchemaSymlink, nil
+		return notSchemaSymlink, "", nil
 	}
 	if err != nil {
-		return notSchemaSymlink, err
+		return notSchemaSymlink, "", err
 	}
 	if !found || entry.Mode != gitSymlinkMode {
-		return notSchemaSymlink, nil
+		return notSchemaSymlink, "", nil
 	}
 
-	targetIsDirectory, err := ic.symlinkTargetIsDirectory(ctx, repo, ref, filePath, entry, levelCache)
+	configDir, underConfigDir, err := ic.nearestConfigDir(ctx, repo, ref, path.Dir(filePath), levelCache)
 	if err != nil {
-		return notSchemaSymlink, err
+		return notSchemaSymlink, "", err
+	}
+	if !underConfigDir {
+		ic.logger.Debug("changed symlink has no config file above it, so it is not a schema input and its target is not read",
+			"repo", repo, "ref", ref, "path", filePath)
+		return notSchemaSymlink, "", nil
+	}
+
+	targetIsDirectory, targetDir, err := ic.symlinkTargetIsDirectory(ctx, repo, ref, filePath, entry, levelCache)
+	if err != nil {
+		return notSchemaSymlink, "", err
 	}
 	if targetIsDirectory {
-		return directorySchemaSymlink, nil
+		return directorySchemaSymlink, targetDir, nil
 	}
-	_, _, inConfigDir, err := ic.resolveGitObjectSHA(ctx, repo, ref, path.Join(path.Dir(filePath), ConfigFileName), levelCache)
-	if err != nil {
-		return notSchemaSymlink, fmt.Errorf("look for %s beside %s: %w", ConfigFileName, filePath, err)
+	if configDir == path.Dir(filePath) {
+		return environmentSchemaSymlink, "", nil
 	}
-	if inConfigDir {
-		return environmentSchemaSymlink, nil
+	ic.logger.Debug("changed symlink points to a file and sits below, not in, a config directory, so it is not a schema input",
+		"repo", repo, "ref", ref, "path", filePath, "config_dir", configDir)
+	return notSchemaSymlink, "", nil
+}
+
+// nearestConfigDir returns the closest directory at or above dir that holds
+// a config file at ref, walking up to the repository root. Every level on the
+// way is one shallow tree read, cached for the rest of the change, so the
+// walk costs nothing once a sibling path has been resolved.
+func (ic *InstallationClient) nearestConfigDir(ctx context.Context, repo, ref, dir string, levelCache map[string][]TreeEntry) (configDir string, found bool, err error) {
+	for dir = path.Clean(dir); ; dir = path.Dir(dir) {
+		_, _, found, err := ic.resolveGitObjectSHA(ctx, repo, ref, path.Join(dir, ConfigFileName), levelCache)
+		if err != nil {
+			return "", false, fmt.Errorf("look for %s in %s: %w", ConfigFileName, dir, err)
+		}
+		if found {
+			return dir, true, nil
+		}
+		if dir == "." {
+			return "", false, nil
+		}
 	}
-	ic.logger.Debug("changed symlink points to a file outside a config directory, so it is not a schema input",
-		"repo", repo, "ref", ref, "path", filePath)
-	return notSchemaSymlink, nil
 }
 
 // symlinkTargetIsDirectory follows the symlink entry at linkPath to its
 // target and reports whether that is a directory, or a target the read
-// cannot resolve (see schemaSymlinkKind).
-func (ic *InstallationClient) symlinkTargetIsDirectory(ctx context.Context, repo, ref, linkPath string, entry TreeEntry, levelCache map[string][]TreeEntry) (bool, error) {
+// cannot resolve (see schemaSymlinkKind). targetDir is the resolved
+// directory, or "" when the target could not be resolved.
+func (ic *InstallationClient) symlinkTargetIsDirectory(ctx context.Context, repo, ref, linkPath string, entry TreeEntry, levelCache map[string][]TreeEntry) (isDirectory bool, targetDir string, err error) {
 	for range maxSymlinkHops {
 		target, err := ic.FetchBlobContent(ctx, repo, entry.SHA)
 		if err != nil {
-			return false, fmt.Errorf("read the target of symlink %s: %w", linkPath, err)
+			return false, "", fmt.Errorf("read the target of symlink %s: %w", linkPath, err)
 		}
 		resolved := path.Clean(path.Join(path.Dir(linkPath), target))
 		if path.IsAbs(target) || resolved == ".." || strings.HasPrefix(resolved, "../") {
 			ic.logger.Debug("symlink target leaves the repository, so it is treated as a directory",
 				"repo", repo, "ref", ref, "path", linkPath, "target", target)
-			return true, nil
+			return true, "", nil
 		}
 		next, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, resolved, levelCache)
 		if errors.Is(err, errGitPathThroughNonTree) {
 			ic.logger.Debug("symlink target is reached through another symlink, so it is treated as a directory",
 				"repo", repo, "ref", ref, "path", linkPath, "target", resolved)
-			return true, nil
+			return true, "", nil
 		}
 		if err != nil {
-			return false, fmt.Errorf("resolve the target %s of symlink %s: %w", resolved, linkPath, err)
+			return false, "", fmt.Errorf("resolve the target %s of symlink %s: %w", resolved, linkPath, err)
 		}
 		switch {
 		case !found:
 			ic.logger.Debug("symlink target is missing, so it is treated as a directory",
 				"repo", repo, "ref", ref, "path", linkPath, "target", resolved)
-			return true, nil
+			return true, "", nil
 		case next.Type == "tree":
-			return true, nil
+			return true, resolved, nil
 		case next.Mode == gitSymlinkMode:
 			linkPath, entry = resolved, next
 		default:
-			return false, nil
+			return false, "", nil
 		}
 	}
 	ic.logger.Debug("symlink chain is longer than the hop limit, so it is treated as a directory",
 		"repo", repo, "ref", ref, "path", linkPath, "max_hops", maxSymlinkHops)
-	return true, nil
+	return true, "", nil
+}
+
+// directoryLinkDeclaresNamespace reports whether the directory symlink at
+// linkPath declared a namespace at ref: whether targetDir held a schema file
+// directly inside it, which is what discovery reads through a namespace
+// symlink. Removing a link whose target held none empties no namespace, so
+// planning must not read the removal as one, or it would propose dropping
+// every table in a namespace the base never declared. A target that could not
+// be resolved (targetDir "") counts as declaring one, so an unreadable link is
+// never mistaken for one that changes nothing.
+func (ic *InstallationClient) directoryLinkDeclaresNamespace(ctx context.Context, repo, ref, linkPath, targetDir string, levelCache map[string][]TreeEntry) (bool, error) {
+	if targetDir == "" {
+		ic.logger.Debug("vacated directory symlink has an unresolved target, so it is treated as declaring a namespace",
+			"repo", repo, "ref", ref, "path", linkPath)
+		return true, nil
+	}
+	treeSHA, found, err := ic.resolveGitTreeSHA(ctx, repo, ref, targetDir, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve the target %s of symlink %s: %w", targetDir, linkPath, err)
+	}
+	if !found {
+		return false, fmt.Errorf("resolve the target %s of symlink %s: it resolved to a directory but is no longer one", targetDir, linkPath)
+	}
+	entries, err := ic.treeLevel(ctx, repo, treeSHA, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("list the target %s of symlink %s: %w", targetDir, linkPath, err)
+	}
+	for _, entry := range entries {
+		if entry.Type == "blob" && entry.Mode != gitSymlinkMode && isManagedSchemaFile(entry.Path) {
+			return true, nil
+		}
+	}
+	ic.logger.Debug("vacated directory symlink pointed at a directory with no schema file, so it declared no namespace",
+		"repo", repo, "ref", ref, "path", linkPath, "target", targetDir)
+	return false, nil
 }
 
 // SchemaPathsChangedSinceMergeBase reports whether any schema path has a
@@ -2979,19 +3107,9 @@ func (ic *InstallationClient) resolveGitTreeEntry(ctx context.Context, repo, ref
 	treeSHA := ref
 	segments := strings.Split(cleanPath, "/")
 	for i, segment := range segments {
-		levelEntries, cached := levelCache[treeSHA]
-		if !cached {
-			levelEntries, cached = ic.treeLevels.get(repo, treeSHA)
-		}
-		if !cached {
-			levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
-			if err != nil {
-				return TreeEntry{}, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
-			}
-			ic.treeLevels.put(repo, treeSHA, levelEntries)
-		}
-		if levelCache != nil {
-			levelCache[treeSHA] = levelEntries
+		levelEntries, err := ic.treeLevel(ctx, repo, treeSHA, levelCache)
+		if err != nil {
+			return TreeEntry{}, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
 		}
 		var matched *TreeEntry
 		for _, levelEntry := range levelEntries {
@@ -3013,6 +3131,28 @@ func (ic *InstallationClient) resolveGitTreeEntry(ctx context.Context, repo, ref
 		treeSHA = matched.SHA
 	}
 	return TreeEntry{}, false, nil
+}
+
+// treeLevel returns the entries directly in the tree treeSHA names (a tree
+// SHA, or a ref for its root tree), from the per-change levelCache, then the
+// client's cache of immutable tree levels, then one shallow tree read.
+func (ic *InstallationClient) treeLevel(ctx context.Context, repo, treeSHA string, levelCache map[string][]TreeEntry) ([]TreeEntry, error) {
+	levelEntries, cached := levelCache[treeSHA]
+	if !cached {
+		levelEntries, cached = ic.treeLevels.get(repo, treeSHA)
+	}
+	if !cached {
+		var err error
+		levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
+		if err != nil {
+			return nil, err
+		}
+		ic.treeLevels.put(repo, treeSHA, levelEntries)
+	}
+	if levelCache != nil {
+		levelCache[treeSHA] = levelEntries
+	}
+	return levelEntries, nil
 }
 
 // FetchBlobContent fetches file content using the Git Blob API.

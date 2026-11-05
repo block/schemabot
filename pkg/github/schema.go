@@ -282,14 +282,18 @@ func vacatedSchemaPath(file PRFile) (string, bool) {
 	return vacated, true
 }
 
-// vacatedSchemaInput returns the path a removal or rename vacates and whether
-// it named a symlink at the base.
+// vacatedSchemaInput returns the path a change vacates and whether it named a
+// symlink at the base: a removal's own path, a rename's previous path, or the
+// path of a directory symlink the change replaced with something else, which
+// stays in place but no longer names a namespace.
 func vacatedSchemaInput(file PRFile) (vacated string, symlink, ok bool) {
 	switch {
 	case isRemovedPRFile(file.Status):
 		return file.Filename, file.Symlink, true
 	case isRenamedPRFile(file.Status):
 		return file.PreviousFilename, file.PreviousSymlink, true
+	case file.VacatedDirectoryLink:
+		return file.Filename, true, true
 	default:
 		return "", false, false
 	}

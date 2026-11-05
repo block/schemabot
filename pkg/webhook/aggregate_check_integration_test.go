@@ -7,6 +7,7 @@ package webhook
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -542,17 +544,32 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 // files and allowed_environments is configured, passing aggregate checks are posted
 // so branch protection isn't blocked. A one-line edit and a symlink between two
 // documentation files could be symlinks by their line counts, so the listing reads
-// their modes and the link's target, and neither is a schema input.
+// their modes and the link's target, and neither is a schema input. When GitHub
+// cannot build the PR's diff in time, the modes come from listing the changed
+// files' directories instead, and the PR still passes.
 func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		files []*gh.CommitFile
 		// root is the head commit's root tree.
 		root []*gh.TreeEntry
+		// diffUnavailable makes GitHub answer the PR's compare diff with
+		// 422 "The diff is taking too long to generate.", the same on
+		// every delivery, so file modes have to come from directory
+		// listings.
+		diffUnavailable bool
 	}{
 		{
 			name:  "multi-line documentation edit",
 			files: []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)}},
+		},
+		{
+			name:  "one-line documentation edit when GitHub cannot build the diff in time",
+			files: []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(1), Deletions: new(1)}},
+			root: []*gh.TreeEntry{
+				{Path: new("README.md"), Mode: new("100644"), Type: new("blob"), SHA: new("readme-blob")},
+			},
+			diffUnavailable: true,
 		},
 		{
 			name: "one-line documentation edit and a documentation symlink",
@@ -602,7 +619,37 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"merge_base_commit": map[string]any{"sha": "def456"}})
 			})
 			mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456...abc123", func(w http.ResponseWriter, _ *http.Request) {
+				if tc.diffUnavailable {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_, _ = io.WriteString(w, `{"message":"The diff is taking too long to generate.","status":"422"}`)
+					return
+				}
 				writeCommitFilesDiff(t, w, tc.files, "CLAUDE.md")
+			})
+			// Directory listings answer the file modes the diff could not:
+			// every directory asked for, at either commit, is the root.
+			mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+				assert.True(t, tc.diffUnavailable, "file modes come from the diff when GitHub serves it")
+				var body struct {
+					Variables map[string]any `json:"variables"`
+				}
+				assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				ref, _ := body.Variables["ref"].(string)
+				repository := map[string]any{"ref": map[string]any{"oid": ref}}
+				for name := range body.Variables {
+					if !strings.HasPrefix(name, "e") {
+						continue
+					}
+					var entries []map[string]any
+					for _, entry := range tc.root {
+						mode, err := strconv.ParseInt(entry.GetMode(), 8, 0)
+						assert.NoError(t, err)
+						entries = append(entries, map[string]any{"name": entry.GetPath(), "mode": mode})
+					}
+					repository["d"+strings.TrimPrefix(name, "e")] = map[string]any{"entries": entries}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": repository}})
 			})
 			mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new("def456"), Entries: []*gh.TreeEntry{

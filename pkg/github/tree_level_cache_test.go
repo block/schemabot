@@ -66,3 +66,32 @@ func TestTreeLevelCacheStartsOverAtItsLimit(t *testing.T) {
 	_, ok = cache.get("octocat/other", second)
 	assert.False(t, ok, "levels are kept per repository")
 }
+
+// A level is kept only when it can be trusted later and fits the cache: one
+// read by a branch name or short SHA can name another tree later, so it is
+// never stored, and one larger than the whole cache is never stored either,
+// and does not evict what the cache already holds. A level that exactly fills
+// the cache is stored.
+func TestTreeLevelCacheKeepsOnlyImmutableLevelsThatFit(t *testing.T) {
+	cache := newTreeLevelCache()
+	kept := strings.Repeat("e", 40)
+	cache.put("octocat/hello-world", kept, make([]TreeEntry, 1))
+
+	for _, ref := range []string{"main", "e1a2b3c", strings.Repeat("e", 39), strings.Repeat("E", 40)} {
+		cache.put("octocat/hello-world", ref, make([]TreeEntry, 1))
+	}
+	oversized := strings.Repeat("f", 40)
+	cache.put("octocat/hello-world", oversized, make([]TreeEntry, maxCachedTreeEntries+1))
+
+	assert.Equal(t, map[treeLevelKey][]TreeEntry{{"octocat/hello-world", kept}: make([]TreeEntry, 1)}, cache.levels,
+		"neither a level read by something other than a full object name nor one larger than the cache is stored, and refusing them leaves the cache as it was")
+	assert.Equal(t, 1, cache.entries)
+	_, ok := cache.get("octocat/hello-world", kept)
+	assert.True(t, ok)
+
+	exact := newTreeLevelCache()
+	full := strings.Repeat("0", 40)
+	exact.put("octocat/hello-world", full, make([]TreeEntry, maxCachedTreeEntries))
+	_, ok = exact.get("octocat/hello-world", full)
+	assert.True(t, ok, "a level that exactly fills the cache is stored")
+}
