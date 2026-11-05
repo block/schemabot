@@ -104,6 +104,95 @@ func testMarkStaleApplyRetryableLeases(t *testing.T, newStore func(*testing.T) *
 		assert.False(t, moved, "a parent is never moved under a live operation drive")
 		assertStaleRunningTree(t, ctx, store, apply.ID, opID)
 	})
+
+	// The parent's heartbeat can read stale while the named operation is
+	// still being driven: the operation refuses first, and the parent is not
+	// reached.
+	t.Run("the named operation's own fresh lease keeps both rows", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		apply, opID := seedStaleRunningTree(t, ctx, store, "stale_fresh_op")
+		_, err := store.db.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET lease_acquired_at = NOW(), updated_at = NOW()
+			WHERE id = ?
+		`, opID)
+		require.NoError(t, err)
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID: apply.ID, ApplyLeaseToken: "token-apply",
+			OperationID: opID, OperationLeaseToken: "token-op",
+			ErrorMessage: "copy of users failed and may be retried",
+		})
+		require.NoError(t, err)
+		assert.False(t, moved, "an operation a driver is heartbeating is never reopened")
+		op, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, op)
+		assert.Equal(t, state.ApplyOperation.Running, op.State)
+		assert.Equal(t, "token-op", op.LeaseToken)
+		parent, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, parent)
+		assert.Equal(t, state.Apply.Running, parent.State)
+		assert.Equal(t, "token-apply", parent.LeaseToken)
+	})
+
+	// The operation matches on id, state, token, and staleness; only its
+	// parent differs from the apply named in the request.
+	t.Run("an operation of another apply is refused", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		apply, opID := seedStaleRunningTree(t, ctx, store, "stale_own_tree")
+		otherApply, otherOpID := seedStaleRunningTree(t, ctx, store, "stale_other_tree")
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID: apply.ID, ApplyLeaseToken: "token-apply",
+			OperationID: otherOpID, OperationLeaseToken: "token-op",
+			ErrorMessage: "copy of users failed and may be retried",
+		})
+		require.NoError(t, err)
+		assert.False(t, moved, "an operation is only ever moved with its own parent")
+		assertStaleRunningTree(t, ctx, store, apply.ID, opID)
+		assertStaleRunningTree(t, ctx, store, otherApply.ID, otherOpID)
+	})
+
+	// The caller observed the operation running, but it settled before the
+	// write: a finished operation keeps its result and its parent stays where
+	// it is.
+	t.Run("a completed operation is never reopened", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		apply, opID := seedStaleRunningTree(t, ctx, store, "stale_completed_op")
+		_, err := store.db.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET state = ?, completed_at = NOW()
+			WHERE id = ?
+		`, state.ApplyOperation.Completed, opID)
+		require.NoError(t, err)
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID: apply.ID, ApplyLeaseToken: "token-apply",
+			OperationID: opID, OperationLeaseToken: "token-op",
+			ErrorMessage: "copy of users failed and may be retried",
+		})
+		require.NoError(t, err)
+		assert.False(t, moved, "a settled operation keeps its result")
+		op, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, op)
+		assert.Equal(t, state.ApplyOperation.Completed, op.State)
+		assert.NotNil(t, op.CompletedAt)
+		parent, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, parent)
+		assert.Equal(t, state.Apply.Running, parent.State)
+		assert.Equal(t, "token-apply", parent.LeaseToken)
+		assert.Empty(t, parent.ErrorMessage)
+	})
 }
 
 // seedStaleRunningTree creates a running apply with one running operation,
