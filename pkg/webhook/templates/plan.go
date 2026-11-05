@@ -2714,7 +2714,15 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 // to make a destructive drop safe.
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
-	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
+	count := fmt.Sprintf("%d unsafe %s detected", n, pluralize("change", n))
+	folded := n > unsafeFindingsFoldThreshold
+	if folded {
+		// GitHub renders <summary> content as HTML, not markdown, so the folded
+		// header bolds with <b> tags instead of asterisks.
+		fmt.Fprintf(sb, "<details>\n<summary>%s <b>Issues</b>: %s</summary>\n\n", glyph.Attention, count)
+	} else {
+		fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, count)
+	}
 	item := 0
 	for _, c := range changes {
 		note := attributionNotes[c.Table]
@@ -2722,6 +2730,9 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attribu
 			note = ""
 		}
 		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, note)
+	}
+	if folded {
+		sb.WriteString("\n</details>\n")
 	}
 	if len(attributionNotes) > 0 {
 		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
@@ -2964,6 +2975,13 @@ func dropCountsWithTableFallback(drops unsafeDropCounts, changeType string) unsa
 // a single advisory finding never needs a click; long lists stop dominating
 // the plan comment while the count stays visible in the header.
 const lintWarningsFoldThreshold = 5
+
+// unsafeFindingsFoldThreshold is the finding count above which the unsafe
+// Issues list collapses into a details block, as the lint section does. The
+// header keeps the count in view, and the apply instruction still names the
+// tables `--allow-unsafe` consents to, so folding a long list hides no
+// disclosure an operator confirms against.
+const unsafeFindingsFoldThreshold = lintWarningsFoldThreshold
 
 // writeLintViolations writes advisory lint findings. Lint warnings never block
 // an apply, so they render with a lighter marker than the unsafe-change Issues

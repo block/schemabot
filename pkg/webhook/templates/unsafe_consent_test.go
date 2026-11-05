@@ -327,3 +327,31 @@ func TestRenderPlanComment_UnsafeConsentCoversOtherTargets(t *testing.T) {
 	require.True(t, found, "the comment offers an apply")
 	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes on `users` and `legacy`:\n```\nschemabot apply -e production\n```\n", footer)
 }
+
+// A long unsafe list folds into a details block, as a long lint list does, so
+// it stops burying the plan under it. The header keeps the count in view, the
+// numbered findings stay intact inside the block, and the apply instruction
+// still names every table the flag consents to. A short list stays open, so a
+// few findings never need a click.
+func TestRenderPlanComment_LongUnsafeListFolds(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = nil
+	for _, table := range []string{"loans", "refunds", "ledger"} {
+		data.UnsafeChanges = append(data.UnsafeChanges,
+			UnsafeChangeData{Table: table, Reason: "Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+			UnsafeChangeData{Table: table, Reason: "Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+		)
+	}
+	require.Greater(t, len(data.UnsafeChanges), unsafeFindingsFoldThreshold)
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "<details>\n<summary>"+glyph.Attention+" <b>Issues</b>: 6 unsafe changes detected</summary>\n\n1. `loans`: Column `created_at` uses `TIMESTAMP`")
+	assert.Contains(t, out, "6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n")
+	assert.NotContains(t, out, "**Issues**", "the folded header bolds with HTML, which a summary renders")
+	assert.Contains(t, out, "to confirm 6 unsafe changes on `loans`, `refunds` and `ledger`:")
+
+	data.UnsafeChanges = data.UnsafeChanges[:unsafeFindingsFoldThreshold]
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, glyph.Attention+" **Issues**: 5 unsafe changes detected\n1. `loans`:")
+	assert.NotContains(t, out, "<b>Issues</b>")
+}
