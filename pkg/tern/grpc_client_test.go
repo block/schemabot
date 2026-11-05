@@ -10520,14 +10520,16 @@ func (o *supersededFakeObserver) Superseded() bool { return o.superseded.Load() 
 func TestClearObserverIfCurrent(t *testing.T) {
 	oldObs := &supersededFakeObserver{}
 	newObs := &supersededFakeObserver{}
-	client := &GRPCClient{observers: map[int64]ProgressObserver{1: oldObs}}
+	oldReg := &observerRegistration{observer: oldObs}
+	newReg := &observerRegistration{observer: newObs}
+	client := &GRPCClient{observers: map[int64]*observerRegistration{1: oldReg}}
 
-	client.observers[1] = newObs
-	assert.False(t, client.clearObserverIfCurrent(1, oldObs),
+	client.observers[1] = newReg
+	assert.False(t, client.clearObserverIfCurrent(1, oldReg),
 		"a replaced observer must not clear its replacement")
 	assert.Same(t, newObs, client.getObserver(1), "the replacement stays registered")
 
-	assert.True(t, client.clearObserverIfCurrent(1, newObs),
+	assert.True(t, client.clearObserverIfCurrent(1, newReg),
 		"the current observer clears itself")
 	assert.Nil(t, client.getObserver(1))
 }
@@ -10815,42 +10817,59 @@ func (o *blockingTerminalObserver) OnTerminal(*storage.Apply, []*storage.Task) {
 	<-o.release
 }
 
+// nonComparableObserver is a valid ProgressObserver whose dynamic type cannot
+// be compared: comparing two of them as interface values panics.
+type nonComparableObserver struct {
+	*blockingTerminalObserver
+	labels []string
+}
+
 // Starting a stopped apply registers a new observer for it while the stopped
 // observer may still be publishing its terminal update. The poll loop that
 // delivered the stop must hand the apply to the new observer rather than
 // clear it: the new registration started no poller of its own, so clearing it
-// leaves the resumed apply with no progress or terminal updates at all.
+// leaves the resumed apply with no progress or terminal updates at all. The
+// hand-off must not depend on the observers being comparable.
 func TestObserverPollKeepsAnObserverRegisteredDuringTerminal(t *testing.T) {
-	const applyID int64 = 78
-	applies := &switchableApplyStore{apply: storage.Apply{
-		ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
-	}}
-	client := &GRPCClient{
-		storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
-		observerPollInterval: 10 * time.Millisecond,
+	for name, wrap := range map[string]func(*blockingTerminalObserver) ProgressObserver{
+		"pointer observer": func(o *blockingTerminalObserver) ProgressObserver { return o },
+		"non-comparable observer": func(o *blockingTerminalObserver) ProgressObserver {
+			return nonComparableObserver{o, []string{"resume"}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			const applyID int64 = 78
+			applies := &switchableApplyStore{apply: storage.Apply{
+				ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
+			}}
+			client := &GRPCClient{
+				storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
+				observerPollInterval: 10 * time.Millisecond,
+			}
+
+			stopped := newBlockingTerminalObserver()
+			client.SetObserver(applyID, wrap(stopped))
+			select {
+			case <-stopped.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the stopped apply never reached its observer's OnTerminal")
+			}
+
+			resumed := newBlockingTerminalObserver()
+			close(resumed.release)
+			applies.setState(state.Apply.Running)
+			client.SetObserver(applyID, wrap(resumed))
+			close(stopped.release)
+
+			require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+				5*time.Second, 10*time.Millisecond,
+				"the resumed apply's observer must receive progress")
+
+			applies.setState(state.Apply.Completed)
+			require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+				5*time.Second, 10*time.Millisecond,
+				"the resumed apply's observer must receive its terminal update and then be cleared")
+			assert.Equal(t, int32(1), stopped.terminal.Load(), "the stopped observer's terminal update runs once")
+		})
 	}
-
-	stopped := newBlockingTerminalObserver()
-	client.SetObserver(applyID, stopped)
-	select {
-	case <-stopped.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the stopped apply never reached its observer's OnTerminal")
-	}
-
-	resumed := newBlockingTerminalObserver()
-	close(resumed.release)
-	applies.setState(state.Apply.Running)
-	client.SetObserver(applyID, resumed)
-	close(stopped.release)
-
-	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
-		5*time.Second, 10*time.Millisecond,
-		"the resumed apply's observer must receive progress")
-
-	applies.setState(state.Apply.Completed)
-	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
-		5*time.Second, 10*time.Millisecond,
-		"the resumed apply's observer must receive its terminal update and then be cleared")
-	assert.Equal(t, int32(1), stopped.terminal.Load(), "the stopped observer's terminal update runs once")
 }

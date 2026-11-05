@@ -149,7 +149,7 @@ type GRPCClient struct {
 	// For GRPCClient, the observer is notified by the local progress poller,
 	// not by the remote engine.
 	observerMu      sync.RWMutex
-	observers       map[int64]ProgressObserver
+	observers       map[int64]*observerRegistration
 	pendingObserver ProgressObserver
 	// observerPollInterval overrides the observer notification cadence; zero
 	// selects the production default. Tests set a short interval so poll-loop
@@ -419,10 +419,10 @@ func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
 		return
 	}
 	if c.observers == nil {
-		c.observers = make(map[int64]ProgressObserver)
+		c.observers = make(map[int64]*observerRegistration)
 	}
 	_, alreadyWatching := c.observers[applyID]
-	c.observers[applyID] = observer
+	c.observers[applyID] = &observerRegistration{observer: observer}
 	shouldStartPoller := c.storage != nil && !alreadyWatching
 	c.observerMu.Unlock()
 
@@ -515,8 +515,24 @@ func (c *GRPCClient) consumePendingObserver() ProgressObserver {
 	return obs
 }
 
+// observerRegistration is one SetObserver call's entry in the observer map.
+// Each call allocates a new one, so a poller tells whether its observer was
+// replaced by comparing pointers. Comparing the observers themselves would
+// panic for an observer whose dynamic type is not comparable.
+type observerRegistration struct {
+	observer ProgressObserver
+}
+
 // getObserver returns the observer for an apply, or nil.
 func (c *GRPCClient) getObserver(applyID int64) ProgressObserver {
+	if reg := c.currentRegistration(applyID); reg != nil {
+		return reg.observer
+	}
+	return nil
+}
+
+// currentRegistration returns the apply's observer registration, or nil.
+func (c *GRPCClient) currentRegistration(applyID int64) *observerRegistration {
 	c.observerMu.RLock()
 	defer c.observerMu.RUnlock()
 	return c.observers[applyID]
@@ -529,16 +545,16 @@ func (c *GRPCClient) clearObserver(applyID int64) {
 	delete(c.observers, applyID)
 }
 
-// clearObserverIfCurrent removes the observer for applyID only if obs is still
+// clearObserverIfCurrent removes the observer for applyID only if reg is still
 // the registered one, and reports whether it removed it. SetObserver treats an
 // existing registration as proof that a poller is already running, so a poller
 // that is about to exit must not blindly delete the map entry — a newer
 // observer may have replaced its own between reads, and deleting that
 // replacement would leave it registered-looking but never polled.
-func (c *GRPCClient) clearObserverIfCurrent(applyID int64, obs ProgressObserver) bool {
+func (c *GRPCClient) clearObserverIfCurrent(applyID int64, reg *observerRegistration) bool {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
-	if c.observers[applyID] != obs {
+	if c.observers[applyID] != reg {
 		return false
 	}
 	delete(c.observers, applyID)
@@ -660,12 +676,13 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 	}
 
 	for range ticker.C {
-		obs := c.getObserver(applyID)
-		if obs == nil {
+		reg := c.currentRegistration(applyID)
+		if reg == nil {
 			// Observer was cleared — apply reached terminal state and
 			// OnTerminal already ran. Stop polling.
 			return
 		}
+		obs := reg.observer
 
 		// An observer that permanently lost its apply lease to a newer owner
 		// will never publish again — the new owner's observer carries the
@@ -674,7 +691,7 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 		// observer: if a newer registration already replaced it, leave the
 		// replacement in place and drive it on the next tick.
 		if sup, ok := obs.(supersededObserver); ok && sup.Superseded() {
-			if c.clearObserverIfCurrent(applyID, obs) {
+			if c.clearObserverIfCurrent(applyID, reg) {
 				c.baseLogger().Info("observer poll: observer superseded by a newer apply owner; stopping poll",
 					identArgs()...)
 				return
@@ -715,7 +732,7 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 			// while OnTerminal is still publishing the stop. That registration
 			// found this poller running and started none of its own, so clear
 			// only the observer just notified and keep driving a replacement.
-			if c.clearObserverIfCurrent(applyID, obs) {
+			if c.clearObserverIfCurrent(applyID, reg) {
 				return
 			}
 			c.applyLogger(apply).Info("observer poll: observer replaced during its terminal update; continuing with the replacement",
