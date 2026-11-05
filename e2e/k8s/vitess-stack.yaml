@@ -280,9 +280,21 @@ spec:
               done
               for f in /fixtures/*.json; do
                 entity_type=$(basename "$f" .json)
-                if curl -sf "http://etre:8080/api/v1/entities/$entity_type?query=_id!=0" | grep -q '"_id"'; then
+                # Etre entities are flat label maps, so each fixture entity has
+                # exactly one "name" key. A failed lookup fails the Job rather
+                # than reading as an empty collection, and a type holding only
+                # part of its fixture, as a multi-entity POST that failed
+                # partway leaves it, fails rather than counting as seeded.
+                want=$(($(grep -o '"name"' "$f" | wc -l)))
+                existing=$(curl -sf "http://etre:8080/api/v1/entities/$entity_type?query=_id!=0") || { echo "looking up $entity_type failed"; exit 1; }
+                have=$(($(printf '%s' "$existing" | grep -o '"_id"' | wc -l)))
+                if [ "$have" -ge "$want" ]; then
                   echo "$entity_type already seeded, skipping"
                   continue
+                fi
+                if [ "$have" -gt 0 ]; then
+                  echo "$entity_type holds $have of the $want entities in $f; delete the namespace and rerun"
+                  exit 1
                 fi
                 echo "seeding $entity_type from $f"
                 curl -sf -X POST "http://etre:8080/api/v1/entities/$entity_type" \
