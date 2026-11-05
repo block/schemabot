@@ -2075,6 +2075,36 @@ target that logged nothing:
 
 </details>
 
+A data plane that predates target reads cannot narrow its log to one target. A
+deployment read never shows its entries as the target's log: that source moves
+to `errors` with reason `upgrade_required`, and the other sources still return.
+
+<details>
+<summary>Target read from a data plane that predates target reads</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&deployment=us-east&target=shop-002
+```
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "deployment": "us-east",
+  "target": "shop-002",
+  "sources": [],
+  "errors": [{
+    "external_id": "remote-apply-example-73",
+    "target": "shop-002",
+    "operations": [{"operation_key": "shop-002", "target": "shop-002", "operation_kind": "work"}],
+    "code": "UnsupportedCapability",
+    "reason": "upgrade_required",
+    "message": "The selected data plane does not support reading one target's logs; upgrade it or omit --target."
+  }]
+}
+```
+
+</details>
+
 ### Read one shard's log
 
 A sharded apply runs each shard's work as its own operation, and every one of

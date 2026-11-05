@@ -998,11 +998,16 @@ message ApplyLog {
 message LogsResponse {
   string apply_id = 1;
   repeated ApplyLog logs = 2;
+  // The target the read was narrowed to, echoing LogsRequest.target; empty
+  // when the read covers every target. A data plane that predates target log
+  // reads ignores the field and leaves this empty, so a caller that asked for
+  // one target must treat a missing or different echo as an unnarrowed read.
+  string target = 3;
   // The shard the read was narrowed to, echoing LogsRequest.shard; empty when
   // the read covers every shard. A data plane that predates LogsRequest.shard
   // ignores the field and leaves this empty, so a caller that asked for one
   // shard must treat a missing or different echo as an unnarrowed read.
-  string shard = 3;
+  string shard = 4;
 }
 
 // ShardProgress contains progress information for a single Vitess shard.

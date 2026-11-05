@@ -4077,7 +4077,7 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if err != nil {
 		return nil, fmt.Errorf("get recent logs for apply %s: %w", req.ApplyId, err)
 	}
-	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Shard: req.Shard, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
+	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Target: req.Target, Shard: req.Shard, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
 	for _, log := range logs {
 		entry := &ternv1.ApplyLog{Id: log.ID, Level: log.Level, EventType: log.EventType, Source: log.Source, Message: log.Message, OldState: log.OldState, NewState: log.NewState, MetadataJson: log.Metadata, CreatedAt: log.CreatedAt.UTC().Format(time.RFC3339Nano)}
 		if log.TaskID != nil {

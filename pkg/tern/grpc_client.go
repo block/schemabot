@@ -4962,6 +4962,13 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 					append(storedApply.MutableLogAttrs(), "table", storedTask.TableName, "shard", sh.Shard)...)
 				return
 			}
+			if ctx.Err() != nil {
+				// The reconcile context ended (shutdown, lease release, or its
+				// deadline), so every further shard would fail the same way.
+				// Stop; the next reconcile re-applies the breakdown.
+				logShardProgressEncodeStopped(ctx, logger, storedApply, storedTask, sh.Shard, err)
+				return
+			}
 			logger.ErrorContext(ctx, "failed to encode remote per-shard progress into control-plane storage",
 				append(storedApply.MutableLogAttrs(),
 					"apply_operation_id", *storedTask.ApplyOperationID,
@@ -4969,6 +4976,22 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 					"error", err)...)
 		}
 	}
+}
+
+// logShardProgressEncodeStopped logs why a per-shard progress encode stopped
+// because its reconcile context ended. Cancellation is how a drive stops on
+// shutdown or lease release, so it is routine; a deadline means the reconcile
+// ran out of time and is worth a warning.
+func logShardProgressEncodeStopped(ctx context.Context, logger *slog.Logger, storedApply *storage.Apply, storedTask *storage.Task, shard string, err error) {
+	attrs := append(storedApply.MutableLogAttrs(),
+		"apply_operation_id", *storedTask.ApplyOperationID,
+		"namespace", storedTask.Namespace, "table", storedTask.TableName, "shard", shard,
+		"cause", context.Cause(ctx), "error", err)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		logger.InfoContext(ctx, "stopping remote per-shard progress encode: reconcile context was cancelled", attrs...)
+		return
+	}
+	logger.WarnContext(ctx, "stopping remote per-shard progress encode: reconcile context deadline passed", attrs...)
 }
 
 // reconcileStoredTasksForTerminalRemoteApply force-resolves any stored task the
