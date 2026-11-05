@@ -434,13 +434,15 @@ const (
 	engineLogsOperation     = "read_engine_logs"
 )
 
-// deploymentLogRecordError reports a source whose log records could not be
-// decoded. Unlike a transport failure, retrying cannot help — the data plane
-// returned records the control plane does not understand.
+// deploymentLogTargetUnsupportedError reports a source whose data plane did
+// not narrow a target-scoped read, because it predates target reads.
 func deploymentLogTargetUnsupportedError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
 	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "UnsupportedCapability", Reason: "upgrade_required", Message: "The selected data plane does not support reading one target's logs; upgrade it or omit --target."}
 }
 
+// deploymentLogRecordError reports a source whose log records could not be
+// decoded. Unlike a transport failure, retrying cannot help — the data plane
+// returned records the control plane does not understand.
 func deploymentLogRecordError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
 	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "MalformedRemoteLog", Reason: "malformed_remote_log", Message: "The data plane returned log records SchemaBot could not decode; check server logs."}
 }
