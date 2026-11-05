@@ -276,10 +276,13 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 		step = "Request a review from a database operator or admin"
 	}
 	// A reviewer who approved without being authorized may belong in one of
-	// the listed teams; membership is checked on every apply, so joining one
-	// lets an approval of the latest commit count. Someone who approved an
-	// earlier commit is also asked to approve the latest one.
-	addToTeam := len(data.UnauthorizedApprovers) > 0 && listsTeam(data)
+	// the database's operator teams; membership is checked on every apply, so
+	// joining one lets an approval of the latest commit count. Admin and
+	// CODEOWNERS teams are never offered, since joining one grants approval
+	// beyond this database. Someone who approved an earlier commit is also
+	// asked to approve the latest one.
+	operatorTeams := teamsIn(data.OperatorReviewers)
+	addToTeam := len(data.UnauthorizedApprovers) > 0 && len(operatorTeams) > 0
 	if addToTeam {
 		var headApprovers []string
 		for _, approver := range data.UnauthorizedApprovers {
@@ -287,10 +290,13 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 				headApprovers = append(headApprovers, approver)
 			}
 		}
-		teams := "one of the teams listed above"
+		teams := joinWithOr(mentions(operatorTeams))
 		if len(headApprovers) > 0 {
 			step += fmt.Sprintf(", or add %s to %s", joinWithAnd(mentions(headApprovers)), teams)
-			teams = "one of them"
+			teams = "it"
+			if len(operatorTeams) > 1 {
+				teams = "one of them"
+			}
 		}
 		if len(data.UnauthorizedEarlierApprovers) > 0 {
 			step += fmt.Sprintf(", or add %s to %s and ask them to approve the latest commit", joinWithAnd(mentions(data.UnauthorizedEarlierApprovers)), teams)
@@ -304,15 +310,16 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 	fmt.Fprintf(sb, "2. Once approved, run `schemabot apply -e %s` again\n", data.Environment)
 }
 
-// listsTeam reports whether any listed reviewer is a GitHub team ("org/team")
-// rather than a user.
-func listsTeam(data ReviewGateData) bool {
-	for _, principal := range slices.Concat(data.OperatorReviewers, data.OtherReviewers) {
+// teamsIn returns the GitHub teams ("org/team") among principals, leaving out
+// user logins.
+func teamsIn(principals []string) []string {
+	var teams []string
+	for _, principal := range principals {
 		if strings.Contains(principal, "/") {
-			return true
+			teams = append(teams, principal)
 		}
 	}
-	return false
+	return teams
 }
 
 // writeMentionList renders teams ("org/team") and user logins as a bulleted

@@ -4493,7 +4493,7 @@ Schema changes require approval from an authorized reviewer before applying.
 - @acme/schema-reviewers
 
 ### Next steps
-1. Request a review from anyone listed above, or add @jdoe to one of the teams listed above
+1. Request a review from anyone listed above, or add @jdoe to @acme/testapp-operators
 2. Then run `schemabot apply -e production` again
 
 </details>
