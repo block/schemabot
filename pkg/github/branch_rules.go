@@ -27,7 +27,7 @@ func (ic *InstallationClient) BaseBranchDismissesStaleApprovals(ctx context.Cont
 	opts := &gh.ListOptions{PerPage: 100}
 	for {
 		var resp *gh.Response
-		rules, err := retryGitHubUnavailableRead(rulesCtx, ic.logger, "get branch rules", logAttrs, func(ctx context.Context) (*gh.BranchRules, error) {
+		rules, err := retryGitHubUnavailableRead(rulesCtx, ic, metrics.GitHubOperationGetBranchRules, "get branch rules", logAttrs, func(ctx context.Context) (*gh.BranchRules, error) {
 			rules, rulesResp, rulesErr := ic.client.Repositories.GetRulesForBranch(ctx, owner, repoName, branch, opts)
 			if rulesErr != nil {
 				return nil, classifyGitHubAPIError(rulesErr)
@@ -50,7 +50,7 @@ func (ic *InstallationClient) BaseBranchDismissesStaleApprovals(ctx context.Cont
 	}
 
 	protectionCtx := withGitHubRateLimitContext(ctx, metrics.GitHubOperationGetPullRequestReviewProtection, repo)
-	enforcement, err := retryGitHubUnavailableRead(protectionCtx, ic.logger, "get pull request review protection", logAttrs, func(ctx context.Context) (*gh.PullRequestReviewsEnforcement, error) {
+	enforcement, err := retryGitHubUnavailableRead(protectionCtx, ic, metrics.GitHubOperationGetPullRequestReviewProtection, "get pull request review protection", logAttrs, func(ctx context.Context) (*gh.PullRequestReviewsEnforcement, error) {
 		enforcement, _, enforcementErr := ic.client.Repositories.GetPullRequestReviewEnforcement(ctx, owner, repoName, branch)
 		if enforcementErr != nil {
 			return nil, classifyGitHubAPIError(enforcementErr)
