@@ -490,6 +490,18 @@ func TestActiveApplyConflictMessage(t *testing.T) {
 			err:  holder(state.Apply.WaitingForCutover),
 			want: "apply blocked: apply-7 is waiting for its cutover on orders in production. Run its cutover or cancel it, then apply again.",
 		},
+		"paused": {
+			err:  holder(state.Apply.Paused),
+			want: "apply blocked: apply-7 is paused on orders in production. Release or cancel it, then apply again.",
+		},
+		"waiting for deploy": {
+			err:  holder(state.Apply.WaitingForDeploy),
+			want: "apply blocked: apply-7 is waiting for its deploy on orders in production. Start or cancel it, then apply again.",
+		},
+		"ended with an operation still in progress": {
+			err:  holder(state.Apply.Failed),
+			want: "apply blocked: apply-7 has ended, but part of its work is still in progress on orders in production. Wait for that to finish, then apply again.",
+		},
 		"no holder details": {
 			err:  fmt.Errorf("create apply: %w", storage.ErrActiveApplyExists),
 			want: "apply blocked: another apply is still in progress on this database. Wait for it to finish, then apply again.",

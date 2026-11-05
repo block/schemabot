@@ -1267,7 +1267,7 @@ func TestApplies(t *testing.T, h Harness) {
 		conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
 		require.True(t, ok, "the refusal carries the holding apply: %v", err)
 		assert.Equal(t, "apply_rollout_failed_early", conflict.HolderApplyID)
-		assert.Equal(t, state.ApplyOperation.Running, conflict.HolderState, "the rollout holds its targets through its running operation, not its failed verdict")
+		assert.Equal(t, state.Apply.Failed, conflict.HolderState, "the refusal reports the holder's own state, which decides which controls it still accepts")
 		assert.Equal(t, "production", conflict.Environment)
 		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_a_while_running", 9302, "region-a"), storage.ErrActiveApplyExists,
 			"a deployment whose operation failed stays reserved while the rollout is live")

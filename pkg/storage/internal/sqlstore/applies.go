@@ -763,7 +763,7 @@ func checkNoInProgressRolloutForTargets(ctx context.Context, tx *rebindTx, diale
 	}
 	return &storage.ActiveApplyError{
 		HolderApplyID: holderIdentifier,
-		HolderState:   busyState,
+		HolderState:   holderState,
 		Database:      database,
 		Environment:   environment,
 		Detail: fmt.Sprintf("apply %s (state %s) still has a %s operation on deployment %s and holds its targets among %v for %s/%s/%s",

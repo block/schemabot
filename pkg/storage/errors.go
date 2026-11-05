@@ -140,9 +140,9 @@ var (
 type ActiveApplyError struct {
 	// HolderApplyID is the identifier of the apply holding the target.
 	HolderApplyID string
-	// HolderState is the state that keeps the holder on the target: the
-	// apply's own state, or the state of its operation still in progress
-	// when the apply itself has already ended.
+	// HolderState is the holding apply's own state. It can be terminal when
+	// the apply has ended but one of its operations is still in progress,
+	// which keeps the rollout's targets reserved.
 	HolderState string
 	Database    string
 	Environment string
