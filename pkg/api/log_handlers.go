@@ -98,9 +98,9 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		}
 
 		if len(applies) == 0 {
-			s.writeJSON(w, http.StatusOK, map[string]any{
+			s.writeJSON(w, http.StatusOK, withLogScope(map[string]any{
 				"logs": []any{},
-			})
+			}, target))
 			return
 		}
 		apply = applies[0]
@@ -121,7 +121,7 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		}
 		operationIDs = storage.LogOperationsOnTarget(ops, target)
 		if len(operationIDs) == 0 {
-			s.writeError(w, http.StatusBadRequest, targetNotInApplyMessage(apply, ops, target))
+			s.writeError(w, http.StatusBadRequest, targetNotInApplyMessage(fmt.Sprintf("apply %q", apply.ApplyIdentifier), ops, target))
 			return
 		}
 	}
@@ -161,11 +161,21 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		logEntries[i] = entry
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, http.StatusOK, withLogScope(map[string]any{
 		"logs":      logEntries,
 		"apply_id":  apply.ApplyIdentifier,
 		"truncated": truncated,
-	})
+	}, target))
+}
+
+// withLogScope echoes the target a read was narrowed to. A server that
+// predates scoped reads ignores the parameter and serves the whole log, so the
+// echo is how a client tells a scoped read from an unscoped one.
+func withLogScope(body map[string]any, target string) map[string]any {
+	if target != "" {
+		body["target"] = target
+	}
+	return body
 }
 
 // logFetchLimit is how many entries to read for a requested window of limit
@@ -194,14 +204,15 @@ func clampLogWindow[T any](logs []T, limit int) ([]T, bool) {
 	return logs[len(logs)-limit:], true
 }
 
-// targetNotInApplyMessage names the targets the apply does run on, so a
-// mistyped target can be corrected from the error alone.
-func targetNotInApplyMessage(apply *storage.Apply, ops []*storage.ApplyOperation, target string) string {
+// targetNotInApplyMessage names the targets ops do run on, so a mistyped
+// target can be corrected from the error alone. where names the part of the
+// apply ops belong to, such as `apply "apply-a"`.
+func targetNotInApplyMessage(where string, ops []*storage.ApplyOperation, target string) string {
 	targets := storage.DistinctOperationTargets(ops)
 	if len(targets) == 0 {
-		return fmt.Sprintf("apply %q has no per-target operations; omit target", apply.ApplyIdentifier)
+		return fmt.Sprintf("%s has no per-target operations; omit target", where)
 	}
-	return fmt.Sprintf("target %q has no operations in apply %q; its targets are %s", target, apply.ApplyIdentifier, strings.Join(targets, ", "))
+	return fmt.Sprintf("target %q has no operations in %s; its targets are %s", target, where, strings.Join(targets, ", "))
 }
 
 type deploymentLogFetch struct {
@@ -317,7 +328,7 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 			}
 		}
 		if len(storage.LogOperationsOnTarget(onDeployment, target)) == 0 {
-			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("target %q has no operations on deployment %q in apply %q; its targets there are %s", target, deployment, apply.ApplyIdentifier, strings.Join(storage.DistinctOperationTargets(onDeployment), ", ")))
+			s.writeError(w, http.StatusBadRequest, targetNotInApplyMessage(fmt.Sprintf("deployment %q of apply %q", deployment, apply.ApplyIdentifier), onDeployment, target))
 			return
 		}
 		// Narrow after grouping, not before: grouping reads the apply's own
@@ -337,7 +348,7 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no remote operation logs; omit --deployment to read control-plane logs", deployment))
 		return
 	}
-	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
+	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Target: target, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
 	keys := sortedFetchKeys(fetches)
 	// The data plane serves at most tern.MaxLogsLimit entries per read and
 	// silently serves the cap to larger requests, which would swallow the

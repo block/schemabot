@@ -1329,9 +1329,11 @@ func TestHandleDeploymentLogsKeepsTruncationDetectableAtTheRemoteCap(t *testing.
 }
 
 // A rollout across two targets reads one target's control-plane history on
-// its own: the read is narrowed to that target's operations, and a target the
-// apply never ran on is refused with the targets it does run on, so a typo is
-// corrected from the error rather than mistaken for a quiet target.
+// its own: the read is narrowed to that target's operations and echoes the
+// target, so a client can tell it from an unscoped answer. A read without a
+// target stays the whole apply's, and a target the apply never ran on is
+// refused with the targets it does run on, so a typo is corrected from the
+// error rather than mistaken for a quiet target.
 func TestHandleLogsScopesToTarget(t *testing.T) {
 	apply := &storage.Apply{ID: 15, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
 	operations := []*storage.ApplyOperation{
@@ -1350,12 +1352,53 @@ func TestHandleLogsScopesToTarget(t *testing.T) {
 	service.handleLogsWithoutDatabase(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, []int64{2}, logStore.lastFilter.OperationIDs)
+	var scoped apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &scoped))
+	assert.Equal(t, "shop-002", scoped.Target)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Nil(t, logStore.lastFilter.OperationIDs, "a read without a target is the whole apply's")
+	var unscoped apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &unscoped))
+	assert.Empty(t, unscoped.Target)
 
 	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&target=shop-003", nil)
 	w = httptest.NewRecorder()
 	service.handleLogsWithoutDatabase(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations in apply \"apply-control\"; its targets are shop-001, shop-002`)
+}
+
+// An apply whose operations name no target has no per-target history to read,
+// so a target read is refused with what to do instead, on the control-plane
+// read and on a deployment read alike, rather than an error listing no targets.
+func TestHandleLogsRefusesTargetOnUntargetedApply(t *testing.T) {
+	apply := &storage.Apply{ID: 19, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  &windowedApplyLogStore{available: 1},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&target=shop-001", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `apply \"apply-control\" has no per-target operations; omit target`)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-001", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `deployment \"region-a\" of apply \"apply-control\" has no per-target operations; omit target`)
+	assert.Empty(t, client.logsReqs, "a refused target fetches nothing")
 }
 
 // A deployment read scoped to one target fetches only that target's
@@ -1386,12 +1429,13 @@ func TestHandleDeploymentLogsScopesToTarget(t *testing.T) {
 	require.Len(t, response.Sources, 1)
 	require.Len(t, response.Sources[0].Operations, 1)
 	assert.Equal(t, "shop-002", response.Sources[0].Operations[0].Target)
+	assert.Equal(t, "shop-002", response.Target)
 
 	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-003", nil)
 	w = httptest.NewRecorder()
 	service.handleLogsWithoutDatabase(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations on deployment \"region-a\" in apply \"apply-control\"; its targets there are shop-001, shop-002`)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations in deployment \"region-a\" of apply \"apply-control\"; its targets are shop-001, shop-002`)
 	assert.Len(t, client.logsReqs, 1, "a refused target fetches nothing")
 }
 
