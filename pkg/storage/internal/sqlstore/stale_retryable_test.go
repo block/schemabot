@@ -218,6 +218,41 @@ func testMarkStaleApplyRetryableLeases(t *testing.T, newStore func(*testing.T) *
 		assertStaleRunningTree(t, ctx, store, otherApply.ID, otherOpID)
 	})
 
+	// A row written before recovering_cutover was folded into recovering still
+	// carries the old name, which the store's own writes never produce. It is
+	// a recovering apply all the same: past its copy, so the retry leaves it
+	// to the stale-active claim.
+	t.Run("a row still named recovering_cutover is left alone", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		apply, opID := seedStaleRunningTree(t, ctx, store, "stale_legacy_recovering")
+		staleHeartbeat := agedHeartbeatExpr(store, 2*storage.ApplyLeaseStaleAfter)
+		_, err := store.db.ExecContext(ctx, `
+			UPDATE applies
+			SET state = 'recovering_cutover', updated_at = `+staleHeartbeat+`
+			WHERE id = ?
+		`, apply.ID)
+		require.NoError(t, err)
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID: apply.ID, ApplyLeaseToken: "token-apply",
+			OperationID: opID, OperationLeaseToken: "token-op",
+			ErrorMessage: "copy of users failed and may be retried",
+		})
+		require.NoError(t, err)
+		assert.False(t, moved, "an apply reattaching to its cutover checkpoint is never rewound to running")
+		var storedState, leaseToken string
+		require.NoError(t, store.db.QueryRowContext(ctx, `SELECT state, lease_token FROM applies WHERE id = ?`, apply.ID).Scan(&storedState, &leaseToken))
+		assert.Equal(t, "recovering_cutover", storedState)
+		assert.Equal(t, "token-apply", leaseToken)
+		op, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, op)
+		assert.Equal(t, state.ApplyOperation.Running, op.State, "the operation write does not survive the parent's refusal")
+		assert.Equal(t, "token-op", op.LeaseToken)
+	})
+
 	// The caller observed the operation running, but it settled before the
 	// write: a finished operation keeps its result and its parent stays where
 	// it is.

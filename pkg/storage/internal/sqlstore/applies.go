@@ -145,6 +145,14 @@ func claimableApplyStates() []string {
 // doing, and an exhausted budget would then settle failed a change that has
 // already cut over. Those applies stay with the stale-active claim, which
 // rotates the lease and leaves the state alone.
+//
+// Recovering is one of them. It is entered only from waiting_for_cutover, when
+// a resume finds the engine's cutover checkpoint and reattaches to it, so the
+// copy is already behind it; the resume path reads the state to know it must
+// look for that checkpoint rather than re-plan. The cost of leaving it out is
+// that a driver that keeps dying during the reattach is never charged to the
+// retry budget; the stale-active claim keeps rotating the lease instead, as it
+// does for waiting_for_cutover itself.
 func retryRestartableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
@@ -153,7 +161,6 @@ func retryRestartableApplyStates() []string {
 		state.Apply.Checksumming,
 		state.Apply.PostChecksum,
 		state.Apply.Resuming,
-		state.Apply.Recovering,
 		state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,

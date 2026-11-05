@@ -440,7 +440,6 @@ func TestApplies(t *testing.T, h Harness) {
 			state.Apply.Checksumming,
 			state.Apply.PostChecksum,
 			state.Apply.Resuming,
-			state.Apply.Recovering,
 			state.Apply.PreparingBranch,
 			state.Apply.ApplyingBranchChanges,
 			state.Apply.ValidatingBranch,
@@ -469,9 +468,10 @@ func TestApplies(t *testing.T, h Harness) {
 
 	// Every row here has no lease owner, so only the state guard keeps it
 	// where it is. Resting and terminal applies are never reopened; an apply
-	// waiting for a deploy, at or past its cutover, or in its revert window
-	// has work behind it that a retry's running would misdescribe, so it is
-	// left to the stale-active claim.
+	// waiting for a deploy, at or past its cutover (recovering reattaches to a
+	// cutover checkpoint), or in its revert window has work behind it that a
+	// retry's running would misdescribe, so it is left to the stale-active
+	// claim.
 	t.Run("MarkStaleApplyRetryable_NeverMovesAnApplyOutsideTheRestartableStates", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -479,11 +479,13 @@ func TestApplies(t *testing.T, h Harness) {
 			state.Apply.Pending,
 			state.Apply.FailedRetryable,
 			state.Apply.Stopped,
+			state.Apply.Paused,
 			state.Apply.Completed,
 			state.Apply.Failed,
 			state.Apply.Cancelled,
 			state.Apply.WaitingForDeploy,
 			state.Apply.WaitingForCutover,
+			state.Apply.Recovering,
 			state.Apply.CuttingOver,
 			state.Apply.RevertWindow,
 			state.Apply.Reverting,
