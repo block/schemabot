@@ -537,9 +537,21 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// expected participant reports terminal success, instead of posting an
 		// unconditional passing aggregate. The fold re-runs as participants'
 		// Check Run events arrive, converging to passing once they succeed.
-		if h.leaderExpectsParticipantsForPR(repo, files) {
+		expectedParticipants, err := h.leaderParticipantsForPR(ctx, client, repo, pr, headSHA, changedFiles, files)
+		routeToFold := len(expectedParticipants) > 0
+		switch {
+		case err != nil:
+			// The fold reads the same participants and fails closed on the same
+			// error, arming its bounded re-fold, so route there instead of
+			// posting a passing aggregate that could hide a participant's run.
+			h.logger.Warn("cannot resolve participants for PR with no leader-managed schema; routing to the aggregate fold, which fails closed",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+			routeToFold = true
+		case routeToFold:
 			h.logger.Info("no leader-managed schema in PR but expected participant paths are touched; aggregate gate will block until participants report",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+		}
+		if routeToFold {
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()

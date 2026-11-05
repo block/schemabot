@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,14 +91,50 @@ func serveHeadSHA(t *testing.T, mux *http.ServeMux, sha string) {
 
 // serveLeaderPRFiles registers the changed-files lookup the aggregate leader
 // performs to resolve which participants a PR requires, reporting the given path
-// as modified so the participant covering it becomes expected.
+// as modified so the participant covering it becomes expected. The file exists
+// at every commit but the default branch tip, so the leader's comparison against
+// the default branch reads it as the PR's own proposal.
 func serveLeaderPRFiles(t *testing.T, mux *http.ServeMux, path string) {
 	t.Helper()
+	const defaultTip, subtreePrefix = "default-tip", "tree~"
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
 			"filename": path,
 			"status":   "modified",
 		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": defaultTip}}))
+	})
+	// Reading the changed files' modes finds the merge base, then reads the
+	// compare diff, which shows the path as a regular file.
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "diff") {
+			writeRegularFilesDiff(t, w, []string{path})
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"merge_base_commit": map[string]string{"sha": "merge-base"}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, req *http.Request) {
+		treeSHA := strings.TrimPrefix(req.URL.Path, "/repos/octocat/hello-world/git/trees/")
+		entries := []map[string]string{}
+		if treeSHA != defaultTip {
+			// A commit SHA serves the root level; a subtree SHA names its directory.
+			dir, rest := "", path
+			if subtree, isSubtree := strings.CutPrefix(treeSHA, subtreePrefix); isSubtree {
+				dir = strings.ReplaceAll(subtree, "~", "/")
+				rest = strings.TrimPrefix(path, dir+"/")
+			}
+			if segment, _, isDir := strings.Cut(rest, "/"); isDir {
+				entries = append(entries, map[string]string{"path": segment, "type": "tree", "sha": subtreePrefix + strings.ReplaceAll(strings.TrimPrefix(dir+"/"+segment, "/"), "/", "~")})
+			} else {
+				entries = append(entries, map[string]string{"path": segment, "type": "blob", "sha": "head-file"})
+			}
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": entries, "truncated": false}))
 	})
 }
 
@@ -207,6 +245,40 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 		assert.Error(t, err)
 	})
 
+	t.Run("leader that cannot compare PR files with the default branch publishes nothing and schedules a participant re-fold", func(t *testing.T) {
+		store := &foldCheckStore{}
+		h, mux, client := newFoldHandler(t, aggregateLeaderConfig(), store)
+		serveHeadSHA(t, mux, "abc123")
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+				"filename": "tenant-b/schema/orders.sql",
+				"status":   "modified",
+			}}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		})
+		// tenant-b has not reported, so nothing but the failed comparison
+		// keeps the leader from treating the PR as proposing no work.
+		serveParticipantCheckRunsEmpty(t, mux, "abc123")
+		var checkRunWrites atomic.Int64
+		mux.HandleFunc("/repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			checkRunWrites.Add(1)
+			w.WriteHeader(http.StatusCreated)
+		})
+
+		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+
+		assert.Equal(t, aggregateFoldScheduleParticipantRefold, followUp)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "to what it proposes")
+		assert.Zero(t, checkRunWrites.Load(), "no Check Run is published while the leader cannot tell which participants the PR requires")
+		assert.Empty(t, store.upserted, "no stored aggregate is written")
+	})
+
 	t.Run("participant that has not reported schedules a participant re-fold with no error", func(t *testing.T) {
 		h, mux, client := newFoldHandler(t, aggregateLeaderConfig(), &foldCheckStore{})
 		serveHeadSHA(t, mux, "abc123")
@@ -302,4 +374,91 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 		assert.Error(t, err)
 		assert.Empty(t, store.upserted, "no stored state may record a Check Run that was never created")
 	})
+}
+
+// TestLeaderSettleWithNoProposedWorkGuards covers which stored aggregate an
+// unscoped leader settles when the PR proposes nothing for any participant or
+// for the leader itself. Only the leader's own unscoped aggregate on the head
+// that is not already passing is settled; an aggregate on another commit, one
+// that already passes, or an aggregate row of a named environment stays as it
+// is. A settle whose publish fails arms the participant re-fold so the gate
+// does not stay on its previous state.
+func TestLeaderSettleWithNoProposedWorkGuards(t *testing.T) {
+	aggregateRow := func(env, headSHA, status, conclusion string) *storage.Check {
+		return &storage.Check{
+			Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: headSHA,
+			Environment: env, DatabaseType: aggregateSentinel, DatabaseName: aggregateSentinel,
+			Status: status, Conclusion: conclusion, CheckRunID: 42,
+		}
+	}
+	tests := []struct {
+		name           string
+		stored         *storage.Check
+		publishStatus  int
+		wantFollowUp   aggregateFoldFollowUp
+		wantError      bool
+		wantPublishing bool
+	}{
+		{
+			name:           "waiting aggregate on the head settles",
+			stored:         aggregateRow(aggregateSentinel, "abc123", checkStatusInProgress, ""),
+			publishStatus:  http.StatusCreated,
+			wantFollowUp:   aggregateFoldClearParticipantRefoldBudget,
+			wantPublishing: true,
+		},
+		{
+			name:         "aggregate on another commit stays",
+			stored:       aggregateRow(aggregateSentinel, "older111", checkStatusInProgress, ""),
+			wantFollowUp: aggregateFoldNoFollowUp,
+		},
+		{
+			name:         "aggregate already passing on the head stays",
+			stored:       aggregateRow(aggregateSentinel, "abc123", checkStatusCompleted, checkConclusionSuccess),
+			wantFollowUp: aggregateFoldNoFollowUp,
+		},
+		{
+			name:         "aggregate row of a named environment is not the unscoped aggregate",
+			stored:       aggregateRow("staging", "abc123", checkStatusInProgress, ""),
+			wantFollowUp: aggregateFoldNoFollowUp,
+		},
+		{
+			name:           "failed publish schedules a participant re-fold",
+			stored:         aggregateRow(aggregateSentinel, "abc123", checkStatusInProgress, ""),
+			publishStatus:  http.StatusInternalServerError,
+			wantFollowUp:   aggregateFoldScheduleParticipantRefold,
+			wantError:      true,
+			wantPublishing: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &foldCheckStore{byPR: []*storage.Check{tt.stored}}
+			h, mux, client := newFoldHandler(t, aggregateLeaderConfig(), store)
+			serveHeadSHA(t, mux, "abc123")
+			// A README change proposes nothing for any participant or for the
+			// leader, so the fold reaches the settle.
+			serveLeaderPRFiles(t, mux, "README.md")
+			var checkRunWrites atomic.Int64
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+				checkRunWrites.Add(1)
+				w.WriteHeader(tt.publishStatus)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
+			})
+
+			followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+
+			assert.Equal(t, tt.wantFollowUp, followUp)
+			if tt.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			if tt.wantPublishing {
+				assert.Equal(t, int64(1), checkRunWrites.Load(), "the settle publishes the verified no-work aggregate")
+			} else {
+				assert.Zero(t, checkRunWrites.Load(), "no Check Run replaces the stored aggregate")
+				assert.Empty(t, store.upserted, "no stored aggregate is written")
+			}
+		})
+	}
 }

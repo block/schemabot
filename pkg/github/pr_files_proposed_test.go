@@ -211,6 +211,52 @@ func TestPRFilesProposedAgainstDefaultBranchKeepsRenamesThatVacateSchema(t *test
 	assert.Equal(t, []string{"schema/orders/users.sql.disabled"}, filenames(proposed))
 }
 
+// TestPRFilesProposedAgainstDefaultBranchKeepsConfigRenamesThatVacateAHeldConfig
+// covers a pull request that moves a participant's config out of its directory
+// while the default branch already holds an identical copy at the destination.
+// When the default branch still declares the old config, merging removes it,
+// so the rename is kept with its previous path and the deployment that managed
+// it is still selected. When the default branch already absorbed the rename,
+// the move is inherited history and the file is narrowed away.
+func TestPRFilesProposedAgainstDefaultBranchKeepsConfigRenamesThatVacateAHeldConfig(t *testing.T) {
+	renamed := PRFile{Filename: "archive/schemabot.yaml", PreviousFilename: "tenant-b/schema/schemabot.yaml", Status: "renamed"}
+	tests := []struct {
+		name         string
+		defaultTip   map[string]string
+		wantProposed []PRFile
+	}{
+		{
+			name: "default branch still declares the old config",
+			defaultTip: map[string]string{
+				"archive/schemabot.yaml":         "config-blob",
+				"tenant-b/schema/schemabot.yaml": "config-blob",
+			},
+			wantProposed: []PRFile{renamed},
+		},
+		{
+			name: "default branch already absorbed the rename",
+			defaultTip: map[string]string{
+				"archive/schemabot.yaml": "config-blob",
+			},
+			wantProposed: []PRFile{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ic, _ := newProposedFilesClient(t, proposedFilesRepo{
+				head:       map[string]string{"archive/schemabot.yaml": "config-blob"},
+				defaultTip: tt.defaultTip,
+			})
+
+			proposed, _, err := ic.PRFilesProposedAgainstDefaultBranch(t.Context(), "octocat/hello-world", "head-sha", []PRFile{renamed})
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantProposed, proposed)
+		})
+	}
+}
+
 // TestPRFilesProposedAgainstDefaultBranchScopesCrossConfigRenames covers a
 // rename that moves a schema file from one config directory to another, run
 // through narrowing and then config discovery. When the pull request proposes

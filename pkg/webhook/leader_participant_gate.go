@@ -2,6 +2,8 @@ package webhook
 
 import (
 	"context"
+	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/checkstate"
@@ -153,6 +155,87 @@ func (h *Handler) participantCheckOutcomes(
 		checks = append(checks, synthesizeParticipantCheck(outcome, repo, pr, headSHA, env, retryPending))
 	}
 	return checks, retriable
+}
+
+// participantsExpectedOnHead returns the participants an unscoped leader folds
+// on headSHA: every participant the PR's proposed files select, plus every
+// participant only its listed files select that already published a Check Run
+// on headSHA which is not completed and successful.
+//
+// Narrowing the listed files to what the PR proposes against the default
+// branch can drop a participant on the same head commit, when the default
+// branch acquires a change the PR carried. A participant that never reported
+// has nothing to protect and is dropped. One that did report keeps its own
+// verdict on the head: a run still in progress (an apply may be under way) or
+// one that failed must keep blocking the aggregate (MG-1, MG-6), so it stays
+// expected and the fold renders it like any other participant. A failed read
+// is returned as an error: the caller cannot tell which case it is in.
+func (h *Handler) participantsExpectedOnHead(
+	ctx context.Context, client checkRunFinder,
+	repo string, pr int, headSHA string,
+	listed, proposed []api.ExpectedTenant,
+) ([]api.ExpectedTenant, error) {
+	expected := slices.Clone(proposed)
+	for _, tenant := range listed {
+		if slices.ContainsFunc(proposed, func(p api.ExpectedTenant) bool { return p.Tenant == tenant.Tenant }) {
+			continue
+		}
+		reported, err := h.participantHasNonPassingRunOnHead(ctx, client, repo, pr, headSHA, tenant)
+		if err != nil {
+			return nil, err
+		}
+		if reported {
+			expected = append(expected, tenant)
+		}
+	}
+	return expected, nil
+}
+
+// participantHasNonPassingRunOnHead reports whether a participant the proposed
+// files no longer select published a trusted Check Run on headSHA that is not
+// completed and successful, or has a same-named run there only from untrusted
+// Apps. It uses the same trusted read as the fold and agrees with the fold on
+// both: each of them blocks the aggregate.
+func (h *Handler) participantHasNonPassingRunOnHead(
+	ctx context.Context, client checkRunFinder,
+	repo string, pr int, headSHA string,
+	tenant api.ExpectedTenant,
+) (bool, error) {
+	if tenant.CheckName == "" {
+		// Config validation requires a check name; without one the leader
+		// cannot read the participant's run, so it stays expected and the fold
+		// blocks on it.
+		h.logger.Warn("participant dropped by narrowing has no check name, keeping it expected",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "tenant", tenant.Tenant)
+		return true, nil
+	}
+	checkName := participantCheckName(tenant.CheckName, aggregateSentinel)
+	result, untrusted, err := client.FindCheckRunByName(ctx, repo, headSHA, checkName)
+	if err != nil {
+		return false, fmt.Errorf("read Check Run %q of participant %s the PR no longer proposes work for on %s@%s: %w", checkName, tenant.Tenant, repo, headSHA, err)
+	}
+	if result == nil && len(untrusted) > 0 {
+		// The fold blocks on a same-named run from an untrusted App, so keep the
+		// participant expected and let the fold render that block.
+		h.logger.Warn("participant the PR no longer proposes work for has a Check Run on the head only from untrusted GitHub Apps, keeping it expected",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "tenant", tenant.Tenant,
+			"check_name", checkName, "untrusted_app_slugs", untrusted)
+		return true, nil
+	}
+	if result == nil {
+		h.logger.Info("participant the PR no longer proposes work for has no Check Run on the head, not expecting it",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "tenant", tenant.Tenant, "check_name", checkName)
+		return false, nil
+	}
+	if result.Status == checkStatusCompleted && result.Conclusion == checkConclusionSuccess {
+		h.logger.Info("participant the PR no longer proposes work for passed on the head, not expecting it",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "tenant", tenant.Tenant, "check_name", checkName)
+		return false, nil
+	}
+	h.logger.Info("participant the PR no longer proposes work for has a Check Run on the head that is not passing, keeping it expected",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "tenant", tenant.Tenant, "check_name", checkName,
+		"check_status", result.Status, "check_conclusion", result.Conclusion)
+	return true, nil
 }
 
 func (h *Handler) resolveParticipantOutcome(
