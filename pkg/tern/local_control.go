@@ -866,7 +866,14 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// Cancel the apply goroutine's context so it stops iterating over tasks.
 	// Without this, executeApplySequential would continue to the next table
 	// after Spirit's runner exits, racing with the resume goroutine.
-	c.cancelApplyHandle(applyCancel, nil)
+	//
+	// The cancel waits until the stop is recorded. The drive it wakes may be
+	// a sibling operation's drive, not the one consuming this stop, and that
+	// drive derives its operation's state from its task rows as it returns.
+	// Woken before the rows read stopped, it would leave its operation running
+	// under a lease nobody renews, and the stop would wait for that lease to
+	// go stale before the apply-state projection could settle the apply.
+	defer c.cancelApplyHandle(applyCancel, nil)
 
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
@@ -894,7 +901,11 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		if terminalState == state.Task.Cancelled {
 			eventMsg = fmt.Sprintf("Cancel requested: %d tasks cancelled, %d skipped (deploy request cancelled)", stoppedCount, skippedCount)
 			eventType = storage.LogEventCancelRequested
-
+		}
+		switch opLease, operationScoped := operationLeaseOnlyDrive(ctx); {
+		case operationScoped:
+			c.leaveApplyRowToProjection(targetApply, opLease, terminalState)
+		case terminalState == state.Task.Cancelled:
 			// For Vitess: set the apply state to cancelled now. The apply
 			// goroutine will see a context cancellation error from the engine
 			// and call failApplyWithTasks, but we set cancelled first so the
@@ -903,8 +914,10 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 			if err := c.markApplyCancelled(ctx, applyID); err != nil {
 				return nil, err
 			}
-		} else if err := c.markApplyStopped(ctx, applyID); err != nil {
-			return nil, err
+		default:
+			if err := c.markApplyStopped(ctx, applyID); err != nil {
+				return nil, err
+			}
 		}
 		if caller != "" {
 			eventMsg += callerApplyLogSuffix(caller)
@@ -1033,7 +1046,9 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return nil, fmt.Errorf("cancel schema change on database %s: %w", c.config.Database, err)
 	}
 	if applyID > 0 && cancelledCount > 0 {
-		if err := c.markApplyCancelled(ctx, applyID); err != nil {
+		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+			c.leaveApplyRowToProjection(targetApply, opLease, state.Task.Cancelled)
+		} else if err := c.markApplyCancelled(ctx, applyID); err != nil {
 			return nil, err
 		}
 		eventMsg := fmt.Sprintf("Cancel requested: %d tasks cancelled, %d skipped", cancelledCount, skippedCount)
@@ -2535,6 +2550,21 @@ func cancelAlreadySettledResponse(settledState string, skippedCount int64) *tern
 		ErrorMessage: fmt.Sprintf("Schema change already %s", settledState),
 		SkippedCount: skippedCount,
 	}
+}
+
+// leaveApplyRowToProjection records that a stop or cancel which reached this
+// apply's tasks leaves the apply row alone. The drive consuming it holds only
+// its operation's lease, and under that lease the apply row belongs to the
+// apply-state projection, which storage enforces by refusing the write. The
+// tasks already record the outcome, each drive settles its own operation from
+// its tasks as it returns, and the projection settles the apply from those
+// operations and completes the durable request.
+func (c *LocalClient) leaveApplyRowToProjection(apply *storage.Apply, opLease storage.OperationLease, taskState string) {
+	attrs := []any{"apply_operation_id", opLease.OperationID, "task_state", taskState}
+	if apply != nil {
+		attrs = append(apply.LogAttrs(), attrs...)
+	}
+	c.logger.Info("control request recorded on the apply's tasks; the apply-state projection settles the apply row this operation-scoped drive does not own", attrs...)
 }
 
 func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error {
