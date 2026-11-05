@@ -207,6 +207,11 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	// with no aggregate config) never fetch files or fold — their behavior is
 	// unchanged.
 	var expectedParticipants []api.ExpectedTenant
+	// proposedFiles is what the PR proposes against the default branch. Only
+	// the unscoped leader reads it, and leaderReadProposedFiles records that it
+	// did.
+	var proposedFiles []ghclient.PRFile
+	leaderReadProposedFiles := false
 	if config.IsAggregateLeaderForRepo(repo) && len(config.AllowedEnvironments) == 0 {
 		files, err := client.FetchPRFiles(ctx, repo, pr)
 		if err != nil {
@@ -244,6 +249,8 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("scope PR files for aggregate leader %s#%d to what it proposes: %w", repo, pr, err)
 		}
 		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
+		proposedFiles = files
+		leaderReadProposedFiles = true
 	}
 
 	var scope *aggregatePRScope
@@ -288,6 +295,9 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 			return aggregateFoldScheduleRefold, nil
 		}
 	} else if len(dbChecks) == 0 && len(expectedParticipants) == 0 {
+		if leaderReadProposedFiles {
+			return h.settleLeaderAggregateWithNoProposedWork(ctx, client, repo, pr, headSHA, checks, proposedFiles)
+		}
 		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate", "repo", repo, "pr", pr)
 		return aggregateFoldNoFollowUp, nil
 	}
@@ -389,6 +399,60 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		// state, such as a passing aggregate persisting over a just-claimed
 		// rollback.
 		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
+	}
+	return aggregateFoldClearParticipantRefoldBudget, nil
+}
+
+// settleLeaderAggregateWithNoProposedWork handles an unscoped leader fold that
+// finds no per-database checks and no expected participant in what the PR
+// proposes against the default branch.
+//
+// That answer can change on the same head commit: when the default branch
+// acquires a change the PR carried, the participant it selected is no longer
+// expected and will never report. An aggregate this leader already published on
+// the head while waiting for that participant would then block with nothing left
+// to fold it again (MG-10), so a non-passing aggregate on the head is settled
+// through the verified no-work publish, which leaves stored blockers and any
+// stored aggregate block in place. Everything else stays silent: with no
+// aggregate on the head, the head-commit events own the first publish, and while
+// the PR still proposes SchemaBot files the leader's own plan owns the gate.
+func (h *Handler) settleLeaderAggregateWithNoProposedWork(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, headSHA string,
+	stored []*storage.Check, proposedFiles []ghclient.PRFile,
+) (aggregateFoldFollowUp, error) {
+	var existing *storage.Check
+	for _, c := range stored {
+		if isAggregateCheck(c) && c.Environment == aggregateSentinel {
+			existing = c
+		}
+	}
+	if existing == nil {
+		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate and no stored aggregate; staying silent",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return aggregateFoldNoFollowUp, nil
+	}
+	if existing.HeadSHA != headSHA {
+		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate and the stored aggregate names another commit; staying silent",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "aggregate_head_sha", existing.HeadSHA)
+		return aggregateFoldNoFollowUp, nil
+	}
+	if existing.Status == checkStatusCompleted && existing.Conclusion == checkConclusionSuccess {
+		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate and the aggregate on this head already passes",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "check_run_id", existing.CheckRunID)
+		return aggregateFoldNoFollowUp, nil
+	}
+	if prHasCurrentSchemaBotFiles(proposedFiles) {
+		h.logger.Info("unscoped aggregate keeps blocking: no participant is expected, but the PR still proposes SchemaBot files whose plan has stored no checks",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "check_run_id", existing.CheckRunID,
+			"check_status", existing.Status, "conclusion", existing.Conclusion)
+		return aggregateFoldNoFollowUp, nil
+	}
+	h.logger.Info("settling unscoped aggregate as verified no-work: the PR no longer proposes anything an expected participant or this leader must check",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "check_run_id", existing.CheckRunID,
+		"check_status", existing.Status, "conclusion", existing.Conclusion)
+	if err := h.postPassingAggregateTargets(ctx, client, repo, pr, headSHA, nil, h.aggregateCheckTargetsForRepo(repo)); err != nil {
+		return aggregateFoldScheduleParticipantRefold, fmt.Errorf("settle unscoped aggregate with no proposed work for %s#%d: %w", repo, pr, err)
 	}
 	return aggregateFoldClearParticipantRefoldBudget, nil
 }

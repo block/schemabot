@@ -399,6 +399,126 @@ func TestE2ELeaderRefoldExpectsNoParticipantForARenameTheDefaultBranchHolds(t *t
 	assert.Empty(t, checkRuns, "no aggregate waits on a participant the PR proposes nothing for")
 }
 
+// The participants an unscoped leader expects are read against the default
+// branch, so they can shrink on the same head commit. A PR renames
+// tenant-b/schema/users.sql to archive/users.sql; the leader's first refold
+// expects tenant-b, which has not reported, and publishes a blocking aggregate.
+// The default branch then acquires the same rename, so the PR proposes nothing
+// for tenant-b and tenant-b never reports. The next refold settles the waiting
+// aggregate as verified no-work instead of leaving it blocking with nothing
+// left to refold it. A stored aggregate block stays authoritative, and while
+// the PR still proposes a schema file of the leader's own the leader's plan
+// owns the gate, so both of those keep the aggregate blocking.
+func TestE2ELeaderRefoldSettlesAggregateWhenDefaultBranchAcquiresTheRename(t *testing.T) {
+	tests := []struct {
+		name string
+		// leaderSchemaFile, when set, is a schema file of the leader's own the
+		// PR also changes and the default branch does not hold.
+		leaderSchemaFile string
+		// storedBlock, when set, is recorded on the aggregate between the two
+		// refolds, as a guard that failed the aggregate closed would.
+		storedBlock  string
+		wantSettled  bool
+		wantFollowUp aggregateFoldFollowUp
+	}{
+		{name: "waiting aggregate settles", wantSettled: true, wantFollowUp: aggregateFoldClearParticipantRefoldBudget},
+		{name: "stored aggregate block stays authoritative", storedBlock: planFailedUnrecordedBlock.blockingReason, wantFollowUp: aggregateFoldClearParticipantRefoldBudget},
+		{name: "leader schema change keeps the gate with the leader plan", leaderSchemaFile: "schema/orders.sql", wantFollowUp: aggregateFoldNoFollowUp},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := leaderRepoConfig()
+			config.AllowedEnvironments = nil
+			svc := setupE2EServiceWithConfig(t, config)
+
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			const repo, headSHA = "octocat/hello-world", "abc123"
+			previous, current := tenantBSchemaDir+"/users.sql", "archive/users.sql"
+			files := []*gh.CommitFile{{Filename: new(current), PreviousFilename: new(previous), Status: new("renamed")}}
+			headEntries := []*gh.TreeEntry{{Path: new(current), Type: new("blob"), SHA: new("renamed-file")}}
+			if tt.leaderSchemaFile != "" {
+				files = append(files, &gh.CommitFile{Filename: new(tt.leaderSchemaFile), Status: new("added")})
+				headEntries = append(headEntries, &gh.TreeEntry{Path: new(tt.leaderSchemaFile), Type: new("blob"), SHA: new("leader-file")})
+			}
+			mockLeaderPRHead(mux, headSHA)
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(files)
+			})
+			var defaultHoldsRename atomic.Bool
+			registerRepositoryTrees(t, mux, repositoryTreeFixture{
+				headSHA:     headSHA,
+				headEntries: headEntries,
+				baseEntries: func() []*gh.TreeEntry {
+					if defaultHoldsRename.Load() {
+						return []*gh.TreeEntry{{Path: new(current), Type: new("blob"), SHA: new("renamed-file")}}
+					}
+					return []*gh.TreeEntry{{Path: new(previous), Type: new("blob"), SHA: new("old-file")}}
+				},
+				defaultTip: func() string {
+					if defaultHoldsRename.Load() {
+						return "main-with-rename"
+					}
+					return "def456"
+				},
+			})
+			mockParticipantCheckRuns(mux, nil)
+			checkRuns := captureLeaderCheckRuns(mux)
+
+			h := newLeaderHandler(t, svc, client)
+			installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
+			checks := svc.Storage().Checks()
+
+			followUp, err := h.updateAggregateCheckOnce(t.Context(), installClient, repo, 1, headSHA)
+			require.NoError(t, err)
+			require.Equal(t, aggregateFoldScheduleParticipantRefold, followUp, "the leader waits for tenant-b to report")
+			waiting := collectAggregate(t, checkRuns, "SchemaBot")
+			require.Equal(t, checkStatusInProgress, waiting.Status)
+			stored, err := checks.Get(t.Context(), repo, 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			require.Equal(t, headSHA, stored.HeadSHA)
+			require.Equal(t, checkStatusInProgress, stored.Status)
+
+			if tt.storedBlock != "" {
+				stored.Status = checkStatusCompleted
+				stored.Conclusion = checkConclusionFailure
+				stored.BlockingReason = tt.storedBlock
+				require.NoError(t, checks.Upsert(t.Context(), stored))
+			}
+
+			defaultHoldsRename.Store(true)
+			followUp, err = h.updateAggregateCheckOnce(t.Context(), installClient, repo, 1, headSHA)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantFollowUp, followUp)
+
+			after, err := checks.Get(t.Context(), repo, 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+			require.NoError(t, err)
+			require.NotNil(t, after)
+			assert.Equal(t, headSHA, after.HeadSHA)
+			assert.Equal(t, stored.CheckRunID, after.CheckRunID)
+			if !tt.wantSettled {
+				assert.Empty(t, checkRuns, "no Check Run replaces the blocking aggregate")
+				assert.Equal(t, stored.Status, after.Status)
+				assert.Equal(t, stored.Conclusion, after.Conclusion)
+				assert.Equal(t, tt.storedBlock, after.BlockingReason)
+				return
+			}
+			settled := collectAggregate(t, checkRuns, "SchemaBot")
+			assert.Equal(t, checkStatusCompleted, settled.Status)
+			assert.Equal(t, checkConclusionSuccess, settled.Conclusion)
+			assert.Equal(t, checkStatusCompleted, after.Status)
+			assert.Equal(t, checkConclusionSuccess, after.Conclusion)
+			assert.Empty(t, after.BlockingReason)
+		})
+	}
+}
+
 // `schemabot plan` on a stale PR whose only change is the deletion of a
 // participant's config that the default branch already carries reads the same
 // list: the PR proposes nothing for the participant, so the leader refreshes
