@@ -841,6 +841,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		return nil, errors.New(revertPhaseControlRejectionMessage(targetApply.ApplyIdentifier, targetApply.State))
 	}
 
+	tasks = c.operationShareOfTasks(ctx, tasks, targetApply, "stop")
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
 
@@ -866,14 +867,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// Cancel the apply goroutine's context so it stops iterating over tasks.
 	// Without this, executeApplySequential would continue to the next table
 	// after Spirit's runner exits, racing with the resume goroutine.
-	//
-	// The cancel waits until the stop is recorded. The drive it wakes may be
-	// a sibling operation's drive, not the one consuming this stop, and that
-	// drive derives its operation's state from its task rows as it returns.
-	// Woken before the rows read stopped, it would leave its operation running
-	// under a lease nobody renews, and the stop would wait for that lease to
-	// go stale before the apply-state projection could settle the apply.
-	defer c.cancelApplyHandle(applyCancel, nil)
+	c.wakeDriveForControl(ctx, applyCancel, nil, targetApply, "stop")
 
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
@@ -1000,6 +994,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return nil, errors.New(revertPhaseControlRejectionMessage(targetApply.ApplyIdentifier, targetApply.State))
 	}
 
+	tasks = c.operationShareOfTasks(ctx, tasks, targetApply, "cancel")
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
 	if err := c.cancelEngineForTasks(ctx, eng, tasks, targetApplyID); err != nil {
@@ -1016,7 +1011,11 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		return nil, fmt.Errorf("engine cancel failed: %w", err)
 	}
-	c.cancelApplyHandle(applyCancel, engine.ErrCancelledByOperator)
+	// The drive is woken before the tasks are recorded cancelled: its engine
+	// run has just been cancelled underneath it, and a drive still running
+	// would read that run's end as the task's own outcome and record it. Woken
+	// with the operator's cause, it records no verdict and hands back.
+	c.wakeDriveForControl(ctx, applyCancel, engine.ErrCancelledByOperator, targetApply, "cancel")
 
 	if targetApply != nil {
 		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
@@ -2565,6 +2564,62 @@ func (c *LocalClient) leaveApplyRowToProjection(apply *storage.Apply, opLease st
 		attrs = append(apply.LogAttrs(), attrs...)
 	}
 	c.logger.Info("control request recorded on the apply's tasks; the apply-state projection settles the apply row this operation-scoped drive does not own", attrs...)
+}
+
+// operationShareOfTasks narrows a stop or cancel to the tasks the consuming
+// drive's lease covers. A drive holding only its operation's lease stops,
+// records, and reclaims its own operation's work: storage refuses its writes
+// to any other operation's tasks. The durable request stays pending until the
+// apply resolves, so each sibling operation's drive consumes it at its next
+// checkpoint and does the same for its own tasks under its own lease. A drive
+// holding the apply lease covers every task, and its tasks are returned as is.
+func (c *LocalClient) operationShareOfTasks(ctx context.Context, tasks []*storage.Task, apply *storage.Apply, operation string) []*storage.Task {
+	opLease, operationScoped := operationLeaseOnlyDrive(ctx)
+	if !operationScoped {
+		return tasks
+	}
+	own := make([]*storage.Task, 0, len(tasks))
+	var siblings int
+	for _, task := range tasks {
+		if task.ApplyOperationID != nil && *task.ApplyOperationID == opLease.OperationID {
+			own = append(own, task)
+			continue
+		}
+		if task.ApplyID == opLease.ApplyID {
+			siblings++
+		}
+	}
+	if siblings > 0 {
+		attrs := []any{"apply_operation_id", opLease.OperationID, "operation", operation, "own_tasks", len(own), "sibling_tasks", siblings}
+		if apply != nil {
+			attrs = append(apply.LogAttrs(), attrs...)
+		}
+		c.logger.Info("operation-scoped drive takes the control request for its own operation's tasks; each sibling operation's drive consumes the pending request for its own", attrs...)
+	}
+	return own
+}
+
+// wakeDriveForControl cancels the drive the handle was taken from, so it
+// stops iterating once a stop or cancel reaches its engine work, with cause as
+// the drive context's cause.
+//
+// A drive holding only its operation's lease consumed the request at one of
+// its own checkpoints and stands down by its return, so there is no other
+// drive of its share to wake. The client's current drive may then be a sibling
+// operation's, and woken it would hand its operation back without recording
+// the request, leaving the operation under a lease nobody renews until it goes
+// stale. Left running, that drive consumes the request at its next checkpoint
+// and settles its own operation.
+func (c *LocalClient) wakeDriveForControl(ctx context.Context, handle applyCancelHandle, cause error, apply *storage.Apply, operation string) {
+	if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+		attrs := []any{"apply_operation_id", opLease.OperationID, "operation", operation}
+		if apply != nil {
+			attrs = append(apply.LogAttrs(), attrs...)
+		}
+		c.logger.Info("operation-scoped drive consumed the control request at its own checkpoint; no other drive is woken", attrs...)
+		return
+	}
+	c.cancelApplyHandle(handle, cause)
 }
 
 func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error {

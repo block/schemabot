@@ -469,33 +469,3 @@ func TestLocalClient_PendingStopStaysPendingWhenAReachedTargetCannotBeRecorded(t
 	require.NoError(t, err)
 	assert.NotNil(t, pending, "the request stays pending for a retry")
 }
-
-// Two shards copy under their own operations, each with its own drive, and the
-// operator's stop is consumed by one of them. The drive the stop wakes can be
-// the other shard's, and that drive settles its operation from its task rows as
-// it returns. So it is woken only once every task already reads stopped; woken
-// earlier, it would leave its operation running and the stop would wait for
-// that operation's lease to go stale.
-func TestLocalClient_StopWakesTheDriveOnlyAfterEveryTaskReadsStopped(t *testing.T) {
-	apply, tasks := eachTargetTestApply("apply-stop-wakes-after-record",
-		state.Task.Running, state.Task.Running)
-	eng := &eachTargetControlEngine{controlCaptureEngine: &controlCaptureEngine{}}
-	client := newEachTargetControlTestClient(apply, tasks, eng)
-
-	var statesAtWake []string
-	client.setApplyCancel(func(error) {
-		stored, err := client.storage.Tasks().GetByApplyID(t.Context(), apply.ID)
-		require.NoError(t, err)
-		for _, task := range stored {
-			statesAtWake = append(statesAtWake, task.State)
-		}
-	})
-
-	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
-
-	require.NoError(t, err)
-	assert.True(t, resp.Accepted)
-	assert.Equal(t, []string{"-40", "40-80"}, eng.stopTargets, "each copying shard gets its own engine stop")
-	assert.Equal(t, []string{state.Task.Stopped, state.Task.Stopped}, statesAtWake,
-		"the woken drive must read every task stopped")
-}

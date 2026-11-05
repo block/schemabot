@@ -36,6 +36,7 @@ type multiOpResumeEngine struct {
 	rejectApply           bool
 	applyErr              error
 	stopErr               error
+	cancelCalls           int
 	authoritativeProgress bool
 	applyCalls            int
 }
@@ -78,6 +79,13 @@ func (e *multiOpResumeEngine) Stop(context.Context, *engine.ControlRequest) (*en
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
+func (e *multiOpResumeEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cancelCalls++
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
 func (e *multiOpResumeEngine) ProgressIsExternallyAuthoritative() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -90,14 +98,15 @@ const multiOpResumeDDL = "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255)"
 // owned by the operator's rollout projection: two operation rows, with the
 // drive's own operation leased and carrying the fixture's tasks.
 type multiOpResumeFixture struct {
-	stor    storage.Storage
-	client  *LocalClient
-	eng     *multiOpResumeEngine
-	apply   *storage.Apply
-	opID    int64
-	opCtx   context.Context
-	tasks   []*storage.Task
-	leaseDB *sql.DB
+	stor        storage.Storage
+	client      *LocalClient
+	eng         *multiOpResumeEngine
+	apply       *storage.Apply
+	opID        int64
+	siblingOpID int64
+	opCtx       context.Context
+	tasks       []*storage.Task
+	leaseDB     *sql.DB
 }
 
 // newMultiOpResumeFixture seeds a running two-operation apply with the given
@@ -164,7 +173,7 @@ func newMultiOpResumeFixture(t *testing.T, taskStates []string) *multiOpResumeFi
 		State:      state.ApplyOperation.Running,
 	})
 	require.NoError(t, err)
-	_, err = stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+	siblingOpID, err := stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID:    applyID,
 		Deployment: "testdb-sibling",
 		Target:     "testdb-sibling",
@@ -211,7 +220,7 @@ func newMultiOpResumeFixture(t *testing.T, taskStates []string) *multiOpResumeFi
 
 	return &multiOpResumeFixture{
 		stor: stor, client: client, eng: eng,
-		apply: apply, opID: opID, opCtx: opCtx, tasks: tasks, leaseDB: leaseDB,
+		apply: apply, opID: opID, siblingOpID: siblingOpID, opCtx: opCtx, tasks: tasks, leaseDB: leaseDB,
 	}
 }
 
@@ -542,4 +551,85 @@ func TestLocalClient_OperationDriveAdoptsEngineTerminalTruthWithoutParentWrites(
 	require.NoError(t, err)
 	assert.NotNil(t, cancelReq,
 		"the mooted cancel request is the projection's to complete once the parent settles")
+}
+
+// Two shards of one apply copy under their own operations, each driven by its
+// own drive on this data plane, when the operator stops the apply. Each drive
+// consumes the stop at its own checkpoint and records it on its own shard's
+// task under its own lease, so both operations settle stopped right away and
+// none waits for a lease to go stale. The first drive to consume the stop
+// leaves the other shard's task alone and does not wake the other drive, which
+// would hand its operation back unsettled.
+func TestLocalClient_StopSettlesEachOperationUnderItsOwnLease(t *testing.T) {
+	requireEachOperationSettlesUnderItsOwnLease(t, storage.ControlOperationStop, state.Task.Stopped)
+}
+
+// The cancel twin of the stop case above.
+func TestLocalClient_CancelSettlesEachOperationUnderItsOwnLease(t *testing.T) {
+	requireEachOperationSettlesUnderItsOwnLease(t, storage.ControlOperationCancel, state.Task.Cancelled)
+}
+
+func requireEachOperationSettlesUnderItsOwnLease(t *testing.T, operation storage.ControlOperation, wantTaskState string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newMultiOpResumeFixture(t, []string{state.Task.Running})
+	f.client.spiritEngine = &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}
+	ctx := t.Context()
+
+	sibling := *f.tasks[0]
+	sibling.ID = 0
+	sibling.TaskIdentifier = f.tasks[0].TaskIdentifier + "-sibling"
+	sibling.ApplyOperationID = &f.siblingOpID
+	sibling.Shard = "80-"
+	_, err := f.stor.Tasks().Create(ctx, &sibling)
+	require.NoError(t, err)
+	_, err = f.leaseDB.ExecContext(ctx, `
+		UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+	`, "sibling-driver", "sibling-token", f.siblingOpID)
+	require.NoError(t, err)
+	siblingCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID: f.apply.ID, OperationID: f.siblingOpID, Owner: "sibling-driver", Token: "sibling-token",
+	})
+
+	_, alreadyPending, err := f.stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     f.apply.ID,
+		Operation:   operation,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	// The client's current drive is the sibling's.
+	var siblingWoken bool
+	f.client.setApplyCancel(func(error) { siblingWoken = true })
+
+	consume := func(opCtx context.Context) (bool, error) {
+		if operation == storage.ControlOperationStop {
+			return f.client.processPendingStopControlRequest(opCtx, f.apply)
+		}
+		return f.client.processPendingCancelControlRequest(opCtx, f.apply)
+	}
+
+	standDown, err := consume(f.opCtx)
+	require.NoError(t, err, "the first drive must record the request on its own operation's task only")
+	assert.True(t, standDown, "the first drive stands down after consuming the request")
+	assert.Equal(t, wantTaskState, f.taskState(t, f.tasks[0]), "the first drive records the request on its own task")
+	assert.Equal(t, state.Task.Running, f.taskState(t, &sibling),
+		"the sibling's task is the sibling drive's to record, under its own lease")
+	assert.False(t, siblingWoken, "the sibling's drive keeps running so it consumes the request at its next checkpoint")
+	requireControlRequestStatus(t, f.stor, f.apply.ID, operation, storage.ControlRequestPending)
+
+	standDown, err = consume(siblingCtx)
+	require.NoError(t, err, "the sibling drive must record the still-pending request on its own task")
+	assert.True(t, standDown, "the sibling drive stands down after consuming the request")
+	assert.Equal(t, wantTaskState, f.taskState(t, &sibling), "the sibling drive records the request on its own task")
+	assert.Equal(t, wantTaskState, f.taskState(t, f.tasks[0]))
+	assert.False(t, siblingWoken)
+	if operation == storage.ControlOperationCancel {
+		assert.Equal(t, 2, f.eng.cancelCalls, "each drive cancels its own shard's engine work")
+	}
+	f.requireParentUntouched(t)
 }
