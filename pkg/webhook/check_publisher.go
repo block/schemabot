@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -232,6 +233,14 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	if len(config.AllowedEnvironments) > 0 {
 		var scopeErr error
 		scope, scopeErr = h.discoverAggregatePRScope(ctx, client, repo, pr, headSHA)
+		if errors.Is(scopeErr, errAggregateHeadMoved) {
+			// The same disposition as a head that was already superseded when
+			// the fold began: a failing aggregate on the old head would gate
+			// nothing, and a leader's bounded re-fold reads the new head.
+			h.logger.Info("aggregate fold stopped because the PR head moved during discovery; the new head's own fold publishes its aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA)
+			return aggregateFoldScheduleRefold, nil
+		}
 		if scopeErr != nil {
 			h.logger.Error("aggregate scope could not be verified; no no-work success will be published",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", scopeErr)
@@ -947,6 +956,39 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errors, checkBlockReason{})
 }
 
+// failClosedPostTimeout bounds a failing aggregate post that runs past the
+// deadline of the run that found the failure.
+const failClosedPostTimeout = 10 * time.Second
+
+// failClosedPostContext returns the context a failing aggregate post runs on.
+// The post is what tells the author why the PR is blocked, and the failure it
+// reports is often the run's own deadline, so it must not lose to that same
+// deadline. When the deadline has passed, or leaves less than
+// failClosedPostTimeout, the post gets its own short budget. Cancellation still
+// stops it: a cancelled run lost its lease or is shutting down, and the
+// delivery is re-run by whichever driver picks it up next.
+func (h *Handler) failClosedPostContext(ctx context.Context, repo string, pr int, headSHA string) (context.Context, context.CancelFunc) {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx, func() {}
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline || time.Until(deadline) >= failClosedPostTimeout {
+		return ctx, func() {}
+	}
+	h.logger.Info("failing aggregate post runs on its own budget because the run that found the failure is at or near its deadline",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "budget", failClosedPostTimeout, "run_error", ctx.Err())
+	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failClosedPostTimeout)
+	stop := context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return postCtx, func() {
+		stop()
+		cancel()
+	}
+}
+
 // postFailingAggregatesWithBlock stores a blocking reason only for callers with
 // a stable failure class. Generic plan errors should use postFailingAggregates.
 //
@@ -954,6 +996,9 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 // and stored. A caller about to fold the aggregate from stored check state
 // reads false as "the fold may not see this failure" and must not fold.
 func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) bool {
+	ctx, cancel := h.failClosedPostContext(ctx, repo, pr, headSHA)
+	defer cancel()
+
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return false
 	}

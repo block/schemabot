@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -211,17 +212,32 @@ func TestE2EUnstoredPlanFailureBlocksOnlyItsEnvironmentAggregate(t *testing.T) {
 // postFailingAggregatesWithBlock reports false whenever the blocked aggregate
 // it set out to post is not both published and stored: a caller about to fold
 // the aggregate from stored check state reads false as "do not fold". It
-// reports true only once the block is in place.
+// reports true only once the block is in place. A run that reached its
+// deadline still lands the block, because the deadline is often the failure
+// being reported; a cancelled run does not, because its delivery is re-run.
 func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T) {
 	disabled := false
+	pastDeadline := func(t *testing.T) context.Context {
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+		t.Cleanup(cancel)
+		return ctx
+	}
+	cancelled := func(t *testing.T) context.Context {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		return ctx
+	}
 	tests := []struct {
 		name         string
 		headSHA      string
 		createStatus int
 		repos        map[string]api.RepoConfig
+		ctx          func(t *testing.T) context.Context
 		want         bool
 	}{
 		{name: "posted and stored", headSHA: "abc123", createStatus: http.StatusCreated, want: true},
+		{name: "run deadline passed", headSHA: "abc123", createStatus: http.StatusCreated, ctx: pastDeadline, want: true},
+		{name: "run cancelled", headSHA: "abc123", createStatus: http.StatusCreated, ctx: cancelled},
 		{name: "check publishing disabled", headSHA: "abc123", createStatus: http.StatusCreated,
 			repos: map[string]api.RepoConfig{"octocat/hello-world": {EnableChecks: &disabled}}},
 		{name: "head moved", headSHA: "newsha456", createStatus: http.StatusCreated},
@@ -249,7 +265,11 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 			h := newE2EHandler(t, svc, client)
 			installClient := ghclient.NewInstallationClient(client, h.logger)
 
-			got := h.postFailingAggregatesWithBlock(t.Context(), installClient, "octocat/hello-world", 1, "abc123",
+			ctx := t.Context()
+			if tt.ctx != nil {
+				ctx = tt.ctx(t)
+			}
+			got := h.postFailingAggregatesWithBlock(ctx, installClient, "octocat/hello-world", 1, "abc123",
 				map[string]string{"production": planFailedUnstoredSummary}, planFailedUnrecordedBlock)
 			assert.Equal(t, tt.want, got)
 
