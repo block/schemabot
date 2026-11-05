@@ -274,6 +274,13 @@ func TestLocalClientLogsScopesToShard(t *testing.T) {
 		assert.Equal(t, []int64{1}, logs.lastFilter.OperationIDs)
 	})
 
+	t.Run("one shard of a single-target apply", func(t *testing.T) {
+		client, logs := newLogsClient(op(1, "orders", storage.ShardOperationKey("main", "-80", "orders")), op(2, "orders", storage.ShardOperationKey("main", "80-", "orders")), op(3, "orders", "main/group_finalizer"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Shard: "80-"})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2}, logs.lastFilter.OperationIDs)
+	})
+
 	t.Run("a shard of a single-target apply recorded under another name", func(t *testing.T) {
 		client, logs := newLogsClient(op(1, "orders", storage.ShardOperationKey("main", "-80", "orders")), op(2, "orders", storage.ShardOperationKey("main", "80-", "orders")))
 		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001", Shard: "80-"})

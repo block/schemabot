@@ -1485,6 +1485,41 @@ func TestHandleLogsScopesToShard(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `target \"shop-003\" of apply \"apply-control\" runs no per-shard operations; omit shard`)
 }
 
+// A sharded apply on a single target keys its operations by shard alone, with
+// no target in front, so --shard narrows the read without --target.
+func TestHandleLogsScopesSingleTargetApplyToShard(t *testing.T) {
+	apply := &storage.Apply{ID: 17, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "orders", OperationKey: storage.ShardOperationKey("main", "-80", "orders")},
+		{ID: 2, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "orders", OperationKey: storage.ShardOperationKey("main", "80-", "orders")},
+		{ID: 3, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "orders", OperationKey: storage.ShardOperationKey("main", "80-", "customers")},
+	}
+	logStore := &windowedApplyLogStore{available: 2}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  logStore,
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	read := func(query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&"+query, nil)
+		w := httptest.NewRecorder()
+		service.handleLogsWithoutDatabase(w, req)
+		return w
+	}
+
+	w := read("shard=80-")
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{2, 3}, logStore.lastFilter.OperationIDs, "every table's operation on the shard")
+	var scoped apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &scoped))
+	assert.Equal(t, "80-", scoped.Shard)
+	assert.Empty(t, scoped.Target)
+
+	w = read("shard=c0-")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `shard \"c0-\" has no operations in apply \"apply-control\"; its shards are -80, 80-`)
+}
+
 // A deployment read scoped to one shard asks the shared data-plane apply for
 // that shard's entries and credits only the operations keyed to it, so the
 // other shards' operations are not listed as the source of lines they did not
