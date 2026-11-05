@@ -137,7 +137,8 @@ const (
 
 // Run runs the test. It returns nil when every step passed, an error
 // wrapping ErrInconclusive when the run could not decide, and any other error
-// when a step failed.
+// when a step failed. A GitHub rate limit or server error leaves the run
+// undecided, so it wraps ErrInconclusive too.
 func (r *Runner) Run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.RunTimeout)
 	defer cancel()
@@ -145,7 +146,16 @@ func (r *Runner) Run(ctx context.Context) error {
 	cur := &run{table: table, branch: BranchPrefix + table}
 	r.logger.Info("starting live e2e run", "repo", r.cfg.Repo, "database", r.cfg.Database,
 		"environment", r.cfg.Environment, "table", cur.table, "branch", cur.branch)
-	return r.steps(ctx, cur)
+	return inconclusiveWhenGitHubUnavailable(r.steps(ctx, cur))
+}
+
+// inconclusiveWhenGitHubUnavailable wraps ErrInconclusive around err when
+// GitHub, not SchemaBot, failed the call.
+func inconclusiveWhenGitHubUnavailable(err error) error {
+	if err == nil || errors.Is(err, ErrInconclusive) || !githubUnavailable(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", err, ErrInconclusive)
 }
 
 func (r *Runner) steps(ctx context.Context, cur *run) error {

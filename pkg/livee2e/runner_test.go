@@ -2,14 +2,18 @@ package livee2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -46,6 +50,8 @@ type fakeSchemaBot struct {
 	startFinishesWithOnlyASummary bool
 	// deleteBranchFails fails every branch delete.
 	deleteBranchFails bool
+	// commentErr, when set, fails every comment the runner posts.
+	commentErr error
 	// commands records every PR command, in order.
 	commands []string
 }
@@ -162,6 +168,9 @@ func (f *fakeSchemaBot) CheckRun(_ context.Context, sha, _, _ string) (*CheckRun
 func (f *fakeSchemaBot) CreateComment(_ context.Context, number int, body string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.commentErr != nil {
+		return 0, fmt.Errorf("comment on pull request #%d: %w", number, f.commentErr)
+	}
 	id := f.id()
 	f.comments[number] = append(f.comments[number], Comment{ID: id, Author: "runner", Body: body})
 	f.commands = append(f.commands, body)
@@ -408,4 +417,28 @@ func TestRunIsInconclusiveWhenTheCancelIsRefusedAsFinished(t *testing.T) {
 
 	require.ErrorIs(t, err, ErrInconclusive)
 	assert.Contains(t, err.Error(), "finished before it reached "+StatusCancelled)
+}
+
+// GitHub rate limiting the runner proves nothing about SchemaBot, so the run
+// is inconclusive and the pipeline can retry it. Any other GitHub error fails.
+func TestRunIsInconclusiveWhenGitHubRateLimitsIt(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	req := httptest.NewRequest(http.MethodPost, "https://api.github.com/repos/octo/schema/issues/1/comments", nil)
+	bot.commentErr = &github.AbuseRateLimitError{
+		Response: &http.Response{Request: req, StatusCode: http.StatusForbidden},
+		Message:  "You have exceeded a secondary rate limit",
+	}
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "secondary rate limit")
+
+	target = newFakeTarget()
+	bot = newFakeSchemaBot(target)
+	bot.commentErr = errors.New("Resource not accessible by integration")
+	err = testRunner(t, bot, target).Run(t.Context())
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInconclusive)
 }
