@@ -287,6 +287,6 @@ spec:
                 echo "seeding $entity_type from $f"
                 curl -sf -X POST "http://etre:8080/api/v1/entities/$entity_type" \
                   -H "Content-Type: application/json" \
-                  -d @"$f"
+                  -d @"$f" || { echo "seeding $entity_type failed"; exit 1; }
               done
               echo "etre seeded"
