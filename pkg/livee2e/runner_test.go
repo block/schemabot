@@ -2,14 +2,18 @@ package livee2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -46,6 +50,10 @@ type fakeSchemaBot struct {
 	startFinishesWithOnlyASummary bool
 	// deleteBranchFails fails every branch delete.
 	deleteBranchFails bool
+	// deleteBranchErr, when set, is the error every branch delete fails with.
+	deleteBranchErr error
+	// commentErr, when set, fails every comment the runner posts.
+	commentErr error
 	// commands records every PR command, in order.
 	commands []string
 }
@@ -96,6 +104,9 @@ func (f *fakeSchemaBot) CreateBranch(_ context.Context, branch, sha string) erro
 func (f *fakeSchemaBot) DeleteBranch(_ context.Context, branch string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteBranchErr != nil {
+		return fmt.Errorf("delete branch %s: %w", branch, f.deleteBranchErr)
+	}
 	if f.deleteBranchFails {
 		return fmt.Errorf("delete branch %s: GitHub is unavailable", branch)
 	}
@@ -177,6 +188,9 @@ func (f *fakeSchemaBot) CheckRun(_ context.Context, sha, _, _ string) (*CheckRun
 func (f *fakeSchemaBot) CreateComment(_ context.Context, number int, body string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.commentErr != nil {
+		return 0, fmt.Errorf("comment on pull request #%d: %w", number, f.commentErr)
+	}
 	id := f.id()
 	f.comments[number] = append(f.comments[number], Comment{ID: id, Author: "runner", Body: body})
 	f.commands = append(f.commands, body)
@@ -651,4 +665,48 @@ func TestSweepDropsTheTableOfAClosedRunWhoseCancelWasRefusedAsFinished(t *testin
 
 	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
 	assert.False(t, target.has(earlier))
+}
+
+// GitHub rate limiting the runner proves nothing about SchemaBot, so the run
+// is inconclusive and the pipeline can retry it. Any other GitHub error fails.
+func TestRunIsInconclusiveWhenGitHubRateLimitsIt(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.commentErr = secondaryRateLimit(http.MethodPost, "https://api.github.com/repos/octo/schema/issues/1/comments")
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "secondary rate limit")
+
+	target = newFakeTarget()
+	bot = newFakeSchemaBot(target)
+	bot.commentErr = errors.New("Resource not accessible by integration")
+	err = testRunner(t, bot, target).Run(t.Context())
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInconclusive)
+}
+
+// secondaryRateLimit is the error go-github returns when GitHub's secondary
+// rate limit refuses a call.
+func secondaryRateLimit(method, url string) error {
+	return &github.AbuseRateLimitError{
+		Response: &http.Response{Request: httptest.NewRequest(method, url, nil), StatusCode: http.StatusForbidden},
+		Message:  "You have exceeded a secondary rate limit",
+	}
+}
+
+// A rate-limited cleanup after a failed step leaves the run failed: the step
+// proved SchemaBot wrong whatever happened to the cleanup after it.
+func TestRunStaysFailedWhenOnlyTheCleanupIsRateLimited(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.deferredCutsOverAlone = true
+	bot.deleteBranchErr = secondaryRateLimit(http.MethodDelete, "https://api.github.com/repos/octo/schema/git/refs/heads/schemabot-e2e/run")
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secondary rate limit", "the cleanup error is still reported")
+	assert.NotErrorIs(t, err, ErrInconclusive)
 }

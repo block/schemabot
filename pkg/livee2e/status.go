@@ -27,10 +27,14 @@ const (
 	StatusStopped           = "Stopped"
 	StatusCancelled         = "Cancelled"
 	StatusFailed            = "Failed"
+	StatusReverted          = "Reverted"
+	StatusRolledBack        = "Rolled Back"
 )
 
 var (
-	applyIDLine = regexp.MustCompile("\\*\\*Apply ID\\*\\*: `(apply-[0-9a-f]+)`")
+	// Apply IDs are opaque, so the pattern takes anything up to the closing
+	// backtick rather than today's hex form.
+	applyIDLine = regexp.MustCompile("\\*\\*Apply ID\\*\\*: `(apply-[^`]+)`")
 	statusLine  = regexp.MustCompile(`(?m)^\*\*Status\*\*: (.+)$`)
 )
 
@@ -103,7 +107,8 @@ func latestApplyStatus(comments []Comment, applyID string) (ApplyStatus, bool) {
 }
 
 // firstApplyAfter returns the first apply status comment posted after the
-// comment with ID after: the apply a command started.
+// comment with ID after: the apply a command started. comments must be
+// SchemaBot's alone.
 func firstApplyAfter(comments []Comment, after int64) (ApplyStatus, bool) {
 	var first ApplyStatus
 	var firstID int64
@@ -145,18 +150,22 @@ func firstLine(body string) string {
 }
 
 // summaryApplyIDLine names the apply in a completed apply's summary comment.
-var summaryApplyIDLine = regexp.MustCompile("_Apply ID: `(apply-[0-9a-f]+)`_")
+var summaryApplyIDLine = regexp.MustCompile("_Apply ID: `(apply-[^`]+)`_")
 
 // finalSummaryTitles maps the title of the summary comment SchemaBot posts when
 // an apply finishes to the status it reports. A reverted apply's title takes
-// either form, depending on which comment announces it. A stopped apply's
-// summary is left out: a start can resume the apply after it.
+// either form, depending on which comment announces it. A rollback apply has
+// titles of its own. A stopped apply's summary is left out: a start can resume
+// the apply after it.
 var finalSummaryTitles = map[string]string{
 	"Schema Change Applied":   StatusApplied,
 	"Schema Change Failed":    StatusFailed,
 	"Schema Change Cancelled": StatusCancelled,
-	"Schema Change Reverted":  "Reverted",
-	"Schema Change: Reverted": "Reverted",
+	"Schema Change Reverted":  StatusReverted,
+	"Schema Change: Reverted": StatusReverted,
+	"Rollback Complete":       StatusRolledBack,
+	"Rollback Failed":         StatusFailed,
+	"Rollback Cancelled":      StatusCancelled,
 }
 
 // parseFinalSummary reads the apply ID and final status from the summary
@@ -216,6 +225,7 @@ var startRefusals = map[string]string{
 
 // refusedAsFinished returns the state SchemaBot named when it refused the
 // command posted as comment after because the apply had already finished.
+// comments must be SchemaBot's alone.
 func refusedAsFinished(comments []Comment, after int64) (string, bool) {
 	for _, c := range comments {
 		if c.ID <= after {
@@ -261,7 +271,7 @@ func inFlightApplies(comments []Comment) []string {
 // starts or cancels it, so the sweep cancels it like a running one.
 func isTerminalStatus(label string) bool {
 	switch label {
-	case StatusApplied, StatusCancelled, StatusFailed, "Reverted", "Rolled Back":
+	case StatusApplied, StatusCancelled, StatusFailed, StatusReverted, StatusRolledBack:
 		return true
 	}
 	return false
@@ -269,21 +279,25 @@ func isTerminalStatus(label string) bool {
 
 // applyRejections are headlines of SchemaBot's replies that refuse an apply
 // command before it reaches the engine, so no apply can be running for it.
-// A generic "Apply Failed" reply is left out: SchemaBot can post it after the
-// engine accepted the apply.
+// The tests render each one from its template. A generic "Apply Failed" reply
+// is left out: SchemaBot can post it after the engine accepted the apply.
+// "Not Registered" covers both the one-database and many-database headlines.
 var applyRejections = []string{
 	"Apply Blocked",
-	"Plan Failed",
+	"Apply Already In Progress",
+	"Rejected — new commits since discovery",
+	"Apply rejected — base schema is newer",
 	"Review Required",
 	"Review Gate Error",
 	"Command Not Authorized",
 	"Authorization Check Failed",
-	"Database Not Registered",
-	"Databases Not Registered",
+	"Database Not Found",
 	"Database Not Configured",
+	"Not Registered",
 	"Database Not Available to This Repository",
 	"No Schema Files Changed",
-	"Missing Environment",
+	"Invalid Environment",
+	"Missing Argument",
 }
 
 func isApplyRejection(body string) bool {

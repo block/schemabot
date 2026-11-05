@@ -144,13 +144,14 @@ const (
 
 // Run sweeps up after earlier runs, then runs the test. It returns nil when
 // every step passed, an error wrapping ErrInconclusive when the run could not
-// decide, and any other error when a step failed. The run's pull request,
-// branch, and table are removed whatever the outcome.
+// decide, and any other error when a step failed. A GitHub rate limit or
+// server error leaves the run undecided, so it wraps ErrInconclusive too. The
+// run's pull request, branch, and table are removed whatever the outcome.
 func (r *Runner) Run(ctx context.Context) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.RunTimeout)
 	defer cancel()
 	if err := r.Sweep(ctx); err != nil {
-		return fmt.Errorf("sweep before the run: %w", err)
+		return inconclusiveWhenGitHubUnavailable(fmt.Errorf("sweep before the run: %w", err))
 	}
 	table := runTablePrefix + r.now().Add(r.cfg.RunTimeout+r.cfg.WaitTimeout).UTC().Format(runTimeLayout)
 	cur := &run{table: table, branch: BranchPrefix + table}
@@ -163,7 +164,18 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 			err = errors.Join(err, fmt.Errorf("clean up run %s: %w", cur.table, cerr))
 		}
 	}()
-	return r.steps(ctx, cur)
+	// Classified before the cleanup error joins it, so a rate-limited cleanup
+	// cannot turn a failed step into an inconclusive run.
+	return inconclusiveWhenGitHubUnavailable(r.steps(ctx, cur))
+}
+
+// inconclusiveWhenGitHubUnavailable wraps ErrInconclusive around err when
+// GitHub, not SchemaBot, failed the call.
+func inconclusiveWhenGitHubUnavailable(err error) error {
+	if err == nil || errors.Is(err, ErrInconclusive) || !githubUnavailable(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", err, ErrInconclusive)
 }
 
 func (r *Runner) steps(ctx context.Context, cur *run) error {
