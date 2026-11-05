@@ -4137,10 +4137,23 @@ func (c *LocalClient) logOperationsOnTarget(apply *storage.Apply, ops []*storage
 	}
 	// A remote apply that drives one target holds only that target's log, and
 	// a single-target dispatch may record its target under another name than
-	// the caller's (the database name when the request named none), so the
-	// whole log is the answer.
-	c.logger.Debug("logs read for a target the single-target apply records under another name; serving its whole log",
-		append(apply.LogAttrs(), "target", target, "recorded_targets", targets)...)
+	// the caller's (the database name when the request named none), so every
+	// operation listed here is the target's. The IDs stay explicit for the
+	// reason LogOperationsOnTarget gives: an operation that joins the apply
+	// after this listing belongs to another target.
+	if len(ops) > 0 {
+		c.logger.Debug("logs read for a target the single-target apply records under another name; serving its listed operations",
+			append(apply.LogAttrs(), "target", target, "recorded_targets", targets)...)
+		listed := make([]int64, 0, len(ops))
+		for _, op := range ops {
+			listed = append(listed, op.ID)
+		}
+		return listed, ops, nil
+	}
+	// An apply with no recorded operation has no operation to scope by, and its
+	// entries name none, so its whole log is the answer.
+	c.logger.Debug("logs read for a target on an apply with no recorded operation; serving its whole log",
+		append(apply.LogAttrs(), "target", target)...)
 	return nil, ops, nil
 }
 
