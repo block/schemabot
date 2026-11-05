@@ -3219,7 +3219,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 
 	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+	// The dispatch request holds no operation lease, so the entry names the
+	// attached operation itself; left unattributed it would read as about the
+	// whole apply and show in every target's log.
+	c.logOperationEvent(ctx, apply.ID, operation.ID, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
 	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attached")
 	c.logger.Info("Apply: attached operation to keyed apply",
