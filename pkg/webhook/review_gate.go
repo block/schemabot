@@ -53,6 +53,12 @@ type ReviewGateResult struct {
 	// for the database, so the comment can say why an approval visible on the
 	// PR does not count.
 	UnauthorizedApprovers []string
+	// UnauthorizedEarlierApprovers are the UnauthorizedApprovers whose
+	// approval was given on an earlier commit. Joining a listed team may not
+	// be enough for such an approval to count, since the schema change may
+	// have changed since, so the comment also asks them to approve the latest
+	// commit.
+	UnauthorizedEarlierApprovers []string
 	// BaseRef and DefaultBranch are the PR's base branch and the repository's
 	// default branch. An approval is carried across base branch changes only
 	// when they are the same, so the review-required comment says so when they
@@ -99,20 +105,21 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 	}
 	if gateResult != nil && !gateResult.Approved {
 		data := templates.ReviewGateData{
-			Database:              schemaResult.Database,
-			Environment:           environment,
-			RequestedBy:           requestedBy,
-			OperatorReviewers:     gateResult.OperatorReviewers,
-			OtherReviewers:        gateResult.OtherReviewers,
-			PRAuthor:              gateResult.PRAuthor,
-			ChangedApprovers:      gateResult.ChangedApprovers,
-			ChangedPaths:          gateResult.ChangedPaths,
-			ChangedBasePaths:      gateResult.ChangedBasePaths,
-			ChangedStatements:     gateResult.ChangedStatements,
-			UncomparedApprovers:   gateResult.UncomparedApprovers,
-			UnauthorizedApprovers: gateResult.UnauthorizedApprovers,
-			BaseRef:               gateResult.BaseRef,
-			DefaultBranch:         gateResult.DefaultBranch,
+			Database:                     schemaResult.Database,
+			Environment:                  environment,
+			RequestedBy:                  requestedBy,
+			OperatorReviewers:            gateResult.OperatorReviewers,
+			OtherReviewers:               gateResult.OtherReviewers,
+			PRAuthor:                     gateResult.PRAuthor,
+			ChangedApprovers:             gateResult.ChangedApprovers,
+			ChangedPaths:                 gateResult.ChangedPaths,
+			ChangedBasePaths:             gateResult.ChangedBasePaths,
+			ChangedStatements:            gateResult.ChangedStatements,
+			UncomparedApprovers:          gateResult.UncomparedApprovers,
+			UnauthorizedApprovers:        gateResult.UnauthorizedApprovers,
+			UnauthorizedEarlierApprovers: gateResult.UnauthorizedEarlierApprovers,
+			BaseRef:                      gateResult.BaseRef,
+			DefaultBranch:                gateResult.DefaultBranch,
 		}
 		if len(gateResult.UncomparedApprovers) > 0 {
 			h.postComment(repo, pr, installationID, templates.RenderReviewGateError(data))
@@ -228,7 +235,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		compareStatements: h.statementComparerFor(repo, pr, database, environment, schema.Type),
 		verdicts:          make(map[string]approvalVerdict),
 	}
-	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers, unauthorizedApprovers []string
+	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers, unauthorizedApprovers, unauthorizedEarlierApprovers []string
 	var staleApprovals []staleApproval
 	for _, approval := range validApprovals {
 		reviewer := approval.User
@@ -240,6 +247,12 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 			h.logger.Debug("review gate: approval does not count because the reviewer is not an authorized reviewer for the database",
 				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer)
 			unauthorizedApprovers = append(unauthorizedApprovers, reviewer)
+			// Whether an earlier approval would still cover the head is not
+			// compared for a reviewer who cannot approve anyway, so no GitHub
+			// request is spent on it; the comment asks for a fresh approval.
+			if approval.CommitID != headSHA {
+				unauthorizedEarlierApprovers = append(unauthorizedEarlierApprovers, reviewer)
+			}
 			continue
 		}
 		verdict, err := h.approvalCoversHead(ctx, client, &coverage, approval)
@@ -287,18 +300,19 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		"operator_reviewers", policy.OperatorReviewers,
 		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
-		Approved:              false,
-		OperatorReviewers:     policy.OperatorReviewers,
-		OtherReviewers:        policy.OtherReviewers,
-		PRAuthor:              prInfo.User,
-		ChangedApprovers:      changedApprovers,
-		ChangedPaths:          changedPaths,
-		ChangedBasePaths:      changedBasePaths,
-		ChangedStatements:     h.changedStatements(ctx, client, &coverage, staleApprovals),
-		UncomparedApprovers:   uncomparedApprovers,
-		UnauthorizedApprovers: unauthorizedApprovers,
-		BaseRef:               prInfo.BaseRef,
-		DefaultBranch:         prInfo.DefaultBranch,
+		Approved:                     false,
+		OperatorReviewers:            policy.OperatorReviewers,
+		OtherReviewers:               policy.OtherReviewers,
+		PRAuthor:                     prInfo.User,
+		ChangedApprovers:             changedApprovers,
+		ChangedPaths:                 changedPaths,
+		ChangedBasePaths:             changedBasePaths,
+		ChangedStatements:            h.changedStatements(ctx, client, &coverage, staleApprovals),
+		UncomparedApprovers:          uncomparedApprovers,
+		UnauthorizedApprovers:        unauthorizedApprovers,
+		UnauthorizedEarlierApprovers: unauthorizedEarlierApprovers,
+		BaseRef:                      prInfo.BaseRef,
+		DefaultBranch:                prInfo.DefaultBranch,
 	}, nil
 }
 

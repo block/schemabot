@@ -94,6 +94,40 @@ func TestRenderReviewRequired_UnauthorizedApproversWithTeam(t *testing.T) {
 	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave, @erin and @frank to one of the teams listed above\n2. Then run `schemabot apply -e staging` again\n")
 }
 
+// An unauthorized reviewer approved an earlier commit, so joining a team is
+// not enough on its own: the next step also asks them to approve the latest
+// commit.
+func TestRenderReviewRequired_UnauthorizedEarlierApprover(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:                     "payments",
+		Environment:                  "staging",
+		RequestedBy:                  "alice",
+		OperatorReviewers:            []string{"org/payments-operators"},
+		PRAuthor:                     "alice",
+		UnauthorizedApprovers:        []string{"dave"},
+		UnauthorizedEarlierApprovers: []string{"dave"},
+	})
+
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave to one of the teams listed above and ask them to approve the latest commit\n2. Then run `schemabot apply -e staging` again\n")
+}
+
+// One unauthorized reviewer approved the head and another an earlier commit.
+// Each gets the remedy that unblocks the apply for them.
+func TestRenderReviewRequired_UnauthorizedHeadAndEarlierApprovers(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:                     "payments",
+		Environment:                  "staging",
+		RequestedBy:                  "alice",
+		OperatorReviewers:            []string{"org/payments-operators"},
+		PRAuthor:                     "alice",
+		UnauthorizedApprovers:        []string{"dave", "erin"},
+		UnauthorizedEarlierApprovers: []string{"erin"},
+	})
+
+	assert.Contains(t, result, "\n@dave and @erin approved, but aren't authorized reviewers for `payments`, so those approvals don't count.\n")
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave to one of the teams listed above, or add @erin to one of them and ask them to approve the latest commit\n2. Then run `schemabot apply -e staging` again\n")
+}
+
 // One reviewer approved an earlier commit whose schema change differs, and
 // another approved without being authorized. Both are named with their own
 // reason, and the next step leads with the reviewer who knows the change.

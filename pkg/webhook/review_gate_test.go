@@ -1533,7 +1533,7 @@ func TestCheckReviewGate_NamesUnauthorizedAndChangedApprovers(t *testing.T) {
 	now := time.Now()
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}, CommitID: new(reviewGateApproved)},
-		{User: &gh.User{Login: new("dave")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}},
+		{User: &gh.User{Login: new("dave")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}, CommitID: new(reviewGateApproved)},
 	})
 	registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
 	registerReviewGateGitObjects(t, mux, map[string]map[string]string{
@@ -1549,6 +1549,7 @@ func TestCheckReviewGate_NamesUnauthorizedAndChangedApprovers(t *testing.T) {
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
 	assert.Equal(t, []string{"dave"}, result.UnauthorizedApprovers)
+	assert.Equal(t, []string{"dave"}, result.UnauthorizedEarlierApprovers, "dave approved an earlier commit, so joining a team alone would not unblock the apply")
 	assert.Equal(t, []string{"bob"}, result.ChangedApprovers)
 }
 
@@ -1990,6 +1991,7 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 			User:        &gh.User{Login: new("dave")},
 			State:       new(ghclient.ReviewApproved),
 			SubmittedAt: &gh.Timestamp{Time: time.Now()},
+			CommitID:    new(reviewGateTestHeadSHA),
 		},
 	})
 	mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
@@ -2002,6 +2004,7 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
 	assert.Equal(t, []string{"dave"}, result.UnauthorizedApprovers, "the comment names the approval that does not count")
+	assert.Empty(t, result.UnauthorizedEarlierApprovers, "dave approved the head, so joining the team is enough")
 }
 
 // The review-required comment splits reviewers by how close each principal is

@@ -42,6 +42,10 @@ type ReviewGateData struct {
 	// UnauthorizedApprovers approved the PR but are not authorized reviewers
 	// for the database, so their approvals do not count.
 	UnauthorizedApprovers []string
+	// UnauthorizedEarlierApprovers are the UnauthorizedApprovers whose
+	// approval was given on an earlier commit, so joining a team is not
+	// enough on its own: they also need to approve the latest commit.
+	UnauthorizedEarlierApprovers []string
 	// BaseRef is the PR's base branch and DefaultBranch the repository's
 	// default branch; either may be empty when unknown.
 	BaseRef       string
@@ -273,10 +277,24 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 	}
 	// A reviewer who approved without being authorized may belong in one of
 	// the listed teams; membership is checked on every apply, so joining one
-	// lets their approval count.
+	// lets an approval of the latest commit count. Someone who approved an
+	// earlier commit is also asked to approve the latest one.
 	addToTeam := len(data.UnauthorizedApprovers) > 0 && listsTeam(data)
 	if addToTeam {
-		step += fmt.Sprintf(", or add %s to one of the teams listed above", joinWithAnd(mentions(data.UnauthorizedApprovers)))
+		var headApprovers []string
+		for _, approver := range data.UnauthorizedApprovers {
+			if !slices.Contains(data.UnauthorizedEarlierApprovers, approver) {
+				headApprovers = append(headApprovers, approver)
+			}
+		}
+		teams := "one of the teams listed above"
+		if len(headApprovers) > 0 {
+			step += fmt.Sprintf(", or add %s to %s", joinWithAnd(mentions(headApprovers)), teams)
+			teams = "one of them"
+		}
+		if len(data.UnauthorizedEarlierApprovers) > 0 {
+			step += fmt.Sprintf(", or add %s to %s and ask them to approve the latest commit", joinWithAnd(mentions(data.UnauthorizedEarlierApprovers)), teams)
+		}
 	}
 	fmt.Fprintf(sb, "1. %s\n", step)
 	if addToTeam {
