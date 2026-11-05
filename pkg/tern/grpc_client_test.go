@@ -3,6 +3,7 @@ package tern
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -6977,25 +6978,75 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 		// A drive stopping on shutdown or lease release cancels its reconcile
 		// context. Every remaining shard write would fail the same way, so the
 		// encode stops after the first one and logs the stop once instead of an
-		// error per shard.
-		storedTask := newStoredTask()
-		tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
-		var logs bytes.Buffer
-		client := &GRPCClient{
-			storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}},
-			logger:  slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		// error per shard. A cancel is routine and logs at Info; a reconcile
+		// that ran out of time logs at Warn.
+		tests := []struct {
+			name      string
+			endCtx    func(ctx context.Context) (context.Context, context.CancelFunc)
+			ctxErr    error
+			wantMsg   string
+			wantLevel string
+		}{
+			{
+				name: "cancelled",
+				endCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+					ctx, cancel := context.WithCancel(ctx)
+					cancel()
+					return ctx, cancel
+				},
+				ctxErr:    context.Canceled,
+				wantMsg:   "stopping remote per-shard progress encode: reconcile context was cancelled",
+				wantLevel: "INFO",
+			},
+			{
+				name: "deadline passed",
+				endCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+					return context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				},
+				ctxErr:    context.DeadlineExceeded,
+				wantMsg:   "stopping remote per-shard progress encode: reconcile context deadline passed",
+				wantLevel: "WARN",
+			},
 		}
-		ctx, cancel := context.WithCancel(storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"}))
-		cancel()
-		tasks.upsertShardErr = fmt.Errorf("look up shard task: %w", context.Canceled)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				storedTask := newStoredTask()
+				tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+				var logs bytes.Buffer
+				client := &GRPCClient{
+					storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}},
+					logger:  slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+				}
+				ctx, cancel := tt.endCtx(storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"}))
+				defer cancel()
+				tasks.upsertShardErr = fmt.Errorf("look up shard task: %w", tt.ctxErr)
 
-		client.syncShardProgressFromRemote(ctx, apply, storedTask, remoteTables()[0].Shards, now)
+				client.syncShardProgressFromRemote(ctx, apply, storedTask, remoteTables()[0].Shards, now)
 
-		assert.Equal(t, 1, tasks.upsertShardCalls, "no shard write may follow the first one once the context has ended")
-		assert.NotContains(t, logs.String(), "failed to encode remote per-shard progress")
-		assert.Contains(t, logs.String(), `"msg":"stopping remote per-shard progress encode: reconcile context was cancelled"`)
-		assert.Contains(t, logs.String(), `"level":"INFO"`)
+				assert.Equal(t, 1, tasks.upsertShardCalls, "no shard write may follow the first one once the context has ended")
+				assert.NotContains(t, logs.String(), "failed to encode remote per-shard progress")
+				stop := logEntryWithMessage(t, logs.String(), tt.wantMsg)
+				assert.Equal(t, tt.wantLevel, stop["level"])
+				assert.Equal(t, remoteTables()[0].Shards[0].Shard, stop["shard"])
+			})
+		}
 	})
+}
+
+// logEntryWithMessage decodes the JSON log lines in logs and returns the one
+// entry whose msg is want, failing the test unless exactly one matches.
+func logEntryWithMessage(t *testing.T, logs, want string) map[string]any {
+	t.Helper()
+	var matches []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), "log line is JSON: %s", line)
+		if entry["msg"] == want {
+			matches = append(matches, entry)
+		}
+	}
+	require.Len(t, matches, 1, "exactly one %q log entry in:\n%s", want, logs)
+	return matches[0]
 }
 
 func TestGRPCClient_SyncUnchangedProgressAdvancesUpdatedAt(t *testing.T) {
