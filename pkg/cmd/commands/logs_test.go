@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/stretchr/testify/assert"
@@ -391,4 +392,31 @@ func TestScopeHeader(t *testing.T) {
 	assert.Equal(t, ", target shop-002", scopeHeader(client.LogScope{Target: "shop-002"}))
 	assert.Equal(t, ", shard -80", scopeHeader(client.LogScope{Shard: "-80"}))
 	assert.Equal(t, ", target shop-002, shard -80", scopeHeader(client.LogScope{Target: "shop-002", Shard: "-80"}))
+}
+
+// Every keyspace's first shard starts with "-", which reads as a flag when it
+// is given as its own argument. The documented form joins it to the flag, and
+// the parser's refusal of the separated form names that form.
+func TestLogsCmdParsesShardStartingWithHyphen(t *testing.T) {
+	var cli struct {
+		Logs LogsCmd `cmd:"" name:"logs"`
+	}
+	parser, err := kong.New(&cli)
+	require.NoError(t, err)
+
+	_, err = parser.Parse([]string{"logs", "apply-a", "--target", "shop-002", "--shard=-80", "--follow"})
+	require.NoError(t, err)
+	assert.Equal(t, "apply-a", cli.Logs.ApplyIDArg)
+	assert.Equal(t, "shop-002", cli.Logs.Target)
+	assert.Equal(t, "-80", cli.Logs.Shard)
+	assert.True(t, cli.Logs.Follow)
+
+	cli.Logs = LogsCmd{}
+	_, err = parser.Parse([]string{"logs", "apply-a", "--shard", "80-"})
+	require.NoError(t, err)
+	assert.Equal(t, "80-", cli.Logs.Shard)
+
+	cli.Logs = LogsCmd{}
+	_, err = parser.Parse([]string{"logs", "apply-a", "--shard", "-80"})
+	require.ErrorContains(t, err, `--shard="-80"`)
 }

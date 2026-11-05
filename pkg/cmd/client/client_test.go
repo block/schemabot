@@ -546,9 +546,27 @@ func TestScopedLogReadRefusesAnUnscopedAnswer(t *testing.T) {
 	require.ErrorContains(t, err, "does not support reading one target's logs")
 	_, err = GetLogs(server.URL, "", "", "apply-a", LogScope{Shard: "-80"}, 10)
 	require.ErrorContains(t, err, "does not support reading one shard's logs and returned the whole apply's; upgrade the server or omit --shard")
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{Shard: "-80"}, 10)
+	require.ErrorContains(t, err, "does not support reading one shard's logs and returned the whole apply's; upgrade the server or omit --shard")
 
 	_, err = GetLogs(server.URL, "", "", "apply-a", LogScope{}, 10)
 	require.NoError(t, err)
 	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{}, 10)
 	require.NoError(t, err)
+}
+
+// A server that answers a shard read with another shard's log is refused too,
+// naming both shards, rather than shown as the requested shard's history.
+func TestScopedLogReadRefusesAnotherShardsAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"apply_id":"apply-a","shard":"80-","logs":[],"sources":[],"errors":[]}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := GetLogs(server.URL, "", "", "apply-a", LogScope{Shard: "-80"}, 10)
+	require.EqualError(t, err, `the server answered a read of shard "-80" with shard "80-"'s logs`)
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{Shard: "-80"}, 10)
+	require.EqualError(t, err, `the server answered a read of shard "-80" with shard "80-"'s logs`)
 }

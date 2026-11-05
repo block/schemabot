@@ -34,7 +34,7 @@ type LogsCmd struct {
 	Follow      bool   `short:"f" help:"Print the newest N entries, then poll for new ones until interrupted"`
 	Deployment  string `help:"Read logs from the selected data-plane deployment"`
 	Target      string `help:"Show only one target's entries, plus the entries about the whole apply"`
-	Shard       string `help:"Show only one shard's entries of a sharded apply, plus the entries about the whole apply; with --target, that target's shard"`
+	Shard       string `help:"Show only one shard's entries of a sharded apply, plus the entries about the whole apply; with --target, that target's shard. Join a shard that starts with - to the flag: --shard=-80"`
 	JSON        bool   `help:"Output as JSON"`
 }
 

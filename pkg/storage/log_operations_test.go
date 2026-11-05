@@ -61,6 +61,9 @@ func TestOperationShard(t *testing.T) {
 		{"group finalizer", ApplyOperationKindGroupFinalizer, "main/group_finalizer", "shop-001", "", false},
 		{"group finalizer behind its target", ApplyOperationKindGroupFinalizer, TargetOperationKey("shop-001", "main/group_finalizer"), "shop-001", "", false},
 		{"four components behind another target", ApplyOperationKindWork, "shop-002/main/-80/orders", "shop-001", "", false},
+		{"namespace named like the target", ApplyOperationKindWork, ShardOperationKey("main", "-80", "orders"), "main", "-80", true},
+		{"no target", ApplyOperationKindWork, ShardOperationKey("main", "80-", "orders"), "", "80-", true},
+		{"extra components", ApplyOperationKindWork, "main/-80/orders/extra", "shop-001", "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			shard, ok := OperationShard(tc.kind, tc.key, tc.target)

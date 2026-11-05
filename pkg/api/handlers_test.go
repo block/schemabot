@@ -1650,18 +1650,30 @@ func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
 
 func TestDeploymentLogErrorIsSanitizedAndIncludesProvenance(t *testing.T) {
 	fetch := &deploymentLogFetch{target: "cluster-a", externalID: "remote-a", operations: []*apitypes.LogOperationProvenance{{OperationKey: "commerce/-80/orders", Target: "cluster-a", OperationKind: "work"}}}
-	got := deploymentLogError(fetch, status.Error(codes.Unavailable, "dial secret.example:443"))
+	got := deploymentLogError(fetch, logScope{}, status.Error(codes.Unavailable, "dial secret.example:443"))
 	assert.Equal(t, "RemoteLogReadFailed", got.Code)
 	assert.NotContains(t, got.Message, "secret.example")
 	assert.Equal(t, fetch.operations, got.Operations)
 
-	got = deploymentLogError(fetch, status.Error(codes.Unimplemented, "method Logs not implemented"))
+	got = deploymentLogError(fetch, logScope{}, status.Error(codes.Unimplemented, "method Logs not implemented"))
 	assert.Equal(t, "UnsupportedCapability", got.Code)
 	assert.Equal(t, "upgrade_required", got.Reason)
 
+	// A read the data plane finds nothing for is never presented as worth
+	// retrying, and a shard read names the way to see the source's entries.
+	got = deploymentLogError(fetch, logScope{shard: "-80"}, status.Error(codes.NotFound, "apply remote-a runs no per-shard operations on target cluster-a"))
+	assert.Equal(t, "RemoteLogNotFound", got.Code)
+	assert.Equal(t, "remote_log_not_found", got.Reason)
+	assert.Equal(t, "The selected data plane records no operation on this shard; read the log without --shard.", got.Message)
+	assert.NotContains(t, got.Message, "retry")
+
+	got = deploymentLogError(fetch, logScope{}, status.Error(codes.NotFound, "apply remote-a not found"))
+	assert.Equal(t, "RemoteLogNotFound", got.Code)
+	assert.Equal(t, "The selected data plane has no log for this apply; check server logs.", got.Message)
+
 	// The gRPC client wraps Unimplemented with upgrade guidance before it
 	// reaches this mapping; detection must see through the wrapping.
-	got = deploymentLogError(fetch, fmt.Errorf("selected data plane does not support log reads; upgrade that data plane: %w", status.Error(codes.Unimplemented, "method Logs not implemented")))
+	got = deploymentLogError(fetch, logScope{}, fmt.Errorf("selected data plane does not support log reads; upgrade that data plane: %w", status.Error(codes.Unimplemented, "method Logs not implemented")))
 	assert.Equal(t, "UnsupportedCapability", got.Code)
 	assert.Equal(t, "upgrade_required", got.Reason)
 

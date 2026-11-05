@@ -2164,6 +2164,7 @@ GET /api/logs?apply_id=apply-example-73&deployment=us-east&shard=-80
   "sources": [],
   "errors": [{
     "external_id": "remote-apply-example-73",
+    "target": "shop-production",
     "operations": [{"operation_key": "main/-80/orders", "target": "shop-production", "operation_kind": "work"}],
     "code": "UnsupportedCapability",
     "reason": "upgrade_required",
@@ -2250,7 +2251,12 @@ source holding that target's entries plus the entries about the remote apply
 as a whole, such as its state changes; another target's entries never appear
 in it. A successful HTTP
 response can still contain source errors. Keep the readable sources and report
-the missing ones; do not treat partial logs as a complete record.
+the missing ones; do not treat partial logs as a complete record. Only
+`remote_log_read_failed` is worth retrying. `upgrade_required` needs a newer
+data plane, `malformed_remote_log` returned records SchemaBot cannot decode,
+and `remote_log_not_found` means the data plane has nothing to read for the
+request, such as a shard its own records do not carry; its message says how to
+read the source instead.
 
 <details>
 <summary>Partial result example (HTTP 200)</summary>

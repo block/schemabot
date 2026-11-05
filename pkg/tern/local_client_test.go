@@ -305,7 +305,7 @@ func TestLocalClientLogsScopesToShard(t *testing.T) {
 		client, _ := newLogsClient(sharded...)
 		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002", Shard: "80-"})
 		require.ErrorIs(t, err, ErrLogsShardNotInApply)
-		assert.ErrorContains(t, err, "only on -80")
+		assert.ErrorContains(t, err, "target shop-002 of apply apply-a has no operation on shard 80-, only on -80")
 		assert.Equal(t, codes.NotFound, applyLookupErrorCode(err))
 	})
 
@@ -313,7 +313,7 @@ func TestLocalClientLogsScopesToShard(t *testing.T) {
 		client, _ := newLogsClient(op(1, "shop-001", storage.TargetOperationKey("shop-001", "")))
 		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Shard: "-80"})
 		require.ErrorIs(t, err, ErrLogsShardNotInApply)
-		assert.ErrorContains(t, err, "runs no per-shard operations")
+		assert.ErrorContains(t, err, "apply apply-a runs no per-shard operations, so it has no log for shard -80", "a shard read that names no target names none")
 	})
 }
 

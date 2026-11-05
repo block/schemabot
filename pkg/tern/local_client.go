@@ -4118,11 +4118,15 @@ func (c *LocalClient) logOperationsFor(ctx context.Context, apply *storage.Apply
 	if operationIDs = storage.LogOperationsOnShard(ops, shard); len(operationIDs) > 0 {
 		return operationIDs, nil
 	}
+	where := "apply " + apply.ApplyIdentifier
+	if target != "" {
+		where = fmt.Sprintf("target %s of apply %s", target, apply.ApplyIdentifier)
+	}
 	shards := storage.DistinctOperationShards(ops)
 	if len(shards) == 0 {
-		return nil, fmt.Errorf("apply %s runs no per-shard operations on target %q, so it has no log for shard %s: %w", apply.ApplyIdentifier, target, shard, ErrLogsShardNotInApply)
+		return nil, fmt.Errorf("%s runs no per-shard operations, so it has no log for shard %s: %w", where, shard, ErrLogsShardNotInApply)
 	}
-	return nil, fmt.Errorf("apply %s has no operation on shard %s of target %q, only on %s: %w", apply.ApplyIdentifier, shard, target, strings.Join(shards, ", "), ErrLogsShardNotInApply)
+	return nil, fmt.Errorf("%s has no operation on shard %s, only on %s: %w", where, shard, strings.Join(shards, ", "), ErrLogsShardNotInApply)
 }
 
 // logOperationsOnTarget narrows ops to target's, returning their IDs and the

@@ -445,7 +445,7 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		resp, fetchErr := client.Logs(r.Context(), &ternv1.LogsRequest{ApplyId: fetch.externalID, Target: fetch.target, Shard: scope.shard, Database: apply.Database, Type: apply.DatabaseType, Environment: apply.Environment, Limit: requestLimit})
 		if fetchErr != nil {
 			s.recordDeploymentLogFailure(apply, deploymentLogsOperation, deployment, fetch, fetchErr)
-			result.Errors = append(result.Errors, deploymentLogError(fetch, fetchErr))
+			result.Errors = append(result.Errors, deploymentLogError(fetch, scope, fetchErr))
 			continue
 		}
 		if scope.target != "" && resp.GetTarget() != scope.target {
@@ -502,14 +502,34 @@ func deploymentLogEntry(applyID string, log *ternv1.ApplyLog) (*apitypes.LogEntr
 	return &apitypes.LogEntry{ID: log.Id, ApplyID: applyID, TaskID: log.TaskId, Level: log.Level, EventType: log.EventType, Source: log.Source, Message: log.Message, OldState: log.OldState, NewState: log.NewState, Metadata: metadata, CreatedAt: createdAt}, nil
 }
 
-func deploymentLogError(fetch *deploymentLogFetch, err error) *apitypes.DeploymentLogError {
+// deploymentLogError reports a source whose data-plane read failed. Only a
+// transport or storage failure is worth retrying: a data plane that predates
+// log reads needs an upgrade, and one that finds nothing to read for the
+// requested scope will answer the same way every time.
+func deploymentLogError(fetch *deploymentLogFetch, scope logScope, err error) *apitypes.DeploymentLogError {
 	result := &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "RemoteLogReadFailed", Reason: "remote_log_read_failed", Message: "Data-plane logs could not be read; check server logs and retry."}
-	if status.Code(err) == codes.Unimplemented {
+	switch status.Code(err) {
+	case codes.Unimplemented:
 		result.Code = "UnsupportedCapability"
 		result.Reason = "upgrade_required"
 		result.Message = "The selected data plane does not support log reads; upgrade it and retry."
+	case codes.NotFound:
+		result.Code = "RemoteLogNotFound"
+		result.Reason = "remote_log_not_found"
+		result.Message = remoteLogNotFoundMessage(scope)
 	}
 	return result
+}
+
+// remoteLogNotFoundMessage says what an operator can do when the data plane has
+// nothing to read. A shard read fails this way when the data plane records no
+// operation on that shard, even though the control plane does, so reading
+// without the shard is the way to see the source's entries.
+func remoteLogNotFoundMessage(scope logScope) string {
+	if scope.shard != "" {
+		return "The selected data plane records no operation on this shard; read the log without --shard."
+	}
+	return "The selected data plane has no log for this apply; check server logs."
 }
 
 // deploymentLogsOperation and engineLogsOperation name the two callers of the

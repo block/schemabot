@@ -2790,24 +2790,29 @@ func OperationsOnTarget(ops []*ApplyOperation, target string) []*ApplyOperation 
 }
 
 // OperationShard returns the shard a sharded work operation runs on: the shard
-// of its ShardOperationKey, on its own or behind the operation's target. An
-// operation that covers no single shard (a whole-target key, a rollout step, a
-// group finalizer) reports false. No component can contain the delimiter, so
-// the component count tells the key shapes apart, with one exception: a group
-// finalizer behind its target ("shop-002/main/group_finalizer") has as many
-// components as a shard key on its own, so the operation's kind rules it out.
+// of its ShardOperationKey, on its own or behind the operation's target, as
+// state.ShardWorkKey reads it. An operation that covers no single shard (a
+// whole-target key, a rollout step, a group finalizer) reports false. No
+// component can contain the delimiter, so the component count tells the key
+// shapes apart, with one exception: a group finalizer behind its target
+// ("shop-002/main/group_finalizer") has as many components as a shard key on
+// its own, so the operation's kind rules it out.
 func OperationShard(kind, key, target string) (string, bool) {
 	if kind == ApplyOperationKindGroupFinalizer {
 		return "", false
 	}
-	parts := strings.Split(key, OperationKeyDelimiter)
-	if len(parts) == 4 && target != "" && parts[0] == target {
-		parts = parts[1:]
+	// A key whose namespace happens to equal the target ("main/-80/orders" on
+	// target "main") is a shard key on its own, so the target prefix is
+	// stripped only when what remains is a whole shard key.
+	if target != "" {
+		if rest, ok := strings.CutPrefix(key, target+OperationKeyDelimiter); ok {
+			if _, shard, _, ok := state.ShardWorkKey(rest); ok {
+				return shard, true
+			}
+		}
 	}
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return "", false
-	}
-	return parts[1], true
+	_, shard, _, ok := state.ShardWorkKey(key)
+	return shard, ok
 }
 
 // LogOperationsOnShard returns the ApplyLogFilter.OperationIDs of a log read
