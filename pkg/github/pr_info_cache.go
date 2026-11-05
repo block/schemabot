@@ -27,10 +27,11 @@ import (
 // comment's who-can-apply check, answer from one read. Only successful reads are
 // cached, so a failed read is retried by the next check rather than replayed.
 type requestPRInfoCache struct {
-	mu          sync.Mutex
-	m           map[string]*PullRequestInfo
-	files       map[string][]PRFile
-	memberships map[string]bool
+	mu             sync.Mutex
+	m              map[string]*PullRequestInfo
+	files          map[string][]PRFile
+	requiredChecks map[string][]string
+	memberships    map[string]bool
 }
 
 type prInfoCacheCtxKey struct{}

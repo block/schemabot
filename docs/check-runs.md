@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [PR target eligibility](#pr-target-eligibility)
 - [GitHub Check Concepts](#github-check-concepts)
 - [Safety Philosophy](#safety-philosophy)
 - [Cross-Deployment Trust Model](#cross-deployment-trust-model)
@@ -28,6 +29,70 @@
 SchemaBot uses GitHub Check Runs as the PR safety gate for schema changes. A
 required SchemaBot check blocks merge until every schema change represented by
 the PR has either been applied successfully or resolved by a new plan.
+
+## PR target eligibility
+
+SchemaBot plans and publishes checks for PRs targeting the repository's configured
+**default branch**. It also runs on another branch when active repository or
+organization rulesets, or classic branch protection, require its aggregate or
+promotion check. Check names and GitHub App identity pins remain unchanged.
+
+For an ordinary PR, the target is its direct base. For a native GitHub stack,
+the target is the stack's ultimate base: every member receives real validation
+when that target is enforced. An ordinary branch-based stack has no such
+inheritance; upper members targeting excluded parent branches stay silent.
+
+An excluded PR receives no new automatic plan or Check Run. Explicit `plan`,
+`apply`, and `apply-confirm` commands are rejected before schema discovery.
+SchemaBot never publishes a successful, neutral, or skipped result to represent
+exclusion. Retarget the PR to an enforced branch to run normal validation, even
+when its head commit has not changed.
+
+Retargeting to an excluded branch preserves prior results, plans, visible plan
+comments, confirmations, and locks. New commands use the current PR target when
+they are processed, and apply rechecks it with an uncached read close to durable
+acceptance. Once accepted, pending and running applies continue under the
+operator; progress, lifecycle controls, and stored outcomes remain available.
+Terminal callbacks record outcomes while suppressing Check Run publication on
+an excluded PR. Returning to an enforced branch uses the ordinary planning,
+freshness, authorization, and ownership safeguards; it introduces no special
+invalidation or pending-reset lifecycle.
+
+**Accepted limit:** a prior real success at the same SHA can satisfy GitHub
+before return-to-target evaluation finishes, including when another PR shares
+the SHA. Retargeting can also race the last eligibility read before acceptance.
+The branch transition and SchemaBot's asynchronous response are not atomic.
+
+Recovery compares the latest observed head, direct base, default branch, native
+stack target, and eligibility. A delivery for an excluded head cannot hide a lost
+retarget notification at the same SHA. Target-specific recovery deliveries also
+cover work already queued for that context. An evaluation identity distinguishes
+a later visit from a completed or permanently failed recovery at the same SHA;
+it never revokes earlier results or consent. Observations use the existing
+settings store and do not revoke previous results or confirmation consent.
+
+### Protection discovery and rollout
+
+Default-target PRs need no protection lookup. For each distinct non-default
+target within one delivery or recovery scan, SchemaBot reads active branch
+rules (paginated) and queries the ref's classic `branchProtectionRule` through
+GraphQL. These lookups do not grow with changed-file count. Publication and apply
+acceptance also perform bounded uncached PR metadata reads. A two-environment
+no-work publisher reads one initial target snapshot and performs one final
+uncached check per published environment, in addition to scope discovery and
+revalidation. Existing snapshots are reused for the initial currency check. A successful null
+classic rule proves absence; an ambiguous REST 404 does not. Missing metadata,
+permission failures, and incomplete lookup responses stop processing rather
+than permitting exclusion. The GitHub App needs **Administration: read** access
+for protection discovery, in addition to its existing permissions.
+
+Before rollout, audit repository and organization rulesets plus classic branch
+protection. Scope SchemaBot requirements to the default branch and intentionally
+included release refs. If a shared ruleset covers additional branches, split out
+only SchemaBot's requirements; preserve other builds and App pins. Existing
+release requirements remain enforced automatically. Participants must configure
+the leader's promotion check name so all deployments resolve the same target
+policy. No repository protection settings are changed by the bot.
 
 ## GitHub Check Concepts
 

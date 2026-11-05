@@ -1585,6 +1585,8 @@ const (
 	GitHubOperationFetchDiff                     = "fetch_diff"
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
+	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
@@ -1789,6 +1791,8 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchDiff,
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
+		GitHubOperationFetchBranchRules,
+		GitHubOperationGraphQLBranchProtection,
 		GitHubOperationFetchPullRequest,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
