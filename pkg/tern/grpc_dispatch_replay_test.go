@@ -339,3 +339,99 @@ func TestGRPCClient_LostDispatchReplayCompletesAPendingStart(t *testing.T) {
 	require.NotNil(t, startReq)
 	assert.Equal(t, storage.ControlRequestCompleted, startReq.Status)
 }
+
+func TestGRPCClient_LostDispatchReplayRefusedForOneRolloutMemberFailsOnlyThatMember(t *testing.T) {
+	// A rollout across two deployments, where the parent apply carries the
+	// remote apply id the other deployment dispatched. This member's operation
+	// is active with no remote apply id of its own, so its drive re-sends the
+	// dispatch under its deployment's key, and the data plane refuses it
+	// outright. Only this member fails, and only through its own tasks: the
+	// operator derives the failed operation and moves the parent through its
+	// projection. The parent keeps the sibling's remote apply id, the sibling
+	// keeps running, and the operator's pending stop and cancel stay pending,
+	// because they address the whole rollout and the sibling still has to
+	// observe them.
+	testCases := []struct {
+		name          string
+		applyErr      error
+		applyResponse *ternv1.ApplyResponse
+		wantError     string
+	}{
+		{
+			name:      "permanent rejection",
+			applyErr:  status.Error(codes.InvalidArgument, "plan no longer matches the target"),
+			wantError: "plan no longer matches the target",
+		},
+		{
+			name: "named conflict",
+			applyResponse: &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: "another schema change is running on users",
+				Conflict:     &ternv1.ApplyConflict{Table: "users", BlockingState: "running"},
+			},
+			wantError: "Table users is held by a schema change",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &capturingTernServer{applyErr: tc.applyErr, applyResponse: tc.applyResponse}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+
+			fixture := newLostDispatchFixture(state.Apply.Running, storage.ControlOperationCancel, storage.ControlOperationStop)
+			fixture.apply.ExternalID = "remote-sibling"
+			memberID, siblingID := int64(31), int64(32)
+			member := &storage.ApplyOperation{
+				ID: memberID, ApplyID: fixture.apply.ID, Deployment: "testdb-west", Target: "testdb-west",
+				OperationKind: storage.ApplyOperationKindWork, OperationKey: "testdb-west",
+				State: state.ApplyOperation.WaitingForCutover,
+			}
+			sibling := &storage.ApplyOperation{
+				ID: siblingID, ApplyID: fixture.apply.ID, Deployment: "testdb-east", Target: "testdb-east",
+				OperationKind: storage.ApplyOperationKindWork, OperationKey: "testdb-east",
+				State: state.ApplyOperation.Running, ExternalID: "remote-sibling",
+			}
+			fixture.task.ApplyOperationID = &memberID
+			siblingTask := &storage.Task{
+				ID: 23, TaskIdentifier: "task-sibling", ApplyID: fixture.apply.ID, ApplyOperationID: &siblingID,
+				TableName: "orders", State: state.Task.Running,
+			}
+			fixture.storage.tasks = &mockTaskStore{tasks: []*storage.Task{fixture.task, siblingTask}}
+			fixture.storage.operations = &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				memberID: member, siblingID: sibling,
+			}}
+			client.storage = fixture.storage
+
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			err := client.ResumeApplyOperation(ctx, fixture.apply, memberID)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantError)
+			assert.NotErrorIs(t, err, ErrRemoteDispatchUnresolved, "a refusal is a verdict")
+
+			req := server.getApplyRequest()
+			require.NotNil(t, req, "the member's dispatch must be re-sent")
+			memberScope := applyTaskScope{applyOperationID: memberID, operation: member, multiOperation: true}
+			assert.Equal(t, remoteApplyIdempotencyKey(fixture.apply, memberScope), req.IdempotencyKey,
+				"the re-send must carry the member's deployment key")
+
+			assert.Equal(t, state.Task.Failed, fixture.task.State)
+			assert.Contains(t, fixture.task.ErrorMessage, tc.wantError)
+			assert.Empty(t, member.RemoteApplyID(), "a refused re-send records no remote apply id for the member")
+
+			assert.Equal(t, state.Apply.Running, fixture.apply.State, "the parent moves only through the operator's projection")
+			assert.Empty(t, fixture.apply.ErrorMessage)
+			assert.Equal(t, "remote-sibling", fixture.apply.ExternalID)
+			assert.Equal(t, state.Task.Running, siblingTask.State)
+			assert.Equal(t, state.ApplyOperation.Running, sibling.State)
+			assert.Equal(t, "remote-sibling", sibling.RemoteApplyID())
+
+			for _, op := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+				req, err := fixture.controlRequests.GetByOperation(t.Context(), fixture.apply.ID, op)
+				require.NoError(t, err)
+				require.NotNilf(t, req, "the %s request must exist", op)
+				assert.Equalf(t, storage.ControlRequestPending, req.Status, "the rollout's %s must stay pending for the sibling", op)
+			}
+		})
+	}
+}
