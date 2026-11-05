@@ -254,9 +254,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 // work is detached from the HTTP request lifetime; the durable webhook driver
 // passes its run context so lease loss and shutdown cancel in-flight work.
 func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	// Dedupe FetchPullRequest calls within this webhook delivery.
-	ctx = ghclient.WithPRInfoCache(ctx)
+	ctx, cancel := autoPlanContext(parent)
 
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
@@ -264,6 +262,31 @@ func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, install
 		return nil, nil, nil, fmt.Errorf("create GitHub client for repo %s installation %d: %w", repo, installationID, err)
 	}
 	return ctx, cancel, client, nil
+}
+
+// autoPlanContext returns the bounded work context for one auto-plan run
+// started from parent, with a PR-info cache that dedupes FetchPullRequest calls
+// within the webhook delivery.
+func autoPlanContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(withRunParent(parent), 30*time.Second)
+	return ghclient.WithPRInfoCache(ctx), cancel
+}
+
+// runParentKey carries the context a bounded webhook run (an auto-plan run or
+// a PR command) was started from, before the run's own work deadline was
+// applied.
+type runParentKey struct{}
+
+func withRunParent(parent context.Context) context.Context {
+	return context.WithValue(parent, runParentKey{}, parent)
+}
+
+// runParent returns the context the run in ctx was started from. It does not
+// carry the run's work deadline, so it ends only when whatever started the run
+// ends it, such as lease loss or shutdown for a durable delivery.
+func runParent(ctx context.Context) (context.Context, bool) {
+	parent, ok := ctx.Value(runParentKey{}).(context.Context)
+	return parent, ok
 }
 
 func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string, configs []ghclient.DiscoveredConfig) bool {
@@ -563,7 +586,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.postPlanPublishVerificationFailure(ctx, client, repo, pr, headSHA, err)
 		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
 	}
-	if moved {
+	if moved != autoPlanInputsUnchanged {
 		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
 			"source", source, "delivery_id", deliveryID)
@@ -653,26 +676,40 @@ func filesNarrowedAway(changed, proposed []ghclient.PRFile) []ghclient.PRFile {
 	return narrowed
 }
 
-// autoPlanInputsMoved reports whether the PR changed underneath a plan that is
-// about to be published. An error means the question could not be answered —
-// the caller must not publish on an unverified PR, and durable callers retry
-// the delivery.
-func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, baseRef string) (bool, error) {
+// autoPlanInputMove names which input of a plan moved while it was being
+// discovered.
+type autoPlanInputMove uint8
+
+const (
+	autoPlanInputsUnchanged autoPlanInputMove = iota
+	// autoPlanHeadMoved means a push replaced the head commit. Checks on the
+	// old head no longer gate the merge, and the push plans the new head.
+	autoPlanHeadMoved
+	// autoPlanBaseMoved means the PR was retargeted. The head commit is the
+	// same, so its checks still gate the merge.
+	autoPlanBaseMoved
+)
+
+// autoPlanInputsMoved reports which input, if any, of a plan that is about to
+// be published changed underneath it. An error means the question could not
+// be answered — the caller must not publish on an unverified PR, and durable
+// callers retry the delivery.
+func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, baseRef string) (autoPlanInputMove, error) {
 	fresh, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
-		return false, fmt.Errorf("fetch PR %s#%d: %w", repo, pr, err)
+		return autoPlanInputsUnchanged, fmt.Errorf("fetch PR %s#%d: %w", repo, pr, err)
 	}
 	if fresh.HeadSHA != headSHA {
 		h.logger.Info("PR head moved while its plan was being discovered",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", fresh.HeadSHA)
-		return true, nil
+		return autoPlanHeadMoved, nil
 	}
 	if baseRef != "" && fresh.BaseRef != baseRef {
 		h.logger.Info("PR base branch moved while its plan was being discovered",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef, "current_base_ref", fresh.BaseRef)
-		return true, nil
+		return autoPlanBaseMoved, nil
 	}
-	return false, nil
+	return autoPlanInputsUnchanged, nil
 }
 
 // notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan

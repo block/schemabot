@@ -1,8 +1,10 @@
 package storagetest
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -135,6 +137,85 @@ func TestApplyLogs(t *testing.T, h Harness) {
 		require.Len(t, warns, 2)
 		assert.Equal(t, "entry 4", warns[0].Message)
 		assert.Equal(t, "entry 6", warns[1].Message)
+	})
+
+	// ListByOperation verifies that an entry is attributed to the operation
+	// whose drive wrote it, read off the operation lease on the context, and
+	// that an operation filter returns exactly that operation's entries: the
+	// ones its drive wrote, and the ones about its tasks written from outside
+	// its drive. Another operation's entries and entries about the whole apply
+	// are left out.
+	t.Run("ListByOperation", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "operation_logs_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_operation_logs", 603, state.Apply.Running, "production")
+		opIDs := make(map[string]int64, 2)
+		taskIDs := make(map[string]int64, 2)
+		for _, target := range []string{"shop-001", "shop-002"} {
+			opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", Target: target,
+				OperationKey:  target + "/step-1",
+				OperationKind: storage.ApplyOperationKindWork,
+			})
+			require.NoError(t, err)
+			task := newTask(apply, "task_operation_logs_"+target, "orders", time.Now().UTC())
+			task.ApplyOperationID = &opID
+			taskID, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+			opIDs[target] = opID
+			taskIDs[target] = taskID
+		}
+		appendEntry := func(ctx context.Context, message string, taskID *int64) {
+			t.Helper()
+			require.NoError(t, store.ApplyLogs().Append(ctx, &storage.ApplyLog{
+				ApplyID:   apply.ID,
+				TaskID:    taskID,
+				Level:     storage.LogLevelInfo,
+				EventType: storage.LogEventInfo,
+				Source:    storage.LogSourceSchemaBot,
+				Message:   message,
+			}))
+		}
+		driving := func(target string) context.Context {
+			return storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opIDs[target], Owner: "driver", Token: "token-" + target})
+		}
+		shop002Task := taskIDs["shop-002"]
+
+		appendEntry(driving("shop-001"), "shop-001 drive", nil)
+		appendEntry(driving("shop-002"), "shop-002 drive", nil)
+		appendEntry(ctx, "whole apply", nil)
+		appendEntry(ctx, "shop-002 task", &shop002Task)
+		require.NoError(t, store.ApplyLogs().Append(driving("shop-001"), &storage.ApplyLog{
+			ApplyID:   apply.ID,
+			Level:     storage.LogLevelInfo,
+			EventType: storage.LogEventStateTransition,
+			Source:    storage.LogSourceSchemaBot,
+			Message:   "projected by shop-001",
+			ApplyWide: true,
+		}))
+
+		all, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: apply.ID, Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, all, 5)
+		require.NotNil(t, all[0].ApplyOperationID, "an entry written under an operation lease names its operation")
+		assert.Equal(t, opIDs["shop-001"], *all[0].ApplyOperationID)
+		assert.Nil(t, all[2].ApplyOperationID, "an entry written outside any operation's drive names no operation")
+
+		messagesFor := func(target string) []string {
+			entries, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: apply.ID, OperationIDs: []int64{opIDs[target]}, Limit: 10})
+			require.NoError(t, err)
+			messages := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				messages = append(messages, entry.Message)
+			}
+			return messages
+		}
+		assert.Nil(t, all[4].ApplyOperationID, "an apply-wide entry written under an operation lease names no operation")
+		assert.Equal(t, []string{"shop-002 drive", "whole apply", "shop-002 task", "projected by shop-001"}, messagesFor("shop-002"),
+			"the parent state one operation projects belongs to every target")
+		assert.Equal(t, []string{"shop-001 drive", "whole apply", "projected by shop-001"}, messagesFor("shop-001"), "another operation's drive and task entries stay out; the whole-apply entry belongs to every operation")
 	})
 
 	t.Run("Append_DBError", func(t *testing.T) {

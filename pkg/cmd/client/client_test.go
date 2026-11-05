@@ -59,21 +59,22 @@ func TestLogRequestQueryValuesAreEncoded(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Clone(t.Context()))
 		w.Header().Set("Content-Type", "application/json")
-		_, err := w.Write([]byte(`{"logs":[],"sources":[],"errors":[]}`))
-		require.NoError(t, err)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"logs": []any{}, "sources": []any{}, "errors": []any{}, "target": r.URL.Query().Get("target")}))
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := GetLogs(server.URL, "", "", "apply/a & b", 17)
+	_, err := GetLogs(server.URL, "", "", "apply/a & b", "shop/a & b", 17)
 	require.NoError(t, err)
-	_, err = GetDeploymentLogs(server.URL, "apply/a & b", "data plane/one", 23)
+	_, err = GetDeploymentLogs(server.URL, "apply/a & b", "data plane/one", "shop/a & b", 23)
 	require.NoError(t, err)
 	require.Len(t, requests, 2)
 	assert.Equal(t, "apply/a & b", requests[0].URL.Query().Get("apply_id"))
 	assert.Equal(t, "17", requests[0].URL.Query().Get("limit"))
+	assert.Equal(t, "shop/a & b", requests[0].URL.Query().Get("target"))
 	assert.Equal(t, "apply/a & b", requests[1].URL.Query().Get("apply_id"))
 	assert.Equal(t, "data plane/one", requests[1].URL.Query().Get("deployment"))
 	assert.Equal(t, "23", requests[1].URL.Query().Get("limit"))
+	assert.Equal(t, "shop/a & b", requests[1].URL.Query().Get("target"))
 }
 
 func TestCallPullSchemaAPIError(t *testing.T) {
@@ -523,4 +524,27 @@ func TestGenerateCLIOwnerIsCanonical(t *testing.T) {
 		owner := GenerateCLIOwner()
 		assert.Equal(t, storage.CanonicalKey(owner), owner)
 	})
+}
+
+// A server that predates scoped reads ignores target and serves the whole
+// apply's log. The client refuses that answer rather than present every
+// target's entries as the one target's history, and still accepts an unscoped
+// read from the same server.
+func TestScopedLogReadRefusesAnUnscopedAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"apply_id":"apply-a","logs":[],"sources":[],"errors":[]}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := GetLogs(server.URL, "", "", "apply-a", "shop-002", 10)
+	require.ErrorContains(t, err, "does not support reading one target's logs")
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", "shop-002", 10)
+	require.ErrorContains(t, err, "does not support reading one target's logs")
+
+	_, err = GetLogs(server.URL, "", "", "apply-a", "", 10)
+	require.NoError(t, err)
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", "", 10)
+	require.NoError(t, err)
 }

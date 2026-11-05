@@ -1,7 +1,6 @@
 package github
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -151,32 +150,33 @@ type diffModes struct {
 // parses its file modes. The diff is read as a comparison of the two commits
 // rather than as the PR's diff, so a push to the PR while it is read cannot
 // move the result away from the commits the GraphQL fallback reads. A diff
-// GitHub refuses as too large yields no modes, so every probe falls back to
+// GitHub will not produce yields no modes, so every probe falls back to
 // GraphQL.
 func (ic *InstallationClient) fetchChangeDiffModes(ctx context.Context, repo string, change ChangeRange) (diffModes, error) {
 	owner, repoName := splitRepo(repo)
 	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationFetchDiff, repo)
 	diff, _, err := ic.client.Repositories.CompareCommitsRaw(ctx, owner, repoName, change.Base, change.Head, gh.RawOptions{Type: gh.Diff})
-	if isDiffTooLarge(err) {
-		ic.logger.Info("GitHub refused the change's diff as too large, so changed file modes are read from their directories with GraphQL",
-			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head)
+	if isDiffUnavailable(err) {
+		ic.logger.Info("GitHub did not produce the change's diff, so changed file modes are read from their directories with GraphQL",
+			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "error", err)
 		return diffModes{}, nil
 	}
 	if err != nil {
 		return diffModes{}, fmt.Errorf("read the diff of %s (pr %d, %s...%s) for changed file modes: %w", repo, change.PR, change.Base, change.Head, err)
 	}
-	modes, err := parseDiffModes(diff)
-	if err != nil {
-		return diffModes{}, fmt.Errorf("parse the diff of %s (pr %d, %s...%s) for changed file modes: %w", repo, change.PR, change.Base, change.Head, err)
-	}
-	return modes, nil
+	return parseDiffModes(diff), nil
 }
 
-// isDiffTooLarge reports whether GitHub refused a diff for exceeding its size
-// limits (files, lines, or bytes), which it answers with 406.
-func isDiffTooLarge(err error) bool {
+// isDiffUnavailable reports whether GitHub declined to produce a diff: it
+// answers one that exceeds its size limits (files, lines, or bytes) with 406,
+// and one that takes too long to generate with 422. Neither says anything
+// about the commits themselves, so the modes are read another way.
+func isDiffUnavailable(err error) bool {
 	var errResp *gh.ErrorResponse
-	return errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusNotAcceptable
+	if !errors.As(err, &errResp) || errResp.Response == nil {
+		return false
+	}
+	return errResp.Response.StatusCode == http.StatusNotAcceptable || errResp.Response.StatusCode == http.StatusUnprocessableEntity
 }
 
 // parseDiffModes reads each file block's extended headers in a git diff and
@@ -194,20 +194,19 @@ func isDiffTooLarge(err error) bool {
 // path, so a path's mode on a side is the one its headers state explicitly,
 // and a block's inferred absence never overrides it.
 //
-// A diff the scanner cannot read to the end is an error: the files after the
-// unreadable line would otherwise lose their modes without a trace.
-func parseDiffModes(diff string) (diffModes, error) {
+// The diff is read line by line whatever the lines hold, so a file whose
+// content is one very long line, such as a minified bundle, does not cut the
+// files after it off from their modes.
+func parseDiffModes(diff string) diffModes {
 	modes := diffModes{base: map[string]bool{}, head: map[string]bool{}}
 	var block diffBlock
 	flush := func() {
 		block.record(modes)
 		block = diffBlock{}
 	}
-	scanner := bufio.NewScanner(strings.NewReader(diff))
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	inHeader := false
-	for scanner.Scan() {
-		line := scanner.Text()
+	for line := range strings.Lines(diff) {
+		line = strings.TrimRight(line, "\r\n")
 		if rest, ok := strings.CutPrefix(line, "diff --git "); ok {
 			flush()
 			block.basePath, block.headPath = parseDiffGitPaths(rest)
@@ -238,11 +237,8 @@ func parseDiffModes(diff string) (diffModes, error) {
 			block.headPath = unquoteDiffPath(line[strings.Index(line, "to ")+len("to "):])
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return diffModes{}, fmt.Errorf("scan diff for file modes: %w", err)
-	}
 	flush()
-	return modes, nil
+	return modes
 }
 
 // diffBlock accumulates one file's extended diff headers.

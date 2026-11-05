@@ -168,10 +168,13 @@ needs to change; it just needs to be picked up again. Those failures move the
 apply to `failed_retryable` instead of `failed`, and recovery is automatic: a
 recovery driver reclaims the apply and continues it from where it left off,
 using engine checkpoints so completed work is not redone. Failures where
-retrying cannot help — the engine rejected a statement, the target refused the
-change, a row already in the table cannot be stored under the new definition
-(a NULL in a column the change makes `NOT NULL`) — skip this state and go
-straight to permanent `failed`.
+retrying cannot help skip this state and go straight to permanent `failed`.
+These include the engine rejecting a statement, the target refusing the change
+with a MySQL error code (a missing privilege, an unsupported feature), and a row
+already in the table that cannot be stored under the new definition (a NULL in a
+column the change makes `NOT NULL`). Any failure SchemaBot does not recognize as
+one of these keeps its retry budget. That includes a missing grant found by
+Spirit's own privilege check before a copy, which Spirit reports without a code.
 
 A clean shutdown is not one of these failures. A process that stops on purpose
 hands its claims back and leaves the apply active, so a peer driver resumes it

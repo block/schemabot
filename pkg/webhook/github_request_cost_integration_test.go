@@ -37,11 +37,14 @@ func TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles(t *testing.T) {
 				few = githubRequestsToPlan(t, dbName, delivery, 1)
 			})
 			t.Run("many non-schema files", func(t *testing.T) {
-				many = githubRequestsToPlan(t, dbName, delivery, 400)
+				// Below GitHub's 300-file cap on a commit comparison, so a
+				// push is read through the comparison in both runs rather
+				// than giving up on it only in this one.
+				many = githubRequestsToPlan(t, dbName, delivery, 250)
 			})
 			require.NotEmpty(t, few, "the plan flow made GitHub requests to count")
 			// The fake lists every changed file in one page, so the listing
-			// request counts the same for one file and for four hundred. Any
+			// request counts the same for one file and for many. Any
 			// difference, the listing included, is a request made per file.
 			assert.Equal(t, few, many, "GitHub requests by method and path, for one non-schema file vs many")
 		})

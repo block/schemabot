@@ -53,6 +53,7 @@ Under **Repository permissions**, grant:
 
 | Permission | Access | Used For |
 |-----------|--------|----------|
+| **Administration** | Read | Read classic branch protection, so a review gate that follows the base branch knows whether GitHub dismisses stale approvals (optional; without it, SchemaBot compares an earlier approval with the latest commit unless a ruleset dismisses stale approvals) |
 | **Checks** | Read & Write | Create SchemaBot check runs and read GitHub check runs for the `require_passing_checks` gate |
 | **Commit statuses** | Read | Read legacy commit statuses for the `require_passing_checks` gate |
 | **Contents** | Read | Read `schemabot.yaml`, schema files, CODEOWNERS, and commit refs |

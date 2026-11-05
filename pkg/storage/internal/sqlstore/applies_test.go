@@ -5,6 +5,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -642,6 +643,12 @@ func TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeploymen
 		newGroupedCreateGroup(now, "payments-b", "payments-b-target", "accounts"),
 	})
 	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+	conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
+	require.True(t, ok, "the refusal carries the holding apply: %v", err)
+	assert.Equal(t, "apply_fanout_first", conflict.HolderApplyID)
+	assert.Equal(t, first.State, conflict.HolderState)
+	assert.Equal(t, first.Database, conflict.Database)
+	assert.Equal(t, first.Environment, conflict.Environment)
 
 	// A new apply whose deployments are disjoint from the active apply is allowed.
 	disjoint := groupedApply("apply_fanout_disjoint", "payments-y")

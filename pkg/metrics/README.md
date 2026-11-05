@@ -178,7 +178,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_branch_rules`, `get_combined_status`, `get_pull_request_review_protection`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
