@@ -324,11 +324,25 @@ func TestParticipantSelectedPathsWithoutSchemaWork(t *testing.T) {
 	}
 }
 
-// A push or retarget during discovery invalidates its no-work evidence. The
-// final PR read bypasses the request cache before any aggregate can pass.
+// A PR that moves while the aggregate fold discovers its scope never gets a
+// no-work success. A push retires the discovered head: a failing aggregate on
+// it would gate nothing, so the fold stops quietly and re-folds onto the new
+// head. A retarget keeps the same head, so its aggregate fails closed, and so
+// does a PR the fold cannot re-read. The final PR read bypasses the request
+// cache before any aggregate can pass.
 func TestAggregateScopeRejectsMovingPR(t *testing.T) {
-	for _, change := range []string{"head", "base", "unreadable"} {
-		t.Run(change, func(t *testing.T) {
+	tests := []struct {
+		change           string
+		wantErr          bool
+		wantFollowUp     aggregateFoldFollowUp
+		wantFailingPosts int
+	}{
+		{change: "head", wantErr: false, wantFollowUp: aggregateFoldScheduleRefold, wantFailingPosts: 0},
+		{change: "base", wantErr: true, wantFollowUp: aggregateFoldScheduleParticipantRefold, wantFailingPosts: 1},
+		{change: "unreadable", wantErr: true, wantFollowUp: aggregateFoldScheduleParticipantRefold, wantFailingPosts: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.change, func(t *testing.T) {
 			store := &foldCheckStore{}
 			cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
 			h, mux, client := newFoldHandler(t, cfg, store)
@@ -337,7 +351,7 @@ func TestAggregateScopeRejectsMovingPR(t *testing.T) {
 				reads++
 				head, base := "abc123", "main"
 				if reads >= 3 {
-					switch change {
+					switch tt.change {
 					case "head":
 						head = "newsha"
 					case "base":
@@ -350,9 +364,26 @@ func TestAggregateScopeRejectsMovingPR(t *testing.T) {
 				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"head": map[string]string{"sha": head}, "base": map[string]string{"ref": base}}))
 			})
 			serveAggregateScopeInputs(t, mux, []string{"README.md"}, "")
-			serveCheckRunCreate(t, mux)
-			_, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
-			require.Error(t, err)
+			var failingPosts int
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				assert.NotEqual(t, checkConclusionSuccess, body["conclusion"], "a moving PR never gets a passing aggregate")
+				if body["conclusion"] == checkConclusionFailure {
+					failingPosts++
+				}
+				w.WriteHeader(http.StatusCreated)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
+			})
+
+			followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantFollowUp, followUp)
+			assert.Equal(t, tt.wantFailingPosts, failingPosts)
 			for _, check := range store.upserted {
 				assert.NotEqual(t, checkConclusionSuccess, check.Conclusion)
 			}

@@ -2,11 +2,16 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// errAggregateHeadMoved marks aggregate discovery that a push overtook. The
+// discovered head no longer gates the merge, and the push folds the new head.
+var errAggregateHeadMoved = errors.New("PR head moved during aggregate discovery")
 
 // aggregatePRScope is evidence from successful discovery at one PR head, rather
 // than an inference from stored rows. Missing results for its local targets
@@ -100,8 +105,14 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 	if err != nil {
 		return nil, fmt.Errorf("re-verify aggregate scope %s#%d: %w", repo, pr, err)
 	}
-	if moved {
-		return nil, fmt.Errorf("PR %s#%d moved during aggregate discovery", repo, pr)
+	switch moved {
+	case autoPlanInputsUnchanged:
+	case autoPlanHeadMoved:
+		return nil, fmt.Errorf("aggregate scope %s#%d: %w", repo, pr, errAggregateHeadMoved)
+	case autoPlanBaseMoved:
+		return nil, fmt.Errorf("PR %s#%d base branch moved during aggregate discovery", repo, pr)
+	default:
+		return nil, fmt.Errorf("PR %s#%d aggregate discovery got unknown input move %d", repo, pr, moved)
 	}
 	return scope, nil
 }
