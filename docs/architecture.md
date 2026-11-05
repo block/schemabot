@@ -574,18 +574,52 @@ request-time reads are not the durable synchronization path. The operator
 driver's polling loop is what keeps SchemaBot storage reconciled with the remote
 data plane.
 
-Remote progress requests are scoped by apply ID and environment only:
+Remote progress requests name the apply and environment, and, when the
+driver's operation shares its remote apply with sibling operations, the
+remote operation the answer is scoped to:
 
 ```
 ProgressRequest{
-  apply_id:     <remote external_id for gRPC, SchemaBot apply_id for local>
-  environment:  <environment>
+  apply_id:           <remote external_id for gRPC, SchemaBot apply_id for local>
+  environment:        <environment>
+  apply_operation_id: <remote operation id, when the remote apply is shared>
 }
 ```
 
 The public HTTP API continues to return SchemaBot's `apply_id`. In gRPC mode the
 API resolves that stored apply to `external_id` before calling remote Tern;
 local mode has no external ID and uses the SchemaBot apply ID directly.
+
+##### Batched Progress for a Shared Remote Apply
+
+The rollout members of one deployment share one remote apply, and each
+member's driver polls its own operation's progress. On each pod, those scoped
+polls are answered in rounds: a poll joins the remote apply's next round that
+has not been sent, and the round asks for every operation in it with one
+`BatchProgress` call. Each entry of the answer is what `Progress` scoped to
+that operation returns, so the driver checks and handles it exactly as a
+direct answer. Rounds for a remote apply start at most once per poll interval,
+and a poll never receives an answer read before it was made. Drives poll on
+their own timers, so a poll waits for the next round: half a poll interval on
+average, and at most one.
+
+```
+Driver A (member 1) --poll--+
+Driver B (member 2) --poll--+--> next round --> BatchProgress(apply_id, [op1, op2, op3])
+Driver C (member 3) --poll--+                         |
+                                                      v
+                       each driver gets its own entry, as Progress(op) would answer
+```
+
+A round that cannot answer an operation hands the poll back, and the driver
+asks `Progress` for it directly. When the whole `BatchProgress` call answers
+`Unimplemented` (the data plane predates it, or its client for the target
+cannot batch), every poll in the round is handed back and the remote apply is
+polled directly for a while before batching is tried again. When only one
+operation's entry is `Unimplemented`, or an answer is too large or leaves an
+operation out, only the polls it could not answer are handed back, and the
+next round is still batched. Any other error is handed to each driver as its own poll
+error, as a direct call on the same connection would have met.
 
 ##### Repeated Remote Progress Errors
 
@@ -845,7 +879,7 @@ canonical task states:
 Only the mid-flight phases refine a running task (`tablePhaseTaskState` accepts
 `catching_up`, `checksumming`, `post_checksum`, `cutting_over`). A per-table
 `"completed"` never completes the task — for Spirit it means only that the
-table's copy finished, not that it cut over.
+table's copy finished, not that its cutover ran.
 
 Because polling is asynchronous, refinement goes through
 `taskStateWithNoBackwardProgress` (`pkg/tern/local_client.go`), which orders the

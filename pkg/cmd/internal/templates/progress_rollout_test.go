@@ -390,7 +390,7 @@ func TestWriteProgress_DivergedTargetsWaitingForCutover(t *testing.T) {
 	assertLess(t, out, "ADD COLUMN `region`", "       target payments-003\n")
 	assertLess(t, out, "       target payments-003\n", "ADD COLUMN `zone`")
 	assert.NotContains(t, out, "▸", "each DDL names its targets rather than heading a group")
-	assert.True(t, strings.HasSuffix(out, "To cut over prod/payments-001:\n  schemabot cutover apply-7f3c -e production\n"),
+	assert.True(t, strings.HasSuffix(out, "To run the cutover for prod/payments-001:\n  schemabot cutover apply-7f3c -e production\n"),
 		"the cutover closes the output:\n%s", out)
 	assert.NotContains(t, out, "schemabot stop", "targets only waiting for cutover keep the cutover as the one command")
 }
@@ -516,7 +516,7 @@ func TestFormatRolloutFooter_CutoverNotDeferredNeedsNoAction(t *testing.T) {
 	}
 
 	out := renderRollout(t, data)
-	assertLess(t, out, "SchemaBot will cut over prod/payments-001 next — no action needed.",
+	assertLess(t, out, "SchemaBot will run the cutover for prod/payments-001 next — no action needed.",
 		"To stop this schema change:\n  schemabot stop apply-7f3c -e production")
 	assert.NotContains(t, out, "schemabot cutover", "%s", out)
 }
@@ -1045,6 +1045,29 @@ func TestWriteProgress_SettledTableByTableRolloutReadsLikeThePRComment(t *testin
 	assert.NotContains(t, out, "• Targets:", "a table no target is copying lists no targets:\n%s", out)
 	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
 	assert.Contains(t, out, "❌ payments-002 — failed", "the failed target is still named for attention:\n%s", out)
+}
+
+// A rollout of `bikes` then `docks` table by table is stopped while both
+// targets are copying `bikes`. Nothing begins `docks` until the apply is
+// started again, so it reads as stopped and not started rather than queued,
+// the way the PR comment does.
+func TestWriteProgress_StoppedTableByTableRolloutTableNotBegunReadsStopped(t *testing.T) {
+	data := tableStepProgress(state.Apply.Stopped, []tableStepRow{
+		{"payments-001", "bikes", 1, state.ApplyOperation.Stopped, state.Task.Stopped, 300, false},
+		{"payments-002", "bikes", 1, state.ApplyOperation.Stopped, state.Task.Stopped, 400, false},
+		{"payments-001", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+		{"payments-002", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+	})
+
+	out := renderRollout(t, data)
+
+	assert.Contains(t, out, "docks: ⏹️ Stopped (not started)\n", "%s", out)
+	_, docks, found := strings.Cut(out, "docks: ")
+	require.True(t, found, "%s", out)
+	assert.NotContains(t, docks, "Targets:", "each target would only repeat that it stopped: %s", out)
+	assert.NotContains(t, docks, "payments-00", "each target would only repeat that it stopped: %s", out)
+	assert.NotContains(t, out, "Queued", "%s", out)
+	assert.NotContains(t, out, "queued", "%s", out)
 }
 
 // payments-000 already held the change, so the rollout gave it one settled row

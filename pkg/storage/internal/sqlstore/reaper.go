@@ -3,7 +3,6 @@ package sqlstore
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/spirit/pkg/utils"
@@ -39,32 +38,22 @@ func reapUnderElection[T any](
 	if err != nil {
 		return nil, fmt.Errorf("get %s reaper connection: %w", sweep.subject, err)
 	}
-	defer utils.CloseAndLog(conn)
 
 	// Do not wait for the lock: whoever holds it is doing this pass's work, and
 	// this instance's next tick is soon enough.
 	acquired, err := locker.Acquire(ctx, conn.lockerConn(), sweep.lockName, 0)
 	if err != nil {
+		utils.CloseAndLog(conn)
 		return nil, fmt.Errorf("acquire %s reaper lock: %w", sweep.subject, err)
 	}
 	if !acquired {
+		utils.CloseAndLog(conn)
 		return nil, sweep.busy
 	}
-	defer func() {
-		// A held lock parks every instance's reaper until this session is
-		// retired, so the two ways it can survive the pass are reported apart:
-		// the release errored, or it ran and reported the lock was not held.
-		released, err := locker.Release(context.WithoutCancel(ctx), conn.lockerConn(), sweep.lockName)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to release a reaper lock; reapers stay blocked until this session is retired",
-				"lock", sweep.lockName, "sweep", sweep.subject, "error", err)
-			return
-		}
-		if !released {
-			slog.WarnContext(ctx, "a reaper lock was not held at release; another session may have taken it",
-				"lock", sweep.lockName, "sweep", sweep.subject)
-		}
-	}()
+	// A held lock parks every instance's reaper until its session is retired,
+	// so a release that fails, hangs, or finds the lock not held discards the
+	// session instead of pooling it.
+	defer releaseLockConn(ctx, locker, conn, sweep.lockName, "reaper lock", "lock", sweep.lockName, "sweep", sweep.subject)
 
 	return reap(ctx)
 }

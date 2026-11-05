@@ -440,11 +440,11 @@ func TestWatchModel_MultiDeploymentCutoverFollowsDeferCutover(t *testing.T) {
 	}
 
 	automatic := render(nil)
-	assert.Contains(t, automatic, "SchemaBot will cut over us-east next — no action needed.")
+	assert.Contains(t, automatic, "SchemaBot will run the cutover for us-east next — no action needed.")
 	assert.NotContains(t, automatic, "schemabot cutover")
 
 	deferred := render(map[string]string{"defer_cutover": "true"})
-	assert.Contains(t, deferred, "To cut over us-east:")
+	assert.Contains(t, deferred, "To run the cutover for us-east:")
 	assert.Contains(t, deferred, "schemabot cutover apply-cutover-test -e production")
 }
 

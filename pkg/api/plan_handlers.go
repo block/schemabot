@@ -1516,6 +1516,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		if refused, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
+			s.writeErrorCode(w, deferredCutoverRefusalStatus(refused), apitypes.ErrCodeDeferredCutoverCapacity, "apply rejected: "+err.Error())
+			return
+		}
 		if storageErr, ok := errors.AsType[*applyStorageError](err); ok {
 			s.logger.Error("apply failed: storage failure while queueing the apply",
 				append(storageErr.LogAttrs(), "environment", req.Environment, "error", err)...)
@@ -1546,6 +1550,10 @@ func applyMetricStatusForError(err error) string {
 	}
 	// A rollout shape the apply cannot run is the request's to change.
 	if _, ok := errors.AsType[*RolloutShapeRefusedError](err); ok {
+		return applyMetricStatusRejected
+	}
+	// So is a deferred cutover wider than the drivers that can run it.
+	if _, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -2177,6 +2185,21 @@ func (s *Service) createStoredApply(
 			"operation_group_count", len(groups))
 	}
 	logRolloutShape(s.logger, plan, req.Environment, members, groups, shardedFanout)
+	if applyOpts.DeferCutover {
+		refused, err := s.deferredCutoverCapacityRefusal(ctx, plan, req.Environment, applyIdentifier, caller, groups)
+		if err != nil {
+			return nil, 0, &applyStorageError{
+				Operation:       "admit deferred cutover",
+				Plan:            plan,
+				ApplyIdentifier: applyIdentifier,
+				Caller:          caller,
+				Err:             err,
+			}
+		}
+		if refused != nil {
+			return nil, 0, refused
+		}
+	}
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {

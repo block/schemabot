@@ -778,6 +778,57 @@ func TestConflictCheckLeavesAnApplyAtTheCutoverBarrierUnpaused(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, applies.apply.State)
 }
 
+// An apply in a revert phase stays in it. Pausing it for retry would let the
+// retryable claim rewind it to running and a spent budget settle it failed,
+// erasing the stored phase that revert-phase handling owns. The task still
+// settles failed_retryable and keeps holding the database.
+func TestConflictCheckLeavesARevertPhaseApplyInItsPhase(t *testing.T) {
+	for name, phase := range map[string]struct{ apply, task string }{
+		"reverting":                             {apply: state.Apply.Reverting, task: state.Task.Reverting},
+		"skipping revert":                       {apply: state.Apply.SkippingRevert, task: state.Task.Running},
+		"task reverting before the apply moved": {apply: state.Apply.Running, task: state.Task.Reverting},
+	} {
+		t.Run(name, func(t *testing.T) {
+			running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", staleOperationOf(state.ApplyOperation.Running))
+			applies := client.storage.(*exactProgressStorage).applies.(*mockApplyStore)
+			applies.staleRetryableMoves = true
+			client.spiritEngine = &fakeControlEngine{progressResult: retryableCopyFailure}
+			running.State = phase.task
+			apply := staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")
+			apply.State = phase.apply
+			applies.apply = apply
+
+			resolved := client.tryResolveStaleTask(t.Context(), running, apply, "testdb", newConflictScanMemo())
+
+			assert.False(t, resolved, "the task keeps holding the database")
+			assert.Equal(t, state.Task.FailedRetryable, running.State)
+			assert.Empty(t, applies.staleRetryableRequests, "an apply in a revert phase is not paused for retry")
+			assert.Equal(t, phase.apply, apply.State, "the stored phase survives the settlement")
+			assert.Equal(t, "token-stale", apply.LeaseToken)
+		})
+	}
+}
+
+// A refused pause leaves the in-memory apply exactly as the conflict check
+// read it: the dispatch's refusal names the state storage still holds, and the
+// active-applies gauge is not moved for a transition that did not happen.
+func TestTryResolveStaleTaskKeepsTheApplyAsReadWhenThePauseIsRefused(t *testing.T) {
+	running, client := operationDrivenTask(storage.LeaseOwnerProcess()+"/driver-0", staleOperationOf(state.ApplyOperation.Running))
+	applies := client.storage.(*exactProgressStorage).applies.(*mockApplyStore)
+	applies.staleRetryableMoves = false
+	client.spiritEngine = &fakeControlEngine{progressResult: retryableCopyFailure}
+	apply := staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")
+
+	resolved := client.tryResolveStaleTask(t.Context(), running, apply, "testdb", newConflictScanMemo())
+
+	assert.False(t, resolved)
+	require.Len(t, applies.staleRetryableRequests, 1, "the pause is attempted once")
+	assert.Equal(t, state.Apply.Running, apply.State, "a refused pause must not rewrite the in-memory apply")
+	assert.Equal(t, "token-stale", apply.LeaseToken)
+	assert.Equal(t, storage.LeaseOwnerProcess()+"/driver-0", apply.LeaseOwner)
+	assert.Empty(t, apply.ErrorMessage)
+}
+
 // An own-process stopped report settles a stale task as stopped, a resting
 // state: the copy keeps its checkpoint and the apply is still claimable, so the
 // task is not stamped complete, records no failure reason, and keeps holding
@@ -1511,13 +1562,13 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			want: []string{"table xfers", "task-holding", "failed_retryable", "retried or cancelled"},
 		},
 		{
-			name: "an apply parked at the cutover barrier holds its database until cut over",
+			name: "an apply parked at the cutover barrier holds its database until its cutover runs",
 			blocking: blockingTask{
 				taskIdentifier: "task-holding",
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.WaitingForCutover},
 			},
-			want: []string{"table xfers", "task-holding", "waiting_for_cutover", "cut over or cancelled"},
+			want: []string{"table xfers", "task-holding", "waiting_for_cutover", "until its cutover runs or it is cancelled"},
 		},
 		{
 			name: "an apply in its revert window rests holding its database, so a decision is owed",

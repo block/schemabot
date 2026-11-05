@@ -175,22 +175,50 @@ func TestLocks(t *testing.T, h Harness) {
 	t.Run("Acquire_DisclosureTravelsWithPendingPlan", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
+		disclosedCopies := []storage.DisclosedCopy{
+			{Namespace: "app", Tables: []string{"events"}, Statement: "ALTER TABLE `events` ADD INDEX `idx_actor_id` (`actor_id`)"},
+			{Target: "eu", Namespace: "app", Tables: []string{"events", "orders"}},
+		}
 
 		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
-			DatabaseName:         "disclosure_db",
-			DatabaseType:         storage.DatabaseTypeMySQL,
-			Repository:           "org/repo",
-			PullRequest:          123,
-			Owner:                "owner-a",
-			PendingPlanID:        "plan-1",
-			DisclosedCopyDiscard: true,
+			DatabaseName:    "disclosure_db",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Repository:      "org/repo",
+			PullRequest:     123,
+			Owner:           "owner-a",
+			PendingPlanID:   "plan-1",
+			DisclosedCopies: disclosedCopies,
 		}))
 
 		stored, err := store.Locks().Get(ctx, "disclosure_db", storage.DatabaseTypeMySQL)
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, "plan-1", stored.PendingPlanID)
-		assert.True(t, stored.DisclosedCopyDiscard)
+		assert.Equal(t, disclosedCopies, stored.DisclosedCopies,
+			"the copies the comment named, each on its target, are the consent")
+		assert.True(t, stored.DisclosedCopyDiscard, "a build that reads only the flag still sees the primary target's copy")
+
+		// The same plan posted again with only another target's copy disclosed:
+		// the record follows the new disclosure though the plan is unchanged,
+		// and the flag drops, since a build that reads only the flag reads it as
+		// consent to discard the primary target's copies.
+		memberOnly := []storage.DisclosedCopy{{Target: "eu/payments-002", Namespace: "app", Tables: []string{"events"}}}
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName:    "disclosure_db",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Repository:      "org/repo",
+			PullRequest:     123,
+			Owner:           "owner-a",
+			PendingPlanID:   "plan-1",
+			DisclosedCopies: memberOnly,
+		}))
+
+		stored, err = store.Locks().Get(ctx, "disclosure_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "plan-1", stored.PendingPlanID)
+		assert.Equal(t, memberOnly, stored.DisclosedCopies, "the same plan re-posted carries the disclosure it was posted with")
+		assert.False(t, stored.DisclosedCopyDiscard, "another target's copy is never consent for the primary target's")
 
 		// A later apply re-plans against a target whose copy is gone and posts
 		// a comment that discloses nothing. The record must follow that
@@ -209,23 +237,25 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, "plan-2", stored.PendingPlanID)
-		assert.False(t, stored.DisclosedCopyDiscard,
+		assert.Empty(t, stored.DisclosedCopies,
 			"the disclosure must describe the plan apply-confirm loads, not an older one")
+		assert.False(t, stored.DisclosedCopyDiscard)
 
 		// A re-acquire with no plan (rollback, CLI) changes neither.
 		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
-			DatabaseName:         "disclosure_db",
-			DatabaseType:         storage.DatabaseTypeMySQL,
-			Repository:           "org/repo",
-			PullRequest:          123,
-			Owner:                "owner-a",
-			DisclosedCopyDiscard: true,
+			DatabaseName:    "disclosure_db",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Repository:      "org/repo",
+			PullRequest:     123,
+			Owner:           "owner-a",
+			DisclosedCopies: disclosedCopies,
 		}))
 
 		stored, err = store.Locks().Get(ctx, "disclosure_db", storage.DatabaseTypeMySQL)
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, "plan-2", stored.PendingPlanID)
+		assert.Empty(t, stored.DisclosedCopies)
 		assert.False(t, stored.DisclosedCopyDiscard)
 	})
 
@@ -560,13 +590,13 @@ func TestLocks(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 
 		lock := &storage.Lock{
-			DatabaseName:         "plan_clear_db",
-			DatabaseType:         storage.DatabaseTypeMySQL,
-			Repository:           "org/repo",
-			PullRequest:          123,
-			Owner:                "owner-a",
-			PendingPlanID:        "rollback:plan-1",
-			DisclosedCopyDiscard: true,
+			DatabaseName:    "plan_clear_db",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Repository:      "org/repo",
+			PullRequest:     123,
+			Owner:           "owner-a",
+			PendingPlanID:   "rollback:plan-1",
+			DisclosedCopies: []storage.DisclosedCopy{{Namespace: "app", Tables: []string{"events"}}},
 		}
 		require.NoError(t, store.Locks().Acquire(ctx, lock))
 
@@ -586,6 +616,7 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NotNil(t, stored)
 		assert.Equal(t, "rollback:plan-1", stored.PendingPlanID)
 		assert.True(t, stored.DisclosedCopyDiscard)
+		assert.Len(t, stored.DisclosedCopies, 1)
 
 		// Owner and pending plan both match: the plan and its disclosure
 		// record are withdrawn, and the owner keeps the lock.
@@ -598,6 +629,7 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Equal(t, "owner-a", stored.Owner)
 		assert.Empty(t, stored.PendingPlanID)
 		assert.False(t, stored.DisclosedCopyDiscard)
+		assert.Empty(t, stored.DisclosedCopies)
 	})
 
 	t.Run("AcquireIfPendingPlanID", func(t *testing.T) {
@@ -657,13 +689,14 @@ func TestLocks(t *testing.T, h Harness) {
 		// A re-pin onto a plan whose comment disclosed a discarded copy moves
 		// the disclosure record with the pin it describes.
 		disclosing := lockPinned("plan-3")
-		disclosing.DisclosedCopyDiscard = true
+		disclosing.DisclosedCopies = []storage.DisclosedCopy{{Target: "eu", Namespace: "app", Tables: []string{"events"}}}
 		require.NoError(t, store.Locks().AcquireIfPendingPlanID(ctx, disclosing, "plan-2"))
 		stored, err = store.Locks().Get(ctx, "plan_acquire_db", storage.DatabaseTypeMySQL)
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, "plan-3", stored.PendingPlanID)
-		assert.True(t, stored.DisclosedCopyDiscard)
+		assert.False(t, stored.DisclosedCopyDiscard, "only another target's copy was disclosed")
+		assert.Equal(t, disclosing.DisclosedCopies, stored.DisclosedCopies)
 
 		// A rollback pinned the lock after the caller read plan-3: the re-pin
 		// is refused and the rollback's pin keeps its own disclosure record.
@@ -675,6 +708,7 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NotNil(t, stored)
 		assert.Equal(t, "rollback:plan-rb", stored.PendingPlanID, "a refused re-pin must leave the rollback's pin in place")
 		assert.False(t, stored.DisclosedCopyDiscard, "a refused re-pin must not record a disclosure on the rollback's pin")
+		assert.Empty(t, stored.DisclosedCopies, "a refused re-pin must not record a disclosure on the rollback's pin")
 	})
 
 	t.Run("ForceRelease", func(t *testing.T) {

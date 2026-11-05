@@ -103,8 +103,12 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	if req.ApplyId != "" {
 		// Use the explicitly requested apply
 		a, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if err != nil || a == nil {
-			return nil, 0, 0, fmt.Errorf("apply %s not found", req.ApplyId)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("load apply %s before start: %w", req.ApplyId, err)
+		}
+		if a == nil {
+			c.logger.Warn("start rejected because the requested apply does not exist", "apply_id", req.ApplyId, "database", c.config.Database)
+			return nil, 0, 0, fmt.Errorf("load apply %s before start: %w", req.ApplyId, storage.ErrApplyNotFound)
 		}
 		apply = a
 		c.logger.Info("Start: found apply", "apply_internal_id", apply.ID, "apply_identifier", apply.ApplyIdentifier, "state", apply.State)
@@ -123,8 +127,15 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 				continue
 			}
 			if task.ApplyID > 0 {
-				a, _ := c.storage.Applies().Get(ctx, task.ApplyID)
-				if a != nil && (apply == nil || a.UpdatedAt.After(apply.UpdatedAt)) {
+				a, err := c.storage.Applies().Get(ctx, task.ApplyID)
+				if err != nil {
+					return nil, 0, 0, fmt.Errorf("load the apply of stopped task %s before start: %w", task.TaskIdentifier, err)
+				}
+				if a == nil {
+					c.logger.Warn("Start: stopped task references an apply that does not exist; skipping it", task.LogAttrs()...)
+					continue
+				}
+				if apply == nil || a.UpdatedAt.After(apply.UpdatedAt) {
 					apply = a
 				}
 			}
@@ -2426,7 +2437,7 @@ func isFinalizerHandoffRecordOnly(stored *storage.EngineResumeState) bool {
 // later start resumes the finalizer, except on an engine whose stop is
 // permanent, where the single stop-terminality decision makes it cancelled.
 func finalizerSettledStateForControl(operation storage.ControlOperation, databaseType string) string {
-	if operation == storage.ControlOperationStop && !stopTerminatesChange(databaseType) {
+	if operation == storage.ControlOperationStop && !StopTerminatesChange(databaseType) {
 		return state.ApplyOperation.Stopped
 	}
 	return state.ApplyOperation.Cancelled

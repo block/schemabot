@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/presentation"
@@ -147,12 +148,41 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 // start under way (presentation.ResumeClaimed).
 func deriveApplyPresentation(applyState string, ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, released bool) presentation.Apply {
 	inputs := make([]presentation.Operation, 0, len(ops))
+	endedBy := endedByRefs(ops)
 	for _, op := range ops {
 		input := applyOperationToPresentation(op, released)
 		input.Retrying = storage.TasksRetrying(tasksByOp[op.ID])
+		input.EndedBy = endedBy[op.ID]
 		inputs = append(inputs, input)
 	}
 	return presentation.Derive(presentation.ResumeClaimed(applyState, inputs))
+}
+
+// endedByRefs maps each row failed for another row of the apply
+// (ended_by_operation_id) to that row's deployment and operation key, the
+// reference presentation resolves to a member name. A row the apply does not
+// list maps to an empty reference, which still reads as stopped at the
+// cutover without naming the row that ended.
+func endedByRefs(ops []*storage.ApplyOperation) map[int64]*presentation.OperationRef {
+	byID := make(map[int64]*storage.ApplyOperation, len(ops))
+	for _, op := range ops {
+		byID[op.ID] = op
+	}
+	refs := make(map[int64]*presentation.OperationRef)
+	for _, op := range ops {
+		if op.EndedByOperationID == 0 {
+			continue
+		}
+		ended, ok := byID[op.EndedByOperationID]
+		if !ok {
+			slog.Warn("apply comment names no operation for a row failed for another: the ended operation is not listed",
+				append(op.LogAttrs(), "ended_by_operation_id", op.EndedByOperationID)...)
+			refs[op.ID] = &presentation.OperationRef{}
+			continue
+		}
+		refs[op.ID] = &presentation.OperationRef{Deployment: ended.Deployment, OperationKey: ended.OperationKey}
+	}
+	return refs
 }
 
 // applyOperationToPresentation maps one storage operation row to the neutral

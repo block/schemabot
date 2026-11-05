@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
@@ -65,15 +66,15 @@ func TestFormatApplyStatusComment_CutoverNextActionFollowsDeferCutover(t *testin
 	}
 
 	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "")
-	assert.Contains(t, automatic, "SchemaBot will cut over `eu` next — no action needed.")
+	assert.Contains(t, automatic, "SchemaBot will run the cutover for `eu` next — no action needed.")
 	assert.NotContains(t, automatic, "schemabot cutover")
 
 	deferred := runningApply()
 	deferred.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
 	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "", "")
-	assert.Contains(t, manual, "To cut over `eu`:")
+	assert.Contains(t, manual, "To run the cutover for `eu`:")
 	assert.Contains(t, manual, "schemabot cutover apply-1 -e production")
-	assert.NotContains(t, manual, "SchemaBot will cut over")
+	assert.NotContains(t, manual, "SchemaBot will run the cutover for")
 }
 
 // An apply that failed under on_failure=pause with a held sibling renders the
@@ -438,4 +439,26 @@ func TestGroupTasksByOperation_SkipsUnlinkedTasks(t *testing.T) {
 	})
 	require.Len(t, grouped[1], 2)
 	assert.Len(t, grouped, 1)
+}
+
+// Target orders-001 deferred its cutover across shards -80 and 80-, and 80-
+// failed while -80 waited at the cutover, so SchemaBot stopped -80 and failed
+// it for 80- (ended_by_operation_id). The comment's model reads -80 as stopped
+// at cutover and counts it apart, and the first failure is the 80- row, even
+// though -80 comes first.
+func TestDeriveApplyPresentation_StoppedAtCutoverNamesTheFailedRow(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 11, Deployment: "payments-a", Target: "orders-001", OperationKey: "orders-001/orders/-80/orders", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, EndedByOperationID: 12},
+		{ID: 12, Deployment: "payments-a", Target: "orders-001", OperationKey: "orders-001/orders/80-/orders", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, ErrorMessage: "lock wait timeout exceeded"},
+	}
+
+	model := deriveApplyPresentation(state.Apply.Failed, ops, nil, false)
+
+	require.Len(t, model.Deployments, 2)
+	assert.Equal(t, presentation.StateStoppedAtCutover, model.Deployments[0].Presentation)
+	assert.Equal(t, presentation.StateFailed, model.Deployments[1].Presentation)
+	assert.Equal(t, []presentation.StateCount{{Label: "failed", Count: 1}, {Label: "stopped at cutover", Count: 1}}, model.Counts)
+	require.NotNil(t, model.FirstFailure)
+	assert.Equal(t, 1, model.FirstFailure.Row)
+	assert.Equal(t, "lock wait timeout exceeded", model.FirstFailure.Error)
 }

@@ -20,6 +20,8 @@ import (
 // create/get/update lifecycle, claimability and lease rotation, stale-lease
 // recovery, lease-guarded writes, and concurrent claim exclusion.
 func TestApplies(t *testing.T, h Harness) {
+	t.Run("EndedOperation", func(t *testing.T) { testEndedOperationApplies(t, h) })
+
 	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -562,7 +564,7 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "a spent retry budget stops recovery claims")
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, apply.ID, expired[0].Apply.ID)
@@ -1562,8 +1564,9 @@ func TestApplies(t *testing.T, h Harness) {
 	// A deployment-keyed generation declared two targets and only target-002
 	// attached before the data plane failed. The operator drives that lone row
 	// under its operation lease because the manifest still expects target-001,
-	// so the redispatch claim charges the parent's retry budget and moves the
-	// row to running, the same as when a sibling has attached.
+	// so the redispatch claim charges the operation's retry budget, raises the
+	// parent's attempt to it, and moves the row to running, the same as when a
+	// sibling has attached.
 	t.Run("FindNextApplyOperation_ManifestExpectedRedispatchMovesTheRowToRunning", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1582,7 +1585,7 @@ func TestApplies(t *testing.T, h Harness) {
 		parent, err := store.Applies().Get(ctx, rollout.ID)
 		require.NoError(t, err)
 		require.NotNil(t, parent)
-		assert.Equal(t, 1, parent.Attempt, "the redispatch consumes one unit of the parent retry budget")
+		assert.Equal(t, 1, parent.Attempt, "the redispatch raises the parent attempt to the operation's")
 
 		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 		require.NoError(t, err)
@@ -2109,7 +2112,19 @@ func TestApplies(t *testing.T, h Harness) {
 			return store.CheckLease(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
 		},
 		"ExpireRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			_, err := store.ExpireRetryable(t.Context(), 10)
+			_, err := store.ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
+			return err
+		},
+		"ListAppliesHeldByEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ListAppliesHeldByEndedOperation(t.Context(), []string{storage.DatabaseTypeMySQL}, 10)
+			return err
+		},
+		"SettleAppliesStoppedForEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.SettleAppliesStoppedForEndedOperation(t.Context(), 10)
+			return err
+		},
+		"ExpireRetryableOperations_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ExpireRetryableOperations(t.Context(), 10)
 			return err
 		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {

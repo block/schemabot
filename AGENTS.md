@@ -138,6 +138,8 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **Keep the schema intelligence guide in sync with the API.** When changing the request or response payloads, field semantics, filters, limits, or availability of `GET /api/databases`, `POST /api/pull`, `GET /api/status`, `GET /api/history/{database}`, `GET /api/plans`, `GET /api/plans/{plan_id}`, `GET /api/progress/apply/{apply_id}`, `GET /api/logs`, `GET /api/logs/{database}`, or `GET /api/locks`, update [docs/schema-intelligence.md](docs/schema-intelligence.md) in the same PR. Update the affected explanations and request/response examples, including catalog, lint, and deployment-specific payloads. Changes to the corresponding CLI commands or rendering must also update the guide's command/output examples. Every command example must have matching visible output; use fictional values and the actual response types or CLI formatters.
 
+**Write simple, plain English with proper grammar.** This applies everywhere people read our words: PR comments, check summaries, CLI output, error messages, logs, docs, code comments, identifiers, commit messages, and PR titles and descriptions. Prefer a short, human-readable explanation over a clever or compressed one. Use real dictionary words, and write full sentences with a clear subject and verb. Don't coin words or force a verb into an adjective. For example, write "the tables it never started", not "the unbegun tables". If a phrase only works as a coinage or as jargon the reader has to decode, rewrite the sentence.
+
 **Terminology:** NEVER use the word "migration" in code, comments, CLI output, or error messages. ALWAYS use "schema change" instead.
 
 **"schema change" is never hyphenated.** In prose — PR comments, check summaries, CLI output, error messages, docs, code comments — write "schema change", never "schema-change".
@@ -155,6 +157,21 @@ Constructions that only read correctly when hyphenated are rewritten rather than
 The rule is about prose only. Identifiers keep whatever form they need: file and script names (`scripts/generate-schema-change.sh`), CLI subcommands, external URLs, generated markdown anchors, and test fixture values are left alone. So is the literal inside a longer word: `VSchema-changed` is a different term and is not a hit.
 
 `make check-terminology` (`scripts/check-terminology.sh`) enforces this in CI on every PR, docs-only ones included. It strips URLs and anchor targets, matches only at a word boundary, and allowlists the identifiers above by value, so a new legitimate hyphenated identifier means extending that allowlist, not weakening the rule.
+
+**"cutover" is one word.** In docs, PR comments, check summaries, CLI output, and error messages, write "cutover", never "cut over", "cuts over", or "cut-over". The `schemabot cutover` command, the `cutover_policy` setting, and the `waiting_for_cutover` state all spell it as one word, so the prose around them does too. Code comments and test messages are not held to it, and neither is an engine's own flag or log text, such as Spirit's `--cut-over-threshold`.
+
+"cutover" is a noun, so a sentence that needs a verb is reworded around it rather than split:
+
+| Write | Not |
+|---|---|
+| each target's cutover runs as soon as its copy is ready | each target cuts over as soon as its copy is ready |
+| SchemaBot will run the cutover for `eu` next | SchemaBot will cut over `eu` next |
+| the apply can never reach its cutover | the apply can never be cut over |
+| the cutover GTID position | the cut-over GTID position |
+
+"cutting over" is the one exception: it is the name of the `cutting_over` state that the PR comment and CLI show, so it stays when it names that state.
+
+`make check-terminology` enforces this on every markdown file in CI, the generated TEMPLATES.md included, and on AGENTS.md outside this Terminology section. It blanks URLs and inline code spans first, so a link or a quoted flag is not a hit. Text the docs do not preview, and whether "cutting over" names the state or is used as a verb, is left for review to catch.
 
 **Driver terminology:** A *driver* is the operator worker that claims an apply via `FOR UPDATE SKIP LOCKED`, holds its lease (`LeaseOwner` / `LeaseToken`), and *drives* it to a terminal state. Use *driver* (noun) and *drive* (verb) — not *worker* — in new code, comments, logs, docs, and tests for the lease-holding goroutine and the work it performs. This is distinct from the **Go MySQL driver** (`github.com/go-sql-driver/mysql`, `database/sql/driver`): always refer to that as the "Go MySQL driver" or "SQL driver" and keep it import-qualified so the two senses never collide.
 

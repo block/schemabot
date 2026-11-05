@@ -5,6 +5,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -62,6 +63,9 @@ type ProgressOperation struct {
 	ErrorMessage        string
 	ErrorCode           string
 	AlreadyConverged    bool
+	// EndedBy names the operation whose end stopped this one at the cutover,
+	// when the operation was failed for it rather than on its own.
+	EndedBy *presentation.OperationRef
 	// RolloutStep is the table step the operation runs when the rollout runs
 	// table by table, and 0 otherwise.
 	RolloutStep int
@@ -202,6 +206,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ErrorMessage:        op.ErrorMessage,
 			ErrorCode:           op.ErrorCode,
 			AlreadyConverged:    op.AlreadyConverged,
+			EndedBy:             progressOperationRef(op.EndedBy),
 			RolloutStep:         op.RolloutStep,
 			StartedAt:           op.StartedAt,
 			CompletedAt:         op.CompletedAt,
@@ -286,4 +291,13 @@ func firstOperationError(ops []ProgressOperation) string {
 		return op.ErrorMessage
 	}
 	return ""
+}
+
+// progressOperationRef maps the API's reference to an operation of the apply
+// to the presentation's, keeping an absent reference absent.
+func progressOperationRef(ref *apitypes.ProgressOperationRef) *presentation.OperationRef {
+	if ref == nil {
+		return nil
+	}
+	return &presentation.OperationRef{Deployment: ref.Deployment, OperationKey: ref.OperationKey}
 }

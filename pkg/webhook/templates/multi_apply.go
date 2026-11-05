@@ -127,6 +127,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
+	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, rolloutMemberNoun(groups))
 
 	// Flat per-deployment summary (always visible — survives any later size
 	// trimming of the detail sections).
@@ -170,6 +171,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
+	writeStoppedAtCutoverNote(&sb, data.Model.Deployments, rolloutMemberNoun(groups))
 
 	writeDeploymentSummaryList(&sb, data.Model, groups)
 
@@ -250,6 +252,7 @@ func writeTargetRolloutStatus(sb *strings.Builder, data MultiDeploymentApplyData
 	}
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
+	writeStoppedAtCutoverNote(sb, data.Model.Deployments, targetNoun)
 	sb.WriteString("\n")
 }
 
@@ -373,6 +376,27 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
 }
 
+// writeStoppedAtCutoverNote explains, under the first failure, the members
+// SchemaBot stopped at the cutover because that failure meant the cutover
+// could never run, and that applying again resumes their saved copies. It
+// writes nothing when no member was stopped at the cutover.
+func writeStoppedAtCutoverNote(sb *strings.Builder, deps []presentation.Deployment, noun presentation.Noun) {
+	note := presentation.StoppedAtCutoverOf(deps).Note(noun, summaryCode)
+	if note == "" {
+		return
+	}
+	fmt.Fprintf(sb, "\n> ⏹️ %s\n", note)
+}
+
+// rolloutMemberNoun is what the rollout's counts call its members: targets
+// when a deployment addresses several of them, deployments otherwise.
+func rolloutMemberNoun(groups []presentation.Group) presentation.Noun {
+	if hasMultiTargetGroup(groups) {
+		return targetNoun
+	}
+	return deploymentNoun
+}
+
 // writeRolloutFooter writes the rollout's footer at the bottom, where the
 // single-deployment comment keeps its footer: every control command addresses
 // the whole apply. A pending rollup action leads; otherwise the footer is the
@@ -472,11 +496,11 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		// and offering the command would contradict that.
 		if !rolloutOptions(data.Details).DeferCutover {
 			sb.WriteString("\n---\n\n")
-			fmt.Fprintf(sb, "SchemaBot will cut over %s next — no action needed.\n", inlineCode(na.Name))
+			fmt.Fprintf(sb, "SchemaBot will run the cutover for %s next — no action needed.\n", inlineCode(na.Name))
 			return
 		}
 		writeFooterAction(sb,
-			fmt.Sprintf("To cut over %s:", inlineCode(na.Name)),
+			fmt.Sprintf("To run the cutover for %s:", inlineCode(na.Name)),
 			appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case presentation.NextActionResume:
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))

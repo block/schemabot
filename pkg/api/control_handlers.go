@@ -879,7 +879,7 @@ func (h *cutoverTurnHold) message() string {
 		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
 			h.blocker, h.parked)
 	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not run their cutover; stop the schema change and apply again",
 			h.blocker, h.blockerState, h.parked)
 	default:
 		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",
@@ -1107,6 +1107,16 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
+	// SchemaBot's own stop of an apply whose deferred cutover can no longer
+	// run is told apart by its caller: the drive tail leaves it for the settle
+	// and retry expiry skips the apply. A stop sent under that caller would
+	// hold the apply open with nothing to settle it, so it is refused.
+	if caller == storage.EndedOperationStopCaller {
+		s.logger.Warn("operator: refused a stop sent under the caller SchemaBot reserves for its own stop",
+			append(apply.LogAttrs(), "caller", caller)...)
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for SchemaBot's own stop; send the stop under your own name", caller)
+	}
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -2027,14 +2037,33 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 	if err != nil {
 		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	neverStarted := neverStartedStoppedOperationIDs(ops)
 	var startedCount int64
 	var skippedCount int64
+	operationsWithTasks := make(map[int64]bool)
 	for _, task := range tasks {
+		if task.ApplyOperationID != nil {
+			operationsWithTasks[*task.ApplyOperationID] = true
+		}
 		switch {
 		case state.IsState(task.State, state.Task.Stopped):
 			startedCount++
+		case taskQueuedUnderNeverStartedStop(task, neverStarted):
+			startedCount++
 		case state.IsTerminalTaskState(task.State):
 			skippedCount++
+		}
+	}
+	// An operation with no tasks, such as a finalizer that publishes the
+	// change once its shards complete, is resumable work of its own when a
+	// stop caught it before it began.
+	for id := range neverStarted {
+		if !operationsWithTasks[id] {
+			startedCount++
 		}
 	}
 	if startedCount == 0 {
@@ -2052,6 +2081,29 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 		}
 	}
 	return s.persistStartRequestForOperator(ctx, apply, caller, startedCount, skippedCount)
+}
+
+// neverStartedStoppedOperationIDs returns the operations a stop caught before
+// any engine took them up: stopped, never claimed, and holding no remote
+// apply. Their tasks, if they have any, are still pending, because nothing ran
+// them, and a start queues them again (RequeueNeverStartedForStartByApply), so
+// their work is stopped work the start resumes.
+func neverStartedStoppedOperationIDs(ops []*storage.ApplyOperation) map[int64]bool {
+	ids := make(map[int64]bool)
+	for _, op := range ops {
+		if state.IsState(op.State, state.ApplyOperation.Stopped) && op.StartedAt == nil && op.ExternalID == "" {
+			ids[op.ID] = true
+		}
+	}
+	return ids
+}
+
+// taskQueuedUnderNeverStartedStop reports whether a task is pending work of an
+// operation a stop caught before it started.
+func taskQueuedUnderNeverStartedStop(task *storage.Task, neverStarted map[int64]bool) bool {
+	return task.ApplyOperationID != nil &&
+		neverStarted[*task.ApplyOperationID] &&
+		state.IsState(task.State, state.Task.Pending)
 }
 
 // queueRemoteStoppedApplyForOperator validates remote stopped state before
