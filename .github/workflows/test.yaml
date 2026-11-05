@@ -418,10 +418,12 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the image
-      # build or the testcontainer-based tests below.
+      # build or the testcontainer-based tests below. The metadata tests start
+      # mysql:8.0 under a per-operation deadline that has no room for a pull.
       - name: "Pre-pull external images"
         run: |
           scripts/ci/prepull-images.sh \
+            mysql:8.0 \
             testcontainers/ryuk:0.13.0 \
             --dockerfile deploy/local/Dockerfile.localscale
       - name: "Build LocalScale image"
