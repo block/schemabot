@@ -573,8 +573,8 @@ func TestDurablePermanentFailureRequiresSuccessfulWrite(t *testing.T) {
 }
 
 // wantDeadLetterLevel is the log level a committed dead letter carries. A PR
-// over GitHub's file cap is a property of the PR that its failing check
-// already reports, so it warns; every other reason needs an operator.
+// over GitHub's file cap is fixed by reducing the PR, not by an operator, so
+// it warns; every other reason needs an operator.
 func wantDeadLetterLevel(reason metrics.WebhookFailureReason) string {
 	if reason == metrics.WebhookFailurePRFileCap {
 		return "WARN"
