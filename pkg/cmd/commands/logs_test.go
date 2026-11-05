@@ -382,3 +382,13 @@ func TestDeploymentFollowStateWarnings(t *testing.T) {
 	require.Len(t, warnings, 1)
 	assert.Equal(t, "target-b / spirit (remote-2): Data-plane logs could not be read; check server logs and retry.", warnings[0])
 }
+
+// A followed read opens with the scope it is narrowed to, so an operator
+// tailing one shard of one target does not mistake its lines for the whole
+// apply's.
+func TestScopeHeader(t *testing.T) {
+	assert.Empty(t, scopeHeader(client.LogScope{}))
+	assert.Equal(t, ", target shop-002", scopeHeader(client.LogScope{Target: "shop-002"}))
+	assert.Equal(t, ", shard -80", scopeHeader(client.LogScope{Shard: "-80"}))
+	assert.Equal(t, ", target shop-002, shard -80", scopeHeader(client.LogScope{Target: "shop-002", Shard: "-80"}))
+}

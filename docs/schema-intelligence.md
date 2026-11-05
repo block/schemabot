@@ -2071,6 +2071,44 @@ target that logged nothing:
 
 </details>
 
+### Read one shard's log
+
+A sharded apply runs each shard's work as its own operation, and every one of
+them writes into the same log. Add `shard` (CLI: `--shard`) to read one shard:
+the response keeps the entries of the operations keyed to that shard and the
+entries about the apply as a whole, and drops every other shard's. Shard names
+such as `-80` repeat across targets, so a shard read without `target` covers
+that shard on every target; add `target` to read one target's shard. `shard`
+also narrows a [deployment read](#read-deployment-logs): the data plane is asked
+for that shard's entries, and each source credits only that shard's operations.
+
+<details>
+<summary>Read one shard of one target</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&target=shop-002&shard=-80
+```
+
+The response has the same shape as the full log.
+
+</details>
+
+A shard the read's operations never ran on returns `400` and names the shards
+they do run on. An apply whose operations are not divided by shard, such as an
+unsharded target's, returns `400` too, rather than its whole log:
+
+<details>
+<summary>Unknown shard (HTTP 400)</summary>
+
+```json
+{
+  "error": "shard \"c0-\" has no operations in target \"shop-002\" of apply \"apply-example-73\"; its shards are -80, 80-",
+  "error_code": ""
+}
+```
+
+</details>
+
 ### Read deployment logs
 
 In local mode, omit `--deployment`. In [gRPC mode](release.md#two-planes-and-deploy-ordering),

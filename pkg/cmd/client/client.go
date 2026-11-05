@@ -993,13 +993,30 @@ func GetStoredPlan(endpoint, planID string) (*apitypes.StoredPlanResponse, error
 
 type LogEntry = apitypes.LogEntry
 
+// LogScope narrows a log read to one target, one shard of a sharded apply, or
+// one shard of one target (shard names repeat across targets). A narrowed read
+// still includes the entries about the apply as a whole. The zero scope reads
+// the whole apply.
+type LogScope struct {
+	Target string
+	Shard  string
+}
+
+func (scope LogScope) setQuery(values url.Values) {
+	if scope.Target != "" {
+		values.Set("target", scope.Target)
+	}
+	if scope.Shard != "" {
+		values.Set("shard", scope.Shard)
+	}
+}
+
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
 // Otherwise, it fetches logs for the most recent apply in the environment.
-// A non-empty target narrows the read to that target's entries and the
-// entries about the apply as a whole. The response carries the newest limit
-// entries plus whether older ones exist beyond the window.
-func GetLogs(endpoint, database, environment, applyID, target string, limit int) (*apitypes.LogsResponse, error) {
+// scope narrows the read to one target or shard. The response carries the
+// newest limit entries plus whether older ones exist beyond the window.
+func GetLogs(endpoint, database, environment, applyID string, scope LogScope, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -1010,9 +1027,7 @@ func GetLogs(endpoint, database, environment, applyID, target string, limit int)
 	} else if environment != "" {
 		values.Set("environment", environment)
 	}
-	if target != "" {
-		values.Set("target", target)
-	}
+	scope.setQuery(values)
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
 	}
@@ -1034,15 +1049,13 @@ func GetLogs(endpoint, database, environment, applyID, target string, limit int)
 }
 
 // GetDeploymentLogs retrieves an apply's logs from one data-plane deployment,
-// one source per remote read. A non-empty target keeps only that target's
-// sources.
-func GetDeploymentLogs(endpoint, applyID, deployment, target string, limit int) (*apitypes.DeploymentLogsResponse, error) {
+// one source per remote read. scope keeps only the sources of one target or
+// shard, and each source's entries for it.
+func GetDeploymentLogs(endpoint, applyID, deployment string, scope LogScope, limit int) (*apitypes.DeploymentLogsResponse, error) {
 	values := url.Values{}
 	values.Set("apply_id", applyID)
 	values.Set("deployment", deployment)
-	if target != "" {
-		values.Set("target", target)
-	}
+	scope.setQuery(values)
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
 	}

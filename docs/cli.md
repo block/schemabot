@@ -928,6 +928,17 @@ $ schemabot logs apply-example-73 --target shop-002
 A target the apply never ran on is refused, and the error lists the targets it
 did run on.
 
+`--shard` narrows a sharded apply's read to one shard, such as `-80`. Shard
+names repeat across targets, so add `--target` to read one target's shard:
+
+```console
+$ schemabot logs apply-example-73 --target shop-002 --shard -80 --follow
+Following logs for apply-example-73, target shop-002, shard -80... (Ctrl+C to stop)
+```
+
+A shard the apply never ran on, or an apply not divided by shard, is refused,
+and the error lists the shards it did run on.
+
 ### Explain a blocked check
 
 A SchemaBot check that will not clear has two records behind it: the Check Run

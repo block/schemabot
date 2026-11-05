@@ -64,18 +64,20 @@ func TestLogRequestQueryValuesAreEncoded(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := GetLogs(server.URL, "", "", "apply/a & b", "shop/a & b", 17)
+	_, err := GetLogs(server.URL, "", "", "apply/a & b", LogScope{Target: "shop/a & b", Shard: "-80"}, 17)
 	require.NoError(t, err)
-	_, err = GetDeploymentLogs(server.URL, "apply/a & b", "data plane/one", "shop/a & b", 23)
+	_, err = GetDeploymentLogs(server.URL, "apply/a & b", "data plane/one", LogScope{Target: "shop/a & b", Shard: "80-"}, 23)
 	require.NoError(t, err)
 	require.Len(t, requests, 2)
 	assert.Equal(t, "apply/a & b", requests[0].URL.Query().Get("apply_id"))
 	assert.Equal(t, "17", requests[0].URL.Query().Get("limit"))
 	assert.Equal(t, "shop/a & b", requests[0].URL.Query().Get("target"))
+	assert.Equal(t, "-80", requests[0].URL.Query().Get("shard"))
 	assert.Equal(t, "apply/a & b", requests[1].URL.Query().Get("apply_id"))
 	assert.Equal(t, "data plane/one", requests[1].URL.Query().Get("deployment"))
 	assert.Equal(t, "23", requests[1].URL.Query().Get("limit"))
 	assert.Equal(t, "shop/a & b", requests[1].URL.Query().Get("target"))
+	assert.Equal(t, "80-", requests[1].URL.Query().Get("shard"))
 }
 
 func TestCallPullSchemaAPIError(t *testing.T) {

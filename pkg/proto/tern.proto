@@ -975,6 +975,11 @@ message LogsRequest {
   string type = 4;
   string environment = 5;
   int32 limit = 6;
+  // Optional shard of a sharded apply to read: only the operations whose work
+  // runs on that shard contribute their entries, alongside the entries that
+  // apply to the whole apply. Composes with target, since a shard name repeats
+  // across targets. Empty reads every shard.
+  string shard = 7;
 }
 
 message ApplyLog {

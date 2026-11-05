@@ -4136,11 +4136,8 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 // finalizer key ("namespace/group_finalizer") are not, so the shard-scope guard
 // applies only to per-shard work.
 func isShardWorkOperationKey(key, target string) bool {
-	parts := strings.Split(key, state.OperationKeyDelimiter)
-	if len(parts) == 4 && target != "" && parts[0] == target {
-		parts = parts[1:]
-	}
-	return len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != ""
+	_, ok := storage.OperationKeyShard(key, target)
+	return ok
 }
 
 func taskTargetShards(tasks []*storage.Task) []string {

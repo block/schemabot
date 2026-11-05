@@ -4066,7 +4066,7 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if apply == nil {
 		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, storage.ErrApplyNotFound)
 	}
-	operationIDs, err := c.logOperationsForTarget(ctx, apply, req.Target)
+	operationIDs, err := c.logOperationsFor(ctx, apply, req.Target, req.Shard)
 	if err != nil {
 		return nil, err
 	}
@@ -4085,28 +4085,52 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	return resp, nil
 }
 
-// logOperationsForTarget returns the operations whose logs a Logs read for
-// target covers. One data-plane apply can drive several targets of a rollout,
-// and a read for one of them must return that target's entries, not the whole
-// apply's: the caller renders one section per target, so an unscoped read
-// would repeat every target's lines under each. It returns nil, an unscoped
-// read, when no target is named. A named target the apply has no operation on
-// is an error when the apply spans several targets, never an empty read that
-// looks like a quiet target.
-func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage.Apply, target string) ([]int64, error) {
-	if target == "" {
+// logOperationsFor returns the operations whose logs a Logs read for target
+// and shard covers. One data-plane apply can drive several targets of a
+// rollout, and every shard of a sharded target, and a read for one of them must
+// return its entries, not the whole apply's: the caller renders one section per
+// target, so an unscoped read would repeat every target's lines under each. It
+// returns nil, an unscoped read, when neither is named. A named target or shard
+// the apply has no operation on is an error, never an empty read that looks
+// like a quiet target or shard; the one exception is a single-target apply that
+// records its target under another name.
+func (c *LocalClient) logOperationsFor(ctx context.Context, apply *storage.Apply, target, shard string) ([]int64, error) {
+	if target == "" && shard == "" {
 		return nil, nil
 	}
 	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		return nil, fmt.Errorf("list operations of apply %s for logs of target %s: %w", apply.ApplyIdentifier, target, err)
+		return nil, fmt.Errorf("list operations of apply %s for logs of target %q shard %q: %w", apply.ApplyIdentifier, target, shard, err)
 	}
-	if operationIDs := storage.LogOperationsOnTarget(ops, target); len(operationIDs) > 0 {
+	var operationIDs []int64
+	if target != "" {
+		operationIDs, ops, err = c.logOperationsOnTarget(apply, ops, target)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if shard == "" {
 		return operationIDs, nil
+	}
+	if operationIDs = storage.LogOperationsOnShard(ops, shard); len(operationIDs) > 0 {
+		return operationIDs, nil
+	}
+	shards := storage.DistinctOperationShards(ops)
+	if len(shards) == 0 {
+		return nil, fmt.Errorf("apply %s runs no per-shard operations on target %q, so it has no log for shard %s: %w", apply.ApplyIdentifier, target, shard, ErrLogsShardNotInApply)
+	}
+	return nil, fmt.Errorf("apply %s has no operation on shard %s of target %q, only on %s: %w", apply.ApplyIdentifier, shard, target, strings.Join(shards, ", "), ErrLogsShardNotInApply)
+}
+
+// logOperationsOnTarget narrows ops to target's, returning their IDs and the
+// operations themselves so a shard read can narrow further.
+func (c *LocalClient) logOperationsOnTarget(apply *storage.Apply, ops []*storage.ApplyOperation, target string) ([]int64, []*storage.ApplyOperation, error) {
+	if onTarget := storage.OperationsOnTarget(ops, target); len(onTarget) > 0 {
+		return storage.LogOperationsOnTarget(onTarget, target), onTarget, nil
 	}
 	targets := storage.DistinctOperationTargets(ops)
 	if len(targets) > 1 {
-		return nil, fmt.Errorf("apply %s has no operation on target %s, only on %s: %w", apply.ApplyIdentifier, target, strings.Join(targets, ", "), ErrLogsTargetNotInApply)
+		return nil, nil, fmt.Errorf("apply %s has no operation on target %s, only on %s: %w", apply.ApplyIdentifier, target, strings.Join(targets, ", "), ErrLogsTargetNotInApply)
 	}
 	// A remote apply that drives one target holds only that target's log, and
 	// a single-target dispatch may record its target under another name than
@@ -4114,7 +4138,7 @@ func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage
 	// whole log is the answer.
 	c.logger.Debug("logs read for a target the single-target apply records under another name; serving its whole log",
 		append(apply.LogAttrs(), "target", target, "recorded_targets", targets)...)
-	return nil, nil
+	return nil, ops, nil
 }
 
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's

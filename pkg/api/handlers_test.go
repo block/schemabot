@@ -1391,8 +1391,87 @@ func TestHandleDeploymentLogsScopesToTarget(t *testing.T) {
 	w = httptest.NewRecorder()
 	service.handleLogsWithoutDatabase(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations on deployment \"region-a\" in apply \"apply-control\"; its targets there are shop-001, shop-002`)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations in deployment \"region-a\" of apply \"apply-control\"; its targets are shop-001, shop-002`)
 	assert.Len(t, client.logsReqs, 1, "a refused target fetches nothing")
+}
+
+// A sharded rollout reads one shard's control-plane history on its own, alone
+// or within one target, since shard names repeat across targets. A shard the
+// target never ran on is refused with the shards it does run on, and an apply
+// not divided by shard is refused rather than answered with its whole log.
+func TestHandleLogsScopesToShard(t *testing.T) {
+	apply := &storage.Apply{ID: 17, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.TargetOperationKey("shop-001", storage.ShardOperationKey("main", "-80", "orders"))},
+		{ID: 2, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.TargetOperationKey("shop-001", storage.ShardOperationKey("main", "80-", "orders"))},
+		{ID: 3, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002", OperationKey: storage.TargetOperationKey("shop-002", storage.ShardOperationKey("main", "-80", "orders"))},
+		{ID: 4, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-003", OperationKey: storage.TargetOperationKey("shop-003", "")},
+	}
+	logStore := &windowedApplyLogStore{available: 2}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  logStore,
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	read := func(query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&"+query, nil)
+		w := httptest.NewRecorder()
+		service.handleLogsWithoutDatabase(w, req)
+		return w
+	}
+
+	w := read("shard=-80")
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{1, 3}, logStore.lastFilter.OperationIDs)
+
+	w = read("target=shop-001&shard=-80")
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{1}, logStore.lastFilter.OperationIDs)
+
+	w = read("target=shop-002&shard=80-")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `shard \"80-\" has no operations in target \"shop-002\" of apply \"apply-control\"; its shards are -80`)
+
+	w = read("target=shop-003&shard=-80")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" of apply \"apply-control\" runs no per-shard operations; omit shard`)
+}
+
+// A deployment read scoped to one shard asks the shared data-plane apply for
+// that shard's entries and credits only the operations keyed to it, so the
+// other shards' operations are not listed as the source of lines they did not
+// write.
+func TestHandleDeploymentLogsScopesToShard(t *testing.T) {
+	apply := &storage.Apply{ID: 18, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.ShardOperationKey("main", "-80", "orders"), ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.ShardOperationKey("main", "80-", "orders"), ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&shard=80-", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "80-", client.logsReqs[0].Shard)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	require.Len(t, response.Sources[0].Operations, 1)
+	assert.Equal(t, "main/80-/orders", response.Sources[0].Operations[0].OperationKey)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&shard=c0-", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `shard \"c0-\" has no operations in deployment \"region-a\" of apply \"apply-control\"; its shards are -80, 80-`)
+	assert.Len(t, client.logsReqs, 1, "a refused shard fetches nothing")
 }
 
 func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {

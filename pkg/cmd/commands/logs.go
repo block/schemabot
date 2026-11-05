@@ -34,6 +34,7 @@ type LogsCmd struct {
 	Follow      bool   `short:"f" help:"Print the newest N entries, then poll for new ones until interrupted"`
 	Deployment  string `help:"Read logs from the selected data-plane deployment"`
 	Target      string `help:"Show only one target's entries, plus the entries about the whole apply"`
+	Shard       string `help:"Show only one shard's entries of a sharded apply, plus the entries about the whole apply; with --target, that target's shard"`
 	JSON        bool   `help:"Output as JSON"`
 }
 
@@ -65,23 +66,24 @@ func (cmd *LogsCmd) Run(ctx context.Context, g *Globals) error {
 		return err
 	}
 
+	scope := client.LogScope{Target: cmd.Target, Shard: cmd.Shard}
 	switch {
 	case cmd.Follow && cmd.Deployment != "":
-		return followDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, cmd.Target, cmd.Limit)
+		return followDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit)
 	case cmd.Follow:
-		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Target, cmd.Limit)
+		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit)
 	case cmd.Deployment != "":
-		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, cmd.Target, cmd.Limit, cmd.JSON)
+		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit, cmd.JSON)
 	default:
-		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Target, cmd.Limit, cmd.JSON)
+		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit, cmd.JSON)
 	}
 }
 
-func showDeploymentLogs(endpoint, applyID, deployment, target string, limit int, outputJSON bool) error {
+func showDeploymentLogs(endpoint, applyID, deployment string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.DeploymentLogsResponse
 	err := withLoading("Loading data-plane logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, target, limit)
+		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
 		return loadErr
 	})
 	if err != nil {
@@ -128,11 +130,11 @@ func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperation
 }
 
 // showLogs displays logs once and exits.
-func showLogs(endpoint, database, environment, applyID, target string, limit int, outputJSON bool) error {
+func showLogs(endpoint, database, environment, applyID string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.LogsResponse
 	err := withLoading("Loading logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, target, limit)
+		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, scope, limit)
 		return loadErr
 	})
 	if err != nil {
@@ -172,20 +174,20 @@ func printFollowGapNotice() {
 
 // followLogs prints the newest initialLimit entries, then polls for new ones
 // until the command context is cancelled (Ctrl+C).
-func followLogs(ctx context.Context, endpoint, database, environment, applyID, target string, initialLimit int) error {
-	scope := targetScope(target)
+func followLogs(ctx context.Context, endpoint, database, environment, applyID string, scope client.LogScope, initialLimit int) error {
+	header := scopeHeader(scope)
 	switch {
 	case applyID != "" && database == "":
-		fmt.Printf("Following logs for %s%s... (Ctrl+C to stop)\n\n", applyID, scope)
+		fmt.Printf("Following logs for %s%s... (Ctrl+C to stop)\n\n", applyID, header)
 	case applyID != "":
-		fmt.Printf("Following logs for %s (apply %s)%s... (Ctrl+C to stop)\n\n", database, applyID, scope)
+		fmt.Printf("Following logs for %s (apply %s)%s... (Ctrl+C to stop)\n\n", database, applyID, header)
 	default:
-		fmt.Printf("Following logs for %s/%s%s... (Ctrl+C to stop)\n\n", database, environment, scope)
+		fmt.Printf("Following logs for %s/%s%s... (Ctrl+C to stop)\n\n", database, environment, header)
 	}
 
 	state := &followState{}
 	fetch := func(limit int) (*apitypes.LogsResponse, error) {
-		return client.GetLogs(endpoint, database, environment, applyID, target, limit)
+		return client.GetLogs(endpoint, database, environment, applyID, scope, limit)
 	}
 	emit := func(result *apitypes.LogsResponse, initial bool) {
 		switch {
@@ -199,24 +201,28 @@ func followLogs(ctx context.Context, endpoint, database, environment, applyID, t
 	return runFollowLoop(ctx, fetch, emit, initialLimit, followInterval)
 }
 
-// targetScope names the target a followed read is narrowed to, for the
-// header that opens the tail.
-func targetScope(target string) string {
-	if target == "" {
-		return ""
+// scopeHeader names the target and shard a followed read is narrowed to, for
+// the header that opens the tail.
+func scopeHeader(scope client.LogScope) string {
+	var header string
+	if scope.Target != "" {
+		header += ", target " + scope.Target
 	}
-	return ", target " + target
+	if scope.Shard != "" {
+		header += ", shard " + scope.Shard
+	}
+	return header
 }
 
 // followDeploymentLogs tails data-plane logs: it prints the newest
 // initialLimit entries from every remote source, then polls for new ones
 // until the command context is cancelled (Ctrl+C).
-func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment, target string, initialLimit int) error {
-	fmt.Printf("Following data-plane logs for %s on %s%s... (Ctrl+C to stop)\n\n", applyID, deployment, targetScope(target))
+func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, scope client.LogScope, initialLimit int) error {
+	fmt.Printf("Following data-plane logs for %s on %s%s... (Ctrl+C to stop)\n\n", applyID, deployment, scopeHeader(scope))
 
 	state := newDeploymentFollowState()
 	fetch := func(limit int) (*apitypes.DeploymentLogsResponse, error) {
-		return client.GetDeploymentLogs(endpoint, applyID, deployment, target, limit)
+		return client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
 	}
 	// The loop-wide initial flag is unused here: each source owes the
 	// truncation notice to its own first successful read, which for a source

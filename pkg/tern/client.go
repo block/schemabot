@@ -124,6 +124,11 @@ var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 // nothing, so the read refuses instead.
 var ErrLogsTargetNotInApply = errors.New("apply has no operation on the requested target")
 
+// ErrLogsShardNotInApply is returned by a Logs read scoped to a shard none of
+// the apply's operations (on the requested target, when one is named) runs on.
+// It refuses for the same reason as ErrLogsTargetNotInApply.
+var ErrLogsShardNotInApply = errors.New("apply has no operation on the requested shard")
+
 // ErrTaskRequeueRefused is returned by a resume whose write putting a
 // failed_retryable task back to pending for a retry, or a stopped task back to
 // pending for a start, did not land. The drive exits with the task row still at
