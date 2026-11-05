@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -498,6 +499,14 @@ func TestActiveApplyConflictMessage(t *testing.T) {
 			err:  holder(state.Apply.WaitingForDeploy),
 			want: "apply blocked: apply-7 is waiting for its deploy on orders in production. Start or cancel it, then apply again.",
 		},
+		"in its revert window": {
+			err:  holder(state.Apply.RevertWindow),
+			want: "apply blocked: apply-7 is in its revert window on orders in production. Skip-revert or revert it, then apply again.",
+		},
+		"retrying after an error": {
+			err:  holder(state.Apply.FailedRetryable),
+			want: "apply blocked: apply-7 is retrying after an error on orders in production. Wait for it to finish or cancel it, then apply again.",
+		},
 		"ended with an operation still in progress": {
 			err:  holder(state.Apply.Failed),
 			want: "apply blocked: apply-7 has ended, but part of its work is still in progress on orders in production. Wait for that to finish, then apply again.",
@@ -510,6 +519,30 @@ func TestActiveApplyConflictMessage(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			assert.Equal(t, tc.want, activeApplyConflictMessage(tc.err))
+		})
+	}
+}
+
+// TestActiveApplyConflictMessageNamesTheDecisionEveryRestingStateOwes walks
+// every apply state the registry says holds the database until someone acts on
+// it. A refused apply must name that action, never tell the operator to wait for
+// a holder that will not finish on its own.
+func TestActiveApplyConflictMessageNamesTheDecisionEveryRestingStateOwes(t *testing.T) {
+	v := reflect.ValueOf(state.Apply)
+	for _, field := range v.Fields() {
+		holderState := field.String()
+		if !strings.HasPrefix(state.Hold(holderState), "it holds the database until") {
+			continue
+		}
+		t.Run(holderState, func(t *testing.T) {
+			msg := activeApplyConflictMessage(&storage.ActiveApplyError{
+				HolderApplyID: "apply-7",
+				HolderState:   holderState,
+				Database:      "orders",
+				Environment:   "production",
+			})
+			assert.NotContains(t, msg, "is still in progress")
+			assert.NotContains(t, msg, "has ended")
 		})
 	}
 }

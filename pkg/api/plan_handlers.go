@@ -1683,6 +1683,13 @@ func activeApplyConflictMessage(err error) string {
 		return fmt.Sprintf("apply blocked: %s is waiting for its deploy %s. Start or cancel it, then apply again.", id, where)
 	case state.IsState(conflict.HolderState, state.Apply.WaitingForCutover):
 		return fmt.Sprintf("apply blocked: %s is waiting for its cutover %s. Run its cutover or cancel it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.RevertWindow):
+		// The cutover already ran, so stop and cancel are rejected here.
+		return fmt.Sprintf("apply blocked: %s is in its revert window %s. Skip-revert or revert it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.FailedRetryable):
+		// The driver retries it without an operator, so waiting is enough,
+		// and cancel abandons it instead.
+		return fmt.Sprintf("apply blocked: %s is retrying after an error %s. Wait for it to finish or cancel it, then apply again.", id, where)
 	case state.IsTerminalApplyState(conflict.HolderState):
 		// An ended apply accepts no control, so the only step is to wait for
 		// its operation still in progress.
