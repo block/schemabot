@@ -150,12 +150,20 @@ const (
 // every step passed, an error wrapping ErrInconclusive when the run could not
 // decide, and any other error when a step failed. A GitHub rate limit or
 // server error leaves the run undecided, so it wraps ErrInconclusive too. The
-// run's pull request, branch, and table are removed whatever the outcome.
+// run's pull request, branch, and table are removed whatever the outcome, and
+// a cleanup that fails fails the run, even an inconclusive one: what it left
+// behind may hold the lock, so a retry would only come back inconclusive.
+//
+// The sweep counts against RunTimeout, so the time in the run's name bounds
+// the whole call. A sweep that fails does not stop the run: a leftover that
+// still holds the lock makes the run inconclusive at its first apply, and a
+// run that fails names the sweep's error too.
 func (r *Runner) Run(ctx context.Context) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.RunTimeout)
 	defer cancel()
-	if err := r.Sweep(ctx); err != nil {
-		return inconclusiveWhenGitHubUnavailable(fmt.Errorf("sweep before the run: %w", err))
+	sweepErr := r.Sweep(ctx)
+	if sweepErr != nil {
+		r.logger.Warn("sweep before the run failed; running anyway", "repo", r.cfg.Repo, "error", sweepErr)
 	}
 	table := runTablePrefix + r.now().Add(r.cfg.RunTimeout+r.cfg.WaitTimeout).UTC().Format(runTimeLayout)
 	cur := &run{table: table, branch: BranchPrefix + table, applies: map[string]bool{}}
@@ -165,12 +173,24 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.cfg.WaitTimeout)
 		defer cancel()
 		if cerr := r.cleanup(cleanupCtx, cur); cerr != nil {
-			err = errors.Join(err, fmt.Errorf("clean up run %s: %w", cur.table, cerr))
+			cleanupErr := fmt.Errorf("clean up run %s: %w", cur.table, cerr)
+			if err == nil {
+				err = cleanupErr
+				return
+			}
+			// The steps' error keeps its message but not its chain, so an
+			// inconclusive run whose cleanup failed no longer reads as
+			// inconclusive.
+			err = fmt.Errorf("%w; %w", err, cleanupErr)
 		}
 	}()
 	// Classified before the cleanup error joins it, so a rate-limited cleanup
 	// cannot turn a failed step into an inconclusive run.
-	return inconclusiveWhenGitHubUnavailable(r.steps(ctx, cur))
+	err = inconclusiveWhenGitHubUnavailable(r.steps(ctx, cur))
+	if err != nil && sweepErr != nil {
+		err = fmt.Errorf("%w (the sweep before the run also failed: %w)", err, sweepErr)
+	}
+	return err
 }
 
 // inconclusiveWhenGitHubUnavailable wraps ErrInconclusive around err when
@@ -571,15 +591,20 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// sweepGrace is how long after the time in a run's name the sweep still
+// leaves it alone, so a sweeper whose clock runs ahead of the run's host
+// cannot reach a cleanup still finishing.
+const sweepGrace = time.Minute
+
 // over reports whether the run that named its table table has ended: the time
-// in its name has passed. A name that does not parse is not a run's, so it
-// never counts as over.
+// in its name, and then sweepGrace, have passed. A name that does not parse is
+// not a run's, so it never counts as over.
 func (r *Runner) over(table string) bool {
 	end, err := time.Parse(runTimeLayout, strings.TrimPrefix(table, runTablePrefix))
 	if err != nil || !strings.HasPrefix(table, runTablePrefix) {
 		return false
 	}
-	return r.now().After(end)
+	return r.now().After(end.Add(sweepGrace))
 }
 
 // closedRunsFinished returns an error unless every pull request from branch
@@ -589,6 +614,11 @@ func (r *Runner) closedRunsFinished(ctx context.Context, branch string) error {
 	prs, err := r.gh.PullRequestsForBranch(ctx, branch)
 	if err != nil {
 		return err
+	}
+	if len(prs) == 0 {
+		// Only a pull request's apply creates a run's table, so finding none
+		// means the lookup missed it, not that nothing ran.
+		return fmt.Errorf("found no pull request from branch %s in %s, so its applies cannot be proven finished; check it by hand", branch, r.cfg.Repo)
 	}
 	for _, pr := range prs {
 		all, err := r.gh.Comments(ctx, pr.Number)
@@ -608,7 +638,9 @@ func (r *Runner) closedRunsFinished(ctx context.Context, branch string) error {
 }
 
 // cancelRefusedAsFinished reports whether SchemaBot refused a cancel of
-// applyID because the apply had already finished, as closeRun accepts.
+// applyID because the apply had already finished, as closeRun accepts. Only
+// the first SchemaBot reply after the cancel counts, so a refusal of a later
+// command for another apply cannot pass for it.
 func (r *Runner) cancelRefusedAsFinished(all []Comment, applyID string) bool {
 	bot := r.fromBot(all)
 	for _, c := range all {
@@ -616,11 +648,27 @@ func (r *Runner) cancelRefusedAsFinished(all []Comment, applyID string) bool {
 		if r.isBot(c) || len(fields) < 3 || fields[0] != r.cfg.CommandPrefix || fields[1] != "cancel" || fields[2] != applyID {
 			continue
 		}
-		if _, refused := refusedAsFinished(bot, c.ID); refused {
+		reply, ok := firstCommentAfter(bot, c.ID)
+		if !ok {
+			continue
+		}
+		if _, refused := refusedAsFinished([]Comment{reply}, c.ID); refused {
 			return true
 		}
 	}
 	return false
+}
+
+// firstCommentAfter returns the earliest comment posted after the comment
+// with ID after.
+func firstCommentAfter(comments []Comment, after int64) (Comment, bool) {
+	var first Comment
+	for _, c := range comments {
+		if c.ID > after && (first.ID == 0 || c.ID < first.ID) {
+			first = c
+		}
+	}
+	return first, first.ID != 0
 }
 
 // cleanup removes one run's pull request, branch, and table.

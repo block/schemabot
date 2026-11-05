@@ -71,6 +71,9 @@ type fakeSchemaBot struct {
 	commentsFailures int
 	// commentErr, when set, fails every comment the runner posts.
 	commentErr error
+	// onCommand, when set, sees every PR command once SchemaBot has
+	// answered it.
+	onCommand func(body string)
 	// commands records every PR command, in order.
 	commands []string
 }
@@ -190,9 +193,13 @@ func (f *fakeSchemaBot) PullRequestsForBranch(_ context.Context, branch string) 
 	return out, nil
 }
 
-func (f *fakeSchemaBot) Comments(_ context.Context, number int) ([]Comment, error) {
+func (f *fakeSchemaBot) Comments(ctx context.Context, number int) ([]Comment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		// Like a real client, a cancelled read fails.
+		return nil, fmt.Errorf("list comments on pull request #%d: %w", number, err)
+	}
 	if f.commentsFailures > 0 {
 		f.commentsFailures--
 		return nil, fmt.Errorf("list comments on pull request #%d: %w", number,
@@ -225,6 +232,9 @@ func (f *fakeSchemaBot) CreateComment(_ context.Context, number int, body string
 	f.comments[number] = append(f.comments[number], Comment{ID: id, Author: "runner", Body: body})
 	f.commands = append(f.commands, body)
 	f.respond(number, strings.Fields(body))
+	if f.onCommand != nil {
+		f.onCommand(body)
+	}
 	return id, nil
 }
 
@@ -864,8 +874,12 @@ func TestRunRetriesAPollThroughAGitHubRateLimit(t *testing.T) {
 	r := testRunner(t, bot, target)
 	r.cfg.WaitTimeout = 50 * time.Millisecond
 	err := r.Run(t.Context())
-	require.ErrorIs(t, err, ErrInconclusive)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "while GitHub was failing")
+	// The cleanup cannot read the pull request either, so it may leave an
+	// apply holding the lock: that outranks the inconclusive wait.
+	assert.Contains(t, err.Error(), "clean up run "+runTablePrefix)
+	assert.NotErrorIs(t, err, ErrInconclusive)
 }
 
 func TestRunIsInconclusiveWhenAnotherRunTookTheName(t *testing.T) {
@@ -894,4 +908,118 @@ func TestRunNamesTheRunDeadlineWhenItEndsAWait(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "run deadline passed")
 	assert.NotContains(t, err.Error(), "timed out after")
+}
+
+// A cleanup that fails may leave an apply holding the lock, so a retry would
+// come back inconclusive at that lock. The cleanup's failure decides the run.
+func TestRunFailsWhenTheCleanupFailsAfterAnInconclusiveRun(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.copyOutrunsStop = true
+	bot.deleteBranchFails = true
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "finished before it reached "+StatusInProgress, "the steps' error is still reported")
+	assert.Contains(t, err.Error(), "clean up run "+testTable)
+}
+
+// A leftover the sweep cannot reap does not stop later runs. A run that
+// fails names the sweep's error too.
+func TestRunGoesOnWhenTheSweepFails(t *testing.T) {
+	const earlier = "e2e_20261104000000"
+	stuck := func() (*fakeSchemaBot, *fakeTarget) {
+		target := newFakeTarget()
+		bot := newFakeSchemaBot(target)
+		target.create(earlier)
+		bot.prs[1] = &fakePR{branch: BranchPrefix + earlier}
+		bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+		return bot, target
+	}
+
+	bot, target := stuck()
+	require.NoError(t, testRunner(t, bot, target).Run(t.Context()))
+	assert.True(t, target.has(earlier), "the stuck leftover stays for someone to check")
+
+	bot, target = stuck()
+	bot.deferredCutsOverAlone = true
+	err := testRunner(t, bot, target).Run(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "the sweep before the run also failed")
+	assert.Contains(t, err.Error(), "apply-00000000000000aa unfinished")
+}
+
+// Only a pull request's apply creates a run's table, so a table with no pull
+// request behind it means the lookup missed it, not that nothing ran.
+func TestSweepKeepsATableWhoseRunHasNoPullRequest(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+
+	err := testRunner(t, bot, target).Sweep(t.Context())
+
+	require.ErrorContains(t, err, "found no pull request")
+	assert.True(t, target.has(earlier))
+}
+
+// A sweeper whose clock runs ahead must not reach a run in its last seconds.
+func TestSweepLeavesARunWithinTheGrace(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const ending = "e2e_20261105092930" // 30 seconds before the test's now
+	target.create(ending)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + ending, open: true}
+
+	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
+
+	assert.True(t, bot.prs[1].open)
+	assert.True(t, target.has(ending))
+}
+
+// Only SchemaBot's first reply to a cancel answers it, so a refusal of a
+// later command for another apply cannot prove this apply finished.
+func TestSweepReadsOnlyTheFirstReplyToACancel(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier}
+	bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+	bot.comments[1] = append(bot.comments[1],
+		Comment{ID: bot.id(), Author: "octocat", Body: "schemabot cancel apply-00000000000000aa -e development"},
+		Comment{ID: bot.id(), Author: "schemabot[bot]", IsBot: true, Body: renderStartRefused("the cancel could not reach the engine")},
+		Comment{ID: bot.id(), Author: "octocat", Body: "schemabot cancel apply-00000000000000bb -e development"},
+		Comment{ID: bot.id(), Author: "schemabot[bot]", IsBot: true, Body: renderAlreadyFinished(state.Apply.Completed)},
+	)
+
+	err := testRunner(t, bot, target).Sweep(t.Context())
+
+	require.ErrorContains(t, err, "apply-00000000000000aa unfinished")
+	assert.True(t, target.has(earlier))
+}
+
+// A run cancelled part way, as a pipeline cancels a superseded gate, still
+// cleans up after itself.
+func TestRunCleansUpAfterItIsCancelled(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	bot.onCommand = func(body string) {
+		if strings.Contains(body, "--defer-cutover") {
+			cancel()
+		}
+	}
+
+	err := testRunner(t, bot, target).Run(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Regexp(t, `^schemabot cancel apply-[0-9a-f]{16} -e development$`, bot.commands[len(bot.commands)-1],
+		"the cleanup cancels the deferred apply")
+	assert.False(t, bot.prs[1].open)
+	assert.NotContains(t, bot.heads, BranchPrefix+testTable)
+	assert.False(t, target.has(testTable))
 }
