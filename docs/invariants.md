@@ -1374,9 +1374,12 @@ storage must never settle on a state that contradicts what the engine is still d
 database underneath. *Enforced:* the revert-phase gate on the control path
 (`pkg/tern/local_control.go`), the resolution of a revert or skip-revert through the apply the
 request names and that apply's own live task (`activeTaskForControlApply`,
-`pkg/tern/local_control.go`), and the drive loops that act on its answer
+`pkg/tern/local_control.go`), the drive loops that act on its answer
 (`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
-`pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`).
+`pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`), and the resume re-plan, which
+keeps a task whose engine accepted work it reattaches to active rather than settling it from a
+schema comparison, so a revert window the drive never recorded is still reached
+(`taskReattachesToAcceptedWork`, `pkg/tern/local_control_resume.go`).
 
 ### CO-6: Commands act only where they have an effect
 
