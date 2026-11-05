@@ -25,8 +25,6 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
-	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
 	gh "github.com/google/go-github/v86/github"
 	"golang.org/x/sync/errgroup"
 )
@@ -447,12 +445,6 @@ func NewRateLimitedTransport(base http.RoundTripper) http.RoundTripper {
 	return newGitHubRateLimitTransport(base)
 }
 
-func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
-	return github_ratelimit.New(base,
-		github_secondary_ratelimit.WithSingleSleepLimit(githubSecondaryRateLimitMaxSleep, nil),
-	)
-}
-
 // GitHub read retries are deliberately generous: transient edge failures
 // (5xx, empty-body 400s, dropped connections, short rate-limit windows) can
 // last several seconds, and a failed read on a webhook path surfaces to the
@@ -476,8 +468,9 @@ func SetUnavailableReadRetryDelayForTest(delay time.Duration) (restore func()) {
 	return func() { githubUnavailableReadRetryDelay = original }
 }
 
-func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger, operation string, logAttrs []any, read func(context.Context) (T, error)) (T, error) {
+func retryGitHubUnavailableRead[T any](ctx context.Context, ic *InstallationClient, metricOperation, operation string, logAttrs []any, read func(context.Context) (T, error)) (T, error) {
 	var zero T
+	logger := ic.logger
 	for attempt := 1; attempt <= githubUnavailableReadRetryMaxAttempts; attempt++ {
 		result, err := read(ctx)
 		if err == nil {
@@ -495,12 +488,8 @@ func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger,
 			logger.Warn("retrying unavailable GitHub read",
 				append(logAttrs, "operation", operation, "attempt", attempt, "max_attempts", githubUnavailableReadRetryMaxAttempts, "delay", delay, "error", err)...)
 		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return zero, fmt.Errorf("wait to retry GitHub read %s: %w", operation, ctx.Err())
-		case <-timer.C:
+		if err := waitToRetryGitHubRead(ctx, ic.readWaitMetricContext(metricOperation), delay, err); err != nil {
+			return zero, fmt.Errorf("wait to retry GitHub read %s: %w", operation, err)
 		}
 	}
 	return zero, fmt.Errorf("retry GitHub read %s: exhausted attempts", operation)
@@ -661,7 +650,7 @@ func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo strin
 // GetIssueComment returns the current body of an existing PR/issue comment.
 func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
 	owner, repoName := splitRepo(repo)
-	comment, err := retryGitHubUnavailableRead(ctx, ic.logger, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
+	comment, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
 		c, _, callErr := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
 		if callErr != nil {
 			return nil, classifyGitHubAPIError(callErr)
@@ -845,7 +834,7 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		},
 	}
 	var resp *gh.Response
-	ghPRs, err := retryGitHubUnavailableRead(ctx, ic.logger, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+	ghPRs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
 		list, listResp, listErr := ic.client.PullRequests.List(ctx, owner, repoName, opts)
 		if listErr != nil {
 			return nil, classifyGitHubAPIError(listErr)
@@ -950,7 +939,7 @@ func (ic *InstallationClient) FetchPullRequestNoCache(ctx context.Context, repo 
 
 func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string, pr int) (*PullRequestInfo, error) {
 	owner, repoName := splitRepo(repo)
-	ghPR, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*gh.PullRequest, error) {
+	ghPR, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*gh.PullRequest, error) {
 		ghPR, _, err := ic.client.PullRequests.Get(ctx, owner, repoName, pr)
 		if err != nil {
 			return nil, fmt.Errorf("fetch pull request %s#%d: %w", repo, pr, classifyGitHubAPIError(err))
@@ -1024,7 +1013,7 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 	var allFiles []PRFile
 
 	for {
-		readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "list PR files", []any{"repo", repo, "pr", pr, "page", opts.Page}, func(ctx context.Context) (struct {
+		readResult, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListPRFiles, "list PR files", []any{"repo", repo, "pr", pr, "page", opts.Page}, func(ctx context.Context) (struct {
 			files []*gh.CommitFile
 			resp  *gh.Response
 		}, error) {
@@ -1065,7 +1054,7 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 // FetchChangedFilesBetween gets the files changed between two refs.
 func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo string, base, head string) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
-	readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "compare commits", []any{"repo", repo, "base", base, "head", head}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+	readResult, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "compare commits", []any{"repo", repo, "base", base, "head", head}, func(ctx context.Context) (*gh.CommitsComparison, error) {
 		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, base, head, nil)
 		if err != nil {
 			return nil, fmt.Errorf("compare commits %s...%s: %w", base, head, classifyGitHubAPIError(err))
@@ -1772,7 +1761,7 @@ func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []Tree
 // repositoryDefaultBranch returns the name of repo's default branch.
 func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	repository, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
+	repository, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
 		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
 		if err != nil {
 			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
@@ -1792,7 +1781,7 @@ func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo 
 // branchTipSHA resolves branch to the commit it points at now.
 func (ic *InstallationClient) branchTipSHA(ctx context.Context, repo, branch string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
 		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+branch)
 		if err != nil {
 			return nil, fmt.Errorf("get ref heads/%s: %w", branch, classifyGitHubAPIError(err))
@@ -1825,7 +1814,7 @@ func (ic *InstallationClient) isAncestorOrSame(ctx context.Context, repo, ancest
 // mergeBaseSHA returns the merge base of baseSHA and headSHA.
 func (ic *InstallationClient) mergeBaseSHA(ctx context.Context, repo, baseSHA, headSHA string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+	comparison, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "find merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
 		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseSHA, headSHA, &gh.ListOptions{PerPage: 1})
 		if err != nil {
 			return nil, fmt.Errorf("compare commits %s...%s: %w", baseSHA, headSHA, classifyGitHubAPIError(err))
@@ -1932,7 +1921,7 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 	// Pin the tip up front so a commit landing on the default branch mid-pass
 	// cannot leave some files compared against one commit and some against the
 	// next.
-	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
 		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
 		if err != nil {
 			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
@@ -2177,7 +2166,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	seenUntrusted := make(map[string]struct{})
 	for {
 		var resp *gh.Response
-		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs by name", []any{"repo", repo, "head_sha", headSHA, "check_name", checkName}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+		result, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListCheckRunsForRef, "list check runs by name", []any{"repo", repo, "head_sha", headSHA, "check_name", checkName}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
 			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -2397,7 +2386,7 @@ func (ic *InstallationClient) fetchCommitStatusRows(ctx context.Context, owner, 
 	var out []CheckStatusRow
 	for {
 		var resp *gh.Response
-		combined, err := retryGitHubUnavailableRead(ctx, ic.logger, "get combined commit status", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.CombinedStatus, error) {
+		combined, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetCombinedStatus, "get combined commit status", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.CombinedStatus, error) {
 			res, statusResp, statusErr := ic.client.Repositories.GetCombinedStatus(ctx, owner, repoName, ref, opts)
 			if statusErr != nil {
 				return nil, classifyGitHubAPIError(statusErr)
@@ -2433,7 +2422,7 @@ func (ic *InstallationClient) fetchCheckRunRows(ctx context.Context, owner, repo
 	var out []CheckStatusRow
 	for {
 		var resp *gh.Response
-		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+		result, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListCheckRunsForRef, "list check runs", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
 			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, ref, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -2521,7 +2510,7 @@ const gitTreeMode = "040000"
 // FetchGitTree fetches the entire directory tree in one API call using recursive mode.
 func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA string) ([]TreeEntry, bool, error) {
 	owner, repoName := splitRepo(repo)
-	ghTree, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch git tree", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
+	ghTree, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchGitTree, "fetch git tree", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
 		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, true)
 		if err != nil {
 			return nil, fmt.Errorf("fetch git tree: %w", classifyGitHubAPIError(err))
@@ -2552,7 +2541,7 @@ func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA st
 // than let the caller act on an incomplete listing.
 func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, treeSHA string) ([]TreeEntry, string, error) {
 	owner, repoName := splitRepo(repo)
-	ghTree, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch git tree level", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
+	ghTree, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchGitTree, "fetch git tree level", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
 		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, false)
 		if err != nil {
 			return nil, fmt.Errorf("fetch git tree level: %w", classifyGitHubAPIError(err))
@@ -2700,7 +2689,7 @@ func (ic *InstallationClient) resolveGitTreeEntry(ctx context.Context, repo, ref
 // FetchBlobContent fetches file content using the Git Blob API.
 func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSHA string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	blob, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch blob", []any{"repo", repo, "blob_sha", blobSHA}, func(ctx context.Context) (*gh.Blob, error) {
+	blob, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchBlob, "fetch blob", []any{"repo", repo, "blob_sha", blobSHA}, func(ctx context.Context) (*gh.Blob, error) {
 		blob, _, err := ic.client.Git.GetBlob(ctx, owner, repoName, blobSHA)
 		if err != nil {
 			return nil, fmt.Errorf("fetch blob: %w", classifyGitHubAPIError(err))
@@ -2726,7 +2715,7 @@ func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSH
 func (ic *InstallationClient) FetchFileContent(ctx context.Context, repo, filePath, ref string) (string, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	fileContent, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch file content", []any{"repo", repo, "path", filePath, "ref", ref}, func(ctx context.Context) (*gh.RepositoryContent, error) {
+	fileContent, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchFileContent, "fetch file content", []any{"repo", repo, "path", filePath, "ref", ref}, func(ctx context.Context) (*gh.RepositoryContent, error) {
 		fileContent, _, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, filePath, opts)
 		if err != nil {
 			return nil, fmt.Errorf("fetch file content: %w", classifyGitHubAPIError(err))
@@ -2781,7 +2770,7 @@ type repositoryContents struct {
 func (ic *InstallationClient) getRepositoryContents(ctx context.Context, repo, contentPath, ref, operation string) (repositoryContents, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	return retryGitHubUnavailableRead(ctx, ic.logger, operation, []any{"repo", repo, "path", contentPath, "ref", ref}, func(ctx context.Context) (repositoryContents, error) {
+	return retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchFileContent, operation, []any{"repo", repo, "path", contentPath, "ref", ref}, func(ctx context.Context) (repositoryContents, error) {
 		fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, contentPath, opts)
 		if err != nil {
 			return repositoryContents{}, fmt.Errorf("%s at %s: %w", operation, contentPath, classifyGitHubAPIError(err))

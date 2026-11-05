@@ -1289,3 +1289,43 @@ func TestResumeClaimedApplyCountsARefusedTaskRequeue(t *testing.T) {
 func (*mockPlanStore) GetListAnchor(context.Context, string) (*storage.PlanListAnchor, error) {
 	return nil, nil
 }
+
+// The real telemetry registry exports counters and histogram sums/counts with
+// units intact, so collectors can map one export path without double counting.
+func TestGitHubThrottlingPrometheusExports(t *testing.T) {
+	previous := otel.GetMeterProvider()
+	tel, err := SetupTelemetry(slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, tel.Shutdown(context.WithoutCancel(t.Context())))
+		otel.SetMeterProvider(previous)
+	})
+	sample := metrics.GitHubClientMetricContext{Operation: metrics.GitHubOperationFetchPullRequest, Resource: metrics.GitHubRateLimitResourceCore, GitHubApp: "test-app", InstallationID: 42}
+	metrics.RecordGitHubPrimaryRateLimitRejection(t.Context(), sample, metrics.GitHubRejectionOriginLocal)
+	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownAccepted, 2*time.Second)
+	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownSingleSleepLimitExceeded, 10*time.Second)
+	metrics.RecordGitHubWait(t.Context(), sample, metrics.GitHubWaitLayerReadRetry, metrics.GitHubWaitReasonTransientError, 250*time.Millisecond)
+	recorder := httptest.NewRecorder()
+	tel.MetricsHandler.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	text := recorder.Body.String()
+	for _, expected := range []string{
+		"schemabot_github_primary_rate_limit_rejections_total",
+		"schemabot_github_secondary_rate_limit_cooldown_reports_total",
+		"schemabot_github_secondary_rate_limit_cooldown_reported_seconds_total",
+		"schemabot_github_wait_duration_seconds_sum",
+		"schemabot_github_wait_duration_seconds_count",
+		`disposition="accepted"`, `disposition="single_sleep_limit_exceeded"`,
+		`origin="local"`, `layer="read_retry"`, `installation_id="42"`,
+	} {
+		assert.Contains(t, text, expected)
+	}
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.HasPrefix(line, "schemabot_github_wait_duration_seconds_sum{") {
+			assert.True(t, strings.HasSuffix(line, " 0.25"), line)
+		}
+		if strings.HasPrefix(line, "schemabot_github_wait_duration_seconds_count{") {
+			assert.True(t, strings.HasSuffix(line, " 1"), line)
+		}
+	}
+}
