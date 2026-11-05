@@ -2087,7 +2087,10 @@ the operations it ran with the `target` it resolved to and its
 the operation that completes a grouped apply); `operation_key`
 (`namespace/shard/table`) appears only for sharded operations, where one apply
 fans out per shard — a single-operation apply lists its operation without a
-key. A successful HTTP
+key. When one remote apply drives several targets, each target gets its own
+source holding that target's entries plus the entries about the remote apply
+as a whole, such as its state changes; another target's entries never appear
+in it. A successful HTTP
 response can still contain source errors. Keep the readable sources and report
 the missing ones; do not treat partial logs as a complete record.
 

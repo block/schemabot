@@ -2712,6 +2712,20 @@ type ApplyLog struct {
 	// TaskID points to tasks.id (optional, for task-specific events).
 	TaskID *int64
 
+	// ApplyOperationID points to apply_operations.id: the operation whose
+	// drive wrote the entry. Append fills it from the operation lease on the
+	// context when the caller leaves it unset, so every entry an
+	// operation-scoped drive writes is attributed to its operation, including
+	// the ones no single task owns. Nil for an entry about the whole apply.
+	ApplyOperationID *int64
+
+	// ApplyWide marks an entry about the whole apply that an operation's drive
+	// writes under its own lease, such as the parent state it projects from
+	// every operation. Append leaves ApplyOperationID nil for it, so a read
+	// scoped to any one target still shows it. It is not stored: an entry
+	// with no operation and no task is how storage records an apply-wide one.
+	ApplyWide bool
+
 	// Level is the log level: "debug", "info", "warn", "error".
 	Level string
 
@@ -2736,6 +2750,36 @@ type ApplyLog struct {
 	CreatedAt time.Time
 }
 
+// LogOperationsOnTarget returns the ApplyLogFilter.OperationIDs of a log read
+// scoped to target: the IDs of the apply's operations that run on it, or nil
+// when none does. The IDs stay explicit even when every operation the caller
+// listed runs on target, since another target's operation can join the apply
+// between that listing and the log read.
+func LogOperationsOnTarget(ops []*ApplyOperation, target string) []int64 {
+	var operationIDs []int64
+	for _, op := range ops {
+		if op.Target == target {
+			operationIDs = append(operationIDs, op.ID)
+		}
+	}
+	return operationIDs
+}
+
+// DistinctOperationTargets lists the distinct targets of ops in sorted order.
+// An operation that names no target adds none.
+func DistinctOperationTargets(ops []*ApplyOperation) []string {
+	seen := make(map[string]bool, len(ops))
+	var targets []string
+	for _, op := range ops {
+		if op.Target != "" && !seen[op.Target] {
+			seen[op.Target] = true
+			targets = append(targets, op.Target)
+		}
+	}
+	slices.Sort(targets)
+	return targets
+}
+
 // ApplyLogFilter specifies criteria for listing apply logs.
 type ApplyLogFilter struct {
 	ApplyID   int64  // Required: filter by apply
@@ -2743,6 +2787,12 @@ type ApplyLogFilter struct {
 	Level     string // Optional: filter by level
 	EventType string // Optional: filter by event type
 	Limit     int    // Optional: limit results (default 100)
+
+	// OperationIDs, when non-empty, keeps the entries attributed to one of
+	// these operations, written by the operation's drive or about one of its
+	// tasks, plus the entries about the whole apply, which name no operation
+	// and no task. Entries attributed to any other operation are left out.
+	OperationIDs []int64
 }
 
 // EngineResumeState stores opaque resume data owned by the engine package.

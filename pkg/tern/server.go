@@ -341,6 +341,9 @@ func applyLookupErrorCode(err error) codes.Code {
 	if errors.Is(err, storage.ErrApplyNotFound) {
 		return codes.NotFound
 	}
+	if errors.Is(err, ErrLogsTargetNotInApply) {
+		return codes.NotFound
+	}
 	return codes.Internal
 }
 

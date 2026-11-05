@@ -3219,7 +3219,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 
 	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+	// The dispatch request holds no operation lease, so the entry names the
+	// attached operation itself; left unattributed it would read as about the
+	// whole apply and show in every target's log.
+	c.logOperationEvent(ctx, apply.ID, operation.ID, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
 	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attached")
 	c.logger.Info("Apply: attached operation to keyed apply",
@@ -4066,7 +4069,11 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if apply == nil {
 		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, storage.ErrApplyNotFound)
 	}
-	logs, err := c.storage.ApplyLogs().GetRecentByApply(ctx, apply.ID, limit)
+	operationIDs, err := c.logOperationsForTarget(ctx, apply, req.Target)
+	if err != nil {
+		return nil, err
+	}
+	logs, err := c.storage.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: apply.ID, OperationIDs: operationIDs, Limit: limit})
 	if err != nil {
 		return nil, fmt.Errorf("get recent logs for apply %s: %w", req.ApplyId, err)
 	}
@@ -4079,6 +4086,38 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 		resp.Logs = append(resp.Logs, entry)
 	}
 	return resp, nil
+}
+
+// logOperationsForTarget returns the operations whose logs a Logs read for
+// target covers. One data-plane apply can drive several targets of a rollout,
+// and a read for one of them must return that target's entries, not the whole
+// apply's: the caller renders one section per target, so an unscoped read
+// would repeat every target's lines under each. It returns nil, an unscoped
+// read, when no target is named. A named target the apply has no operation on
+// is an error when the apply spans several targets, never an empty read that
+// looks like a quiet target.
+func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage.Apply, target string) ([]int64, error) {
+	if target == "" {
+		return nil, nil
+	}
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list operations of apply %s for logs of target %s: %w", apply.ApplyIdentifier, target, err)
+	}
+	if operationIDs := storage.LogOperationsOnTarget(ops, target); len(operationIDs) > 0 {
+		return operationIDs, nil
+	}
+	targets := storage.DistinctOperationTargets(ops)
+	if len(targets) > 1 {
+		return nil, fmt.Errorf("apply %s has no operation on target %s, only on %s: %w", apply.ApplyIdentifier, target, strings.Join(targets, ", "), ErrLogsTargetNotInApply)
+	}
+	// A remote apply that drives one target holds only that target's log, and
+	// a single-target dispatch may record its target under another name than
+	// the caller's (the database name when the request named none), so the
+	// whole log is the answer.
+	c.logger.Debug("logs read for a target the single-target apply records under another name; serving its whole log",
+		append(apply.LogAttrs(), "target", target, "recorded_targets", targets)...)
+	return nil, nil
 }
 
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's
