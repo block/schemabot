@@ -1189,7 +1189,7 @@ func (m *mockTernClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*te
 	if m.logsHook != nil {
 		return m.logsHook(req)
 	}
-	return &ternv1.LogsResponse{}, nil
+	return &ternv1.LogsResponse{Target: req.GetTarget()}, nil
 }
 
 // An apply with more history than the requested window returns exactly the
@@ -1437,6 +1437,48 @@ func TestHandleDeploymentLogsScopesToTarget(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations in deployment \"region-a\" of apply \"apply-control\"; its targets are shop-001, shop-002`)
 	assert.Len(t, client.logsReqs, 1, "a refused target fetches nothing")
+}
+
+// During a rolling upgrade a data plane that predates target reads ignores the
+// target and returns every target's entries. The control plane refuses that
+// source with an upgrade hint rather than showing the whole history as one
+// target's log.
+func TestHandleDeploymentLogsRefusesUnnarrowedTargetRead(t *testing.T) {
+	apply := &storage.Apply{ID: 16, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002", ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true, logsHook: func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: "remote-a", Logs: []*ternv1.ApplyLog{{Id: 1, Level: "info", EventType: "info", Source: "schemabot", Message: "Operation attached: shop-001", CreatedAt: "2026-11-05T10:00:00Z"}}}, nil
+	}}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-002", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Empty(t, response.Sources, "an unnarrowed read is never shown as the target's log")
+	require.Len(t, response.Errors, 1)
+	assert.Equal(t, "remote-a", response.Errors[0].ExternalID)
+	assert.Equal(t, "shop-002", response.Errors[0].Target)
+	assert.Equal(t, "UnsupportedCapability", response.Errors[0].Code)
+	assert.Equal(t, "upgrade_required", response.Errors[0].Reason)
+	assert.Equal(t, "The selected data plane does not support reading one target's logs; upgrade it or omit --target.", response.Errors[0].Message)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var unscoped apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &unscoped))
+	assert.Len(t, unscoped.Sources, 2, "a read that names no target asks for no narrowing, so any data plane answers it")
+	assert.Empty(t, unscoped.Errors)
 }
 
 func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {

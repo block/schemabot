@@ -371,6 +371,16 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 			result.Errors = append(result.Errors, deploymentLogError(fetch, fetchErr))
 			continue
 		}
+		if target != "" && resp.GetTarget() != target {
+			// A data plane that predates target reads ignores the target and
+			// returns every target's entries, which must not be shown as one
+			// target's log.
+			s.logger.Warn("data plane did not narrow a log read to the requested target; refusing its entries",
+				append(apply.LogAttrs(),
+					"operation", deploymentLogsOperation, "operation_deployment", deployment, "target", target, "external_id", fetch.externalID, "echoed_target", resp.GetTarget())...)
+			result.Errors = append(result.Errors, deploymentLogTargetUnsupportedError(fetch))
+			continue
+		}
 		remoteLogs, truncated := clampLogWindow(resp.Logs, limit)
 		source := &apitypes.DeploymentLogSource{ExternalID: fetch.externalID, Operations: fetch.operations, Logs: []*apitypes.LogEntry{}, Truncated: truncated}
 		for _, log := range remoteLogs {
@@ -427,6 +437,10 @@ const (
 // deploymentLogRecordError reports a source whose log records could not be
 // decoded. Unlike a transport failure, retrying cannot help — the data plane
 // returned records the control plane does not understand.
+func deploymentLogTargetUnsupportedError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
+	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "UnsupportedCapability", Reason: "upgrade_required", Message: "The selected data plane does not support reading one target's logs; upgrade it or omit --target."}
+}
+
 func deploymentLogRecordError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
 	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "MalformedRemoteLog", Reason: "malformed_remote_log", Message: "The data plane returned log records SchemaBot could not decode; check server logs."}
 }

@@ -206,10 +206,11 @@ func TestLocalClientLogsScopesToTarget(t *testing.T) {
 
 	t.Run("one of several targets", func(t *testing.T) {
 		client, logs := newClient(op(1, "shop-001"), op(2, "shop-002"), op(3, "shop-002"))
-		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002"})
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002"})
 		require.NoError(t, err)
 		assert.Equal(t, int64(9), logs.lastFilter.ApplyID)
 		assert.ElementsMatch(t, []int64{2, 3}, logs.lastFilter.OperationIDs)
+		assert.Equal(t, "shop-002", resp.Target, "the response names the target it was narrowed to")
 	})
 
 	t.Run("the only target", func(t *testing.T) {
