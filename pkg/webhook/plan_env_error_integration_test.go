@@ -249,6 +249,39 @@ func TestE2EAllEnvPlanFailureOverOldSuccessFailsAggregate(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "a refold must not pass the aggregate on the old success rows")
 }
 
+// A pull request plans staging and production together from a repository the
+// database's source policy does not authorize. Staging finds its schema files
+// and the source policy refuses its plan. Production fails earlier, because
+// the repository's config ignores the only namespace production would plan, so
+// the source policy never checks its source. Neither environment stores a
+// check row, since that would record state on behalf of a source the policy
+// refused, and the failing aggregate alone blocks the merge.
+func TestE2EAllEnvPlanFailureWithSourcePolicyRefusalStoresNoRow(t *testing.T) {
+	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	p := newMultiEnvPlanHarnessWithRepo(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_production"}},
+	}, &namespaceSelectingTernClient{}, nil, map[string]string{
+		"ns_{env}/orders.sql": table,
+	}, "ignore_namespaces:\n  - ns_production\n")
+	dbConfig := p.handler.service.Config().Databases[p.dbName]
+	dbConfig.AllowedRepos = []string{"octocat/orders"}
+	p.handler.service.Config().Databases[p.dbName] = dbConfig
+
+	body := p.comment(t, "schemabot plan")
+	assert.Contains(t, body, `repo "octocat/hello-world" is not authorized`, "staging's plan is refused by source policy")
+	assert.Contains(t, body, "no schema files found", "production fails before its source is checked")
+
+	assert.Empty(t, p.checksByEnv(t), "no environment stores a check row for a source the policy refused")
+	aggregate := p.lastAggregate()
+	require.NotNil(t, aggregate, "the aggregate check run is published")
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion)
+	stored, err := p.store.Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored, "the failing aggregate is stored")
+	assert.Equal(t, checkConclusionFailure, stored.Conclusion)
+	assert.Equal(t, "abc123", stored.HeadSHA)
+}
+
 // A pull request's staging and production checks both passed on an earlier
 // plan. A plan of production alone then fails outright, and the failing row
 // recording that cannot be stored, so production's stored row is still the old

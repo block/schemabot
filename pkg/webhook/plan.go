@@ -558,8 +558,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// earlier passing row of the environment that failed.
 	var planFailedEnvironments []string
 	// Environments whose plan source policy refused. When every environment
-	// fails, these store no check row: a source the policy refused records no
-	// check state, and the failing aggregate alone answers for it.
+	// fails and any of them was refused, no environment stores a check row: a
+	// source the policy refused records no check state, the others failed
+	// before their source was authorized, and the failing aggregate alone
+	// answers for all of them.
 	sourcePolicyRefused := map[string]bool{}
 	// Whether any environment's rollout round found a member with work. The
 	// primary's plan alone cannot say, so auto-plan reads this before skipping
@@ -750,17 +752,23 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				Repository: repo,
 				HeadSHA:    prInfo.HeadSHA,
 			}
-			recordable := slices.DeleteFunc(slices.Clone(planFailedEnvironments), func(env string) bool {
-				return sourcePolicyRefused[env]
-			})
+			// A source policy refusal of any environment stores no row for
+			// any of them. The other environments failed before their source
+			// was authorized, so a row for them would still record state on
+			// behalf of a source the policy refused.
+			var recordable []string
+			if len(sourcePolicyRefused) == 0 {
+				recordable = planFailedEnvironments
+			}
 			if len(recordable) > 0 {
 				h.recordPlanFailuresAndFold(ctx, client, repo, pr, prInfo.HeadSHA, failedSchema, recordable)
 			}
-			// Every other failure on the comment still fails the aggregate: a
-			// source policy refusal, which stores no check state on behalf of
-			// a source the policy refused, and a namespace placement refusal
-			// whose row could not be stored. It is posted after the fold so
-			// the fold cannot replace it.
+			// Every failure on the comment that stored no row still fails the
+			// aggregate: every environment's failure once the source policy
+			// refused any of them, since no check state is stored on behalf
+			// of a source the policy refused, and a namespace placement
+			// refusal whose row could not be stored. It is posted after the
+			// fold so the fold cannot replace it.
 			unrecorded := maps.Clone(multiEnvData.Errors)
 			for _, env := range recordable {
 				delete(unrecorded, env)
