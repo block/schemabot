@@ -135,16 +135,27 @@ const (
 	columnAfter  = "datetime(6)"
 )
 
-// Run runs the test. It returns nil when every step passed, an error
-// wrapping ErrInconclusive when the run could not decide, and any other error
-// when a step failed.
-func (r *Runner) Run(ctx context.Context) error {
+// Run sweeps up after earlier runs, then runs the test. It returns nil when
+// every step passed, an error wrapping ErrInconclusive when the run could not
+// decide, and any other error when a step failed. The run's pull request,
+// branch, and table are removed whatever the outcome.
+func (r *Runner) Run(ctx context.Context) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.RunTimeout)
 	defer cancel()
+	if err := r.Sweep(ctx); err != nil {
+		return fmt.Errorf("sweep before the run: %w", err)
+	}
 	table := runTablePrefix + r.now().UTC().Format(runTimeLayout)
 	cur := &run{table: table, branch: BranchPrefix + table}
 	r.logger.Info("starting live e2e run", "repo", r.cfg.Repo, "database", r.cfg.Database,
 		"environment", r.cfg.Environment, "table", cur.table, "branch", cur.branch)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.cfg.WaitTimeout)
+		defer cancel()
+		if cerr := r.cleanup(cleanupCtx, cur); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("clean up run %s: %w", cur.table, cerr))
+		}
+	}()
 	return r.steps(ctx, cur)
 }
 
@@ -431,6 +442,137 @@ func (r *Runner) expectNoLeftoverCopy(ctx context.Context, table string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("cancelled copy of %s.%s left %v behind: %w", r.cfg.Database, table, leftover, err)
+	}
+	return nil
+}
+
+// Sweep removes what earlier runs left behind: it cancels their unfinished
+// applies, closes their pull requests and deletes their branches, then drops
+// their tables. It reaps only runs that are over (see Config.RunTimeout), so
+// it never touches a run another runner is still driving, and it drops no
+// table while its run's pull request stays open.
+func (r *Runner) Sweep(ctx context.Context) error {
+	prs, err := r.gh.OpenPullRequests(ctx, BranchPrefix)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	kept := map[string]bool{}
+	for _, pr := range prs {
+		table := strings.TrimPrefix(pr.Branch, BranchPrefix)
+		if !r.over(table) {
+			r.logger.Info("leaving a run that may still be in progress", "repo", r.cfg.Repo, "pr", pr.Number, "branch", pr.Branch)
+			kept[table] = true
+			continue
+		}
+		r.logger.Info("sweeping earlier run", "repo", r.cfg.Repo, "pr", pr.Number, "branch", pr.Branch)
+		if err := r.closeRun(ctx, &run{table: table, branch: pr.Branch, pr: pr.Number}); err != nil {
+			errs = append(errs, fmt.Errorf("leaving table %s in place: %w", table, err))
+			kept[table] = true
+		}
+	}
+	tables, err := r.target.RunTables(ctx)
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	for _, table := range tables {
+		if kept[table] || !r.over(table) {
+			continue
+		}
+		if err := r.target.DropTable(ctx, table); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// over reports whether the run that named its table table has ended: it
+// started more than RunTimeout plus WaitTimeout ago. A name that does not
+// parse is not a run's, so it never counts as over.
+func (r *Runner) over(table string) bool {
+	started, err := time.Parse(runTimeLayout, strings.TrimPrefix(table, runTablePrefix))
+	if err != nil || !strings.HasPrefix(table, runTablePrefix) {
+		return false
+	}
+	return r.now().Sub(started) > r.cfg.RunTimeout+r.cfg.WaitTimeout
+}
+
+// cleanup removes one run's pull request, branch, and table.
+func (r *Runner) cleanup(ctx context.Context, cur *run) error {
+	if cur.pr == 0 {
+		r.logger.Info("run opened no pull request; deleting its branch", "branch", cur.branch)
+		if err := r.gh.DeleteBranch(ctx, cur.branch); err != nil {
+			return err
+		}
+	} else if err := r.closeRun(ctx, cur); err != nil {
+		return fmt.Errorf("leaving table %s in place for the next sweep: %w", cur.table, err)
+	}
+	return r.target.DropTable(ctx, cur.table)
+}
+
+// closeRun cancels a run's unfinished applies, then closes its pull request
+// and deletes its branch. Closing a pull request releases its database lock
+// only once no apply is in flight, so the cancels come first.
+func (r *Runner) closeRun(ctx context.Context, cur *run) error {
+	all, err := r.gh.Comments(ctx, cur.pr)
+	if err != nil {
+		return err
+	}
+	comments := r.fromBot(all)
+	if unansweredApply(all, r.isBot, r.cfg.CommandPrefix) {
+		// SchemaBot can accept an apply and fail to post its progress
+		// comment, so an unanswered apply may be running. Closing the pull
+		// request would not stop it.
+		return fmt.Errorf("an apply command on %s#%d has no reply from SchemaBot, so an apply may be running; check the pull request by hand", r.cfg.Repo, cur.pr)
+	}
+	for _, applyID := range inFlightApplies(comments) {
+		r.logger.Info("cancelling unfinished apply", "repo", r.cfg.Repo, "pr", cur.pr, "apply_id", applyID)
+		cancelID, err := r.command(ctx, cur, "cancel", applyID)
+		if err != nil {
+			return err
+		}
+		if err := r.waitForTerminal(ctx, cur, applyID, cancelID); err != nil {
+			return err
+		}
+	}
+	// Deleting the branch first closes the pull request with it. If the
+	// delete fails, the pull request stays open, and the next sweep finds it
+	// and retries.
+	if err := r.gh.DeleteBranch(ctx, cur.branch); err != nil {
+		return err
+	}
+	if err := r.gh.ClosePullRequest(ctx, cur.pr); err != nil {
+		return err
+	}
+	r.logger.Info("closed run pull request", "repo", r.cfg.Repo, "pr", cur.pr, "branch", cur.branch)
+	return nil
+}
+
+// waitForTerminal waits for applyID to finish after the cancel posted as
+// comment cancelID. SchemaBot refusing the cancel because the apply already
+// finished counts: the apply holds nothing, even though its comments never
+// showed it finishing.
+func (r *Runner) waitForTerminal(ctx context.Context, cur *run, applyID string, cancelID int64) error {
+	var last, refusedState string
+	err := r.poll(ctx, func(ctx context.Context) (bool, error) {
+		comments, err := r.botComments(ctx, cur.pr)
+		if err != nil {
+			return false, err
+		}
+		if _, finished := finishedStatus(comments, applyID); finished {
+			return true, nil
+		}
+		s, _ := latestApplyStatus(comments, applyID)
+		last = s.Status
+		refusedState, _ = refusedAsFinished(comments, cancelID)
+		return refusedState != "", nil
+	})
+	if err != nil {
+		return fmt.Errorf("wait for apply %s on %s#%d to finish (last status %q): %w", applyID, r.cfg.Repo, cur.pr, last, err)
+	}
+	if refusedState != "" {
+		r.logger.Warn("SchemaBot refused the cancel because the apply already finished, but the pull request never showed it finishing",
+			"repo", r.cfg.Repo, "pr", cur.pr, "apply_id", applyID, "state", refusedState, "last_status", last)
 	}
 	return nil
 }

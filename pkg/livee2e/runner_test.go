@@ -344,7 +344,7 @@ func testRunner(t *testing.T, bot *fakeSchemaBot, target *fakeTarget) *Runner {
 
 const testTable = "e2e_20261105093000"
 
-func TestRunDrivesEveryStep(t *testing.T) {
+func TestRunDrivesEveryStepAndCleansUp(t *testing.T) {
 	target := newFakeTarget()
 	bot := newFakeSchemaBot(target)
 
@@ -360,7 +360,9 @@ func TestRunDrivesEveryStep(t *testing.T) {
 	assert.Regexp(t, `^schemabot cutover apply-[0-9a-f]{16} -e development$`, bot.commands[6])
 	assert.NotEqual(t, bot.commands[4], strings.Replace(bot.commands[6], "cutover", "cancel", 1),
 		"the cutover acts on the deferred apply, not the cancelled one")
-	assert.True(t, target.has(testTable), "the run leaves its altered table")
+	assert.False(t, bot.prs[1].open, "the run closes its pull request")
+	assert.NotContains(t, bot.heads, BranchPrefix+testTable, "the run deletes its branch")
+	assert.False(t, target.has(testTable), "the run drops its table")
 }
 
 func TestRunIsInconclusiveWhenTheCopyOutrunsTheStop(t *testing.T) {
@@ -371,6 +373,8 @@ func TestRunIsInconclusiveWhenTheCopyOutrunsTheStop(t *testing.T) {
 	err := testRunner(t, bot, target).Run(t.Context())
 
 	require.ErrorIs(t, err, ErrInconclusive)
+	assert.False(t, bot.prs[1].open)
+	assert.False(t, target.has(testTable))
 }
 
 func TestRunFailsWhenADeferredApplyCutsOverAlone(t *testing.T) {
@@ -382,6 +386,7 @@ func TestRunFailsWhenADeferredApplyCutsOverAlone(t *testing.T) {
 
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrInconclusive, "a deferred apply that finishes alone is a failure, not a race")
+	assert.False(t, bot.prs[1].open)
 }
 
 // An Applied summary posted while the status comment still shows Stopped
@@ -395,4 +400,162 @@ func TestRunReadsASummaryWhileTheStatusCommentLags(t *testing.T) {
 
 	require.ErrorIs(t, err, ErrInconclusive)
 	assert.Contains(t, err.Error(), "finished before it reached "+StatusInProgress)
+}
+
+func TestSweepCancelsAnEarlierRunBeforeClosingIt(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier, open: true}
+	bot.heads[BranchPrefix+earlier] = "sha-old"
+	bot.post(1, "apply-00000000000000aa", state.Apply.Running)
+	bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+
+	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
+
+	assert.Equal(t, []string{"schemabot cancel apply-00000000000000aa -e development"}, bot.commands)
+	assert.False(t, bot.prs[1].open)
+	assert.NotContains(t, bot.heads, BranchPrefix+earlier)
+	assert.False(t, target.has(earlier))
+}
+
+// A stopped apply that finished without its status comment showing it, as when
+// SchemaBot loses track of a resumed apply, holds nothing: the sweep closes
+// its run when SchemaBot refuses the cancel because the apply already
+// finished.
+func TestSweepClosesARunWhoseCancelIsRefusedAsFinished(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.cancelRefusedAsFinished = true
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier, open: true}
+	bot.heads[BranchPrefix+earlier] = "sha-old"
+	bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+
+	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
+
+	assert.Equal(t, []string{"schemabot cancel apply-00000000000000aa -e development"}, bot.commands)
+	assert.False(t, bot.prs[1].open)
+	assert.False(t, target.has(earlier))
+}
+
+func TestSweepDoesNotCancelAnApplyWhoseSummaryShowsItFinished(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier, open: true}
+	bot.heads[BranchPrefix+earlier] = "sha-old"
+	bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+	bot.comments[1] = append(bot.comments[1], Comment{
+		ID: bot.id(), Author: "schemabot[bot]", IsBot: true,
+		Body: renderSummary("apply-00000000000000aa", state.Apply.Completed),
+	})
+
+	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
+
+	assert.Empty(t, bot.commands)
+	assert.False(t, bot.prs[1].open)
+	assert.False(t, target.has(earlier))
+}
+
+func TestSweepKeepsTablesWhileARunCannotBeClosed(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier, open: true}
+	// An apply whose cancel SchemaBot never acknowledges.
+	bot.comments[1] = append(bot.comments[1], Comment{
+		ID: 1, Author: "schemabot[bot]", IsBot: true,
+		Body: renderStatus("apply-00000000000000bb", state.Apply.Running),
+	})
+	r := testRunner(t, bot, target)
+	r.cfg.WaitTimeout = 20 * time.Millisecond
+	r.gh = &silentBot{fakeSchemaBot: bot}
+
+	err := r.Sweep(t.Context())
+
+	require.Error(t, err)
+	assert.True(t, bot.prs[1].open, "a run with an unfinished apply stays open")
+	assert.True(t, target.has(earlier), "its table stays until the apply finishes")
+	assert.NotErrorIs(t, err, ErrInconclusive)
+}
+
+// silentBot records commands but never answers them.
+type silentBot struct {
+	*fakeSchemaBot
+}
+
+func (s *silentBot) CreateComment(_ context.Context, number int, body string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.id()
+	s.comments[number] = append(s.comments[number], Comment{ID: id, Author: "runner", Body: body})
+	s.commands = append(s.commands, body)
+	return id, nil
+}
+
+// Another runner may be driving a recent run, so the sweep leaves its pull
+// request, applies, and table alone.
+func TestSweepLeavesARunThatMayStillBeInProgress(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const recent = "e2e_20261105090000" // 30 minutes before the test's now
+	const orphan = "e2e_20261105091500" // a table whose run has not opened its pull request yet
+	target.create(recent)
+	target.create(orphan)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + recent, open: true}
+	bot.post(1, "apply-00000000000000aa", state.Apply.Running)
+
+	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
+
+	assert.Empty(t, bot.commands)
+	assert.True(t, bot.prs[1].open)
+	assert.True(t, target.has(recent))
+	assert.True(t, target.has(orphan))
+}
+
+// SchemaBot can accept an apply without posting its progress comment, so an
+// apply command with no reply may have a running apply behind it. The sweep
+// keeps that run's pull request and table.
+func TestSweepKeepsARunWhoseApplyCommandHasNoReply(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier, open: true}
+	bot.comments[1] = append(bot.comments[1], Comment{ID: bot.id(), Author: "runner", Body: "schemabot apply -e development"})
+
+	err := testRunner(t, bot, target).Sweep(t.Context())
+
+	require.ErrorContains(t, err, "no reply from SchemaBot")
+	assert.Empty(t, bot.commands)
+	assert.True(t, bot.prs[1].open)
+	assert.True(t, target.has(earlier))
+}
+
+// The branch is deleted before the pull request is closed, so a failed
+// delete leaves the pull request open for the next sweep to retry.
+func TestSweepRetriesARunWhoseBranchDeleteFailed(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier, open: true}
+	bot.heads[BranchPrefix+earlier] = "sha-old"
+	bot.deleteBranchFails = true
+	r := testRunner(t, bot, target)
+
+	require.Error(t, r.Sweep(t.Context()))
+	assert.True(t, bot.prs[1].open, "the next sweep still finds the run")
+	assert.True(t, target.has(earlier))
+
+	bot.deleteBranchFails = false
+	require.NoError(t, r.Sweep(t.Context()))
+	assert.False(t, bot.prs[1].open)
+	assert.NotContains(t, bot.heads, BranchPrefix+earlier)
+	assert.False(t, target.has(earlier))
 }
