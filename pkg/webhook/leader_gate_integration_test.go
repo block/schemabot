@@ -584,6 +584,144 @@ func TestE2ELeaderPlanCommandExpectsNoParticipantForADeletionTheDefaultBranchHol
 	}
 }
 
+// A PR deletes tenant-b's config and the default branch has already absorbed
+// the deletion, so the PR proposes nothing for tenant-b. tenant-b planned the
+// head before that and its run there is still running, failed, or came only
+// from an App the leader does not trust. `schemabot plan` on the leader must
+// fold tenant-b like the leader's own fold does, so the aggregate keeps
+// blocking instead of being refreshed as passing over tenant-b's run.
+func TestE2ELeaderPlanCommandKeepsFoldingAParticipantRunOnTheHead(t *testing.T) {
+	tests := []struct {
+		name           string
+		run            map[string]any
+		wantStatus     string
+		wantConclusion string
+	}{
+		{
+			name:       "in_progress run keeps the aggregate in progress",
+			run:        map[string]any{"status": "in_progress", "app": map[string]any{"slug": trustedTenantAppSlug}},
+			wantStatus: checkStatusInProgress,
+		},
+		{
+			name:           "failed run keeps the aggregate failing",
+			run:            map[string]any{"status": "completed", "conclusion": "failure", "app": map[string]any{"slug": trustedTenantAppSlug}},
+			wantStatus:     checkStatusCompleted,
+			wantConclusion: checkConclusionFailure,
+		},
+		{
+			name:           "run only from an untrusted App blocks the aggregate",
+			run:            map[string]any{"status": "in_progress", "app": map[string]any{"slug": "some-other-app"}},
+			wantStatus:     checkStatusCompleted,
+			wantConclusion: checkConclusionActionRequired,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := leaderRepoConfig()
+			config.AllowedEnvironments = nil
+			svc := setupE2EServiceWithConfig(t, config)
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			const headSHA = "abc123"
+			mockLeaderPRHead(mux, headSHA)
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+					{Filename: new(tenantBSchemaDir + "/schemabot.yaml"), Status: new("removed")},
+				})
+			})
+			other := []*gh.TreeEntry{{Path: new("README.md"), Type: new("blob"), SHA: new("readme")}}
+			registerRepositoryTrees(t, mux, repositoryTreeFixture{
+				headSHA:     headSHA,
+				headEntries: other,
+				baseEntries: func() []*gh.TreeEntry { return other },
+			})
+			comments := make(chan string, 4)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Body string `json:"body"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				comments <- body.Body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			})
+			run := map[string]any{"id": 4001, "name": tenantBCheckName}
+			maps.Copy(run, tt.run)
+			mockParticipantCheckRuns(mux, map[string]map[string]any{tenantBCheckName: run})
+			checkRuns := captureLeaderCheckRuns(mux)
+
+			h := newLeaderHandler(t, svc, client)
+			installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
+			handled, err := h.handleNoManagedSchemaChangesForCommand(t.Context(), installClient, "octocat/hello-world", 1, 0, action.Plan, "", "", "testuser")
+			require.NoError(t, err)
+			require.True(t, handled)
+
+			select {
+			case body := <-comments:
+				assert.NotContains(t, body, "were refreshed as passing")
+			case <-time.After(30 * time.Second):
+				t.Fatal("timed out waiting for the checks-refreshed comment")
+			}
+			agg := collectAggregate(t, checkRuns, "SchemaBot")
+			assert.Equal(t, tt.wantStatus, agg.Status)
+			assert.Equal(t, tt.wantConclusion, agg.Conclusion)
+		})
+	}
+}
+
+// A participant deployment receives `schemabot plan` on a PR whose only change
+// deletes a config under the participant's schema directory, a deletion the
+// default branch has already absorbed. The PR proposes nothing for the
+// participant, so it stays silent: no Check Run, no comment.
+func TestE2EParticipantPlanCommandStaysSilentForADeletionTheDefaultBranchHolds(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+		Databases: map[string]api.DatabaseConfig{
+			"orders": {Type: "mysql", AllowedRepos: []string{"octocat/hello-world"}, AllowedDirs: []string{tenantBSchemaDir}},
+		},
+	})
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new(tenantBSchemaDir + "/schemabot.yaml"), Status: new("removed")},
+		})
+	})
+	other := []*gh.TreeEntry{{Path: new("README.md"), Type: new("blob"), SHA: new("readme")}}
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA:     headSHA,
+		headEntries: other,
+		baseEntries: func() []*gh.TreeEntry { return other },
+	})
+	var comments atomic.Int64
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		comments.Add(1)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug)
+	handled, err := h.handleNoManagedSchemaChangesForCommand(t.Context(), installClient, "octocat/hello-world", 1, 0, action.Plan, "", "", "testuser")
+	require.NoError(t, err)
+	require.True(t, handled)
+	assert.Empty(t, checkRuns, "a participant the PR proposes nothing for publishes no Check Run")
+	assert.Zero(t, comments.Load(), "a participant the PR proposes nothing for posts no comment")
+}
+
 // mockPlanCommandComparisonFailure serves a PR whose only change deletes
 // tenant-b's config, and a default branch whose tip cannot be resolved, so the
 // comparison against the default branch fails. Posted comments are returned.

@@ -114,6 +114,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	// PR only inherited selects no participant here either. Only a leader or a
 	// participant reads the list below, so a repository with no aggregate role
 	// never makes the comparison and cannot fail on it.
+	listed := files
 	if h.hasAggregateRole(repo) {
 		files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
 		if err != nil {
@@ -134,7 +135,14 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 		return nil
 	}
 
-	if h.leaderExpectsParticipantsForPR(repo, files) {
+	// The same question the leader's fold asks: a participant the narrowed list
+	// no longer selects still gates the refresh while its own run on the head
+	// is not passing, so the refresh never posts a passing aggregate over it.
+	expectedParticipants, err := h.leaderParticipantsForPR(ctx, client, repo, pr, headSHA, listed, files)
+	if err != nil {
+		return fmt.Errorf("resolve participants before refreshing checks for PR with no managed schema changes: %w", err)
+	}
+	if len(expectedParticipants) > 0 {
 		h.logger.Info("plan found no leader-managed schema changes but expected participant paths are touched; aggregate gate will block until participants report",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)

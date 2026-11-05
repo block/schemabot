@@ -193,7 +193,9 @@ func (h *Handler) participantsExpectedOnHead(
 
 // participantHasNonPassingRunOnHead reports whether a participant the proposed
 // files no longer select published a trusted Check Run on headSHA that is not
-// completed and successful. It uses the same trusted read as the fold.
+// completed and successful, or has a same-named run there only from untrusted
+// Apps. It uses the same trusted read as the fold and agrees with the fold on
+// both: each of them blocks the aggregate.
 func (h *Handler) participantHasNonPassingRunOnHead(
 	ctx context.Context, client checkRunFinder,
 	repo string, pr int, headSHA string,
@@ -212,10 +214,17 @@ func (h *Handler) participantHasNonPassingRunOnHead(
 	if err != nil {
 		return false, fmt.Errorf("read Check Run %q of participant %s the PR no longer proposes work for on %s@%s: %w", checkName, tenant.Tenant, repo, headSHA, err)
 	}
-	if result == nil {
-		h.logger.Info("participant the PR no longer proposes work for has no trusted Check Run on the head, not expecting it",
+	if result == nil && len(untrusted) > 0 {
+		// The fold blocks on a same-named run from an untrusted App, so keep the
+		// participant expected and let the fold render that block.
+		h.logger.Warn("participant the PR no longer proposes work for has a Check Run on the head only from untrusted GitHub Apps, keeping it expected",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "tenant", tenant.Tenant,
 			"check_name", checkName, "untrusted_app_slugs", untrusted)
+		return true, nil
+	}
+	if result == nil {
+		h.logger.Info("participant the PR no longer proposes work for has no Check Run on the head, not expecting it",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "tenant", tenant.Tenant, "check_name", checkName)
 		return false, nil
 	}
 	if result.Status == checkStatusCompleted && result.Conclusion == checkConclusionSuccess {

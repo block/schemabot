@@ -252,9 +252,7 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		// A participant only the listed files select keeps blocking while its
 		// own Check Run on this head is not passing; one it cannot read leaves
 		// the leader unable to tell, so it fails closed the same way.
-		expectedParticipants, err = h.participantsExpectedOnHead(ctx, client, repo, pr, headSHA,
-			config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)),
-			config.ExpectedParticipantChecksForPR(repo, prFilePaths(files)))
+		expectedParticipants, err = h.leaderParticipantsForPR(ctx, client, repo, pr, headSHA, listed, files)
 		if err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:  "aggregate_check_sync",
