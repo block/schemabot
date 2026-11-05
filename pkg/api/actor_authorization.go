@@ -61,19 +61,54 @@ func (c *ServerConfig) ReviewPolicyEnabledForDatabase(database string) bool {
 	return dbConfig != nil && dbConfig.ReviewPolicy.Enabled
 }
 
-// ReviewPolicyRequiresReapprovalForDatabase returns true when an approval
-// counts only for the schema change it reviewed for database: the
-// instance-wide review policy requires it, or the database opts in with its
-// own review_policy. Otherwise any authorized approval on the PR counts.
-func (c *ServerConfig) ReviewPolicyRequiresReapprovalForDatabase(database string) bool {
+// Reapproval is the re-approval rule the review gate applies to an approval
+// given on an earlier commit than the one being applied.
+type Reapproval int
+
+const (
+	// ReapprovalFollowsBaseBranch compares the commits unless the PR's base
+	// branch rules dismiss stale approvals on push. It is the default.
+	ReapprovalFollowsBaseBranch Reapproval = iota
+	// ReapprovalRequired always compares the commits: the approval counts
+	// only while the PR's schema change is the one it reviewed.
+	ReapprovalRequired
+	// ReapprovalNotRequired never compares the commits: an authorized
+	// approval counts until the reviewer withdraws it or GitHub dismisses it.
+	ReapprovalNotRequired
+)
+
+func (r Reapproval) String() string {
+	switch r {
+	case ReapprovalRequired:
+		return "required"
+	case ReapprovalNotRequired:
+		return "not_required"
+	default:
+		return "follows_base_branch"
+	}
+}
+
+// ReviewPolicyReapprovalForDatabase returns the re-approval rule for
+// database: its own review_policy.require_reapproval when set, otherwise the
+// instance-wide one, otherwise ReapprovalFollowsBaseBranch.
+func (c *ServerConfig) ReviewPolicyReapprovalForDatabase(database string) Reapproval {
 	if c == nil {
-		return false
+		return ReapprovalFollowsBaseBranch
 	}
-	if c.ReviewPolicy.RequireReapproval {
-		return true
+	if dbConfig := c.Database(database); dbConfig != nil && dbConfig.ReviewPolicy.RequireReapproval != nil {
+		return reapprovalFromSetting(*dbConfig.ReviewPolicy.RequireReapproval)
 	}
-	dbConfig := c.Database(database)
-	return dbConfig != nil && dbConfig.ReviewPolicy.RequireReapproval
+	if c.ReviewPolicy.RequireReapproval != nil {
+		return reapprovalFromSetting(*c.ReviewPolicy.RequireReapproval)
+	}
+	return ReapprovalFollowsBaseBranch
+}
+
+func reapprovalFromSetting(require bool) Reapproval {
+	if require {
+		return ReapprovalRequired
+	}
+	return ReapprovalNotRequired
 }
 
 // ReviewPolicyIncludesDatabaseOperators returns whether database-scoped
@@ -121,7 +156,7 @@ func validateReviewPolicy(config ReviewPolicyConfig) error {
 // it. Without one, the gate fails that PR's every apply with an error instead
 // of asking for a review.
 func (c *ServerConfig) validateDatabaseReviewPolicy(database string, dbConfig DatabaseConfig) error {
-	if dbConfig.ReviewPolicy.RequireReapproval && !c.ReviewPolicyEnabled() && !dbConfig.ReviewPolicy.Enabled {
+	if dbConfig.ReviewPolicy.RequireReapproval != nil && !c.ReviewPolicyEnabled() && !dbConfig.ReviewPolicy.Enabled {
 		return fmt.Errorf("databases.%s.review_policy.require_reapproval needs the review gate on for the database: set databases.%s.review_policy.enabled or review_policy.enabled", database, database)
 	}
 	if !dbConfig.ReviewPolicy.Enabled {

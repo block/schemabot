@@ -12,6 +12,7 @@ import (
 
 	"github.com/hmarr/codeowners"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	schemadialect "github.com/block/schemabot/pkg/schema"
@@ -202,12 +203,15 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 			"repo", repo, "pr", pr, "database", database, "base_ref", prInfo.BaseRef, "head_sha", headSHA)
 	}
 
-	requireReapproval := h.reviewGateRequiresReapproval(database)
+	reapproval := &reapprovalRequirement{
+		h: h, client: client, repo: repo, pr: pr, database: database, baseRef: prInfo.BaseRef,
+		rule: h.reviewGateReapproval(database),
+	}
 	approvals := ghclient.GetApprovedReviews(reviews)
 	h.logger.Info("review gate: fetched reviews",
 		"repo", repo, "pr", pr, "database", database,
 		"approved_by", ghclient.GetApprovedReviewers(reviews), "pr_author", prInfo.User,
-		"head_sha", headSHA, "require_reapproval", requireReapproval)
+		"head_sha", headSHA, "reapproval", reapproval.rule.String())
 
 	// Approvals on the head need no comparison, so they are checked first: a
 	// head approval decides the gate without reading GitHub again.
@@ -255,12 +259,12 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 			// is not compared for a reviewer who cannot approve anyway, so no
 			// GitHub request is spent on it; the comment asks for a fresh
 			// approval.
-			if requireReapproval && approval.CommitID != headSHA {
+			if approval.CommitID != headSHA && reapproval.required(ctx) {
 				unauthorizedEarlierApprovers = append(unauthorizedEarlierApprovers, reviewer)
 			}
 			continue
 		}
-		if !requireReapproval {
+		if approval.CommitID != headSHA && !reapproval.required(ctx) {
 			h.logger.Info("review gate: approved; re-approval is not required, so the approval counts on any commit",
 				"repo", repo, "pr", pr, "database", database,
 				"approved_by", reviewer, "matched_principal", principal,
@@ -840,10 +844,64 @@ func (h *Handler) isReviewGateEnabled(repo, database string) bool {
 	return enabled
 }
 
-// reviewGateRequiresReapproval reports whether an approval counts only for
-// the schema change it reviewed, instance-wide or for the database alone.
-func (h *Handler) reviewGateRequiresReapproval(database string) bool {
-	return h.service != nil && h.service.Config().ReviewPolicyRequiresReapprovalForDatabase(database)
+// reviewGateReapproval returns the database's re-approval rule.
+func (h *Handler) reviewGateReapproval(database string) api.Reapproval {
+	if h.service == nil {
+		return api.ReapprovalFollowsBaseBranch
+	}
+	return h.service.Config().ReviewPolicyReapprovalForDatabase(database)
+}
+
+// reapprovalRequirement decides whether an approval on an earlier commit
+// counts only while it covers the head's schema change. When the rule
+// follows the base branch, it reads the branch's rules from GitHub at most
+// once per gate check, and only when an earlier approval needs the answer.
+type reapprovalRequirement struct {
+	h        *Handler
+	client   *ghclient.InstallationClient
+	repo     string
+	pr       int
+	database string
+	baseRef  string
+	rule     api.Reapproval
+
+	resolved, requires bool
+}
+
+// required reports whether an approval on an earlier commit must cover the
+// head's schema change. Following the base branch, it is false only when
+// GitHub proves the branch dismisses stale approvals on push: GitHub has
+// then already removed every approval the PR's later commits made stale.
+// When the rules cannot be read, it is true, so the gate compares the
+// commits as it would without the base branch's help.
+func (r *reapprovalRequirement) required(ctx context.Context) bool {
+	switch r.rule {
+	case api.ReapprovalRequired:
+		return true
+	case api.ReapprovalNotRequired:
+		return false
+	}
+	if r.resolved {
+		return r.requires
+	}
+	r.resolved = true
+	logAttrs := []any{"repo", r.repo, "pr", r.pr, "database", r.database, "base_ref", r.baseRef}
+	dismisses, err := r.client.BaseBranchDismissesStaleApprovals(ctx, r.repo, r.baseRef)
+	switch {
+	case err != nil:
+		r.h.logger.Warn("review gate: cannot read whether the base branch dismisses stale approvals, so an approval on an earlier commit counts only if it covers the head's schema change",
+			append(logAttrs, "error", err)...)
+		r.requires = true
+	case dismisses:
+		r.h.logger.Info("review gate: the base branch dismisses stale approvals, so an approval GitHub kept counts on any commit",
+			logAttrs...)
+		r.requires = false
+	default:
+		r.h.logger.Info("review gate: the base branch does not dismiss stale approvals, so an approval on an earlier commit counts only if it covers the head's schema change",
+			logAttrs...)
+		r.requires = true
+	}
+	return r.requires
 }
 
 func appendUniqueString(values []string, value string) []string {

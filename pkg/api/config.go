@@ -1300,12 +1300,11 @@ type DatabaseReviewPolicyConfig struct {
 	// repo admins, this database's operators, and CODEOWNERS when included.
 	Enabled bool `yaml:"enabled,omitempty"`
 
-	// RequireReapproval makes an approval count only for the schema change it
-	// reviewed, for this database alone, even when
-	// review_policy.require_reapproval is false. Like Enabled, it can only
-	// add the requirement, never remove it, and it needs the review gate on
-	// for the database.
-	RequireReapproval bool `yaml:"require_reapproval,omitempty"`
+	// RequireReapproval overrides review_policy.require_reapproval for this
+	// database, in either direction. Unset, the database follows the
+	// instance-wide value. Setting it needs the review gate on for the
+	// database.
+	RequireReapproval *bool `yaml:"require_reapproval,omitempty"`
 }
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
@@ -1347,12 +1346,17 @@ type ReviewPolicyConfig struct {
 	// review gate. Defaults to false.
 	IncludeCodeowners bool `yaml:"include_codeowners,omitempty"`
 
-	// RequireReapproval makes an approval count only for the schema change it
-	// reviewed: a push that changes the PR's schema change after an approval
-	// needs a new one. Defaults to false, where an authorized approval keeps
-	// counting across later pushes until the reviewer withdraws it or GitHub
-	// dismisses it.
-	RequireReapproval bool `yaml:"require_reapproval,omitempty"`
+	// RequireReapproval decides whether an approval on an earlier commit
+	// still counts after the PR's schema change differs from the one it
+	// reviewed. True makes SchemaBot compare the commits and require a new
+	// approval when they differ. False keeps every authorized approval
+	// counting until the reviewer withdraws it or GitHub dismisses it. Unset,
+	// the default, follows the PR's base branch: when its rules dismiss stale
+	// approvals on push, GitHub has already removed every stale approval, so
+	// SchemaBot does not compare; otherwise, or when SchemaBot cannot read
+	// those rules, it compares as if true. A database's own
+	// review_policy.require_reapproval overrides it.
+	RequireReapproval *bool `yaml:"require_reapproval,omitempty"`
 }
 
 // EnvironmentConfig holds per-environment database configuration.
