@@ -233,6 +233,12 @@ type LocalClient struct {
 	// as its wait on a held target. Tests may lower it to drive many polls quickly.
 	taskPollIntervalOverride time.Duration
 
+	// progressWriteCapOverride and progressWriteFloorOverride, when positive,
+	// replace defaultProgressWriteCap and defaultProgressWriteFloor. Tests may
+	// set them to pin which polls write a task row.
+	progressWriteCapOverride   time.Duration
+	progressWriteFloorOverride time.Duration
+
 	// taskStallWarnIntervalOverride, when positive, replaces
 	// defaultTaskStallWarnInterval as the interval after which a polled task
 	// with no state or progress movement is warned about. Tests may lower it

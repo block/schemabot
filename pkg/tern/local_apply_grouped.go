@@ -986,7 +986,10 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
 	// Update all tasks with engine progress
-	if syncErr := c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled); syncErr != nil {
+	if ps.taskWrites == nil {
+		ps.taskWrites = newTaskWrites(c.progressWritePolicy())
+	}
+	if syncErr := c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled, ps.taskWrites); syncErr != nil {
 		if errors.Is(syncErr, storage.ErrApplyLeaseLost) {
 			logger.Warn("task progress write was refused because the drive's lease was lost; this driver exits",
 				append(apply.MutableLogAttrs(), "error", syncErr)...)
@@ -1818,18 +1821,20 @@ func (p enginePoll) retryableFailure() bool {
 // always refresh, and the state the poll claims for the task, which is a
 // correctness decision.
 //
-// Every task the poll speaks for ends its tick with a persisted write, even
-// when no field moved: the operator reads tasks.updated_at as the drive's
-// liveness signal (ApplyDriveStallAfter) and cancels a drive whose rows stop
-// advancing, so the write must stay unconditional — including through parked
+// Each task the poll speaks for is written when its write gate says the poll
+// is due (progressWritePolicy): at once when its state, throttle, or outcome
+// changes, at most once per cap when only its progress figures move, and once
+// per floor when nothing moves. The floor keeps the row written through parked
 // states such as deferred cutovers and revert windows, where nothing changes
-// tick to tick. A task the poll does not speak for is one already settled from
-// a more authoritative source earlier in the tick, and it took its persisted
+// tick to tick, because the operator reads tasks.updated_at as the drive's
+// liveness signal (ApplyDriveStallAfter) and cancels a drive whose rows stop
+// advancing. A task the poll does not speak for is one already settled from a
+// more authoritative source earlier in the tick, and it took its persisted
 // write from that settlement.
 //
 // It returns the writes that did not land, joined, after attempting every
 // task, so one refused row does not keep the others from updating.
-func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) error {
+func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet, writes *taskWrites) error {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	poll := enginePoll{result: result, newState: newState, now: now}
 	var writeErrs []error
@@ -1857,7 +1862,7 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 			c.unrecognizedStatuses.observeTaskStatus(ctx, logger, task, tp.State)
 		}
 		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, poll)
-		if err := c.advanceTaskFromEngineProgress(ctx, task, tp, poll); err != nil {
+		if err := c.advanceTaskFromEngineProgress(ctx, logger, task, tp, poll, writes.gate(task)); err != nil {
 			logger.Warn("failed to persist task progress", append(task.LogAttrs(), "error", err)...)
 			writeErrs = append(writeErrs, err)
 		}
@@ -1879,9 +1884,9 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 // advanceTaskFromEngineProgress makes, which is why the refresh runs first — a
 // transition rolled back by a storage failure keeps the display fields the
 // caller refreshed before it. A caller that refreshes the display and then
-// declines the advance still owes the task a persisted write. The operator
-// reads tasks.updated_at as the drive's liveness signal
-// (ApplyDriveStallAfter), so a tick that ends without one reads as a drive
+// declines the advance still owes the task a write within the write floor. The
+// operator reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter), so a row left unwritten past it reads as a drive
 // that stopped making progress, however fresh the fields left in memory are.
 func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *slog.Logger, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
 	switch {
@@ -1919,9 +1924,11 @@ func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *
 // policy for whether the claim is allowed to move the stored state.
 //
 // This is also where the tick reaches storage, for the task's stamps and for
-// the display fields the refresh left in memory. A write that does not land is
-// returned with the task's state left as it arrived.
-func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) error {
+// the display fields the refresh left in memory, when gate says the poll is
+// due. A new stamp or error message is a change to the task's outcome, so it is
+// always written at once. A write that does not land is returned with the
+// task's state left as it arrived.
+func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, logger *slog.Logger, task *storage.Task, tp *engine.TableProgress, poll enginePoll, gate *taskWriteGate) error {
 	retryableFailure := poll.retryableFailure()
 	if tp != nil {
 		if tp.StartedAt != nil && task.StartedAt == nil {
@@ -1942,7 +1949,18 @@ func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *s
 			task.ErrorMessage = msg
 		}
 	}
-	return c.persistTaskStateTransition(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
+	nextState := taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp))
+	row := taskRowOf(task, nextState)
+	if !gate.due(poll.now, row) {
+		logger.Debug("task row is not written this poll: its state is unchanged and its progress was written recently",
+			append(task.LogAttrs(), "rows_copied", task.RowsCopied)...)
+		return nil
+	}
+	if err := c.persistTaskStateTransition(ctx, task, 0, nextState, ""); err != nil {
+		return err
+	}
+	gate.landed(poll.now, row)
+	return nil
 }
 
 // engineTaskStateClaim is the state a progress poll claims for one task: the

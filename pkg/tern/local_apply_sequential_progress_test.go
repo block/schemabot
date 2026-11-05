@@ -160,9 +160,10 @@ func TestPollTaskToCompletion_RefinesPostCopyPhases(t *testing.T) {
 	assert.Equal(t, taskContinue, action)
 	assert.Equal(t, state.Task.Completed, task.State)
 	assert.Equal(t, []string{
-		state.Task.Running,      // copyRows
-		state.Task.CatchingUp,   // applyChangeset refines the running task
-		state.Task.CatchingUp,   // restoreSecondaryIndexes maps to running; monotonic guard holds the phase
+		state.Task.Running,    // copyRows
+		state.Task.CatchingUp, // applyChangeset refines the running task
+		// restoreSecondaryIndexes maps to running; the monotonic guard holds
+		// catching_up, so the unchanged row is not rewritten.
 		state.Task.Checksumming, // checksum
 		state.Task.PostChecksum, // postChecksum
 		state.Task.Completed,
@@ -1138,7 +1139,8 @@ func TestLostEngineWorkPendingBudgetFollowsTheEngine(t *testing.T) {
 // refuses every terminal write while it takes the progress writes, must still
 // end the drive: each landed progress write restarts the consecutive budget,
 // so only a ceiling over the whole poll keeps the drive from holding the
-// database's active-apply slot forever.
+// database's active-apply slot forever. The write floor is due on every poll
+// here, so every in-flight report lands a progress write.
 func TestPollTaskToCompletion_TerminalWriteRefusalsStayBoundedUnderAFlappingEngine(t *testing.T) {
 	const flaps = 50
 	results := make([]*engine.ProgressResult, 0, 2*flaps+1)
@@ -1154,6 +1156,7 @@ func TestPollTaskToCompletion_TerminalWriteRefusalsStayBoundedUnderAFlappingEngi
 		refusals:                -1,
 	}
 	client.storage.(*exactProgressStorage).tasks = refusing
+	client.progressWriteFloorOverride = time.Nanosecond
 
 	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
 

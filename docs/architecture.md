@@ -951,14 +951,14 @@ Task fields updated during polling (`storage.Task` in `pkg/storage/types.go`):
 | `State`           | string | Mapped from `engine.State` |
 | `StartedAt`       | time   | Set when task transitions to RUNNING |
 | `CompletedAt`     | time   | Set when engine reports a terminal state |
-| `UpdatedAt`       | time   | Bumped on every full poll |
+| `UpdatedAt`       | time   | Bumped on every write of the row |
 
 **When task rows are updated:**
 
 | Trigger | What writes | Frequency | Fields updated |
 |---------|-------------|-----------|----------------|
-| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
-| `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | Same as above, plus `IsInstant` |
+| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Polls every 500ms, or every 5s while held at a deferred cutover with no cutover, stop, or cancel pending. Writes a row at once when its state, throttle, or outcome changes, at most every 1.5s when only its progress figures move, and every 30s when nothing moves | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
+| `pollTaskToCompletion` (sequential mode) | Poller goroutine | Same as above | Same as above, plus `IsInstant` |
 | Durable stop request | Lease-held drive | Once, after the engine stops | `State` → STOPPED for non-terminal tasks, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `CompletedAt` |
 | `executeGroupedApply` / `executeApplySequential` | Apply launcher | Once at start | `State` → RUNNING, `StartedAt` |
 

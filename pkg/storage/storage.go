@@ -23,12 +23,13 @@ const ApplyLeaseStaleAfter = time.Minute
 
 // ApplyDriveStallAfter bounds how long a drive may go without mirroring any
 // task progress to storage before its driver presumes the drive goroutine is
-// wedged and cancels the run. A healthy drive's poll loop writes every task row
-// on every full poll: every tick, except that a drive held at a deferred
-// cutover runs its full poll only on a slower refresh interval
-// (tern.parkedFullPollInterval). Legitimate silence is therefore far shorter
-// than this window, and tightening the window must keep it well above that
-// refresh interval. The window is kept generous so slow pre-poll phases (target schema pulls,
+// wedged and cancels the run. A healthy drive's poll loop writes each task row
+// at least once per write floor (tern.defaultProgressWriteFloor), and sooner
+// when the row changes. A drive held at a deferred cutover runs its full poll
+// only on a slower refresh interval (tern.parkedFullPollInterval), so it writes
+// at the first full poll past the floor. Legitimate silence is therefore far
+// shorter than this window, and tightening the window must keep it well above
+// the floor plus that refresh interval. The window is kept generous so slow pre-poll phases (target schema pulls,
 // re-planning, engine acceptance) have the full window before their first
 // mirror write.
 //

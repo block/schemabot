@@ -83,8 +83,9 @@ func statementCounts(t *testing.T, db *sql.DB, schemaName string) map[string]int
 
 // statementsForDrive seeds a running apply with one task, claims it, and polls
 // the task until the engine reports it completed after runningTicks running
-// polls. It returns how many times each statement shape ran during the poll.
-func statementsForDrive(t *testing.T, dsn, schemaName string, runningTicks int) map[string]int64 {
+// polls, writing new progress figures at most once per writeCap. It returns
+// how many times each statement shape ran during the poll.
+func statementsForDrive(t *testing.T, dsn, schemaName string, runningTicks int, writeCap time.Duration) map[string]int64 {
 	t.Helper()
 	// The poll settles the task but leaves its apply running, so clear the
 	// previous drive's rows before seeding another apply for the same target.
@@ -108,6 +109,8 @@ func statementsForDrive(t *testing.T, dsn, schemaName string, runningTicks int) 
 	require.NoError(t, err)
 	defer utils.CloseAndLog(client)
 	client.taskPollIntervalOverride = 10 * time.Millisecond
+	client.progressWriteCapOverride = writeCap
+	client.progressWriteFloorOverride = time.Hour
 
 	apply, _ := seedRunningApplyWithTask(t, stor, storage.DatabaseTypeStrata, storage.EngineStrata)
 	expireApplyLease(t, dsn, apply.ID)
@@ -140,7 +143,8 @@ func statementsForDrive(t *testing.T, dsn, schemaName string, runningTicks int) 
 // in a wide apply does the same against one storage writer, so the storage
 // statements one tick runs are multiplied by the number of shards. Two drives
 // that differ only in how many running polls they make isolate that per-tick
-// cost from the one-off work of starting and settling the task.
+// cost from the one-off work of starting and settling the task. A running
+// poll writes the task row only when its write cap comes due.
 func TestPollTaskToCompletion_StorageStatementsPerTick(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -153,9 +157,52 @@ func TestPollTaskToCompletion_StorageStatementsPerTick(t *testing.T) {
 	cfg, err := drivermysql.ParseDSN(dsn)
 	require.NoError(t, err)
 
+	tests := []struct {
+		name     string
+		writeCap time.Duration
+		want     map[string]float64
+	}{
+		{
+			// Each running poll reads the apply's pending control requests and
+			// the task row. No poll here reaches the write cap, so the moving
+			// progress figures add no write.
+			name:     "progress inside the write cap",
+			writeCap: time.Hour,
+			want: map[string]float64{
+				"SELECT apply_control_requests": 1,
+				"SELECT tasks":                  1,
+			},
+		},
+		{
+			// A cap shorter than a poll interval is due on every poll, so every
+			// running poll also writes the task row's progress.
+			name:     "write cap due on every poll",
+			writeCap: time.Nanosecond,
+			want: map[string]float64{
+				"SELECT apply_control_requests": 1,
+				"SELECT tasks":                  1,
+				"UPDATE tasks":                  1,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A change that adds a statement here adds it once per shard per
+			// tick on the storage writer.
+			byShape, report := statementsPerRunningPoll(t, dsn, cfg.DBName, tt.writeCap)
+			assert.Equal(t, tt.want, byShape, "storage statements per running poll:\n%s", report)
+		})
+	}
+}
+
+// statementsPerRunningPoll runs two drives that differ only in how many
+// running polls they make, and returns the statements one running poll adds,
+// grouped by shape, with a per-digest report for a failure message.
+func statementsPerRunningPoll(t *testing.T, dsn, schemaName string, writeCap time.Duration) (map[string]float64, string) {
+	t.Helper()
 	const shortTicks, longTicks = 5, 25
-	short := statementsForDrive(t, dsn, cfg.DBName, shortTicks)
-	long := statementsForDrive(t, dsn, cfg.DBName, longTicks)
+	short := statementsForDrive(t, dsn, schemaName, shortTicks, writeCap)
+	long := statementsForDrive(t, dsn, schemaName, longTicks, writeCap)
 
 	perTick := map[string]float64{}
 	byShape := map[string]float64{}
@@ -174,15 +221,7 @@ func TestPollTaskToCompletion_StorageStatementsPerTick(t *testing.T) {
 	for _, digest := range digests {
 		fmt.Fprintf(&report, "%6.2f  %s\n", perTick[digest], digest)
 	}
-
-	// Each running poll reads the apply's pending control requests and the
-	// task row, and writes the task row's progress. A change that adds a
-	// statement here adds it once per shard per tick on the storage writer.
-	assert.Equal(t, map[string]float64{
-		"SELECT apply_control_requests": 1,
-		"SELECT tasks":                  1,
-		"UPDATE tasks":                  1,
-	}, byShape, "storage statements per running poll:\n%s", report.String())
+	return byShape, report.String()
 }
 
 // statementTable matches the first table a statement digest names.

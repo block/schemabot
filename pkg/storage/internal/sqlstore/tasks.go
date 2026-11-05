@@ -1021,18 +1021,20 @@ const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 
 // strandedActiveTaskQuiescence is how long a task row must have gone untouched
 // before the sweep settles it. It is measured on the task row, not the parent,
-// because the task row is the one a live drive writes: every tick mirrors its
-// tasks unconditionally, so tasks.updated_at tracks a drive's activity closely
-// enough to say when a row is worth looking at. The parent applies row is not a
-// substitute — a drive holding only an operation lease is forbidden from bumping
-// it, so it can sit quiet while that drive works.
+// because the task row is the one a live drive writes: a drive writes each of
+// its task rows at least once per write floor even when nothing on it changes,
+// so tasks.updated_at tracks a drive's activity closely enough to say when a
+// row is worth looking at. The parent applies row is not a substitute — a drive
+// holding only an operation lease is forbidden from bumping it, so it can sit
+// quiet while that drive works.
 //
-// Three drive shapes make that unconditional write, and all three say so where
-// they make it: syncAtomicTaskProgress (local grouped drives),
-// pollTaskToCompletion (local sequential drives), and
-// syncStoredTasksFromRemoteTasks (gRPC drives against remote Tern). A change
-// that makes any of them write only on a field change breaks this window, which
-// is why they are named here rather than left to be rediscovered.
+// Three drive shapes make that write, and all three say so where they make it:
+// syncAtomicTaskProgress (local grouped drives) and pollTaskToCompletion (local
+// sequential drives), which write an unchanged row once per write floor, and
+// syncStoredTasksFromRemoteTasks (gRPC drives against remote Tern), which
+// writes every tick. A change that makes any of them write only on a field
+// change, or that raises the floor toward this window, breaks it, which is why
+// they are named here rather than left to be rediscovered.
 //
 // The window covers the operator's whole recovery budget rather than just its
 // stall bound, because the two actions are not equally recoverable. The

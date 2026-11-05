@@ -795,6 +795,10 @@ type atomicPollState struct {
 	// writes did not all land; see pollTaskToCompletion's counterpart.
 	progressWriteFailures int
 
+	// taskWrites decides which polls write each task's row. It is created on
+	// the first progress tick.
+	taskWrites *taskWrites
+
 	// stateEnteredAt tracks when the current waiting state was entered,
 	// used for timeout enforcement on deferred cutover and revert window.
 	stateEnteredAt time.Time
@@ -1082,13 +1086,16 @@ func (c *LocalClient) lostEngineWorkPendingBudget(eng engine.Engine) time.Durati
 }
 
 // pollTaskToCompletion polls a single task to completion (sequential mode).
-// Each poll tick persists the task row, even when no field moved: the operator
-// reads tasks.updated_at as the drive's liveness signal (ApplyDriveStallAfter)
-// and cancels a drive whose rows stop advancing, so the write must stay
-// unconditional — including through parked states such as deferred cutovers
-// and revert windows, where nothing changes tick to tick. A drive held at a
-// deferred cutover runs the full poll less often (see parkedPoll), still well
-// inside that window.
+// A poll writes the task row when its write gate says the poll is due
+// (progressWritePolicy): at once when the task's state, throttle, or outcome
+// changes, at most once per cap when only its progress figures move, and once
+// per floor when nothing moves. The floor keeps the row written through parked
+// states such as deferred cutovers and revert windows, where nothing changes
+// tick to tick, because the operator reads tasks.updated_at as the drive's
+// liveness signal (ApplyDriveStallAfter) and cancels a drive whose rows stop
+// advancing. A drive held at a deferred cutover runs the full poll less often
+// (see parkedPoll), and both that interval and the floor stay well inside the
+// window.
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
 	ticker := time.NewTicker(c.taskPollInterval())
@@ -1120,6 +1127,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 	parked := newParkedPoll()
+	writes := taskWriteGate{policy: c.progressWritePolicy()}
 
 	for {
 		select {
@@ -1356,6 +1364,12 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			}
 
 			polledState := task.State
+			row := taskRowOf(task, polledState)
+			if !writes.due(now, row) {
+				logger.Debug("task row is not written this poll: its state is unchanged and its progress was written recently",
+					"task_id", task.TaskIdentifier, "table", task.TableName, "state", polledState, "rows_copied", task.RowsCopied)
+				continue
+			}
 			if err := c.persistTaskStateTransition(ctx, task, 0, polledState, ""); err != nil {
 				task.State = prevState
 				attrs := append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "target_state", polledState, "engine_state", result.State)
@@ -1378,6 +1392,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					append(attrs, "consecutive_write_failures", progressWriteFailures, "error", err)...)
 				continue
 			}
+			writes.landed(now, row)
 			terminalWriteFailures = 0
 			progressWriteFailures = 0
 
