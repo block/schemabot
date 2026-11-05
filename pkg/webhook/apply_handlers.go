@@ -84,6 +84,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	if blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
+		return false, nil
+	}
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
@@ -543,6 +549,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	if blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
+		return false, nil
+	}
+
 	// Acquire lock. PendingPlanID pins the confirmation plan this lock was
 	// posted with so apply-confirm can load the exact plan the human reviewed
 	// (not whatever happens to be newest in the plans table at confirm time).
@@ -834,6 +846,12 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	defer cancel()
 
 	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, result.Tenant, requestedBy, action.ApplyConfirm, result.SuppressRetryComments) {
+		return false, nil
+	}
+
+	if blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
 		return false, nil
 	}
 

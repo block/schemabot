@@ -200,7 +200,7 @@ func openPR(number int, headSHA string, updatedAt time.Time) map[string]any {
 		"title":      fmt.Sprintf("PR %d", number),
 		"updated_at": updatedAt.UTC().Format(time.RFC3339),
 		"head":       map[string]any{"sha": headSHA, "ref": "feature"},
-		"base":       map[string]any{"ref": "main"},
+		"base":       map[string]any{"ref": "main", "repo": map[string]any{"default_branch": "main"}},
 		"user":       map[string]any{"login": "octocat"},
 	}
 }
@@ -226,7 +226,7 @@ func TestWebhookReconcilerReportsMissingInboxRow(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing)
 	require.Equal(t, 0, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row, "report-only scan must not synthesize inbox rows")
 }
@@ -245,6 +245,8 @@ func TestWebhookReconcilerSkipsRecordedHead(t *testing.T) {
 	})
 	require.NoError(t, err)
 	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "head-sha")
+
 	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
 		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
 	})
@@ -295,7 +297,7 @@ func TestWebhookReconcilerSynthesizesMissingHeadDelivery(t *testing.T) {
 	require.Equal(t, 1, missing)
 	require.Equal(t, 1, synthesized)
 
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	require.Equal(t, "pull_request", row.Event)
@@ -494,7 +496,7 @@ func TestWebhookReconcilerSynthesisInsertFailureLeavesHeadRecoverable(t *testing
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing)
 	require.Equal(t, 0, synthesized, "a rejected insert must not count as synthesized")
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, fullSHA))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, fullSHA))
 	require.NoError(t, err)
 	require.Nil(t, row)
 
@@ -512,7 +514,7 @@ func TestWebhookReconcilerSynthesisInsertFailureLeavesHeadRecoverable(t *testing
 // failed row as a fresh pending delivery.
 func TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow(t *testing.T) {
 	store := newRecordingWebhookEventStore()
-	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha")
+	guid := reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha")
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  guid,
@@ -551,7 +553,7 @@ func TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow(t *testing.T)
 // only planned again when a new push mints a new head SHA.
 func TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead(t *testing.T) {
 	store := newRecordingWebhookEventStore()
-	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha")
+	guid := reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha")
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  guid,
@@ -566,6 +568,8 @@ func TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead(t *testing.T) {
 	})
 	require.NoError(t, err)
 	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "head-sha")
+
 	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
 		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
 	})
@@ -603,6 +607,8 @@ func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
 	})
 	require.NoError(t, err)
 	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "head-sha")
+
 	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
 		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
 	})
@@ -612,7 +618,7 @@ func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 0, missing, "a terminally failed organic row must cover its head")
 	require.Equal(t, 0, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row, "no recovery row may be synthesized over a failed organic delivery")
 }
@@ -647,7 +653,7 @@ func TestWebhookReconcilerNonPlanRowDoesNotCoverHead(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing, "a closed row must not cover the reopened head")
 	require.Equal(t, 1, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	require.Equal(t, storage.WebhookEventPending, row.State)
@@ -671,6 +677,8 @@ func TestWebhookReconcilerCompletedRowStillCoversHead(t *testing.T) {
 	})
 	require.NoError(t, err)
 	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "head-sha")
+
 	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
 		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
 	})
@@ -1184,4 +1192,14 @@ func TestWithWebhookReconcileScanBounds(t *testing.T) {
 
 	WithWebhookReconcileScanBounds(MinWebhookReconcileMaxPages, 0)(h)
 	require.Equal(t, MinWebhookReconcileMaxPages, h.webhookReconcileMaxPages)
+}
+
+func reconcileMainTargetGUID(repo string, pr int, headSHA string) string {
+	info := &ghclient.PullRequestInfo{HeadSHA: headSHA, BaseRef: "main", DefaultBranch: "main"}
+	return synthesizedDeliveryGUID(repo, pr, headSHA, prTargetObservation(info, ghclient.PRTargetEligibility{Target: "main", Eligible: true}))
+}
+
+func recordMainTargetObservation(t *testing.T, h *Handler, repo string, pr int, headSHA string) {
+	t.Helper()
+	require.NoError(t, h.recordPRTargetObservation(t.Context(), repo, pr, &ghclient.PullRequestInfo{HeadSHA: headSHA, BaseRef: "main", DefaultBranch: "main"}, ghclient.PRTargetEligibility{Target: "main", Eligible: true}))
 }

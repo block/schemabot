@@ -452,7 +452,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			repo, pr, environment, schema.Type, schema.Database)
 	}
 
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "plan_check_recorded",
@@ -475,6 +475,14 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		})
 		return headSHA, nil, fmt.Errorf("skip stale plan check record for repo %s pr %d environment %s database_type %s database %s: plan head SHA %s no longer matches current head SHA for PR %s",
 			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
+	}
+
+	decision, targetErr := h.evaluatePRTarget(ctx, client, repo, prInfo)
+	if targetErr != nil {
+		return headSHA, nil, targetErr
+	}
+	if !decision.Eligible {
+		return headSHA, nil, errPRTargetExcluded
 	}
 
 	// A check passes only when no rollout member has work (MG-12), so work on a

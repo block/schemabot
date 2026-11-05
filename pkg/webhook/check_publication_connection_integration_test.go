@@ -95,7 +95,7 @@ func TestCheckPublicationLeavesStorageConnectionAvailable(t *testing.T) {
 				if tc.pause == "head" {
 					pause(r)
 				}
-				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"head": map[string]string{"sha": "abc123"}}))
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"head": map[string]string{"sha": "abc123"}, "base": map[string]any{"ref": "main", "repo": map[string]string{"default_branch": "main"}}}))
 			})
 			serveAggregateScopeInputs(t, mux, []string{"schemabot.yaml"}, "database: orders\ntype: mysql\n")
 			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {

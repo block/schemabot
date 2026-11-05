@@ -178,7 +178,7 @@ func newStoppedApplyCheckFixture(t *testing.T, repo string, pr int, applySHA, he
 	mux.HandleFunc(fmt.Sprintf("GET /repos/%s/pulls/%d", repo, pr), func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(headSHA)},
-			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("base456")},
+			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("base456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User:  &gh.User{Login: new("testuser")},
 			State: new("open"),
 		})

@@ -599,3 +599,9 @@ func RecordXxx(ctx context.Context, database, environment, status string) {
 ```
 
 The OTel SDK deduplicates instruments with the same name, so calling `Int64Counter` on every invocation is safe and cheap after the first registration.
+
+PR target eligibility attributes its bounded non-default-branch reads to the
+existing `schemabot.github.requests_total` operation values `fetch_branch_rules`
+and `graphql_branch_protection`. Default-target PRs make neither request. Compare
+these reads and remaining installation budgets during rollout; a permission
+failure blocks target evaluation and requires fixing the App's read access.

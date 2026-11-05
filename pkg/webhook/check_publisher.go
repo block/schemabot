@@ -44,19 +44,15 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 // error, both non-nil) apart from a genuinely superseded head (current=false,
 // err=nil), which must never be retried as if GitHub had failed. It records the
 // same metrics and logs as before. A superseded head is not an operational
-// failure, so it returns a nil error.
+// failure, so it returns a nil error. Verified branch exclusion instead returns
+// errPRTargetExcluded, allowing retry owners to stop without treating it as
+// infrastructure failure.
 func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string) (bool, error) {
 	if headSHA == "" {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:  operation,
-			Repository: repo,
-			Status:     "error",
-		})
-		h.logger.Error("refusing to update status check without head SHA", "repo", repo, "pr", pr, "operation", operation)
-		return false, fmt.Errorf("verify head SHA for %s#%d (%s): missing head SHA", repo, pr, operation)
+		return h.verifyPublicationPRInfo(ctx, client, repo, pr, headSHA, operation, nil)
 	}
 
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  operation,
@@ -67,6 +63,31 @@ func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.In
 			"repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation, "error", err)
 		return false, fmt.Errorf("verify head SHA for %s#%d (%s): %w", repo, pr, operation, err)
 	}
+	return h.verifyPublicationPRInfo(ctx, client, repo, pr, headSHA, operation, prInfo)
+}
+
+// verifyPublicationSnapshot validates the initial discovery snapshot without
+// spending another GitHub request. Every Check Run write still performs the
+// uncached verification above after its scope and stored inputs are read.
+func (h *Handler) verifyPublicationSnapshot(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string) (bool, error) {
+	snapshot, ok := ctx.Value(publicationTargetKey{}).(publicationTarget)
+	if !ok {
+		return false, fmt.Errorf("missing publication target snapshot for %s#%d", repo, pr)
+	}
+	return h.verifyPublicationPRInfo(ctx, client, repo, pr, headSHA, operation, &snapshot.info)
+}
+
+func (h *Handler) verifyPublicationPRInfo(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string, prInfo *ghclient.PullRequestInfo) (bool, error) {
+	if headSHA == "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  operation,
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("refusing to update status check without head SHA", "repo", repo, "pr", pr, "operation", operation)
+		return false, fmt.Errorf("verify head SHA for %s#%d (%s): missing head SHA", repo, pr, operation)
+	}
+
 	if prInfo.HeadSHA != headSHA {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  operation,
@@ -77,6 +98,21 @@ func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.In
 			"repo", repo, "pr", pr, "operation", operation,
 			"stale_head_sha", headSHA, "current_head_sha", prInfo.HeadSHA)
 		return false, nil
+	}
+	if snapshot, ok := ctx.Value(publicationTargetKey{}).(publicationTarget); ok && snapshot.repository == repo && snapshot.pr == pr {
+		if !samePRTargetContext(&snapshot.info, prInfo) {
+			h.logger.Info("discarding check publication because PR target changed", "repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation)
+			return false, nil
+		}
+	}
+	decision, err := h.evaluatePRTarget(ctx, client, repo, prInfo)
+	if err != nil {
+		h.logger.Error("failed to verify status check target before update", "repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation, "error", err)
+		return false, fmt.Errorf("verify publication target for %s#%d: %w", repo, pr, err)
+	}
+	if !decision.Eligible {
+		h.logger.Info("check publication suppressed for excluded PR target", "repo", repo, "pr", pr, "head_sha", headSHA, "effective_target", decision.Target, "operation", operation)
+		return false, errPRTargetExcluded
 	}
 	return true, nil
 }
@@ -166,13 +202,21 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		return aggregateFoldNoFollowUp, nil
 	}
 
-	current, err := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	ctx, snapshotErr := snapshotPublicationTarget(ctx, client, repo, pr)
+	if snapshotErr != nil {
+		return aggregateFoldScheduleRefold, snapshotErr
+	}
+
+	current, err := h.verifyPublicationSnapshot(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
 	if !current {
 		// A non-current head covers a transient PR-fetch failure (non-nil err)
 		// as well as a genuinely newer head (nil err); either way a leader's
 		// next re-fold fetches the then-current head, so arm a bounded re-fold
 		// instead of stranding an aggregate waiting on a participant re-read.
 		// verifyHeadSHACurrency already logged the reason.
+		if errors.Is(err, errPRTargetExcluded) {
+			return aggregateFoldNoFollowUp, nil
+		}
 		return aggregateFoldScheduleRefold, err
 	}
 
@@ -576,13 +620,6 @@ func (h *Handler) foldAggregateCheckRun(
 		}
 	}
 
-	currentHead, err := client.FetchPullRequestNoCache(ctx, repo, pr)
-	if err != nil {
-		return aggregateFold{}, fmt.Errorf("reverify aggregate head for %s#%d: %w", repo, pr, err)
-	}
-	if currentHead.HeadSHA != headSHA {
-		return aggregateFold{}, fmt.Errorf("aggregate head changed for %s#%d", repo, pr)
-	}
 	opts := ghclient.CheckRunOptions{
 		Name:   checkName,
 		Status: status,
@@ -650,6 +687,13 @@ func (h *Handler) foldAggregateCheckRun(
 			"concluded_check_run_id", liveRun.ID,
 			"concluded_conclusion", liveRun.Conclusion, "check_status", status)
 		reuseExistingRun = false
+	}
+	current, err := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	if err != nil {
+		return aggregateFold{}, err
+	}
+	if !current {
+		return aggregateFold{}, fmt.Errorf("aggregate head or target changed for %s#%d", repo, pr)
 	}
 	var checkRunID int64
 	if reuseExistingRun {
@@ -785,8 +829,16 @@ func (h *Handler) postPassingAggregateTargets(ctx context.Context, client *ghcli
 		return nil
 	}
 
-	current, err := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	ctx, snapshotErr := snapshotPublicationTarget(ctx, client, repo, pr)
+	if snapshotErr != nil {
+		return snapshotErr
+	}
+
+	current, err := h.verifyPublicationSnapshot(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
 	if !current {
+		if errors.Is(err, errPRTargetExcluded) {
+			return nil
+		}
 		return err
 	}
 
@@ -861,6 +913,13 @@ func (h *Handler) postPassingAggregateTargets(ctx context.Context, client *ghcli
 			continue
 		}
 
+		current, verifyErr := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+		if verifyErr != nil {
+			return verifyErr
+		}
+		if !current {
+			return nil
+		}
 		var checkRunID int64
 		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 			if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
@@ -958,7 +1017,18 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		return false
 	}
 
-	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+	ctx, snapshotErr := snapshotPublicationTarget(ctx, client, repo, pr)
+	if snapshotErr != nil {
+		h.logger.Error("could not snapshot failing aggregate target", "repo", repo, "pr", pr, "error", snapshotErr)
+		return false
+	}
+
+	current, verifyErr := h.verifyPublicationSnapshot(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	if verifyErr != nil {
+		h.logger.Error("could not verify failing aggregate target", "repo", repo, "pr", pr, "error", verifyErr)
+		return false
+	}
+	if !current {
 		return false
 	}
 
@@ -1055,6 +1125,9 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 			},
 		}
 
+		if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+			return false
+		}
 		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 		if err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{

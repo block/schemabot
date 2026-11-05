@@ -758,6 +758,17 @@ names), or, when that row cannot be stored, a failing aggregate carrying the sam
 the auto-plan guards release (`failClosedOnNamespacePlacement` and `handleMultiEnvPlan` in
 `pkg/webhook/plan.go`).
 
+### MG-13: Branch exclusion never creates validation
+
+New PR plans, apply commands, and Check Run publication require an eligible target.
+Exclusion never produces a passing, neutral, or skipped result, and uncertainty
+never authorizes omission of required validation. Earlier results and accepted
+applies remain authoritative through a target change.
+*Enforced:* effective-target and protection discovery (`pkg/github/pr_target.go`);
+shared command and recovery policy (`pkg/webhook/pr_target.go`); auto-plan and
+aggregate publishers (`pkg/webhook/pull_request.go`, `pkg/webhook/check_publisher.go`);
+uncached apply-acceptance gate (`pkg/webhook/apply_execute.go`).
+
 ## Apply state machine (ST)
 
 Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and

@@ -1291,7 +1291,7 @@ func TestEnforceOpenPR(t *testing.T) {
 				"state":  state,
 				"merged": merged,
 				"head":   map[string]any{"ref": "feature-branch", "sha": "abc123"},
-				"base":   map[string]any{"ref": "main", "sha": "def456"},
+				"base":   map[string]any{"ref": "main", "sha": "def456", "repo": map[string]any{"default_branch": "main"}},
 				"user":   map[string]any{"login": "alice"},
 			})
 		})

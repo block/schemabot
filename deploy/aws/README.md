@@ -136,6 +136,7 @@ Fill in:
 
 | Permission | Access |
 |-----------|--------|
+| Administration | Read |
 | Checks | Read & Write |
 | Contents | Read & Write |
 | Issues | Read & Write |

@@ -236,7 +236,7 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(gh.PullRequest{
 					Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(tt.headSHA)},
-					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 					User: &gh.User{Login: new("testuser")},
 				})
 			})
