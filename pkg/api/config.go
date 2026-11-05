@@ -1009,13 +1009,16 @@ func validatePositiveDuration(context, field, value string) error {
 	return nil
 }
 
-// DSNFromConfig configures a MySQL DSN assembled from separate secret values.
+// DSNFromConfig configures a DSN assembled from separate secret values: a Go
+// MySQL driver DSN for MySQL-family databases (and for storage), or a libpq URL
+// for a PostgreSQL database.
 type DSNFromConfig struct {
 	// ConfigRef is a secret reference containing database connection metadata.
 	ConfigRef string `yaml:"config_ref"`
 
 	// ConfigPaths selects fields from the referenced config document. Paths are
-	// dot-separated YAML map keys and default to host, port, and database.
+	// dot-separated YAML map keys and default to host, port, and database (dbname
+	// for a PostgreSQL database).
 	ConfigPaths DSNFromConfigPaths `yaml:"config_paths,omitempty"`
 
 	// Username is the database user to include in the generated DSN.
@@ -1024,15 +1027,21 @@ type DSNFromConfig struct {
 	// PasswordRef is a secret reference containing the database user's password.
 	PasswordRef string `yaml:"password_ref"`
 
-	// Params are appended as MySQL DSN query parameters.
+	// Params are appended as MySQL DSN query parameters. For a PostgreSQL
+	// database they are validate-only under the assembler's allowlist: the
+	// libpq URL always carries sslmode=verify-full and nothing else.
 	Params map[string]string `yaml:"params,omitempty"`
 }
 
 // DSNFromConfigPaths configures where to find connection fields in ConfigRef.
 type DSNFromConfigPaths struct {
-	Host     string `yaml:"host,omitempty"`
-	Port     string `yaml:"port,omitempty"`
+	Host string `yaml:"host,omitempty"`
+	Port string `yaml:"port,omitempty"`
+	// Database is the database name path for MySQL-family DSNs.
 	Database string `yaml:"database,omitempty"`
+	// DBName is the database name path for a PostgreSQL database, named as on
+	// a target_resolver target's dsn_from so the two blocks read the same.
+	DBName string `yaml:"dbname,omitempty"`
 }
 
 // TargetResolverConfig configures the data-plane connection resolver. Targets
@@ -1368,7 +1377,8 @@ type EnvironmentConfig struct {
 	DSN string `yaml:"dsn"`
 
 	// DSNFrom builds the database connection string for local mode from separate
-	// database config and password references. It is mutually exclusive with DSN.
+	// database config and password references, in the format the database's
+	// type connects with. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
 
 	// Target is the opaque Tern-facing target identifier for gRPC mode.
@@ -2543,7 +2553,7 @@ func (c *ServerConfig) Validate() error {
 			case hasScalarRouting && hasMapRouting:
 				return fmt.Errorf("database %q environment %q cannot configure both scalar target/deployment and a deployments map", name, env)
 			case hasDSN:
-				if err := envConfig.validateLocalDSNConfig(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+				if err := envConfig.validateLocalDSNConfig(fmt.Sprintf("database %q environment %q", name, env), dbConfig.Type); err != nil {
 					return err
 				}
 				continue
@@ -3940,7 +3950,7 @@ func (c *ServerConfig) StorageDSN() (string, error) {
 
 func (c *ServerConfig) resolveStorageDSN() (string, error) {
 	if c.Storage.DSNFrom != nil {
-		return c.Storage.DSNFrom.Resolve()
+		return c.Storage.DSNFrom.Resolve(storage.DatabaseTypeMySQL)
 	}
 	if c.Storage.DSN == "" {
 		if dsn := os.Getenv("STORAGE_DSN"); dsn != "" {
@@ -3955,7 +3965,7 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
 	}
 	if c.DSNFrom != nil {
-		if err := c.DSNFrom.Validate(context); err != nil {
+		if err := c.DSNFrom.Validate(context, storage.DatabaseTypeMySQL); err != nil {
 			return err
 		}
 	}
@@ -3992,22 +4002,24 @@ func (c EnvironmentConfig) HasLocalDSN() bool {
 	return c.DSN != "" || c.DSNFrom != nil
 }
 
-func (c EnvironmentConfig) validateLocalDSNConfig(context string) error {
+func (c EnvironmentConfig) validateLocalDSNConfig(context, databaseType string) error {
 	if c.DSN != "" && c.DSNFrom != nil {
 		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
 	}
 	if c.DSNFrom != nil {
-		return c.DSNFrom.Validate(context)
+		return c.DSNFrom.Validate(context, databaseType)
 	}
 	return nil
 }
 
-func (c EnvironmentConfig) ResolveDSN() (string, error) {
+// ResolveDSN returns the environment's local connection string for a database
+// of the given type, which selects the DSN format dsn_from assembles.
+func (c EnvironmentConfig) ResolveDSN(databaseType string) (string, error) {
 	if c.resolvedLocalDSN != "" {
 		return c.resolvedLocalDSN, nil
 	}
 	if c.DSNFrom != nil {
-		return c.DSNFrom.Resolve()
+		return c.DSNFrom.Resolve(databaseType)
 	}
 	return secrets.Resolve(c.DSN, "")
 }
@@ -4171,16 +4183,13 @@ func (c *ServerConfig) DirectExecutionPolicyFor(database, environment, databaseT
 	return c.DirectExecutionPolicy(c.DatabaseEnvironment(database, environment), databaseType)
 }
 
-func (c *DSNFromConfig) Validate(context string) error {
+// Validate checks a dsn_from block for a database of the given type. The type
+// selects the DSN format: MySQL-family types assemble a Go MySQL driver DSN, a
+// PostgreSQL database assembles a libpq URL, and any other type fails closed
+// because no assembler builds its DSN.
+func (c *DSNFromConfig) Validate(context, databaseType string) error {
 	if c.ConfigRef == "" {
 		return fmt.Errorf("%s dsn_from missing config_ref", context)
-	}
-	paths := c.configPaths()
-	if paths.Host == "" {
-		return fmt.Errorf("%s dsn_from missing config_paths.host", context)
-	}
-	if paths.Database == "" {
-		return fmt.Errorf("%s dsn_from missing config_paths.database", context)
 	}
 	if c.Username == "" {
 		return fmt.Errorf("%s dsn_from missing username", context)
@@ -4188,11 +4197,28 @@ func (c *DSNFromConfig) Validate(context string) error {
 	if c.PasswordRef == "" {
 		return fmt.Errorf("%s dsn_from missing password_ref", context)
 	}
+	switch schema.DialectForDatabaseType(databaseType) {
+	case schema.DialectMySQL:
+		if c.ConfigPaths.DBName != "" {
+			return fmt.Errorf("%s dsn_from config_paths.dbname is only supported for postgres databases; use config_paths.database", context)
+		}
+	case schema.DialectPostgres:
+		if c.ConfigPaths.Database != "" {
+			return fmt.Errorf("%s dsn_from config_paths.database is not supported for postgres databases; use config_paths.dbname", context)
+		}
+		if err := inventory.ValidatePostgresDSNParams(c.Params); err != nil {
+			return fmt.Errorf("%s dsn_from: %w", context, err)
+		}
+	default:
+		return fmt.Errorf("%s dsn_from is not supported with database type %q; use dsn", context, databaseType)
+	}
 	return nil
 }
 
-func (c *DSNFromConfig) Resolve() (string, error) {
-	if err := c.Validate("database connection"); err != nil {
+// Resolve assembles the DSN for a database of the given type from the
+// referenced config document and password, both read fresh.
+func (c *DSNFromConfig) Resolve(databaseType string) (string, error) {
+	if err := c.Validate("database connection", databaseType); err != nil {
 		return "", err
 	}
 
@@ -4206,14 +4232,19 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 		return "", fmt.Errorf("parse database config: %w", err)
 	}
 
-	paths := c.configPaths()
+	paths := c.configPaths(databaseType)
 	host, err := stringAtPath(config, paths.Host)
 	if err != nil {
 		return "", fmt.Errorf("read database config host: %w", err)
 	}
-	database, err := stringAtPath(config, paths.Database)
+	isPostgres := schema.DialectForDatabaseType(databaseType) == schema.DialectPostgres
+	databaseField, databasePath := "database", paths.Database
+	if isPostgres {
+		databaseField, databasePath = "dbname", paths.DBName
+	}
+	database, err := stringAtPath(config, databasePath)
 	if err != nil {
-		return "", fmt.Errorf("read database config database: %w", err)
+		return "", fmt.Errorf("read database config %s: %w", databaseField, err)
 	}
 	port, err := optionalIntAtPath(config, paths.Port)
 	if err != nil {
@@ -4229,9 +4260,13 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 		return "", fmt.Errorf("resolve database password reference: %w", err)
 	}
 
+	if isPostgres {
+		return c.assemblePostgres(endpoint, password)
+	}
+
 	mysqlConfig := gomysql.NewConfig()
 	mysqlConfig.Net = "tcp"
-	mysqlConfig.Addr = endpoint.address()
+	mysqlConfig.Addr = endpoint.address("3306")
 	mysqlConfig.User = c.Username
 	mysqlConfig.Passwd = password
 	mysqlConfig.DBName = endpoint.Database
@@ -4240,13 +4275,37 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 	return mysqlConfig.FormatDSN(), nil
 }
 
-func (c *DSNFromConfig) configPaths() DSNFromConfigPaths {
+// assemblePostgres builds the libpq URL through the same assembler a
+// target_resolver target's dsn_from uses, so both blocks escape, require a
+// database name, and pin sslmode=verify-full identically. No CA reference is
+// configured, so the assembler resolves one only for an RDS host, to the
+// embedded RDS bundle the connection layer already verifies a verify-full RDS
+// DSN against; any other host fails here rather than falling back to ambient
+// trust. That makes the returned metadata safe to drop: it carries nothing the
+// local connection does not already enforce.
+func (c *DSNFromConfig) assemblePostgres(endpoint externalDatabaseEndpoint, password string) (string, error) {
+	assembler := inventory.PostgresConnectionAssembler{Params: c.Params}
+	attrs := map[string]string{inventory.PostgresDBNameAttribute: endpoint.Database}
+	dsn, _, err := assembler.Assemble(endpoint.address("5432"), attrs, &inventory.Credentials{Username: c.Username, Password: password})
+	if err != nil {
+		return "", fmt.Errorf("assemble postgres DSN: %w", err)
+	}
+	return dsn, nil
+}
+
+func (c *DSNFromConfig) configPaths(databaseType string) DSNFromConfigPaths {
 	paths := c.ConfigPaths
 	if paths.Host == "" {
 		paths.Host = "host"
 	}
 	if paths.Port == "" {
 		paths.Port = "port"
+	}
+	if schema.DialectForDatabaseType(databaseType) == schema.DialectPostgres {
+		if paths.DBName == "" {
+			paths.DBName = inventory.PostgresDBNameAttribute
+		}
+		return paths
 	}
 	if paths.Database == "" {
 		paths.Database = "database"
@@ -4332,12 +4391,12 @@ func (e externalDatabaseEndpoint) validate() error {
 	return nil
 }
 
-func (e externalDatabaseEndpoint) address() string {
+func (e externalDatabaseEndpoint) address(defaultPort string) string {
 	if _, _, err := net.SplitHostPort(e.Host); err == nil {
 		return e.Host
 	}
 	if e.Port == 0 {
-		return net.JoinHostPort(e.Host, "3306")
+		return net.JoinHostPort(e.Host, defaultPort)
 	}
 	return net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
 }
