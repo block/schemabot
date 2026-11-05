@@ -236,8 +236,22 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.ExecutePullSchema(r.Context(), req)
+	// Reading a large database's live schema outlasts the server-wide write
+	// timeout, so this route gets its own budget. Without it the read finishes
+	// and its response is lost on a connection already closed under it.
+	ctx, cancel := s.extendOperatorWriteDeadline(w, r, apitypes.PullSchemaBudget)
+	defer cancel()
+
+	resp, err := s.ExecutePullSchema(ctx, req)
 	if err != nil {
+		// A caller that hangs up mid-pull cancels the read. Nothing failed on
+		// this side and there is no one left to answer, so the pull ends here
+		// with a warning rather than an error and an unwritable response.
+		if r.Context().Err() != nil {
+			s.logger.Warn("pull schema abandoned because the caller disconnected before it finished",
+				pullFailureLogAttrs(req, err)...)
+			return
+		}
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("pull schema rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
@@ -268,22 +282,28 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if unavailableErr, ok := errors.AsType[*RemoteDeploymentUnavailableError](err); ok {
-			s.logger.Error("pull schema failed because remote deployment is unavailable",
-				"database", req.Database,
-				"environment", req.Environment,
-				"deployment", unavailableErr.Deployment,
-				"target", unavailableErr.Target,
-				"error", err)
+		if _, ok := errors.AsType[*RemoteDeploymentUnavailableError](err); ok {
+			s.logger.Error("pull schema failed because remote deployment is unavailable", pullFailureLogAttrs(req, err)...)
 			s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "pull schema failed: "+err.Error())
 			return
 		}
-		s.logger.Error("pull schema failed", "database", req.Database, "environment", req.Environment, "error", err)
+		s.logger.Error("pull schema failed", pullFailureLogAttrs(req, err)...)
 		s.writeError(w, http.StatusInternalServerError, "pull schema failed: "+err.Error())
 		return
 	}
 
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// pullFailureLogAttrs are the identifiers a failed pull is logged with. When
+// the failure is one target's read, they name that target, namespace, and
+// data-plane endpoint, so the single log line says where the read went.
+func pullFailureLogAttrs(req apitypes.PullSchemaRequest, err error) []any {
+	attrs := []any{"database", req.Database, "environment", req.Environment}
+	if memberErr, ok := errors.AsType[*memberPullError](err); ok {
+		attrs = append(attrs, memberErr.logAttrs()...)
+	}
+	return append(attrs, "error", err)
 }
 
 // ExecutePullSchema resolves a configured database route and fetches its live schema.

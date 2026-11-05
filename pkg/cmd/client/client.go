@@ -209,7 +209,7 @@ func CallPullSchemaAPIWithContext(ctx context.Context, endpoint, database, dbTyp
 		Lint:          opts.Lint,
 	}
 	var result apitypes.PullSchemaResponse
-	if err := doPostIntoWithClient(ctx, httpClient, endpoint, "/api/pull", req, &result); err != nil {
+	if err := doPostIntoWithClient(ctx, pullHTTPClient, endpoint, "/api/pull", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
