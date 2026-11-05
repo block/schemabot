@@ -402,10 +402,11 @@ var refusedStatuses = map[string]string{
 func (r *Runner) waitForStatus(ctx context.Context, cur *run, applyID, want string, applied onApplied, command int64) error {
 	var last string
 	err := r.poll(ctx, func(ctx context.Context) (bool, error) {
-		comments, err := r.botComments(ctx, cur.pr)
+		all, err := r.gh.Comments(ctx, cur.pr)
 		if err != nil {
 			return false, err
 		}
+		comments := r.fromBot(all)
 		s, ok := latestApplyStatus(comments, applyID)
 		if final, finished := finishedStatus(comments, applyID); finished {
 			// A summary can land while the status comment still shows an
@@ -415,7 +416,7 @@ func (r *Runner) waitForStatus(ctx context.Context, cur *run, applyID, want stri
 		if command != 0 {
 			// The copy can finish before the command lands, and the refusal
 			// can arrive while the status comment still shows an earlier state.
-			if finished, refused := refusedAsFinished(comments, command); refused {
+			if finished, refused := r.commandRefusedAsFinished(all, command); refused {
 				label, known := refusedStatuses[finished]
 				if !known {
 					return false, fmt.Errorf("SchemaBot refused the command for apply %s, which finished in unknown state %q", applyID, finished)
@@ -642,21 +643,45 @@ func (r *Runner) closedRunsFinished(ctx context.Context, branch string) error {
 // the first SchemaBot reply after the cancel counts, so a refusal of a later
 // command for another apply cannot pass for it.
 func (r *Runner) cancelRefusedAsFinished(all []Comment, applyID string) bool {
-	bot := r.fromBot(all)
 	for _, c := range all {
 		fields := strings.Fields(c.Body)
 		if r.isBot(c) || len(fields) < 3 || fields[0] != r.cfg.CommandPrefix || fields[1] != "cancel" || fields[2] != applyID {
 			continue
 		}
-		reply, ok := firstCommentAfter(bot, c.ID)
-		if !ok {
-			continue
-		}
-		if _, refused := refusedAsFinished([]Comment{reply}, c.ID); refused {
+		if _, refused := r.commandRefusedAsFinished(all, c.ID); refused {
 			return true
 		}
 	}
 	return false
+}
+
+// commandRefusedAsFinished returns the state SchemaBot named when it refused
+// the command posted as comment command because the apply had already
+// finished. Only SchemaBot's reply to that command counts.
+func (r *Runner) commandRefusedAsFinished(all []Comment, command int64) (string, bool) {
+	reply, ok := r.replyTo(all, command)
+	if !ok {
+		return "", false
+	}
+	return refusedAsFinished([]Comment{reply}, command)
+}
+
+// replyTo returns SchemaBot's reply to the command posted as comment command:
+// its first comment after the command, unless another command came first.
+// Once a later command lands, the next reply may answer that one instead, so
+// it proves nothing about this command.
+func (r *Runner) replyTo(all []Comment, command int64) (Comment, bool) {
+	reply, ok := firstCommentAfter(r.fromBot(all), command)
+	if !ok {
+		return Comment{}, false
+	}
+	for _, c := range all {
+		fields := strings.Fields(c.Body)
+		if c.ID > command && c.ID < reply.ID && !r.isBot(c) && len(fields) > 0 && fields[0] == r.cfg.CommandPrefix {
+			return Comment{}, false
+		}
+	}
+	return reply, true
 }
 
 // firstCommentAfter returns the earliest comment posted after the comment
@@ -733,16 +758,17 @@ func (r *Runner) closeRun(ctx context.Context, cur *run) error {
 func (r *Runner) waitForTerminal(ctx context.Context, cur *run, applyID string, cancelID int64) error {
 	var last, refusedState string
 	err := r.poll(ctx, func(ctx context.Context) (bool, error) {
-		comments, err := r.botComments(ctx, cur.pr)
+		all, err := r.gh.Comments(ctx, cur.pr)
 		if err != nil {
 			return false, err
 		}
+		comments := r.fromBot(all)
 		if _, finished := finishedStatus(comments, applyID); finished {
 			return true, nil
 		}
 		s, _ := latestApplyStatus(comments, applyID)
 		last = s.Status
-		refusedState, _ = refusedAsFinished(comments, cancelID)
+		refusedState, _ = r.commandRefusedAsFinished(all, cancelID)
 		return refusedState != "", nil
 	})
 	if err != nil {

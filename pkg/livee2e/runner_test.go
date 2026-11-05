@@ -74,6 +74,8 @@ type fakeSchemaBot struct {
 	// onCommand, when set, sees every PR command once SchemaBot has
 	// answered it.
 	onCommand func(body string)
+	// cancelUnanswered leaves every cancel without a reply.
+	cancelUnanswered bool
 	// commands records every PR command, in order.
 	commands []string
 }
@@ -305,6 +307,9 @@ func (f *fakeSchemaBot) respond(number int, args []string) {
 		}
 		f.post(number, args[2], state.Apply.Running)
 	case "cancel":
+		if f.cancelUnanswered {
+			return
+		}
 		if f.cancelRefusedAsFinished {
 			f.comments[number] = append(f.comments[number], Comment{
 				ID: f.id(), Author: "schemabot[bot]", IsBot: true,
@@ -1023,4 +1028,55 @@ func TestRunCleansUpAfterItIsCancelled(t *testing.T) {
 	assert.False(t, bot.prs[1].open)
 	assert.NotContains(t, bot.heads, BranchPrefix+testTable)
 	assert.False(t, target.has(testTable))
+}
+
+// Once someone posts another command, SchemaBot's next reply may answer that
+// one, so cleanup must not read it as proof that its own cancel's apply
+// finished.
+func TestRunKeepsItsTableWhenOnlyAnotherCancelIsRefusedAsFinished(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	bot.onCommand = func(body string) {
+		switch {
+		case strings.Contains(body, "--defer-cutover"):
+			// Stop the run with the deferred apply waiting, and leave the
+			// cleanup's cancel of it unanswered.
+			cancel()
+			bot.cancelUnanswered = true
+		case bot.cancelUnanswered && strings.Contains(body, " cancel "):
+			bot.comments[1] = append(bot.comments[1],
+				Comment{ID: bot.id(), Author: "octocat", Body: "schemabot cancel apply-00000000000000bb -e development"},
+				Comment{ID: bot.id(), Author: "schemabot[bot]", IsBot: true, Body: renderAlreadyFinished(state.Apply.Completed)},
+			)
+		}
+	}
+	err := testRunner(t, bot, target).Run(ctx)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "clean up run "+testTable)
+	assert.Contains(t, bot.heads, BranchPrefix+testTable, "the branch, and with it the pull request, stays for the next sweep")
+	assert.True(t, bot.prs[1].open)
+	assert.True(t, target.has(testTable))
+}
+
+// The sweep reads a cancel's answer the same way.
+func TestSweepIgnoresAReplyToALaterCancel(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier}
+	bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+	bot.comments[1] = append(bot.comments[1],
+		Comment{ID: bot.id(), Author: "octocat", Body: "schemabot cancel apply-00000000000000aa -e development"},
+		Comment{ID: bot.id(), Author: "octocat", Body: "schemabot cancel apply-00000000000000bb -e development"},
+		Comment{ID: bot.id(), Author: "schemabot[bot]", IsBot: true, Body: renderAlreadyFinished(state.Apply.Completed)},
+	)
+
+	err := testRunner(t, bot, target).Sweep(t.Context())
+
+	require.ErrorContains(t, err, "apply-00000000000000aa unfinished")
+	assert.True(t, target.has(earlier))
 }
