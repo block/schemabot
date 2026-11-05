@@ -738,7 +738,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 			c.logger.Info("conflict check: settled a stale task into a resting state; it keeps blocking the database while its apply is still claimable",
 				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error_message", t.ErrorMessage)...)
 			if state.IsState(settledState, state.Task.FailedRetryable) {
-				c.pauseStaleApplyForRetry(ctx, t, apply, op)
+				c.pauseStaleApplyForRetry(ctx, t, &previous, apply, op)
 			}
 			return false
 		}
@@ -811,6 +811,19 @@ func staleTaskSettlementRests(settledState string) bool {
 // recovers the apply. Either way the task keeps blocking, so nothing here
 // changes what the conflict check reports.
 //
+// The pause is attempted once, in the pass that settles the task. A later
+// conflict check meets a task that already rests failed_retryable, which it
+// leaves alone, so an apply whose pause was refused or failed is recovered by
+// the stale-active claim without a charge. That uncharged path is one recovery
+// long: the drive that re-leases the apply records the next failure itself,
+// through the paths that charge the budget.
+//
+// An apply in a revert phase, or a task that was in one before it settled
+// (settledFrom), is left in it. The retryable claim rewinds the apply it
+// claims to running, and a spent budget settles it failed over a change that
+// already cut over; both erase the stored phase that revert-phase handling,
+// not forward-apply handling, owns the outcome of.
+//
 // Multi-operation applies move the same way. The rollout projection derives a
 // failed_retryable parent from any failed_retryable operation, so the pair this
 // writes is the state the projection would reach once the operation recorded
@@ -823,7 +836,12 @@ func staleTaskSettlementRests(settledState string) bool {
 // An operation parked at the cutover barrier is left as today: its copy is
 // done and it is reserved for the cutover claim, so routing it through the
 // retryable copy claim would take it out of the barrier's ordering.
-func (c *LocalClient) pauseStaleApplyForRetry(ctx context.Context, t *storage.Task, apply *storage.Apply, op *storage.ApplyOperation) {
+func (c *LocalClient) pauseStaleApplyForRetry(ctx context.Context, t, settledFrom *storage.Task, apply *storage.Apply, op *storage.ApplyOperation) {
+	if applyInRevertPhase(apply) || taskInRevertPhase(settledFrom) {
+		c.logger.Info("conflict check: the stale task was in a revert phase, so its apply is left in that phase rather than paused for retry",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State, "settled_from", settledFrom.State)...)
+		return
+	}
 	if op != nil && state.IsState(op.State, state.ApplyOperation.WaitingForCutover) {
 		c.logger.Info("conflict check: the stale task's operation is parked at the cutover barrier, so its apply is left for the cutover claim rather than paused for retry",
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "operation_deployment", op.Deployment)...)
@@ -845,7 +863,7 @@ func (c *LocalClient) pauseStaleApplyForRetry(ctx context.Context, t *storage.Ta
 		return
 	}
 	if !moved {
-		c.logger.Info("conflict check: the stale task's apply was not paused for retry, because another writer moved it first or a live drive holds a lease under it; it is left to that writer",
+		c.logger.Info("conflict check: storage refused to pause the stale task's apply for retry, so it is left to the writer that holds it; the storage debug log names the row and the reason",
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", req.OperationID)...)
 		return
 	}
