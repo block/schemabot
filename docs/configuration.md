@@ -2029,7 +2029,7 @@ Repo admins sit between the global admin policy and per-database operators: they
 
 > **Note:** a populated `repos:` map doubles as a repository allowlist — once any repository is listed, only listed repositories may use SchemaBot. If you add a repo entry solely to configure its admins, make sure every other repository this deployment serves is also listed, or they will be rejected as unregistered.
 
-The PR author's own approval never counts, even if they match one of the configured principals. If the GitHub API fails while checking reviews or team membership, SchemaBot blocks the apply and posts an error comment.
+The PR author's own approval never counts, even if they match one of the configured principals. An approval from someone who is not one of these principals does not count either; the Review Required comment names that reviewer and, when the database's operators include a team, offers adding them to it. It never offers an admin or CODEOWNERS team, since joining one grants approval beyond this database. Team membership is checked on every apply, so once they join, running the apply again counts the approval they already gave. When re-approval is required (see below), that approval must still cover the PR's schema change, so a reviewer who approved an earlier commit is also asked to approve the latest one, which always counts once they join. If the GitHub API fails while checking reviews or team membership, SchemaBot blocks the apply and posts an error comment.
 
 CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review policy is server-controlled. When `include_codeowners` is true, SchemaBot looks for CODEOWNERS in the standard GitHub locations on the base branch:
 

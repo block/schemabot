@@ -1526,6 +1526,21 @@ func PreviewCommentReviewRequired() string {
 	})
 }
 
+// PreviewCommentReviewRequiredUnauthorizedApprover renders the "review
+// required" comment when the PR's only approval comes from a reviewer who is
+// not an authorized reviewer for the database.
+func PreviewCommentReviewRequiredUnauthorizedApprover() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:              "testapp",
+		Environment:           "production",
+		RequestedBy:           previewRequestedBy,
+		OperatorReviewers:     []string{"acme/testapp-operators"},
+		OtherReviewers:        []string{"acme/schema-reviewers"},
+		PRAuthor:              previewRequestedBy,
+		UnauthorizedApprovers: []string{"jdoe"},
+	})
+}
+
 // PreviewCommentReviewRequiredNoOperators renders the "review required"
 // comment for a database with no configured operators: a single flat list of
 // authorized reviewers.

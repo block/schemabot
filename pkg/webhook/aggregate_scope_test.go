@@ -3,10 +3,14 @@ package webhook
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -31,6 +35,13 @@ func serveAggregateScopeInputs(t *testing.T, mux *http.ServeMux, paths []string,
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "base"}}))
 	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "diff") {
+			writeRegularFilesDiff(t, w, paths)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"merge_base_commit": map[string]string{"sha": "base"}}))
+	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, req *http.Request) {
 		entries := []map[string]string{}
 		if strings.HasSuffix(req.URL.Path, "/abc123") {
@@ -43,6 +54,49 @@ func serveAggregateScopeInputs(t *testing.T, mux *http.ServeMux, paths []string,
 			"type": "file", "encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(schemaConfig)),
 		}))
 	})
+}
+
+// writeRegularFilesDiff answers a compare diff request with a diff in which
+// every path is a modified regular file, so reading the changed files' modes
+// finds no symlink.
+func writeRegularFilesDiff(t *testing.T, w http.ResponseWriter, paths []string) {
+	t.Helper()
+	files := make([]*gh.CommitFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, &gh.CommitFile{Filename: new(p), Status: new("modified")})
+	}
+	writeCommitFilesDiff(t, w, files)
+}
+
+// writeCommitFilesDiff answers a compare diff request with the git diff
+// headers of files, the way GitHub writes them, so reading the changed files'
+// modes sees each file's status. Every file is a regular file except the
+// paths in symlinks, which are symlinks on every side they exist.
+func writeCommitFilesDiff(t *testing.T, w http.ResponseWriter, files []*gh.CommitFile, symlinks ...string) {
+	t.Helper()
+	mode := func(p string) string {
+		if slices.Contains(symlinks, p) {
+			return "120000"
+		}
+		return "100644"
+	}
+	var diff strings.Builder
+	for _, f := range files {
+		name, previous := f.GetFilename(), f.GetPreviousFilename()
+		switch f.GetStatus() {
+		case "added":
+			fmt.Fprintf(&diff, "diff --git a/%s b/%s\nnew file mode %s\nindex 0000000..2222222\n", name, name, mode(name))
+		case "removed":
+			fmt.Fprintf(&diff, "diff --git a/%s b/%s\ndeleted file mode %s\nindex 1111111..0000000\n", name, name, mode(name))
+		case "renamed":
+			fmt.Fprintf(&diff, "diff --git a/%s b/%s\nsimilarity index 90%%\nrename from %s\nrename to %s\nindex 1111111..2222222 %s\n", previous, name, previous, name, mode(name))
+		default:
+			fmt.Fprintf(&diff, "diff --git a/%s b/%s\nindex 1111111..2222222 %s\n", name, name, mode(name))
+		}
+		diff.WriteString("@@ -1 +1 @@\n")
+	}
+	_, err := io.WriteString(w, diff.String())
+	require.NoError(t, err)
 }
 
 // Publication follows repository registrations. Applicable work without a
