@@ -15,6 +15,5 @@ CREATE TABLE apply_logs (
 );
 CREATE INDEX idx_apply_logs_apply_created ON apply_logs (apply_id, created_at);
 CREATE INDEX idx_apply_logs_task_id ON apply_logs (task_id);
-CREATE INDEX idx_apply_logs_apply_operation_id ON apply_logs (apply_operation_id);
 CREATE INDEX idx_apply_logs_level ON apply_logs (level);
 CREATE INDEX idx_apply_logs_event_type ON apply_logs (event_type);
