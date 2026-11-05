@@ -99,9 +99,9 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		}
 
 		if len(applies) == 0 {
-			s.writeJSON(w, http.StatusOK, map[string]any{
+			s.writeJSON(w, http.StatusOK, withLogScope(map[string]any{
 				"logs": []any{},
-			})
+			}, scope))
 			return
 		}
 		apply = applies[0]
@@ -163,11 +163,24 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		logEntries[i] = entry
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, http.StatusOK, withLogScope(map[string]any{
 		"logs":      logEntries,
 		"apply_id":  apply.ApplyIdentifier,
 		"truncated": truncated,
-	})
+	}, scope))
+}
+
+// withLogScope echoes the target and shard a read was narrowed to. A server
+// that predates scoped reads ignores the parameters and serves the whole log,
+// so the echo is how a client tells a scoped read from an unscoped one.
+func withLogScope(body map[string]any, scope logScope) map[string]any {
+	if scope.target != "" {
+		body["target"] = scope.target
+	}
+	if scope.shard != "" {
+		body["shard"] = scope.shard
+	}
+	return body
 }
 
 // logFetchLimit is how many entries to read for a requested window of limit
@@ -218,7 +231,7 @@ func (sc logScope) operations(where string, ops []*storage.ApplyOperation) ([]in
 	if sc.target != "" {
 		onTarget := storage.OperationsOnTarget(ops, sc.target)
 		if len(onTarget) == 0 {
-			return nil, targetRefusal(where, ops, sc.target)
+			return nil, targetNotInApplyMessage(where, ops, sc.target)
 		}
 		operationIDs = storage.LogOperationsOnTarget(onTarget, sc.target)
 		ops = onTarget
@@ -237,7 +250,10 @@ func (sc logScope) operations(where string, ops []*storage.ApplyOperation) ([]in
 	return nil, fmt.Sprintf("shard %q has no operations in %s; its shards are %s", sc.shard, where, strings.Join(shards, ", "))
 }
 
-func targetRefusal(where string, ops []*storage.ApplyOperation, target string) string {
+// targetNotInApplyMessage names the targets ops do run on, so a mistyped
+// target can be corrected from the error alone. where names the part of the
+// apply ops belong to, such as `apply "apply-a"`.
+func targetNotInApplyMessage(where string, ops []*storage.ApplyOperation, target string) string {
 	targets := storage.DistinctOperationTargets(ops)
 	if len(targets) == 0 {
 		return fmt.Sprintf("%s has no per-target operations; omit target", where)
@@ -409,7 +425,7 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no remote operation logs; omit --deployment to read control-plane logs", deployment))
 		return
 	}
-	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
+	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Target: scope.target, Shard: scope.shard, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
 	keys := sortedFetchKeys(fetches)
 	// The data plane serves at most tern.MaxLogsLimit entries per read and
 	// silently serves the cap to larger requests, which would swallow the

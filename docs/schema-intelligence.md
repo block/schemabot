@@ -2022,8 +2022,11 @@ A multi-target apply writes every target's lifecycle into one log. Add
 `target` (CLI: `--target`) to read one of them: the response keeps that
 target's entries and the entries about the apply as a whole, such as its state
 changes, and drops every other target's. The response has the same shape as
-the full log. `target` also narrows a [deployment read](#read-deployment-logs)
-to that target's sources.
+the full log, plus a `target` field that echoes the target it was narrowed to;
+a server that predates scoped reads omits it, and the CLI refuses that answer
+rather than show every target's entries as one target's. `target` also narrows
+a [deployment read](#read-deployment-logs) to that target's sources, and that
+response echoes `target` the same way.
 
 <details>
 <summary>Read one target's log</summary>
@@ -2037,6 +2040,7 @@ Response excerpt (illustrative values):
 ```json
 {
   "apply_id": "apply-example-73",
+  "target": "shop-002",
   "truncated": false,
   "logs": [
     {
@@ -2081,6 +2085,7 @@ such as `-80` repeat across targets, so a shard read without `target` covers
 that shard on every target; add `target` to read one target's shard. `shard`
 also narrows a [deployment read](#read-deployment-logs): the data plane is asked
 for that shard's entries, and each source credits only that shard's operations.
+Both responses echo `shard` the way they echo `target`.
 
 <details>
 <summary>Read one shard of one target</summary>
@@ -2089,7 +2094,8 @@ for that shard's entries, and each source credits only that shard's operations.
 GET /api/logs?apply_id=apply-example-73&target=shop-002&shard=-80
 ```
 
-The response has the same shape as the full log.
+The response has the same shape as the full log, with `"target": "shop-002"`
+and `"shard": "-80"` echoed.
 
 </details>
 

@@ -1045,7 +1045,31 @@ func GetLogs(endpoint, database, environment, applyID string, scope LogScope, li
 	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
+	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {
+		return nil, err
+	}
 	return &result, nil
+}
+
+// requireEchoed refuses a scoped read the server answered unscoped. A server
+// that predates scoped reads ignores the target or shard and serves the whole
+// apply's entries interleaved, which would read as the one target's or shard's
+// history.
+func (scope LogScope) requireEchoed(target, shard string) error {
+	if err := requireEchoedScope("target", "--target", scope.Target, target); err != nil {
+		return err
+	}
+	return requireEchoedScope("shard", "--shard", scope.Shard, shard)
+}
+
+func requireEchoedScope(kind, flag, requested, echoed string) error {
+	if requested == "" || echoed == requested {
+		return nil
+	}
+	if echoed == "" {
+		return fmt.Errorf("the server does not support reading one %s's logs and returned the whole apply's; upgrade the server or omit %s", kind, flag)
+	}
+	return fmt.Errorf("the server answered a read of %s %q with %s %q's logs", kind, requested, kind, echoed)
 }
 
 // GetDeploymentLogs retrieves an apply's logs from one data-plane deployment,
@@ -1061,6 +1085,9 @@ func GetDeploymentLogs(endpoint, applyID, deployment string, scope LogScope, lim
 	}
 	var result apitypes.DeploymentLogsResponse
 	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {
 		return nil, err
 	}
 	return &result, nil
