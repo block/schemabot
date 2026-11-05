@@ -47,12 +47,12 @@ func newGitHubRateLimitTransportWithTotalAllowance(base http.RoundTripper, total
 	}
 	options = append(options,
 		github_primary_ratelimit.WithLimitDetectedCallback(func(c *github_primary_ratelimit.CallbackContext) {
-			metrics.RecordGitHubPrimaryRateLimitRejection(c.Request.Context(), t.sample(c.Request, string(c.Category)), metrics.GitHubRejectionOriginHTTP)
+			t.recordPrimaryQuotaResponse(c, string(c.Category))
 		}),
 		github_primary_ratelimit.WithUnknownCategoryCallback(func(c *github_primary_ratelimit.CallbackContext) {
 			// This branch has verified quota exhaustion but cannot track its bucket.
 			// Keep the rejection visible without exporting an unbounded header value.
-			metrics.RecordGitHubPrimaryRateLimitRejection(c.Request.Context(), t.sample(c.Request, ""), metrics.GitHubRejectionOriginHTTP)
+			t.recordPrimaryQuotaResponse(c, "unknown")
 		}),
 		github_primary_ratelimit.WithRequestPreventedCallback(func(c *github_primary_ratelimit.CallbackContext) {
 			if observation, ok := c.Request.Context().Value(primaryRejectionObservationKey{}).(*primaryRejectionObservation); ok {
@@ -62,6 +62,32 @@ func newGitHubRateLimitTransportWithTotalAllowance(base http.RoundTripper, total
 	)
 	t.base = github_ratelimit.New(base, options...)
 	return t
+}
+
+// Log only HTTP detections, not each subsequent local refusal. The reporting
+// repository encountered the exhausted shared budget; it need not have spent it.
+func (t *githubQuotaWaitTransport) recordPrimaryQuotaResponse(c *github_primary_ratelimit.CallbackContext, resource string) {
+	sample := t.sample(c.Request, resource)
+	metrics.RecordGitHubPrimaryRateLimitRejection(c.Request.Context(), sample, metrics.GitHubRejectionOriginHTTP)
+	repository := githubRateLimitContextFromRequest(c.Request).repository
+	if metricCtx, ok := githubRateLimitContextFrom(c.Request.Context()); ok && metricCtx.repository != "" {
+		repository = metricCtx.repository
+	}
+	if repository == "" {
+		repository = "unknown"
+	}
+	app := sample.GitHubApp
+	if app == "" {
+		app = "unknown"
+	}
+	reset := "unknown"
+	if c.ResetTime != nil {
+		reset = c.ResetTime.UTC().Format(time.RFC3339)
+	}
+	slog.WarnContext(c.Request.Context(), "GitHub primary quota exhausted",
+		"repo", repository, "operation", sample.Operation,
+		"github_app", app, "installation_id", sample.InstallationID,
+		"resource", resource, "reset_time", reset)
 }
 
 func (t *githubQuotaWaitTransport) cooldownCallback(disposition string) func(*github_secondary_ratelimit.CallbackContext) {

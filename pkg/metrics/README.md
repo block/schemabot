@@ -80,7 +80,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
-| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP or local prevention; any event is actionable |
+| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP or local prevention; investigate shared quota usage and blocked work (see guidance below) |
 | `schemabot.github.secondary_rate_limit_cooldown_reports_total` | Counter | environment, operation, resource, github_app, installation_id, disposition | Parsed secondary cooldown decisions, including accepted and exceeded allowances |
 | `schemabot.github.wait_duration_seconds` | Histogram (seconds) | environment, operation, resource, github_app, installation_id, layer, reason | Actual elapsed outer read-retry waits, including cancellation/deadline interruptions |
 | `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
@@ -613,6 +613,22 @@ remain HTTP errors. HTTP-origin quota rejections intentionally overlap HTTP
 errors; never add these counters together into one error total.
 Quota refusals with a missing or unrecognized resource header still count as
 HTTP-origin rejections with `resource=unknown`; their response handling is unchanged.
+
+Each HTTP-origin primary quota detection also emits a `GitHub primary quota exhausted`
+warning with `repo`, `operation`, `github_app`, `installation_id`, `resource`, and
+`reset_time` (UTC). Local refusals do not emit this warning. Missing or unfamiliar
+resources use `unknown`; requests without repository attribution use `repo=unknown`.
+Repeated HTTP detections can still produce repeated warnings, including for
+unknown buckets that the limiter cannot cache.
+
+On a quota alert, find this warning for the installation/resource and check the
+reset time. The logged repository encountered exhaustion; it is not necessarily
+the repository that consumed the shared budget. Compare `requests_total` volume
+by repository and operation for that installation/resource before exhaustion to
+locate excess traffic, then reduce avoidable requests or repeated redrives. After
+reset, verify fresh successful checks for affected repositories before declaring
+recovery. Keep the rejection counter as the direct alert signal, including
+locally blocked calls; use the warning for investigation context.
 
 Secondary limiter callbacks emit one report with disposition: `accepted`,
 `single_sleep_limit_exceeded`, or `total_sleep_limit_exceeded`. The existing

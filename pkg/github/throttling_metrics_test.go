@@ -1,10 +1,13 @@
 package github
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -191,6 +194,79 @@ func TestGitHubPrimaryQuotaUnknownResource(t *testing.T) {
 				assert.Equal(t, tc.httpStatus, status.AsString())
 			})
 		}
+	}
+}
+
+// HTTP quota detections carry triage context without logging each local refusal.
+// Unknown buckets remain observable, and ordinary permission failures stay quiet.
+func TestGitHubPrimaryQuotaWarnings(t *testing.T) {
+	for _, tc := range []struct {
+		name, resource, path, contextRepo, wantRepo, wantOperation string
+		remaining                                                  string
+		wantWarnings                                               int
+	}{
+		{"recognized", "core", "/repos/octocat/example/pulls/1", "", "octocat/example", metrics.GitHubOperationFetchPullRequest, "0", 1},
+		{"unknown_resource", "search_v2", "/repos/octocat/example/pulls/1", "", "octocat/example", metrics.GitHubOperationFetchPullRequest, "0", 2},
+		{"missing_resource", "", "/repos/octocat/example/pulls/1", "", "octocat/example", metrics.GitHubOperationFetchPullRequest, "0", 2},
+		{"context_repository", "graphql", "/graphql", "octocat/context-repo", "octocat/context-repo", metrics.GitHubOperationGraphQLMinimizeComment, "0", 2},
+		{"no_repository", "core", "/app", "", "unknown", metrics.GitHubOperationFetchAppSlug, "0", 1},
+		{"permission", "core", "/repos/octocat/example/pulls/1", "", "", "", "100", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			reset := time.Now().Add(time.Minute).Truncate(time.Second).UTC()
+			rt := metricTestTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				header := http.Header{}
+				header.Set("X-RateLimit-Resource", tc.resource)
+				header.Set("X-RateLimit-Remaining", tc.remaining)
+				header.Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
+				return &http.Response{StatusCode: http.StatusForbidden, Header: header, Request: req, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+			}))
+			ctx := t.Context()
+			if tc.contextRepo != "" {
+				ctx = withGitHubRateLimitContext(ctx, tc.wantOperation, tc.contextRepo)
+			}
+			req := throttlingRequest(t, ctx, http.MethodGet, "https://api.github.com"+tc.path+"?private_query=omit-me")
+			req.Header.Set("Authorization", "Bearer omit-me")
+			for range 2 {
+				resp, err := rt.RoundTrip(req)
+				if err != nil {
+					var quotaErr *github_primary_ratelimit.RateLimitReachedError
+					require.ErrorAs(t, err, &quotaErr)
+					require.NoError(t, quotaErr.Response.Body.Close())
+				} else {
+					require.NotNil(t, resp)
+					require.NoError(t, resp.Body.Close())
+				}
+			}
+			assert.NotContains(t, logs.String(), "omit-me")
+			var warnings []map[string]any
+			decoder := json.NewDecoder(&logs)
+			for decoder.More() {
+				var entry map[string]any
+				require.NoError(t, decoder.Decode(&entry))
+				if entry["msg"] == "GitHub primary quota exhausted" {
+					warnings = append(warnings, entry)
+				}
+			}
+			require.Len(t, warnings, tc.wantWarnings)
+			resource := tc.resource
+			if resource == "" || resource == "search_v2" {
+				resource = "unknown"
+			}
+			for _, entry := range warnings {
+				assert.Equal(t, "WARN", entry["level"])
+				assert.Equal(t, tc.wantRepo, entry["repo"])
+				assert.Equal(t, tc.wantOperation, entry["operation"])
+				assert.Equal(t, "test-app", entry["github_app"])
+				assert.Equal(t, float64(42), entry["installation_id"])
+				assert.Equal(t, resource, entry["resource"])
+				assert.Equal(t, reset.Format(time.RFC3339), entry["reset_time"])
+			}
+		})
 	}
 }
 
