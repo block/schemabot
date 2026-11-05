@@ -109,6 +109,15 @@ func serveLeaderPRFiles(t *testing.T, mux *http.ServeMux, path string) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": defaultTip}}))
 	})
+	// Reading the changed files' modes finds the merge base, then reads the
+	// compare diff, which shows the path as a regular file.
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "diff") {
+			writeRegularFilesDiff(t, w, []string{path})
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"merge_base_commit": map[string]string{"sha": "merge-base"}}))
+	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, req *http.Request) {
 		treeSHA := strings.TrimPrefix(req.URL.Path, "/repos/octocat/hello-world/git/trees/")
 		entries := []map[string]string{}
