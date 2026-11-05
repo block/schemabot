@@ -87,15 +87,22 @@ func (g *apiGitHub) CreateBranch(ctx context.Context, branch, sha string) error 
 
 func (g *apiGitHub) DeleteBranch(ctx context.Context, branch string) error {
 	resp, err := g.client.Git.DeleteRef(ctx, g.owner, g.repo, "heads/"+branch)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
-			// The branch is already gone: a closed pull request's branch may
-			// have been deleted by repository settings or an earlier sweep.
-			return nil
-		}
-		return fmt.Errorf("delete branch %s in %s/%s: %w", branch, g.owner, g.repo, err)
+	if err == nil {
+		return nil
 	}
-	return nil
+	deleteErr := fmt.Errorf("delete branch %s in %s/%s: %w", branch, g.owner, g.repo, err)
+	if resp == nil || resp.StatusCode != http.StatusUnprocessableEntity {
+		return deleteErr
+	}
+	// GitHub answers 422 both when the branch is already gone, as when
+	// repository settings or an earlier sweep deleted a closed pull request's
+	// branch, and when it refuses the deletion. Only a branch that no longer
+	// exists counts as deleted.
+	_, getResp, getErr := g.client.Git.GetRef(ctx, g.owner, g.repo, "heads/"+branch)
+	if getErr != nil && getResp != nil && getResp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return deleteErr
 }
 
 func (g *apiGitHub) PutFile(ctx context.Context, branch, path, message string, content []byte) (string, error) {
@@ -106,6 +113,8 @@ func (g *apiGitHub) PutFile(ctx context.Context, branch, path, message string, c
 	}
 	existing, _, resp, err := g.client.Repositories.GetContents(ctx, g.owner, g.repo, path, &github.RepositoryContentGetOptions{Ref: branch})
 	switch {
+	case err == nil && existing == nil:
+		return "", fmt.Errorf("%s on branch %s in %s/%s is a directory, not a file", path, branch, g.owner, g.repo)
 	case err == nil:
 		opts.SHA = existing.SHA
 	case resp != nil && resp.StatusCode == http.StatusNotFound:
@@ -150,7 +159,10 @@ func (g *apiGitHub) OpenPullRequests(ctx context.Context, branchPrefix string) (
 			return nil, fmt.Errorf("list open pull requests in %s/%s: %w", g.owner, g.repo, err)
 		}
 		for _, pr := range prs {
-			if pr.GetHead().GetRepo().GetFullName() != g.owner+"/"+g.repo {
+			// Repository names are case-insensitive, so the canonical name
+			// can differ in case from the configured one. A fork's pull
+			// request still differs in owner and stays out.
+			if !strings.EqualFold(pr.GetHead().GetRepo().GetFullName(), g.owner+"/"+g.repo) {
 				continue
 			}
 			branch := pr.GetHead().GetRef()

@@ -44,16 +44,24 @@ type mysqlTarget struct {
 	logger   *slog.Logger
 }
 
-// OpenMySQLTarget connects to the test database named database. It pings the
-// database first, so a run whose database is unreachable fails before the
-// sweep cancels applies or closes pull requests.
+// OpenMySQLTarget connects to the test database named database. It confirms
+// the connection can see database first, so a run whose database is
+// unreachable or missing fails before the sweep cancels applies or closes pull
+// requests. The DSN may select a different default database, so a ping alone
+// does not prove that.
 func OpenMySQLTarget(ctx context.Context, dsn, database string, logger *slog.Logger) (Target, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open test database %s: %w", database, err)
 	}
-	if err := db.PingContext(ctx); err != nil {
+	var n int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?", database).Scan(&n)
+	if err != nil {
 		return nil, errors.Join(fmt.Errorf("reach test database %s: %w", database, err), db.Close())
+	}
+	if n == 0 {
+		return nil, errors.Join(fmt.Errorf("test database %s does not exist or this connection cannot see it", database), db.Close())
 	}
 	return &mysqlTarget{db: db, database: database, logger: logger}, nil
 }
@@ -96,9 +104,17 @@ func (t *mysqlTarget) RowCount(ctx context.Context, table string) (int64, error)
 }
 
 func (t *mysqlTarget) Seed(ctx context.Context, table, source string, rows int64) error {
+	existing, err := t.RowCount(ctx, table)
+	if err != nil {
+		return err
+	}
+	needed, err := seedRowsNeeded(existing, rows)
+	if err != nil {
+		return fmt.Errorf("seed %s.%s: %w", t.database, table, err)
+	}
 	var lastID int64
-	for copied := int64(0); copied < rows; {
-		batch := min(seedBatchRows, rows-copied)
+	for copied := int64(0); copied < needed; {
+		batch := min(seedBatchRows, needed-copied)
 		var maxID sql.NullInt64
 		err := t.db.QueryRowContext(ctx,
 			"SELECT MAX(id) FROM (SELECT id FROM "+t.qualified(source)+" WHERE id > ? ORDER BY id LIMIT ?) AS batch",
@@ -107,7 +123,7 @@ func (t *mysqlTarget) Seed(ctx context.Context, table, source string, rows int64
 			return fmt.Errorf("find the next seed batch in %s.%s after id %d: %w", t.database, source, lastID, err)
 		}
 		if !maxID.Valid {
-			return fmt.Errorf("seed table %s.%s has only %d rows; the run needs %d", t.database, source, copied, rows)
+			return fmt.Errorf("seed table %s.%s has only %d rows; the run needs %d", t.database, source, copied, needed)
 		}
 		res, err := t.db.ExecContext(ctx,
 			"INSERT INTO "+t.qualified(table)+" (payload, created_at) SELECT payload, created_at FROM "+t.qualified(source)+" WHERE id > ? AND id <= ?",
@@ -124,6 +140,16 @@ func (t *mysqlTarget) Seed(ctx context.Context, table, source string, rows int64
 	}
 	t.logger.Info("seeded test table", "database", t.database, "table", table, "source", source, "rows", rows)
 	return nil
+}
+
+// seedRowsNeeded returns how many rows Seed must copy into a table that holds
+// existing rows so it ends with rows rows. A retried seed starts from what an
+// earlier attempt copied, so it never overshoots.
+func seedRowsNeeded(existing, rows int64) (int64, error) {
+	if existing > rows {
+		return 0, fmt.Errorf("table already holds %d rows, more than the %d requested", existing, rows)
+	}
+	return rows - existing, nil
 }
 
 func (t *mysqlTarget) LeftoverCopyTables(ctx context.Context, table string) ([]string, error) {
