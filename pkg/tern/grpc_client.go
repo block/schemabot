@@ -103,6 +103,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -155,6 +156,10 @@ type GRPCClient struct {
 	// selects the production default. Tests set a short interval so poll-loop
 	// behavior is observable without real-time waits.
 	observerPollInterval time.Duration
+	// observerHandoffGrace overrides how long the poller holds a stop back
+	// from an observer registered during the stop's terminal update; zero
+	// selects defaultObserverHandoffGrace.
+	observerHandoffGrace time.Duration
 
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
@@ -421,7 +426,14 @@ func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
 	if c.observers == nil {
 		c.observers = make(map[int64]*observerRegistration)
 	}
-	_, alreadyWatching := c.observers[applyID]
+	existing, alreadyWatching := c.observers[applyID]
+	if alreadyWatching && samePointerObserver(existing.observer, observer) {
+		// Re-attaching the observer already registered, as routed calls do,
+		// is not a replacement: keep its registration so the poller does not
+		// hand it a terminal update it already received.
+		c.observerMu.Unlock()
+		return
+	}
 	c.observers[applyID] = &observerRegistration{observer: observer}
 	shouldStartPoller := c.storage != nil && !alreadyWatching
 	c.observerMu.Unlock()
@@ -521,6 +533,40 @@ func (c *GRPCClient) consumePendingObserver() ProgressObserver {
 // panic for an observer whose dynamic type is not comparable.
 type observerRegistration struct {
 	observer ProgressObserver
+}
+
+// samePointerObserver reports whether a and b are the same pointer observer.
+// Only pointers are compared: comparing other dynamic types as interface
+// values can panic.
+func samePointerObserver(a, b ProgressObserver) bool {
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	return va.Kind() == reflect.Pointer && vb.Kind() == reflect.Pointer &&
+		va.Type() == vb.Type() && va.Pointer() == vb.Pointer()
+}
+
+// defaultObserverHandoffGrace bounds how long the poller holds a stop back
+// from an observer registered while the stop's terminal update ran. A start
+// on a single-operation apply registers its observer before the drive moves
+// the row out of stopped, which takes a remote progress check and a remote
+// start. A row still stopped after the grace was not resumed, so the new
+// observer then receives the stop.
+const defaultObserverHandoffGrace = 2 * time.Minute
+
+// terminalHandoff records a stop the poller delivered to one observer before
+// moving on to the observer that replaced it during that update.
+type terminalHandoff struct {
+	reg      *observerRegistration
+	deadline time.Time
+}
+
+// observerPoll is one poller's state, kept outside the poll loop so a failed
+// poll can see which registration it was driving.
+type observerPoll struct {
+	// driving is the registration the poller last read.
+	driving *observerRegistration
+	// deliveringStop is set while the poller delivers a stop.
+	deliveringStop bool
+	handoff        *terminalHandoff
 }
 
 // getObserver returns the observer for an apply, or nil.
@@ -623,8 +669,15 @@ func remoteApplyStateDescription(remoteState ternv1.State) string {
 // process that drives every apply. On a contained panic the observer is
 // cleared and the poller exits; the apply's drive is unaffected.
 func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
+	c.pollObserver(applyID, nil)
+}
+
+// pollObserver runs pollAndNotifyObserver's poll, starting from handoff when a
+// failed poll passes one on.
+func (c *GRPCClient) pollObserver(applyID int64, handoff *terminalHandoff) {
+	poll := &observerPoll{handoff: handoff}
 	err := panicsafe.Call(func() error {
-		c.notifyObserverUntilTerminal(applyID)
+		c.notifyObserverUntilTerminal(applyID, poll)
 		return nil
 	})
 	if err == nil {
@@ -635,7 +688,7 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 		// The poll loop returns nothing, so only a contained panic reaches here
 		// today; keep the signal if that invariant changes.
 		c.baseLogger().Error("observer poll failed; progress and terminal notifications for this apply are stopped", "error", err)
-		c.clearObserver(applyID)
+		c.releaseFailedPoll(applyID, poll)
 		return
 	}
 	attrs := []any{
@@ -650,17 +703,53 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 	}
 	c.baseLogger().Error("observer poll panicked; progress and terminal notifications for this apply are stopped", attrs...)
 	metrics.RecordRecoveredPanic(context.Background(), "observer_poll")
-	c.clearObserver(applyID)
+	c.releaseFailedPoll(applyID, poll)
+}
+
+// releaseFailedPoll clears the registration a failed poller was driving. A
+// start that registered a replacement during the failed callback found the
+// poller running and started none of its own, so the replacement gets a new
+// poller rather than being deleted. If the poll failed while delivering a
+// stop, the new poller holds that stop back from the replacement as the
+// failed one would have.
+func (c *GRPCClient) releaseFailedPoll(applyID int64, poll *observerPoll) {
+	if poll.driving == nil {
+		c.clearObserver(applyID)
+		return
+	}
+	if c.clearObserverIfCurrent(applyID, poll.driving) {
+		return
+	}
+	next := c.currentRegistration(applyID)
+	if next == nil {
+		return
+	}
+	var handoff *terminalHandoff
+	if poll.deliveringStop {
+		handoff = &terminalHandoff{reg: next, deadline: time.Now().Add(c.handoffGrace())}
+	}
+	c.baseLogger().Info("observer poll: observer replaced before its poll failed; starting a poll for the replacement",
+		"apply_row_id", applyID)
+	go c.pollObserver(applyID, handoff)
+}
+
+func (c *GRPCClient) handoffGrace() time.Duration {
+	if c.observerHandoffGrace == 0 {
+		return defaultObserverHandoffGrace
+	}
+	return c.observerHandoffGrace
 }
 
 // notifyObserverUntilTerminal is pollAndNotifyObserver's poll loop: it ticks
 // until the apply reaches a terminal state, the observer is cleared, or the
-// apply row disappears.
-func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
+// apply row disappears. It records in poll the registration it is notifying,
+// so a failed poll clears only that one.
+func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64, poll *observerPoll) {
 	interval := c.observerPollInterval
 	if interval == 0 {
 		interval = 5 * time.Second
 	}
+	grace := c.handoffGrace()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -682,6 +771,7 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 			// OnTerminal already ran. Stop polling.
 			return
 		}
+		poll.driving = reg
 		obs := reg.observer
 
 		// An observer that permanently lost its apply lease to a newer owner
@@ -727,13 +817,32 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 		}
 
 		if state.IsTerminalApplyState(apply.State) {
+			stopped := state.IsState(apply.State, state.Apply.Stopped)
+			if handoff := poll.handoff; handoff != nil && handoff.reg == reg && stopped {
+				// The stop was already delivered to the observer this one
+				// replaced. A start can register before its drive moves the
+				// row out of stopped, so wait for the row to move rather
+				// than hand the new observer the stop and clear it.
+				if time.Now().Before(handoff.deadline) {
+					continue
+				}
+				c.applyLogger(apply).Warn("observer poll: apply still stopped after its replacement observer's grace; delivering the stop",
+					append(apply.MutableLogAttrs(), "grace", grace)...)
+			}
+			poll.deliveringStop = stopped
 			obs.OnTerminal(apply, tasks)
+			poll.deliveringStop = false
 			// Starting a stopped apply registers a new observer, which can land
 			// while OnTerminal is still publishing the stop. That registration
 			// found this poller running and started none of its own, so clear
 			// only the observer just notified and keep driving a replacement.
 			if c.clearObserverIfCurrent(applyID, reg) {
 				return
+			}
+			if stopped {
+				if next := c.currentRegistration(applyID); next != nil {
+					poll.handoff = &terminalHandoff{reg: next, deadline: time.Now().Add(grace)}
+				}
 			}
 			c.applyLogger(apply).Info("observer poll: observer replaced during its terminal update; continuing with the replacement",
 				apply.MutableLogAttrs()...)

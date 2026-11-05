@@ -10768,9 +10768,12 @@ type switchableApplyStore struct {
 	storage.ApplyStore
 	mu    sync.Mutex
 	apply storage.Apply
+	// gets counts reads, so a test can wait for the poller to tick.
+	gets atomic.Int32
 }
 
 func (s *switchableApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	s.gets.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	apply := s.apply
@@ -10872,4 +10875,125 @@ func TestObserverPollKeepsAnObserverRegisteredDuringTerminal(t *testing.T) {
 			assert.Equal(t, int32(1), stopped.terminal.Load(), "the stopped observer's terminal update runs once")
 		})
 	}
+}
+
+// panickingTerminalObserver panics in OnTerminal once released, standing in
+// for an observer whose terminal update fails while a start registers its
+// replacement.
+type panickingTerminalObserver struct {
+	*blockingTerminalObserver
+}
+
+func (o *panickingTerminalObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
+	o.blockingTerminalObserver.OnTerminal(apply, tasks)
+	panic("terminal update failed")
+}
+
+// newHandoffTestClient returns a client polling a stopped apply, and waits for
+// stopped's OnTerminal to start.
+func newHandoffTestClient(t *testing.T, applyID int64, stopped ProgressObserver, entered <-chan struct{}, grace time.Duration) (*GRPCClient, *switchableApplyStore) {
+	t.Helper()
+	applies := &switchableApplyStore{apply: storage.Apply{
+		ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
+	}}
+	client := &GRPCClient{
+		storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
+		observerPollInterval: 10 * time.Millisecond,
+		observerHandoffGrace: grace,
+	}
+	client.SetObserver(applyID, stopped)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stopped apply never reached its observer's OnTerminal")
+	}
+	return client, applies
+}
+
+// waitForTicks waits until the poller has read the apply n more times.
+func waitForTicks(t *testing.T, applies *switchableApplyStore, n int32) {
+	t.Helper()
+	start := applies.gets.Load()
+	require.Eventually(t, func() bool { return applies.gets.Load() >= start+n },
+		5*time.Second, 5*time.Millisecond, "the poller stopped ticking")
+}
+
+// On a single-operation apply, a start registers its observer before the
+// drive moves the row out of stopped. The poller must not hand that observer
+// the stop it already delivered, nor clear it: it waits for the row to move.
+func TestObserverPollHoldsTheStopBackFromAnObserverRegisteredWhileStopped(t *testing.T) {
+	const applyID int64 = 79
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	waitForTicks(t, applies, 5)
+	assert.Equal(t, int32(0), resumed.terminal.Load(), "the resumed observer must not receive the earlier stop")
+	assert.Same(t, resumed, client.getObserver(applyID), "the resumed observer must stay registered")
+
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive progress")
+	applies.setState(state.Apply.Completed)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive its terminal update and then be cleared")
+	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
+// A start that never moves the row out of stopped did not resume the apply.
+// Once the grace passes, its observer receives the stop and is cleared, so
+// the poller does not tick a stopped apply forever.
+func TestObserverPollDeliversTheStopOnceTheHandoffGracePasses(t *testing.T) {
+	const applyID int64 = 80
+	stopped := newBlockingTerminalObserver()
+	client, _ := newHandoffTestClient(t, applyID, stopped, stopped.entered, 50*time.Millisecond)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the observer of a start that never resumed must receive the stop and be cleared")
+}
+
+// If the stopped observer's terminal update panics after a start registered
+// its replacement, the replacement must still be polled rather than deleted.
+func TestObserverPollKeepsAReplacementWhenTheTerminalUpdatePanics(t *testing.T) {
+	const applyID int64 = 81
+	inner := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, &panickingTerminalObserver{inner}, inner.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(inner.release)
+
+	waitForTicks(t, applies, 2)
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the replacement must be polled after the panic")
+	applies.setState(state.Apply.Completed)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond)
+}
+
+// Routed calls re-attach the observer already registered. That is not a
+// replacement, so the observer receives its terminal update once.
+func TestObserverPollTreatsAReattachedObserverAsTheSameRegistration(t *testing.T) {
+	const applyID int64 = 82
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	client.SetObserver(applyID, stopped)
+	close(stopped.release)
+
+	require.Eventually(t, func() bool { return client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the observer is cleared after its terminal update")
+	waitForTicks(t, applies, 0)
+	assert.Equal(t, int32(1), stopped.terminal.Load())
 }
