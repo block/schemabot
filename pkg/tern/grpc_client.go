@@ -298,6 +298,19 @@ const retryServiceConfig = `{
 // Connecting needs only a TCP dial and the server's HTTP/2 preface.
 const grpcMinConnectTimeout = 5 * time.Second
 
+// grpcConnectBackoff paces reconnect attempts to the data plane. gRPC gives
+// each attempt the larger of grpcMinConnectTimeout and the current backoff, and
+// it jitters the backoff after capping it, so the cap leaves room for the
+// jitter. However many attempts have failed before it, no attempt waits longer
+// than the connect timeout; gRPC's default cap would let later attempts wait
+// two minutes.
+var grpcConnectBackoff = backoff.Config{
+	BaseDelay:  backoff.DefaultConfig.BaseDelay,
+	Multiplier: backoff.DefaultConfig.Multiplier,
+	Jitter:     backoff.DefaultConfig.Jitter,
+	MaxDelay:   time.Duration(float64(grpcMinConnectTimeout) / (1 + backoff.DefaultConfig.Jitter)),
+}
+
 // Default per-RPC deadlines, applied only when the caller's context carries
 // none. A driver runs on a context with no deadline while a separate heartbeat
 // keeps renewing its lease, so an RPC hung on a black-holed connection would
@@ -375,7 +388,7 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
 		grpc.WithConnectParams(grpc.ConnectParams{
-			Backoff:           backoff.DefaultConfig,
+			Backoff:           grpcConnectBackoff,
 			MinConnectTimeout: grpcMinConnectTimeout,
 		}),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),

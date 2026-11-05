@@ -327,6 +327,19 @@ func TestGRPCClientProgressGivesUpOnSilentDataPlane(t *testing.T) {
 	assert.Less(t, elapsed, 2*grpcMinConnectTimeout, "the poll must give up within the connect timeout")
 }
 
+// Every reconnect attempt after a run of failures is bounded the same way as
+// the first: gRPC gives an attempt the larger of the connect timeout and the
+// current backoff, so the backoff at its jittered worst must not exceed the
+// connect timeout, or a poll during a long data-plane rollout could hang far
+// past it.
+func TestGRPCClientLaterReconnectAttemptsKeepTheConnectTimeout(t *testing.T) {
+	worstBackoff := time.Duration(float64(grpcConnectBackoff.MaxDelay) * (1 + grpcConnectBackoff.Jitter))
+	assert.LessOrEqual(t, worstBackoff, grpcMinConnectTimeout,
+		"the longest jittered backoff must not extend a connection attempt past the connect timeout")
+	assert.Greater(t, grpcConnectBackoff.MaxDelay, grpcConnectBackoff.BaseDelay,
+		"backoff must still grow between consecutive failures")
+}
+
 // Apply is state-changing, so the client surfaces a transient UNAVAILABLE
 // instead of re-sending the request; the operator's durable queue owns
 // redelivery for dispatch failures.
