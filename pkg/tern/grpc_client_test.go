@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -947,6 +948,7 @@ type mockTaskStore struct {
 	updated             []*storage.Task
 	upsertedShards      []*storage.Task
 	upsertShardErr      error
+	upsertShardCalls    int
 }
 
 func (m *mockTaskStore) Get(context.Context, string) (*storage.Task, error) {
@@ -992,6 +994,7 @@ func (m *mockTaskStore) Update(_ context.Context, task *storage.Task) error {
 }
 
 func (m *mockTaskStore) UpsertShardProgress(_ context.Context, task *storage.Task) error {
+	m.upsertShardCalls++
 	if m.upsertShardErr != nil {
 		return m.upsertShardErr
 	}
@@ -6968,6 +6971,30 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 		for _, s := range tasks.upsertedShards {
 			assert.NotEmpty(t, s.Shard, "no per-shard row may be stored without a shard name")
 		}
+	})
+
+	t.Run("stops at the first shard once the reconcile context ends", func(t *testing.T) {
+		// A drive stopping on shutdown or lease release cancels its reconcile
+		// context. Every remaining shard write would fail the same way, so the
+		// encode stops after the first one and logs the stop once instead of an
+		// error per shard.
+		storedTask := newStoredTask()
+		tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+		var logs bytes.Buffer
+		client := &GRPCClient{
+			storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}},
+			logger:  slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		}
+		ctx, cancel := context.WithCancel(storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"}))
+		cancel()
+		tasks.upsertShardErr = fmt.Errorf("look up shard task: %w", context.Canceled)
+
+		client.syncShardProgressFromRemote(ctx, apply, storedTask, remoteTables()[0].Shards, now)
+
+		assert.Equal(t, 1, tasks.upsertShardCalls, "no shard write may follow the first one once the context has ended")
+		assert.NotContains(t, logs.String(), "failed to encode remote per-shard progress")
+		assert.Contains(t, logs.String(), `"msg":"stopping remote per-shard progress encode: reconcile context was cancelled"`)
+		assert.Contains(t, logs.String(), `"level":"INFO"`)
 	})
 }
 

@@ -413,10 +413,22 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
 				origin = "synthesized"
 			}
-			h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; re-run it with GitHub Redeliver for an organic delivery, or a new head push / SchemaBot check re-run for a synthesized one",
+			deadLetterAttrs := []any{
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
-				"attempts", event.Attempts, "failure_reason", string(failureReason), "origin", origin, "error", processErr)
+				"attempts", event.Attempts, "failure_reason", string(failureReason), "origin", origin, "error", processErr,
+			}
+			if failureReason == metrics.WebhookFailurePRFileCap {
+				// The PR itself is the cause, and the auto-plan run already
+				// posted the failing check that tells its author. A redelivery
+				// replays the same truncated file list, so there is nothing for
+				// an operator to do.
+				h.logger.Warn("durable webhook delivery is dead-lettered because the pull request changes more files than GitHub lists; its head carries a failing check that tells the author",
+					deadLetterAttrs...)
+			} else {
+				h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; re-run it with GitHub Redeliver for an organic delivery, or a new head push / SchemaBot check re-run for a synthesized one",
+					deadLetterAttrs...)
+			}
 		} else {
 			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
 		}
