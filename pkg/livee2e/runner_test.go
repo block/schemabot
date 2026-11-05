@@ -1017,6 +1017,7 @@ func TestRunCleansUpAfterItIsCancelled(t *testing.T) {
 	err := testRunner(t, bot, target).Run(ctx)
 
 	require.ErrorIs(t, err, context.Canceled)
+	assert.Contains(t, err.Error(), "run cancelled")
 	assert.Regexp(t, `^schemabot cancel apply-[0-9a-f]{16} -e development$`, bot.commands[len(bot.commands)-1],
 		"the cleanup cancels the deferred apply")
 	assert.False(t, bot.prs[1].open)

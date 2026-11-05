@@ -181,14 +181,14 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 			// The steps' error keeps its message but not its chain, so an
 			// inconclusive run whose cleanup failed no longer reads as
 			// inconclusive.
-			err = fmt.Errorf("%w; %w", err, cleanupErr)
+			err = fmt.Errorf("%s; %w", err.Error(), cleanupErr)
 		}
 	}()
 	// Classified before the cleanup error joins it, so a rate-limited cleanup
 	// cannot turn a failed step into an inconclusive run.
 	err = inconclusiveWhenGitHubUnavailable(r.steps(ctx, cur))
 	if err != nil && sweepErr != nil {
-		err = fmt.Errorf("%w (the sweep before the run also failed: %w)", err, sweepErr)
+		err = fmt.Errorf("%w (the sweep before the run also failed: %s)", err, sweepErr.Error())
 	}
 	return err
 }
@@ -837,6 +837,9 @@ func (r *Runner) poll(ctx context.Context, check func(context.Context) (bool, er
 	for {
 		done, err := check(ctx)
 		switch {
+		case err != nil && ctx.Err() != nil:
+			// The read failed because the wait ended mid-call.
+			return r.pollExpired(run, ctx, transient)
 		case err != nil && githubUnavailable(err):
 			r.logger.Warn("GitHub call failed; retrying", "error", err)
 			transient = err
