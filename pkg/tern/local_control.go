@@ -930,7 +930,14 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		// queued apply stopped before its first drive created tasks). The apply
 		// row itself is still active work, so settle it directly — erroring here
 		// would leave the durable stop request pending and the apply re-claimed
-		// on every operator poll forever.
+		// on every operator poll forever. A drive holding only its operation's
+		// lease settles just that operation; its siblings' tasks are not its own.
+		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+			if err := c.settleTasklessOperationShare(ctx, targetApply, opLease, storage.ControlOperationStop, state.ApplyOperation.Stopped, caller); err != nil {
+				return nil, err
+			}
+			return &ternv1.StopResponse{Accepted: true}, nil
+		}
 		return c.settleStopForTasklessApply(ctx, targetApply, caller)
 	}
 
@@ -1068,7 +1075,14 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		// VSchema-only apply that never has any). The apply row itself is still
 		// active work, so settle it directly — erroring here would leave the
 		// durable cancel request pending and the apply re-claimed on every
-		// operator poll forever.
+		// operator poll forever. A drive holding only its operation's lease
+		// settles just that operation; its siblings' tasks are not its own.
+		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+			if err := c.settleTasklessOperationShare(ctx, targetApply, opLease, storage.ControlOperationCancel, state.ApplyOperation.Cancelled, caller); err != nil {
+				return nil, err
+			}
+			return &ternv1.CancelResponse{Accepted: true}, nil
+		}
 		return c.settleCancelForTasklessApply(ctx, targetApply, caller)
 	}
 	if cancelledCount == 0 && skippedCount > 0 && applyID > 0 {
@@ -1165,6 +1179,43 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
 
+// settleTasklessOperationShare settles a stop or cancel consumed by a drive
+// that holds only its operation's lease when that operation owns no tasks,
+// such as a VSchema-only operation beside shard operations that do. The
+// drive's operation row is the only work it can settle: each sibling's tasks
+// belong to the sibling's drive, which consumes the still-pending request at
+// its next checkpoint, and the apply row belongs to the apply-state
+// projection, which settles it and completes the request once every operation
+// has settled. Fails closed when the operation does own tasks that this
+// client's database-scoped read could not see.
+func (c *LocalClient) settleTasklessOperationShare(ctx context.Context, apply *storage.Apply, opLease storage.OperationLease, operation storage.ControlOperation, operationState, caller string) error {
+	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, opLease.OperationID)
+	if err != nil {
+		return fmt.Errorf("load tasks of apply_operation %d before task-less %s settle of apply %s: %w",
+			opLease.OperationID, operation, apply.ApplyIdentifier, err)
+	}
+	if len(tasks) > 0 {
+		c.logger.Warn(string(operation)+" found no targetable tasks for its operation in this client's database scope, but the operation owns tasks; failing closed rather than settling over unseen task work",
+			append(apply.LogAttrs(), "apply_operation_id", opLease.OperationID, "task_count", len(tasks), "client_database", c.config.Database)...)
+		return fmt.Errorf("%s cannot settle apply_operation %d of apply %s: its %d tasks are outside this client's database scope (%s)",
+			operation, opLease.OperationID, apply.ApplyIdentifier, len(tasks), c.config.Database)
+	}
+	if err := c.settleLeasedOperationRow(ctx, apply, opLease, operationState); err != nil {
+		return err
+	}
+	eventType := storage.LogEventStopRequested
+	eventMsg := "Stop requested: task-less operation settled as stopped; the apply record follows via the operator's state projection"
+	if operation == storage.ControlOperationCancel {
+		eventType = storage.LogEventCancelRequested
+		eventMsg = "Cancel requested: task-less operation settled as cancelled; the apply record follows via the operator's state projection"
+	}
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, eventType, storage.LogSourceSchemaBot, eventMsg, "", "")
+	return nil
+}
+
 // deferTasklessCancelToProjection settles a task-less cancel whose apply-row
 // write was refused because the apply lease was lost. Only the operation row is
 // heartbeated through a drive, so a drive can outlive its parent apply lease
@@ -1229,6 +1280,14 @@ func (c *LocalClient) settleLeasedOperationRowForTasklessApply(ctx context.Conte
 		return fmt.Errorf("task-less settle of apply %s to %s: apply lease was lost and no operation lease is held: %w",
 			apply.ApplyIdentifier, operationState, applyWriteErr)
 	}
+	return c.settleLeasedOperationRow(ctx, apply, opLease, operationState)
+}
+
+// settleLeasedOperationRow moves the operation row opLease covers to
+// operationState for a task-less settle, leaving the apply row to the
+// apply-state projection. Fails closed when the row cannot be loaded or belongs
+// to a different apply, and leaves an already-terminal row unchanged.
+func (c *LocalClient) settleLeasedOperationRow(ctx context.Context, apply *storage.Apply, opLease storage.OperationLease, operationState string) error {
 	op, err := c.storage.ApplyOperations().Get(ctx, opLease.OperationID)
 	if err != nil {
 		return fmt.Errorf("load leased apply_operation %d for task-less settle of apply %s to %s: %w",

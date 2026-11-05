@@ -569,6 +569,78 @@ func TestLocalClient_CancelSettlesEachOperationUnderItsOwnLease(t *testing.T) {
 	requireEachOperationSettlesUnderItsOwnLease(t, storage.ControlOperationCancel, state.Task.Cancelled)
 }
 
+// An apply has a shard operation copying a table and a second operation with
+// no tasks of its own, such as a VSchema-only change, each driven under its own
+// lease, when the operator stops it. The task-less operation's drive consumes
+// the stop first: it settles its own operation row and leaves the shard's task
+// and the apply row alone, so the request stays pending for the shard's drive,
+// which then records the stop on its task. Neither drive fails the request.
+func TestLocalClient_StopSettlesATasklessOperationBesideATaskedOne(t *testing.T) {
+	requireTasklessOperationSettlesBesideTaskedOne(t, storage.ControlOperationStop, state.ApplyOperation.Stopped, state.Task.Stopped)
+}
+
+// The cancel twin of the stop case above.
+func TestLocalClient_CancelSettlesATasklessOperationBesideATaskedOne(t *testing.T) {
+	requireTasklessOperationSettlesBesideTaskedOne(t, storage.ControlOperationCancel, state.ApplyOperation.Cancelled, state.Task.Cancelled)
+}
+
+func requireTasklessOperationSettlesBesideTaskedOne(t *testing.T, operation storage.ControlOperation, wantOperationState, wantTaskState string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newMultiOpResumeFixture(t, []string{state.Task.Running})
+	f.client.spiritEngine = &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}
+	ctx := t.Context()
+
+	// The sibling operation owns no tasks.
+	_, err := f.leaseDB.ExecContext(ctx, `
+		UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+	`, "taskless-driver", "taskless-token", f.siblingOpID)
+	require.NoError(t, err)
+	tasklessCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID: f.apply.ID, OperationID: f.siblingOpID, Owner: "taskless-driver", Token: "taskless-token",
+	})
+
+	_, alreadyPending, err := f.stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     f.apply.ID,
+		Operation:   operation,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	consume := func(opCtx context.Context) (bool, error) {
+		if operation == storage.ControlOperationStop {
+			return f.client.processPendingStopControlRequest(opCtx, f.apply)
+		}
+		return f.client.processPendingCancelControlRequest(opCtx, f.apply)
+	}
+	operationState := func(id int64) string {
+		op, err := f.stor.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, op)
+		return op.State
+	}
+
+	standDown, err := consume(tasklessCtx)
+	require.NoError(t, err, "the task-less operation's drive must settle its own operation, not fail over the sibling's tasks")
+	assert.True(t, standDown, "the task-less operation's drive stands down after consuming the request")
+	assert.Equal(t, wantOperationState, operationState(f.siblingOpID), "the task-less operation settles under its own lease")
+	assert.Equal(t, state.ApplyOperation.Running, operationState(f.opID), "the shard operation is its own drive's to settle")
+	assert.Equal(t, state.Task.Running, f.taskState(t, f.tasks[0]), "the shard's task is its own drive's to record")
+	requireControlRequestStatus(t, f.stor, f.apply.ID, operation, storage.ControlRequestPending)
+	f.requireParentUntouched(t)
+
+	standDown, err = consume(f.opCtx)
+	require.NoError(t, err, "the shard's drive must record the still-pending request on its own task")
+	assert.True(t, standDown, "the shard's drive stands down after consuming the request")
+	assert.Equal(t, wantTaskState, f.taskState(t, f.tasks[0]), "the shard's drive records the request on its own task")
+	assert.Equal(t, wantOperationState, operationState(f.siblingOpID))
+	f.requireParentUntouched(t)
+}
+
 func requireEachOperationSettlesUnderItsOwnLease(t *testing.T, operation storage.ControlOperation, wantTaskState string) {
 	t.Helper()
 	if testing.Short() {

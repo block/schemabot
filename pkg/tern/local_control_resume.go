@@ -1366,11 +1366,8 @@ func shouldInspectCutoverSignalForResume(apply *storage.Apply, forceCutoverResum
 // The operator advances the parent via updateApplyStateFromOperations after the
 // drive returns.
 func suppressParentApplyWrites(ctx context.Context) bool {
-	if _, ok := storage.ApplyLeaseFromContext(ctx); ok {
-		return false
-	}
-	opLease, ok := storage.OperationLeaseFromContext(ctx)
-	return ok && opLease.Valid()
+	opLease, operationScoped := operationLeaseOnlyDrive(ctx)
+	return operationScoped && opLease.Valid()
 }
 
 func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
