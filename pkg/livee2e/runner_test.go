@@ -52,6 +52,23 @@ type fakeSchemaBot struct {
 	deleteBranchFails bool
 	// deleteBranchErr, when set, is the error every branch delete fails with.
 	deleteBranchErr error
+	// applyRefusal, when set, is SchemaBot's reply to every apply command,
+	// which then starts nothing.
+	applyRefusal string
+	// stopRefusedAsFinished refuses every stop because the apply already
+	// finished.
+	stopRefusedAsFinished bool
+	// planReads counts the reads of each commit's Check Run; the first
+	// planInProgressReads of them show the plan still running.
+	planReads           map[string]int
+	planInProgressReads int
+	// planFails fails the plan of the commit that alters the table.
+	planFails bool
+	// finalCheckFails leaves the Check Run failed after the cutover.
+	finalCheckFails bool
+	// commentsFailures fails that many comment reads with a GitHub rate
+	// limit before they succeed again.
+	commentsFailures int
 	// commentErr, when set, fails every comment the runner posts.
 	commentErr error
 	// commands records every PR command, in order.
@@ -65,14 +82,15 @@ type fakePR struct {
 
 func newFakeSchemaBot(target *fakeTarget) *fakeSchemaBot {
 	return &fakeSchemaBot{
-		target:   target,
-		nextID:   100,
-		heads:    map[string]string{"main": "sha-main"},
-		files:    map[string]string{},
-		prs:      map[int]*fakePR{},
-		comments: map[int][]Comment{},
-		checks:   map[string]CheckRun{},
-		applies:  map[string]string{},
+		target:    target,
+		nextID:    100,
+		heads:     map[string]string{"main": "sha-main"},
+		files:     map[string]string{},
+		prs:       map[int]*fakePR{},
+		comments:  map[int][]Comment{},
+		checks:    map[string]CheckRun{},
+		applies:   map[string]string{},
+		planReads: map[string]int{},
 	}
 }
 
@@ -94,8 +112,8 @@ func (f *fakeSchemaBot) BranchHead(_ context.Context, branch string) (string, er
 func (f *fakeSchemaBot) CreateBranch(_ context.Context, branch, sha string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, exists := f.heads[branch]; exists {
-		return fmt.Errorf("branch %s already exists", branch)
+	if _, ok := f.heads[branch]; ok {
+		return fmt.Errorf("create branch %s: Reference already exists", branch)
 	}
 	f.heads[branch] = sha
 	return nil
@@ -127,6 +145,9 @@ func (f *fakeSchemaBot) PutFile(_ context.Context, branch, _, _ string, content 
 	f.heads[branch] = sha
 	f.files[branch] = string(content)
 	f.checks[sha] = CheckRun{Status: "completed", Conclusion: "action_required", Title: "Schema change pending"}
+	if f.planFails && strings.Contains(string(content), columnAfter) {
+		f.checks[sha] = CheckRun{Status: "completed", Conclusion: "failure", Title: "Plan failed: unsafe change"}
+	}
 	return sha, nil
 }
 
@@ -172,6 +193,11 @@ func (f *fakeSchemaBot) PullRequestsForBranch(_ context.Context, branch string) 
 func (f *fakeSchemaBot) Comments(_ context.Context, number int) ([]Comment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.commentsFailures > 0 {
+		f.commentsFailures--
+		return nil, fmt.Errorf("list comments on pull request #%d: %w", number,
+			secondaryRateLimit(http.MethodGet, "https://api.github.com/repos/octo/schema/issues/1/comments"))
+	}
 	return append([]Comment(nil), f.comments[number]...), nil
 }
 
@@ -181,6 +207,10 @@ func (f *fakeSchemaBot) CheckRun(_ context.Context, sha, _, _ string) (*CheckRun
 	run, ok := f.checks[sha]
 	if !ok {
 		return nil, nil
+	}
+	f.planReads[sha]++
+	if f.planReads[sha] <= f.planInProgressReads {
+		return &CheckRun{Status: "in_progress"}, nil
 	}
 	return &run, nil
 }
@@ -214,6 +244,12 @@ func (f *fakeSchemaBot) respond(number int, args []string) {
 	table := strings.TrimPrefix(branch, BranchPrefix)
 	switch args[1] {
 	case "apply":
+		if f.applyRefusal != "" {
+			f.comments[number] = append(f.comments[number], Comment{
+				ID: f.id(), Author: "schemabot[bot]", IsBot: true, Body: f.applyRefusal,
+			})
+			return
+		}
 		applyID := fmt.Sprintf("apply-%016x", f.id())
 		f.applies[applyID] = table
 		deferred := strings.Contains(strings.Join(args, " "), "--defer-cutover")
@@ -239,6 +275,14 @@ func (f *fakeSchemaBot) respond(number int, args []string) {
 			f.post(number, applyID, state.Apply.Running)
 		}
 	case "stop":
+		if f.stopRefusedAsFinished {
+			f.target.alter(table)
+			f.comments[number] = append(f.comments[number], Comment{
+				ID: f.id(), Author: "schemabot[bot]", IsBot: true,
+				Body: renderAlreadyFinished(state.Apply.Completed),
+			})
+			return
+		}
 		f.post(number, args[2], state.Apply.Stopped)
 	case "start":
 		if f.startFinishesWithOnlyASummary {
@@ -263,6 +307,9 @@ func (f *fakeSchemaBot) respond(number int, args []string) {
 		f.target.alter(f.applies[args[2]])
 		f.post(number, args[2], state.Apply.Completed)
 		f.checks[f.heads[branch]] = CheckRun{Status: "completed", Conclusion: "success", Title: "Schema up to date"}
+		if f.finalCheckFails {
+			f.checks[f.heads[branch]] = CheckRun{Status: "completed", Conclusion: "failure", Title: "Schema drift detected"}
+		}
 	}
 }
 
@@ -690,8 +737,9 @@ func TestRunIsInconclusiveWhenGitHubRateLimitsIt(t *testing.T) {
 // secondaryRateLimit is the error go-github returns when GitHub's secondary
 // rate limit refuses a call.
 func secondaryRateLimit(method, url string) error {
+	req := httptest.NewRequestWithContext(context.Background(), method, url, nil)
 	return &github.AbuseRateLimitError{
-		Response: &http.Response{Request: httptest.NewRequest(method, url, nil), StatusCode: http.StatusForbidden},
+		Response: &http.Response{Request: req, StatusCode: http.StatusForbidden},
 		Message:  "You have exceeded a secondary rate limit",
 	}
 }
@@ -709,4 +757,141 @@ func TestRunStaysFailedWhenOnlyTheCleanupIsRateLimited(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "secondary rate limit", "the cleanup error is still reported")
 	assert.NotErrorIs(t, err, ErrInconclusive)
+}
+
+func TestRunIsInconclusiveWhenAnotherPullRequestHoldsTheLock(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.applyRefusal = templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
+		Database: "testdb", Environment: "development", RequestedBy: "octocat",
+		LockOwner: "hubot", LockRepo: "octo/schema", LockPR: 9, LockCreated: time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC),
+	})
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "holds the lock")
+}
+
+func TestRunIsInconclusiveWhileOtherChecksAreRunning(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.applyRefusal = templates.RenderApplyBlockedByInProgressChecks("development", []templates.BlockingCheck{{Name: "lint", State: "in_progress"}}, nil)
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "Apply Blocked")
+}
+
+// A refusal answers the command, so the run fails at once and names it
+// rather than waiting out WaitTimeout.
+func TestRunFailsFastWhenSchemaBotRefusesTheApply(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.applyRefusal = templates.RenderApplyBlockedByNonPassingChecks("development", []templates.BlockingCheck{{Name: "lint", State: "failure"}})
+	r := testRunner(t, bot, target)
+	r.cfg.WaitTimeout = time.Hour
+
+	err := r.Run(t.Context())
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "SchemaBot refused apply")
+	assert.Contains(t, err.Error(), "Apply Blocked")
+}
+
+func TestRunIsInconclusiveWhenTheStopIsRefusedAsFinished(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.stopRefusedAsFinished = true
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "finished before it reached "+StatusStopped)
+}
+
+func TestRunWaitsForAPlanStillRunning(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.planInProgressReads = 3
+
+	require.NoError(t, testRunner(t, bot, target).Run(t.Context()))
+	assert.Equal(t, "schemabot apply -e development", bot.commands[0], "the first apply waits for the plan")
+}
+
+func TestRunFailsFastWhenThePlanFails(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.planFails = true
+	r := testRunner(t, bot, target)
+	r.cfg.WaitTimeout = time.Hour
+
+	err := r.Run(t.Context())
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "Plan failed: unsafe change")
+	assert.Len(t, bot.commands, 1, "no apply follows a failed plan")
+}
+
+func TestRunFailsWhenTheFinalCheckNeverPasses(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.finalCheckFails = true
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), `completed/failure "Schema drift detected"`)
+	assert.Contains(t, err.Error(), "timed out after")
+}
+
+// A poll reads only, so it rides out a few rate-limited reads. A wait that
+// ends while GitHub is still failing proves nothing either way.
+func TestRunRetriesAPollThroughAGitHubRateLimit(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.commentsFailures = 3
+
+	require.NoError(t, testRunner(t, bot, target).Run(t.Context()))
+
+	target = newFakeTarget()
+	bot = newFakeSchemaBot(target)
+	bot.commentsFailures = 1 << 30
+	r := testRunner(t, bot, target)
+	r.cfg.WaitTimeout = 50 * time.Millisecond
+	err := r.Run(t.Context())
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "while GitHub was failing")
+}
+
+func TestRunIsInconclusiveWhenAnotherRunTookTheName(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.heads[BranchPrefix+testTable] = "sha-other"
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "already exists")
+}
+
+// A wait the run's own deadline cuts short says so, rather than blaming
+// WaitTimeout.
+func TestRunNamesTheRunDeadlineWhenItEndsAWait(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.planInProgressReads = 1 << 30
+	r := testRunner(t, bot, target)
+	r.cfg.RunTimeout = 50 * time.Millisecond
+	r.cfg.WaitTimeout = time.Hour
+
+	err := r.Run(t.Context())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "run deadline passed")
+	assert.NotContains(t, err.Error(), "timed out after")
 }

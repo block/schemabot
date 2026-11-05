@@ -48,7 +48,10 @@ type Config struct {
 	// PollInterval is how often the runner reads the pull request.
 	PollInterval time.Duration
 	// WaitTimeout bounds each wait for SchemaBot to act on a command, and
-	// the cleanup after a run.
+	// the cleanup after a run. The wait for the deferred apply to reach
+	// Waiting for Cutover runs the whole copy and checksum of SeedRows rows,
+	// so WaitTimeout must cover that copy, and RunTimeout several waits:
+	// raise both with SeedRows.
 	WaitTimeout time.Duration
 	// RunTimeout bounds a whole run, database calls included. A run is over
 	// once RunTimeout and then WaitTimeout have passed since it started. The
@@ -112,11 +115,12 @@ const (
 	runTimeLayout  = "20060102150405"
 )
 
-// run is one test's names.
+// run is one test's names, and the applies it has started.
 type run struct {
-	table  string
-	branch string
-	pr     int
+	table   string
+	branch  string
+	pr      int
+	applies map[string]bool
 	// ownsBranch is set once the run created its branch. Another run that
 	// picked the same name owns everything under it, so a run that never
 	// created its branch cleans up nothing.
@@ -154,7 +158,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 		return inconclusiveWhenGitHubUnavailable(fmt.Errorf("sweep before the run: %w", err))
 	}
 	table := runTablePrefix + r.now().Add(r.cfg.RunTimeout+r.cfg.WaitTimeout).UTC().Format(runTimeLayout)
-	cur := &run{table: table, branch: BranchPrefix + table}
+	cur := &run{table: table, branch: BranchPrefix + table, applies: map[string]bool{}}
 	r.logger.Info("starting live e2e run", "repo", r.cfg.Repo, "database", r.cfg.Database,
 		"environment", r.cfg.Environment, "table", cur.table, "branch", cur.branch)
 	defer func() {
@@ -184,6 +188,10 @@ func (r *Runner) steps(ctx context.Context, cur *run) error {
 		return err
 	}
 	if err := r.gh.CreateBranch(ctx, cur.branch, base); err != nil {
+		if _, headErr := r.gh.BranchHead(ctx, cur.branch); headErr == nil {
+			// Another run started in the same second and took the name.
+			return fmt.Errorf("branch %s already exists: %w", cur.branch, ErrInconclusive)
+		}
 		return err
 	}
 	cur.ownsBranch = true
@@ -313,12 +321,25 @@ func (r *Runner) applyCommand(ctx context.Context, cur *run, verb string, args .
 			return false, fmt.Errorf("another pull request or CLI session holds the lock on %s: %w", r.cfg.Database, ErrInconclusive)
 		}
 		var ok bool
-		started, ok = firstApplyAfter(comments, commentID)
-		return ok, nil
+		started, ok = firstApplyAfter(withoutApplies(comments, cur.applies), commentID)
+		if ok {
+			return true, nil
+		}
+		if refusal, refused := refusalAfter(comments, commentID); refused {
+			if strings.Contains(refusal, pendingHeadline) {
+				// Another check, or an earlier environment, is still running:
+				// a matter of timing, not of SchemaBot.
+				return false, fmt.Errorf("SchemaBot held %s until other work finishes (%q): %w", verb, refusal, ErrInconclusive)
+			}
+			return false, fmt.Errorf("SchemaBot refused %s: %q", verb, refusal)
+		}
+		r.logger.Debug("no apply started yet", "pr", cur.pr, "command_id", commentID)
+		return false, nil
 	})
 	if err != nil {
 		return "", fmt.Errorf("wait for %s on %s#%d to start an apply (last reply %q): %w", verb, r.cfg.Repo, cur.pr, lastHeadline, err)
 	}
+	cur.applies[started.ApplyID] = true
 	r.logger.Info("apply started", "repo", r.cfg.Repo, "pr", cur.pr, "apply_id", started.ApplyID, "status", started.Status)
 	return started.ApplyID, nil
 }
@@ -351,7 +372,7 @@ var refusedStatuses = map[string]string{
 	"completed": StatusApplied,
 	"failed":    StatusFailed,
 	"cancelled": StatusCancelled,
-	"reverted":  "Reverted",
+	"reverted":  StatusReverted,
 }
 
 // waitForStatus waits until applyID's comment shows want. Any other terminal
@@ -414,7 +435,14 @@ func (r *Runner) waitForPlan(ctx context.Context, sha string) error {
 		if err != nil {
 			return false, err
 		}
-		return check != nil && check.Status == "completed", nil
+		if check == nil || check.Status != "completed" {
+			r.logger.Debug("plan not finished yet", "sha", sha, "check", r.cfg.CheckName)
+			return false, nil
+		}
+		if check.Conclusion == "failure" {
+			return false, fmt.Errorf("SchemaBot's plan failed: %q", check.Title)
+		}
+		return true, nil
 	})
 	if err != nil {
 		return fmt.Errorf("wait for check %q on %s: %w", r.cfg.CheckName, sha, err)
@@ -430,6 +458,7 @@ func (r *Runner) waitForCheckSuccess(ctx context.Context, sha string) error {
 			return false, err
 		}
 		if check == nil {
+			r.logger.Debug("no check run yet", "sha", sha, "check", r.cfg.CheckName)
 			return false, nil
 		}
 		last = *check
@@ -704,6 +733,35 @@ func (r *Runner) isBot(c Comment) bool {
 	return c.IsBot && c.Author == r.cfg.AppSlug+"[bot]"
 }
 
+// pendingHeadline marks the refusal SchemaBot posts while other checks on the
+// commit, or an apply in an earlier environment, are still running.
+const pendingHeadline = "⏳ Apply Blocked"
+
+// refusalAfter returns the headline of the first reply after the comment with
+// ID after that refuses an apply before it reaches the engine.
+func refusalAfter(comments []Comment, after int64) (string, bool) {
+	var first Comment
+	for _, c := range comments {
+		if c.ID > after && isApplyRejection(c.Body) && (first.ID == 0 || c.ID < first.ID) {
+			first = c
+		}
+	}
+	return firstLine(first.Body), first.ID != 0
+}
+
+// withoutApplies drops the status comments for applies in known, so a
+// rotated comment for an earlier apply is never read as a new one.
+func withoutApplies(comments []Comment, known map[string]bool) []Comment {
+	var out []Comment
+	for _, c := range comments {
+		if s, ok := ParseApplyStatus(c.Body); ok && known[s.ApplyID] {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 // lastHeadlineAfter returns the first line of the newest bot comment posted
 // after the comment with ID after, so a command SchemaBot refused names the
 // refusal in the error.
@@ -718,24 +776,52 @@ func lastHeadlineAfter(comments []Comment, after int64) string {
 }
 
 // poll calls check every PollInterval until it reports done, returns an
-// error, or WaitTimeout passes.
+// error, or WaitTimeout passes. A GitHub rate limit or server error from
+// check is retried on the next tick: polls only read, so a retry cannot post
+// anything twice.
 func (r *Runner) poll(ctx context.Context, check func(context.Context) (bool, error)) error {
+	run := ctx
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.WaitTimeout)
 	defer cancel()
 	ticker := time.NewTicker(r.cfg.PollInterval)
 	defer ticker.Stop()
+	var transient error
 	for {
 		done, err := check(ctx)
-		if err != nil {
+		switch {
+		case err != nil && githubUnavailable(err):
+			r.logger.Warn("GitHub call failed; retrying", "error", err)
+			transient = err
+		case err != nil:
 			return err
-		}
-		if done {
+		case done:
 			return nil
+		default:
+			transient = nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timed out after %s: %w", r.cfg.WaitTimeout, ctx.Err())
+			return r.pollExpired(run, ctx, transient)
 		case <-ticker.C:
 		}
 	}
+}
+
+// pollExpired names the bound that ended a poll: the run's own deadline or
+// cancellation, or WaitTimeout. A GitHub error the poll was still retrying
+// marks the wait inconclusive.
+func (r *Runner) pollExpired(run, wait context.Context, transient error) error {
+	var err error
+	switch {
+	case errors.Is(run.Err(), context.Canceled):
+		err = fmt.Errorf("run cancelled: %w", run.Err())
+	case run.Err() != nil:
+		err = fmt.Errorf("run deadline passed: %w", run.Err())
+	default:
+		err = fmt.Errorf("timed out after %s: %w", r.cfg.WaitTimeout, wait.Err())
+	}
+	if transient != nil {
+		return fmt.Errorf("%w, while GitHub was failing (%w): %w", err, transient, ErrInconclusive)
+	}
+	return err
 }
