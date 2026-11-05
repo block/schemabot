@@ -589,7 +589,9 @@ scope and pending contributions for missing local results (`pkg/webhook/aggregat
 path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
 match, which all read the schema paths a PR vacates as well as those it changes
 (`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
-`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`);
+`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`), with
+the narrowing to what a PR proposes keeping every vacated schema or config path the default branch
+still holds (`PRFilesProposedAgainstDefaultBranch` in `pkg/github/client.go`);
 required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
 `pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
 multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a

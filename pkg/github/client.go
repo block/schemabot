@@ -2313,11 +2313,12 @@ func pathInsideAny(p string, dirs []string) bool {
 // A file is kept when its object at headSHA differs from the object at the
 // default branch tip, which is what "this pull request proposes it" means: if
 // the content already matches what the default branch declares, merging changes
-// nothing for that file. A rename is also kept when it vacates a schema path the
-// default branch still holds, since merging it stops declaring that file's
-// tables. The default branch is the right yardstick because it
-// is the one SchemaBot already privileges — the post-merge reconcile runs for
-// it alone, and a registered repository cannot be pointed at another ref.
+// nothing for that file. A rename is also kept when it vacates a schema or
+// config path the default branch still holds, since merging it stops declaring
+// that file's tables or that config's database. The default branch is the
+// right yardstick because it is the one SchemaBot already privileges — the
+// post-merge reconcile runs for it alone, and a registered repository cannot be
+// pointed at another ref.
 //
 // Every kept file is one of files, unchanged except that a rename the default
 // branch already holds has its PreviousFilename cleared, so this can only ever
@@ -2375,12 +2376,12 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 			}
 			keep = differs
 		}
-		// A rename proposes vacating its previous schema path only when the
-		// head lacks that path and the default branch still declares it; a
-		// rename the default branch already holds is inherited history, so
-		// its previous path is cleared and discovery does not resolve the
+		// A rename proposes vacating its previous schema or config path only
+		// when the head lacks that path and the default branch still declares
+		// it; a rename the default branch already holds is inherited history,
+		// so its previous path is cleared and discovery does not resolve the
 		// config that managed it.
-		if vacated, ok := renamedAwaySchemaPath(file); ok {
+		if vacated, ok := renamedAwayDiscoveryInputPath(file); ok {
 			removes, err := ic.pathRemovedFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, vacated, levelCache)
 			if err != nil {
 				return nil, defaultTipSHA, err
@@ -2396,6 +2397,21 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		}
 	}
 	return proposed, defaultTipSHA, nil
+}
+
+// renamedAwayDiscoveryInputPath reports the path a rename vacated when that
+// path is a discovery input other than the file's current path: a schema file,
+// as renamedAwaySchemaPath reports, or a SchemaBot config. Moving a config
+// away stops the default branch declaring the database it configured, so the
+// narrowing measures that vacated path the same way as a schema file's.
+func renamedAwayDiscoveryInputPath(file PRFile) (string, bool) {
+	if vacated, ok := renamedAwaySchemaPath(file); ok {
+		return vacated, true
+	}
+	if isRenamedPRFile(file.Status) && isConfigFile(file.PreviousFilename) && file.PreviousFilename != file.Filename {
+		return file.PreviousFilename, true
+	}
+	return "", false
 }
 
 // pathDiffersFromDefaultBranch reports whether objectPath at headSHA differs

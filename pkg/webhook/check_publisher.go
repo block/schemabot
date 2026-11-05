@@ -237,6 +237,7 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		// participant on any path. Without the comparison the leader cannot
 		// tell an inherited file from a proposed one, so it fails closed the
 		// same way as a failed listing.
+		listed := files
 		files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
 		if err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -248,7 +249,22 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
 			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("scope PR files for aggregate leader %s#%d to what it proposes: %w", repo, pr, err)
 		}
-		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
+		// A participant only the listed files select keeps blocking while its
+		// own Check Run on this head is not passing; one it cannot read leaves
+		// the leader unable to tell, so it fails closed the same way.
+		expectedParticipants, err = h.participantsExpectedOnHead(ctx, client, repo, pr, headSHA,
+			config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)),
+			config.ExpectedParticipantChecksForPR(repo, prFilePaths(files)))
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("aggregate leader cannot read a participant the PR no longer proposes work for, not publishing aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("resolve participants for aggregate leader %s#%d: %w", repo, pr, err)
+		}
 		proposedFiles = files
 		leaderReadProposedFiles = true
 	}
@@ -409,13 +425,23 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 //
 // That answer can change on the same head commit: when the default branch
 // acquires a change the PR carried, the participant it selected is no longer
-// expected and will never report. An aggregate this leader already published on
-// the head while waiting for that participant would then block with nothing left
-// to fold it again (MG-10), so a non-passing aggregate on the head is settled
-// through the verified no-work publish, which leaves stored blockers and any
-// stored aggregate block in place. Everything else stays silent: with no
-// aggregate on the head, the head-commit events own the first publish, and while
-// the PR still proposes SchemaBot files the leader's own plan owns the gate.
+// expected and, if it never reported, never will. A participant that did report
+// a run on the head that is not passing stays expected
+// (participantsExpectedOnHead), so this is reached only when every dropped
+// participant has no run on the head or a passing one. An aggregate this leader
+// already published on the head while waiting for that participant would then
+// block with nothing left to fold it again (MG-10), so a non-passing aggregate on
+// the head is settled through the verified no-work publish, which leaves stored
+// blockers and any stored aggregate block in place. Everything else stays
+// silent: with no aggregate on the head, the head-commit events own the first
+// publish, and while the PR still proposes SchemaBot files the leader's own plan
+// owns the gate.
+//
+// The settle runs only when something else folds the PR. Nothing re-folds open
+// PRs when the default branch moves, and the participant refold budget runs out
+// shortly after the participant was first expected, so an aggregate left
+// waiting when the default branch absorbs the change converges here only on a
+// later fold event, such as a Check Run or a command on the PR.
 func (h *Handler) settleLeaderAggregateWithNoProposedWork(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,

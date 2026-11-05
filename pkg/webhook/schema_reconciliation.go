@@ -111,10 +111,14 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 
 	// Participant selection reads what the PR proposes against the default
 	// branch, as auto-plan and the leader's refold do, so a config deletion the
-	// PR only inherited selects no participant here either.
-	files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
-	if err != nil {
-		return fmt.Errorf("scope PR files to what the PR proposes before refreshing checks for PR with no managed schema changes: %w", err)
+	// PR only inherited selects no participant here either. Only a leader or a
+	// participant reads the list below, so a repository with no aggregate role
+	// never makes the comparison and cannot fail on it.
+	if h.hasAggregateRole(repo) {
+		files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
+		if err != nil {
+			return fmt.Errorf("scope PR files to what the PR proposes before refreshing checks for PR with no managed schema changes: %w", err)
+		}
 	}
 
 	// Stale plan-only checks from commits whose schema changes were since

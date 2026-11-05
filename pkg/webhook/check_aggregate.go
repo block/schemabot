@@ -48,6 +48,17 @@ func (h *Handler) isAggregateParticipant(repo string) bool {
 	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
+// hasAggregateRole reports whether this deployment is the aggregate leader or
+// an aggregate participant for repo.
+func (h *Handler) hasAggregateRole(repo string) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	role := config.AggregateRoleForRepo(repo)
+	return role == api.AggregateRoleLeader || role == api.AggregateRoleParticipant
+}
+
 // leaderExpectsParticipantsForPR reports whether this deployment is the
 // aggregate leader for repo and the PR's changed files touch at least one
 // expected participant's paths. Such a PR carries schema work owned by another
