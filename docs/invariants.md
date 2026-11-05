@@ -1994,8 +1994,10 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval counts only for the schema change it reviewed: it was
-given on the commit being applied, or on an earlier commit at which the change's own effect on every
+their own review requirement. An approval that the reviewer withdrew or that the repository
+dismissed does not count. By default an authorized approval counts on whichever commit of the
+change it was given. Where the review policy requires re-approval, an approval counts only for the
+schema change it reviewed: it was given on the commit being applied, or on an earlier commit at which the change's own effect on every
 schema input is provably the same, or the change has stopped touching an input that newer default
 branch content has changed since, so any difference between the two came from newer content on the
 repository's default branch; when that cannot be proved, the approval does not count. A change

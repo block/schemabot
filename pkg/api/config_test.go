@@ -4339,6 +4339,110 @@ databases:
 	}
 }
 
+// Re-approval is off unless the instance or the database turns it on. A
+// database can only add it, so it needs the review gate on for the database,
+// and turning it on for one database leaves the others alone.
+func TestServerConfig_ReviewPolicyRequireReapproval(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+	const databases = `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    operator_users:
+      - mona
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`
+
+	t.Run("off by default", func(t *testing.T) {
+		cfg, err := loadConfig(t, "review_policy:\n  enabled: true\n"+databases)
+		require.NoError(t, err)
+		assert.False(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("payments"))
+	})
+
+	t.Run("on for the instance covers every database", func(t *testing.T) {
+		cfg, err := loadConfig(t, "review_policy:\n  enabled: true\n  require_reapproval: true\n"+databases)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+		assert.True(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("payments"))
+		assert.True(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("unknown"))
+	})
+
+	t.Run("on for one database covers only that database", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+review_policy:
+  enabled: true
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      require_reapproval: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("payments"))
+	})
+
+	t.Run("a database that opts into the gate can require re-approval with it", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+      require_reapproval: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.True(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+	})
+
+	t.Run("a database that requires re-approval without the gate is rejected", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      require_reapproval: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.require_reapproval needs the review gate on for the database")
+	})
+}
+
 func TestServerConfig_IsCheckRequired(t *testing.T) {
 	t.Run("nil receiver requires all checks", func(t *testing.T) {
 		var cfg *ServerConfig

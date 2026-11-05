@@ -68,7 +68,7 @@ var errApprovalNotComparable = errors.New("an approval on an earlier commit cann
 
 // enforceReviewGate runs the review gate check and posts the appropriate comment if blocked.
 // Returns blocked=true when the gate blocks — the PR lacks an approval from a
-// configured review-policy principal that covers the head (caller should
+// configured review-policy principal that counts for the head (caller should
 // return). A block in which an approval could not be compared with the head
 // posts a gate-error comment; any other block posts Review Required. Both
 // name the reviewers who can approve the latest commit.
@@ -142,7 +142,9 @@ func reviewGateErrorDetail(err error) string {
 // config file. schema.HeadSHA is the commit the schema files being applied
 // were read from.
 //
-// An approval counts only for the schema change it reviewed: it must have been
+// By default any authorized approval on the PR counts, on whichever commit it
+// was given. When the review policy requires re-approval for the database, an
+// approval counts only for the schema change it reviewed: it must have been
 // given on HeadSHA, or on an earlier commit at which the PR's change to the
 // database's schema inputs is the same as at HeadSHA (see approvalCoversHead).
 // When GitHub is unavailable while proving that, the approval state is
@@ -188,11 +190,12 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 			"repo", repo, "pr", pr, "database", database, "base_ref", prInfo.BaseRef, "head_sha", headSHA)
 	}
 
+	requireReapproval := h.reviewGateRequiresReapproval(database)
 	approvals := ghclient.GetApprovedReviews(reviews)
 	h.logger.Info("review gate: fetched reviews",
 		"repo", repo, "pr", pr, "database", database,
 		"approved_by", ghclient.GetApprovedReviewers(reviews), "pr_author", prInfo.User,
-		"head_sha", headSHA)
+		"head_sha", headSHA, "require_reapproval", requireReapproval)
 
 	// Approvals on the head need no comparison, so they are checked first: a
 	// head approval decides the gate without reading GitHub again.
@@ -235,6 +238,18 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 			h.logger.Debug("review gate: approval does not count because the reviewer is not an authorized reviewer for the database",
 				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer)
 			continue
+		}
+		if !requireReapproval {
+			h.logger.Info("review gate: approved; re-approval is not required, so the approval counts on any commit",
+				"repo", repo, "pr", pr, "database", database,
+				"approved_by", reviewer, "matched_principal", principal,
+				"approved_sha", approval.CommitID, "head_sha", headSHA)
+			return &ReviewGateResult{
+				Approved:          true,
+				OperatorReviewers: policy.OperatorReviewers,
+				OtherReviewers:    policy.OtherReviewers,
+				PRAuthor:          prInfo.User,
+			}, nil
 		}
 		verdict, err := h.approvalCoversHead(ctx, client, &coverage, approval)
 		// An approval that cannot be compared does not count, but another
@@ -799,6 +814,12 @@ func (h *Handler) isReviewGateEnabled(repo, database string) bool {
 	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabledForDatabase(database)
 	h.logger.Debug("review gate: server config", "repo", repo, "database", database, "enabled", enabled)
 	return enabled
+}
+
+// reviewGateRequiresReapproval reports whether an approval counts only for
+// the schema change it reviewed, instance-wide or for the database alone.
+func (h *Handler) reviewGateRequiresReapproval(database string) bool {
+	return h.service != nil && h.service.Config().ReviewPolicyRequiresReapprovalForDatabase(database)
 }
 
 func appendUniqueString(values []string, value string) []string {

@@ -1299,6 +1299,13 @@ type DatabaseReviewPolicyConfig struct {
 	// approve still comes from the instance-wide review_policy: its admins,
 	// repo admins, this database's operators, and CODEOWNERS when included.
 	Enabled bool `yaml:"enabled,omitempty"`
+
+	// RequireReapproval makes an approval count only for the schema change it
+	// reviewed, for this database alone, even when
+	// review_policy.require_reapproval is false. Like Enabled, it can only
+	// add the requirement, never remove it, and it needs the review gate on
+	// for the database.
+	RequireReapproval bool `yaml:"require_reapproval,omitempty"`
 }
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
@@ -1339,6 +1346,13 @@ type ReviewPolicyConfig struct {
 	// IncludeCodeowners allows matching CODEOWNERS approvals to satisfy the
 	// review gate. Defaults to false.
 	IncludeCodeowners bool `yaml:"include_codeowners,omitempty"`
+
+	// RequireReapproval makes an approval count only for the schema change it
+	// reviewed: a push that changes the PR's schema change after an approval
+	// needs a new one. Defaults to false, where an authorized approval keeps
+	// counting across later pushes until the reviewer withdraws it or GitHub
+	// dismisses it.
+	RequireReapproval bool `yaml:"require_reapproval,omitempty"`
 }
 
 // EnvironmentConfig holds per-environment database configuration.

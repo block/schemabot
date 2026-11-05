@@ -93,7 +93,9 @@ the agent uses your credentials.
   [`review_policy`](configuration.md#review-gate) to require a qualifying
   approval for the environments served by that instance, or a database's
   own `review_policy` to require one for that database alone. The PR
-  author's own approval does not count.
+  author's own approval does not count. An approval keeps counting after
+  later pushes unless you set `require_reapproval`, which requires a new
+  approval when the PR's schema change differs from the one approved.
 - **Review destructive changes before allowing them.** Changes flagged as unsafe
   require `--allow-unsafe` to proceed. If your agent uses your credentials, it
   can supply that flag too—SchemaBot cannot tell whether you personally

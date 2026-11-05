@@ -61,6 +61,21 @@ func (c *ServerConfig) ReviewPolicyEnabledForDatabase(database string) bool {
 	return dbConfig != nil && dbConfig.ReviewPolicy.Enabled
 }
 
+// ReviewPolicyRequiresReapprovalForDatabase returns true when an approval
+// counts only for the schema change it reviewed for database: the
+// instance-wide review policy requires it, or the database opts in with its
+// own review_policy. Otherwise any authorized approval on the PR counts.
+func (c *ServerConfig) ReviewPolicyRequiresReapprovalForDatabase(database string) bool {
+	if c == nil {
+		return false
+	}
+	if c.ReviewPolicy.RequireReapproval {
+		return true
+	}
+	dbConfig := c.Database(database)
+	return dbConfig != nil && dbConfig.ReviewPolicy.RequireReapproval
+}
+
 // ReviewPolicyIncludesDatabaseOperators returns whether database-scoped
 // operator principals should satisfy the review gate. Defaults to true.
 func (c *ServerConfig) ReviewPolicyIncludesDatabaseOperators() bool {
@@ -106,6 +121,9 @@ func validateReviewPolicy(config ReviewPolicyConfig) error {
 // it. Without one, the gate fails that PR's every apply with an error instead
 // of asking for a review.
 func (c *ServerConfig) validateDatabaseReviewPolicy(database string, dbConfig DatabaseConfig) error {
+	if dbConfig.ReviewPolicy.RequireReapproval && !c.ReviewPolicyEnabled() && !dbConfig.ReviewPolicy.Enabled {
+		return fmt.Errorf("databases.%s.review_policy.require_reapproval needs the review gate on for the database: set databases.%s.review_policy.enabled or review_policy.enabled", database, database)
+	}
 	if !dbConfig.ReviewPolicy.Enabled {
 		return nil
 	}
