@@ -962,13 +962,23 @@ const failClosedPostTimeout = 10 * time.Second
 
 // failClosedPostContext returns the context a failing aggregate post runs on.
 // The post is what tells the author why the PR is blocked, and the failure it
-// reports is often the run's own deadline, so it must not lose to that same
-// deadline. When the deadline has passed, or leaves less than
-// failClosedPostTimeout, the post gets its own short budget. Cancellation still
-// stops it: a cancelled run lost its lease or is shutting down, and the
-// delivery is re-run by whichever driver picks it up next.
+// reports is often the auto-plan run's own work deadline, so it must not lose
+// to that same deadline. When an auto-plan run's deadline has passed, or leaves
+// less than failClosedPostTimeout, the post gets its own short budget.
+//
+// That budget hangs off the context the run was started from, so lease loss or
+// shutdown still stops the post at any point: the delivery is re-run by
+// whichever driver picks it up next. It also starts with an empty PR-info
+// cache, so the post's head check reads the PR again rather than trusting a
+// head the run cached before a push could have replaced it.
 func (h *Handler) failClosedPostContext(ctx context.Context, repo string, pr int, headSHA string) (context.Context, context.CancelFunc) {
-	if errors.Is(ctx.Err(), context.Canceled) {
+	run, isAutoPlanRun := autoPlanRunContext(ctx)
+	if !isAutoPlanRun {
+		return ctx, func() {}
+	}
+	if run.Err() != nil {
+		h.logger.Info("failing aggregate post keeps the run's context because the run has ended; the next driver re-runs the delivery",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "cause", context.Cause(run))
 		return ctx, func() {}
 	}
 	deadline, hasDeadline := ctx.Deadline()
@@ -977,16 +987,8 @@ func (h *Handler) failClosedPostContext(ctx context.Context, repo string, pr int
 	}
 	h.logger.Info("failing aggregate post runs on its own budget because the run that found the failure is at or near its deadline",
 		"repo", repo, "pr", pr, "head_sha", headSHA, "budget", failClosedPostTimeout, "run_error", ctx.Err())
-	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failClosedPostTimeout)
-	stop := context.AfterFunc(ctx, func() {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			cancel()
-		}
-	})
-	return postCtx, func() {
-		stop()
-		cancel()
-	}
+	postCtx, cancel := context.WithTimeout(run, failClosedPostTimeout)
+	return ghclient.WithPRInfoCache(postCtx), cancel
 }
 
 // postFailingAggregatesWithBlock stores a blocking reason only for callers with

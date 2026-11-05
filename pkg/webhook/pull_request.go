@@ -254,7 +254,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 // work is detached from the HTTP request lifetime; the durable webhook driver
 // passes its run context so lease loss and shutdown cancel in-flight work.
 func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	ctx, cancel := context.WithTimeout(withAutoPlanRunContext(parent), 30*time.Second)
 	// Dedupe FetchPullRequest calls within this webhook delivery.
 	ctx = ghclient.WithPRInfoCache(ctx)
 
@@ -264,6 +264,22 @@ func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, install
 		return nil, nil, nil, fmt.Errorf("create GitHub client for repo %s installation %d: %w", repo, installationID, err)
 	}
 	return ctx, cancel, client, nil
+}
+
+// autoPlanRunContextKey carries the context an auto-plan run was started
+// from, before the run's own work deadline was applied.
+type autoPlanRunContextKey struct{}
+
+func withAutoPlanRunContext(run context.Context) context.Context {
+	return context.WithValue(run, autoPlanRunContextKey{}, run)
+}
+
+// autoPlanRunContext returns the context the auto-plan run in ctx was started
+// from. Its cancellation is lease loss or shutdown; it does not carry the
+// run's work deadline.
+func autoPlanRunContext(ctx context.Context) (context.Context, bool) {
+	run, ok := ctx.Value(autoPlanRunContextKey{}).(context.Context)
+	return run, ok
 }
 
 func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string, configs []ghclient.DiscoveredConfig) bool {

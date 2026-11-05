@@ -212,32 +212,35 @@ func TestE2EUnstoredPlanFailureBlocksOnlyItsEnvironmentAggregate(t *testing.T) {
 // postFailingAggregatesWithBlock reports false whenever the blocked aggregate
 // it set out to post is not both published and stored: a caller about to fold
 // the aggregate from stored check state reads false as "do not fold". It
-// reports true only once the block is in place. A run that reached its
-// deadline still lands the block, because the deadline is often the failure
-// being reported; a cancelled run does not, because its delivery is re-run.
+// reports true only once the block is in place.
+//
+// An auto-plan run that reached its work deadline still lands the block,
+// because the deadline is often the failure being reported. The post's own
+// budget still ends when the run is cancelled (lease loss or shutdown), even
+// part-way through the post, and it reads the PR head again instead of
+// trusting a head the run cached before a push replaced it.
 func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T) {
 	disabled := false
-	pastDeadline := func(t *testing.T) context.Context {
-		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
-		t.Cleanup(cancel)
-		return ctx
-	}
-	cancelled := func(t *testing.T) context.Context {
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-		return ctx
-	}
 	tests := []struct {
 		name         string
 		headSHA      string
 		createStatus int
 		repos        map[string]api.RepoConfig
-		ctx          func(t *testing.T) context.Context
-		want         bool
+		// pastDeadline runs the post inside an auto-plan run whose work
+		// deadline has passed; cachedHead seeds that run's PR-info cache.
+		pastDeadline      bool
+		cachedHead        string
+		runCancelled      bool
+		cancelRunOnPRRead bool
+		want              bool
 	}{
 		{name: "posted and stored", headSHA: "abc123", createStatus: http.StatusCreated, want: true},
-		{name: "run deadline passed", headSHA: "abc123", createStatus: http.StatusCreated, ctx: pastDeadline, want: true},
-		{name: "run cancelled", headSHA: "abc123", createStatus: http.StatusCreated, ctx: cancelled},
+		{name: "run deadline passed", headSHA: "abc123", createStatus: http.StatusCreated, pastDeadline: true, want: true},
+		{name: "run deadline passed after a push replaced the cached head", headSHA: "newsha456", createStatus: http.StatusCreated,
+			pastDeadline: true, cachedHead: "abc123"},
+		{name: "run cancelled", headSHA: "abc123", createStatus: http.StatusCreated, runCancelled: true},
+		{name: "run cancelled during the post after its deadline passed", headSHA: "abc123", createStatus: http.StatusCreated,
+			pastDeadline: true, cancelRunOnPRRead: true},
 		{name: "check publishing disabled", headSHA: "abc123", createStatus: http.StatusCreated,
 			repos: map[string]api.RepoConfig{"octocat/hello-world": {EnableChecks: &disabled}}},
 		{name: "head moved", headSHA: "newsha456", createStatus: http.StatusCreated},
@@ -245,11 +248,30 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			run, cancelRun := context.WithCancel(t.Context())
+			t.Cleanup(cancelRun)
+			ctx := run
+			if tt.pastDeadline {
+				var cancelWork context.CancelFunc
+				ctx, cancelWork = context.WithDeadline(withAutoPlanRunContext(run), time.Now().Add(-time.Second))
+				t.Cleanup(cancelWork)
+			}
+			if tt.cachedHead != "" {
+				ctx = ghclient.WithPRInfo(ctx, "octocat/hello-world", 1, &ghclient.PullRequestInfo{HeadSHA: tt.cachedHead, BaseRef: "main"})
+			}
+			if tt.runCancelled {
+				cancelRun()
+			}
+
 			svc := setupE2EServiceWithConfig(t, &api.ServerConfig{Repos: tt.repos})
 			mux := http.NewServeMux()
 			server := httptest.NewServer(mux)
 			t.Cleanup(server.Close)
+			var checkRunPosts int
 			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+				if tt.cancelRunOnPRRead {
+					cancelRun()
+				}
 				_ = json.NewEncoder(w).Encode(gh.PullRequest{
 					Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(tt.headSHA)},
 					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
@@ -257,6 +279,7 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 				})
 			})
 			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+				checkRunPosts++
 				w.WriteHeader(tt.createStatus)
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
 			})
@@ -265,13 +288,12 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 			h := newE2EHandler(t, svc, client)
 			installClient := ghclient.NewInstallationClient(client, h.logger)
 
-			ctx := t.Context()
-			if tt.ctx != nil {
-				ctx = tt.ctx(t)
-			}
 			got := h.postFailingAggregatesWithBlock(ctx, installClient, "octocat/hello-world", 1, "abc123",
 				map[string]string{"production": planFailedUnstoredSummary}, planFailedUnrecordedBlock)
 			assert.Equal(t, tt.want, got)
+			if tt.cachedHead != "" || tt.cancelRunOnPRRead {
+				assert.Zero(t, checkRunPosts, "no Check Run is published")
+			}
 
 			stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
 			require.NoError(t, err)
