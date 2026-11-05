@@ -267,11 +267,46 @@ func isTerminalStatus(label string) bool {
 	return false
 }
 
+// applyRejections are headlines of SchemaBot's replies that refuse an apply
+// command before it reaches the engine, so no apply can be running for it.
+// A generic "Apply Failed" reply is left out: SchemaBot can post it after the
+// engine accepted the apply.
+var applyRejections = []string{
+	"Apply Blocked",
+	"Plan Failed",
+	"Review Required",
+	"Review Gate Error",
+	"Command Not Authorized",
+	"Authorization Check Failed",
+	"Database Not Registered",
+	"Databases Not Registered",
+	"Database Not Configured",
+	"Database Not Available to This Repository",
+	"No Schema Files Changed",
+	"Missing Environment",
+}
+
+func isApplyRejection(body string) bool {
+	headline := firstLine(body)
+	if !strings.HasPrefix(headline, "## ") {
+		return false
+	}
+	for _, r := range applyRejections {
+		if strings.Contains(headline, r) {
+			return true
+		}
+	}
+	return false
+}
+
 // unansweredApply reports whether the last apply command in comments has no
-// reply from SchemaBot yet. isBot picks out SchemaBot's comments. A comment
-// about an apply that started before the command, such as a late summary,
-// is not a reply to it. Only the last apply command can be unanswered: the
-// runner waits for each apply to start before it posts the next command.
+// answer from SchemaBot yet. isBot picks out SchemaBot's comments. An answer
+// is a comment about an apply that started after the command, or a refusal
+// of the command before it reached the engine. Any other comment, such as a
+// late summary of an earlier apply or a plan, leaves the command unanswered,
+// since an accepted apply may still be running without its progress comment.
+// Only the last apply command can be unanswered: the runner waits for each
+// apply to start before it posts the next command.
 func unansweredApply(comments []Comment, isBot func(Comment) bool, commandPrefix string) bool {
 	var command int64
 	for _, c := range comments {
@@ -296,11 +331,14 @@ func unansweredApply(comments []Comment, isBot func(Comment) bool, commandPrefix
 		if !isBot(c) || c.ID <= command {
 			continue
 		}
+		if isApplyRejection(c.Body) {
+			return false
+		}
 		s, ok := ParseApplyStatus(c.Body)
 		if !ok {
 			s, ok = parseFinalSummary(c.Body)
 		}
-		if !ok || !earlier[s.ApplyID] {
+		if ok && !earlier[s.ApplyID] {
 			return false
 		}
 	}
