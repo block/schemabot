@@ -4,7 +4,8 @@
 // gate runs it after each SchemaBot release.
 //
 // It exits 0 when the run passed, 1 when a step failed, and 2 when the run was
-// inconclusive and should be retried.
+// inconclusive and should be retried: the copy outran a control command,
+// another pull request held the lock, or GitHub rate limited or failed a call.
 //
 // The GitHub token comes from GITHUB_TOKEN and the test database DSN from
 // SCHEMABOT_E2E_DSN.
