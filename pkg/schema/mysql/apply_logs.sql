@@ -14,7 +14,6 @@ CREATE TABLE `apply_logs` (
   PRIMARY KEY (`id`),
   KEY `idx_apply_created` (`apply_id`,`created_at`),
   KEY `idx_task_id` (`task_id`),
-  KEY `idx_apply_operation_id` (`apply_operation_id`),
   KEY `idx_level` (`level`),
   KEY `idx_event_type` (`event_type`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
