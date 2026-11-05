@@ -303,10 +303,10 @@ func TestClassifyRunnerErrorRowData(t *testing.T) {
 	}
 }
 
-// A statement the target refuses whatever the moment, for a missing grant, an
-// unsupported feature, or a system function the binary log cannot replicate,
-// is refused the same way on every attempt, so it fails on the first one
-// instead of spending the retry budget, whether Spirit ran it or SchemaBot ran
+// A statement the target refuses whatever the moment, for a missing grant or
+// an unsupported feature, is refused the same way on every attempt, so a
+// refusal that carries its MySQL code fails on the first attempt instead of
+// spending the retry budget, whether Spirit ran the statement or SchemaBot ran
 // it directly. A lock wait on the same statement stays retryable.
 func TestClassifyRunnerErrorStatement(t *testing.T) {
 	permanent := []struct {
@@ -317,7 +317,6 @@ func TestClassifyRunnerErrorStatement(t *testing.T) {
 			&mysql.MySQLError{Number: 1142, Message: "ALTER command denied to user 'app'@'10.0.0.1' for table 'orders'"})},
 		{"feature the server does not support", fmt.Errorf("failed to execute ddl: %w",
 			&mysql.MySQLError{Number: 1235, Message: "This version of MySQL doesn't yet support 'ALTER TABLE ... with this combination of options'"})},
-		{"system function unsafe for the binary log", copyWarningError(1674, "Statement is unsafe because it uses a system function that may return a different value on the replica.")},
 	}
 	for _, tc := range permanent {
 		t.Run(tc.name+" is permanent", func(t *testing.T) {
