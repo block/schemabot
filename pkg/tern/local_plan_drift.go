@@ -494,39 +494,52 @@ func stampReplannedVSchema(namespaces map[string]*storage.NamespacePlanData, rep
 	return nil
 }
 
-// vschemaUnsafeRecord is one VSchema deletion or mutation record as plan
-// change-metadata encodes it.
-type vschemaUnsafeRecord struct {
+// vschemaUnsafeRecordIdentity is the part of a VSchema deletion or mutation
+// record that identifies it: the fields plan change-metadata encodes today.
+// Two records with the same identity are the same record, whatever other
+// fields they carry.
+type vschemaUnsafeRecordIdentity struct {
 	Kind   string `json:"kind"`
 	Name   string `json:"name"`
 	Reason string `json:"reason"`
 }
 
+// vschemaUnsafeRecord is one VSchema deletion or mutation record: its identity,
+// used to tell it apart from other records, and the bytes the engine encoded
+// it as, which are what the merged value carries. Keeping the bytes means a
+// field the engine records that this package does not know survives the
+// merge.
+type vschemaUnsafeRecord struct {
+	identity vschemaUnsafeRecordIdentity
+	raw      json.RawMessage
+}
+
 // mergeVSchemaUnsafeRecords returns the dispatched records followed by each
 // re-planned record the dispatch does not already hold, encoded as plan
-// change-metadata. A dispatched value that cannot be decoded is kept as it is:
-// the gate already fails closed on it, and rewriting it could only lose what
-// it holds. A re-planned value that cannot be decoded is an error, since this
-// target's judgement would otherwise be dropped, even when the dispatch
-// carries the same bytes.
+// change-metadata. Each record keeps the bytes its side encoded it as. A
+// dispatched value that cannot be decoded is kept as it is: the gate already
+// fails closed on it, and rewriting it could only lose what it holds. A
+// re-planned value that cannot be decoded is an error, since this target's
+// judgement would otherwise be dropped, even when the dispatch carries the
+// same bytes.
 func mergeVSchemaUnsafeRecords(dispatched, replanned string) (string, error) {
 	if replanned == "" {
 		return dispatched, nil
 	}
-	var replannedRecords []vschemaUnsafeRecord
-	if err := json.Unmarshal([]byte(replanned), &replannedRecords); err != nil {
+	replannedRecords, err := decodeVSchemaUnsafeRecords(replanned)
+	if err != nil {
 		return "", fmt.Errorf("decode re-planned records: %w", err)
 	}
 	if dispatched == "" || replanned == dispatched {
 		return replanned, nil
 	}
-	merged, ok := decodeVSchemaUnsafeRecords(dispatched)
-	if !ok {
+	merged, err := decodeVSchemaUnsafeRecords(dispatched)
+	if err != nil {
 		return dispatched, nil
 	}
 	added := false
 	for _, r := range replannedRecords {
-		if !slices.Contains(merged, r) {
+		if !slices.ContainsFunc(merged, func(m vschemaUnsafeRecord) bool { return m.identity == r.identity }) {
 			merged = append(merged, r)
 			added = true
 		}
@@ -534,7 +547,11 @@ func mergeVSchemaUnsafeRecords(dispatched, replanned string) (string, error) {
 	if !added {
 		return dispatched, nil
 	}
-	encoded, err := json.Marshal(merged)
+	elements := make([]json.RawMessage, 0, len(merged))
+	for _, m := range merged {
+		elements = append(elements, m.raw)
+	}
+	encoded, err := json.Marshal(elements)
 	if err != nil {
 		return "", fmt.Errorf("encode merged records: %w", err)
 	}
@@ -542,13 +559,21 @@ func mergeVSchemaUnsafeRecords(dispatched, replanned string) (string, error) {
 }
 
 // decodeVSchemaUnsafeRecords decodes a VSchema deletion or mutation record
-// value, reporting whether it could be decoded.
-func decodeVSchemaUnsafeRecords(raw string) ([]vschemaUnsafeRecord, bool) {
-	var records []vschemaUnsafeRecord
-	if err := json.Unmarshal([]byte(raw), &records); err != nil {
-		return nil, false
+// value into its records, each keeping the bytes it was encoded as.
+func decodeVSchemaUnsafeRecords(raw string) ([]vschemaUnsafeRecord, error) {
+	var elements []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &elements); err != nil {
+		return nil, err
 	}
-	return records, true
+	records := make([]vschemaUnsafeRecord, 0, len(elements))
+	for _, element := range elements {
+		var identity vschemaUnsafeRecordIdentity
+		if err := json.Unmarshal(element, &identity); err != nil {
+			return nil, err
+		}
+		records = append(records, vschemaUnsafeRecord{identity: identity, raw: element})
+	}
+	return records, nil
 }
 
 // stampReplannedTables stamps each change with its re-planned counterpart,

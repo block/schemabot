@@ -310,6 +310,10 @@ func vschemaChangeMetadata(deletions, mutations string) map[string]string {
 	return meta
 }
 
+// undecodableVSchemaDeletionsReason is the reason the unsafe VSchema admission
+// gate reports for a namespace whose recorded deletions cannot be decoded.
+const undecodableVSchemaDeletionsReason = "VSchema deletions were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe; re-plan to record them"
+
 // A non-primary deployment's live VSchema can differ from the primary's, so
 // its own re-plan can find a VSchema deletion or routing change the primary's
 // record — the one the dispatch carries — does not. The materialized plan must
@@ -317,11 +321,14 @@ func vschemaChangeMetadata(deletions, mutations string) map[string]string {
 // VSchema admission gate refuses the apply without the opt-in whenever either
 // side found an unsafe change, and never drops a record the dispatch carried.
 func TestMaterializedPlanCarriesReplannedVSchemaUnsafeRecords(t *testing.T) {
+	emailAndPhoneDeletionsJSON := `[{"kind":"vindex","name":"email_idx","reason":"` + dropEmailVindexReason + `"},{"kind":"vindex","name":"phone_idx","reason":"` + dropPhoneVindexReason + `"}]`
+	emailDeletionWithOwnerJSON := `[{"kind":"vindex","name":"email_idx","reason":"` + dropEmailVindexReason + `","owner":"billing"}]`
 	cases := []struct {
 		name               string
 		dispatched         map[string]string
 		replanned          map[string]string
 		wantUnsafeReasons  []string
+		wantDeletions      string
 		wantMaterializeErr string
 	}{
 		{
@@ -351,8 +358,37 @@ func TestMaterializedPlanCarriesReplannedVSchemaUnsafeRecords(t *testing.T) {
 		{
 			name:              "a record on both sides is kept once",
 			dispatched:        vschemaChangeMetadata(emailVindexDeletionJSON, ""),
-			replanned:         vschemaChangeMetadata(`[{"kind":"vindex","name":"email_idx","reason":"`+dropEmailVindexReason+`"},{"kind":"vindex","name":"phone_idx","reason":"`+dropPhoneVindexReason+`"}]`, ""),
+			replanned:         vschemaChangeMetadata(emailAndPhoneDeletionsJSON, ""),
 			wantUnsafeReasons: []string{dropEmailVindexReason, dropPhoneVindexReason},
+			wantDeletions:     emailAndPhoneDeletionsJSON,
+		},
+		{
+			name:              "dispatched records the re-plan repeats only in part are all kept",
+			dispatched:        vschemaChangeMetadata(emailAndPhoneDeletionsJSON, ""),
+			replanned:         vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			wantUnsafeReasons: []string{dropEmailVindexReason, dropPhoneVindexReason},
+			wantDeletions:     emailAndPhoneDeletionsJSON,
+		},
+		{
+			name:              "a dispatched record keeps every field it carries when the re-plan adds one",
+			dispatched:        vschemaChangeMetadata(emailDeletionWithOwnerJSON, ""),
+			replanned:         vschemaChangeMetadata(phoneVindexDeletionJSON, ""),
+			wantUnsafeReasons: []string{dropEmailVindexReason, dropPhoneVindexReason},
+			wantDeletions:     `[{"kind":"vindex","name":"email_idx","reason":"` + dropEmailVindexReason + `","owner":"billing"},{"kind":"vindex","name":"phone_idx","reason":"` + dropPhoneVindexReason + `"}]`,
+		},
+		{
+			name:              "a dispatched record that cannot be decoded is kept as it is",
+			dispatched:        vschemaChangeMetadata("not json", ""),
+			replanned:         vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			wantUnsafeReasons: []string{undecodableVSchemaDeletionsReason},
+			wantDeletions:     "not json",
+		},
+		{
+			name:              "a dispatch without VSchema change-metadata stays unsafe however the re-plan judged it",
+			dispatched:        nil,
+			replanned:         vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			wantUnsafeReasons: []string{"the stored plan does not record whether this VSchema change removes or mutates vindexes or routing entries, so it is treated as unsafe; re-plan to record it"},
+			wantDeletions:     emailVindexDeletionJSON,
 		},
 		{
 			name:       "safe on both sides",
@@ -395,6 +431,9 @@ func TestMaterializedPlanCarriesReplannedVSchemaUnsafeRecords(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.NotNil(t, plan)
+			if tc.wantDeletions != "" {
+				assert.Equal(t, tc.wantDeletions, plan.Namespaces["testapp"].Metadata[storage.PlanMetadataVSchemaDeletions])
+			}
 
 			var reasons []string
 			for _, change := range plan.UnsafeVSchemaChanges() {
@@ -412,6 +451,17 @@ func TestMaterializedPlanCarriesReplannedVSchemaUnsafeRecords(t *testing.T) {
 			require.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(plan, storage.ApplyOptions{AllowUnsafe: true}))
 		})
 	}
+}
+
+// The VSchema parity check matches the re-planned namespaces to the dispatched
+// ones before any record is stamped, so a re-planned namespace with no
+// materialized VSchema change is a broken precondition. It is refused rather
+// than skipped, so no re-planned judgement is dropped on the way to the gate.
+func TestStampReplannedVSchemaRefusesNamespaceWithoutMaterializedChange(t *testing.T) {
+	namespaces := map[string]*storage.NamespacePlanData{"other": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}}}
+	err := stampReplannedVSchema(namespaces, map[string][]map[string]string{"testapp": {vschemaChangeMetadata(emailVindexDeletionJSON, "")}})
+	require.EqualError(t, err, `namespace "testapp": no materialized VSchema change for one the VSchema parity check matched`)
+	assert.Empty(t, namespaces["other"].Metadata, "no other namespace is stamped")
 }
 
 // A locally planned keyspace whose shards diverge keeps each shard's own
