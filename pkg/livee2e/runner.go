@@ -188,7 +188,7 @@ func (r *Runner) steps(ctx context.Context, cur *run) error {
 	if err != nil {
 		return err
 	}
-	if err := r.waitForStatus(ctx, cur, create, StatusApplied, appliedFails); err != nil {
+	if err := r.waitForStatus(ctx, cur, create, StatusApplied, appliedFails, 0); err != nil {
 		return err
 	}
 	if err := r.expectTable(ctx, cur.table); err != nil {
@@ -210,7 +210,7 @@ func (r *Runner) steps(ctx context.Context, cur *run) error {
 	if err != nil {
 		return err
 	}
-	if err := r.waitForStatus(ctx, cur, copyApply, StatusInProgress, appliedInconclusive); err != nil {
+	if err := r.waitForStatus(ctx, cur, copyApply, StatusInProgress, appliedInconclusive, 0); err != nil {
 		return err
 	}
 	if err := r.controlCommand(ctx, cur, "stop", copyApply, StatusStopped, appliedInconclusive); err != nil {
@@ -237,7 +237,7 @@ func (r *Runner) steps(ctx context.Context, cur *run) error {
 	if err != nil {
 		return err
 	}
-	if err := r.waitForStatus(ctx, cur, deferred, StatusWaitingForCutover, appliedFails); err != nil {
+	if err := r.waitForStatus(ctx, cur, deferred, StatusWaitingForCutover, appliedFails, 0); err != nil {
 		return err
 	}
 	if err := r.expectColumn(ctx, cur.table, columnBefore); err != nil {
@@ -305,10 +305,11 @@ func (r *Runner) applyCommand(ctx context.Context, cur *run, verb string, args .
 
 // controlCommand posts a control command for applyID and waits for want.
 func (r *Runner) controlCommand(ctx context.Context, cur *run, verb, applyID, want string, applied onApplied) error {
-	if _, err := r.command(ctx, cur, verb, applyID); err != nil {
+	commentID, err := r.command(ctx, cur, verb, applyID)
+	if err != nil {
 		return err
 	}
-	return r.waitForStatus(ctx, cur, applyID, want, applied)
+	return r.waitForStatus(ctx, cur, applyID, want, applied, commentID)
 }
 
 // onApplied says what an apply that finishes before reaching the awaited
@@ -324,9 +325,20 @@ const (
 	appliedFails
 )
 
+// refusedStatuses maps the state SchemaBot names when it refuses a command for
+// a finished apply to the status label that state renders as.
+var refusedStatuses = map[string]string{
+	"completed": StatusApplied,
+	"failed":    StatusFailed,
+	"cancelled": StatusCancelled,
+	"reverted":  "Reverted",
+}
+
 // waitForStatus waits until applyID's comment shows want. Any other terminal
-// status fails the run; Applied is judged by applied.
-func (r *Runner) waitForStatus(ctx context.Context, cur *run, applyID, want string, applied onApplied) error {
+// status fails the run; Applied is judged by applied. A nonzero command is the
+// control command's comment: SchemaBot's refusal of it because the apply had
+// already finished counts as that final status.
+func (r *Runner) waitForStatus(ctx context.Context, cur *run, applyID, want string, applied onApplied, command int64) error {
 	var last string
 	err := r.poll(ctx, func(ctx context.Context) (bool, error) {
 		comments, err := r.botComments(ctx, cur.pr)
@@ -338,6 +350,17 @@ func (r *Runner) waitForStatus(ctx context.Context, cur *run, applyID, want stri
 			// A summary can land while the status comment still shows an
 			// earlier state.
 			s, ok = ApplyStatus{ApplyID: applyID, Status: final}, true
+		}
+		if command != 0 {
+			// The copy can finish before the command lands, and the refusal
+			// can arrive while the status comment still shows an earlier state.
+			if finished, refused := refusedAsFinished(comments, command); refused {
+				label, known := refusedStatuses[finished]
+				if !known {
+					return false, fmt.Errorf("SchemaBot refused the command for apply %s, which finished in unknown state %q", applyID, finished)
+				}
+				s, ok = ApplyStatus{ApplyID: applyID, Status: label}, true
+			}
 		}
 		if !ok {
 			r.logger.Debug("no status comment yet", "pr", cur.pr, "apply_id", applyID)

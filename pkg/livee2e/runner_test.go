@@ -559,3 +559,16 @@ func TestSweepRetriesARunWhoseBranchDeleteFailed(t *testing.T) {
 	assert.NotContains(t, bot.heads, BranchPrefix+earlier)
 	assert.False(t, target.has(earlier))
 }
+
+// A cancel SchemaBot refuses because the copy already finished means the copy
+// outran the cancel: inconclusive, not a wait that times out.
+func TestRunIsInconclusiveWhenTheCancelIsRefusedAsFinished(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	bot.cancelRefusedAsFinished = true
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorIs(t, err, ErrInconclusive)
+	assert.Contains(t, err.Error(), "finished before it reached "+StatusCancelled)
+}
