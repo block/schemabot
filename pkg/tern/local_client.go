@@ -4090,9 +4090,9 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 // and a read for one of them must return that target's entries, not the whole
 // apply's: the caller renders one section per target, so an unscoped read
 // would repeat every target's lines under each. It returns nil, an unscoped
-// read, when no target is named or every operation runs on that one target. A
-// named target the apply has no operation on is an error, never an empty
-// read that looks like a quiet target.
+// read, when no target is named. A named target the apply has no operation on
+// is an error when the apply spans several targets, never an empty read that
+// looks like a quiet target.
 func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage.Apply, target string) ([]int64, error) {
 	if target == "" {
 		return nil, nil
@@ -4101,11 +4101,20 @@ func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage
 	if err != nil {
 		return nil, fmt.Errorf("list operations of apply %s for logs of target %s: %w", apply.ApplyIdentifier, target, err)
 	}
-	operationIDs, ok := storage.LogOperationsOnTarget(ops, target)
-	if !ok {
-		return nil, fmt.Errorf("apply %s has no operation on target %s: %w", apply.ApplyIdentifier, target, ErrLogsTargetNotInApply)
+	if operationIDs := storage.LogOperationsOnTarget(ops, target); len(operationIDs) > 0 {
+		return operationIDs, nil
 	}
-	return operationIDs, nil
+	targets := storage.DistinctOperationTargets(ops)
+	if len(targets) > 1 {
+		return nil, fmt.Errorf("apply %s has no operation on target %s, only on %s: %w", apply.ApplyIdentifier, target, strings.Join(targets, ", "), ErrLogsTargetNotInApply)
+	}
+	// A remote apply that drives one target holds only that target's log, and
+	// a single-target dispatch may record its target under another name than
+	// the caller's (the database name when the request named none), so the
+	// whole log is the answer.
+	c.logger.Debug("logs read for a target the single-target apply records under another name; serving its whole log",
+		append(apply.LogAttrs(), "target", target, "recorded_targets", targets)...)
+	return nil, nil
 }
 
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's

@@ -506,6 +506,7 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 		assert.Equal(t, state.Apply.Cancelled, entry.NewState)
 		assert.Contains(t, entry.Message, "derived")
 		assert.Contains(t, entry.Message, state.Apply.Cancelled)
+		assert.True(t, entry.ApplyWide, "the parent's state belongs to every target, not to the operation whose drive projected it")
 	})
 
 	t.Run("lost compare-and-swap appends nothing", func(t *testing.T) {
