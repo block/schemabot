@@ -41,7 +41,7 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	if err != nil {
 		return err
 	}
-	if log.ApplyOperationID == nil {
+	if log.ApplyOperationID == nil && !log.ApplyWide {
 		log.ApplyOperationID = drivingOperationID(ctx, log.ApplyID)
 	}
 	// Default source to schemabot if not set

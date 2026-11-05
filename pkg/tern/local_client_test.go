@@ -183,8 +183,10 @@ func TestLocalClientLogsValidationAndConversion(t *testing.T) {
 // A data-plane apply that drives two targets of a rollout serves each target's
 // log read from that target's operations only, so the control plane's
 // per-target sections do not each repeat the whole apply. A read for the only
-// target, or for no target, stays unscoped, and a read for a target the apply
-// never ran on is refused rather than answered with an empty log.
+// target still names its operations, so a sibling that joins mid-read stays
+// out; a read for no target, or for a single-target apply that records its
+// target under another name, is the whole log; and a target a multi-target
+// apply never ran on is refused rather than answered with an empty log.
 func TestLocalClientLogsScopesToTarget(t *testing.T) {
 	newClient := func(ops ...*storage.ApplyOperation) (*LocalClient, *mockApplyLogStore) {
 		logs := &mockApplyLogStore{}
@@ -192,7 +194,7 @@ func TestLocalClientLogsScopesToTarget(t *testing.T) {
 		for _, op := range ops {
 			byID[op.ID] = op
 		}
-		return &LocalClient{storage: &mockStorage{
+		return &LocalClient{logger: slog.New(slog.DiscardHandler), storage: &mockStorage{
 			applies:    &mockApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-a"}},
 			logs:       logs,
 			operations: &mockApplyOperationStore{ops: byID},
@@ -212,6 +214,13 @@ func TestLocalClientLogsScopesToTarget(t *testing.T) {
 
 	t.Run("the only target", func(t *testing.T) {
 		client, logs := newClient(op(1, "shop-001"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1}, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("a single-target apply recorded under another name", func(t *testing.T) {
+		client, logs := newClient(op(1, "orders"))
 		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
 		require.NoError(t, err)
 		assert.Nil(t, logs.lastFilter.OperationIDs)

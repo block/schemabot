@@ -187,10 +187,18 @@ func TestApplyLogs(t *testing.T, h Harness) {
 		appendEntry(driving("shop-002"), "shop-002 drive", nil)
 		appendEntry(ctx, "whole apply", nil)
 		appendEntry(ctx, "shop-002 task", &shop002Task)
+		require.NoError(t, store.ApplyLogs().Append(driving("shop-001"), &storage.ApplyLog{
+			ApplyID:   apply.ID,
+			Level:     storage.LogLevelInfo,
+			EventType: storage.LogEventStateTransition,
+			Source:    storage.LogSourceSchemaBot,
+			Message:   "projected by shop-001",
+			ApplyWide: true,
+		}))
 
 		all, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: apply.ID, Limit: 10})
 		require.NoError(t, err)
-		require.Len(t, all, 4)
+		require.Len(t, all, 5)
 		require.NotNil(t, all[0].ApplyOperationID, "an entry written under an operation lease names its operation")
 		assert.Equal(t, opIDs["shop-001"], *all[0].ApplyOperationID)
 		assert.Nil(t, all[2].ApplyOperationID, "an entry written outside any operation's drive names no operation")
@@ -204,8 +212,10 @@ func TestApplyLogs(t *testing.T, h Harness) {
 			}
 			return messages
 		}
-		assert.Equal(t, []string{"shop-002 drive", "whole apply", "shop-002 task"}, messagesFor("shop-002"))
-		assert.Equal(t, []string{"shop-001 drive", "whole apply"}, messagesFor("shop-001"), "another operation's drive and task entries stay out; the whole-apply entry belongs to every operation")
+		assert.Nil(t, all[4].ApplyOperationID, "an apply-wide entry written under an operation lease names no operation")
+		assert.Equal(t, []string{"shop-002 drive", "whole apply", "shop-002 task", "projected by shop-001"}, messagesFor("shop-002"),
+			"the parent state one operation projects belongs to every target")
+		assert.Equal(t, []string{"shop-001 drive", "whole apply", "projected by shop-001"}, messagesFor("shop-001"), "another operation's drive and task entries stay out; the whole-apply entry belongs to every operation")
 	})
 
 	t.Run("Append_DBError", func(t *testing.T) {

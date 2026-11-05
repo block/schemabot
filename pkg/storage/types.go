@@ -2719,6 +2719,13 @@ type ApplyLog struct {
 	// the ones no single task owns. Nil for an entry about the whole apply.
 	ApplyOperationID *int64
 
+	// ApplyWide marks an entry about the whole apply that an operation's drive
+	// writes under its own lease, such as the parent state it projects from
+	// every operation. Append leaves ApplyOperationID nil for it, so a read
+	// scoped to any one target still shows it. It is not stored: an entry
+	// with no operation and no task is how storage records an apply-wide one.
+	ApplyWide bool
+
 	// Level is the log level: "debug", "info", "warn", "error".
 	Level string
 
@@ -2743,25 +2750,34 @@ type ApplyLog struct {
 	CreatedAt time.Time
 }
 
-// LogOperationsOnTarget resolves a log read scoped to target into the
-// ApplyLogFilter.OperationIDs that read needs, given every operation of the
-// apply. It returns nil when every operation runs on target, since an unscoped
-// read already covers exactly that target, and ok is false when no operation
-// runs on target: a read for that target has nothing to show, and an empty
-// result would read as a target that wrote nothing.
-func LogOperationsOnTarget(ops []*ApplyOperation, target string) (operationIDs []int64, ok bool) {
+// LogOperationsOnTarget returns the ApplyLogFilter.OperationIDs of a log read
+// scoped to target: the IDs of the apply's operations that run on it, or nil
+// when none does. The IDs stay explicit even when every operation the caller
+// listed runs on target, since another target's operation can join the apply
+// between that listing and the log read.
+func LogOperationsOnTarget(ops []*ApplyOperation, target string) []int64 {
+	var operationIDs []int64
 	for _, op := range ops {
 		if op.Target == target {
 			operationIDs = append(operationIDs, op.ID)
 		}
 	}
-	if len(operationIDs) == 0 {
-		return nil, false
+	return operationIDs
+}
+
+// DistinctOperationTargets lists the distinct targets of ops in sorted order.
+// An operation that names no target adds none.
+func DistinctOperationTargets(ops []*ApplyOperation) []string {
+	seen := make(map[string]bool, len(ops))
+	var targets []string
+	for _, op := range ops {
+		if op.Target != "" && !seen[op.Target] {
+			seen[op.Target] = true
+			targets = append(targets, op.Target)
+		}
 	}
-	if len(operationIDs) == len(ops) {
-		return nil, true
-	}
-	return operationIDs, true
+	slices.Sort(targets)
+	return targets
 }
 
 // ApplyLogFilter specifies criteria for listing apply logs.
