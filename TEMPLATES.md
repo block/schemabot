@@ -4473,6 +4473,32 @@ Schema changes require approval from an authorized reviewer before applying.
 </details>
 
 <details>
+<summary><a name="apply-blocked-review-required-approver-not-authorized"></a><strong>Apply Blocked: Review Required (Approver Not Authorized)</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Schema changes require approval from an authorized reviewer before applying.
+
+@jdoe approved, but isn't an authorized reviewer for `testapp`, so that approval doesn't count.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+
+### Next steps
+1. Request a review from anyone listed above, or add @jdoe to @acme/testapp-operators
+2. Then run `schemabot apply -e production` again
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-review-required-approval-on-an-earlier-commit"></a><strong>Apply Blocked: Review Required (Approval On An Earlier Commit)</strong></summary>
 
 

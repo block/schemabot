@@ -328,6 +328,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: ENVIRONMENT NOT IN PROMOTION ORDER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUnlistedEnvironment()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (NO OPERATORS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredNoOperators()) }},
+		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVER NOT AUTHORIZED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredUnauthorizedApprover()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApproval()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT, PR TARGETS ANOTHER BRANCH)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApprovalOtherBranch()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (UNCHANGED FILE, CHANGED BASE)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredChangedBase()) }},
