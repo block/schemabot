@@ -86,6 +86,9 @@ func (f *fakeSchemaBot) BranchHead(_ context.Context, branch string) (string, er
 func (f *fakeSchemaBot) CreateBranch(_ context.Context, branch, sha string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, exists := f.heads[branch]; exists {
+		return fmt.Errorf("branch %s already exists", branch)
+	}
 	f.heads[branch] = sha
 	return nil
 }
@@ -137,6 +140,18 @@ func (f *fakeSchemaBot) OpenPullRequests(_ context.Context, prefix string) ([]Pu
 	var out []PullRequest
 	for number, pr := range f.prs {
 		if pr.open && strings.HasPrefix(pr.branch, prefix) {
+			out = append(out, PullRequest{Number: number, Branch: pr.branch})
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeSchemaBot) PullRequestsForBranch(_ context.Context, branch string) ([]PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []PullRequest
+	for number, pr := range f.prs {
+		if pr.branch == branch {
 			out = append(out, PullRequest{Number: number, Branch: pr.branch})
 		}
 	}
@@ -342,7 +357,9 @@ func testRunner(t *testing.T, bot *fakeSchemaBot, target *fakeTarget) *Runner {
 	return r
 }
 
-const testTable = "e2e_20261105093000"
+// testTable is the table a run started at the test's now names: the time it
+// is over, a RunTimeout and a WaitTimeout later.
+const testTable = "e2e_20261105103001"
 
 func TestRunDrivesEveryStepAndCleansUp(t *testing.T) {
 	target := newFakeTarget()
@@ -498,13 +515,14 @@ func (s *silentBot) CreateComment(_ context.Context, number int, body string) (i
 	return id, nil
 }
 
-// Another runner may be driving a recent run, so the sweep leaves its pull
-// request, applies, and table alone.
+// Another runner may be driving a run that is not over, so the sweep leaves
+// its pull request, applies, and table alone. The time in the name decides,
+// not the sweeping runner's own timeouts.
 func TestSweepLeavesARunThatMayStillBeInProgress(t *testing.T) {
 	target := newFakeTarget()
 	bot := newFakeSchemaBot(target)
-	const recent = "e2e_20261105090000" // 30 minutes before the test's now
-	const orphan = "e2e_20261105091500" // a table whose run has not opened its pull request yet
+	const recent = "e2e_20261105100000" // over 30 minutes after the test's now
+	const orphan = "e2e_20261105101500" // a table whose run has not opened its pull request yet
 	target.create(recent)
 	target.create(orphan)
 	bot.prs[1] = &fakePR{branch: BranchPrefix + recent, open: true}
@@ -571,4 +589,66 @@ func TestRunIsInconclusiveWhenTheCancelIsRefusedAsFinished(t *testing.T) {
 
 	require.ErrorIs(t, err, ErrInconclusive)
 	assert.Contains(t, err.Error(), "finished before it reached "+StatusCancelled)
+}
+
+// A run that picked the same name as one already in progress creates no
+// branch, so its cleanup must leave the other run's pull request, branch, and
+// table alone.
+func TestRunLeavesAnotherRunsNamesAlone(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	target.create(testTable)
+	bot.heads[BranchPrefix+testTable] = "sha-other"
+	bot.prs[1] = &fakePR{branch: BranchPrefix + testTable, open: true}
+	bot.post(1, "apply-00000000000000aa", state.Apply.Running)
+
+	err := testRunner(t, bot, target).Run(t.Context())
+
+	require.ErrorContains(t, err, "already exists")
+	assert.Empty(t, bot.commands)
+	assert.True(t, bot.prs[1].open)
+	assert.Contains(t, bot.heads, BranchPrefix+testTable)
+	assert.True(t, target.has(testTable))
+}
+
+// Closing a pull request leaves its unfinished apply running, so the sweep
+// keeps the table of a closed run until its applies are proven finished.
+func TestSweepKeepsTheTableOfAClosedRunWithAnUnfinishedApply(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier}
+	bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+
+	err := testRunner(t, bot, target).Sweep(t.Context())
+
+	require.ErrorContains(t, err, "apply-00000000000000aa unfinished")
+	assert.Empty(t, bot.commands, "the sweep cannot cancel through a closed pull request")
+	assert.True(t, target.has(earlier))
+
+	bot.comments[1] = append(bot.comments[1], Comment{
+		ID: bot.id(), Author: "schemabot[bot]", IsBot: true,
+		Body: renderSummary("apply-00000000000000aa", state.Apply.Cancelled),
+	})
+	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
+	assert.False(t, target.has(earlier))
+}
+
+// A closed run whose cancel SchemaBot refused because the apply had finished
+// holds nothing, as closeRun already accepts, so its table can go.
+func TestSweepDropsTheTableOfAClosedRunWhoseCancelWasRefusedAsFinished(t *testing.T) {
+	target := newFakeTarget()
+	bot := newFakeSchemaBot(target)
+	const earlier = "e2e_20261104000000"
+	target.create(earlier)
+	bot.prs[1] = &fakePR{branch: BranchPrefix + earlier}
+	bot.post(1, "apply-00000000000000aa", state.Apply.Stopped)
+	bot.comments[1] = append(bot.comments[1],
+		Comment{ID: bot.id(), Author: "octocat", Body: "schemabot cancel apply-00000000000000aa -e development"},
+		Comment{ID: bot.id(), Author: "schemabot[bot]", IsBot: true, Body: renderAlreadyFinished(state.Apply.Completed)},
+	)
+
+	require.NoError(t, testRunner(t, bot, target).Sweep(t.Context()))
+	assert.False(t, target.has(earlier))
 }

@@ -51,8 +51,9 @@ type Config struct {
 	// the cleanup after a run.
 	WaitTimeout time.Duration
 	// RunTimeout bounds a whole run, database calls included. A run is over
-	// once RunTimeout and then WaitTimeout have passed since it started, so
-	// the sweep reaps only runs older than that.
+	// once RunTimeout and then WaitTimeout have passed since it started. The
+	// run writes that time into its name, so a sweep with other timeouts
+	// still waits for it.
 	RunTimeout time.Duration
 }
 
@@ -102,8 +103,10 @@ func NewRunner(cfg Config, gh GitHub, target Target, logger *slog.Logger) (*Runn
 	return &Runner{cfg: cfg, gh: gh, target: target, logger: logger, now: time.Now}, nil
 }
 
-// A run names its table runTablePrefix plus its start time in runTimeLayout,
-// UTC.
+// A run names its table runTablePrefix plus the time it is over in
+// runTimeLayout, UTC: its start plus RunTimeout and WaitTimeout. The sweep
+// reads that time from the name, so it never reaps a run that is still
+// within its own limits.
 const (
 	runTablePrefix = "e2e_"
 	runTimeLayout  = "20060102150405"
@@ -114,6 +117,10 @@ type run struct {
 	table  string
 	branch string
 	pr     int
+	// ownsBranch is set once the run created its branch. Another run that
+	// picked the same name owns everything under it, so a run that never
+	// created its branch cleans up nothing.
+	ownsBranch bool
 }
 
 // The test table's two schemas. The change between them rewrites every row,
@@ -145,7 +152,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	if err := r.Sweep(ctx); err != nil {
 		return fmt.Errorf("sweep before the run: %w", err)
 	}
-	table := runTablePrefix + r.now().UTC().Format(runTimeLayout)
+	table := runTablePrefix + r.now().Add(r.cfg.RunTimeout+r.cfg.WaitTimeout).UTC().Format(runTimeLayout)
 	cur := &run{table: table, branch: BranchPrefix + table}
 	r.logger.Info("starting live e2e run", "repo", r.cfg.Repo, "database", r.cfg.Database,
 		"environment", r.cfg.Environment, "table", cur.table, "branch", cur.branch)
@@ -167,6 +174,7 @@ func (r *Runner) steps(ctx context.Context, cur *run) error {
 	if err := r.gh.CreateBranch(ctx, cur.branch, base); err != nil {
 		return err
 	}
+	cur.ownsBranch = true
 	file := path.Join(r.cfg.TableDir, cur.table+".sql")
 	sha, err := r.gh.PutFile(ctx, cur.branch, file, "Create "+cur.table, fmt.Appendf(nil, createTableDDL, cur.table))
 	if err != nil {
@@ -472,8 +480,9 @@ func (r *Runner) expectNoLeftoverCopy(ctx context.Context, table string) error {
 // Sweep removes what earlier runs left behind: it cancels their unfinished
 // applies, closes their pull requests and deletes their branches, then drops
 // their tables. It reaps only runs that are over (see Config.RunTimeout), so
-// it never touches a run another runner is still driving, and it drops no
-// table while its run's pull request stays open.
+// it never touches a run another runner is still driving. It drops no table
+// while its run's pull request stays open, or while a closed pull request
+// for it shows an apply that may not have finished.
 func (r *Runner) Sweep(ctx context.Context) error {
 	prs, err := r.gh.OpenPullRequests(ctx, BranchPrefix)
 	if err != nil {
@@ -481,6 +490,7 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 	var errs []error
 	kept := map[string]bool{}
+	closed := map[string]bool{}
 	for _, pr := range prs {
 		table := strings.TrimPrefix(pr.Branch, BranchPrefix)
 		if !r.over(table) {
@@ -492,7 +502,9 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		if err := r.closeRun(ctx, &run{table: table, branch: pr.Branch, pr: pr.Number}); err != nil {
 			errs = append(errs, fmt.Errorf("leaving table %s in place: %w", table, err))
 			kept[table] = true
+			continue
 		}
+		closed[table] = true
 	}
 	tables, err := r.target.RunTables(ctx)
 	if err != nil {
@@ -502,6 +514,15 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		if kept[table] || !r.over(table) {
 			continue
 		}
+		if !closed[table] {
+			// Closing a pull request leaves an unfinished apply running and
+			// holding its lock, so a closed run's table stays until its
+			// applies are proven finished.
+			if err := r.closedRunsFinished(ctx, BranchPrefix+table); err != nil {
+				errs = append(errs, fmt.Errorf("leaving table %s in place: %w", table, err))
+				continue
+			}
+		}
 		if err := r.target.DropTable(ctx, table); err != nil {
 			errs = append(errs, err)
 		}
@@ -509,19 +530,64 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// over reports whether the run that named its table table has ended: it
-// started more than RunTimeout plus WaitTimeout ago. A name that does not
-// parse is not a run's, so it never counts as over.
+// over reports whether the run that named its table table has ended: the time
+// in its name has passed. A name that does not parse is not a run's, so it
+// never counts as over.
 func (r *Runner) over(table string) bool {
-	started, err := time.Parse(runTimeLayout, strings.TrimPrefix(table, runTablePrefix))
+	end, err := time.Parse(runTimeLayout, strings.TrimPrefix(table, runTablePrefix))
 	if err != nil || !strings.HasPrefix(table, runTablePrefix) {
 		return false
 	}
-	return r.now().Sub(started) > r.cfg.RunTimeout+r.cfg.WaitTimeout
+	return r.now().After(end)
+}
+
+// closedRunsFinished returns an error unless every pull request from branch
+// shows each of its applies finished. The sweep cannot cancel through a
+// closed pull request, so it leaves the table for someone to check by hand.
+func (r *Runner) closedRunsFinished(ctx context.Context, branch string) error {
+	prs, err := r.gh.PullRequestsForBranch(ctx, branch)
+	if err != nil {
+		return err
+	}
+	for _, pr := range prs {
+		all, err := r.gh.Comments(ctx, pr.Number)
+		if err != nil {
+			return err
+		}
+		if unansweredApply(all, r.isBot, r.cfg.CommandPrefix) {
+			return fmt.Errorf("closed pull request %s#%d has an apply command with no reply from SchemaBot, so an apply may be running; check it by hand", r.cfg.Repo, pr.Number)
+		}
+		for _, applyID := range inFlightApplies(r.fromBot(all)) {
+			if !r.cancelRefusedAsFinished(all, applyID) {
+				return fmt.Errorf("closed pull request %s#%d shows apply %s unfinished; cancel it by hand", r.cfg.Repo, pr.Number, applyID)
+			}
+		}
+	}
+	return nil
+}
+
+// cancelRefusedAsFinished reports whether SchemaBot refused a cancel of
+// applyID because the apply had already finished, as closeRun accepts.
+func (r *Runner) cancelRefusedAsFinished(all []Comment, applyID string) bool {
+	bot := r.fromBot(all)
+	for _, c := range all {
+		fields := strings.Fields(c.Body)
+		if r.isBot(c) || len(fields) < 3 || fields[0] != r.cfg.CommandPrefix || fields[1] != "cancel" || fields[2] != applyID {
+			continue
+		}
+		if _, refused := refusedAsFinished(bot, c.ID); refused {
+			return true
+		}
+	}
+	return false
 }
 
 // cleanup removes one run's pull request, branch, and table.
 func (r *Runner) cleanup(ctx context.Context, cur *run) error {
+	if !cur.ownsBranch {
+		r.logger.Info("run created no branch; leaving its names to the run that owns them", "branch", cur.branch)
+		return nil
+	}
 	if cur.pr == 0 {
 		r.logger.Info("run opened no pull request; deleting its branch", "branch", cur.branch)
 		if err := r.gh.DeleteBranch(ctx, cur.branch); err != nil {

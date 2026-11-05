@@ -37,6 +37,9 @@ type GitHub interface {
 	OpenPullRequest(ctx context.Context, head, base, title, body string) (int, error)
 	ClosePullRequest(ctx context.Context, number int) error
 	OpenPullRequests(ctx context.Context, branchPrefix string) ([]PullRequest, error)
+	// PullRequestsForBranch returns every pull request, open or closed, from
+	// branch in the repository.
+	PullRequestsForBranch(ctx context.Context, branch string) ([]PullRequest, error)
 	CreateComment(ctx context.Context, number int, body string) (int64, error)
 	Comments(ctx context.Context, number int) ([]Comment, error)
 	// CheckRun returns the newest Check Run named name that the GitHub App
@@ -169,6 +172,24 @@ func (g *apiGitHub) OpenPullRequests(ctx context.Context, branchPrefix string) (
 			if strings.HasPrefix(branch, branchPrefix) {
 				out = append(out, PullRequest{Number: pr.GetNumber(), Branch: branch})
 			}
+		}
+		if resp.NextPage == 0 {
+			return out, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+func (g *apiGitHub) PullRequestsForBranch(ctx context.Context, branch string) ([]PullRequest, error) {
+	opts := &github.PullRequestListOptions{State: "all", Head: g.owner + ":" + branch, ListOptions: github.ListOptions{PerPage: 100}}
+	var out []PullRequest
+	for {
+		prs, resp, err := g.client.PullRequests.List(ctx, g.owner, g.repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list pull requests from %s in %s/%s: %w", branch, g.owner, g.repo, err)
+		}
+		for _, pr := range prs {
+			out = append(out, PullRequest{Number: pr.GetNumber(), Branch: pr.GetHead().GetRef()})
 		}
 		if resp.NextPage == 0 {
 			return out, nil
