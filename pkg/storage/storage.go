@@ -947,19 +947,28 @@ type ApplyStore interface {
 	// claim that would otherwise re-lease it charges nothing, so work that keeps
 	// failing without a driver to record it would retry forever.
 	//
-	// Each row moves only while it is in an active, recovery-claimable state,
-	// still carries the lease token the caller observed, and that lease is not
-	// fresh (no owner, or a heartbeat older than ApplyLeaseStaleAfter). The
-	// apply additionally moves only while no operation under it holds a fresh
-	// lease, and the operation must belong to the apply. Both rows clear their
-	// lease, record ErrorMessage, and keep no completion time; nothing else is
-	// written, so attempt is left for the claim to charge and the takeover
-	// marker and tasks are untouched.
+	// Each row moves only while it is in a state a retry restarts from running:
+	// copying, or staging the change before any rows move. An apply waiting
+	// for a deploy, at or past its cutover, or in its revert window is left to
+	// the stale-active claim, since the retryable claim writes running over the
+	// state it finds and running does not describe work that far along. The
+	// row must also still carry the lease token the caller observed, and that
+	// lease must not be fresh (no owner, or a heartbeat older than
+	// ApplyLeaseStaleAfter). The apply additionally moves only while no
+	// operation under it holds a fresh lease, checked with the parent and its
+	// operations locked so a sibling claim cannot land between the check and
+	// the write, and the operation must belong to the apply. Both rows clear
+	// their lease, record ErrorMessage, and keep no completion time; nothing
+	// else is written, so attempt is left for the claim to charge and the
+	// takeover marker and tasks are untouched.
 	//
 	// The rows move together or not at all, in one transaction. Reports false,
 	// with nothing written, when either row does not match: a newer claim
-	// rotated the token, a live drive holds a lease, or the row has left the
-	// active states. A terminal or resting apply is never reopened.
+	// rotated the token, a live drive holds a lease, the apply row is gone, or
+	// the row has left the restartable states. A terminal or resting apply is
+	// never reopened. The store logs which row refused at debug level; the
+	// caller owns the operator-facing log and keeps the apply's previous state
+	// for it, because a false here means the row is whatever it was before.
 	MarkStaleApplyRetryable(ctx context.Context, req StaleRetryableRequest) (bool, error)
 
 	// SetRevertSkipped records when skip-revert was dispatched for an apply, so

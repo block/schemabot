@@ -130,6 +130,45 @@ func claimableApplyStates() []string {
 	}
 }
 
+// retryRestartableApplyStates lists the active states whose work a retry
+// restarts from running. It is the set MarkStaleApplyRetryable moves out of,
+// and it is deliberately narrower than claimableApplyStates(): "states a
+// driver can be reclaimed in" and "states a retry can honestly re-enter" are
+// different questions.
+//
+// The retryable claim writes running over whatever the apply was, and that is
+// the right answer only while the apply is still copying, or staging the
+// change before any rows move (the deploy setup phases, which DeriveApplyState
+// ranks with running for the same reason). An apply waiting for a deploy, at
+// or past its cutover, or in its revert window has work behind it that running
+// does not describe: rewinding it would announce a copy the engine is not
+// doing, and an exhausted budget would then settle failed a change that has
+// already cut over. Those applies stay with the stale-active claim, which
+// rotates the lease and leaves the state alone.
+//
+// Recovering is one of them. It is entered only from waiting_for_cutover, when
+// a resume finds the engine's cutover checkpoint and reattaches to it, so the
+// copy is already behind it; the resume path reads the state to know it must
+// look for that checkpoint rather than re-plan. The cost of leaving it out is
+// that a driver that keeps dying during the reattach is never charged to the
+// retry budget; the stale-active claim keeps rotating the lease instead, as it
+// does for waiting_for_cutover itself.
+func retryRestartableApplyStates() []string {
+	return []string{
+		state.Apply.Running,
+		state.Apply.RunningDegraded,
+		state.Apply.CatchingUp,
+		state.Apply.Checksumming,
+		state.Apply.PostChecksum,
+		state.Apply.Resuming,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest,
+	}
+}
+
 func terminalApplyStates() []string {
 	return []string{
 		state.Apply.Completed,
@@ -2909,14 +2948,22 @@ func (s *applyStore) MarkStaleApplyRetryable(ctx context.Context, req storage.St
 
 // markStaleApplyRetryableOnce runs one attempt of MarkStaleApplyRetryable.
 //
-// The operation row is written before the apply row, the order the operation
-// claim takes them in (it locks the operation, then charges the parent's
-// budget), so the two never wait on each other in opposite orders.
+// Rows are taken in the order the operation claim takes them: the operation
+// row first, then the parent apply, then the parent's other operations. The
+// claim locks the operation, then charges the parent's budget, so the two
+// transactions never wait on each other in opposite orders.
 //
-// The apply's fresh-operation-lease gate is a candidate filter rather than a
-// fence, for the reason undrivenApplyGate gives: it keeps the parent from
-// moving under a sibling drive that already holds its lease, but a sibling
-// claim can still commit right after it is evaluated.
+// The parent is locked before the sibling leases are read, and the siblings
+// are locked with SKIP LOCKED, so a sibling claim that already holds its
+// operation row shows up as a row this transaction could not lock and the
+// parent is left alone. Read without those locks, the fresh-lease check would
+// only be a candidate filter: a sibling claim could commit between the check
+// and the apply write and the parent would move out from under a live drive.
+//
+// Every refusal is logged at debug with the row that refused, because the
+// caller sees only false and the four reasons want different triage: the
+// operation moved or was reclaimed, the apply row is gone, a sibling drive
+// holds the parent, or the apply itself moved or was reclaimed.
 func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storage.StaleRetryableRequest) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -2924,7 +2971,7 @@ func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storag
 	}
 	defer rollbackTx(ctx, tx, "mark stale apply retryable")
 
-	activeStates := claimableApplyStates()
+	activeStates := retryRestartableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
 	staleCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	// A lease is fresh only while it has an owner and a heartbeat inside the
@@ -2952,8 +2999,31 @@ func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storag
 			return false, fmt.Errorf("read mark stale apply_operation %d retryable rows affected: %w", req.OperationID, err)
 		}
 		if rows == 0 {
+			slog.DebugContext(ctx, "stale apply retry refused: the operation row is no longer the stale, restartable row the caller observed; it moved, was reclaimed, or belongs to another apply",
+				"apply_row_id", req.ApplyID, "apply_operation_row_id", req.OperationID)
 			return false, nil
 		}
+	}
+
+	var lockedApplyID int64
+	err = tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? FOR UPDATE`, req.ApplyID).Scan(&lockedApplyID)
+	if errors.Is(err, sql.ErrNoRows) {
+		slog.DebugContext(ctx, "stale apply retry refused: the apply row is gone",
+			"apply_row_id", req.ApplyID, "apply_operation_row_id", req.OperationID)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock apply %d for stale retry: %w", req.ApplyID, err)
+	}
+
+	undriven, err := s.lockUndrivenApplies(ctx, tx, "stale retry", []int64{req.ApplyID})
+	if err != nil {
+		return false, err
+	}
+	if !undriven[req.ApplyID] {
+		slog.DebugContext(ctx, "stale apply retry refused: a sibling drive holds a fresh operation lease under the apply; the parent stays as it is",
+			"apply_row_id", req.ApplyID, "apply_operation_row_id", req.OperationID)
+		return false, nil
 	}
 
 	applyArgs := []any{state.Apply.FailedRetryable, req.ErrorMessage, req.ApplyID}
@@ -2966,8 +3036,7 @@ func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storag
 		    updated_at = NOW()
 		WHERE id = ? AND state IN (%s) AND lease_token = ?
 			AND %s
-			AND %s
-	`, activeStatePlaceholders, notFreshlyLeased, undrivenApplyGate(s.dialect)), applyArgs...)
+	`, activeStatePlaceholders, notFreshlyLeased), applyArgs...)
 	if err != nil {
 		return false, fmt.Errorf("mark stale apply %d retryable: %w", req.ApplyID, err)
 	}
@@ -2976,6 +3045,8 @@ func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storag
 		return false, fmt.Errorf("read mark stale apply %d retryable rows affected: %w", req.ApplyID, err)
 	}
 	if rows == 0 {
+		slog.DebugContext(ctx, "stale apply retry refused: the apply row is no longer the stale, restartable row the caller observed; it moved past the copy or was reclaimed",
+			"apply_row_id", req.ApplyID, "apply_operation_row_id", req.OperationID)
 		return false, nil
 	}
 
@@ -3262,7 +3333,7 @@ func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopType
 	// heartbeat that won after the scan causes the whole apply to be deferred.
 	// AttachOperationWithTasks locks the parent, so no new sibling can attach
 	// while we establish and hold this complete set of operation locks.
-	applies, err = s.lockUndrivenCandidates(ctx, tx, applies)
+	applies, err = s.lockUndrivenCandidates(ctx, tx, "retryable expiry", applies)
 	if err != nil {
 		return nil, err
 	}
@@ -3486,7 +3557,7 @@ func (s *applyStore) expireRetryableOperations(ctx context.Context, limit int) (
 		return nil, nil
 	}
 
-	applies, err = s.lockUndrivenCandidates(ctx, tx, applies)
+	applies, err = s.lockUndrivenCandidates(ctx, tx, "retryable operation expiry", applies)
 	if err != nil {
 		return nil, err
 	}
@@ -3611,13 +3682,13 @@ func (s *applyStore) expireRetryableOperations(ctx context.Context, limit int) (
 // lockUndrivenCandidates narrows a candidate set whose parent rows tx already
 // holds FOR UPDATE to the applies whose complete operation set could be locked
 // and still reads as undriven under those locks. The order of the candidates
-// is preserved.
-func (s *applyStore) lockUndrivenCandidates(ctx context.Context, tx *rebindTx, candidates []*storage.Apply) ([]*storage.Apply, error) {
+// is preserved. purpose names the caller's transaction in errors.
+func (s *applyStore) lockUndrivenCandidates(ctx context.Context, tx *rebindTx, purpose string, candidates []*storage.Apply) ([]*storage.Apply, error) {
 	candidateIDs := make([]int64, 0, len(candidates))
 	for _, apply := range candidates {
 		candidateIDs = append(candidateIDs, apply.ID)
 	}
-	undriven, err := s.lockUndrivenApplies(ctx, tx, candidateIDs)
+	undriven, err := s.lockUndrivenApplies(ctx, tx, purpose, candidateIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -3653,8 +3724,8 @@ func (s *applyStore) lockUndrivenCandidates(ctx context.Context, tx *rebindTx, c
 // paid by anything attaching an operation to one of these applies. Errors carry
 // the candidate count rather than an apply id because the pass is one
 // transaction — a failure rolls the whole batch back, so no single apply is the
-// one that failed.
-func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, applyIDs []int64) (map[int64]bool, error) {
+// one that failed. purpose names the caller's transaction in those errors.
+func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, purpose string, applyIDs []int64) (map[int64]bool, error) {
 	undriven := make(map[int64]bool, len(applyIDs))
 	if len(applyIDs) == 0 {
 		return undriven, nil
@@ -3672,20 +3743,20 @@ func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, appl
 		FOR UPDATE SKIP LOCKED
 	`, in), args...)
 	if err != nil {
-		return nil, fmt.Errorf("lock operations for retryable expiry of %d applies: %w", len(applyIDs), err)
+		return nil, fmt.Errorf("lock operations for %s of %d applies: %w", purpose, len(applyIDs), err)
 	}
 	for rows.Next() {
 		var applyID int64
 		if err := rows.Scan(&applyID); err != nil {
 			utils.CloseAndLog(rows)
-			return nil, fmt.Errorf("scan locked operation for retryable expiry of %d applies: %w", len(applyIDs), err)
+			return nil, fmt.Errorf("scan locked operation for %s of %d applies: %w", purpose, len(applyIDs), err)
 		}
 		locked[applyID]++
 	}
 	err = rows.Err()
 	utils.CloseAndLog(rows)
 	if err != nil {
-		return nil, fmt.Errorf("read locked operations for retryable expiry of %d applies: %w", len(applyIDs), err)
+		return nil, fmt.Errorf("read locked operations for %s of %d applies: %w", purpose, len(applyIDs), err)
 	}
 
 	total := make(map[int64]int, len(applyIDs))
@@ -3695,21 +3766,21 @@ func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, appl
 		GROUP BY apply_id
 	`, in), args...)
 	if err != nil {
-		return nil, fmt.Errorf("count operations for retryable expiry of %d applies: %w", len(applyIDs), err)
+		return nil, fmt.Errorf("count operations for %s of %d applies: %w", purpose, len(applyIDs), err)
 	}
 	for totalRows.Next() {
 		var applyID int64
 		var count int
 		if err := totalRows.Scan(&applyID, &count); err != nil {
 			utils.CloseAndLog(totalRows)
-			return nil, fmt.Errorf("scan operation count for retryable expiry of %d applies: %w", len(applyIDs), err)
+			return nil, fmt.Errorf("scan operation count for %s of %d applies: %w", purpose, len(applyIDs), err)
 		}
 		total[applyID] = count
 	}
 	err = totalRows.Err()
 	utils.CloseAndLog(totalRows)
 	if err != nil {
-		return nil, fmt.Errorf("read operation counts for retryable expiry of %d applies: %w", len(applyIDs), err)
+		return nil, fmt.Errorf("read operation counts for %s of %d applies: %w", purpose, len(applyIDs), err)
 	}
 
 	// The bound inside the gate repeats the candidate list, so its placeholders
@@ -3724,20 +3795,20 @@ func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, appl
 		WHERE id IN (%s) AND %s
 	`, in, undrivenApplyGateBoundedTo(s.dialect, in)), gateArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("recheck operation leases for retryable expiry of %d applies: %w", len(applyIDs), err)
+		return nil, fmt.Errorf("recheck operation leases for %s of %d applies: %w", purpose, len(applyIDs), err)
 	}
 	for gateRows.Next() {
 		var applyID int64
 		if err := gateRows.Scan(&applyID); err != nil {
 			utils.CloseAndLog(gateRows)
-			return nil, fmt.Errorf("scan lease recheck for retryable expiry of %d applies: %w", len(applyIDs), err)
+			return nil, fmt.Errorf("scan lease recheck for %s of %d applies: %w", purpose, len(applyIDs), err)
 		}
 		unleased[applyID] = true
 	}
 	err = gateRows.Err()
 	utils.CloseAndLog(gateRows)
 	if err != nil {
-		return nil, fmt.Errorf("read lease recheck for retryable expiry of %d applies: %w", len(applyIDs), err)
+		return nil, fmt.Errorf("read lease recheck for %s of %d applies: %w", purpose, len(applyIDs), err)
 	}
 
 	// An apply with no operations has nothing to lock and nothing holding a
