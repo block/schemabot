@@ -184,9 +184,11 @@ func TestLocalClientLogsValidationAndConversion(t *testing.T) {
 // log read from that target's operations only, so the control plane's
 // per-target sections do not each repeat the whole apply. A read for the only
 // target still names its operations, so a sibling that joins mid-read stays
-// out; a read for no target, or for a single-target apply that records its
-// target under another name, is the whole log; and a target a multi-target
-// apply never ran on is refused rather than answered with an empty log.
+// out. A single-target apply that records its target under another name
+// serves the operations it has, named the same way; a read for no target, or
+// on an apply with no recorded operation, is the whole log; and a target a
+// multi-target apply never ran on is refused rather than answered with an
+// empty log.
 func TestLocalClientLogsScopesToTarget(t *testing.T) {
 	newClient := func(ops ...*storage.ApplyOperation) (*LocalClient, *mockApplyLogStore) {
 		logs := &mockApplyLogStore{}
@@ -206,10 +208,11 @@ func TestLocalClientLogsScopesToTarget(t *testing.T) {
 
 	t.Run("one of several targets", func(t *testing.T) {
 		client, logs := newClient(op(1, "shop-001"), op(2, "shop-002"), op(3, "shop-002"))
-		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002"})
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002"})
 		require.NoError(t, err)
 		assert.Equal(t, int64(9), logs.lastFilter.ApplyID)
 		assert.ElementsMatch(t, []int64{2, 3}, logs.lastFilter.OperationIDs)
+		assert.Equal(t, "shop-002", resp.Target, "the response names the target it was narrowed to")
 	})
 
 	t.Run("the only target", func(t *testing.T) {
@@ -220,10 +223,19 @@ func TestLocalClientLogsScopesToTarget(t *testing.T) {
 	})
 
 	t.Run("a single-target apply recorded under another name", func(t *testing.T) {
-		client, logs := newClient(op(1, "orders"))
-		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
+		client, logs := newClient(op(1, "orders"), op(2, ""))
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []int64{1, 2}, logs.lastFilter.OperationIDs, "an operation that joins after the listing stays out")
+		assert.Equal(t, "shop-001", resp.Target)
+	})
+
+	t.Run("an apply with no recorded operation", func(t *testing.T) {
+		client, logs := newClient()
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
 		require.NoError(t, err)
 		assert.Nil(t, logs.lastFilter.OperationIDs)
+		assert.Equal(t, "shop-001", resp.Target)
 	})
 
 	t.Run("no target", func(t *testing.T) {

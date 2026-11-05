@@ -2016,6 +2016,95 @@ older entries exist; increasing the limit reads further back. There is no
 pagination cursor. Remote deployment logs cap the window at 999 entries per
 source, so increasing the limit cannot always recover the whole lifecycle.
 
+### Read one target's log
+
+A multi-target apply writes every target's lifecycle into one log. Add
+`target` (CLI: `--target`) to read one of them: the response keeps that
+target's entries and the entries about the apply as a whole, such as its state
+changes, and drops every other target's. The response has the same shape as
+the full log, plus a `target` field that echoes the target it was narrowed to;
+a server that predates scoped reads omits it, and the CLI refuses that answer
+rather than show every target's entries as one target's. `target` also narrows
+a [deployment read](#read-deployment-logs) to that target's sources, and that
+response echoes `target` the same way.
+
+<details>
+<summary>Read one target's log</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&target=shop-002
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "target": "shop-002",
+  "truncated": false,
+  "logs": [
+    {
+      "id": 41,
+      "apply_id": "apply-example-73",
+      "level": "info",
+      "event_type": "state_transition",
+      "message": "Apply state changed",
+      "old_state": "pending",
+      "new_state": "running",
+      "created_at": "2026-09-01T03:00:00Z"
+    }
+  ]
+}
+```
+
+</details>
+
+A target the apply has no operation on returns `400` and names the targets it
+does have, so a mistyped name is corrected from the error rather than read as a
+target that logged nothing:
+
+<details>
+<summary>Unknown target (HTTP 400)</summary>
+
+```json
+{
+  "error": "target \"shop-009\" has no operations in apply \"apply-example-73\"; its targets are shop-001, shop-002",
+  "error_code": ""
+}
+```
+
+</details>
+
+A data plane that predates target reads cannot narrow its log to one target. A
+deployment read never shows its entries as the target's log: that source moves
+to `errors` with reason `upgrade_required`, and the other sources still return.
+
+<details>
+<summary>Target read from a data plane that predates target reads</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&deployment=us-east&target=shop-002
+```
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "deployment": "us-east",
+  "target": "shop-002",
+  "sources": [],
+  "errors": [{
+    "external_id": "remote-apply-example-73",
+    "target": "shop-002",
+    "operations": [{"operation_key": "shop-002", "target": "shop-002", "operation_kind": "work"}],
+    "code": "UnsupportedCapability",
+    "reason": "upgrade_required",
+    "message": "The selected data plane does not support reading one target's logs; upgrade it or omit --target."
+  }]
+}
+```
+
+</details>
+
 ### Read deployment logs
 
 In local mode, omit `--deployment`. In [gRPC mode](release.md#two-planes-and-deploy-ordering),
