@@ -36,25 +36,40 @@ func main() {
 
 func run() int {
 	var cfg livee2e.Config
-	sweepOnly := flag.Bool("sweep-only", false, "only remove what earlier runs left behind")
-	flag.StringVar(&cfg.Repo, "repo", "", "test repository, in owner/name form")
-	flag.StringVar(&cfg.BaseBranch, "base", "main", "branch test pull requests target")
-	flag.StringVar(&cfg.TableDir, "table-dir", "", "repository directory that holds the test database's table files")
-	flag.StringVar(&cfg.Database, "database", "", "test database SchemaBot manages")
-	flag.StringVar(&cfg.Environment, "environment", "", "SchemaBot environment to apply to")
-	flag.StringVar(&cfg.CheckName, "check-name", "", "Check Run SchemaBot posts for the environment")
-	flag.StringVar(&cfg.AppSlug, "app-slug", "", "slug of SchemaBot's GitHub App; only its comments and Check Runs count")
-	flag.StringVar(&cfg.CommandPrefix, "command-prefix", "schemabot", "word every PR command starts with")
-	flag.StringVar(&cfg.SeedTable, "seed-table", "", "existing table in the test database to copy rows from")
-	flag.Int64Var(&cfg.SeedRows, "seed-rows", 2_000_000, "rows to copy into the run's table, enough for its copy to last past a stop")
-	flag.DurationVar(&cfg.PollInterval, "poll-interval", 5*time.Second, "how often to read the pull request")
-	flag.DurationVar(&cfg.WaitTimeout, "wait-timeout", 15*time.Minute, "how long to wait for SchemaBot to act on each command")
-	flag.DurationVar(&cfg.RunTimeout, "run-timeout", 2*time.Hour, "how long a whole run may take; the sweep reaps only runs older than this plus the wait timeout")
-	flag.Parse()
+	// ContinueOnError keeps a bad flag from exiting 2, which means retry.
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	sweepOnly := fs.Bool("sweep-only", false, "only remove what earlier runs left behind")
+	fs.StringVar(&cfg.Repo, "repo", "", "test repository, in owner/name form")
+	fs.StringVar(&cfg.BaseBranch, "base", "main", "branch test pull requests target")
+	fs.StringVar(&cfg.TableDir, "table-dir", "", "repository directory that holds the test database's table files")
+	fs.StringVar(&cfg.Database, "database", "", "test database SchemaBot manages")
+	fs.StringVar(&cfg.Environment, "environment", "", "SchemaBot environment to apply to")
+	fs.StringVar(&cfg.CheckName, "check-name", "", "Check Run SchemaBot posts for the environment")
+	fs.StringVar(&cfg.AppSlug, "app-slug", "", "slug of SchemaBot's GitHub App; only its comments and Check Runs count")
+	fs.StringVar(&cfg.CommandPrefix, "command-prefix", "schemabot", "word every PR command starts with")
+	fs.StringVar(&cfg.SeedTable, "seed-table", "", "existing table in the test database to copy rows from")
+	fs.Int64Var(&cfg.SeedRows, "seed-rows", 2_000_000, "rows to copy into the run's table, enough for its copy to last past a stop")
+	fs.DurationVar(&cfg.PollInterval, "poll-interval", 5*time.Second, "how often to read the pull request")
+	fs.DurationVar(&cfg.WaitTimeout, "wait-timeout", 15*time.Minute, "how long to wait for SchemaBot to act on each command")
+	fs.DurationVar(&cfg.RunTimeout, "run-timeout", 2*time.Hour, "how long a whole run may take, opening the test database included; the sweep reaps only runs older than this plus the wait timeout")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitPassed
+		}
+		return exitFailed
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	if cfg.RunTimeout <= 0 {
+		logger.Error("invalid configuration", "error", "--run-timeout must be positive")
+		return exitFailed
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The run's deadline starts before the test database opens, so a slow
+	// connection counts against it. The runner keeps its own cleanup budget.
+	runCtx, cancelRun := context.WithTimeout(ctx, cfg.RunTimeout)
+	defer cancelRun()
 
 	gh, err := livee2e.NewGitHub(cfg.Repo, os.Getenv("GITHUB_TOKEN"))
 	if err != nil {
@@ -66,7 +81,7 @@ func run() int {
 		logger.Error("SCHEMABOT_E2E_DSN is not set")
 		return exitFailed
 	}
-	openCtx, cancelOpen := context.WithTimeout(ctx, time.Minute)
+	openCtx, cancelOpen := context.WithTimeout(runCtx, time.Minute)
 	target, err := livee2e.OpenMySQLTarget(openCtx, dsn, cfg.Database, logger)
 	cancelOpen()
 	if err != nil {
@@ -85,11 +100,9 @@ func run() int {
 	}
 
 	if *sweepOnly {
-		sweepCtx, cancel := context.WithTimeout(ctx, cfg.RunTimeout)
-		defer cancel()
-		err = runner.Sweep(sweepCtx)
+		err = runner.Sweep(runCtx)
 	} else {
-		err = runner.Run(ctx)
+		err = runner.Run(runCtx)
 	}
 	return report(logger, err)
 }
