@@ -54,9 +54,13 @@ func TestParseApplyStatusIgnoresOtherComments(t *testing.T) {
 		Engine:      "spirit",
 	}
 	for name, body := range map[string]string{
-		"terminal summary": templates.RenderApplySummaryComment(summary),
-		"command":          "schemabot apply -e development",
-		"status, no apply": "**Status**: Applied\n",
+		"terminal summary":  templates.RenderApplySummaryComment(summary),
+		"failed summary":    renderSummary("apply-0123456789abcdef", state.Apply.Failed),
+		"cancelled summary": renderSummary("apply-0123456789abcdef", state.Apply.Cancelled),
+		"stopped summary":   renderSummary("apply-0123456789abcdef", state.Apply.Stopped),
+		"reverted summary":  renderSummary("apply-0123456789abcdef", state.Apply.Reverted),
+		"command":           "schemabot apply -e development",
+		"status, no apply":  "**Status**: Applied\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, ok := ParseApplyStatus(body)
@@ -78,6 +82,24 @@ func TestParseApplyStatusReadsAStartedCommentWithoutStatus(t *testing.T) {
 	assert.Equal(t, ApplyStatus{ApplyID: "apply-0123456789abcdef"}, got)
 }
 
+// A sharded apply's status line appends its change count to the label.
+func TestParseApplyStatusReadsAShardedStatusComment(t *testing.T) {
+	body := templates.RenderShardedApplyComment(templates.ShardedApplyData{
+		State:       state.Apply.WaitingForCutover,
+		Environment: "development",
+		Database:    "testdb",
+		ApplyID:     "apply-0123456789abcdef",
+		Keyspaces: []templates.ShardedKeyspace{{
+			Keyspace: "commerce",
+			Tables:   []templates.ShardedTableStatus{{Table: "orders", Status: state.Task.WaitingForCutover}},
+		}},
+	})
+	require.Contains(t, body, " — 0 of 1 change applied", "the rendered status line carries the count")
+	got, ok := ParseApplyStatus(body)
+	require.True(t, ok)
+	assert.Equal(t, ApplyStatus{ApplyID: "apply-0123456789abcdef", Status: StatusWaitingForCutover}, got)
+}
+
 func TestBlockedAfterReadsTheLockConflictReply(t *testing.T) {
 	blocked := templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
 		Database:    "testdb",
@@ -90,6 +112,9 @@ func TestBlockedAfterReadsTheLockConflictReply(t *testing.T) {
 	comments := []Comment{{ID: 5, Body: blocked}}
 	assert.True(t, blockedAfter(comments, 4))
 	assert.False(t, blockedAfter(comments, 5), "a refusal of an earlier command does not count")
+
+	checks := templates.RenderApplyBlockedByNonPassingChecks("development", []templates.BlockingCheck{{Name: "lint", State: "failure"}})
+	assert.False(t, blockedAfter([]Comment{{ID: 5, Body: checks}}, 4), "a refusal for failing checks is not a lock conflict")
 }
 
 func TestLatestApplyStatusFollowsTheNewestComment(t *testing.T) {
@@ -188,6 +213,33 @@ func renderAlreadyFinished(applyState string) string {
 		RequestedBy: "octocat",
 		ErrorDetail: "schema change is already terminal (current state: " + applyState + ")",
 	})
+}
+
+// renderStartRefused renders SchemaBot's refusal of a start for an apply that
+// finished in applyState, which words each state differently.
+func renderStartRefused(detail string) string {
+	return templates.RenderGenericError(templates.SchemaErrorData{
+		CommandName: "start",
+		Environment: "development",
+		RequestedBy: "octocat",
+		ErrorDetail: detail,
+	})
+}
+
+func TestRefusedAsFinishedReadsAStartRefusal(t *testing.T) {
+	cases := map[string]string{
+		"schema change already completed and cannot be started":                                         state.Apply.Completed,
+		"schema change failed and cannot be started":                                                    state.Apply.Failed,
+		"schema change was cancelled and cannot be started; open a new schema change to apply it again": state.Apply.Cancelled,
+		"schema change was reverted and cannot be started":                                              state.Apply.Reverted,
+	}
+	for detail, want := range cases {
+		t.Run(want, func(t *testing.T) {
+			got, ok := refusedAsFinished([]Comment{{ID: 5, Body: renderStartRefused(detail)}}, 4)
+			require.True(t, ok)
+			assert.Equal(t, want, got)
+		})
+	}
 }
 
 func TestRefusedAsFinishedReadsTheRenderedRefusal(t *testing.T) {
