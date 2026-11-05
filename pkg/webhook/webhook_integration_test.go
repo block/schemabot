@@ -863,8 +863,9 @@ func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schema
 				SHA: &sha,
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: &baseRef,
-				SHA: new("def456"),
+				Ref:  &baseRef,
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})

@@ -18,11 +18,11 @@
 //     superseded rows do not attest coverage of their head.
 //     With synthesis enabled (WithWebhookReconcileSynthesis) it also recovers
 //     each miss by enqueueing a pull_request-equivalent inbox row (see
-//     synthesizedDeliveryGUID; naturally deduped per head) that the durable
+//     synthesizedDeliveryGUID; naturally deduped per head and target) that the durable
 //     dispatcher plans through the ordinary auto-plan flow; otherwise the scan
 //     is report-only. A dead-lettered head (failed_permanent) is not a miss —
-//     HasEventForHead reports it covered — so synthesis cannot resurrect a
-//     delivery the driver proved can never succeed for that head.
+//     Matching target coverage preserves dead-letter disposition. A new target
+//     is a new evaluation context, not a retry of the rejected context.
 //
 // The missing-delivery scan pages each repository's updated-descending open
 // PR listing under a per-pass page budget, in two phases. A fresh-window walk
@@ -452,6 +452,7 @@ func (h *Handler) terminateStuckWebhookEvents(ctx context.Context, store storage
 // checked, how many were missing rows, and how many recovery rows were
 // enqueued.
 func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.WebhookEventStore, repo string) (scanned, missing, synthesized int) {
+	ctx = github.WithPRInfoCache(ctx)
 	installationID, err := h.resolveRepoWebhookInstallation(ctx, repo)
 	if err != nil {
 		h.logger.Warn("webhook reconciler could not resolve installation for repository", "repo", repo, "error", err)
@@ -705,13 +706,24 @@ func (h *Handler) examineOpenPRHead(ctx context.Context, store storage.WebhookEv
 			"repo", repo, "pr", pr.Number, "updated_at", pr.UpdatedAt)
 		return 0, 0, 0
 	}
-	found, err := store.HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr.Number, pr.HeadSHA)
+	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		h.logger.Warn("webhook reconciler failed to query inbox for PR head",
-			"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)
+		h.logger.Warn("reconciler could not resolve PR target client", "repo", repo, "pr", pr.Number, "error", err)
 		return 1, 0, 0
 	}
-	if found {
+	info := &github.PullRequestInfo{HeadSHA: pr.HeadSHA, BaseRef: pr.BaseRef, DefaultBranch: pr.DefaultBranch, NativeStack: pr.NativeStack, StackBaseRef: pr.StackBaseRef}
+	decision, err := h.evaluatePRTarget(ctx, client, repo, info)
+	if err != nil {
+		h.logger.Warn("reconciler could not verify PR target", "repo", repo, "pr", pr.Number, "error", err)
+		return 1, 0, 0
+	}
+	observation := prTargetObservation(info, decision)
+	covered, err := h.recoveryTargetCovered(ctx, store, repo, pr.Number, pr.HeadSHA, observation)
+	if err != nil {
+		h.logger.Warn("reconciler could not verify target coverage", "repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)
+		return 1, 0, 0
+	}
+	if covered {
 		return 1, 0, 0
 	}
 	metrics.RecordWebhookReconcileMissingEvent(ctx, repo)
@@ -726,7 +738,7 @@ func (h *Handler) examineOpenPRHead(ctx context.Context, store storage.WebhookEv
 	}
 	h.logger.Warn("webhook reconciler found open PR head with no inbox delivery; synthesizing recovery delivery",
 		"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
-	inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(ctx, repo, pr.Number, pr.HeadSHA, installationID)
+	inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(ctx, repo, pr.Number, pr.HeadSHA, installationID, observation)
 	if err != nil {
 		// Each head recovers independently; the next pass retries this one.
 		h.logger.Warn("webhook reconciler failed to synthesize recovery delivery for open PR head",
@@ -761,10 +773,14 @@ const webhookReconcileSynthesizedAction = "synchronize"
 // folded into a short digest while the PR number and a truncated head SHA
 // stay readable for triage. The GUID is a dedup key only — the inbox row's
 // repository, pull_request, and head_sha columns carry the full values.
-// Re-scans of the same head produce the same GUID and dedupe naturally, and
-// every new push mints a fresh recovery candidate.
-func synthesizedDeliveryGUID(repo string, pr int, headSHA string) string {
-	repoDigest := sha256.Sum256([]byte(repo))
+// Re-scans of the same head and target produce the same GUID. A new push,
+// target, or eligibility decision mints a fresh recovery candidate.
+func synthesizedDeliveryGUID(repo string, pr int, headSHA string, targetObservation ...string) string {
+	identity := repo
+	if len(targetObservation) > 0 {
+		identity += "\x00" + targetObservation[0]
+	}
+	repoDigest := sha256.Sum256([]byte(identity))
 	if len(headSHA) > 12 {
 		headSHA = headSHA[:12]
 	}
@@ -783,9 +799,15 @@ func synthesizedDeliveryGUID(repo string, pr int, headSHA string) string {
 // recovery from a head that keeps failing after recovery. The pre-check and
 // the enqueue are not atomic; a concurrent pod inserting between them can at
 // worst mislabel one metric increment, never affect the row itself.
-func (h *Handler) synthesizeMissingHeadDelivery(ctx context.Context, repo string, pr int, headSHA string, installationID int64) (inserted, resynthesized bool, err error) {
+func (h *Handler) synthesizeMissingHeadDelivery(ctx context.Context, repo string, pr int, headSHA string, installationID int64, targetObservation ...string) (inserted, resynthesized bool, err error) {
 	repo = storage.CanonicalKey(repo)
-	guid := synthesizedDeliveryGUID(repo, pr, headSHA)
+	guid := synthesizedDeliveryGUID(repo, pr, headSHA, targetObservation...)
+	if len(targetObservation) > 0 {
+		guid, err = h.recoveryDeliveryGUID(ctx, repo, pr, headSHA, targetObservation[0])
+		if err != nil {
+			return false, false, fmt.Errorf("resolve target recovery identity for %s#%d: %w", repo, pr, err)
+		}
+	}
 	if store := h.webhookEventStore(); store != nil {
 		prior, err := store.GetByDeliveryID(ctx, storage.WebhookProviderGitHub, guid)
 		if err != nil {

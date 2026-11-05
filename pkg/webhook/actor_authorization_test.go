@@ -1136,7 +1136,7 @@ func registerApplyDiscoveryEndpointsDeclaring(t *testing.T, mux *http.ServeMux, 
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 			"state": "open",
 			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
-			"base":  map[string]any{"sha": "def456", "ref": "main"},
+			"base":  map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 			"user":  map[string]any{"login": "testuser"},
 		}))
 	})

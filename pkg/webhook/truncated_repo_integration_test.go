@@ -71,8 +71,9 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 				SHA: new("abc123"),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})

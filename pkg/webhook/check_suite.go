@@ -192,6 +192,7 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 // inbox. In the steady state — the organic pull_request delivery arrived and
 // planned during the grace — every candidate is covered and the pass no-ops.
 func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	ctx = ghclient.WithPRInfoCache(ctx)
 	var payload checkSuitePayload
 	if err := decodeDurablePayload(event, &payload); err != nil {
 		return false, err
@@ -260,8 +261,14 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 	}
 
 	var synthesized int
-	for _, pr := range candidates {
-		covered, err := store.HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr, headSHA)
+	for _, candidate := range candidates {
+		pr, info := candidate.number, candidate.info
+		decision, err := h.evaluatePRTarget(ctx, client, repo, info)
+		if err != nil {
+			return true, fmt.Errorf("evaluate check_suite PR target %s#%d: %w", repo, pr, err)
+		}
+		observation := prTargetObservation(info, decision)
+		covered, err := h.recoveryTargetCovered(ctx, store, repo, pr, headSHA, observation)
 		if err != nil {
 			return true, fmt.Errorf("query inbox coverage for %s#%d@%s (durable check_suite delivery %s): %w",
 				repo, pr, headSHA, event.DeliveryID, err)
@@ -272,7 +279,7 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 			metrics.RecordWebhookCheckSuiteRecovery(ctx, repo, "covered")
 			continue
 		}
-		inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(ctx, repo, pr, headSHA, installationID)
+		inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(ctx, repo, pr, headSHA, installationID, observation)
 		if err != nil {
 			return true, fmt.Errorf("synthesize recovery delivery for %s#%d@%s (durable check_suite delivery %s): %w",
 				repo, pr, headSHA, event.DeliveryID, err)
@@ -302,6 +309,11 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 	return false, nil
 }
 
+type checkSuitePR struct {
+	number int
+	info   *ghclient.PullRequestInfo
+}
+
 // resolveCheckSuitePRs resolves the open PRs whose *current* head is the
 // check suite's head SHA. The payload's pull_requests entries are
 // point-in-time snapshots taken when GitHub sent the delivery — and the
@@ -313,7 +325,7 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 // current at call time. truncated reports that the walk exhausted its page
 // budget before the listing did, so the returned PRs are incomplete rather
 // than a genuine no-match.
-func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, payload checkSuitePayload) (prs []int, truncated bool, retry bool, err error) {
+func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, payload checkSuitePayload) (prs []checkSuitePR, truncated bool, retry bool, err error) {
 	if len(payload.CheckSuite.PullRequests) > 0 {
 		for _, candidate := range payload.CheckSuite.PullRequests {
 			if candidate.Number <= 0 {
@@ -337,7 +349,7 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 					"current_head_sha", info.HeadSHA)
 				continue
 			}
-			prs = append(prs, candidate.Number)
+			prs = append(prs, checkSuitePR{number: candidate.Number, info: info})
 		}
 		return prs, false, false, nil
 	}
@@ -362,7 +374,7 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 		}
 		for _, pr := range open {
 			if pr.HeadSHA == headSHA {
-				prs = append(prs, pr.Number)
+				prs = append(prs, checkSuitePR{number: pr.Number, info: &ghclient.PullRequestInfo{HeadSHA: pr.HeadSHA, BaseRef: pr.BaseRef, DefaultBranch: pr.DefaultBranch, NativeStack: pr.NativeStack, StackBaseRef: pr.StackBaseRef, State: "open"}})
 			}
 		}
 		if nextPage == 0 {

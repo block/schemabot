@@ -24,6 +24,13 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 	if err != nil {
 		return nil, fmt.Errorf("read PR before aggregate scope %s#%d: %w", repo, pr, err)
 	}
+	decision, err := h.evaluatePRTarget(ctx, client, repo, prInfo)
+	if err != nil {
+		return nil, err
+	}
+	if !decision.Eligible {
+		return nil, errPRTargetExcluded
+	}
 	files, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
 		return nil, fmt.Errorf("list files for aggregate scope %s#%d: %w", repo, pr, err)
@@ -96,7 +103,7 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 			}
 		}
 	}
-	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, prInfo.BaseRef)
+	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, prInfo)
 	if err != nil {
 		return nil, fmt.Errorf("re-verify aggregate scope %s#%d: %w", repo, pr, err)
 	}

@@ -21,9 +21,10 @@ import (
 // call each. Concurrent callers from spawned goroutines that share the ctx
 // see the populated entry once the first fetch completes.
 type requestPRInfoCache struct {
-	mu    sync.Mutex
-	m     map[string]*PullRequestInfo
-	files map[string][]PRFile
+	mu             sync.Mutex
+	m              map[string]*PullRequestInfo
+	files          map[string][]PRFile
+	requiredChecks map[string][]string
 }
 
 type prInfoCacheCtxKey struct{}

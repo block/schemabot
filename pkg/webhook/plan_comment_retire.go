@@ -50,6 +50,34 @@ func (s planCommentSlot) soleEnvironment() string {
 // failure mode here leaves extra comments visible on the PR, never a hidden
 // or lost record.
 func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int64, slot planCommentSlot, body string) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		h.logger.Error("failed to create GitHub client for plan comment",
+			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
+		return
+	}
+
+	info, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("could not verify plan comment target", "repo", repo, "pr", pr, "error", err)
+		return
+	}
+	decision, err := h.evaluatePRTarget(ctx, client, repo, info)
+	if err != nil {
+		h.logger.Error("could not verify plan comment eligibility", "repo", repo, "pr", pr, "error", err)
+		return
+	}
+	if !decision.Eligible {
+		return
+	}
+	if slot.HeadSHA != "" && info.HeadSHA != slot.HeadSHA {
+		return
+	}
+
 	if slot.Database == "" || slot.HeadSHA == "" {
 		// A plan whose every environment failed renders an error-only comment
 		// with no resolved database or head, so there is no slot identity to
@@ -60,16 +88,6 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 			"repo", repo, "pr", pr, "database", slot.Database, "database_type", slot.DatabaseType,
 			"head_sha", slot.HeadSHA)
 		h.postComment(repo, pr, installationID, body)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	client, err := h.clientForRepo(repo, installationID)
-	if err != nil {
-		h.logger.Error("failed to create GitHub client for plan comment",
-			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 		return
 	}
 

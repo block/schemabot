@@ -707,8 +707,9 @@ func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
 				SHA: new("abc123"),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -1846,7 +1847,8 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	// Discovery (cached FetchPullRequest) sees abc123; the NoCache fetch
 	// inside the auto-confirm branch sees a new commit at newsha456.
-	result.HeadSHAs = []string{"abc123", "newsha456"}
+	// The eligibility read and discovery see the same commit; it advances afterward.
+	result.HeadSHAs = []string{"abc123", "abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -2368,7 +2370,8 @@ func TestE2EApplyConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	}
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-	result.HeadSHAs = []string{"abc123", "newsha456"}
+	// The eligibility read and discovery see the same commit; it advances afterward.
+	result.HeadSHAs = []string{"abc123", "abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -2430,7 +2433,8 @@ func TestE2EApplyDefaultAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	// Discovery (cached FetchPullRequest) sees abc123; the NoCache fetch
 	// just before execution sees a new commit at newsha456.
-	result.HeadSHAs = []string{"abc123", "newsha456"}
+	// The eligibility read and discovery see the same commit; it advances afterward.
+	result.HeadSHAs = []string{"abc123", "abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -2505,7 +2509,8 @@ func TestE2EApplyConfirmStaleSchemaPreservesOtherPRLock(t *testing.T) {
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	// HEAD advances between cached discovery and NoCache fetch, triggering
 	// the stale-schema rejection on PR #1.
-	result.HeadSHAs = []string{"abc123", "newsha456"}
+	// The eligibility read and discovery see the same commit; it advances afterward.
+	result.HeadSHAs = []string{"abc123", "abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
 	// Webhook delivery for PR #1 — but the lock is held by PR #999.
@@ -2557,7 +2562,8 @@ func TestE2EPlanRejectsWhenHEADAdvanced(t *testing.T) {
 	}
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-	result.HeadSHAs = []string{"abc123", "newsha456"}
+	// The eligibility read and discovery see the same commit; it advances afterward.
+	result.HeadSHAs = []string{"abc123", "abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{

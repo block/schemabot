@@ -524,6 +524,15 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, actionName, environment, requestedBy, false, false)
+	if gateErr != nil {
+		return
+	}
+	if blocked {
+		// Preserve the pending confirmation and lock intent for a later eligible retry.
+		return
+	}
+
 	// Set observer before queuing the apply so ExecuteApply can register it on
 	// the durable apply row before operator dispatch starts.
 	observerCfg := h.commentObserverConfig(factory, repo, pr, installationID)

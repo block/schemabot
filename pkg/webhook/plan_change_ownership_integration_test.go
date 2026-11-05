@@ -598,7 +598,7 @@ func registerPullRequestState(mux *http.ServeMux, pr int, prState string, merged
 			State:  &prState,
 			Merged: &merged,
 			Head:   &gh.PullRequestBranch{Ref: new("other-branch"), SHA: new("otherhead")},
-			Base:   &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base:   &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User:   &gh.User{Login: new("otheruser")},
 		})
 	})

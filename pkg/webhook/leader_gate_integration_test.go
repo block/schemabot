@@ -92,7 +92,7 @@ func mockLeaderPRHeadWithState(mux *http.ServeMux, headSHA, state string) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			State: &state,
 			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
-			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User:  &gh.User{Login: new("testuser")},
 		})
 	})

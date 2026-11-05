@@ -837,6 +837,13 @@ func TestE2EAutoPlanDiscardsAPlanWhoseBaseMovedDuringDiscovery(t *testing.T) {
 	}
 	result.BaseTip.Store(&moveBaseDuringDiscovery)
 
+	// The release branch remains enforced, so its retarget delivery must plan.
+	serveUnrequiredTarget(t, mux)
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release-1", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := fmt.Fprint(w, `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot (staging)"}]}}]`)
+		require.NoError(t, err)
+	})
+
 	h := newE2EHandler(t, svc, client)
 
 	openedReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
@@ -948,12 +955,10 @@ func TestE2EAutoPlanDiscardsAPlanWhoseHeadMovedDuringDiscovery(t *testing.T) {
 	}
 }
 
-// SchemaBot loses access to the PR between the snapshot discovery starts from
-// and the re-read that would confirm the PR still has that head and base. The
-// question a plan is published on cannot be answered, so no plan is published
-// and the aggregate fails closed naming what could not be confirmed — the
-// request path has no durable row to retry, so a failure only in the logs would
-// leave the PR showing nothing at all.
+// SchemaBot loses PR access after discovery. Without a fresh head and target,
+// it publishes neither a plan nor a Check Run. The required result stays absent,
+// and the returned verification error remains retryable rather than becoming
+// evidence that this target is excluded.
 func TestE2EAutoPlanFailsClosedWhenThePRCannotBeReVerifiedBeforePublishing(t *testing.T) {
 	dbName := "webhook_autoplan_reverify_fails"
 	svc := setupE2EService(t, dbName)
@@ -975,34 +980,13 @@ func TestE2EAutoPlanFailsClosedWhenThePRCannotBeReVerifiedBeforePublishing(t *te
 
 	h := newE2EHandler(t, svc, client)
 
-	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
-		action:  "opened",
-		headSHA: "abc123",
-		headRef: "feature-branch",
-	}, nil)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
+	ctx := ghclient.WithPRInfoCache(t.Context())
+	message, err := h.runAutoPlanForPR(ctx, ghclient.NewInstallationClient(client, testLogger()), "octocat/hello-world", 1, "abc123", 12345, "pull_request", "opened", "", "")
+	require.ErrorContains(t, err, "re-verify")
+	assert.Equal(t, "plan publish verification failed", message)
+	assert.Empty(t, result.checkRuns, "no result is published without fresh PR evidence")
+	assert.Empty(t, result.comments, "an unverified plan is never shown")
 
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "auto-plan started")
-
-	select {
-	case cr := <-result.checkRuns:
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionFailure, cr.Conclusion,
-			"a PR that cannot be re-verified must fail the check closed")
-		require.NotNil(t, cr.Output)
-		assert.Equal(t, planPublishVerificationFailedBlock.message, cr.Output.Summary,
-			"the check must name the verification that could not be answered")
-	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the publish-verification failure check run")
-	}
-
-	select {
-	case body := <-result.comments:
-		t.Fatalf("expected no plan comment for a PR that could not be re-verified, got: %s", body)
-	case <-time.After(3 * time.Second):
-	}
 }
 
 func TestE2EAutoPlanWithLintViolations(t *testing.T) {
@@ -1347,8 +1331,9 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 				SHA: new("abc123"),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -1492,8 +1477,9 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 				SHA: new("abc123"),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -1599,8 +1585,9 @@ func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
 						SHA: new("abc123"),
 					},
 					Base: &gh.PullRequestBranch{
-						Ref: new("main"),
-						SHA: new("def456"),
+						Ref:  new("main"),
+						SHA:  new("def456"),
+						Repo: &gh.Repository{DefaultBranch: new("main")},
 					},
 					User: &gh.User{Login: new("testuser")},
 				})
@@ -1920,7 +1907,7 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})

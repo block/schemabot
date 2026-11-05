@@ -33,16 +33,26 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 	defer cancel()
 
+	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, tenant, requestedBy, action.Plan, false) {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "database not configured handled"})
+		return
+	}
+
+	blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.Plan, environment, requestedBy, false, false)
+	if gateErr != nil {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan target could not be verified"})
+		return
+	}
+	if blocked {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan blocked by PR target"})
+		return
+	}
+
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "status check reconciliation failed"})
-		return
-	}
-
-	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, tenant, requestedBy, action.Plan, false) {
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "database not configured handled"})
 		return
 	}
 
@@ -349,19 +359,27 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	}
 	defer cancel()
 
-	// Fix checks stuck at "in_progress" from crashed applies
-	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
-		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
-		return
-	}
-
 	// The registry gate reads databaseName as the command's -d value. An
 	// auto-plan passes the database discovered from the PR instead, and its
 	// answer for an unconfigured database is the failing aggregate the
 	// multi-environment setup below posts, which is what tells branch
 	// protection the plan cannot succeed.
 	if !isAutoPlan && h.answerUnregisteredDatabase(repo, pr, installationID, "", databaseName, tenant, requestedBy, action.Plan, false) {
+		return
+	}
+
+	blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.Plan, "", requestedBy, isAutoPlan, false)
+	if gateErr != nil {
+		return
+	}
+	if blocked {
+		return
+	}
+
+	// Fix checks stuck at "in_progress" from crashed applies
+	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
+		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
 		return
 	}
 
