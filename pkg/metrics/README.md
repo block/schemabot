@@ -82,7 +82,6 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
 | `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP or local prevention; any event is actionable |
 | `schemabot.github.secondary_rate_limit_cooldown_reports_total` | Counter | environment, operation, resource, github_app, installation_id, disposition | Parsed secondary cooldown decisions, including accepted and exceeded allowances |
-| `schemabot.github.secondary_rate_limit_cooldown_reported_seconds_total` | Floating-point counter (seconds) | environment, operation, resource, github_app, installation_id, disposition | Sum of reported cooldown durations, including declined cooldowns; not actual waiting |
 | `schemabot.github.wait_duration_seconds` | Histogram (seconds) | environment, operation, resource, github_app, installation_id, layer, reason | Actual elapsed outer read-retry waits, including cancellation/deadline interruptions |
 | `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
 | `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
@@ -615,8 +614,7 @@ errors; never add these counters together into one error total.
 Quota refusals with a missing or unrecognized resource header still count as
 HTTP-origin rejections with `resource=unknown`; their response handling is unchanged.
 
-Secondary limiter callbacks emit one report and `max(0, reset - observed_at)`
-seconds using the same attributes and disposition: `accepted`,
+Secondary limiter callbacks emit one report with disposition: `accepted`,
 `single_sleep_limit_exceeded`, or `total_sleep_limit_exceeded`. The existing
 five-second per-sleep allowance is unchanged. No total allowance is enabled in
 production; the internal constructor registers its callback together with any
@@ -625,21 +623,19 @@ retain the instrumentation callbacks when overriding allowances.
 
 These are limiter decisions before any sleep. One accepted report can delay
 many callers; shared waiters and cancelled inner sleeps add no reports. Declined
-cooldowns can report repeatedly during one throttling episode. Reported seconds
-are neither wall-clock throttling time nor aggregate caller delay. Display each
-disposition separately: count, sum of reported seconds, and seconds/count when
-the denominator is positive. Alert tuning initially selects only repeated
+cooldowns can report repeatedly during one throttling episode. Display report
+counts separately by disposition. Alert tuning initially selects only repeated
 `single_sleep_limit_exceeded` reports; accepted reports stay diagnostic.
 
 `wait_duration_seconds` observes only positive outer waits at `layer=read_retry`,
 with `reason=secondary_rate_limit` for typed secondary errors or
 `reason=transient_error` otherwise. Its count/distribution describe individual
 waits; its sum is aggregate actual caller-seconds and includes interrupted waits.
-A killed process can lose an in-flight observation. Do not add reported cooldown
-seconds to actual outer waiting, and do not infer final logical operation failure
-rates from either population. Retry policy and dependency versions are unchanged.
+A killed process can lose an in-flight observation. Do not infer final logical
+operation failure rates from cooldown reports or outer waits. Retry policy and
+dependency versions are unchanged.
 
-All four instruments omit repository, PR, SHA, reset timestamps and error text.
+All three instruments omit repository, PR, SHA, reset timestamps and error text.
 Unavailable App/installation/resource/operation identities use explicit `unknown`.
 The Prometheus registry exports the counter names with dots replaced by
 underscores (retaining `_total`), and the histogram as

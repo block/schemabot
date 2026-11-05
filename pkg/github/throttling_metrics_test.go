@@ -24,10 +24,9 @@ import (
 )
 
 const (
-	quotaMetric           = "schemabot.github.primary_rate_limit_rejections_total"
-	reportMetric          = "schemabot.github.secondary_rate_limit_cooldown_reports_total"
-	reportedSecondsMetric = "schemabot.github.secondary_rate_limit_cooldown_reported_seconds_total"
-	waitMetric            = "schemabot.github.wait_duration_seconds"
+	quotaMetric  = "schemabot.github.primary_rate_limit_rejections_total"
+	reportMetric = "schemabot.github.secondary_rate_limit_cooldown_reports_total"
+	waitMetric   = "schemabot.github.wait_duration_seconds"
 )
 
 func throttlingData(t *testing.T, reader *sdkmetric.ManualReader) map[string]metricdata.Metrics {
@@ -205,18 +204,19 @@ func secondaryResponse(req *http.Request, retryAfter string) *http.Response {
 	return &http.Response{StatusCode: 403, Header: header, Request: req, Body: io.NopCloser(strings.NewReader(`{"message":"You have exceeded a secondary rate limit","documentation_url":"https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api#about-secondary-rate-limits"}`))}
 }
 
-// The same callback emits both counters, including long cooldowns on writes
+// Each callback counts one decision, including long cooldowns on writes
 // that never enter an outer read retry and the optional total-allowance branch.
 func TestGitHubSecondaryCooldownReports(t *testing.T) {
 	cases := []struct {
 		name, retryAfter, method, disposition string
 		allowance                             *time.Duration
 		calls                                 int
-		seconds                               float64
+		resetAfter                            time.Duration
 	}{
-		{"accepted", "1", http.MethodGet, metrics.GitHubCooldownAccepted, nil, 2, 1},
-		{"declined_write", "10", http.MethodPost, metrics.GitHubCooldownSingleSleepLimitExceeded, nil, 1, 10},
-		{"total_allowance", "1", http.MethodGet, metrics.GitHubCooldownTotalSleepLimitExceeded, new(time.Duration), 1, 1},
+		{"accepted", "1", http.MethodGet, metrics.GitHubCooldownAccepted, nil, 2, 0},
+		{"declined_write", "10", http.MethodPost, metrics.GitHubCooldownSingleSleepLimitExceeded, nil, 1, 0},
+		{"total_allowance", "1", http.MethodGet, metrics.GitHubCooldownTotalSleepLimitExceeded, new(time.Duration), 1, 0},
+		{"declined_reset", "", http.MethodPost, metrics.GitHubCooldownSingleSleepLimitExceeded, nil, 1, 30 * time.Minute},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -225,7 +225,11 @@ func TestGitHubSecondaryCooldownReports(t *testing.T) {
 			base := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				calls++
 				if calls == 1 {
-					return secondaryResponse(req, tc.retryAfter), nil
+					resp := secondaryResponse(req, tc.retryAfter)
+					if tc.resetAfter > 0 {
+						resp.Header.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(tc.resetAfter).Unix(), 10))
+					}
+					return resp, nil
 				}
 				return &http.Response{StatusCode: 200, Header: http.Header{}, Request: req, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 			}), 42, func() string { return "test-app" })
@@ -243,12 +247,8 @@ func TestGitHubSecondaryCooldownReports(t *testing.T) {
 			assert.Equal(t, tc.calls, calls)
 			data := throttlingData(t, reader)
 			reports := data[reportMetric].Data.(metricdata.Sum[int64]).DataPoints
-			seconds := data[reportedSecondsMetric].Data.(metricdata.Sum[float64]).DataPoints
 			require.Len(t, reports, 1)
-			require.Len(t, seconds, 1)
 			assert.Equal(t, int64(1), reports[0].Value)
-			assert.InDelta(t, tc.seconds, seconds[0].Value, 0.1)
-			assert.Equal(t, reports[0].Attributes, seconds[0].Attributes)
 			disposition, _ := reports[0].Attributes.Value("disposition")
 			assert.Equal(t, tc.disposition, disposition.AsString())
 			assertThrottlingIdentity(t, reports[0].Attributes, operation)
@@ -269,7 +269,6 @@ func TestGitHubRepeatedDeclinedCooldowns(t *testing.T) {
 	}
 	data := throttlingData(t, reader)
 	assert.Equal(t, int64(3), data[reportMetric].Data.(metricdata.Sum[int64]).DataPoints[0].Value)
-	assert.InDelta(t, 30, data[reportedSecondsMetric].Data.(metricdata.Sum[float64]).DataPoints[0].Value, 0.1)
 }
 
 func TestGitHubNonQuotaResponses(t *testing.T) {
@@ -298,7 +297,7 @@ func TestGitHubNonQuotaResponses(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, resp.Body.Close())
 			data := throttlingData(t, reader)
-			for _, name := range []string{quotaMetric, reportMetric, reportedSecondsMetric, waitMetric} {
+			for _, name := range []string{quotaMetric, reportMetric, waitMetric} {
 				_, ok := data[name]
 				assert.False(t, ok, name)
 			}
@@ -459,7 +458,6 @@ func TestGitHubSharedCooldownCancellation(t *testing.T) {
 	}
 	data := throttlingData(t, reader)
 	assert.Equal(t, int64(1), data[reportMetric].Data.(metricdata.Sum[int64]).DataPoints[0].Value)
-	assert.InDelta(t, 1, data[reportedSecondsMetric].Data.(metricdata.Sum[float64]).DataPoints[0].Value, 0.1)
 	_, hasWait := data[waitMetric]
 	assert.False(t, hasWait)
 }
@@ -492,7 +490,6 @@ func TestGitHubDeclinedCooldownThenSuccessfulOuterRetry(t *testing.T) {
 	assert.Equal(t, int64(1), reports[0].Value)
 	disposition, _ := reports[0].Attributes.Value("disposition")
 	assert.Equal(t, metrics.GitHubCooldownSingleSleepLimitExceeded, disposition.AsString())
-	assert.InDelta(t, 6, data[reportedSecondsMetric].Data.(metricdata.Sum[float64]).DataPoints[0].Value, 0.1)
 	waits := data[waitMetric].Data.(metricdata.Histogram[float64]).DataPoints
 	require.Len(t, waits, 1)
 	assert.Equal(t, uint64(1), waits[0].Count)

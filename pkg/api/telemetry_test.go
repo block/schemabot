@@ -1302,8 +1302,8 @@ func TestGitHubThrottlingPrometheusExports(t *testing.T) {
 	})
 	sample := metrics.GitHubClientMetricContext{Operation: metrics.GitHubOperationFetchPullRequest, Resource: metrics.GitHubRateLimitResourceCore, GitHubApp: "test-app", InstallationID: 42}
 	metrics.RecordGitHubPrimaryRateLimitRejection(t.Context(), sample, metrics.GitHubRejectionOriginLocal)
-	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownAccepted, 2*time.Second)
-	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownSingleSleepLimitExceeded, 10*time.Second)
+	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownAccepted)
+	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownSingleSleepLimitExceeded)
 	metrics.RecordGitHubWait(t.Context(), sample, metrics.GitHubWaitLayerReadRetry, metrics.GitHubWaitReasonTransientError, 250*time.Millisecond)
 	recorder := httptest.NewRecorder()
 	tel.MetricsHandler.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
@@ -1312,7 +1312,6 @@ func TestGitHubThrottlingPrometheusExports(t *testing.T) {
 	for _, expected := range []string{
 		"schemabot_github_primary_rate_limit_rejections_total",
 		"schemabot_github_secondary_rate_limit_cooldown_reports_total",
-		"schemabot_github_secondary_rate_limit_cooldown_reported_seconds_total",
 		"schemabot_github_wait_duration_seconds_sum",
 		"schemabot_github_wait_duration_seconds_count",
 		`disposition="accepted"`, `disposition="single_sleep_limit_exceeded"`,

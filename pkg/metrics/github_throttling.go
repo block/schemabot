@@ -98,27 +98,13 @@ const (
 	GitHubCooldownTotalSleepLimitExceeded  = "total_sleep_limit_exceeded"
 )
 
-// RecordGitHubSecondaryCooldownReport emits matching report counts and reported
-// seconds. These are limiter decisions, not actual sleep or unique callers.
-func RecordGitHubSecondaryCooldownReport(ctx context.Context, sample GitHubClientMetricContext, disposition string, reported time.Duration) {
+// RecordGitHubSecondaryCooldownReport counts a limiter decision, not an
+// actual sleep, unique caller, or final failure.
+func RecordGitHubSecondaryCooldownReport(ctx context.Context, sample GitHubClientMetricContext, disposition string) {
 	disposition = normalizeGitHubLabel("disposition", disposition, func(v string) bool {
 		return v == GitHubCooldownAccepted || v == GitHubCooldownSingleSleepLimitExceeded || v == GitHubCooldownTotalSleepLimitExceeded
 	})
 	attrs := append(sample.attributes(), attribute.String("disposition", disposition))
-	meter := otel.Meter(meterName)
-	reports, err := meter.Int64Counter("schemabot.github.secondary_rate_limit_cooldown_reports_total",
-		otelmetric.WithDescription("Secondary rate limit cooldown decisions; not caller waits or final failures"), otelmetric.WithUnit("{report}"))
-	if err != nil {
-		slog.Warn("failed to create GitHub cooldown report counter", "error", err)
-		return
-	}
-	seconds, err := meter.Float64Counter("schemabot.github.secondary_rate_limit_cooldown_reported_seconds_total",
-		otelmetric.WithDescription("Sum of reported secondary cooldown seconds, including declined cooldowns; not actual waiting"), otelmetric.WithUnit("s"))
-	if err != nil {
-		slog.Warn("failed to create GitHub cooldown seconds counter", "error", err)
-		return
-	}
-	options := otelmetric.WithAttributes(attrs...)
-	reports.Add(ctx, 1, options)
-	seconds.Add(ctx, max(0, reported.Seconds()), options)
+	addCounter(ctx, "schemabot.github.secondary_rate_limit_cooldown_reports_total",
+		"Secondary rate limit cooldown decisions; not caller waits or final failures", "{report}", attrs...)
 }

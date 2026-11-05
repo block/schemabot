@@ -66,18 +66,17 @@ func newGitHubRateLimitTransportWithTotalAllowance(base http.RoundTripper, total
 
 func (t *githubQuotaWaitTransport) cooldownCallback(disposition string) func(*github_secondary_ratelimit.CallbackContext) {
 	return func(c *github_secondary_ratelimit.CallbackContext) {
-		// The dependency holds its lock here. Capture once and record in-process;
-		// never retain callback pointers or use cumulative TotalSleepTime as elapsed.
-		observedAt := time.Now()
-		if c.Request == nil || c.ResetTime == nil {
-			slog.Error("GitHub cooldown report missing request or reset metadata", "disposition", disposition)
+		// The dependency holds its lock here. Record in-process without retaining
+		// callback pointers or re-entering the limiter.
+		if c.Request == nil {
+			slog.Error("GitHub cooldown report missing request", "disposition", disposition)
 			return
 		}
 		resource := githubRateLimitResourceFromRequest(c.Request)
 		if c.Response != nil {
 			resource = githubRateLimitResourceFromHeaders(c.Request, c.Response)
 		}
-		metrics.RecordGitHubSecondaryCooldownReport(c.Request.Context(), t.sample(c.Request, resource), disposition, c.ResetTime.Sub(observedAt))
+		metrics.RecordGitHubSecondaryCooldownReport(c.Request.Context(), t.sample(c.Request, resource), disposition)
 	}
 }
 
