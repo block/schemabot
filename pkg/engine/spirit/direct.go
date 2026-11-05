@@ -831,7 +831,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 			}
 			logger.Error("direct execution failed",
 				"database", database, "table", ds.table, "error", err)
-			e.setSchemaChangeFailed(fmt.Errorf("direct execution of ALTER on table %q failed: %w", ds.table, err))
+			e.setSchemaChangeFailed(fmt.Errorf("direct execution of ALTER on table %q failed: %w", ds.table, classifyDirectError(err)))
 			return false
 		}
 		e.setDirectStatementState(progress, directStateCompleted)
@@ -947,4 +947,16 @@ func (s *targetSchema) createTable(ctx context.Context, tableName string) (strin
 	}
 	s.cache[tableName] = createTable
 	return createTable, nil
+}
+
+// classifyDirectError marks a direct ALTER failure that a retry would repeat
+// as permanent: a statement the target refuses whatever the moment, or a row
+// an in-place ALTER cannot store under the new definition. The same statement
+// runs against the same server and rows on every attempt. Everything else,
+// such as a lock wait or a dropped connection, stays retryable.
+func classifyDirectError(err error) error {
+	if isStatementError(err) || isRowDataError(err) {
+		return &engine.PermanentError{Err: err}
+	}
+	return err
 }
