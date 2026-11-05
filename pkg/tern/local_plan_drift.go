@@ -249,31 +249,34 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 	return result, nil
 }
 
-// verifyAttachedShardDispatch checks a shard-scoped dispatch that attaches to
-// an existing apply against its own shard: the reviewed change it carries must
-// be what this deployment would plan for that shard and table against its own
-// live schema, or the attach fails closed. The plan row the attach runs from
-// was checked against the creating dispatch's shard at most — only when that
-// dispatch materialized it; a plan row already stored on the deployment is
-// taken as it is — so without this a sibling shard that drifted would run the
-// reviewed DDL unchecked. On a match the scope's changes take this
+// verifyShardDispatchAgainstLiveSchema checks a shard-scoped dispatch against
+// its own shard when the dispatch runs from a plan row it did not materialize:
+// the reviewed change it carries must be what this deployment would plan for that
+// shard and table against its own live schema, or the dispatch fails closed.
+// That is every dispatch attaching to an existing apply, and a dispatch
+// creating an apply from a plan row already stored on this deployment. A plan
+// row is checked against a shard only when a dispatch for that shard
+// materializes it; a stored row is taken as it is. So without this check a
+// shard that drifted would run the reviewed DDL unchecked, and when the
+// creating dispatch ran unchecked while a later sibling was refused, the
+// shards would end up divergent. On a match the scope's changes take this
 // shard's re-planned statement, execution-mode verdict and unsafe flag, as a
 // materialized plan's do.
 //
 // The comparison is restricted to the tables the dispatch names. A dispatch
 // carries one table's changes for one shard, and the shard's other tables are
-// other operations' work — some already run, some not yet attached — so they
+// other operations' work — some already run, some not yet dispatched — so they
 // are no evidence about this one.
 //
 // A dispatch that carries no schema files has no reviewed schema to re-plan
-// against, and attaches against the plan row as it is: a change no re-plan has
+// against, and runs against the plan row as it is: a change no re-plan has
 // judged keeps the mark that makes admission require the unsafe opt-in for it.
-func (c *LocalClient) verifyAttachedShardDispatch(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, scope *dispatchScope) error {
+// logAttrs identify the apply and operation for that warning.
+func (c *LocalClient) verifyShardDispatchAgainstLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope, logAttrs []any) error {
 	if len(req.SchemaFiles) == 0 {
-		c.logger.Warn("shard dispatch carries no schema files to re-plan against; attaching against the plan row, which will require the unsafe opt-in for every change it could not confirm",
-			append(apply.LogAttrs(),
+		c.logger.Warn("shard dispatch carries no schema files to re-plan against; admitting it against the plan row, which will require the unsafe opt-in for every change it could not confirm",
+			append(logAttrs,
 				"plan_id", req.PlanId,
-				"operation_key", operationKey,
 				"shard", scope.shard)...)
 		return nil
 	}
