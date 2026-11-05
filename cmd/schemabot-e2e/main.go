@@ -36,13 +36,19 @@ const (
 )
 
 func main() {
-	os.Exit(run())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	code := run(ctx, os.Args, os.Getenv, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
-func run() int {
+// run takes ctx, cancelled by a signal, and its arguments, environment and
+// output as parameters so tests can drive it.
+func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	var cfg livee2e.Config
 	// ContinueOnError keeps a bad flag from exiting 2, which means retry.
-	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	sweepOnly := fs.Bool("sweep-only", false, "only remove what earlier runs left behind; it still needs every flag a run needs")
 	fs.StringVar(&cfg.Repo, "repo", "", "test repository, in owner/name form")
 	fs.StringVar(&cfg.BaseBranch, "base", "main", "branch test pull requests target")
@@ -57,29 +63,27 @@ func run() int {
 	fs.DurationVar(&cfg.PollInterval, "poll-interval", 5*time.Second, "how often to read the pull request")
 	fs.DurationVar(&cfg.WaitTimeout, "wait-timeout", 15*time.Minute, "how long to wait for SchemaBot to act on each command")
 	fs.DurationVar(&cfg.RunTimeout, "run-timeout", 2*time.Hour, "how long a whole run may take, opening the test database included; a sweep reaps the run once this and then the wait timeout have passed")
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(args[1:]); err != nil {
 		// -h fails too, so a gate misconfigured with it cannot pass.
 		return exitFailed
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	if cfg.RunTimeout <= 0 {
 		logger.Error("invalid configuration", "error", "--run-timeout must be positive")
 		return exitFailed
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	// The run's deadline starts before the test database opens, so a slow
 	// connection counts against it. The runner keeps its own cleanup budget.
 	runCtx, cancelRun := context.WithTimeout(ctx, cfg.RunTimeout)
 	defer cancelRun()
 
-	gh, err := livee2e.NewGitHub(cfg.Repo, os.Getenv("GITHUB_TOKEN"))
+	gh, err := livee2e.NewGitHub(cfg.Repo, getenv("GITHUB_TOKEN"))
 	if err != nil {
 		logger.Error("cannot build the GitHub client", "error", err)
 		return exitFailed
 	}
-	dsn := os.Getenv("SCHEMABOT_E2E_DSN")
+	dsn := getenv("SCHEMABOT_E2E_DSN")
 	if dsn == "" {
 		logger.Error("SCHEMABOT_E2E_DSN is not set")
 		return exitFailed
@@ -88,8 +92,9 @@ func run() int {
 	target, err := livee2e.OpenMySQLTarget(openCtx, dsn, cfg.Database, logger)
 	cancelOpen()
 	if err != nil {
-		logger.Error("cannot open the test database", "database", cfg.Database, "error", err)
-		return exitFailed
+		// A signal can land while the database opens, so this goes through
+		// report like a run's own outcome.
+		return report(logger, stdout, err, ctx.Err() != nil)
 	}
 	defer func() {
 		if err := target.Close(); err != nil {
@@ -107,7 +112,7 @@ func run() int {
 	} else {
 		err = runner.Run(runCtx)
 	}
-	return report(logger, os.Stdout, err, ctx.Err() != nil)
+	return report(logger, stdout, err, ctx.Err() != nil)
 }
 
 // report prints the outcome and returns the exit code. A run that stopped

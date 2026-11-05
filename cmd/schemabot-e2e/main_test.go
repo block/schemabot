@@ -47,3 +47,39 @@ func TestReportMapsEachOutcomeToItsExitCode(t *testing.T) {
 		})
 	}
 }
+
+// A signal can stop the binary before the runner starts. Stopped while the
+// test database opens, it proved nothing about the release, so it exits 2. A
+// database it cannot reach still fails.
+func TestRunMapsAStartupFailureToItsExitCode(t *testing.T) {
+	args := []string{"schemabot-e2e",
+		"--repo", "octo/schema", "--table-dir", "schema/testdb", "--database", "testdb",
+		"--environment", "staging", "--check-name", "SchemaBot (staging)",
+		"--app-slug", "schemabot", "--seed-table", "seed"}
+	env := map[string]string{
+		"GITHUB_TOKEN": "test-token",
+		// Nothing listens on port 1, so a connection is refused at once.
+		"SCHEMABOT_E2E_DSN": "e2e:e2e@tcp(127.0.0.1:1)/testdb",
+	}
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+
+	for _, tt := range []struct {
+		name string
+		ctx  context.Context
+		args []string
+		code int
+		out  string
+	}{
+		{name: "stopped while the database opens", ctx: stopped, args: args, code: exitInconclusive, out: "INCONCLUSIVE"},
+		{name: "database unreachable", ctx: t.Context(), args: args, code: exitFailed, out: "FAIL"},
+		{name: "help", ctx: t.Context(), args: []string{"schemabot-e2e", "-h"}, code: exitFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			code := run(tt.ctx, tt.args, func(k string) string { return env[k] }, &out, io.Discard)
+			assert.Equal(t, tt.code, code)
+			assert.Equal(t, tt.out, strings.TrimSpace(out.String()))
+		})
+	}
+}
