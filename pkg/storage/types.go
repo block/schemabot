@@ -2766,11 +2766,12 @@ func LogOperationsOnTarget(ops []*ApplyOperation, target string) []int64 {
 }
 
 // DistinctOperationTargets lists the distinct targets of ops in sorted order.
+// An operation that names no target adds none.
 func DistinctOperationTargets(ops []*ApplyOperation) []string {
 	seen := make(map[string]bool, len(ops))
 	var targets []string
 	for _, op := range ops {
-		if !seen[op.Target] {
+		if op.Target != "" && !seen[op.Target] {
 			seen[op.Target] = true
 			targets = append(targets, op.Target)
 		}

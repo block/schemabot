@@ -20,5 +20,5 @@ func TestLogOperationsOnTarget(t *testing.T) {
 	assert.Equal(t, []int64{1}, LogOperationsOnTarget([]*ApplyOperation{{ID: 1, Target: "shop-001"}}, "shop-001"),
 		"a sibling can join between listing and reading, so the only target still names its operations")
 	assert.Nil(t, LogOperationsOnTarget(rollout, "shop-003"))
-	assert.Equal(t, []string{"shop-001", "shop-002"}, DistinctOperationTargets(rollout))
+	assert.Equal(t, []string{"shop-001", "shop-002"}, DistinctOperationTargets(append(rollout, &ApplyOperation{ID: 4})))
 }
