@@ -78,6 +78,22 @@ func TestRenderReviewRequired_UnauthorizedApproversWithoutTeams(t *testing.T) {
 	assert.NotContains(t, result, "teams listed above")
 }
 
+// Several unauthorized reviewers approved and a team is listed, so the next
+// step offers adding every one of them to it.
+func TestRenderReviewRequired_UnauthorizedApproversWithTeam(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:              "payments",
+		Environment:           "staging",
+		RequestedBy:           "alice",
+		OperatorReviewers:     []string{"org/payments-operators"},
+		PRAuthor:              "alice",
+		UnauthorizedApprovers: []string{"dave", "erin", "frank"},
+	})
+
+	assert.Contains(t, result, "\n@dave, @erin and @frank approved, but aren't authorized reviewers for `payments`, so those approvals don't count.\n")
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave, @erin and @frank to one of the teams listed above\n2. Then run `schemabot apply -e staging` again\n")
+}
+
 // One reviewer approved an earlier commit whose schema change differs, and
 // another approved without being authorized. Both are named with their own
 // reason, and the next step leads with the reviewer who knows the change.
