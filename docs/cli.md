@@ -913,6 +913,21 @@ In gRPC mode, add it with a deployment name from the apply's progress to read
 remote engine details such as copying, throttling, or cutover. It requires an
 explicit apply ID. See [deployment log examples](schema-intelligence.md#read-deployment-logs).
 
+A multi-target apply logs every target into one history. `--target` narrows
+either read to one target: its own entries plus the entries about the apply as
+a whole, such as state changes.
+
+```console
+$ schemabot logs apply-example-73 --target shop-002
+11:47:07 [INF] Apply queued: apply-example-73
+11:48:12 [INF] [orders] acquired advisory lock
+11:52:40 [INF] [orders] Table complete
+...
+```
+
+A target the apply never ran on is refused, and the error lists the targets it
+did run on.
+
 ### Explain a blocked check
 
 A SchemaBot check that will not clear has two records behind it: the Check Run

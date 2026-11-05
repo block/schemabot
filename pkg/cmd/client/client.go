@@ -996,9 +996,10 @@ type LogEntry = apitypes.LogEntry
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
 // Otherwise, it fetches logs for the most recent apply in the environment.
-// The response carries the newest limit entries plus whether older ones exist
-// beyond the window.
-func GetLogs(endpoint, database, environment, applyID string, limit int) (*apitypes.LogsResponse, error) {
+// A non-empty target narrows the read to that target's entries and the
+// entries about the apply as a whole. The response carries the newest limit
+// entries plus whether older ones exist beyond the window.
+func GetLogs(endpoint, database, environment, applyID, target string, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -1008,6 +1009,9 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) (*apity
 		values.Set("apply_id", applyID)
 	} else if environment != "" {
 		values.Set("environment", environment)
+	}
+	if target != "" {
+		values.Set("target", target)
 	}
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
@@ -1029,10 +1033,16 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) (*apity
 	return &result, nil
 }
 
-func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {
+// GetDeploymentLogs retrieves an apply's logs from one data-plane deployment,
+// one source per remote read. A non-empty target keeps only that target's
+// sources.
+func GetDeploymentLogs(endpoint, applyID, deployment, target string, limit int) (*apitypes.DeploymentLogsResponse, error) {
 	values := url.Values{}
 	values.Set("apply_id", applyID)
 	values.Set("deployment", deployment)
+	if target != "" {
+		values.Set("target", target)
+	}
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
 	}

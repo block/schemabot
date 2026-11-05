@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -20,19 +21,21 @@ import (
 // handleLogs returns apply logs for a database or apply.
 // GET /api/logs/{database}?environment=staging&limit=50
 // GET /api/logs/{database}?apply_id=apply_abc123&limit=50
+// GET /api/logs/{database}?apply_id=apply_abc123&target=shop-002
 func (s *Service) handleLogs(w http.ResponseWriter, r *http.Request) {
 	database := storage.CanonicalKey(r.PathValue("database"))
 	environment := storage.CanonicalKey(r.URL.Query().Get("environment"))
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
 	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
+	target := r.URL.Query().Get("target")
 
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
 	}
 
-	s.handleLogsCommon(w, r, database, environment, applyID, deployment, limitStr)
+	s.handleLogsCommon(w, r, database, environment, applyID, deployment, target, limitStr)
 }
 
 // handleLogsWithoutDatabase returns apply logs for a specific apply ID.
@@ -41,17 +44,18 @@ func (s *Service) handleLogsWithoutDatabase(w http.ResponseWriter, r *http.Reque
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
 	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
+	target := r.URL.Query().Get("target")
 
 	if applyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
 		return
 	}
 
-	s.handleLogsCommon(w, r, "", "", applyID, deployment, limitStr)
+	s.handleLogsCommon(w, r, "", "", applyID, deployment, target, limitStr)
 }
 
 // handleLogsCommon is the shared implementation for log handlers.
-func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, database, environment, applyID, deployment, limitStr string) {
+func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, database, environment, applyID, deployment, target, limitStr string) {
 
 	limit := 50
 	if limitStr != "" {
@@ -102,13 +106,31 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		apply = applies[0]
 	}
 	if deployment != "" {
-		s.handleDeploymentLogs(w, r, apply, deployment, limit)
+		s.handleDeploymentLogs(w, r, apply, deployment, target, limit)
 		return
 	}
 
+	var operationIDs []int64
+	if target != "" {
+		ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
+		if err != nil {
+			s.logger.Error("failed to list apply operations for target logs",
+				append(apply.LogAttrs(), "target", target, "error", err)...)
+			s.writeError(w, http.StatusInternalServerError, "failed to list apply operations")
+			return
+		}
+		ids, ok := storage.LogOperationsOnTarget(ops, target)
+		if !ok {
+			s.writeError(w, http.StatusBadRequest, targetNotInApplyMessage(apply, ops, target))
+			return
+		}
+		operationIDs = ids
+	}
+
 	logs, err := s.storage.ApplyLogs().List(r.Context(), storage.ApplyLogFilter{
-		ApplyID: apply.ID,
-		Limit:   logFetchLimit(limit),
+		ApplyID:      apply.ID,
+		OperationIDs: operationIDs,
+		Limit:        logFetchLimit(limit),
 	})
 	if err != nil {
 		s.logger.Error("failed to get logs", append(apply.LogAttrs(), "error", err)...)
@@ -173,6 +195,30 @@ func clampLogWindow[T any](logs []T, limit int) ([]T, bool) {
 	return logs[len(logs)-limit:], true
 }
 
+// targetNotInApplyMessage names the targets the apply does run on, so a
+// mistyped target can be corrected from the error alone.
+func targetNotInApplyMessage(apply *storage.Apply, ops []*storage.ApplyOperation, target string) string {
+	targets := operationTargets(ops)
+	if len(targets) == 0 {
+		return fmt.Sprintf("apply %q has no per-target operations; omit target", apply.ApplyIdentifier)
+	}
+	return fmt.Sprintf("target %q has no operations in apply %q; its targets are %s", target, apply.ApplyIdentifier, strings.Join(targets, ", "))
+}
+
+// operationTargets lists the distinct targets of ops in sorted order.
+func operationTargets(ops []*storage.ApplyOperation) []string {
+	seen := make(map[string]bool, len(ops))
+	var targets []string
+	for _, op := range ops {
+		if op.Target != "" && !seen[op.Target] {
+			seen[op.Target] = true
+			targets = append(targets, op.Target)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
 type deploymentLogFetch struct {
 	target     string
 	externalID string
@@ -216,6 +262,24 @@ func deploymentLogFetches(apply *storage.Apply, ops []*storage.ApplyOperation, d
 	return fetches, undispatched
 }
 
+// fetchesOnTarget keeps the reads and undispatched operations of one target,
+// so a deployment read scoped to that target fetches only its sources.
+func fetchesOnTarget(fetches map[string]*deploymentLogFetch, undispatched []*storage.ApplyOperation, target string) (map[string]*deploymentLogFetch, []*storage.ApplyOperation) {
+	kept := make(map[string]*deploymentLogFetch, len(fetches))
+	for key, fetch := range fetches {
+		if fetch.target == target {
+			kept[key] = fetch
+		}
+	}
+	var keptUndispatched []*storage.ApplyOperation
+	for _, op := range undispatched {
+		if op.Target == target {
+			keptUndispatched = append(keptUndispatched, op)
+		}
+	}
+	return kept, keptUndispatched
+}
+
 // sortedFetchKeys orders the grouped reads deterministically, so a fan-out
 // across several targets renders in the same order on every read.
 func sortedFetchKeys(fetches map[string]*deploymentLogFetch) []string {
@@ -227,7 +291,7 @@ func sortedFetchKeys(fetches map[string]*deploymentLogFetch) []string {
 	return keys
 }
 
-func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment string, limit int) {
+func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment, target string, limit int) {
 	ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if err != nil {
 		s.logger.Error("failed to list apply operations for data-plane logs",
@@ -260,6 +324,22 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	fetches, undispatched := deploymentLogFetches(apply, ops, deployment)
+	if target != "" {
+		onDeployment := make([]*storage.ApplyOperation, 0, len(ops))
+		for _, op := range ops {
+			if op.Deployment == deployment {
+				onDeployment = append(onDeployment, op)
+			}
+		}
+		if _, ok := storage.LogOperationsOnTarget(onDeployment, target); !ok {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("target %q has no operations on deployment %q in apply %q; its targets there are %s", target, deployment, apply.ApplyIdentifier, strings.Join(operationTargets(onDeployment), ", ")))
+			return
+		}
+		// Narrow after grouping, not before: grouping reads the apply's own
+		// remote id when the apply has a single operation, and dropping the
+		// other targets' operations first would fake that case.
+		fetches, undispatched = fetchesOnTarget(fetches, undispatched, target)
+	}
 	for _, op := range undispatched {
 		// An operation without a remote apply id has not been dispatched to
 		// the data plane; its logs live in control-plane storage, not behind
