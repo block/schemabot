@@ -4101,19 +4101,11 @@ func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage
 	if err != nil {
 		return nil, fmt.Errorf("list operations of apply %s for logs of target %s: %w", apply.ApplyIdentifier, target, err)
 	}
-	var matched []int64
-	for _, op := range ops {
-		if op.Target == target {
-			matched = append(matched, op.ID)
-		}
-	}
-	if len(matched) == len(ops) {
-		return nil, nil
-	}
-	if len(matched) == 0 {
+	operationIDs, ok := storage.LogOperationsOnTarget(ops, target)
+	if !ok {
 		return nil, fmt.Errorf("apply %s has no operation on target %s: %w", apply.ApplyIdentifier, target, ErrLogsTargetNotInApply)
 	}
-	return matched, nil
+	return operationIDs, nil
 }
 
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's

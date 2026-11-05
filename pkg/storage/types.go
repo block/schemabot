@@ -2743,6 +2743,27 @@ type ApplyLog struct {
 	CreatedAt time.Time
 }
 
+// LogOperationsOnTarget resolves a log read scoped to target into the
+// ApplyLogFilter.OperationIDs that read needs, given every operation of the
+// apply. It returns nil when every operation runs on target, since an unscoped
+// read already covers exactly that target, and ok is false when no operation
+// runs on target: a read for that target has nothing to show, and an empty
+// result would read as a target that wrote nothing.
+func LogOperationsOnTarget(ops []*ApplyOperation, target string) (operationIDs []int64, ok bool) {
+	for _, op := range ops {
+		if op.Target == target {
+			operationIDs = append(operationIDs, op.ID)
+		}
+	}
+	if len(operationIDs) == 0 {
+		return nil, false
+	}
+	if len(operationIDs) == len(ops) {
+		return nil, true
+	}
+	return operationIDs, true
+}
+
 // ApplyLogFilter specifies criteria for listing apply logs.
 type ApplyLogFilter struct {
 	ApplyID   int64  // Required: filter by apply
