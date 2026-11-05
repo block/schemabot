@@ -962,23 +962,26 @@ const failClosedPostTimeout = 10 * time.Second
 
 // failClosedPostContext returns the context a failing aggregate post runs on.
 // The post is what tells the author why the PR is blocked, and the failure it
-// reports is often the auto-plan run's own work deadline, so it must not lose
-// to that same deadline. When an auto-plan run's deadline has passed, or leaves
-// less than failClosedPostTimeout, the post gets its own short budget.
+// reports is often the run's own work deadline, so it must not lose to that
+// same deadline. When an auto-plan run's or a PR command's deadline has passed,
+// or leaves less than failClosedPostTimeout, the post gets its own short
+// budget.
 //
-// That budget hangs off the context the run was started from, so lease loss or
-// shutdown still stops the post at any point: the delivery is re-run by
-// whichever driver picks it up next. It also starts with an empty PR-info
-// cache, so the post's head check reads the PR again rather than trusting a
-// head the run cached before a push could have replaced it.
+// That budget hangs off the context the run was started from, so whatever
+// would have stopped the run still stops the post at any point: for a durable
+// delivery that is lease loss or shutdown, and the delivery is re-run by
+// whichever driver picks it up next. A run started from a context that never
+// ends is bounded by the budget alone. The post also starts with an empty
+// PR-info cache, so its head check reads the PR again rather than trusting a
+// head cached before a push could have replaced it.
 func (h *Handler) failClosedPostContext(ctx context.Context, repo string, pr int, headSHA string) (context.Context, context.CancelFunc) {
-	run, isAutoPlanRun := autoPlanRunContext(ctx)
-	if !isAutoPlanRun {
+	parent, isBoundedRun := runParent(ctx)
+	if !isBoundedRun {
 		return ctx, func() {}
 	}
-	if run.Err() != nil {
+	if parent.Err() != nil {
 		h.logger.Info("failing aggregate post keeps the run's context because the run has ended; the next driver re-runs the delivery",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "cause", context.Cause(run))
+			"repo", repo, "pr", pr, "head_sha", headSHA, "cause", context.Cause(parent))
 		return ctx, func() {}
 	}
 	deadline, hasDeadline := ctx.Deadline()
@@ -986,8 +989,8 @@ func (h *Handler) failClosedPostContext(ctx context.Context, repo string, pr int
 		return ctx, func() {}
 	}
 	h.logger.Info("failing aggregate post runs on its own budget because the run that found the failure is at or near its deadline",
-		"repo", repo, "pr", pr, "head_sha", headSHA, "budget", failClosedPostTimeout, "run_error", ctx.Err())
-	postCtx, cancel := context.WithTimeout(run, failClosedPostTimeout)
+		"repo", repo, "pr", pr, "head_sha", headSHA, "budget", failClosedPostTimeout, "run_time_left", time.Until(deadline).Round(time.Millisecond))
+	postCtx, cancel := context.WithTimeout(parent, failClosedPostTimeout)
 	return ghclient.WithPRInfoCache(postCtx), cancel
 }
 
@@ -1110,7 +1113,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Environment: ec.environment,
 				Status:      "error",
 			})
-			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "error", err)
+			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "environment", ec.environment, "check_name", ec.name, "error", err)
 			stored = false
 			continue
 		}
@@ -1136,7 +1139,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Environment: ec.environment,
 				Status:      "error",
 			})
-			h.logger.Error("failed to store failing aggregate check", "error", err)
+			h.logger.Error("failed to store failing aggregate check", "repo", repo, "pr", pr, "head_sha", headSHA, "environment", ec.environment, "check_name", ec.name, "check_run_id", id, "error", err)
 			stored = false
 			continue
 		}

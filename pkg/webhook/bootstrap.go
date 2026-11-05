@@ -45,11 +45,12 @@ func (h *Handler) commandBootstrap(parent context.Context, repo string, installa
 }
 
 // commandContext returns the standard per-command context: a bounded deadline
-// plus the request-scoped PR-info cache. Use this for handlers that do not
+// plus the request-scoped PR-info cache. It records parent as the run's parent
+// so a failing aggregate post can outlive the command's deadline. Use this for handlers that do not
 // need a GitHub client up front (e.g. handleUnlockCommand does its work
 // directly against storage and only creates a client later, conditionally).
 func (h *Handler) commandContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(parent, timeout)
+	ctx, cancel := context.WithTimeout(withRunParent(parent), timeout)
 	ctx = ghclient.WithPRInfoCache(ctx)
 	return ctx, cancel
 }
