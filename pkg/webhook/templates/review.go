@@ -39,6 +39,9 @@ type ReviewGateData struct {
 	// UncomparedApprovers are authorized reviewers whose approval was given
 	// on an earlier commit the review gate could not compare with the head.
 	UncomparedApprovers []string
+	// UnauthorizedApprovers approved the PR but are not authorized reviewers
+	// for the database, so their approvals do not count.
+	UnauthorizedApprovers []string
 	// BaseRef is the PR's base branch and DefaultBranch the repository's
 	// default branch; either may be empty when unknown.
 	BaseRef       string
@@ -72,6 +75,7 @@ func RenderReviewRequired(data ReviewGateData) string {
 		if len(data.ChangedApprovers) == 0 {
 			sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
 		}
+		writeUnauthorizedApprovers(&sb, data)
 		writeChangedApprovers(&sb, data)
 		writeChangedStatements(&sb, data.ChangedStatements, budget)
 		writeReviewersAndNextSteps(&sb, data)
@@ -94,6 +98,7 @@ func RenderReviewGateError(data ReviewGateData) string {
 		writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
 		writeUncomparedApprovers(&sb, data.UncomparedApprovers)
+		writeUnauthorizedApprovers(&sb, data)
 		writeChangedApprovers(&sb, data)
 		writeChangedStatements(&sb, data.ChangedStatements, budget)
 		writeReviewersAndNextSteps(&sb, data)
@@ -111,6 +116,21 @@ func writeUncomparedApprovers(sb *strings.Builder, approvers []string) {
 	}
 	fmt.Fprintf(sb, "\n**This apply needs an approval of the latest commit.** %s approved %s. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so %s not count. Operators can find the error in the server logs.\n",
 		joinWithAnd(mentions(approvers)), commits, approvals)
+}
+
+// writeUnauthorizedApprovers says who approved the PR without being an
+// authorized reviewer for the database, so the reader knows why an approval
+// they can see on the PR does not count.
+func writeUnauthorizedApprovers(sb *strings.Builder, data ReviewGateData) {
+	if len(data.UnauthorizedApprovers) == 0 {
+		return
+	}
+	verb, approvals := "isn't an authorized reviewer", "that approval doesn't"
+	if len(data.UnauthorizedApprovers) > 1 {
+		verb, approvals = "aren't authorized reviewers", "those approvals don't"
+	}
+	fmt.Fprintf(sb, "\n%s approved, but %s for `%s`, so %s count.\n",
+		joinWithAnd(mentions(data.UnauthorizedApprovers)), verb, data.Database, approvals)
 }
 
 // writeChangedApprovers says who approved an earlier commit, what changed
@@ -238,19 +258,43 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 
 	sb.WriteString("\n### Next steps\n")
 	earlierApprovers := slices.Concat(data.UncomparedApprovers, data.ChangedApprovers)
+	var step string
 	switch {
 	case len(earlierApprovers) > 0 && (hasOperators || hasOthers):
 		// Whoever approved an earlier commit already knows the change, so
 		// they lead.
-		fmt.Fprintf(sb, "1. Ask %s to approve the latest commit\n", joinWithOr(append(mentions(earlierApprovers), "anyone listed above")))
+		step = fmt.Sprintf("Ask %s to approve the latest commit", joinWithOr(append(mentions(earlierApprovers), "anyone listed above")))
 	case len(earlierApprovers) > 0:
-		fmt.Fprintf(sb, "1. Ask %s to approve the latest commit\n", joinWithOr(append(mentions(earlierApprovers), "another authorized reviewer")))
+		step = fmt.Sprintf("Ask %s to approve the latest commit", joinWithOr(append(mentions(earlierApprovers), "another authorized reviewer")))
 	case hasOperators || hasOthers:
-		sb.WriteString("1. Request a review from anyone listed above\n")
+		step = "Request a review from anyone listed above"
 	default:
-		sb.WriteString("1. Request a review from a database operator or admin\n")
+		step = "Request a review from a database operator or admin"
+	}
+	// A reviewer who approved without being authorized may belong in one of
+	// the listed teams; membership is checked on every apply, so joining one
+	// lets their approval count.
+	addToTeam := len(data.UnauthorizedApprovers) > 0 && listsTeam(data)
+	if addToTeam {
+		step += fmt.Sprintf(", or add %s to one of the teams listed above", joinWithAnd(mentions(data.UnauthorizedApprovers)))
+	}
+	fmt.Fprintf(sb, "1. %s\n", step)
+	if addToTeam {
+		fmt.Fprintf(sb, "2. Then run `schemabot apply -e %s` again\n", data.Environment)
+		return
 	}
 	fmt.Fprintf(sb, "2. Once approved, run `schemabot apply -e %s` again\n", data.Environment)
+}
+
+// listsTeam reports whether any listed reviewer is a GitHub team ("org/team")
+// rather than a user.
+func listsTeam(data ReviewGateData) bool {
+	for _, principal := range slices.Concat(data.OperatorReviewers, data.OtherReviewers) {
+		if strings.Contains(principal, "/") {
+			return true
+		}
+	}
+	return false
 }
 
 // writeMentionList renders teams ("org/team") and user logins as a bulleted

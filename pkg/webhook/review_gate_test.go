@@ -1519,6 +1519,39 @@ func TestCheckReviewGate_SharedEarlierApprovalBlocksAndComparesOnce(t *testing.T
 	assert.Equal(t, []string{reviewGateApproved, reviewGateTestHeadSHA}, reads.comparedCommits())
 }
 
+// Two approvals are on the PR and neither counts: an operator approved an
+// earlier commit whose schema change differs from the head, and a reviewer
+// outside the operators approved the head. The result names each reviewer
+// with the reason their approval does not count.
+func TestCheckReviewGate_NamesUnauthorizedAndChangedApprovers(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	now := time.Now()
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}, CommitID: new(reviewGateApproved)},
+		{User: &gh.User{Login: new("dave")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}},
+	})
+	registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+	registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+		reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+		reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"},
+		reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
+	})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"dave"}, result.UnauthorizedApprovers)
+	assert.Equal(t, []string{"bob"}, result.ChangedApprovers)
+}
+
 // The PR retargets a namespace symlink under the database's schema path after
 // the approval: a non-.sql entry is part of the PR's schema change, so the
 // approval no longer covers the head.
@@ -1772,6 +1805,7 @@ func TestCheckReviewGate_RepoAdminTeamNonMemberBlocked(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"dave"}, result.UnauthorizedApprovers)
 }
 
 // An approval from a user who is only a repo admin of a different repository
@@ -1849,6 +1883,7 @@ func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved, "self-approval should be blocked")
+	assert.Empty(t, result.UnauthorizedApprovers, "the author is an operator, so their approval is not reported as unauthorized")
 }
 
 func TestCheckReviewGate_DisabledByDefault(t *testing.T) {
@@ -1966,6 +2001,7 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"dave"}, result.UnauthorizedApprovers, "the comment names the approval that does not count")
 }
 
 // The review-required comment splits reviewers by how close each principal is
@@ -2436,6 +2472,40 @@ func TestEnforceReviewGate(t *testing.T) {
 		require.Error(t, err)
 		assert.False(t, blocked, "evaluation failure must not report a merit block")
 		assert.Empty(t, comments, "a durable attempt must not post per-retry evaluation-failure comments")
+	})
+
+	// A reviewer outside the database's operator team approved the head. The
+	// comment says that approval does not count and offers both ways out:
+	// another reviewer, or adding the approver to the team.
+	t.Run("an approval from outside the operator team is named with the fix", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorTeams = []string{"octocat/db-admins"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("dave")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}},
+		})
+		mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "production", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "## Review Required")
+			assert.Contains(t, body, "\n@dave approved, but isn't an authorized reviewer for `orders`, so that approval doesn't count.\n")
+			assert.Contains(t, body, "1. Request a review from anyone listed above, or add @dave to one of the teams listed above\n2. Then run `schemabot apply -e production` again\n")
+			assert.Contains(t, body, "- @octocat/db-admins\n")
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "timed out waiting for review-required comment")
+		}
 	})
 
 	t.Run("missing approval blocks on the merits without error", func(t *testing.T) {
