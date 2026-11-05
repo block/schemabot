@@ -1004,6 +1004,7 @@ type mockApplyLogStore struct {
 	storage.ApplyLogStore
 	logs        []*storage.ApplyLog
 	recentLimit int
+	lastFilter  storage.ApplyLogFilter
 }
 
 // Append records the line the way the real store does: a cancelled context is
@@ -1023,6 +1024,12 @@ func (m *mockApplyLogStore) GetByApply(context.Context, int64) ([]*storage.Apply
 
 func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit int) ([]*storage.ApplyLog, error) {
 	m.recentLimit = limit
+	return m.logs, nil
+}
+
+func (m *mockApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
+	m.recentLimit = filter.Limit
+	m.lastFilter = filter
 	return m.logs, nil
 }
 

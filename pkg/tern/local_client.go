@@ -4066,7 +4066,11 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if apply == nil {
 		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, storage.ErrApplyNotFound)
 	}
-	logs, err := c.storage.ApplyLogs().GetRecentByApply(ctx, apply.ID, limit)
+	operationIDs, err := c.logOperationsForTarget(ctx, apply, req.Target)
+	if err != nil {
+		return nil, err
+	}
+	logs, err := c.storage.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: apply.ID, OperationIDs: operationIDs, Limit: limit})
 	if err != nil {
 		return nil, fmt.Errorf("get recent logs for apply %s: %w", req.ApplyId, err)
 	}
@@ -4079,6 +4083,37 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 		resp.Logs = append(resp.Logs, entry)
 	}
 	return resp, nil
+}
+
+// logOperationsForTarget returns the operations whose logs a Logs read for
+// target covers. One data-plane apply can drive several targets of a rollout,
+// and a read for one of them must return that target's entries, not the whole
+// apply's: the caller renders one section per target, so an unscoped read
+// would repeat every target's lines under each. It returns nil, an unscoped
+// read, when no target is named or every operation runs on that one target. A
+// named target the apply has no operation on is an error, never an empty
+// read that looks like a quiet target.
+func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage.Apply, target string) ([]int64, error) {
+	if target == "" {
+		return nil, nil
+	}
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list operations of apply %s for logs of target %s: %w", apply.ApplyIdentifier, target, err)
+	}
+	var matched []int64
+	for _, op := range ops {
+		if op.Target == target {
+			matched = append(matched, op.ID)
+		}
+	}
+	if len(matched) == len(ops) {
+		return nil, nil
+	}
+	if len(matched) == 0 {
+		return nil, fmt.Errorf("apply %s has no operation on target %s: %w", apply.ApplyIdentifier, target, ErrLogsTargetNotInApply)
+	}
+	return matched, nil
 }
 
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's

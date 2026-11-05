@@ -16,6 +16,7 @@ import (
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -177,6 +178,58 @@ func TestLocalClientLogsValidationAndConversion(t *testing.T) {
 	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: MaxLogsLimit + 1})
 	require.NoError(t, err)
 	assert.Equal(t, MaxLogsLimit, logs.recentLimit)
+}
+
+// A data-plane apply that drives two targets of a rollout serves each target's
+// log read from that target's operations only, so the control plane's
+// per-target sections do not each repeat the whole apply. A read for the only
+// target, or for no target, stays unscoped, and a read for a target the apply
+// never ran on is refused rather than answered with an empty log.
+func TestLocalClientLogsScopesToTarget(t *testing.T) {
+	newClient := func(ops ...*storage.ApplyOperation) (*LocalClient, *mockApplyLogStore) {
+		logs := &mockApplyLogStore{}
+		byID := make(map[int64]*storage.ApplyOperation, len(ops))
+		for _, op := range ops {
+			byID[op.ID] = op
+		}
+		return &LocalClient{storage: &mockStorage{
+			applies:    &mockApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-a"}},
+			logs:       logs,
+			operations: &mockApplyOperationStore{ops: byID},
+		}}, logs
+	}
+	op := func(id int64, target string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 9, Target: target}
+	}
+
+	t.Run("one of several targets", func(t *testing.T) {
+		client, logs := newClient(op(1, "shop-001"), op(2, "shop-002"), op(3, "shop-002"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002"})
+		require.NoError(t, err)
+		assert.Equal(t, int64(9), logs.lastFilter.ApplyID)
+		assert.ElementsMatch(t, []int64{2, 3}, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("the only target", func(t *testing.T) {
+		client, logs := newClient(op(1, "shop-001"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
+		require.NoError(t, err)
+		assert.Nil(t, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("no target", func(t *testing.T) {
+		client, logs := newClient(op(1, "shop-001"), op(2, "shop-002"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a"})
+		require.NoError(t, err)
+		assert.Nil(t, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("a target the apply never ran on", func(t *testing.T) {
+		client, _ := newClient(op(1, "shop-001"), op(2, "shop-002"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-003"})
+		require.ErrorIs(t, err, ErrLogsTargetNotInApply)
+		assert.Equal(t, codes.NotFound, applyLookupErrorCode(err))
+	})
 }
 
 type pullSchemaPSClient struct {

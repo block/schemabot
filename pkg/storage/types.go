@@ -2712,6 +2712,13 @@ type ApplyLog struct {
 	// TaskID points to tasks.id (optional, for task-specific events).
 	TaskID *int64
 
+	// ApplyOperationID points to apply_operations.id: the operation whose
+	// drive wrote the entry. Append fills it from the operation lease on the
+	// context when the caller leaves it unset, so every entry an
+	// operation-scoped drive writes is attributed to its operation, including
+	// the ones no single task owns. Nil for an entry about the whole apply.
+	ApplyOperationID *int64
+
 	// Level is the log level: "debug", "info", "warn", "error".
 	Level string
 
@@ -2743,6 +2750,12 @@ type ApplyLogFilter struct {
 	Level     string // Optional: filter by level
 	EventType string // Optional: filter by event type
 	Limit     int    // Optional: limit results (default 100)
+
+	// OperationIDs, when non-empty, keeps the entries attributed to one of
+	// these operations, written by the operation's drive or about one of its
+	// tasks, plus the entries about the whole apply, which name no operation
+	// and no task. Entries attributed to any other operation are left out.
+	OperationIDs []int64
 }
 
 // EngineResumeState stores opaque resume data owned by the engine package.

@@ -13,7 +13,7 @@ import (
 )
 
 // applyLogColumns lists all columns for SELECT queries.
-const applyLogColumns = `id, apply_id, task_id, level, event_type, source, message,
+const applyLogColumns = `id, apply_id, task_id, apply_operation_id, level, event_type, source, message,
 	old_state, new_state, metadata, created_at`
 
 // applyLogStore implements storage.ApplyLogStore using MySQL.
@@ -24,15 +24,15 @@ type applyLogStore struct {
 }
 
 // applyLogLeasedAppendStatement renders Append's statement for a caller holding
-// the apply lease. It binds the nine inserted columns, then the apply ID, then
+// the apply lease. It binds the ten inserted columns, then the apply ID, then
 // the lease token. The row is selected from the leased applies row, so a
 // displaced driver's statement selects nothing and inserts nothing; the token
 // check goes through LeaseSourceFence so it serializes against a concurrent
 // steal instead of passing against a token the statement's snapshot still
 // holds, at whatever isolation level the storage session runs.
 func applyLogLeasedAppendStatement(d Dialect) string {
-	return "INSERT INTO apply_logs (apply_id, task_id, level, event_type, source, message, old_state, new_state, metadata) " +
-		"SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token")
+	return "INSERT INTO apply_logs (apply_id, task_id, apply_operation_id, level, event_type, source, message, old_state, new_state, metadata) " +
+		"SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token")
 }
 
 // Append adds a new log entry.
@@ -40,6 +40,9 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	lease, hasLease, err := applyLeaseFromContext(ctx, log.ApplyID)
 	if err != nil {
 		return err
+	}
+	if log.ApplyOperationID == nil {
+		log.ApplyOperationID = drivingOperationID(ctx, log.ApplyID)
 	}
 	// Default source to schemabot if not set
 	source := log.Source
@@ -49,7 +52,7 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 
 	if hasLease {
 		id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, applyLogLeasedAppendStatement(s.dialect),
-			log.ApplyID, nullInt64Ptr(log.TaskID), log.Level, log.EventType, source, log.Message,
+			log.ApplyID, nullInt64Ptr(log.TaskID), nullInt64Ptr(log.ApplyOperationID), log.Level, log.EventType, source, log.Message,
 			nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
 			lease.ApplyID, lease.Token,
 		)
@@ -68,11 +71,11 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO apply_logs (
-			apply_id, task_id, level, event_type, source, message,
+			apply_id, task_id, apply_operation_id, level, event_type, source, message,
 			old_state, new_state, metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		log.ApplyID, nullInt64Ptr(log.TaskID), log.Level, log.EventType, source, log.Message,
+		log.ApplyID, nullInt64Ptr(log.TaskID), nullInt64Ptr(log.ApplyOperationID), log.Level, log.EventType, source, log.Message,
 		nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
 	)
 	if err != nil {
@@ -81,6 +84,19 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	log.ID = id
 
 	return nil
+}
+
+// drivingOperationID returns the operation whose drive is writing to applyID,
+// read off the operation lease on ctx: an operation-scoped drive carries its
+// operation's lease for every write it makes. Nil when ctx carries no
+// operation lease, or one for another apply.
+func drivingOperationID(ctx context.Context, applyID int64) *int64 {
+	lease, ok := storage.OperationLeaseFromContext(ctx)
+	if !ok || lease.ApplyID != applyID || lease.OperationID <= 0 {
+		return nil
+	}
+	id := lease.OperationID
+	return &id
 }
 
 // GetByApply returns all logs for an apply, ordered by created_at ascending.
@@ -142,6 +158,19 @@ func (s *applyLogStore) List(ctx context.Context, filter storage.ApplyLogFilter)
 		query += " AND task_id = ?"
 		args = append(args, *filter.TaskID)
 	}
+	if len(filter.OperationIDs) > 0 {
+		// An entry belongs to an operation when its drive wrote it, or when it
+		// is about one of the operation's tasks: a task-scoped entry written
+		// outside the operation's drive still names the task. An entry that
+		// names neither is about the whole apply, and so about every operation.
+		marks := placeholders(len(filter.OperationIDs))
+		query += " AND (apply_operation_id IN (" + marks + ") OR task_id IN (SELECT id FROM tasks WHERE apply_operation_id IN (" + marks + ")) OR (apply_operation_id IS NULL AND task_id IS NULL))"
+		for range 2 {
+			for _, id := range filter.OperationIDs {
+				args = append(args, id)
+			}
+		}
+	}
 	if filter.Level != "" {
 		query += " AND level = ?"
 		args = append(args, filter.Level)
@@ -190,12 +219,12 @@ func scanApplyLogs(rows *sql.Rows) ([]*storage.ApplyLog, error) {
 // scanApplyLogInto scans apply log data from a scanner.
 func scanApplyLogInto(s scanner) (*storage.ApplyLog, error) {
 	var log storage.ApplyLog
-	var taskID sql.NullInt64
+	var taskID, operationID sql.NullInt64
 	var oldState, newState sql.NullString
 	var metadata []byte
 
 	err := s.Scan(
-		&log.ID, &log.ApplyID, &taskID, &log.Level, &log.EventType, &log.Source, &log.Message,
+		&log.ID, &log.ApplyID, &taskID, &operationID, &log.Level, &log.EventType, &log.Source, &log.Message,
 		&oldState, &newState, &metadata, &log.CreatedAt,
 	)
 	if err != nil {
@@ -204,6 +233,9 @@ func scanApplyLogInto(s scanner) (*storage.ApplyLog, error) {
 
 	if taskID.Valid {
 		log.TaskID = &taskID.Int64
+	}
+	if operationID.Valid {
+		log.ApplyOperationID = &operationID.Int64
 	}
 	if oldState.Valid {
 		log.OldState = oldState.String
