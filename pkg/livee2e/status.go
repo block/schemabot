@@ -34,6 +34,11 @@ var (
 	statusLine  = regexp.MustCompile(`(?m)^\*\*Status\*\*: (.+)$`)
 )
 
+// statusHeadings are the titles of the apply status comment SchemaBot edits
+// in place. Summary comments repeat the bold Apply ID line under their own
+// titles, so the title is what tells a status comment apart.
+var statusHeadings = []string{"Schema Change Status", "Rollback Status"}
+
 // ApplyStatus is the state one apply status comment shows.
 type ApplyStatus struct {
 	ApplyID string
@@ -46,6 +51,9 @@ type ApplyStatus struct {
 // when the comment names the apply but shows no status yet, as the first body
 // of a progress comment does before its first update.
 func ParseApplyStatus(body string) (ApplyStatus, bool) {
+	if !isStatusComment(body) {
+		return ApplyStatus{}, false
+	}
 	id := applyIDLine.FindStringSubmatch(body)
 	if id == nil {
 		return ApplyStatus{}, false
@@ -54,10 +62,24 @@ func ParseApplyStatus(body string) (ApplyStatus, bool) {
 	if status == nil {
 		return ApplyStatus{ApplyID: id[1]}, true
 	}
-	// A revert window appends its countdown after a separator; the label is
-	// the part before it.
+	// A revert window appends its countdown after " | ", and a sharded apply
+	// appends its change count after " — "; the label is the part before.
 	label, _, _ := strings.Cut(status[1], " | ")
+	label, _, _ = strings.Cut(label, " — ")
 	return ApplyStatus{ApplyID: id[1], Status: strings.TrimSpace(label)}, true
+}
+
+func isStatusComment(body string) bool {
+	headline := firstLine(body)
+	if !strings.HasPrefix(headline, "## ") {
+		return false
+	}
+	for _, h := range statusHeadings {
+		if strings.Contains(headline, h) {
+			return true
+		}
+	}
+	return false
 }
 
 // latestApplyStatus returns the newest status the bot's comments show for
@@ -102,8 +124,9 @@ func firstApplyAfter(comments []Comment, after int64) (ApplyStatus, bool) {
 }
 
 // blockedHeadline starts the reply SchemaBot posts when another pull request
-// or a CLI session holds the database's lock.
-const blockedHeadline = "Apply Blocked"
+// or a CLI session holds the database's lock. Other refusals, such as failing
+// checks, share "Apply Blocked" without the lock glyph.
+const blockedHeadline = "🔒 Apply Blocked"
 
 // blockedAfter reports whether SchemaBot refused a command posted as comment
 // after because something else holds the database's lock.
@@ -178,9 +201,18 @@ func finishedStatus(comments []Comment, applyID string) (string, bool) {
 	return "", false
 }
 
-// alreadyFinishedReply matches SchemaBot's refusal of a control command for an
+// alreadyFinishedReply matches SchemaBot's refusal of a stop or cancel for an
 // apply that has already finished, and captures the state it finished in.
 var alreadyFinishedReply = regexp.MustCompile(`is already terminal \(current state: ([a-z_]+)\)`)
+
+// startRefusals maps SchemaBot's refusal of a start for a finished apply,
+// which words each state differently, to the state it names.
+var startRefusals = map[string]string{
+	"schema change already completed and cannot be started": "completed",
+	"schema change failed and cannot be started":            "failed",
+	"schema change was cancelled and cannot be started":     "cancelled",
+	"schema change was reverted and cannot be started":      "reverted",
+}
 
 // refusedAsFinished returns the state SchemaBot named when it refused the
 // command posted as comment after because the apply had already finished.
@@ -191,6 +223,11 @@ func refusedAsFinished(comments []Comment, after int64) (string, bool) {
 		}
 		if m := alreadyFinishedReply.FindStringSubmatch(c.Body); m != nil {
 			return m[1], true
+		}
+		for refusal, finished := range startRefusals {
+			if strings.Contains(c.Body, refusal) {
+				return finished, true
+			}
 		}
 	}
 	return "", false
