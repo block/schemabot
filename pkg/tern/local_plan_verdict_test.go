@@ -365,6 +365,12 @@ func TestMaterializedPlanCarriesReplannedVSchemaUnsafeRecords(t *testing.T) {
 			replanned:          vschemaChangeMetadata("not json", ""),
 			wantMaterializeErr: `namespace "testapp": vschema_deletions: decode re-planned records`,
 		},
+		{
+			name:               "a re-planned record that cannot be decoded refuses the plan even when the dispatch carries the same bytes",
+			dispatched:         vschemaChangeMetadata("not json", ""),
+			replanned:          vschemaChangeMetadata("not json", ""),
+			wantMaterializeErr: `namespace "testapp": vschema_deletions: decode re-planned records`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

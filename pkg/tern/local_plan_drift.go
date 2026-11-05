@@ -507,16 +507,17 @@ type vschemaUnsafeRecord struct {
 // change-metadata. A dispatched value that cannot be decoded is kept as it is:
 // the gate already fails closed on it, and rewriting it could only lose what
 // it holds. A re-planned value that cannot be decoded is an error, since this
-// target's judgement would otherwise be dropped.
+// target's judgement would otherwise be dropped, even when the dispatch
+// carries the same bytes.
 func mergeVSchemaUnsafeRecords(dispatched, replanned string) (string, error) {
-	if replanned == "" || replanned == dispatched {
+	if replanned == "" {
 		return dispatched, nil
 	}
 	var replannedRecords []vschemaUnsafeRecord
 	if err := json.Unmarshal([]byte(replanned), &replannedRecords); err != nil {
 		return "", fmt.Errorf("decode re-planned records: %w", err)
 	}
-	if dispatched == "" {
+	if dispatched == "" || replanned == dispatched {
 		return replanned, nil
 	}
 	merged, ok := decodeVSchemaUnsafeRecords(dispatched)
