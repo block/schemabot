@@ -63,6 +63,11 @@ type Harness interface {
 	// verify that storage methods surface connection failures as errors
 	// instead of swallowing them.
 	NewUnreachableStorage(t *testing.T) storage.Storage
+	// AgeApplyOperation moves the operation's updated_at age into the past
+	// on store, a Storage from NewStorage, so the suite can step past a gate
+	// that counts from that time, such as the redispatch backoff, without
+	// waiting it out.
+	AgeApplyOperation(t *testing.T, store storage.Storage, operationID int64, age time.Duration)
 }
 
 type parityFamily struct {

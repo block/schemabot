@@ -509,7 +509,7 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	switch {
 	case activeApplyAwaitsCutover(data):
 		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
-		fmt.Fprintf(&sb, "To cut over:\n```\n%s\n```\n\n", control("cutover"))
+		fmt.Fprintf(&sb, "To run the cutover:\n```\n%s\n```\n\n", control("cutover"))
 		thenApplyAgain("Once it completes, apply again")
 	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
 		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)

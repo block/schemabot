@@ -20,6 +20,8 @@ import (
 // create/get/update lifecycle, claimability and lease rotation, stale-lease
 // recovery, lease-guarded writes, and concurrent claim exclusion.
 func TestApplies(t *testing.T, h Harness) {
+	t.Run("EndedOperation", func(t *testing.T) { testEndedOperationApplies(t, h) })
+
 	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -334,6 +336,243 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, persisted)
 		assert.Equal(t, state.Apply.FailedRetryable, persisted.State)
+		assert.Equal(t, storage.MaxRecoveryAttempts, persisted.Attempt)
+	})
+
+	// A driver held a running apply and is gone: its lease was handed back and
+	// its heartbeat is stale. Marking it retryable hands its next recovery to
+	// the retryable claim, which charges an attempt, rather than to the
+	// stale-active claim, which charges nothing.
+	t.Run("MarkStaleApplyRetryable_RoutesRecoveryThroughTheRetryBudget", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_db", storage.DatabaseTypeMySQL)
+		apply := createStaleRunningApply(t, store, lock, "apply_stale_retryable", 9401)
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID:      apply.ID,
+			ErrorMessage: "copy of users failed and may be retried",
+		})
+		require.NoError(t, err)
+		require.True(t, moved, "a stale running apply whose lease the caller observed must move")
+
+		marked, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, marked)
+		assert.Equal(t, state.Apply.FailedRetryable, marked.State)
+		assert.Equal(t, "copy of users failed and may be retried", marked.ErrorMessage)
+		assert.Empty(t, marked.LeaseOwner)
+		assert.Empty(t, marked.LeaseToken)
+		assert.Nil(t, marked.LeaseAcquiredAt)
+		assert.Nil(t, marked.CompletedAt, "a retryable apply is resumable and carries no completion time")
+		assert.Equal(t, 0, marked.Attempt, "the transition leaves the attempt for the claim to charge")
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a freshly marked retryable apply is within its recovery window")
+		assert.Equal(t, 1, claimed.Attempt, "the retryable claim charges the retry budget")
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Running, persisted.State)
+		assert.Equal(t, 1, persisted.Attempt)
+		assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
+	})
+
+	// The caller observed the lease a driver held before it was handed back;
+	// the stored token no longer matches, so another writer has moved the row
+	// on since the caller read it.
+	t.Run("MarkStaleApplyRetryable_RefusesAnObservedTokenTheRowNoLongerHolds", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_token_db", storage.DatabaseTypeMySQL)
+		apply := createStaleRunningApply(t, store, lock, "apply_stale_retryable_token", 9402)
+		require.NotEmpty(t, apply.LeaseToken, "the scenario needs the token the driver held before handing it back")
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID:         apply.ID,
+			ApplyLeaseToken: apply.LeaseToken,
+			ErrorMessage:    "stale observation",
+		})
+		require.NoError(t, err)
+		assert.False(t, moved)
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Running, persisted.State)
+		assert.Empty(t, persisted.ErrorMessage)
+	})
+
+	t.Run("MarkStaleApplyRetryable_RefusesAFreshLease", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_fresh_db", storage.DatabaseTypeMySQL)
+		apply := CreateClaimedApply(t, store, lock, "apply_stale_retryable_fresh", 9403, "driver-live")
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID:         apply.ID,
+			ApplyLeaseToken: apply.LeaseToken,
+			ErrorMessage:    "live drive",
+		})
+		require.NoError(t, err)
+		assert.False(t, moved, "a live driver's lease is never taken out from under it")
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Running, persisted.State)
+		assert.Equal(t, "driver-live", persisted.LeaseOwner)
+		assert.Equal(t, apply.LeaseToken, persisted.LeaseToken)
+		assert.Empty(t, persisted.ErrorMessage)
+	})
+
+	// Every row here has no lease owner, so only the state guard keeps it
+	// where it is.
+	t.Run("MarkStaleApplyRetryable_NeverMovesAnApplyOutsideTheActiveStates", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		for i, applyState := range []string{
+			state.Apply.Pending,
+			state.Apply.FailedRetryable,
+			state.Apply.Stopped,
+			state.Apply.Completed,
+			state.Apply.Failed,
+			state.Apply.Cancelled,
+		} {
+			t.Run(applyState, func(t *testing.T) {
+				lock := CreateLock(t, store, "apply_stale_retryable_"+applyState+"_db", storage.DatabaseTypeMySQL)
+				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stale_retryable_"+applyState, int64(9410+i), applyState, "production")
+
+				moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+					ApplyID:      apply.ID,
+					ErrorMessage: "late settlement",
+				})
+				require.NoError(t, err)
+				assert.False(t, moved)
+
+				persisted, err := store.Applies().Get(ctx, apply.ID)
+				require.NoError(t, err)
+				require.NotNil(t, persisted)
+				assert.Equal(t, applyState, persisted.State)
+				assert.Empty(t, persisted.ErrorMessage)
+			})
+		}
+	})
+
+	// The task belongs to an operation whose driver is gone, so the operation
+	// rests failed_retryable alongside its apply, and its redispatch charges
+	// the apply's retry budget.
+	t.Run("MarkStaleApplyRetryable_MovesTheOperationWithTheApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_op_db", storage.DatabaseTypeMySQL)
+		apply, op := createStaleRunningApplyWithOperation(t, store, lock, "apply_stale_retryable_op", 9420)
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID:      apply.ID,
+			OperationID:  op.ID,
+			ErrorMessage: "copy of orders failed and may be retried",
+		})
+		require.NoError(t, err)
+		require.True(t, moved)
+
+		markedOp, err := store.ApplyOperations().Get(ctx, op.ID)
+		require.NoError(t, err)
+		require.NotNil(t, markedOp)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, markedOp.State)
+		assert.Equal(t, "copy of orders failed and may be retried", markedOp.ErrorMessage)
+		assert.Empty(t, markedOp.LeaseOwner)
+		assert.Empty(t, markedOp.LeaseToken)
+		assert.Nil(t, markedOp.LeaseAcquiredAt)
+		assert.Nil(t, markedOp.CompletedAt)
+		marked, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, marked)
+		assert.Equal(t, state.Apply.FailedRetryable, marked.State)
+		assert.Equal(t, "copy of orders failed and may be retried", marked.ErrorMessage)
+
+		redispatched, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, redispatched, "a retryable operation under a parent with budget left is claimable")
+		assert.Equal(t, op.ID, redispatched.ID)
+		charged, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, charged)
+		assert.Equal(t, 1, charged.Attempt, "the redispatch charges the parent's retry budget")
+	})
+
+	t.Run("MarkStaleApplyRetryable_LeavesBothRowsWhenTheOperationTokenMoved", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_op_token_db", storage.DatabaseTypeMySQL)
+		apply, op := createStaleRunningApplyWithOperation(t, store, lock, "apply_stale_retryable_op_token", 9421)
+		require.NotEmpty(t, op.LeaseToken, "the scenario needs the token the driver held before handing it back")
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID:             apply.ID,
+			OperationID:         op.ID,
+			OperationLeaseToken: op.LeaseToken,
+			ErrorMessage:        "stale observation",
+		})
+		require.NoError(t, err)
+		assert.False(t, moved)
+
+		persistedOp, err := store.ApplyOperations().Get(ctx, op.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persistedOp)
+		assert.Equal(t, state.ApplyOperation.Running, persistedOp.State)
+		assert.Empty(t, persistedOp.ErrorMessage)
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Running, persisted.State, "the apply moves only together with its operation")
+		assert.Empty(t, persisted.ErrorMessage)
+	})
+
+	// Each cycle is a driver that dies without recording its failure, so the
+	// apply is found stale and marked retryable. The budget bounds the cycles:
+	// once it is spent the apply is no longer claimed, and expiry fails it.
+	t.Run("MarkStaleApplyRetryable_RetriesEndWhenTheBudgetIsSpent", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_budget_db", storage.DatabaseTypeMySQL)
+		apply := createStaleRunningApply(t, store, lock, "apply_stale_retryable_budget", 9430)
+		markStale := func() {
+			t.Helper()
+			moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+				ApplyID:      apply.ID,
+				ErrorMessage: "copy of users failed and may be retried",
+			})
+			require.NoError(t, err)
+			require.True(t, moved)
+		}
+
+		for i := 1; i <= storage.MaxRecoveryAttempts; i++ {
+			markStale()
+			claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			require.Equal(t, i, claimed.Attempt)
+			released, err := store.Applies().ReleaseClaim(ctx, claimed.Lease())
+			require.NoError(t, err)
+			require.True(t, released)
+		}
+
+		markStale()
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "a spent retry budget stops recovery claims")
+
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
+		require.NoError(t, err)
+		require.Len(t, expired, 1)
+		assert.Equal(t, apply.ID, expired[0].Apply.ID)
+		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Failed, persisted.State)
 		assert.Equal(t, storage.MaxRecoveryAttempts, persisted.Attempt)
 	})
 
@@ -1025,6 +1264,11 @@ func TestApplies(t *testing.T, h Harness) {
 		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "a running operation holds its deployment even with no lease on it")
 		assert.Contains(t, err.Error(), "apply_rollout_failed_early", "the refusal names the apply still in progress")
 		assert.Contains(t, err.Error(), "running operation on deployment region-b", "the refusal names the operation keeping it live")
+		conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
+		require.True(t, ok, "the refusal carries the holding apply: %v", err)
+		assert.Equal(t, "apply_rollout_failed_early", conflict.HolderApplyID)
+		assert.Equal(t, state.Apply.Failed, conflict.HolderState, "the refusal reports the holder's own state, which decides which controls it still accepts")
+		assert.Equal(t, "production", conflict.Environment)
 		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_a_while_running", 9302, "region-a"), storage.ErrActiveApplyExists,
 			"a deployment whose operation failed stays reserved while the rollout is live")
 		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_c_while_running", 9303, "region-c"), storage.ErrActiveApplyExists,
@@ -1859,6 +2103,10 @@ func TestApplies(t *testing.T, h Harness) {
 			_, err := store.ReleaseClaim(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
 			return err
 		},
+		"MarkStaleApplyRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.MarkStaleApplyRetryable(t.Context(), storage.StaleRetryableRequest{ApplyID: 1, OperationID: 1})
+			return err
+		},
 		"SetRevertSkipped_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			return store.SetRevertSkipped(t.Context(), 1, time.Now())
 		},
@@ -1869,7 +2117,19 @@ func TestApplies(t *testing.T, h Harness) {
 			return store.CheckLease(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
 		},
 		"ExpireRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			_, err := store.ExpireRetryable(t.Context(), 10)
+			_, err := store.ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
+			return err
+		},
+		"ListAppliesHeldByEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ListAppliesHeldByEndedOperation(t.Context(), []string{storage.DatabaseTypeMySQL}, 10)
+			return err
+		},
+		"SettleAppliesStoppedForEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.SettleAppliesStoppedForEndedOperation(t.Context(), 10)
+			return err
+		},
+		"ExpireRetryableOperations_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ExpireRetryableOperations(t.Context(), 10)
 			return err
 		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {
@@ -1900,6 +2160,45 @@ func TestApplies(t *testing.T, h Harness) {
 			require.Error(t, test(t, h.NewUnreachableStorage(t).Applies()))
 		})
 	}
+}
+
+// createStaleRunningApply creates a running apply whose driver handed its lease
+// back, so its heartbeat is stale and it holds no lease. The returned apply
+// carries the token that driver held.
+func createStaleRunningApply(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64) *storage.Apply {
+	t.Helper()
+	claimed := CreateClaimedApply(t, store, lock, identifier, planID, "driver-gone")
+	released, err := store.Applies().ReleaseClaim(t.Context(), claimed.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+	return claimed
+}
+
+// createStaleRunningApplyWithOperation creates a running apply with one running
+// operation, both claimed by a driver that handed the leases back, so both are
+// stale and unleased. The returned rows carry the tokens that driver held.
+func createStaleRunningApplyWithOperation(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64) (*storage.Apply, *storage.ApplyOperation) {
+	t.Helper()
+	ctx := t.Context()
+	apply := CreateApplyWithStateAndEnv(t, store, lock, identifier, planID, state.Apply.Pending, "production")
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "schema"})
+	require.NoError(t, err)
+
+	op, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-gone")
+	require.NoError(t, err)
+	require.NotNil(t, op, "the pending operation under an active parent must be claimable")
+	require.Equal(t, operationID, op.ID)
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-gone")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a pending apply with an operation row must be claimable")
+
+	released, err := store.ApplyOperations().ReleaseClaim(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: op.ID, Owner: op.LeaseOwner, Token: op.LeaseToken})
+	require.NoError(t, err)
+	require.True(t, released)
+	released, err = store.Applies().ReleaseClaim(ctx, claimed.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+	return claimed, op
 }
 
 // createApplyOnDeployment creates a pending production apply on one deployment of

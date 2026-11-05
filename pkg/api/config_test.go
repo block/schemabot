@@ -4339,6 +4339,106 @@ databases:
 	}
 }
 
+// Re-approval follows the PR's base branch unless the instance or the
+// database sets require_reapproval. A database's own value overrides the
+// instance-wide one in either direction and needs the review gate on for the
+// database; another database on the instance keeps the instance-wide rule.
+func TestServerConfig_ReviewPolicyReapproval(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+	config := func(instance, orders string) string {
+		return "review_policy:\n  enabled: true\n" + instance + `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+` + orders + `
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    operator_users:
+      - mona
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`
+	}
+	const (
+		instanceTrue  = "  require_reapproval: true\n"
+		instanceFalse = "  require_reapproval: false\n"
+		ordersTrue    = "      require_reapproval: true"
+		ordersFalse   = "      require_reapproval: false"
+		ordersUnset   = "      enabled: false"
+	)
+
+	for _, tt := range []struct {
+		name             string
+		instance, orders string
+		wantOrders       Reapproval
+		wantPayments     Reapproval
+	}{
+		{"unset everywhere follows the base branch", "", ordersUnset, ReapprovalFollowsBaseBranch, ReapprovalFollowsBaseBranch},
+		{"instance true covers every database", instanceTrue, ordersUnset, ReapprovalRequired, ReapprovalRequired},
+		{"instance false covers every database", instanceFalse, ordersUnset, ReapprovalNotRequired, ReapprovalNotRequired},
+		{"a database can require it alone", "", ordersTrue, ReapprovalRequired, ReapprovalFollowsBaseBranch},
+		{"a database can opt out alone", "", ordersFalse, ReapprovalNotRequired, ReapprovalFollowsBaseBranch},
+		{"a database can require it when the instance opts out", instanceFalse, ordersTrue, ReapprovalRequired, ReapprovalNotRequired},
+		{"a database can opt out when the instance requires it", instanceTrue, ordersFalse, ReapprovalNotRequired, ReapprovalRequired},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadConfig(t, config(tt.instance, tt.orders))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantOrders, cfg.ReviewPolicyReapprovalForDatabase("orders"))
+			assert.Equal(t, tt.wantPayments, cfg.ReviewPolicyReapprovalForDatabase("payments"))
+		})
+	}
+
+	t.Run("a database that opts into the gate can set it with it", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+      require_reapproval: false
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.Equal(t, ReapprovalNotRequired, cfg.ReviewPolicyReapprovalForDatabase("orders"))
+	})
+
+	for _, value := range []string{"true", "false"} {
+		t.Run("a database that sets it to "+value+" without the gate is rejected", func(t *testing.T) {
+			_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      require_reapproval: `+value+`
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+			require.ErrorContains(t, err, "databases.orders.review_policy.require_reapproval needs the review gate on for the database")
+		})
+	}
+}
+
 func TestServerConfig_IsCheckRequired(t *testing.T) {
 	t.Run("nil receiver requires all checks", func(t *testing.T) {
 		var cfg *ServerConfig

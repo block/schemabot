@@ -856,6 +856,33 @@ failed`. A table lists its targets while it is in flight on any of them or any o
 them stopped, even when another target's failure makes the table read as
 failed; any other table counts them on its own line.
 
+`ended_by` is set on a failed operation that did not fail on its own. Its
+apply deferred the cutover, which runs for all of a target's operations
+together, and another operation of the same deployment and target failed, so
+the cutover could never run. SchemaBot stopped that target's operations
+waiting at the cutover, saved their copies, and failed them. Other targets are
+not stopped: they wait at the rollout's barrier. `ended_by` names the
+operation that failed, by `deployment` and `operation_key`. It is empty (`{}`)
+when that operation's row is no longer listed. A new apply of the same change
+resumes from the saved copies. Response excerpt for shard `-40` failing while
+shards `40-80` and `80-` waited at the cutover:
+
+```json
+{
+  "state": "failed",
+  "operations": [
+    {"deployment": "commerce-a", "operation_key": "commerce/-40/orders", "state": "failed", "cutover_policy": "parallel", "error_message": "lock wait timeout exceeded; try restarting transaction"},
+    {"deployment": "commerce-a", "operation_key": "commerce/40-80/orders", "state": "failed", "cutover_policy": "parallel", "ended_by": {"deployment": "commerce-a", "operation_key": "commerce/-40/orders"}},
+    {"deployment": "commerce-a", "operation_key": "commerce/80-/orders", "state": "failed", "cutover_policy": "parallel", "ended_by": {"deployment": "commerce-a", "operation_key": "commerce/-40/orders"}}
+  ]
+}
+```
+
+The CLI and the PR comment count such a shard as stopped at cutover, not
+failed: both read `Shards: 1 failed, 2 stopped at cutover`, name only `-40`
+as the failure, and note that the two stopped shards' copies are saved, so
+applying again resumes them.
+
 </details>
 
 For event-based output while applying a rollout, use log mode:

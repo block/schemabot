@@ -1526,6 +1526,21 @@ func PreviewCommentReviewRequired() string {
 	})
 }
 
+// PreviewCommentReviewRequiredUnauthorizedApprover renders the "review
+// required" comment when the PR's only approval comes from a reviewer who is
+// not an authorized reviewer for the database.
+func PreviewCommentReviewRequiredUnauthorizedApprover() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:              "testapp",
+		Environment:           "production",
+		RequestedBy:           previewRequestedBy,
+		OperatorReviewers:     []string{"acme/testapp-operators"},
+		OtherReviewers:        []string{"acme/schema-reviewers"},
+		PRAuthor:              previewRequestedBy,
+		UnauthorizedApprovers: []string{"jdoe"},
+	})
+}
+
 // PreviewCommentReviewRequiredNoOperators renders the "review required"
 // comment for a database with no configured operators: a single flat list of
 // authorized reviewers.
@@ -3658,6 +3673,27 @@ func PreviewCommentSummaryFailed() string {
 		RenderFailureLogs([]LogGroupData{
 			{Entries: sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value")},
 		}, GitHubIssueCommentMaxChars)
+}
+
+// PreviewCommentSummaryStoppedAtCutoverOnOnlyShard renders the final summary
+// of an apply on a keyspace's only shard that deferred its cutover across
+// three tables. users failed while orders and products had copied and waited
+// at the cutover, which could then never run, so SchemaBot stopped them,
+// saved their copies, and failed the apply. The error is users' alone, and a
+// note says a new apply resumes the stopped tables.
+func PreviewCommentSummaryStoppedAtCutoverOnOnlyShard() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Stopped
+	tables[1].Status = state.Task.Failed
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[2].Status = state.Task.Stopped
+	data := sampleSummaryData(state.Apply.Failed, tables)
+	data.DeferCutover = true
+	data.ErrorMessage = "lock wait timeout exceeded; try restarting transaction"
+	data.StoppedAtCutover = presentation.StoppedAtCutover{Count: 2, EndedBy: "users"}
+	return RenderApplySummaryComment(data)
 }
 
 // PreviewCommentSummaryFailedEngineLogs renders a failed summary for an apply

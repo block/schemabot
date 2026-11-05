@@ -515,24 +515,29 @@ or from one request that covers them all, never by a lookup per file.
 *Breaks if violated:* an App installation's rate limit is shared by every pull request in every
 repository it serves, so routine edits in one large repository use it up and required checks stop
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
-configs, probing each directory once (`pkg/github/config.go`), and
+configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
+(`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
+symlinks from one diff of the change, or from directory listings batched across those paths when
+GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
+the server's configuration names every directory the repository's configs can sit in, and reads a
+symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
-(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
-hundred one-line edits outside its schema directory and requires the same GitHub requests. It
-covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
-a repository whose tree GitHub truncates.
+(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
+one-line edits outside its schema directory and requires the same GitHub requests. It covers an
+auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
+repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
 An apply that keeps its drivers until an operator cuts it over is admitted only if SchemaBot's
 servers can hold all of it at once, and such applies take drivers in turn: none starts an operation
 while one ahead of it still has an operation waiting to start. The apply at the front therefore
-always gets every driver it needs and can be cut over, and the rest follow it. An apply's place is
+always gets every driver it needs and can reach its cutover, and the rest follow it. An apply's place is
 when it last started, so one that was stopped and started again goes behind every apply that started
 while it held no drivers.
 
 *Breaks if violated:* two applies each hold part of the drivers with the rest of their operations
-queued behind the other, neither can be cut over, and both wait until the waiting-for-cutover
+queued behind the other, neither can reach its cutover, and both wait until the waiting-for-cutover
 timeout fails them. *Enforced:* the width refusal at apply and at apply creation
 (`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
 (`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
@@ -935,8 +940,8 @@ the cutover barrier under `barrier`, while `parallel` does not order copy start 
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
 work held behind an earlier table that settled without completing can never start, so it holds no target. Under
-`barrier` and `parallel` cutover follows deployment order: an operation cuts over only once every
-operation of every earlier deployment has completed. Within one deployment, an operation cuts over
+`barrier` and `parallel` cutover follows deployment order: an operation's cutover runs only once every
+operation of every earlier deployment has completed. Within one deployment, an operation's cutover runs
 as soon as its own copy is ready: an earlier operation of the same deployment holds it only while it
 is in a state the rollout halts on (failed, retrying a failure, stopped, cancelled, or reverted),
 never while it is still copying or cutting over. A member's finalizer publishes its change without
@@ -976,7 +981,7 @@ arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker`
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
 dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
 `pkg/storage/internal/sqlstore/apply_operations.go`), and each member's progress and cutover are scoped to its own operation
-(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+(`progressReads.scopeOperation` in `pkg/tern/local_progress_reads.go`, `boundCutoverRequestTurn` in
 `pkg/tern/local_control.go`); for a manually deferred cutover, the turn
 check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
@@ -991,6 +996,24 @@ projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/a
 `StopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
 (`pkg/tern/control_requests.go`, reached from `pkg/api/control_handlers.go` and `pkg/tern/local_control.go`, through `RequestPendingSuperseding` in
 `pkg/storage/internal/sqlstore/control_requests.go`).
+
+### ST-11: An apply whose cutover can never run is ended, not left waiting
+
+When an apply holds its operations for a cutover that runs for all of them, and one operation ends
+before it gets there, by failing under a policy that halts the rollout or by waiting on a retry that
+will never come, SchemaBot ends the apply rather than leaving the rest holding their targets until
+the wait times out. It stops the others so each one saves its work, then settles the apply failed
+once nothing drives it, and each stopped operation records the operation it failed for. It does
+this only where a stop pauses the work: where a stop would end the change, the apply waits as
+before. An apply an operator already stopped or cancelled is left to that request.
+*Enforced:* the reaper's ended-operation pass and the stoppable types it passes
+(`runEndedOperationPass`, `endedOperationStoppableDatabaseTypes`, `pkg/api/reaper.go`), its two
+sweeps (`ListAppliesHeldByEndedOperation`, `SettleAppliesStoppedForEndedOperation`,
+`pkg/storage/internal/sqlstore/ended_operation_applies.go`), and retry expiry leaving such an apply
+to the settle (`expireRetryable`, `pkg/storage/internal/sqlstore/applies.go`), pinned on both
+dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_applies.go`). The
+drive tail leaves SchemaBot's stop pending for the settle (`completeLandedStopForHeldOpenApply`,
+`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 
@@ -1185,9 +1208,9 @@ stored rows without writing them (`pkg/api/progress_handlers.go`).
 ### OW-9: An advisory lock is only exclusion where the session holds still
 
 Every guarantee SchemaBot has across instances that is not a lease predicate is one advisory
-lock: the storage bootstrap, the apply target lock behind OW-5, and reaper election. All three
-are session-scoped, so all three are exclusion only while a connection keeps reaching the same
-server session.
+lock: the storage bootstrap, the apply target lock behind OW-5, reaper election, and the pending
+drops cleanup lock behind RV-5. All four are session-scoped, so all four are exclusion only while
+a connection keeps reaching the same server session.
 
 That is a property of the connection and not of the lock. It holds against a database, and
 against a pooler that gives a client its own session for the connection's lifetime. It does not
@@ -1211,8 +1234,9 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
-`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
-`pkg/storage/internal/sqlstore/reaper.go`).
+`releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`; `releaseCleanupLock`,
+`pkg/pendingdrops/cleaner.go`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1345,7 +1369,7 @@ in the write that records the stop, under the locks the resuming claims take (`S
 and failing the cutover a stop superseded before the stop's
 request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
 `pkg/tern/control_requests.go`, reached from both clients and from
-`pkg/api/control_handlers.go` and `pkg/api/operator.go`).
+`pkg/api/control_handlers.go`, `pkg/api/operator.go`, and `pkg/api/reaper.go`).
 
 ### CO-5: The revert phase owns the outcome
 
@@ -1734,8 +1758,8 @@ re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), whi
 the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
-validates the branch against the declared schema before creating the deploy request. The
-cross-deployment comparison a plan is reviewed against
+validates the branch against the declared schema before creating or adopting the deploy request.
+The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
@@ -1783,6 +1807,9 @@ dispatch scope, an attaching shard dispatch re-planned against its own shard and
 shard's verdict, and a shard dispatch this deployment could not re-plan (it carries no schema
 files) treated as unsafe (`verifyAttachedShardDispatch` and `restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+`pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
+mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
+`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeVSchemaChangesWithoutOptIn` in
 `pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
@@ -1975,9 +2002,11 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval counts only for the schema change it reviewed: it was
-given on the commit being applied, or on an earlier commit at which the change's own effect on every
-schema input is provably the same, or the change has stopped touching an input that newer default
+their own review requirement. An approval that the reviewer withdrew or that the repository
+dismissed does not count. An approval counts only for the schema change it reviewed, unless the
+change's target branch dismisses stale approvals itself or the review policy turns re-approval
+off: it was given on the commit being applied, or on an earlier commit at which the change's own
+effect on every schema input is provably the same, or the change has stopped touching an input that newer default
 branch content has changed since, so any difference between the two came from newer content on the
 repository's default branch; when that cannot be proved, the approval does not count. A change
 targeting any other branch keeps an approval only where its own effect and its base content are
@@ -1990,7 +2019,9 @@ generates no statement the approval did not cover: with `SameTableChange`
 (`pkg/ddl/table_change.go`) for MySQL-family table files, `SameVSchemaChange`
 (`pkg/ddl/vschema_change.go`) for a Vitess keyspace's VSchema, and on the environment's primary
 target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for PostgreSQL
-files.
+files. Whether the target branch dismisses stale approvals is read by
+`BaseBranchDismissesStaleApprovals` (`pkg/github/branch_rules.go`); when it cannot be read, the
+gate compares.
 
 ### AZ-5: Commands never guess
 

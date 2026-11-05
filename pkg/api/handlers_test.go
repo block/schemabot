@@ -780,7 +780,19 @@ func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) er
 	return nil
 }
 
-func (s *capturingApplyStore) ExpireRetryable(context.Context, int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *capturingApplyStore) ExpireRetryable(context.Context, []string, int) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) ListAppliesHeldByEndedOperation(context.Context, []string, int) ([]*storage.EndedOperationApply, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) SettleAppliesStoppedForEndedOperation(context.Context, int) ([]*storage.EndedOperationApply, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) ExpireRetryableOperations(context.Context, int) ([]*storage.RetryableOperationExpiration, error) {
 	return nil, nil
 }
 
@@ -6282,7 +6294,7 @@ func TestApplyHandler(t *testing.T) {
 		var resp apitypes.ErrorResponse
 		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 		assert.Equal(t, apitypes.ErrCodeActiveApplyExists, resp.ErrorCode)
-		assert.Contains(t, resp.Error, storage.ErrActiveApplyExists.Error())
+		assert.Equal(t, "apply blocked: another apply is still in progress on this database. Wait for it to finish, then apply again.", resp.Error)
 	})
 
 	t.Run("allows direct stored plans without source metadata", func(t *testing.T) {

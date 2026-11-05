@@ -41,8 +41,8 @@ The CLI or API calls `Plan()` with the desired schema files. The Tern client pas
 
 `Apply()` creates an Apply record (one Apply contains N Tasks, one per table) and launches background execution in one of two modes:
 
-- **Sequential mode** (default): Each table's DDL is executed one at a time. Each task runs through Spirit independently and cuts over before the next starts.
-- **Atomic mode** (`--defer-cutover`): All DDLs are passed to Spirit in a single call. All tables copy in parallel and cut over together when the user triggers cutover.
+- **Sequential mode** (default): Each table's DDL is executed one at a time. Each task runs through Spirit independently and runs its cutover before the next starts.
+- **Atomic mode** (`--defer-cutover`): All DDLs are passed to Spirit in a single call. All tables copy in parallel, and their cutover runs together when the user triggers it.
 
 ### 3. Poll
 
@@ -50,7 +50,7 @@ Background goroutines poll the engine for progress every 500ms and update task s
 
 ### 4. Cutover
 
-In atomic mode with `--defer-cutover`, the schema change pauses at `WaitingForCutover` once all row copying is complete. The user calls `Cutover()` to trigger the final table swap. In sequential mode, each table cuts over automatically.
+In atomic mode with `--defer-cutover`, the schema change pauses at `WaitingForCutover` once all row copying is complete. The user calls `Cutover()` to trigger the final table swap. In sequential mode, each table's cutover runs automatically.
 
 ## Recovery
 

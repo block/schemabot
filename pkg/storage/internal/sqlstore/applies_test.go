@@ -5,6 +5,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -642,6 +643,12 @@ func TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeploymen
 		newGroupedCreateGroup(now, "payments-b", "payments-b-target", "accounts"),
 	})
 	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+	conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
+	require.True(t, ok, "the refusal carries the holding apply: %v", err)
+	assert.Equal(t, "apply_fanout_first", conflict.HolderApplyID)
+	assert.Equal(t, first.State, conflict.HolderState)
+	assert.Equal(t, first.Database, conflict.Database)
+	assert.Equal(t, first.Environment, conflict.Environment)
 
 	// A new apply whose deployments are disjoint from the active apply is allowed.
 	disjoint := groupedApply("apply_fanout_disjoint", "payments-y")
@@ -3243,7 +3250,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -3286,7 +3293,7 @@ func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
 	`, apply.ID)
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationRecoveryWindow, expired[0].Reason)
@@ -3334,7 +3341,7 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
@@ -3376,14 +3383,14 @@ func TestApplyStore_ExpireRetryable_TakesTheOldestUpToTheLimit(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 2)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 2)
 	require.NoError(t, err)
 	require.Len(t, expired, 2, "a pass settles at most the limit it was given")
 	assert.Equal(t, []string{"apply_expire_oldest", "apply_expire_middle"},
 		[]string{expired[0].Apply.ApplyIdentifier, expired[1].Apply.ApplyIdentifier},
 		"the backlog drains oldest first")
 
-	remaining, err := store.Applies().ExpireRetryable(ctx, 2)
+	remaining, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 2)
 	require.NoError(t, err)
 	require.Len(t, remaining, 1, "the tail is settled by the next pass")
 	assert.Equal(t, "apply_expire_newest", remaining[0].Apply.ApplyIdentifier)
@@ -3453,7 +3460,7 @@ func TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply(t *te
 		assert.Nil(t, claimed, "an apply expiry will take must not be claimable for a drive: %s", apply.ApplyIdentifier)
 	}
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 
 	expiredIDs := make([]string, 0, len(expired))
@@ -3502,7 +3509,7 @@ func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t 
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_queued", "products", state.Task.Pending, "")
 	attachTaskToOperation(t, queuedTask.TaskIdentifier, held)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
 
@@ -3518,7 +3525,7 @@ func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t 
 	// The driver dies and its lease ages out. Nothing else changes.
 	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
 
-	expired, err = store.Applies().ExpireRetryable(ctx, 10)
+	expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -3555,18 +3562,382 @@ func TestApplyStore_ExpireRetryable_DefersUntilARetryableOperationsLeaseIsStale(
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_queued", "orders", state.Task.Pending, "")
 	attachTaskToOperation(t, queuedTask.TaskIdentifier, settled)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "a fresh retryable lease may belong to a newly admitted drive")
 	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.FailedRetryable)
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
 	backdateOperationHeartbeat(t, settled, storage.ApplyLeaseStaleAfter+time.Minute)
-	expired, err = store.Applies().ExpireRetryable(ctx, 10)
+	expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
 	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.Failed)
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Cancelled)
+}
+
+// degradedRollout is the fixture every ExpireRetryableOperations test starts
+// from: a rollout held at running_degraded because one deployment halt-failed
+// for good while another paused failed_retryable, with a third deployment
+// still queued behind it. Every lease on it has gone stale, so no driver holds
+// any of its rows.
+type degradedRollout struct {
+	apply      *storage.Apply
+	halted     int64
+	paused     int64
+	queued     int64
+	pausedTask *storage.Task
+	queuedTask *storage.Task
+}
+
+func stageDegradedRollout(t *testing.T, store *Storage, applyID string, planID int64) degradedRollout {
+	t.Helper()
+	ctx := t.Context()
+
+	lock := createTestLock(t, store, "degraded_"+applyID, storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.RunningDegraded, "staging")
+
+	halted := leasedOperationFor(t, store, apply, "region-a")
+	_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ?, completed_at = NOW() WHERE id = ?`,
+		state.ApplyOperation.Failed, halted)
+	require.NoError(t, err)
+	backdateOperationHeartbeat(t, halted, storage.ApplyLeaseStaleAfter+time.Minute)
+	haltedTask := createRetryableReapTask(t, store, apply, applyID+"_halted", "users", state.Task.Failed, "halt failed")
+	attachTaskToOperation(t, haltedTask.TaskIdentifier, halted)
+
+	paused := leasedOperationFor(t, store, apply, "region-b")
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ? WHERE id = ?`,
+		state.ApplyOperation.FailedRetryable, paused)
+	require.NoError(t, err)
+	backdateOperationHeartbeat(t, paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	pausedTask := createRetryableReapTask(t, store, apply, applyID+"_paused", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, pausedTask.TaskIdentifier, paused)
+	pausedQueuedTask := createRetryableReapTask(t, store, apply, applyID+"_paused_queued", "orders", state.Task.Pending, "")
+	attachTaskToOperation(t, pausedQueuedTask.TaskIdentifier, paused)
+
+	queued, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-c", Target: apply.Database, State: state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+	queuedTask := createRetryableReapTask(t, store, apply, applyID+"_queued", "users", state.Task.Pending, "")
+	attachTaskToOperation(t, queuedTask.TaskIdentifier, queued)
+
+	return degradedRollout{
+		apply:      apply,
+		halted:     halted,
+		paused:     paused,
+		queued:     queued,
+		pausedTask: pausedTask,
+		queuedTask: pausedQueuedTask,
+	}
+}
+
+// spendPausedRetryBudget leaves the paused deployment with attempts attempts
+// spent. The budget is the operation's own, and the parent records the highest
+// attempt of any of its operations, so both rows carry it. The paused row's
+// heartbeat stays stale: the write would otherwise refresh it and read as a
+// live lease.
+func spendPausedRetryBudget(t *testing.T, rollout degradedRollout, attempts int) {
+	t.Helper()
+	ctx := t.Context()
+	_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET attempt = ? WHERE id = ?`, attempts, rollout.paused)
+	require.NoError(t, err)
+	backdateOperationHeartbeat(t, rollout.paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, attempts, rollout.apply.ID)
+	require.NoError(t, err)
+}
+
+func assertOperationState(t *testing.T, store *Storage, id int64, want string, msgAndArgs ...any) {
+	t.Helper()
+	op, err := store.ApplyOperations().Get(t.Context(), id)
+	require.NoError(t, err)
+	require.NotNil(t, op, "apply_operation %d", id)
+	assert.Equal(t, want, op.State, msgAndArgs...)
+}
+
+// A rollout whose retry budget is spent keeps its paused deployment parked for
+// good: the paused row and the tasks under it settle, while the parent, the
+// deployment that already halt-failed, and the deployment queued behind the
+// pause are left as they were. The parent is not transitioned here, so the
+// rollout settles through its own projection once every deployment has.
+func TestApplyStore_ExpireRetryableOperations_SettlesOnlyThePausedDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_budget", 530)
+	spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "one paused deployment under the rollout")
+	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+	assert.Equal(t, rollout.apply.ApplyIdentifier, expired[0].Apply.ApplyIdentifier)
+	assert.Equal(t, state.Apply.RunningDegraded, expired[0].Apply.State, "the parent handed back is the parent as it stands")
+	assert.Equal(t, rollout.paused, expired[0].Operation.ID)
+	assert.Equal(t, "region-b", expired[0].Operation.Deployment)
+	assert.Equal(t, state.ApplyOperation.Failed, expired[0].Operation.State)
+	assert.NotNil(t, expired[0].Operation.CompletedAt)
+
+	persisted, err := store.Applies().Get(ctx, rollout.apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.RunningDegraded, persisted.State, "the rollout is left to settle through its projection")
+	assert.Nil(t, persisted.CompletedAt)
+
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.Failed)
+	assertOperationState(t, store, rollout.halted, state.ApplyOperation.Failed)
+	assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending)
+	assertTaskState(t, store, rollout.pausedTask.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, rollout.queuedTask.TaskIdentifier, state.Task.Cancelled)
+	assertTaskState(t, store, "apply_degraded_budget_queued", state.Task.Pending)
+
+	again, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, again, "nothing retryable is left under the rollout")
+}
+
+// The freshness window is the other way a rollout's recovery ends: a paused
+// deployment nobody has written to for longer than the window is expired on
+// that alone, however many attempts remain. The window is measured on the
+// paused row, the row the claim redispatches, so a sibling's progress on the
+// parent does not keep the pause alive.
+func TestApplyStore_ExpireRetryableOperations_ExpiresAStaleRolloutUnderBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_window", 531)
+	spendPausedRetryBudget(t, rollout, 1)
+	backdateOperationHeartbeat(t, rollout.paused, 48*time.Hour)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() WHERE id = ?`, rollout.apply.ID)
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, storage.RetryableExpirationRecoveryWindow, expired[0].Reason)
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.Failed)
+	assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending)
+}
+
+// A rollout with attempts left whose pause is still inside the window is one
+// the operation claim may still redispatch, so expiry leaves it alone. The
+// claim and expiry read the same budget and the same window on the same row,
+// so a paused row is either still the claim's to retry or expiry's to retire,
+// never both and never neither. The parent's own timestamp plays no part: it
+// is left stale here and the pause is still kept.
+func TestApplyStore_ExpireRetryableOperations_LeavesARolloutStillWithinBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_fresh", 532)
+	spendPausedRetryBudget(t, rollout, maxRecoveryAttempts-1)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 DAY WHERE id = ?`, rollout.apply.ID)
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired, "a rollout with attempts left and a live window is still recoverable")
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.FailedRetryable)
+	assertTaskState(t, store, rollout.pausedTask.TaskIdentifier, state.Task.FailedRetryable)
+	assertTaskState(t, store, rollout.queuedTask.TaskIdentifier, state.Task.Pending)
+}
+
+// A driver holding any deployment under the rollout holds the whole rollout:
+// the paused row is not written while a sibling's lease is fresh, and is
+// offered again once that lease has gone stale.
+func TestApplyStore_ExpireRetryableOperations_DefersWhileASiblingIsDriven(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_driven", 533)
+	spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
+	// The queued deployment is picked up and driven while the pause ages out.
+	held := leasedOperationFor(t, store, rollout.apply, "region-d")
+	liveTask := createRetryableReapTask(t, store, rollout.apply, "apply_degraded_driven_live", "users", state.Task.Running, "")
+	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired, "a live sibling lease defers the whole rollout")
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.FailedRetryable)
+	assertTaskState(t, store, rollout.pausedTask.TaskIdentifier, state.Task.FailedRetryable)
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
+
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	expired, err = store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "a deferred rollout is offered again on the next pass")
+	assert.Equal(t, rollout.paused, expired[0].Operation.ID)
+	assertOperationState(t, store, rollout.paused, state.ApplyOperation.Failed)
+	assertOperationState(t, store, held, state.ApplyOperation.Running, "the sibling's row is the operation claim's to recover, not expiry's")
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
+}
+
+// Once expiry has settled the last unsettled deployment, the rollout is a parent
+// behind its children and the operation projection claims it to record the
+// verdict. The paused deployment is the only one that was unsettled here, so
+// expiring it is what makes the rollout claimable.
+func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjection(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_project", 534)
+	_, err := testDB.ExecContext(ctx, `DELETE FROM apply_operations WHERE id = ?`, rollout.queued)
+	require.NoError(t, err)
+	spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
+	backdateApplyUpdatedAt(t, rollout.apply.ID, 2*storage.ApplyLeaseStaleAfter)
+
+	claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.Nil(t, claimed, "a paused deployment is unsettled work, so the rollout is not yet the projection's")
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+
+	claimed, err = store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "with every deployment settled the rollout is the projection's to record")
+	assert.Equal(t, rollout.apply.ID, claimed.ID)
+	assert.Equal(t, state.Apply.RunningDegraded, claimed.State, "the projection, not expiry, writes the verdict")
+}
+
+// A paused deployment whose namespace work carries a group_finalizer hands the
+// rollout to the projection the same way. Expiry fails the work and leaves the
+// finalizer pending: its claim waits for that work to complete, which a failed
+// row never does, so the row is one nothing will ever start. The projection
+// reads it that way and claims the rollout rather than waiting on it.
+func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjectionPastAnOrphanedFinalizer(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollout := stageDegradedRollout(t, store, "apply_degraded_finalizer", 535)
+	_, err := testDB.ExecContext(ctx, `DELETE FROM apply_operations WHERE id = ?`, rollout.queued)
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET operation_key = ? WHERE id = ?`,
+		"commerce/-80/users", rollout.paused)
+	require.NoError(t, err)
+	backdateOperationHeartbeat(t, rollout.paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	finalizer, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: rollout.apply.ID, Deployment: "region-b", Target: rollout.apply.Database,
+		OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		State: state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+	spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
+	backdateApplyUpdatedAt(t, rollout.apply.ID, 2*storage.ApplyLeaseStaleAfter)
+
+	claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.Nil(t, claimed, "while the work is paused the finalizer is queued behind a retry, not orphaned")
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, rollout.paused, expired[0].Operation.ID, "only the paused work row is expired")
+	assertOperationState(t, store, finalizer, state.ApplyOperation.Pending, "the finalizer is left as it was")
+
+	claimed, err = store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a finalizer whose work failed never starts, so it does not hold the rollout from the projection")
+	assert.Equal(t, rollout.apply.ID, claimed.ID)
+	assertOperationState(t, store, finalizer, state.ApplyOperation.Pending, "the claim writes the parent's lease, not the orphaned row")
+}
+
+// A rollout under the halting policy keeps a queued deployment behind a
+// failed sibling: the operation claim never starts it, and the derivation
+// records the failed verdict without waiting on it. Once expiry has settled
+// the paused deployment, that queued row is the only unsettled one left, and
+// the projection reads it the way the derivation does and claims the rollout.
+// Under a policy that continues past the failure the same queued row is the
+// claim's next deployment, so it holds the rollout back from the projection.
+func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjectionPastAQueuedSiblingTheFailureHoldsBack(t *testing.T) {
+	cases := []struct {
+		name      string
+		onFailure string
+		claimable bool
+		verdict   string
+	}{
+		{"halt", storage.OnFailureHalt, true, state.Apply.Failed},
+		{"continue", storage.OnFailureContinue, false, state.Apply.RunningDegraded},
+		{"pause", storage.OnFailurePause, false, state.Apply.Paused},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			rollout := stageDegradedRollout(t, store, "apply_degraded_queued_"+tc.name, 537)
+			_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET on_failure = ? WHERE apply_id = ?`,
+				tc.onFailure, rollout.apply.ID)
+			require.NoError(t, err)
+			backdateOperationHeartbeat(t, rollout.halted, storage.ApplyLeaseStaleAfter+time.Minute)
+			spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
+			backdateApplyUpdatedAt(t, rollout.apply.ID, 2*storage.ApplyLeaseStaleAfter)
+
+			claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+			require.NoError(t, err)
+			require.Nil(t, claimed, "a paused deployment is unsettled work, so the rollout is not yet the projection's")
+
+			expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+			require.NoError(t, err)
+			require.Len(t, expired, 1)
+			assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending, "expiry leaves the queued deployment as it was")
+
+			ops, err := store.ApplyOperations().ListByApply(ctx, rollout.apply.ID)
+			require.NoError(t, err)
+			rolloutOps := make([]state.RolloutOperation, 0, len(ops))
+			for _, op := range ops {
+				rolloutOps = append(rolloutOps, op.RolloutOperation(false))
+			}
+			assert.Equal(t, tc.verdict, state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps)),
+				"the verdict the projection would record over these rows")
+
+			claimed, err = store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.claimable {
+				assert.Nil(t, claimed, "the queued deployment can still start, so it holds the rollout back from the projection")
+				return
+			}
+			require.NotNil(t, claimed, "the failure holds the queued deployment back for good, so it does not hold the rollout from the projection")
+			assert.Equal(t, rollout.apply.ID, claimed.ID)
+			assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending, "the claim writes the parent's lease, not the queued row")
+		})
+	}
+}
+
+// Oldest rollout first, and no more than limit of them per pass, so a backlog
+// drains in order rather than leaving the same tail unexpired every time.
+func TestApplyStore_ExpireRetryableOperations_TakesTheOldestUpToTheLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	newest := stageDegradedRollout(t, store, "apply_degraded_newest", 535)
+	oldest := stageDegradedRollout(t, store, "apply_degraded_oldest", 536)
+	for _, rollout := range []degradedRollout{newest, oldest} {
+		spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
+	}
+	backdateApplyUpdatedAt(t, oldest.apply.ID, time.Hour)
+
+	expired, err := store.Applies().ExpireRetryableOperations(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, oldest.apply.ID, expired[0].Apply.ID)
+	assertOperationState(t, store, newest.paused, state.ApplyOperation.FailedRetryable)
+
+	expired, err = store.Applies().ExpireRetryableOperations(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, newest.apply.ID, expired[0].Apply.ID)
 }
 
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
@@ -4689,6 +5060,202 @@ func TestApplyStore_FindNextApplyForOperationProjection_SkipsLiveAndUnsettledApp
 			claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
 			require.NoError(t, err)
 			assert.Nil(t, claimed, tc.reason)
+		})
+	}
+}
+
+// TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettled
+// verifies the claim agrees with the rollout derivation about which pending
+// rows hold a rollout open. A group_finalizer whose work failed, a table
+// step behind one that settled without completing, and a deployment queued
+// behind a sibling's failure under a policy that halts the rollout, are rows
+// no claim arm will ever start, and the derivation settles the parent without
+// them; the claim reads them as settled so that parent is reached. The same
+// rows behind work that completed, under another deployment, or behind a
+// failure the rollout continues past or pauses on, are queued work and still
+// hold the parent back. Rows that exercise only the finalizer and step arms
+// fail under the continuing policy, so the halting policy's own arm stays out
+// of their way.
+func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettled(t *testing.T) {
+	work := func(deployment, key, opState string, step int) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			Deployment: deployment, OperationKey: key, OperationKind: storage.ApplyOperationKindWork,
+			RolloutStep: step, State: opState,
+		}
+	}
+	finalizer := func(deployment, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			Deployment: deployment, OperationKey: key, OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			State: opState,
+		}
+	}
+	under := func(onFailure string, op *storage.ApplyOperation) *storage.ApplyOperation {
+		op.OnFailure = onFailure
+		return op
+	}
+	cases := []struct {
+		name      string
+		ops       []*storage.ApplyOperation
+		claimable bool
+		reason    string
+	}{
+		{
+			name: "pending finalizer behind failed work",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
+				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: true,
+			reason:    "a finalizer waits for its work to complete, and failed work never does",
+		},
+		{
+			name: "stopped finalizer behind failed work",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
+				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Stopped),
+			},
+			claimable: true,
+			reason:    "a stop caught the finalizer before it started, and a start would hold it to the same gate",
+		},
+		{
+			name: "pending finalizer behind completed work",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "commerce/-80/users", state.ApplyOperation.Completed, 0),
+				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: false,
+			reason:    "the finalizer is the operation claim's next row, not residue",
+		},
+		{
+			name: "pending finalizer behind another deployment's failed work",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
+				work("region-b", "commerce/-80/users", state.ApplyOperation.Completed, 0),
+				finalizer("region-b", "commerce/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: false,
+			reason:    "a finalizer is orphaned only by work of its own deployment",
+		},
+		{
+			name: "pending finalizer of another namespace",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
+				work("region-a", "billing/-80/invoices", state.ApplyOperation.Completed, 0),
+				finalizer("region-a", "billing/group_finalizer", state.ApplyOperation.Pending),
+			},
+			claimable: false,
+			reason:    "a finalizer is orphaned only by the work it finalizes",
+		},
+		{
+			name: "pending step behind a failed earlier step",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 1)),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: true,
+			reason:    "a later step starts only once every earlier step completed, and a failed step never does",
+		},
+		{
+			name: "pending step behind a cancelled earlier step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Cancelled, 1),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: true,
+			reason:    "a cancelled step ends its deployment's rollout the same way a failed one does",
+		},
+		{
+			name: "pending step behind a reverted earlier step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Reverted, 1),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: true,
+			reason:    "a reverted step settled without completing, so the step behind it never starts",
+		},
+		{
+			name: "pending step behind a completed earlier step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Completed, 1),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: false,
+			reason:    "the next step is the operation claim's next row, not residue",
+		},
+		{
+			name: "pending step beside a failed row of its own step",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 2)),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: false,
+			reason:    "the step gate waits on earlier steps only, so a failure in the same step does not end the step",
+		},
+		{
+			name: "pending step behind another deployment's failed step",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 1)),
+				work("region-b", "users", state.ApplyOperation.Completed, 1),
+				work("region-b", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: false,
+			reason:    "the step gate orders steps within a deployment, so another deployment's failure does not end this one's",
+		},
+		{
+			name: "pending deployment behind a sibling's failure that halts the rollout",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureHalt, work("region-a", "users", state.ApplyOperation.Failed, 0)),
+				work("region-b", "users", state.ApplyOperation.Pending, 0),
+			},
+			claimable: true,
+			reason:    "the halting policy keeps the queued deployment from ever starting, and the derivation records the failure without it",
+		},
+		{
+			name: "pending deployment behind a sibling's failure the rollout continues past",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 0)),
+				work("region-b", "users", state.ApplyOperation.Pending, 0),
+			},
+			claimable: false,
+			reason:    "the queued deployment is the operation claim's next row",
+		},
+		{
+			name: "pending deployment behind a sibling's failure the rollout pauses on",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailurePause, work("region-a", "users", state.ApplyOperation.Failed, 0)),
+				work("region-b", "users", state.ApplyOperation.Pending, 0),
+			},
+			claimable: false,
+			reason:    "a paused rollout waits for its release, and the queued deployment starts once it is released",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_projection_orphan_rows", 1, state.Apply.RunningDegraded, "staging")
+			for _, op := range tc.ops {
+				op.ApplyID = apply.ID
+				op.Target = apply.Database
+				_, err := store.ApplyOperations().Insert(ctx, op)
+				require.NoError(t, err)
+			}
+			_, err := testDB.ExecContext(ctx,
+				`UPDATE applies SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?`,
+				int64((2 * storage.ApplyLeaseStaleAfter).Seconds()), apply.ID)
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+			require.NoError(t, err)
+			if tc.claimable {
+				require.NotNil(t, claimed, tc.reason)
+				assert.Equal(t, apply.ID, claimed.ID)
+			} else {
+				assert.Nil(t, claimed, tc.reason)
+			}
 		})
 	}
 }

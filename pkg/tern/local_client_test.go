@@ -853,7 +853,7 @@ func TestLoadStoredProgressMetadataMergesVitessResumeFieldsLast(t *testing.T) {
 	}
 	task := &storage.Task{TaskIdentifier: "task-read-progress", ApplyOperationID: &operationID}
 
-	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	metadata := client.loadStoredProgressMetadata(t.Context(), &progressReads{}, task)
 	assert.Equal(t, "copying", metadata["phase"])
 	assert.Equal(t, "resume-branch", metadata["branch_name"])
 	assert.Equal(t, "https://example.com/request", metadata["deploy_request_url"])
@@ -871,7 +871,7 @@ func TestLoadStoredProgressMetadataReturnsEmptyMapForNull(t *testing.T) {
 	}
 	task := &storage.Task{TaskIdentifier: "task-read-null-progress", ApplyOperationID: &operationID}
 
-	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	metadata := client.loadStoredProgressMetadata(t.Context(), &progressReads{}, task)
 	assert.NotNil(t, metadata)
 	assert.Empty(t, metadata)
 }
@@ -939,6 +939,23 @@ func (s *testControlRequestStore) RequestPending(_ context.Context, req *storage
 	stored.ID = int64(len(s.requests) + 1)
 	s.requests = append(s.requests, stored)
 	return cloneTestControlRequest(stored), false, nil
+}
+
+func (s *testControlRequestStore) UpdateMetadata(_ context.Context, applyID int64, operation storage.ControlOperation, update func(*storage.ApplyControlRequest) ([]byte, error)) (bool, error) {
+	for _, req := range slices.Backward(s.requests) {
+		if req.ApplyID != applyID || req.Operation != operation {
+			continue
+		}
+		metadata, err := update(cloneTestControlRequest(req))
+		if err != nil {
+			return true, err
+		}
+		if metadata != nil {
+			req.Metadata = metadata
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (s *testControlRequestStore) RequestPendingCommand(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
@@ -3249,6 +3266,378 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	require.NoError(t, err)
 	assert.Nil(t, pending, "the accepted cutover must complete the pending request")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
+}
+
+// unknownCutoverFixture is a drive parked at waiting_for_cutover with a pending
+// cutover request whose first send loses its answer.
+type unknownCutoverFixture struct {
+	client          *LocalClient
+	apply           *storage.Apply
+	task            *storage.Task
+	controlRequests *testControlRequestStore
+	engine          *fakeControlEngine
+	logs            *mockApplyLogStore
+}
+
+// newUnknownCutoverFixture builds the fixture; a non-zero operationID binds
+// the request and the task to that operation.
+func newUnknownCutoverFixture(t *testing.T, operationID int64) *unknownCutoverFixture {
+	t.Helper()
+	apply := &storage.Apply{
+		ID:              132,
+		ApplyIdentifier: "apply-cutover-outcome-unknown-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             465,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-outcome-unknown-local",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	request := &storage.ApplyControlRequest{
+		ID:          1,
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}
+	var ops []*storage.ApplyOperation
+	if operationID != 0 {
+		task.ApplyOperationID = &operationID
+		request.Metadata = storage.CutoverRequestMetadata(operationID)
+		ops = []*storage.ApplyOperation{{ID: operationID, ApplyID: apply.ID}}
+	}
+	fx := &unknownCutoverFixture{
+		apply:           apply,
+		task:            task,
+		controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{request}},
+		engine:          &fakeControlEngine{cutoverErr: engine.NewOutcomeUnknownError("drop sentinel table: connection reset by peer")},
+		logs:            &mockApplyLogStore{},
+	}
+	fx.client = &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            fx.logs,
+			controlRequests: fx.controlRequests,
+			applyOperations: &exactProgressApplyOperationStore{ops: ops},
+		},
+		spiritEngine: fx.engine,
+		logger:       slog.Default(),
+	}
+	return fx
+}
+
+// pending returns the stored pending cutover request, or nil.
+func (fx *unknownCutoverFixture) pending(t *testing.T) *storage.ApplyControlRequest {
+	t.Helper()
+	req, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	return req
+}
+
+// A cutover whose engine cannot tell whether the backend took it (the
+// connection broke while the request was in flight) must not be failed: the
+// cutover may be completing. The request stays pending and records when its
+// outcome became unknown, the apply stays cutting_over, and the next tick sends
+// the cutover again. A resend that fails before reaching the database (here a
+// refused connection) says nothing about the first send, so the request still
+// stays pending; the resend that is accepted completes it.
+func TestLocalClient_ProcessPendingCutoverControlRequestKeepsRequestPendingWhenOutcomeUnknown(t *testing.T) {
+	fx := newUnknownCutoverFixture(t, 0)
+	tasks := []*storage.Task{fx.task}
+
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, tasks))
+	assert.Equal(t, 1, fx.engine.cutoverCount)
+	pending := fx.pending(t)
+	require.NotNil(t, pending, "an unknown outcome must keep the cutover request pending for the next tick")
+	since, err := pending.CutoverOutcomeUnknownSince(0)
+	require.NoError(t, err)
+	assert.False(t, since.IsZero(), "the request row records when its outcome became unknown, so a later drive keeps the window")
+	assert.Equal(t, state.Apply.CuttingOver, fx.apply.State, "the cutover may have taken, so the apply is not restored")
+	assert.True(t, hasLogMessageContaining(fx.logs.logs, "Cutover outcome unknown"))
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"), "an unknown outcome must not record a failure in the timeline")
+
+	fx.engine.cutoverErr = errors.New("ping database for cutover: dial tcp 10.0.0.1:3306: connect: connection refused")
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, tasks))
+	assert.Equal(t, 2, fx.engine.cutoverCount)
+	pending = fx.pending(t)
+	require.NotNil(t, pending, "a failed resend must not settle a request whose first send may have cut over")
+	resent, err := pending.CutoverOutcomeUnknownSince(0)
+	require.NoError(t, err)
+	assert.True(t, since.Equal(resent), "a resend keeps the time the outcome first became unknown")
+	assert.Equal(t, state.Apply.CuttingOver, fx.apply.State)
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"), "a failed resend must not record a failure in the timeline")
+
+	fx.engine.cutoverErr = nil
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, tasks))
+	assert.Equal(t, 3, fx.engine.cutoverCount)
+	assert.Nil(t, fx.pending(t), "the accepted cutover must complete the pending request")
+}
+
+// A database that stays unreachable for the whole window settles the request
+// as unconfirmed instead of keeping it pending forever. The message does not
+// claim the cutover failed, and the apply returns to waiting_for_cutover, which
+// any cutover state progress reports outranks.
+func TestLocalClient_ProcessPendingCutoverControlRequestSettlesAnUnknownOutcomeAfterTheWindow(t *testing.T) {
+	fx := newUnknownCutoverFixture(t, 0)
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	fx.apply.State = state.Apply.CuttingOver
+	fx.engine.cutoverErr = errors.New("ping database for cutover: dial tcp 10.0.0.1:3306: connect: connection refused")
+
+	err = fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.Error(t, err)
+	assert.Nil(t, fx.pending(t), "the window bounds how long the request stays pending")
+	require.Len(t, fx.controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, fx.controlRequests.requests[0].Status)
+	assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+	assert.Equal(t, state.Apply.WaitingForCutover, fx.apply.State, "an unconfirmed cutover must not leave the apply wedged in cutting_over")
+}
+
+// The same holds for a cutover request bound to one operation of a grouped
+// apply: an unknown outcome keeps the request pending, recorded on the row
+// without losing the binding, a failed resend keeps it pending, and the window
+// settles it as unconfirmed.
+func TestLocalClient_TakeBoundCutoverRequestKeepsRequestPendingWhenOutcomeUnknown(t *testing.T) {
+	const operationID int64 = 77
+	fx := newUnknownCutoverFixture(t, operationID)
+	take := func() error {
+		return fx.client.takeBoundCutoverRequest(t.Context(), fx.apply, fx.pending(t), operationID, slog.Default())
+	}
+
+	require.NoError(t, take())
+	pending := fx.pending(t)
+	require.NotNil(t, pending, "an unknown outcome must keep the bound cutover request pending")
+	bound, err := pending.CutoverOperationID()
+	require.NoError(t, err)
+	assert.Equal(t, operationID, bound, "recording the unknown outcome keeps the request bound to its operation")
+	since, err := pending.CutoverOutcomeUnknownSince(operationID)
+	require.NoError(t, err)
+	assert.False(t, since.IsZero())
+
+	fx.engine.cutoverErr = errors.New("ping database for cutover: dial tcp 10.0.0.1:3306: connect: connection refused")
+	require.NoError(t, take())
+	require.NotNil(t, fx.pending(t), "a failed resend must not settle the bound request")
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"), "an unknown outcome must not record a failure in the timeline")
+
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(operationID, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	require.Error(t, take())
+	assert.Nil(t, fx.pending(t), "the window bounds how long the bound request stays pending")
+	assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+	assert.Equal(t, 3, fx.engine.cutoverCount)
+	assert.True(t, hasLogMessageContaining(fx.logs.logs, cutoverOutcomeUnconfirmedMessage), "settling the request closes the timeline's unknown-outcome entry")
+}
+
+// secondReadFailsTaskStore answers the first task read and fails every later
+// one, standing in for a storage outage that begins after the handler has
+// read the apply's tasks and before the resend reaches the engine.
+type secondReadFailsTaskStore struct {
+	*exactProgressTaskStore
+	calls int
+}
+
+func (s *secondReadFailsTaskStore) GetByApplyID(ctx context.Context, id int64) ([]*storage.Task, error) {
+	s.calls++
+	if s.calls >= 2 {
+		return nil, errors.New("storage read timed out")
+	}
+	return s.exactProgressTaskStore.GetByApplyID(ctx, id)
+}
+
+// A resend that fails before it reaches the engine says as little about the
+// send that lost its answer as a resend the engine fails: the request stays
+// pending inside the window instead of being failed and the apply restored.
+func TestResendStorageErrorBeforeEngineKeepsRequestPending(t *testing.T) {
+	fx := newUnknownCutoverFixture(t, 0)
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-time.Second))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	fx.apply.State = state.Apply.CuttingOver
+	base := fx.client.storage.(*exactProgressStorage)
+	base.tasks = &secondReadFailsTaskStore{exactProgressTaskStore: base.tasks.(*exactProgressTaskStore)}
+
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task}))
+
+	assert.Equal(t, 0, fx.engine.cutoverCount)
+	assert.NotNil(t, fx.pending(t), "a resend that never reached the engine must leave the request pending")
+	assert.Equal(t, state.Apply.CuttingOver, fx.apply.State, "the first send may have cut over, so the apply is not restored")
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"))
+}
+
+// Once a send has lost its answer, a resend the backend turns away as not
+// ready is held inside the same window: a fresh stamp keeps the request
+// pending, an expired one settles it as unconfirmed and restores the apply.
+func TestLocalClient_ProcessPendingCutoverControlRequestBoundsANotReadyResendByTheWindow(t *testing.T) {
+	t.Run("fresh stamp stays pending", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, 0)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-time.Second))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.apply.State = state.Apply.CuttingOver
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task}))
+		assert.Equal(t, 1, fx.engine.cutoverCount)
+		require.NotNil(t, fx.pending(t), "a not-ready resend inside the window keeps the request pending")
+		assert.Equal(t, state.Apply.CuttingOver, fx.apply.State)
+	})
+
+	t.Run("expired stamp settles as unconfirmed", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, 0)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.apply.State = state.Apply.CuttingOver
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.Error(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task}))
+		assert.Nil(t, fx.pending(t), "a not-ready resend must not keep a request pending past the window")
+		require.Len(t, fx.controlRequests.requests, 1)
+		assert.Equal(t, storage.ControlRequestFailed, fx.controlRequests.requests[0].Status)
+		assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+		assert.Equal(t, state.Apply.WaitingForCutover, fx.apply.State)
+		assert.True(t, hasLogMessageContaining(fx.logs.logs, cutoverOutcomeUnconfirmedMessage))
+	})
+}
+
+// The bound path holds a stamped request's not-ready resend inside the same
+// window.
+func TestLocalClient_TakeBoundCutoverRequestBoundsANotReadyResendByTheWindow(t *testing.T) {
+	const operationID int64 = 77
+	t.Run("fresh stamp stays pending", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, operationID)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(operationID, time.Now().Add(-time.Second))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.NoError(t, fx.client.takeBoundCutoverRequest(t.Context(), fx.apply, fx.pending(t), operationID, slog.Default()))
+		assert.Equal(t, 1, fx.engine.cutoverCount)
+		require.NotNil(t, fx.pending(t))
+	})
+
+	t.Run("expired stamp settles as unconfirmed", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, operationID)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(operationID, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.Error(t, fx.client.takeBoundCutoverRequest(t.Context(), fx.apply, fx.pending(t), operationID, slog.Default()))
+		assert.Nil(t, fx.pending(t))
+		assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+		assert.True(t, hasLogMessageContaining(fx.logs.logs, cutoverOutcomeUnconfirmedMessage))
+	})
+}
+
+// A request bound to a set of operations is sent once per member, and one
+// member's lost answer is stamped under that member alone: a sibling's first
+// send is not a resend, so a refusal from it fails the request at once rather
+// than being held until the stamped member's window closes.
+func TestLocalClient_CutOverBoundOperationDoesNotInheritASiblingsUnknownOutcome(t *testing.T) {
+	const stampedID, siblingID int64 = 77, 78
+	fx := newUnknownCutoverFixture(t, stampedID)
+	metadata, err := storage.CutoverRequestSetMetadata([]int64{stampedID, siblingID})
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = metadata
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(stampedID, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	siblingOp := siblingID
+	siblingTask := &storage.Task{
+		ID:               466,
+		ApplyID:          fx.apply.ID,
+		ApplyOperationID: &siblingOp,
+		TaskIdentifier:   "task-cutover-outcome-unknown-local-sibling",
+		Database:         "testdb",
+		Namespace:        "testdb",
+		DatabaseType:     storage.DatabaseTypeMySQL,
+		TableName:        "orders",
+		State:            state.Task.WaitingForCutover,
+	}
+	base := fx.client.storage.(*exactProgressStorage)
+	base.tasks.(*exactProgressTaskStore).tasks = append(base.tasks.(*exactProgressTaskStore).tasks, siblingTask)
+	ops := base.applyOperations.(*exactProgressApplyOperationStore)
+	ops.ops = append(ops.ops, &storage.ApplyOperation{ID: siblingID, ApplyID: fx.apply.ID})
+	fx.engine.cutoverErr = errors.New("access denied for user 'spirit'@'%'")
+	failRequest := func(reason string) error {
+		return failPendingControlRequests(t.Context(), fx.client.storage, fx.apply, storage.ControlOperationCutover, reason)
+	}
+
+	accepted, err := fx.client.cutOverBoundOperation(t.Context(), fx.apply, fx.pending(t), siblingID, slog.Default(), failRequest)
+	require.Error(t, err)
+	assert.False(t, accepted)
+	assert.Equal(t, 1, fx.engine.cutoverCount)
+	assert.Nil(t, fx.pending(t), "the sibling's own refusal settles the request")
+	assert.Equal(t, storage.ControlRequestFailed, fx.controlRequests.requests[0].Status)
+	assert.Contains(t, fx.controlRequests.requests[0].ErrorMessage, "access denied")
+	assert.NotEqual(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+	assert.True(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"))
+	siblingSince, err := fx.controlRequests.requests[0].CutoverOutcomeUnknownSince(siblingID)
+	require.NoError(t, err)
+	assert.True(t, siblingSince.IsZero(), "the sibling's send was answered, so it is not stamped")
+	stampedSince, err := fx.controlRequests.requests[0].CutoverOutcomeUnknownSince(stampedID)
+	require.NoError(t, err)
+	assert.False(t, stampedSince.IsZero(), "the stamped member keeps its own stamp")
+}
+
+// stampCutoverOutcomeUnknown writes only to the row it was sent from: a row
+// that has since been re-armed for a new command, settled, or replaced is
+// left alone, and an existing stamp for the operation is kept.
+func TestStampCutoverOutcomeUnknownLeavesAChangedRowAlone(t *testing.T) {
+	sent := &storage.ApplyControlRequest{
+		ID:        1,
+		ApplyID:   132,
+		Operation: storage.ControlOperationCutover,
+		Status:    storage.ControlRequestPending,
+		Revision:  3,
+	}
+	apply := &storage.Apply{ID: sent.ApplyID, ApplyIdentifier: "apply-stamp-guard"}
+	tests := []struct {
+		name   string
+		stored func(*storage.ApplyControlRequest)
+	}{
+		{name: "replaced row", stored: func(r *storage.ApplyControlRequest) { r.ID = 2 }},
+		{name: "re-armed row", stored: func(r *storage.ApplyControlRequest) { r.Revision = sent.Revision + 1 }},
+		{name: "settled row", stored: func(r *storage.ApplyControlRequest) { r.Status = storage.ControlRequestFailed }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stored := *sent
+			stored.Metadata = storage.CutoverRequestMetadata(77)
+			tt.stored(&stored)
+			store := &exactProgressStorage{controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{&stored}}}
+
+			require.NoError(t, stampCutoverOutcomeUnknown(t.Context(), store, apply, sent, 0, time.Now(), discardLogger()))
+			assert.JSONEq(t, string(storage.CutoverRequestMetadata(77)), string(stored.Metadata), "a row the send did not come from is never stamped")
+		})
+	}
+
+	t.Run("matching row keeps its first stamp", func(t *testing.T) {
+		stored := *sent
+		first := time.Now().Add(-time.Minute).Truncate(time.Second)
+		metadata, err := stored.WithCutoverOutcomeUnknownSince(0, first)
+		require.NoError(t, err)
+		stored.Metadata = metadata
+		store := &exactProgressStorage{controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{&stored}}}
+
+		require.NoError(t, stampCutoverOutcomeUnknown(t.Context(), store, apply, sent, 0, time.Now(), discardLogger()))
+		since, err := stored.CutoverOutcomeUnknownSince(0)
+		require.NoError(t, err)
+		assert.True(t, first.Equal(since), "the window is measured from the first lost answer")
+	})
 }
 
 // A drive claim that reattaches to the engine's durable checkpoint records one

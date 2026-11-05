@@ -169,7 +169,7 @@ the lock. That refusal becomes the routing signal into copy and swap when pg-spr
 This is what happens when the cheap path is not possible. The engine builds a new table, backfills
 it, keeps it in sync with ongoing writes, and swaps it in. That is what lets a large table change
 without a long lock, and it is why the change becomes a long-running process with phases:
-something is in flight, so there is something to pause, to slow down, and to cut over when you
+something is in flight, so there is something to pause, something to slow down, and a cutover to run when you
 choose. Every control operation in the matrix exists because of it.
 
 What drives the copy decides who can report on it:
@@ -253,7 +253,7 @@ PostgreSQL transaction that either commits or fails.
 
 Most of what the PostgreSQL column is missing follows from that, rather than from anything
 permanent about the engine. The control operations arrive with the copy rather than before it,
-because with no long-running copy there is nothing to pause and no swap to cut over. `revert` is
+because with no long-running copy there is nothing to pause and no cutover to run. `revert` is
 the exception: it needs the engine to keep the pre-cutover table, which is the retention decision
 described above, and it is not on the PostgreSQL roadmap today.
 

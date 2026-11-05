@@ -1391,6 +1391,13 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		}
 		return refused
 	case router.DispositionExecute:
+		// The planning library carries this change through its shadow-table
+		// engine, but SchemaBot does not drive that engine yet, so the
+		// statement is blocked in SchemaBot's words rather than reported as
+		// vocabulary that moved.
+		if statement.Backend == router.BackendCopyAndSwap {
+			return blocked(fmt.Sprintf("statement for table %q requires copy-and-swap, which SchemaBot's PostgreSQL support does not run yet", table))
+		}
 		// Execute on anything but the native route with native steps is a
 		// route or backend this build does not run, or a plan with nothing
 		// to run; the disposition itself is known, so the shape is what the

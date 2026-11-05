@@ -1860,12 +1860,25 @@ type ProgressOperationResponse struct {
 	// apply was created, because its target already held the change and
 	// nothing ran there.
 	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// EndedBy is set on a failed operation that did not fail on its own: it
+	// waited at a deferred cutover that another operation's end meant could
+	// never run, so SchemaBot stopped it, saved its copy, and failed it. It
+	// names that other operation of the same apply.
+	EndedBy *ProgressOperationRef `json:"ended_by,omitempty"`
 	// RolloutStep is the table step this operation runs, numbered from 1, when
 	// the rollout runs table by table: one operation per target and table.
 	// Omitted for an operation that runs its member's whole change.
 	RolloutStep int    `json:"rollout_step,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+}
+
+// ProgressOperationRef names one operation of an apply by its deployment and
+// operation key, which together identify it. An empty reference ({}) says the
+// operation was failed for another whose row the apply no longer lists.
+type ProgressOperationRef struct {
+	Deployment   string `json:"deployment,omitempty"`
+	OperationKey string `json:"operation_key,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

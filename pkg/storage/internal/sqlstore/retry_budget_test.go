@@ -83,7 +83,7 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 		insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.Completed, maxRecoveryAttempts, 0)
 		shardB := insertOperationAtAttempt(t, store, apply, "region-b", state.ApplyOperation.FailedRetryable, 0, 0)
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "a failed_retryable shard with retries left keeps the apply alive")
 
@@ -118,7 +118,7 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "an operation that spent its budget is not redispatched")
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, apply.ID, expired[0].Apply.ID)
@@ -127,28 +127,32 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 
 	// A drive that failed back to failed_retryable hands its lease back on
 	// shutdown. The failure time is what the backoff counts from, so the
-	// handback leaves it in place and the next redispatch still waits.
-	t.Run("handing a failed operation back keeps its backoff", func(t *testing.T) {
-		ctx := t.Context()
-		store := newStore(t)
-		lock := createTestLock(t, store, "retry_handback_db", storage.DatabaseTypeMySQL)
-		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retry_handback", 1, state.Apply.FailedRetryable, "staging")
-		id := insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.FailedRetryable, 2, 0)
-		insertOperationAtAttempt(t, store, apply, "region-b", state.ApplyOperation.WaitingForCutover, 0, 0)
-		_, err := store.db.ExecContext(ctx,
-			"UPDATE apply_operations SET lease_owner = 'driver-a', lease_token = 'token-a', lease_acquired_at = NOW() WHERE id = ?", id)
-		require.NoError(t, err)
+	// handback leaves it in place and the next redispatch still waits, both
+	// when the whole apply awaits a retry and when a degraded rollout holds the
+	// apply open over the paused operation.
+	for _, parentState := range redispatchParentStates() {
+		t.Run("handing a failed operation back keeps its backoff under a "+parentState+" apply", func(t *testing.T) {
+			ctx := t.Context()
+			store := newStore(t)
+			lock := createTestLock(t, store, "retry_handback_db", storage.DatabaseTypeMySQL)
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retry_handback", 1, parentState, "staging")
+			id := insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.FailedRetryable, 2, 0)
+			insertOperationAtAttempt(t, store, apply, "region-b", state.ApplyOperation.WaitingForCutover, 0, 0)
+			_, err := store.db.ExecContext(ctx,
+				"UPDATE apply_operations SET lease_owner = 'driver-a', lease_token = 'token-a', lease_acquired_at = NOW() WHERE id = ?", id)
+			require.NoError(t, err)
 
-		released, err := store.ApplyOperations().ReleaseClaim(ctx, storage.OperationLease{
-			ApplyID: apply.ID, OperationID: id, Owner: "driver-a", Token: "token-a",
+			released, err := store.ApplyOperations().ReleaseClaim(ctx, storage.OperationLease{
+				ApplyID: apply.ID, OperationID: id, Owner: "driver-a", Token: "token-a",
+			})
+			require.NoError(t, err)
+			require.True(t, released)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+			require.NoError(t, err)
+			assert.Nil(t, claimed, "the handed-back operation still waits out its backoff")
 		})
-		require.NoError(t, err)
-		require.True(t, released)
-
-		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
-		require.NoError(t, err)
-		assert.Nil(t, claimed, "the handed-back operation still waits out its backoff")
-	})
+	}
 
 	// A driver crashed part-way through a retry its parent had already
 	// admitted: the parent is running with a stale heartbeat and the operation

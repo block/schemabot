@@ -1563,6 +1563,14 @@ type ApplyOperation struct {
 	// a member's whole change.
 	RolloutStep int
 
+	// EndedByOperationID names the sibling operation whose failure ended this
+	// one, or 0 when it ended on its own outcome. It is set when an apply that
+	// deferred its cutover fails because one operation ended before the
+	// cutover: SchemaBot stops the operations still waiting and settles them
+	// failed, and this records which sibling they failed for. Their tasks stay
+	// stopped, because the work they did is saved and a new apply resumes it.
+	EndedByOperationID int64
+
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 
@@ -2058,18 +2066,91 @@ func (r *ApplyControlRequest) CutoverOperationIDs() ([]int64, error) {
 	return nil, nil
 }
 
+// cutoverOutcomeUnknownSinceMetadataKey records when a cutover request's
+// outcome became unknown: a send whose answer was lost may have started the
+// cutover. Its value is an object keyed by the decimal apply_operation id the
+// send was for, "0" for a request not bound to an operation, each holding the
+// moment that operation's send first lost its answer. A request bound to a
+// set of operations is sent once per member, so the stamps are kept apart:
+// one member's lost answer says nothing about another member's first send. It
+// lives on the request row, so it outlasts the drive that sent the request
+// and is cleared when the row is re-armed for a new command.
+const cutoverOutcomeUnknownSinceMetadataKey = "outcome_unknown_since"
+
+// cutoverOutcomeUnknownStamps decodes the per-operation stamps under
+// cutoverOutcomeUnknownSinceMetadataKey from the request's metadata, and
+// returns the remaining metadata fields so a stamp can be written back
+// without losing them.
+func (r *ApplyControlRequest) cutoverOutcomeUnknownStamps() (map[string]json.RawMessage, map[string]time.Time, error) {
+	fields := map[string]json.RawMessage{}
+	stamps := map[string]time.Time{}
+	if r == nil || len(r.Metadata) == 0 {
+		return fields, stamps, nil
+	}
+	if err := json.Unmarshal(r.Metadata, &fields); err != nil {
+		return nil, nil, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	raw, ok := fields[cutoverOutcomeUnknownSinceMetadataKey]
+	if !ok {
+		return fields, stamps, nil
+	}
+	if err := json.Unmarshal(raw, &stamps); err != nil {
+		return nil, nil, fmt.Errorf("parse %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
+	}
+	return fields, stamps, nil
+}
+
+// CutoverOutcomeUnknownSince returns when the request's send for operationID
+// (0 for a request not bound to an operation) first lost its answer, or the
+// zero time when no send for that operation has.
+func (r *ApplyControlRequest) CutoverOutcomeUnknownSince(operationID int64) (time.Time, error) {
+	_, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return stamps[strconv.FormatInt(operationID, 10)], nil
+}
+
+// WithCutoverOutcomeUnknownSince returns the request's metadata with since
+// recorded as the moment its send for operationID (0 for a request not bound
+// to an operation) lost its answer, keeping every other key and every other
+// operation's stamp.
+func (r *ApplyControlRequest) WithCutoverOutcomeUnknownSince(operationID int64, since time.Time) ([]byte, error) {
+	fields, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return nil, err
+	}
+	stamps[strconv.FormatInt(operationID, 10)] = since.UTC()
+	raw, err := json.Marshal(stamps)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
+	}
+	fields[cutoverOutcomeUnknownSinceMetadataKey] = raw
+	metadata, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return metadata, nil
+}
+
 // ForwardingControlRequestCaller is the requester recorded for a control
 // request that reached this plane over the data-plane RPC boundary. The control
 // RPCs carry no operator identity, so this names the path the request arrived
 // on rather than the person who issued it.
 const ForwardingControlRequestCaller = "tern-grpc"
 
+// EndedOperationStopCaller is the requester recorded for the stop SchemaBot
+// itself requests on an apply that deferred its cutover when one of its
+// operations ends before the cutover. No operator issued it, so it names
+// SchemaBot.
+const EndedOperationStopCaller = "schemabot"
+
 // ControlRequestNamesAnOperator reports whether a requester identifies the
 // operator who issued the command. Only such a value is worth showing in the
 // PR notice, whose whole purpose is telling an operator which of their commands
 // did not take effect.
 func ControlRequestNamesAnOperator(requestedBy string) bool {
-	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller
 }
 
 // IsMirroredRemoteRejection reports whether this row exists only to carry

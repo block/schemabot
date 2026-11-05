@@ -69,7 +69,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
 	var reservedWake chan struct{}
-	if deferredCutoverDrivers(driverCount) < driverCount {
+	if storage.DeferredCutoverDrivers(driverCount) < driverCount {
 		reservedWake = make(chan struct{}, 1)
 	}
 	driverCtx, cancel := tern.NewOperatorContext(ctx)
@@ -126,6 +126,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 	s.maintenanceWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, expiryEvery, "ended operation", s.runEndedOperationPass)
+	})
+	s.maintenanceWg.Go(func() {
 		s.operatorHeartbeatLoop(driverCtx, stop, heartbeatEvery, server)
 	})
 	if pass, ok := s.branchReconcilePass(); ok {
@@ -140,7 +143,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// to the default in storage. Log the resolved cap beside the pool size.
 	s.logger.Info("operator started",
 		"drivers", driverCount,
-		"deferred_cutover_drivers", deferredCutoverDrivers(driverCount),
+		"deferred_cutover_drivers", storage.DeferredCutoverDrivers(driverCount),
 		"server_id", server.ServerID,
 		"heartbeat_interval", heartbeatEvery,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
@@ -1037,15 +1040,6 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan 
 // A pod with a single driver reserves nothing, so its only driver can still
 // run a deferred apply.
 const reservedDriverID = 0
-
-// deferredCutoverDrivers reports how many of a pool of drivers may run work
-// for an apply deferring its cutover.
-func deferredCutoverDrivers(drivers int) int {
-	if drivers < 2 {
-		return drivers
-	}
-	return drivers - 1
-}
 
 // operationClaimOptions returns the filter driverID's operation claims run
 // under: the reserved driver skips deferred-cutover work (see reservedDriverID).
@@ -2540,6 +2534,15 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger
 		return fmt.Errorf("load pending stop request for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
 	}
 	if controlReq == nil {
+		return nil
+	}
+	// The stop SchemaBot records for an ended operation marks the apply as the
+	// ended-operation settle's, which fails the apply and then answers the
+	// stop. Completing it here would leave the apply open with nothing to
+	// settle it.
+	if controlReq.RequestedBy == storage.EndedOperationStopCaller {
+		logger.Debug("operator: leaving SchemaBot's stop for an ended operation to the settle that fails the apply",
+			apply.LogAttrs()...)
 		return nil
 	}
 

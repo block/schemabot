@@ -638,7 +638,7 @@ permission levels, called **tiers** in configuration and logs:
 | Access | Operations |
 |---|---|
 | Read | List databases, pull live schemas, view stored plans, status, progress, logs, history, and locks |
-| Write | Create plans, apply changes, stop or resume work, cut over, cancel, revert, skip revert, roll back, acquire or release locks, change settings, run check or webhook maintenance, and inspect or converge SchemaBot's own storage schema |
+| Write | Create plans, apply changes, stop or resume work, run a cutover, cancel, revert, skip revert, roll back, acquire or release locks, change settings, run check or webhook maintenance, and inspect or converge SchemaBot's own storage schema |
 
 Creating a plan requires write access because it stages a change. Reading a
 plan that already exists requires only read access.

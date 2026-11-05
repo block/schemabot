@@ -2913,6 +2913,42 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, 1, held.Attempt)
 	})
 
+	// region-a halt-failed and region-b paused on a retryable failure, so the
+	// projection holds the apply at running_degraded. Claiming region-b's row
+	// is a deliberate retry: the row moves to running, spends one attempt of
+	// its own budget, and the apply records that attempt. A second driver sees
+	// a running row under a fresh lease and leaves it alone.
+	t.Run("FailedRetryableRedispatch_DegradedRollout", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_redispatch_degraded_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_operation_redispatch_degraded", 914, state.Apply.RunningDegraded, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+		})
+		require.NoError(t, err)
+		retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable, ErrorMessage: "data plane unavailable",
+		})
+		require.NoError(t, err)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the paused deployment under a degraded rollout is redispatched")
+		assert.Equal(t, retryID, claimed.ID)
+		assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+		assert.Equal(t, 1, claimed.Attempt)
+
+		reloaded, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, 1, reloaded.Attempt, "the apply records the deployment's attempt")
+
+		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, second, "a running row under a fresh lease is not re-claimed")
+	})
+
 	// An operator stops or cancels an apply while its shards wait out their
 	// redispatch backoff. Only the drive a redispatch starts delivers the
 	// request to a failed shard, so the request claims one at once rather than
