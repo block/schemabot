@@ -119,12 +119,11 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 			s.writeError(w, http.StatusInternalServerError, "failed to list apply operations")
 			return
 		}
-		ids, ok := storage.LogOperationsOnTarget(ops, target)
-		if !ok {
+		operationIDs = storage.LogOperationsOnTarget(ops, target)
+		if len(operationIDs) == 0 {
 			s.writeError(w, http.StatusBadRequest, targetNotInApplyMessage(apply, ops, target))
 			return
 		}
-		operationIDs = ids
 	}
 
 	logs, err := s.storage.ApplyLogs().List(r.Context(), storage.ApplyLogFilter{
@@ -198,25 +197,11 @@ func clampLogWindow[T any](logs []T, limit int) ([]T, bool) {
 // targetNotInApplyMessage names the targets the apply does run on, so a
 // mistyped target can be corrected from the error alone.
 func targetNotInApplyMessage(apply *storage.Apply, ops []*storage.ApplyOperation, target string) string {
-	targets := operationTargets(ops)
+	targets := storage.DistinctOperationTargets(ops)
 	if len(targets) == 0 {
 		return fmt.Sprintf("apply %q has no per-target operations; omit target", apply.ApplyIdentifier)
 	}
 	return fmt.Sprintf("target %q has no operations in apply %q; its targets are %s", target, apply.ApplyIdentifier, strings.Join(targets, ", "))
-}
-
-// operationTargets lists the distinct targets of ops in sorted order.
-func operationTargets(ops []*storage.ApplyOperation) []string {
-	seen := make(map[string]bool, len(ops))
-	var targets []string
-	for _, op := range ops {
-		if op.Target != "" && !seen[op.Target] {
-			seen[op.Target] = true
-			targets = append(targets, op.Target)
-		}
-	}
-	sort.Strings(targets)
-	return targets
 }
 
 type deploymentLogFetch struct {
@@ -331,8 +316,8 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 				onDeployment = append(onDeployment, op)
 			}
 		}
-		if _, ok := storage.LogOperationsOnTarget(onDeployment, target); !ok {
-			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("target %q has no operations on deployment %q in apply %q; its targets there are %s", target, deployment, apply.ApplyIdentifier, strings.Join(operationTargets(onDeployment), ", ")))
+		if len(storage.LogOperationsOnTarget(onDeployment, target)) == 0 {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("target %q has no operations on deployment %q in apply %q; its targets there are %s", target, deployment, apply.ApplyIdentifier, strings.Join(storage.DistinctOperationTargets(onDeployment), ", ")))
 			return
 		}
 		// Narrow after grouping, not before: grouping reads the apply's own
