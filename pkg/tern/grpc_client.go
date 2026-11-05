@@ -711,8 +711,16 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 
 		if state.IsTerminalApplyState(apply.State) {
 			obs.OnTerminal(apply, tasks)
-			c.clearObserver(applyID)
-			return
+			// Starting a stopped apply registers a new observer, which can land
+			// while OnTerminal is still publishing the stop. That registration
+			// found this poller running and started none of its own, so clear
+			// only the observer just notified and keep driving a replacement.
+			if c.clearObserverIfCurrent(applyID, obs) {
+				return
+			}
+			c.applyLogger(apply).Info("observer poll: observer replaced during its terminal update; continuing with the replacement",
+				apply.MutableLogAttrs()...)
+			continue
 		}
 
 		obs.OnProgress(apply, tasks)

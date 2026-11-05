@@ -10759,3 +10759,98 @@ func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 		}
 	}
 }
+
+// switchableApplyStore serves one apply whose state a test changes while a
+// poller reads it.
+type switchableApplyStore struct {
+	storage.ApplyStore
+	mu    sync.Mutex
+	apply storage.Apply
+}
+
+func (s *switchableApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	apply := s.apply
+	return &apply, nil
+}
+
+// switchableStorage serves a switchableApplyStore in place of the mock store.
+type switchableStorage struct {
+	*mockStorage
+	applies *switchableApplyStore
+}
+
+func (s *switchableStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *switchableApplyStore) setState(applyState string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apply.State = applyState
+}
+
+// blockingTerminalObserver holds OnTerminal until released, standing in for a
+// comment observer still publishing its terminal comment and Check Run.
+type blockingTerminalObserver struct {
+	entered  chan struct{}
+	release  chan struct{}
+	progress atomic.Int32
+	terminal atomic.Int32
+}
+
+func newBlockingTerminalObserver() *blockingTerminalObserver {
+	return &blockingTerminalObserver{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (o *blockingTerminalObserver) OnProgress(*storage.Apply, []*storage.Task) {
+	o.progress.Add(1)
+}
+
+func (o *blockingTerminalObserver) OnTerminal(*storage.Apply, []*storage.Task) {
+	o.terminal.Add(1)
+	select {
+	case o.entered <- struct{}{}:
+	default:
+	}
+	<-o.release
+}
+
+// Starting a stopped apply registers a new observer for it while the stopped
+// observer may still be publishing its terminal update. The poll loop that
+// delivered the stop must hand the apply to the new observer rather than
+// clear it: the new registration started no poller of its own, so clearing it
+// leaves the resumed apply with no progress or terminal updates at all.
+func TestObserverPollKeepsAnObserverRegisteredDuringTerminal(t *testing.T) {
+	const applyID int64 = 78
+	applies := &switchableApplyStore{apply: storage.Apply{
+		ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
+	}}
+	client := &GRPCClient{
+		storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
+		observerPollInterval: 10 * time.Millisecond,
+	}
+
+	stopped := newBlockingTerminalObserver()
+	client.SetObserver(applyID, stopped)
+	select {
+	case <-stopped.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stopped apply never reached its observer's OnTerminal")
+	}
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	applies.setState(state.Apply.Running)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond,
+		"the resumed apply's observer must receive progress")
+
+	applies.setState(state.Apply.Completed)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond,
+		"the resumed apply's observer must receive its terminal update and then be cleared")
+	assert.Equal(t, int32(1), stopped.terminal.Load(), "the stopped observer's terminal update runs once")
+}
