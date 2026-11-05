@@ -1519,6 +1519,138 @@ func TestCheckReviewGate_SharedEarlierApprovalBlocksAndComparesOnce(t *testing.T
 	assert.Equal(t, []string{reviewGateApproved, reviewGateTestHeadSHA}, reads.comparedCommits())
 }
 
+// An operator approved an earlier commit and the PR has since changed its
+// schema file. The instance turns re-approval off, so the approval still
+// counts and the gate reads nothing from GitHub to compare the commits or to
+// learn the base branch's rules.
+// The PR author's own approval and an approval the reviewer later withdrew or
+// GitHub dismissed still do not count.
+func TestCheckReviewGate_EarlierApprovalCountsWithoutReapproval(t *testing.T) {
+	earlier := func(user, state string, at time.Time) *gh.PullRequestReview {
+		return &gh.PullRequestReview{User: &gh.User{Login: new(user)}, State: new(state), SubmittedAt: &gh.Timestamp{Time: at}, CommitID: new(reviewGateApproved)}
+	}
+	now := time.Now()
+	for _, tt := range []struct {
+		name         string
+		reviews      []*gh.PullRequestReview
+		want         bool
+		unauthorized []string
+	}{
+		{
+			name:    "an operator's approval of an earlier commit counts",
+			reviews: []*gh.PullRequestReview{earlier("bob", ghclient.ReviewApproved, now)},
+			want:    true,
+		},
+		{
+			name:    "the author's own approval does not count",
+			reviews: []*gh.PullRequestReview{earlier("alice", ghclient.ReviewApproved, now)},
+		},
+		{
+			name: "an approval GitHub dismissed does not count",
+			reviews: []*gh.PullRequestReview{
+				earlier("bob", ghclient.ReviewApproved, now.Add(-time.Minute)),
+				earlier("bob", ghclient.ReviewDismissed, now),
+			},
+		},
+		{
+			name: "an approval followed by a request for changes does not count",
+			reviews: []*gh.PullRequestReview{
+				earlier("bob", ghclient.ReviewApproved, now.Add(-time.Minute)),
+				earlier("bob", ghclient.ReviewChangesRequested, now),
+			},
+		},
+		{
+			name:         "an approval from someone who cannot approve the database does not count",
+			reviews:      []*gh.PullRequestReview{earlier("mallory", ghclient.ReviewApproved, now)},
+			unauthorized: []string{"mallory"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+				cfg.ReviewPolicy.RequireReapproval = new(false)
+				db := cfg.Databases["orders"]
+				db.OperatorUsers = []string{"alice", "bob"}
+				cfg.Databases["orders"] = db
+			}))
+			registerPREndpoint(mux, "alice")
+			registerReviewsEndpoint(mux, tt.reviews)
+			reads := registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+			registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+				reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+				reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"},
+				reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
+			})
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
+
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tt.want, result.Approved)
+			assert.Equal(t, tt.unauthorized, result.UnauthorizedApprovers)
+			assert.Empty(t, result.UnauthorizedEarlierApprovers, "without re-approval, joining a team is enough for an approval of an earlier commit to count")
+			assert.Empty(t, result.ChangedApprovers, "without re-approval no approval is ruled out for a changed schema change")
+			assert.Empty(t, result.ChangedPaths)
+			assert.Zero(t, reads.refs.Load(), "without re-approval the gate does not compare commits")
+			assert.Empty(t, reads.comparedCommits())
+		})
+	}
+}
+
+// The instance turns re-approval off, and one database turns it on with its
+// own review_policy. An approval of an earlier commit with a different schema
+// change no longer counts for that database and names the reviewer, while the
+// same approval still counts for another database on the instance.
+func TestCheckReviewGate_DatabaseRequiresReapproval(t *testing.T) {
+	cfg := reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.RequireReapproval = new(false)
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		db.ReviewPolicy = api.DatabaseReviewPolicyConfig{RequireReapproval: new(true)}
+		cfg.Databases["orders"] = db
+		cfg.Databases["payments"] = api.DatabaseConfig{Type: "mysql", OperatorUsers: []string{"bob"}}
+	})
+	setup := func(t *testing.T) (*Handler, *ghclient.InstallationClient, *reviewGateBaseReads) {
+		t.Helper()
+		h, mux := setupReviewGateHandler(t, cfg)
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+		})
+		reads := registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+			reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+			reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"},
+			reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
+		})
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+		return h, client, reads
+	}
+
+	t.Run("the opted-in database needs a new approval", func(t *testing.T) {
+		h, client, reads := setup(t)
+		result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.False(t, result.Approved)
+		assert.Equal(t, []string{"bob"}, result.ChangedApprovers)
+		assert.Equal(t, []string{"schema/testdb/orders.sql"}, result.ChangedPaths)
+		assert.Equal(t, []string{reviewGateApproved, reviewGateTestHeadSHA}, reads.comparedCommits())
+	})
+
+	t.Run("another database keeps the approval", func(t *testing.T) {
+		h, client, reads := setup(t)
+		schema := reviewGateSchema("schema/payments", reviewGateTestHeadSHA)
+		schema.Database = "payments"
+		result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", schema)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.True(t, result.Approved)
+		assert.Zero(t, reads.refs.Load())
+	})
+}
+
 // Two approvals are on the PR and neither counts: an operator approved an
 // earlier commit whose schema change differs from the head, and a reviewer
 // outside the operators approved the head. The result names each reviewer
@@ -1551,6 +1683,156 @@ func TestCheckReviewGate_NamesUnauthorizedAndChangedApprovers(t *testing.T) {
 	assert.Equal(t, []string{"dave"}, result.UnauthorizedApprovers)
 	assert.Equal(t, []string{"dave"}, result.UnauthorizedEarlierApprovers, "dave approved an earlier commit, so joining a team alone would not unblock the apply")
 	assert.Equal(t, []string{"bob"}, result.ChangedApprovers)
+}
+
+// branchRuleReads serves the base branch's rulesets and classic review
+// protection for main and counts the reads of each.
+type branchRuleReads struct {
+	rules, protection atomic.Int32
+}
+
+// registerBranchRules serves main's branch rules. rulesetDismisses puts a
+// ruleset on main that dismisses stale approvals. protectionStatus is the
+// status the classic review protection read answers with; on 200 it reports
+// protectionDismisses. rulesStatus other than 200 fails the ruleset read.
+func registerBranchRules(t *testing.T, mux *http.ServeMux, rulesStatus int, rulesetDismisses bool, protectionStatus int, protectionDismisses bool) *branchRuleReads {
+	t.Helper()
+	reads := &branchRuleReads{}
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/main", func(w http.ResponseWriter, _ *http.Request) {
+		reads.rules.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if rulesStatus != http.StatusOK {
+			w.WriteHeader(rulesStatus)
+			_, _ = w.Write([]byte(`{"message":"rules unavailable"}`))
+			return
+		}
+		rules := []map[string]any{}
+		if rulesetDismisses {
+			rules = append(rules, map[string]any{
+				"type":       "pull_request",
+				"parameters": map[string]any{"dismiss_stale_reviews_on_push": true, "required_approving_review_count": 1},
+			})
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(rules))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/branches/main/protection/required_pull_request_reviews", func(w http.ResponseWriter, _ *http.Request) {
+		reads.protection.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if protectionStatus != http.StatusOK {
+			w.WriteHeader(protectionStatus)
+			_, _ = w.Write([]byte(`{"message":"protection unavailable"}`))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"dismiss_stale_reviews": protectionDismisses}))
+	})
+	return reads
+}
+
+// An operator approved an earlier commit and the PR has since changed its
+// schema file. Neither the instance nor the database sets
+// require_reapproval, so the gate follows the PR's base branch. When the
+// branch's rules dismiss stale approvals, GitHub has already removed every
+// approval a later commit made stale, so the approval counts without a
+// comparison. When they do not, or SchemaBot cannot read them, the gate
+// compares the commits and asks for a new approval, as it does when
+// re-approval is required.
+func TestCheckReviewGate_ReapprovalFollowsBaseBranch(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		rulesStatus         int
+		rulesetDismisses    bool
+		protectionStatus    int
+		protectionDismisses bool
+		wantApproved        bool
+		wantProtectionReads int32
+	}{
+		{name: "a ruleset that dismisses stale approvals keeps the approval", rulesStatus: http.StatusOK, rulesetDismisses: true, protectionStatus: http.StatusOK, wantApproved: true},
+		{name: "classic protection that dismisses stale approvals keeps the approval", rulesStatus: http.StatusOK, protectionStatus: http.StatusOK, protectionDismisses: true, wantApproved: true, wantProtectionReads: 1},
+		{name: "rules that do not dismiss stale approvals need a new approval", rulesStatus: http.StatusOK, protectionStatus: http.StatusOK, wantProtectionReads: 1},
+		{name: "an unprotected branch needs a new approval", rulesStatus: http.StatusOK, protectionStatus: http.StatusNotFound, wantProtectionReads: 1},
+		{name: "protection the App cannot read needs a new approval", rulesStatus: http.StatusOK, protectionStatus: http.StatusForbidden, wantProtectionReads: 1},
+		{name: "rules the App cannot read need a new approval", rulesStatus: http.StatusForbidden, protectionStatus: http.StatusOK, protectionDismisses: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+				cfg.ReviewPolicy.RequireReapproval = nil
+				db := cfg.Databases["orders"]
+				db.OperatorUsers = []string{"bob"}
+				cfg.Databases["orders"] = db
+			}))
+			registerPREndpoint(mux, "alice")
+			registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+				{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+			})
+			branchRules := registerBranchRules(t, mux, tt.rulesStatus, tt.rulesetDismisses, tt.protectionStatus, tt.protectionDismisses)
+			reads := registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+			registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+				reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+				reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"},
+				reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
+			})
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
+
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantApproved, result.Approved)
+			assert.Equal(t, int32(1), branchRules.rules.Load(), "the gate reads the base branch's rulesets once")
+			assert.Equal(t, tt.wantProtectionReads, branchRules.protection.Load(), "classic protection is read only when no ruleset dismisses stale approvals")
+			if tt.wantApproved {
+				assert.Empty(t, reads.comparedCommits(), "GitHub dismisses stale approvals, so the gate does not compare the commits")
+				return
+			}
+			assert.Equal(t, []string{"bob"}, result.ChangedApprovers)
+			assert.Equal(t, []string{reviewGateApproved, reviewGateTestHeadSHA}, reads.comparedCommits())
+		})
+	}
+}
+
+// The base branch's rules are read only for an approval on an earlier
+// commit, and not when require_reapproval decides the rule: an approval on
+// the head counts without them, and an explicit setting overrides them.
+func TestCheckReviewGate_ReapprovalReadsBaseBranchOnlyWhenNeeded(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		setting      *bool
+		commit       string
+		wantApproved bool
+	}{
+		{name: "an approval on the head", commit: reviewGateTestHeadSHA, wantApproved: true},
+		{name: "re-approval required compares even when GitHub dismisses stale approvals", setting: new(true), commit: reviewGateApproved},
+		{name: "re-approval not required keeps the approval", setting: new(false), commit: reviewGateApproved, wantApproved: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+				cfg.ReviewPolicy.RequireReapproval = tt.setting
+				db := cfg.Databases["orders"]
+				db.OperatorUsers = []string{"bob"}
+				cfg.Databases["orders"] = db
+			}))
+			registerPREndpoint(mux, "alice")
+			registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+				{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(tt.commit)},
+			})
+			branchRules := registerBranchRules(t, mux, http.StatusOK, true, http.StatusOK, true)
+			registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+			registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+				reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+				reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"},
+				reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
+			})
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
+
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantApproved, result.Approved)
+			assert.Zero(t, branchRules.rules.Load())
+			assert.Zero(t, branchRules.protection.Load())
+		})
+	}
 }
 
 // The PR retargets a namespace symlink under the database's schema path after
@@ -2357,9 +2639,13 @@ func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
 	assert.NotContains(t, err.Error(), "CODEOWNERS")
 }
 
+// reviewGateTestConfig turns the review gate on with re-approval required,
+// since most tests here cover the comparison of an earlier approval with the
+// head. Tests of the other re-approval rules set RequireReapproval
+// themselves.
 func reviewGateTestConfig(opts ...func(*api.ServerConfig)) *api.ServerConfig {
 	cfg := actorAuthTestConfig(false)
-	cfg.ReviewPolicy = api.ReviewPolicyConfig{Enabled: true}
+	cfg.ReviewPolicy = api.ReviewPolicyConfig{Enabled: true, RequireReapproval: new(true)}
 	for _, opt := range opts {
 		opt(cfg)
 	}
