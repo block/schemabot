@@ -811,8 +811,12 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	var targetApply *storage.Apply
 	if req.ApplyId != "" {
 		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if err != nil || apply == nil {
-			return nil, fmt.Errorf("apply %s not found", req.ApplyId)
+		if err != nil {
+			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, err)
+		}
+		if apply == nil {
+			c.logger.Warn("stop rejected because the requested apply does not exist", "apply_id", req.ApplyId, "database", c.config.Database)
+			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, storage.ErrApplyNotFound)
 		}
 		targetApplyID = apply.ID
 		targetApply = apply

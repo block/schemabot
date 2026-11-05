@@ -1301,6 +1301,7 @@ func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deploy
 
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
+	"expire_degraded_retry_error":              true,
 	"stranded_reaper_error":                    true,
 	"stranded_task_reaper_error":               true,
 	"stranded_active_task_reaper_error":        true,
