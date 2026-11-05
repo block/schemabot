@@ -3,6 +3,7 @@
 package pendingdrops
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -249,6 +250,53 @@ func TestCleaner_DropFailureReturnsError(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, recorded, 1, "the record of a copy that is still there is kept")
 	assert.Equal(t, expired, recorded[0].QuarantineTable)
+}
+
+// stuckReleaseLocker takes and reports the lock through the real MySQL locker
+// but never answers a release, as a release sent down a half-open connection
+// is never answered. The lock is therefore still held on the pass's session
+// when the release gives up, and only the pass closing its pool frees it.
+type stuckReleaseLocker struct {
+	namedlock.MySQL
+}
+
+func (stuckReleaseLocker) Release(ctx context.Context, _ *sql.Conn, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// A pass whose release is never answered ends at the release bound rather
+// than pinning the cleaner, and the server frees the cleanup lock once the
+// pass has closed its pool, so the next pass on this target can take it.
+func TestCleaner_PassEndsWhenTheReleaseIsNeverAnswered(t *testing.T) {
+	previous := lockReleaseTimeout
+	lockReleaseTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { lockReleaseTimeout = previous })
+	db := setupCleanerTest(t)
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	target := Target{Database: "testdb", Environment: "staging", DSN: sharedDSN, Locker: stuckReleaseLocker{}}
+	cleaner := NewCleaner([]Target{target}, DefaultRetention, false, logger)
+
+	done := make(chan error, 1)
+	go func() { done <- cleaner.Run(t.Context()) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the cleanup pass did not end at the release bound")
+	}
+	assert.Contains(t, logs.String(), "failed to release pending drops cleanup lock")
+	assert.Contains(t, logs.String(), context.DeadlineExceeded.Error())
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	require.Eventually(t, func() bool {
+		acquired, err := namedlock.MySQL{}.Acquire(t.Context(), conn, targetLockName(target), 0)
+		return err == nil && acquired
+	}, 10*time.Second, 100*time.Millisecond, "the cleanup lock must be free once the pass has closed its pool")
 }
 
 // An unreachable target fails the pass with an error but does not panic; the

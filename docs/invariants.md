@@ -1203,9 +1203,9 @@ stored rows without writing them (`pkg/api/progress_handlers.go`).
 ### OW-9: An advisory lock is only exclusion where the session holds still
 
 Every guarantee SchemaBot has across instances that is not a lease predicate is one advisory
-lock: the storage bootstrap, the apply target lock behind OW-5, and reaper election. All three
-are session-scoped, so all three are exclusion only while a connection keeps reaching the same
-server session.
+lock: the storage bootstrap, the apply target lock behind OW-5, reaper election, and the pending
+drops cleanup lock behind RV-5. All four are session-scoped, so all four are exclusion only while
+a connection keeps reaching the same server session.
 
 That is a property of the connection and not of the lock. It holds against a database, and
 against a pooler that gives a client its own session for the connection's lifetime. It does not

@@ -166,3 +166,36 @@ func TestCleaner_ReleaseIsBoundedAndSurvivesCancellation(t *testing.T) {
 	assert.Contains(t, logs.String(), context.DeadlineExceeded.Error())
 	assert.Contains(t, logs.String(), targetLockName(target))
 }
+
+// notHeldLocker is a namedlock.Locker whose Release answers that the session
+// no longer held the lock, as a server does when the lock was lost to another
+// session.
+type notHeldLocker struct{}
+
+func (notHeldLocker) Acquire(context.Context, *sql.Conn, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (notHeldLocker) Release(context.Context, *sql.Conn, string) (bool, error) {
+	return false, nil
+}
+
+func (notHeldLocker) HeldByAnySession(context.Context, *sql.Conn, string) (bool, error) {
+	return false, nil
+}
+
+// A release that is answered, but answered "not held", is the only sign that
+// another instance may have run against the target during this pass. It is
+// logged as lost ownership, not as a release failure.
+func TestCleaner_ReleaseWarnsWhenTheLockWasNotHeld(t *testing.T) {
+	var logs bytes.Buffer
+	cleaner := NewCleaner(nil, DefaultRetention, false, slog.New(slog.NewTextHandler(&logs, nil)))
+	target := Target{Database: "testdb", Environment: "staging", Locker: notHeldLocker{}}
+
+	cleaner.releaseCleanupLock(t.Context(), target, nil, targetLockName(target))
+
+	assert.Contains(t, logs.String(), "no longer held at release")
+	assert.Contains(t, logs.String(), targetLockName(target))
+	assert.NotContains(t, logs.String(), "failed to release")
+	assert.NotContains(t, logs.String(), context.DeadlineExceeded.Error())
+}
