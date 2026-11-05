@@ -515,12 +515,17 @@ or from one request that covers them all, never by a lookup per file.
 *Breaks if violated:* an App installation's rate limit is shared by every pull request in every
 repository it serves, so routine edits in one large repository use it up and required checks stop
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
-configs, probing each directory once (`pkg/github/config.go`), and
+configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
+(`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
+symlinks from one diff of the change, or from directory listings batched across those paths when
+GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
+the server's configuration names every directory the repository's configs can sit in, and reads a
+symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
-(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
-hundred one-line edits outside its schema directory and requires the same GitHub requests. It
-covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
-a repository whose tree GitHub truncates.
+(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
+one-line edits outside its schema directory and requires the same GitHub requests. It covers an
+auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
+repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
