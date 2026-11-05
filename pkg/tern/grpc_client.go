@@ -3806,9 +3806,10 @@ const (
 	// It says nothing about the data plane.
 	dispatchReadFailed
 	// dispatchUnanswered is a response that names no remote apply and gives
-	// no reason that is known to be permanent. A first dispatch records it as
-	// failed, as it does a refusal. A replay cannot, because the response does
-	// not rule out a remote apply an earlier send created.
+	// no reason for it, such as an acceptance without a remote apply id. A
+	// first dispatch records it as failed, as it does a refusal. A replay
+	// cannot, because the response does not rule out a remote apply an earlier
+	// send created.
 	dispatchUnanswered
 )
 
@@ -3819,19 +3820,6 @@ func classifyRemoteApplyError(err error) dispatchFailure {
 		return dispatchRetryable
 	}
 	return dispatchRefused
-}
-
-// classifyRemoteApplyRejection classifies an Apply response that was not
-// accepted. A named conflict is a refusal: the data plane resolves the
-// idempotency key before it checks for conflicts, so a conflict proves no
-// remote apply carries this dispatch's key. Every other rejection is
-// unanswered, because the same field also carries a data-plane storage read
-// failure that a later send may get past.
-func classifyRemoteApplyRejection(resp *ternv1.ApplyResponse) dispatchFailure {
-	if resp.GetConflict() != nil {
-		return dispatchRefused
-	}
-	return dispatchUnanswered
 }
 
 // settleFailedDispatch records a dispatch that did not attach a remote apply.
@@ -3998,11 +3986,15 @@ func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.App
 	if !resp.Accepted {
 		holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
 		errMsg := remoteApplyRejectionMessage(resp, holderApplyID, "remote apply was not accepted")
-		failure := classifyRemoteApplyRejection(resp)
-		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, failure, errMsg); markErr != nil {
+		// A rejection is a refusal. The data plane resolves the idempotency key
+		// before any check that can reject, and a key that resolves to this
+		// dispatch's operation is answered with its remote apply, so a rejection
+		// proves no remote apply runs this dispatch's work. A storage read that
+		// fails during those checks comes back as a retryable error instead.
+		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, dispatchRefused, errMsg); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}
-		return dispatchError(kind, failure, fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg))
+		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if resp.ApplyId == "" {
 		errMsg := "remote apply accepted without apply_id"

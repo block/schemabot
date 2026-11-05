@@ -428,3 +428,79 @@ func TestDriverCapacityFailsWhenDriverPoolsCannotBeRead(t *testing.T) {
 	assert.Nil(t, capacity)
 	require.NoError(t, client.Health(t.Context()))
 }
+
+// conflictReadFailureStorage serves a stored plan and an unused idempotency
+// key, and fails every read of the database's tasks.
+type conflictReadFailureStorage struct {
+	storage.Storage
+	plan *storage.Plan
+}
+
+func (s conflictReadFailureStorage) Plans() storage.PlanStore {
+	return conflictReadFailurePlanStore{plan: s.plan}
+}
+
+func (conflictReadFailureStorage) Applies() storage.ApplyStore {
+	return conflictReadFailureApplyStore{}
+}
+
+func (conflictReadFailureStorage) Tasks() storage.TaskStore {
+	return conflictReadFailureTaskStore{}
+}
+
+type conflictReadFailurePlanStore struct {
+	storage.PlanStore
+	plan *storage.Plan
+}
+
+func (s conflictReadFailurePlanStore) Get(context.Context, string) (*storage.Plan, error) {
+	return s.plan, nil
+}
+
+type conflictReadFailureApplyStore struct {
+	storage.ApplyStore
+}
+
+func (conflictReadFailureApplyStore) GetByIdempotencyKey(context.Context, string) (*storage.Apply, error) {
+	return nil, nil
+}
+
+type conflictReadFailureTaskStore struct {
+	storage.TaskStore
+}
+
+func (conflictReadFailureTaskStore) GetByDatabase(context.Context, string) ([]*storage.Task, error) {
+	return nil, errors.New("tasks storage unavailable")
+}
+
+func TestServerApplyReportsAFailedConflictReadAsRetryable(t *testing.T) {
+	// A dispatch whose conflict check cannot read the database's active tasks
+	// was never judged, so a later send may succeed. The data plane answers
+	// with a retryable gRPC error rather than a rejection, because the control
+	// plane fails the work on any rejection: a re-sent dispatch could not
+	// otherwise tell a transient storage failure from a refusal that will
+	// never pass.
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: conflictReadFailureStorage{plan: &storage.Plan{
+			PlanIdentifier: "plan-123",
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+		}},
+		logger: slog.Default(),
+	}
+	server := NewServer(client, slog.Default())
+
+	resp, err := server.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:         "plan-123",
+		Database:       "testdb",
+		Type:           storage.DatabaseTypeMySQL,
+		Environment:    "staging",
+		IdempotencyKey: "key-123",
+	})
+	require.Error(t, err)
+	assert.Nil(t, resp, "a failed conflict read is not a rejection")
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "tasks storage unavailable")
+	assert.True(t, isRetryableRemoteApplyError(err), "the control plane retries a failed conflict read")
+}

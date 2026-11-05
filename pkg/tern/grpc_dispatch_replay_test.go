@@ -157,12 +157,6 @@ func TestGRPCClient_LostDispatchReplayWithoutAVerdictLeavesTheWorkUntouched(t *t
 		wantError     string
 	}{
 		{
-			name:          "rejection without a named conflict",
-			applyResponse: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "read active tasks: storage unavailable"},
-			wantSent:      true,
-			wantError:     "read active tasks: storage unavailable",
-		},
-		{
 			name:          "accepted without a remote apply id",
 			applyResponse: &ternv1.ApplyResponse{Accepted: true},
 			wantSent:      true,
@@ -225,9 +219,10 @@ func TestGRPCClient_LostDispatchReplayRefusedFailsClosedWithPendingControlReques
 	// A re-sent dispatch the data plane refuses outright can never succeed as
 	// sent, so the apply fails closed. A failed apply is never claimed again, so
 	// the operator's pending stop and cancel fail with it rather than waiting
-	// forever on a drive that will not come. A named conflict is such a
-	// refusal: the data plane resolves the idempotency key before it checks
-	// for conflicts, so the conflict proves no remote apply carries the key.
+	// forever on a drive that will not come. A rejection is such a refusal,
+	// whether or not it names a conflict: the data plane resolves the
+	// idempotency key before any check that can reject, so a rejection proves
+	// no remote apply runs this work.
 	testCases := []struct {
 		name          string
 		applyErr      error
@@ -247,6 +242,14 @@ func TestGRPCClient_LostDispatchReplayRefusedFailsClosedWithPendingControlReques
 				Conflict:     &ternv1.ApplyConflict{Table: "users", BlockingState: "running"},
 			},
 			wantError: "Table users is held by a schema change",
+		},
+		{
+			name: "rejection without a named conflict",
+			applyResponse: &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: "plan plan-1 has unsafe changes; set allow_unsafe to apply them",
+			},
+			wantError: "plan plan-1 has unsafe changes",
 		},
 	}
 	for _, tc := range testCases {
