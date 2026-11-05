@@ -1030,7 +1030,24 @@ func GetLogs(endpoint, database, environment, applyID, target string, limit int)
 	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
+	if err := requireScopedLogRead(target, result.Target); err != nil {
+		return nil, err
+	}
 	return &result, nil
+}
+
+// requireScopedLogRead refuses a target-scoped read the server answered
+// unscoped. A server that predates scoped reads ignores the target and serves
+// every target's entries interleaved, which would read as the one target's
+// history.
+func requireScopedLogRead(requested, echoed string) error {
+	if requested == "" || echoed == requested {
+		return nil
+	}
+	if echoed == "" {
+		return fmt.Errorf("the server does not support reading one target's logs and returned the whole apply's; upgrade the server or omit --target")
+	}
+	return fmt.Errorf("the server answered a read of target %q with target %q's logs", requested, echoed)
 }
 
 // GetDeploymentLogs retrieves an apply's logs from one data-plane deployment,
@@ -1048,6 +1065,9 @@ func GetDeploymentLogs(endpoint, applyID, deployment, target string, limit int) 
 	}
 	var result apitypes.DeploymentLogsResponse
 	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	if err := requireScopedLogRead(target, result.Target); err != nil {
 		return nil, err
 	}
 	return &result, nil

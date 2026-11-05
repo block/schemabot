@@ -425,6 +425,45 @@ func TestK8sMultiTarget_TwoTableRolloutCompletes(t *testing.T) {
 		assert.True(t, testutil.ColumnExists(t, dsn, "users", "email"), "users.email on %s", mtTargets[i])
 		assert.True(t, indexOn(t, dsn, "orders", "idx_user_id"), "orders.idx_user_id on %s", mtTargets[i])
 	}
+	requireTargetLogsScoped(t, ep, applyID)
+}
+
+// requireTargetLogsScoped reads the finished rollout's log one target at a
+// time. Each read echoes its target and returns part of the whole log, never
+// all of it, since the other targets' operations wrote the rest; and no entry
+// shows up under two targets unless it is about the apply as a whole, which
+// every target's read keeps. A target the rollout never ran on is refused.
+func requireTargetLogsScoped(t *testing.T, endpoint, applyID string) {
+	t.Helper()
+	whole, err := client.GetLogs(endpoint, "", "", applyID, "", 500)
+	require.NoError(t, err)
+	require.False(t, whole.Truncated, "the whole log fits one read")
+	inWhole := make(map[int64]bool, len(whole.Logs))
+	for _, entry := range whole.Logs {
+		inWhole[entry.ID] = true
+	}
+	readBy := make(map[int64]int, len(whole.Logs))
+	for _, target := range mtTargets {
+		scoped, err := client.GetLogs(endpoint, "", "", applyID, target, 500)
+		require.NoError(t, err, "read target %s", target)
+		assert.Equal(t, target, scoped.Target)
+		require.NotEmpty(t, scoped.Logs, "target %s logged its operations", target)
+		assert.Less(t, len(scoped.Logs), len(whole.Logs), "target %s reads only its own entries and the apply's", target)
+		for _, entry := range scoped.Logs {
+			assert.True(t, inWhole[entry.ID], "target %s entry %d is part of the whole log", target, entry.ID)
+			readBy[entry.ID]++
+		}
+	}
+	ownEntries := 0
+	for _, reads := range readBy {
+		if reads == 1 {
+			ownEntries++
+		}
+	}
+	assert.Positive(t, ownEntries, "some entries belong to exactly one target")
+
+	_, err = client.GetLogs(endpoint, "", "", applyID, "dsid-shard-999", 50)
+	require.ErrorContains(t, err, `target "dsid-shard-999" has no operations`)
 }
 
 // A copy of orders on every shard runs long enough to poll. No target starts
