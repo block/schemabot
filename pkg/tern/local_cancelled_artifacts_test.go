@@ -5,10 +5,12 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -57,4 +59,37 @@ func TestSkippedArtifactReleaseReason(t *testing.T) {
 			assert.Equal(t, tt.want, skippedArtifactReleaseReason(tt.err))
 		})
 	}
+}
+
+// A cancel's release reaches only the shards of the tasks it stopped, so a drive
+// that stopped one shard's copy never reclaims a sibling shard's copy, which
+// another drive may still be writing under the same table name. Work that is
+// not divided by shard releases the whole target.
+func TestCancelledArtifactTablesBoundTheReleaseToTheStoppedShards(t *testing.T) {
+	c := &LocalClient{logger: slog.New(slog.DiscardHandler)}
+	apply := &storage.Apply{ID: 7, Database: "orders"}
+	task := func(namespace, table, shard string) *storage.Task {
+		return &storage.Task{ApplyID: apply.ID, Namespace: namespace, TableName: table, Shard: shard}
+	}
+
+	byNamespace := c.cancelledArtifactTables(apply, []*storage.Task{
+		task("orders_sharded", "orders", "80-"),
+		task("orders_sharded", "orders", "-80"),
+		task("orders_sharded", "refunds", "-80"),
+		task("orders_unsharded", "orders_seq", ""),
+	})
+
+	require.Contains(t, byNamespace, "orders_sharded")
+	assert.Equal(t, []string{"orders", "refunds"}, byNamespace["orders_sharded"].tables)
+	assert.Equal(t, []string{"-80", "80-"}, byNamespace["orders_sharded"].targetShards(),
+		"the release names each stopped shard once, in order")
+	require.Contains(t, byNamespace, "orders_unsharded")
+	assert.Empty(t, byNamespace["orders_unsharded"].targetShards(), "work with no shard releases the whole target")
+
+	mixed := c.cancelledArtifactTables(apply, []*storage.Task{
+		task("orders_sharded", "orders", "-80"),
+		task("orders_sharded", "refunds", ""),
+	})
+	assert.Empty(t, mixed["orders_sharded"].targetShards(),
+		"a stopped task that covers the whole target leaves the release unscoped")
 }

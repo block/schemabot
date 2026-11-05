@@ -352,10 +352,18 @@ type CancelledArtifactReleaser interface {
 // schema change artifacts should be reclaimed. Tables are the target's own
 // table names, not the engine's derived ones — deriving those is the engine's
 // job, because only the engine knows how it names them.
+//
+// TargetShards names the shards whose copies the release may reclaim: the
+// shards of the cancelled work this caller drove, which it has already
+// stopped. A sharded engine reclaims nothing on any other shard, because
+// another drive may still be copying there under the same table names. Empty
+// means the whole target, for work that is not divided by shard. An engine
+// whose target has no shards ignores it.
 type ReleaseArtifactsRequest struct {
-	Database    string
-	Tables      []string
-	Credentials *Credentials
+	Database     string
+	Tables       []string
+	TargetShards []string
+	Credentials  *Credentials
 }
 
 // ReleaseArtifactsResult reports what a release reclaimed and what it left

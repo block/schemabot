@@ -37,10 +37,23 @@ const cancelledArtifactReleaseTimeout = 10 * time.Minute
 
 // namespaceArtifacts collects the tables of one schema whose artifacts a
 // release should reclaim, alongside a task from that schema to resolve its
-// credentials from.
+// credentials from, and the tasks whose shards bound the release.
 type namespaceArtifacts struct {
 	task   *storage.Task
 	tables []string
+	tasks  []*storage.Task
+}
+
+// targetShards names the shards the release may reclaim copies on: the shards
+// of the tasks the cancel stopped. A task with no shard covers the whole
+// target, so any such task leaves the release unscoped.
+func (a *namespaceArtifacts) targetShards() []string {
+	for _, task := range a.tasks {
+		if task.Shard == "" {
+			return nil
+		}
+	}
+	return taskTargetShards(a.tasks)
 }
 
 // releaseCancelledArtifacts reclaims the artifacts the cancelled apply left on
@@ -121,10 +134,12 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 		return false, fmt.Errorf("resolve credentials to reclaim artifacts in %s: %w", namespace, err)
 	}
 
+	targetShards := artifacts.targetShards()
 	supported, result, err := engine.ReleaseCancelledArtifacts(ctx, eng, &engine.ReleaseArtifactsRequest{
-		Database:    namespace,
-		Tables:      artifacts.tables,
-		Credentials: creds,
+		Database:     namespace,
+		Tables:       artifacts.tables,
+		TargetShards: targetShards,
+		Credentials:  creds,
 	})
 	if !supported {
 		// The engine's unfinished work lives in the service it drives, which
@@ -136,20 +151,20 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 	// What the release did is recorded before its error is returned: a release
 	// that fails part-way has still moved the copy, and the entry naming where
 	// it went is what an operator follows to recover it.
-	reclaimed := c.recordReleaseResult(ctx, apply, namespace, result)
+	reclaimed := c.recordReleaseResult(ctx, apply, namespace, targetShards, result)
 	if err != nil {
 		return reclaimed, err
 	}
 	if !reclaimed {
 		c.logger.Info("cancelled schema change left no artifacts on the target",
-			append(apply.LogAttrs(), "namespace", namespace, "tables", artifacts.tables)...)
+			append(apply.LogAttrs(), "namespace", namespace, "tables", artifacts.tables, "target_shards", targetShards)...)
 	}
 	return reclaimed, nil
 }
 
 // recordReleaseResult writes what one schema's release reclaimed and retained to
 // the server log and the apply log, and reports whether it reclaimed anything.
-func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace string, result *engine.ReleaseArtifactsResult) bool {
+func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace string, targetShards []string, result *engine.ReleaseArtifactsResult) bool {
 	if result == nil {
 		return false
 	}
@@ -158,6 +173,7 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 		c.logger.Info("reclaimed cancelled schema change artifacts",
 			append(apply.LogAttrs(),
 				"namespace", namespace,
+				"target_shards", targetShards,
 				"preserved", len(result.Preserved),
 				"discarded", len(result.Discarded))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
@@ -172,6 +188,7 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 		c.logger.Warn("cancelled schema change's shared metadata was left on the target",
 			append(apply.LogAttrs(),
 				"namespace", namespace,
+				"target_shards", targetShards,
 				"retained", result.Retained,
 				"reason", result.RetainedReason)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
@@ -216,6 +233,11 @@ func pluralizeTables(count int) string {
 // Each schema has its own credentials, and the engine derives its artifact
 // names from the table names within one schema, so a release is per schema.
 //
+// The tasks are the ones this cancel stopped. A drive holding only its
+// operation's lease passes its own operation's tasks, so the release is bounded
+// to that operation's shards and never reaches a shard a sibling operation's
+// drive may still be copying.
+//
 // Every task counts, whatever state it reached. A task that never started
 // copying has no artifacts and the engine finds nothing for it, while a task
 // the apply believes finished may still have left a swapped-out original
@@ -240,6 +262,7 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 			byNamespace[namespace] = &namespaceArtifacts{task: task}
 		}
 		entry := byNamespace[namespace]
+		entry.tasks = append(entry.tasks, task)
 		if !slices.Contains(entry.tables, task.TableName) {
 			entry.tables = append(entry.tables, task.TableName)
 		}
