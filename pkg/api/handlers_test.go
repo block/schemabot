@@ -6294,7 +6294,7 @@ func TestApplyHandler(t *testing.T) {
 		var resp apitypes.ErrorResponse
 		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 		assert.Equal(t, apitypes.ErrCodeActiveApplyExists, resp.ErrorCode)
-		assert.Contains(t, resp.Error, storage.ErrActiveApplyExists.Error())
+		assert.Equal(t, "apply blocked: another apply is still in progress on this database. Wait for it to finish, then apply again.", resp.Error)
 	})
 
 	t.Run("allows direct stored plans without source metadata", func(t *testing.T) {

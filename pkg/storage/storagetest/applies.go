@@ -1264,6 +1264,11 @@ func TestApplies(t *testing.T, h Harness) {
 		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "a running operation holds its deployment even with no lease on it")
 		assert.Contains(t, err.Error(), "apply_rollout_failed_early", "the refusal names the apply still in progress")
 		assert.Contains(t, err.Error(), "running operation on deployment region-b", "the refusal names the operation keeping it live")
+		conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
+		require.True(t, ok, "the refusal carries the holding apply: %v", err)
+		assert.Equal(t, "apply_rollout_failed_early", conflict.HolderApplyID)
+		assert.Equal(t, state.ApplyOperation.Running, conflict.HolderState, "the rollout holds its targets through its running operation, not its failed verdict")
+		assert.Equal(t, "production", conflict.Environment)
 		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_a_while_running", 9302, "region-a"), storage.ErrActiveApplyExists,
 			"a deployment whose operation failed stays reserved while the rollout is live")
 		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_c_while_running", 9303, "region-c"), storage.ErrActiveApplyExists,

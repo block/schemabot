@@ -1457,7 +1457,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrActiveApplyExists) {
 			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
-			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, activeApplyConflictMessage(err))
 			return
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
@@ -1661,6 +1661,26 @@ func (e *applyStorageError) LogAttrs() []any {
 // nothing refuses the retry, so the caller checks the apply's state first.
 func applyStorageFailedMessage(planID string) string {
 	return fmt.Sprintf("apply failed: storage error while queueing plan %s; see server logs and check for a stored apply before retrying", planID)
+}
+
+// activeApplyConflictMessage tells the operator which apply holds the target
+// and what to do before applying again. The store's own account names internal
+// deployments, so it stays in the server log.
+func activeApplyConflictMessage(err error) string {
+	conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
+	if !ok {
+		return "apply blocked: another apply is still in progress on this database. Wait for it to finish, then apply again."
+	}
+	id := conflict.HolderApplyID
+	where := fmt.Sprintf("on %s in %s", conflict.Database, conflict.Environment)
+	switch {
+	case state.IsState(conflict.HolderState, state.Apply.Stopped):
+		return fmt.Sprintf("apply blocked: %s is stopped %s. Start or cancel it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.WaitingForCutover):
+		return fmt.Sprintf("apply blocked: %s is waiting for its cutover %s. Run its cutover or cancel it, then apply again.", id, where)
+	default:
+		return fmt.Sprintf("apply blocked: %s is still in progress %s. Wait for it to finish, then apply again.", id, where)
+	}
 }
 
 // isApplyCreationStorageRefusal reports whether storing an apply failed with

@@ -132,3 +132,28 @@ var (
 	// ErrWebhookEventLeaseLost is returned when a driver no longer owns a durable webhook event.
 	ErrWebhookEventLeaseLost = errors.New("webhook event lease lost")
 )
+
+// ActiveApplyError reports the apply that already holds a target another apply
+// asked for. It matches ErrActiveApplyExists, and carries the holder's
+// identifier and state so a caller can tell the operator what to do next
+// without presenting the error text.
+type ActiveApplyError struct {
+	// HolderApplyID is the identifier of the apply holding the target.
+	HolderApplyID string
+	// HolderState is the state that keeps the holder on the target: the
+	// apply's own state, or the state of its operation still in progress
+	// when the apply itself has already ended.
+	HolderState string
+	Database    string
+	Environment string
+	// Detail is the store's full account of the conflict, for the log line.
+	Detail string
+}
+
+func (e *ActiveApplyError) Error() string {
+	return e.Detail + ": " + ErrActiveApplyExists.Error()
+}
+
+func (e *ActiveApplyError) Unwrap() error {
+	return ErrActiveApplyExists
+}
