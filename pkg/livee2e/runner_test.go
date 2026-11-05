@@ -168,9 +168,13 @@ func (f *fakeSchemaBot) OpenPullRequests(_ context.Context, prefix string) ([]Pu
 	return out, nil
 }
 
-func (f *fakeSchemaBot) Comments(_ context.Context, number int) ([]Comment, error) {
+func (f *fakeSchemaBot) Comments(ctx context.Context, number int) ([]Comment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		// Like a real client, a cancelled read fails.
+		return nil, fmt.Errorf("list comments on pull request #%d: %w", number, err)
+	}
 	if f.commentsFailures > 0 {
 		f.commentsFailures--
 		return nil, fmt.Errorf("list comments on pull request #%d: %w", number,
