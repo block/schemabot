@@ -69,6 +69,12 @@ type Client struct {
 	// directory configuration to offer.
 	configDirHints ConfigDirHints
 
+	// listenOnlyRepos names the repositories whose GitHub writes the
+	// installation transport refuses to send. Static configuration set at
+	// construction; never mutated afterwards. Nil when every repository may
+	// be written to.
+	listenOnlyRepos ListenOnlyRepos
+
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
 	// failure. lastSlugAttempt is read+written only under this mutex.
@@ -267,7 +273,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		return existing, nil
 	}
 
-	baseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, installationID, c.loadAppSlug))
+	baseTransport := newGitHubRateLimitTransport(newListenOnlyTransport(newGitHubMetricsTransport(http.DefaultTransport, installationID, c.loadAppSlug), c.listenOnlyRepos, installationID, c.loadAppSlug))
 	installationTransport, err := ghinstallation.New(baseTransport, c.appID, installationID, c.privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)

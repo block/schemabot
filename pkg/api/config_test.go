@@ -6610,3 +6610,83 @@ func targetNames(targets ...string) []TargetEntry {
 	}
 	return entries
 }
+
+// A listen-only repository loads from YAML, matches case-insensitively, and
+// never publishes Check Runs; repositories beside it are unaffected.
+func TestLoadServerConfigListenOnlyRepository(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+tern_deployments:
+  default:
+    staging: "tern-staging:9090"
+repos:
+  acme/monorepo:
+    listen_only: true
+  acme/onboarded: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0o644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err, "LoadServerConfigFromFile")
+
+	assert.True(t, cfg.IsRepoListenOnly("acme/monorepo"))
+	assert.True(t, cfg.IsRepoListenOnly("ACME/Monorepo"))
+	assert.False(t, cfg.AreChecksEnabled("acme/monorepo"))
+	assert.False(t, cfg.IsRepoListenOnly("acme/onboarded"))
+	assert.True(t, cfg.AreChecksEnabled("acme/onboarded"))
+	assert.False(t, cfg.IsRepoListenOnly("acme/unlisted"))
+
+	var nilCfg *ServerConfig
+	assert.False(t, nilCfg.IsRepoListenOnly("acme/monorepo"))
+
+	conflicting := strings.Replace(content, "    listen_only: true\n", "    listen_only: true\n    enable_checks: true\n", 1)
+	require.NotEqual(t, content, conflicting)
+	require.NoError(t, os.WriteFile(configPath, []byte(conflicting), 0o644), "write conflicting config file")
+	_, err = LoadServerConfigFromFile(configPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "listen_only cannot be combined with enable_checks: true")
+}
+
+// listen_only cannot be combined with settings that would publish or nudge a
+// check, since a listen-only repository never writes to GitHub.
+func TestValidateListenOnlyRepo(t *testing.T) {
+	enableChecks := true
+	disableChecks := false
+	tests := []struct {
+		name    string
+		config  RepoConfig
+		wantErr string
+	}{
+		{name: "listen-only alone", config: RepoConfig{ListenOnly: true}},
+		{name: "listen-only with checks disabled", config: RepoConfig{ListenOnly: true, EnableChecks: &disableChecks}},
+		{name: "checks enabled without listen-only", config: RepoConfig{EnableChecks: &enableChecks}},
+		{
+			name:    "listen-only with checks enabled",
+			config:  RepoConfig{ListenOnly: true, EnableChecks: &enableChecks},
+			wantErr: `repos "acme/monorepo": listen_only cannot be combined with enable_checks: true`,
+		},
+		{
+			name:    "listen-only aggregate participant",
+			config:  RepoConfig{ListenOnly: true, Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
+			wantErr: `repos "acme/monorepo": listen_only cannot be combined with aggregate`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateListenOnlyRepo("acme/monorepo", tt.config)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}

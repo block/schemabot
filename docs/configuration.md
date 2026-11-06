@@ -1947,6 +1947,29 @@ unlisted repository:
 
 If `repos` is not configured or empty, all repositories are allowed.
 
+### Listen-only repositories
+
+A listen-only repository is one SchemaBot reads from but never writes to. Use it to measure what a repository would cost in GitHub requests before you onboard it. For example, you can point a development deployment at your largest repository and catch a release whose reads grow with pull request size before that release reaches production.
+
+```yaml
+repos:
+  myorg/monorepo:
+    listen_only: true
+```
+
+For a listen-only repository, SchemaBot:
+- processes its webhooks and reads GitHub the same way it does for any other repository;
+- sends no comments, reactions, review requests, or Check Runs;
+- ignores comment commands, so no apply ever starts from the repository. Auto-plan still runs for any database this deployment manages in the repository, but its plan comment and checks are not posted.
+
+The GitHub client refuses every request to the repository that is not a read. It does this in its HTTP transport, below every client method. A write path added later is covered too, so the pull request shows nothing from this deployment.
+
+To read the cost, group `schemabot.github.requests_total` for the repository by `operation`. The client counts each refused write with `status:suppressed`, which shows how much the deployment would have written without counting it as traffic or as an error.
+
+`listen_only` implies `enable_checks: false`. Config load rejects `listen_only` combined with `enable_checks: true` or with an `aggregate` role, because both of those publish checks.
+
+The App's rate limit is shared by every repository it is installed on. A listen-only repository spends the same budget as the repositories the deployment serves.
+
 ## PR Checks Gate
 
 By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR checks are not passing. This prevents applying schema changes on a PR with broken, cancelled, or incomplete CI, linters, or security scans.

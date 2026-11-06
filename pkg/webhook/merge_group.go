@@ -295,6 +295,13 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			targets = append(targets, aggregateCheckTarget{name: aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), env), environment: env})
 		}
 	}
+	// The coverage reads above run as for any repository, so a listen-only
+	// repository still shows what this path costs; only the writes are skipped.
+	if h.isRepoListenOnly(repo) {
+		h.logger.Info("skipping passing aggregate Check Runs on listen-only repository",
+			"repo", repo, "head_sha", headSHA, "operation", content.operation, "checks", len(targets))
+		return nil
+	}
 	for _, target := range targets {
 		opts := ghclient.CheckRunOptions{
 			Name:       target.name,

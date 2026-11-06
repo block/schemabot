@@ -1624,6 +1624,11 @@ const (
 	// operation is a genuine failure (a suspended App installation answers
 	// every token exchange with 404) and stays GitHubRequestStatusError.
 	GitHubRequestStatusNotFound = "not_found"
+	// GitHubRequestStatusSuppressed marks write requests SchemaBot refused to
+	// send because the target repository is configured listen-only. They never
+	// reach GitHub and spend no rate limit, so they show what a deployment
+	// would have written without being mistaken for traffic or errors.
+	GitHubRequestStatusSuppressed = "suppressed"
 	// GitHubRequestStatusTransportError marks requests that never produced an
 	// HTTP response: dials that failed, TLS errors, and requests cut off by a
 	// context deadline. These are the signature of GitHub (or the network path
@@ -1823,6 +1828,7 @@ func isKnownGitHubRequestStatus(status string) bool {
 	case GitHubRequestStatusCancelled,
 		GitHubRequestStatusError,
 		GitHubRequestStatusNotFound,
+		GitHubRequestStatusSuppressed,
 		GitHubRequestStatusTransportError,
 		GitHubRequestStatusSuccess,
 		GitHubRequestStatusUnknown:

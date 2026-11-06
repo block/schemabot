@@ -1233,6 +1233,14 @@ func (h *Handler) effectiveInstallationID(ctx context.Context, payloadID int64) 
 	return 0
 }
 
+// isRepoListenOnly reports whether SchemaBot reads this repository without
+// ever writing to it. The GitHub client refuses every write to such a
+// repository on its own; handlers check this only to skip work whose whole
+// purpose is a write, so the refusal does not show up as an error.
+func (h *Handler) isRepoListenOnly(repo string) bool {
+	return h.service != nil && h.service.Config().IsRepoListenOnly(repo)
+}
+
 // isRepoAllowed reports whether the repository is permitted by config. Mirrors
 // the per-handler allowlist check so repo-webhook dispatch can skip installation
 // resolution for repos this deployment does not manage.
