@@ -2833,12 +2833,16 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 		return nil, fmt.Errorf("build revert request for task %s: %w", task.TaskIdentifier, err)
 	}
 	c.logger.Info("sending revert request to engine", task.LogAttrs()...)
-	if _, err = eng.Revert(ctx, controlReq); err != nil {
+	result, err := eng.Revert(ctx, controlReq)
+	if err != nil {
 		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
 			c.logDeclinedControlOperation(task, "revert", unsupported)
 			return &ternv1.RevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
 		}
 		return nil, fmt.Errorf("revert failed: %w", err)
+	}
+	if refusal, refused := c.engineControlRefusal(task, "revert", result); refused {
+		return &ternv1.RevertResponse{Accepted: false, ErrorMessage: refusal}, nil
 	}
 	c.logger.Info("engine accepted the revert request", task.LogAttrs()...)
 	return &ternv1.RevertResponse{Accepted: true}, nil
@@ -2856,15 +2860,43 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 		return nil, fmt.Errorf("build skip-revert request for task %s: %w", task.TaskIdentifier, err)
 	}
 	c.logger.Info("sending skip-revert request to engine", task.LogAttrs()...)
-	if _, err = eng.SkipRevert(ctx, controlReq); err != nil {
+	result, err := eng.SkipRevert(ctx, controlReq)
+	if err != nil {
 		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
 			c.logDeclinedControlOperation(task, "skip-revert", unsupported)
 			return &ternv1.SkipRevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
 		}
 		return nil, fmt.Errorf("skip revert failed: %w", err)
 	}
+	if refusal, refused := c.engineControlRefusal(task, "skip-revert", result); refused {
+		return &ternv1.SkipRevertResponse{Accepted: false, ErrorMessage: refusal}, nil
+	}
 	c.logger.Info("engine accepted the skip-revert request", task.LogAttrs()...)
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
+}
+
+// engineControlRefusal reads the engine's answer to a revert-window control and
+// returns the refusal reason when the engine did not accept it. A missing
+// result is a refusal too: only an explicit acceptance lets the control be
+// reported as accepted. The engine's own message is the reason when it gave
+// one, so the caller and the durable control request resolve on it.
+func (c *LocalClient) engineControlRefusal(task *storage.Task, operation string, result *engine.ControlResult) (string, bool) {
+	if result == nil {
+		reason := fmt.Sprintf("the engine returned no result for the %s", operation)
+		c.logger.Warn("the engine returned no result for the control operation; it is reported as refused",
+			append(task.LogAttrs(), "operation", operation)...)
+		return reason, true
+	}
+	if !result.Accepted {
+		reason := fmt.Sprintf("the engine did not accept the %s", operation)
+		if result.Message != "" {
+			reason = result.Message
+		}
+		c.logger.Warn("the engine refused the control operation; it is reported as refused",
+			append(task.LogAttrs(), "operation", operation, "error_message", reason)...)
+		return reason, true
+	}
+	return "", false
 }
 
 // logDeclinedControlOperation records an engine declining a control operation
