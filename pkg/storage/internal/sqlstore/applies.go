@@ -950,7 +950,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
 		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), expectedOperationKeys, apply.Engine,
-		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
+		apply.State, storedErrorMessage(apply.ErrorMessage), string(options), apply.Attempt,
 	)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
@@ -1236,7 +1236,7 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
 		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), expectedOperationKeys, apply.Engine,
-		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
+		apply.State, storedErrorMessage(apply.ErrorMessage), string(options), apply.Attempt,
 	)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
@@ -1603,7 +1603,7 @@ func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease
 
 	optionsUpdate := ""
 	args := []any{
-		apply.State, apply.ErrorMessage,
+		apply.State, storedErrorMessage(apply.ErrorMessage),
 		apply.ExternalID,
 	}
 	if len(apply.Options) > 0 {
@@ -1790,7 +1790,7 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 		return false, err
 	}
 
-	args := []any{newState, errorMessage, startedAt, completedAt, applyID, expectedState}
+	args := []any{newState, storedErrorMessage(errorMessage), startedAt, completedAt, applyID, expectedState}
 	args = append(args, guard.predicateArgs...)
 
 	result, err := s.db.ExecContext(ctx, guard.query, args...)
@@ -2980,7 +2980,7 @@ func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storag
 	notFreshlyLeased := fmt.Sprintf("(lease_owner = '' OR updated_at < %s)", staleCutoff)
 
 	if req.OperationID != 0 {
-		opArgs := []any{state.ApplyOperation.FailedRetryable, nullString(req.ErrorMessage), req.OperationID, req.ApplyID}
+		opArgs := []any{state.ApplyOperation.FailedRetryable, nullString(storedErrorMessage(req.ErrorMessage)), req.OperationID, req.ApplyID}
 		opArgs = append(opArgs, stringArgs(activeStates)...)
 		opArgs = append(opArgs, req.OperationLeaseToken)
 		result, err := tx.ExecContext(ctx, fmt.Sprintf(`
@@ -3026,7 +3026,7 @@ func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storag
 		return false, nil
 	}
 
-	applyArgs := []any{state.Apply.FailedRetryable, req.ErrorMessage, req.ApplyID}
+	applyArgs := []any{state.Apply.FailedRetryable, storedErrorMessage(req.ErrorMessage), req.ApplyID}
 	applyArgs = append(applyArgs, stringArgs(activeStates)...)
 	applyArgs = append(applyArgs, req.ApplyLeaseToken)
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`

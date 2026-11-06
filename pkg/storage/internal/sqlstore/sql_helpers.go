@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 )
 
 // rollbackTx rolls back tx, logging a warning if the rollback fails for a
@@ -31,6 +32,30 @@ func nullString(s string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: s, Valid: true}
+}
+
+// maxStoredErrorMessageBytes is the width of the error_message column on
+// tasks, applies and apply_operations, in bytes: the most a MySQL text column
+// holds. PostgreSQL's text holds more, and is held to the same width so a
+// failure reads the same on every dialect.
+const maxStoredErrorMessageBytes = 65535
+
+// storedErrorMessage cuts a failure message to the error_message column's
+// width on a character boundary, marking the cut with an ellipsis. A failure
+// message carries engine and database error text with no bound of its own;
+// written unbounded, one would refuse every write that records it, and a
+// refused failure verdict leaves the apply active through every claim that
+// retries the same write.
+func storedErrorMessage(msg string) string {
+	if len(msg) <= maxStoredErrorMessageBytes {
+		return msg
+	}
+	const marker = "…"
+	cut := maxStoredErrorMessageBytes - len(marker)
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + marker
 }
 
 // nullInt64 returns a sql.NullInt64 for a row reference held as an int64, where
