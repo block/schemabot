@@ -142,15 +142,16 @@ func TestGitHubQuotaSnapshotOrderingAndIdentity(t *testing.T) {
 func TestGitHubQuotaSnapshotRejectsInvalidObservations(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	tests := map[string]func(*GitHubRateLimitSample){
-		"no app":                  func(s *GitHubRateLimitSample) { s.GitHubApp = "" },
-		"no installation":         func(s *GitHubRateLimitSample) { s.InstallationID = 0 },
-		"negative installation":   func(s *GitHubRateLimitSample) { s.InstallationID = -1 },
-		"unknown resource":        func(s *GitHubRateLimitSample) { s.Resource = "other" },
-		"zero limit":              func(s *GitHubRateLimitSample) { s.Limit = 0 },
-		"negative remaining":      func(s *GitHubRateLimitSample) { s.Remaining = -1 },
-		"remaining exceeds limit": func(s *GitHubRateLimitSample) { s.Remaining = s.Limit + 1 },
-		"missing receipt":         func(s *GitHubRateLimitSample) { s.ObservedAt = time.Time{} },
-		"expired reset":           func(s *GitHubRateLimitSample) { s.ResetAt = now },
+		"no app":                   func(s *GitHubRateLimitSample) { s.GitHubApp = "" },
+		"no installation":          func(s *GitHubRateLimitSample) { s.InstallationID = 0 },
+		"negative installation":    func(s *GitHubRateLimitSample) { s.InstallationID = -1 },
+		"unknown resource":         func(s *GitHubRateLimitSample) { s.Resource = "other" },
+		"zero limit":               func(s *GitHubRateLimitSample) { s.Limit = 0 },
+		"zero limit and remaining": func(s *GitHubRateLimitSample) { s.Limit = 0; s.Remaining = 0 },
+		"negative remaining":       func(s *GitHubRateLimitSample) { s.Remaining = -1 },
+		"remaining exceeds limit":  func(s *GitHubRateLimitSample) { s.Remaining = s.Limit + 1 },
+		"missing receipt":          func(s *GitHubRateLimitSample) { s.ObservedAt = time.Time{} },
+		"expired reset":            func(s *GitHubRateLimitSample) { s.ResetAt = now },
 	}
 	for name, change := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -260,4 +261,21 @@ func TestGitHubQuotaSnapshotLowerAllowanceAcrossRecordingOrders(t *testing.T) {
 			assert.Len(t, snapshotLines(scrape(), "schemabot_github_rate_limit_remaining"), 1)
 		})
 	}
+}
+
+// An observation cannot describe current headroom before its receipt time.
+func TestGitHubQuotaSnapshotFutureObservation(t *testing.T) {
+	recorder, scrape := newQuotaRegistry(t)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	recorder.now = func() time.Time { return now }
+	sample := quotaSample(now.Add(time.Second), 1999)
+	RecordGitHubRateLimit(t.Context(), sample)
+	assert.Empty(t, snapshotLines(scrape(), "schemabot_github_rate_limit_remaining"))
+	now = sample.ObservedAt
+	lines := snapshotLines(scrape(), "schemabot_github_rate_limit_remaining")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 1999"), lines[0])
+	ages := snapshotLines(scrape(), "schemabot_github_rate_limit_observation_age_seconds")
+	require.Len(t, ages, 1)
+	assert.True(t, strings.HasSuffix(ages[0], " 0"), ages[0])
 }

@@ -567,6 +567,10 @@ func TestGitHubTransportQuotaSnapshots(t *testing.T) {
 		{name: "negative remaining", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "-1") }},
 		{name: "over limit", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "15001") }},
 		{name: "zero limit", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitLimit, "0") }},
+		{name: "zero limit and remaining", installation: 42, app: "example-app", change: func(h http.Header) {
+			h.Set(headerRateLimitLimit, "0")
+			h.Set(headerRateLimitRemaining, "0")
+		}},
 		{name: "app JWT", app: "example-app"},
 		{name: "missing app", installation: 42},
 	}
@@ -577,7 +581,8 @@ func TestGitHubTransportQuotaSnapshots(t *testing.T) {
 				header := http.Header{}
 				header.Set(headerRateLimitLimit, "15000")
 				header.Set(headerRateLimitRemaining, "1999")
-				header.Set(headerRateLimitReset, strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+				// Use the wire header name independently of the production constant.
+				header.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
 				header.Set(headerRateLimitResource, "core")
 				if tt.change != nil {
 					tt.change(header)
@@ -586,14 +591,35 @@ func TestGitHubTransportQuotaSnapshots(t *testing.T) {
 			}), tt.installation, func() string { return tt.app })
 			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/pulls/1", nil)
 			require.NoError(t, err)
+			beforeResponse := time.Now()
 			resp, err := rt.RoundTrip(req)
 			require.NoError(t, err)
 			require.NoError(t, resp.Body.Close())
 			var data metricdata.ResourceMetrics
 			require.NoError(t, reader.Collect(t.Context(), &data))
-			var snapshots int
+			maxAge := time.Since(beforeResponse).Seconds()
+			var snapshots, ages int
 			for _, scope := range data.ScopeMetrics {
 				for _, m := range scope.Metrics {
+					if m.Name == "schemabot.github.rate_limit.observation_age_seconds" {
+						gauge, ok := m.Data.(metricdata.Gauge[float64])
+						require.True(t, ok)
+						for _, point := range gauge.DataPoints {
+							ages++
+							op, _ := point.Attributes.Value("operation")
+							assert.Equal(t, metrics.GitHubOperationRateLimitSnapshot, op.AsString())
+							app, _ := point.Attributes.Value("github_app")
+							assert.Equal(t, tt.app, app.AsString())
+							installation, _ := point.Attributes.Value("installation_id")
+							assert.Equal(t, strconv.FormatInt(tt.installation, 10), installation.AsString())
+							resource, _ := point.Attributes.Value("resource")
+							assert.Equal(t, "core", resource.AsString())
+							_, hasRepository := point.Attributes.Value("repository")
+							assert.False(t, hasRepository)
+							assert.GreaterOrEqual(t, point.Value, float64(0))
+							assert.LessOrEqual(t, point.Value, maxAge)
+						}
+					}
 					if m.Name != "schemabot.github.rate_limit.remaining" {
 						continue
 					}
@@ -617,8 +643,10 @@ func TestGitHubTransportQuotaSnapshots(t *testing.T) {
 			}
 			if tt.wantSnapshot {
 				assert.Equal(t, 1, snapshots)
+				assert.Equal(t, 1, ages)
 			} else {
 				assert.Zero(t, snapshots)
+				assert.Zero(t, ages)
 			}
 		})
 	}
