@@ -186,7 +186,7 @@ func TestListenOnlyTransportRecordsSuppressedWrites(t *testing.T) {
 	base := roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("a suppressed write must not reach the base transport")
 	})
-	transport := newListenOnlyTransport(base, listenOnlyRepoSet{listenOnlyTestRepo: true}, 42, func() string { return "schemabot-dev" })
+	transport := newListenOnlyTransport(base, listenOnlyRepoSet{listenOnlyTestRepo: true}, 42, func() string { return "acme-schemabot" })
 
 	body := &closeTrackingBody{Reader: strings.NewReader(`{"body":"plan"}`)}
 	req, err := http.NewRequestWithContext(context.WithoutCancel(t.Context()), http.MethodPost, "https://api.github.com/repos/ACME/monorepo/issues/1/comments", body)
@@ -205,7 +205,7 @@ func TestListenOnlyTransportRecordsSuppressedWrites(t *testing.T) {
 	assert.Equal(t, metrics.GitHubRequestStatusSuppressed, attrs["status"])
 	assert.Equal(t, metrics.GitHubRequestCategoryWrite, attrs["category"])
 	assert.Equal(t, metrics.GitHubOperationCreateIssueComment, attrs["operation"])
-	assert.Equal(t, "schemabot-dev", attrs["github_app"])
+	assert.Equal(t, "acme-schemabot", attrs["github_app"])
 }
 
 type closeTrackingBody struct {
@@ -223,13 +223,13 @@ func (b *closeTrackingBody) Close() error {
 // directly either way, so cooldown and quota telemetry keeps the App and
 // installation that made the request.
 func TestInstallationBaseTransportOrder(t *testing.T) {
-	appSlug := func() string { return "schemabot-dev" }
+	appSlug := func() string { return "acme-schemabot" }
 
 	withoutListenOnly := newInstallationBaseTransport(42, appSlug, listenOnlyRepoSet{})
 	quota, ok := withoutListenOnly.(*githubQuotaWaitTransport)
 	require.True(t, ok, "without listen-only repositories the rate-limit transport is outermost, got %T", withoutListenOnly)
 	assert.Equal(t, int64(42), quota.installationID)
-	assert.Equal(t, "schemabot-dev", quota.appSlug())
+	assert.Equal(t, "acme-schemabot", quota.appSlug())
 
 	withListenOnly := newInstallationBaseTransport(42, appSlug, listenOnlyRepoSet{listenOnlyTestRepo: true})
 	guard, ok := withListenOnly.(*listenOnlyTransport)
@@ -237,5 +237,5 @@ func TestInstallationBaseTransportOrder(t *testing.T) {
 	quota, ok = guard.base.(*githubQuotaWaitTransport)
 	require.True(t, ok, "the listen-only guard sends through the rate-limit transport, got %T", guard.base)
 	assert.Equal(t, int64(42), quota.installationID)
-	assert.Equal(t, "schemabot-dev", quota.appSlug())
+	assert.Equal(t, "acme-schemabot", quota.appSlug())
 }

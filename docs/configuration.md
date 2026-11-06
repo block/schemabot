@@ -1949,7 +1949,7 @@ If `repos` is not configured or empty, all repositories are allowed.
 
 ### Listen-only repositories
 
-A listen-only repository is one SchemaBot reads from but never writes to. Use it to measure what a repository would cost in GitHub requests before you onboard it. For example, you can point a development deployment at your largest repository and catch a release whose reads grow with pull request size before that release reaches production.
+A listen-only repository is one SchemaBot reads from but never writes to. Use it to measure what a repository would cost in GitHub requests before you onboard it. For example, a separate SchemaBot deployment with its own GitHub App and no required checks can listen to your largest repository, and catch a release whose reads grow with pull request size before any deployment that gates merges runs it.
 
 ```yaml
 repos:
