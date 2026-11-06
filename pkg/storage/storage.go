@@ -1333,7 +1333,9 @@ type TaskStore interface {
 	// sends the stored statement to that deployment. Identity columns
 	// (apply, operation, namespace, table, shard) never change through
 	// Update.
-	// Returns ErrTaskNotFound if the task does not exist.
+	// Returns ErrTaskNotFound if the task does not exist. Under an operation
+	// lease, returns ErrTaskOutsideOperationLease for a task of another
+	// operation or of none, without writing it.
 	Update(ctx context.Context, task *Task) error
 
 	// UpsertShardProgress creates or updates the per-shard task row for

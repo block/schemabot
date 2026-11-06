@@ -84,6 +84,11 @@ var (
 	// operation to remain unleased but a live drive owns it.
 	ErrOperationLeaseActive = errors.New("operation lease is active")
 
+	// ErrTaskOutsideOperationLease is returned when a task write under an
+	// operation lease names a task of another operation, or of none. The lease
+	// authorizes writes to its own operation's tasks only.
+	ErrTaskOutsideOperationLease = errors.New("task is outside the held operation lease")
+
 	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
 	// apply's superseded_by marker to a different successor. The marker is
 	// write-once, so a second claimant means the takeover is ambiguous.
