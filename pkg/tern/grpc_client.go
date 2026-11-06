@@ -1550,11 +1550,11 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 // stopped or cancelled while it kept running on the target, and because that
 // leaves the apply terminal, nothing would ever revisit it to find out. So this
 // declines to stand the drive down and lets it continue to the dispatch
-// ambiguity guard, which fails the apply closed and fails the pending stop and
-// cancel requests with the same ambiguity message, so the operator sees the
-// rejection rather than a command no later claim would ever answer. The guard
-// is where this apply was headed regardless — a pending request must not be
-// what routes around it.
+// replay, which re-sends the dispatch under its original idempotency key. Once
+// the replay recovers the remote apply id, the poll delivers the request to the
+// remote apply that actually exists. If the replay is refused, the work fails
+// closed and the pending stop and cancel fail with it, so the operator sees the
+// rejection rather than a command no later claim would ever answer.
 //
 // The request must never be answered with an error here: it stays pending across
 // the error, so every later claim would abort at this same point and the apply
@@ -1563,7 +1563,7 @@ func (c *GRPCClient) settleUndispatchedControlRequest(ctx context.Context, apply
 	logger := c.applyLogger(apply)
 	caller := controlRequestCaller(controlReq)
 	if !undispatchedControlRequestSettlesLocally(apply, scope) {
-		logger.WarnContext(ctx, "leaving pending gRPC control request to the dispatch ambiguity guard; remote dispatch state is ambiguous so the request cannot be satisfied locally",
+		logger.WarnContext(ctx, "leaving pending gRPC control request for the dispatch replay; an earlier dispatch may have created a remote apply, so the request cannot be satisfied locally",
 			append(apply.MutableLogAttrs(),
 				"control_operation", terminalization.controlOperation,
 				"requested_by", caller,
@@ -3003,7 +3003,7 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		// Fail closed before any dispatch or state mutation on every other
 		// task-less work shape: it is an invalid or stale claim. The shared resume
 		// path would otherwise mark the whole parent apply failed
-		// (dispatchPendingApply and the remote-failure sites set applies.state
+		// (dispatchRemoteApply and the remote-failure sites set applies.state
 		// regardless of scope), which is wrong when only this operation's lookup
 		// came back empty.
 		if !scope.operation.IsTasklessVSchemaOnlyWork(plan) {
@@ -3496,28 +3496,19 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	}
 
 	if shouldDispatchQueuedRemoteApply(apply, scope) {
-		return c.dispatchPendingApply(ctx, apply, scope)
+		return c.dispatchRemoteApply(ctx, apply, scope, firstRemoteDispatch)
 	}
 	if hasAmbiguousRemoteDispatchState(apply, scope) {
-		errMsg := fmt.Sprintf("gRPC apply %s is %s without a remote apply id; remote dispatch state is ambiguous", apply.ApplyIdentifier, scope.dispatchState(apply))
-		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
-			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
-		}
-		// A failed apply is never claimed again, so a stop or cancel left
-		// pending here would stay unanswered forever and a re-issued command
-		// would be refused as already requested. Fail the requests with the
-		// same ambiguity message the apply carries. An operation-only drive
-		// leaves the shared apply-level requests pending: sibling deployments
-		// still need to observe them, and the operator projection settles them
-		// once the parent apply derives terminal.
-		if !scope.suppressesDirectParentApplyWrites() {
-			for _, operation := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
-				if err := failPendingControlRequests(ctx, c.storage, apply, operation, errMsg); err != nil {
-					return fmt.Errorf("%s; fail pending %s control request: %w", errMsg, operation, err)
-				}
-			}
-		}
-		return errors.New(errMsg)
+		// The work is active with no remote apply id, so an earlier dispatch
+		// may have created a remote apply whose id never reached storage. Ask
+		// the data plane instead of guessing: the re-sent dispatch carries the
+		// idempotency key the earlier one used, so the data plane either
+		// returns the remote apply it already created or starts the work for
+		// the first time. Either way exactly one remote apply exists, and the
+		// drive resumes against it.
+		c.applyLogger(apply).WarnContext(ctx, "re-sending gRPC dispatch for active work with no remote apply id; the original idempotency key lets the data plane return a remote apply it already created",
+			append(apply.MutableLogAttrs(), "dispatch_state", scope.dispatchState(apply))...)
+		return c.dispatchRemoteApply(ctx, apply, scope, replayedRemoteDispatch)
 	}
 
 	startControlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
@@ -3907,8 +3898,8 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	// operation reaches dispatch in running with no operation-scoped remote id
 	// yet. An empty per-operation remote id means nothing was durably dispatched
 	// to remote Tern, so this is the operation's first dispatch — not the
-	// ambiguous "running with no remote id" case the whole-apply path guards
-	// against, where a shared external_id could have been lost after a real
+	// ambiguous "running with no remote id" case the whole-apply path
+	// replays, where a shared external_id could have been lost after a real
 	// dispatch.
 	if !scope.usesOperationRemoteResume() {
 		return false
@@ -3941,6 +3932,9 @@ func undispatchedControlRequestSettlesLocally(apply *storage.Apply, scope applyT
 	return scope.remoteApplyID(apply) == "" && state.IsState(scope.dispatchState(apply), state.Apply.Stopped)
 }
 
+// hasAmbiguousRemoteDispatchState reports whether nonterminal work with no
+// remote apply id falls outside a first dispatch, so an earlier dispatch may
+// have created a remote apply whose id never reached storage.
 func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope) bool {
 	if apply == nil {
 		return false
@@ -3950,24 +3944,127 @@ func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope)
 		!shouldDispatchQueuedRemoteApply(apply, scope)
 }
 
-func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+// remoteDispatchKind says whether an earlier dispatch of the same work may
+// already have reached the data plane.
+type remoteDispatchKind int
+
+const (
+	// firstRemoteDispatch sends work that nothing has dispatched before.
+	firstRemoteDispatch remoteDispatchKind = iota
+	// replayedRemoteDispatch re-sends work that is active with no remote apply
+	// id. An earlier dispatch may have created a remote apply whose id never
+	// reached storage.
+	replayedRemoteDispatch
+)
+
+// ErrRemoteDispatchUnresolved reports a re-sent dispatch that ended without
+// a verdict: no remote apply id was stored and the work was not failed. The
+// work stays active, and the next claim re-sends the same idempotency key.
+var ErrRemoteDispatchUnresolved = errors.New("re-sent gRPC dispatch got no verdict")
+
+// dispatchError returns the error a failed dispatch reports. A replay that
+// left the work untouched wraps ErrRemoteDispatchUnresolved, so the drive loop
+// counts a data plane that keeps giving no verdict apart from other resume
+// failures.
+func dispatchError(kind remoteDispatchKind, failure dispatchFailure, err error) error {
+	if kind == replayedRemoteDispatch && failure != dispatchRefused {
+		return fmt.Errorf("%w: %w", ErrRemoteDispatchUnresolved, err)
+	}
+	return err
+}
+
+// dispatchFailure classifies why a dispatch did not attach a remote apply.
+type dispatchFailure int
+
+const (
+	// dispatchRefused can never succeed as sent.
+	dispatchRefused dispatchFailure = iota
+	// dispatchRetryable is a definite rejection that a later send may get past.
+	dispatchRetryable
+	// dispatchReadFailed is a control-plane read that failed before the send.
+	// It says nothing about the data plane.
+	dispatchReadFailed
+	// dispatchUnanswered is a response that names no remote apply and gives
+	// no reason for it, such as an acceptance without a remote apply id. A
+	// first dispatch records it as failed, as it does a refusal. A replay
+	// cannot, because the response does not rule out a remote apply an earlier
+	// send created.
+	dispatchUnanswered
+)
+
+// classifyRemoteApplyError classifies a definite remote Apply error. Callers
+// handle ambiguous errors first, since those prove nothing either way.
+func classifyRemoteApplyError(err error) dispatchFailure {
+	if isRetryableRemoteApplyError(err) {
+		return dispatchRetryable
+	}
+	return dispatchRefused
+}
+
+// settleFailedDispatch records a dispatch that did not attach a remote apply.
+//
+// A first dispatch created nothing remote, so the failure is recorded as it
+// is: retryable when a later send may succeed, failed otherwise.
+//
+// A replayed dispatch cannot settle that way, because an earlier send may have
+// created a remote apply and nothing the replay saw proves otherwise. A
+// retryable rejection, an unanswered response, or a failed control-plane read
+// leaves the apply untouched, so the next claim re-sends the same idempotency
+// key. Recording failed_retryable instead would break that for a whole apply:
+// the retryable claim charges an attempt, the attempt feeds the key, and a
+// re-send under a new key would start a second remote apply. Only a refusal that can never
+// succeed fails the work closed. That refusal settles the request but not the
+// target, so it is logged as an error naming the reconcile risk, and it fails
+// any pending stop or cancel too, since failed work is never claimed again.
+func (c *GRPCClient) settleFailedDispatch(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, scope applyTaskScope, kind remoteDispatchKind, failure dispatchFailure, message string) error {
+	if kind == firstRemoteDispatch {
+		return c.markRemoteApplyFailed(ctx, apply, tasks, message, failure == dispatchRetryable, scope)
+	}
+	logger := c.applyLogger(apply)
+	attrs := append(apply.MutableLogAttrs(), "dispatch_state", scope.dispatchState(apply), "error", message)
+	if failure != dispatchRefused {
+		logger.WarnContext(ctx, "re-sent gRPC dispatch got no verdict; leaving the work untouched so the next claim re-sends the same idempotency key", attrs...)
+		return nil
+	}
+	logger.ErrorContext(ctx, "re-sent gRPC dispatch was refused; failing the work closed. An earlier dispatch of this change may still be running on the target, so reconcile the target before applying again", attrs...)
+	if err := c.markRemoteApplyFailed(ctx, apply, tasks, message, false, scope); err != nil {
+		return err
+	}
+	// An operation-only drive leaves the shared apply-level requests pending:
+	// sibling deployments still need to observe them, and the operator
+	// projection settles them once the parent apply derives terminal.
+	if scope.suppressesDirectParentApplyWrites() {
+		return nil
+	}
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+		if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+			return fmt.Errorf("fail pending %s control request after refused dispatch replay: %w", operation, err)
+		}
+	}
+	return nil
+}
+
+// dispatchRemoteApply sends the work to the data plane, stores the remote
+// apply id it returns, and drives the remote apply to completion. The kind
+// decides how a failed send settles; see settleFailedDispatch.
+func (c *GRPCClient) dispatchRemoteApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, kind remoteDispatchKind) error {
 	planID, err := scope.planID(apply)
 	if err != nil {
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: %v", err), false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchRefused, fmt.Sprintf("queued gRPC apply failed: %v", err)); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after plan resolution error: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	plan, err := c.storage.Plans().GetByID(ctx, planID)
 	if err != nil {
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", planID, err), false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchReadFailed, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", planID, err)); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after plan load error: %w", apply.ApplyIdentifier, markErr)
 		}
-		return fmt.Errorf("load plan %d for queued gRPC apply %s: %w", planID, apply.ApplyIdentifier, err)
+		return dispatchError(kind, dispatchReadFailed, fmt.Errorf("load plan %d for queued gRPC apply %s: %w", planID, apply.ApplyIdentifier, err))
 	}
 	if plan == nil {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: plan %d not found", planID)
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchRefused, errMsg); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing plan: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
@@ -3975,14 +4072,14 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err), false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchReadFailed, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err)); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after task load error: %w", apply.ApplyIdentifier, markErr)
 		}
-		return fmt.Errorf("load tasks for queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		return dispatchError(kind, dispatchReadFailed, fmt.Errorf("load tasks for queued gRPC apply %s: %w", apply.ApplyIdentifier, err))
 	}
 	if len(tasks) == 0 {
 		errMsg := "queued gRPC apply failed: no tasks found"
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchRefused, errMsg); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing tasks: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
@@ -4001,7 +4098,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	targetShards := taskTargetShards(tasks)
 	if scope.operation != nil && isShardWorkOperationKey(scope.operation.OperationKey, scope.operation.Target) && len(targetShards) != 1 {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: shard operation %q resolved %d target shards, expected exactly 1 — its tasks carry no shard, so refusing to dispatch (the data plane would reject with \"expected exactly one target shard, got 0\"); this indicates a version or data skew", scope.operation.OperationKey, len(targetShards))
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, nil, scope, kind, dispatchRefused, errMsg); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after shard-scope guard: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
@@ -4050,16 +4147,17 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		if isAmbiguousRemoteCallError(err) {
-			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
+			return dispatchError(kind, dispatchUnanswered, fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err))
 		}
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
+		failure := classifyRemoteApplyError(err)
+		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, failure, err.Error()); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after remote apply error: %w", apply.ApplyIdentifier, markErr)
 		}
-		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		return dispatchError(kind, failure, fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, err))
 	}
 	if resp == nil {
 		errMsg := "remote apply returned nil response"
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, dispatchRefused, errMsg); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after nil response: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
@@ -4067,17 +4165,22 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	if !resp.Accepted {
 		holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
 		errMsg := remoteApplyRejectionMessage(resp, holderApplyID, "remote apply was not accepted")
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
+		// A rejection is a refusal. The data plane resolves the idempotency key
+		// before any check that can reject, and a key that resolves to this
+		// dispatch's operation is answered with its remote apply, so a rejection
+		// proves no remote apply runs this dispatch's work. A storage read that
+		// fails during those checks comes back as a retryable error instead.
+		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, dispatchRefused, errMsg); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if resp.ApplyId == "" {
 		errMsg := "remote apply accepted without apply_id"
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, dispatchUnanswered, errMsg); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing remote apply id: %w", apply.ApplyIdentifier, markErr)
 		}
-		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+		return dispatchError(kind, dispatchUnanswered, fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg))
 	}
 	if echoErr := verifyDispatchOperationKeyEcho(plan, req, resp); echoErr != nil {
 		c.applyLogger(apply).ErrorContext(ctx, "remote dispatch response does not address this operation; refusing its remote ids and failing the apply closed",
@@ -4085,7 +4188,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 				"remote_apply_id", resp.ApplyId,
 				"error", echoErr)...)
 		metrics.RecordRemoteApplyKeyEchoMismatch(ctx, apply.Database, apply.Environment)
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, echoErr.Error(), false, scope); markErr != nil {
+		if markErr := c.settleFailedDispatch(ctx, apply, tasks, scope, kind, dispatchRefused, echoErr.Error()); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after operation key echo mismatch: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, echoErr)
@@ -4117,6 +4220,16 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 			oldApplyState)
 	}
 
+	if kind == replayedRemoteDispatch {
+		// The replay recovered the handle on the work, so the drive resumes it
+		// the way it resumes any work with a remote apply id. That delivers a
+		// pending stop or cancel to the recovered remote apply, and it
+		// reconciles a pending start, which polling alone never completes.
+		if scope.remoteApplyID(apply) == "" {
+			return fmt.Errorf("replayed gRPC dispatch for %s stored remote apply id %s but the drive does not see it", apply.ApplyIdentifier, resp.ApplyId)
+		}
+		return c.resumeApply(ctx, apply, scope)
+	}
 	return c.pollForCompletion(ctx, apply, false, scope,
 		shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
 }
@@ -4986,7 +5099,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 // the ApplyRequest from the same column, so a task that pauses in a retryable
 // failure after adopting is re-dispatched carrying the adopted spelling. That
 // stays within RV-1 because the spelling goes back to the deployment it came
-// from — dispatchPendingApply targets the apply's own database and
+// from — dispatchRemoteApply targets the apply's own database and
 // environment — it is proven the same change as the reviewed text, and the
 // data plane derives its drift keys from the statement it receives. Adopting
 // from any other source, or re-dispatching to any other target, would need

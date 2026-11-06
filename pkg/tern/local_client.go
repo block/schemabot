@@ -3108,7 +3108,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
 	// resolve into. Adoption is a create-path outcome only.
-	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
+	blocking, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
+	if err != nil && !blocking.blocks() {
+		return nil, conflictReadError(req, err)
+	}
 	if err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -3272,6 +3275,15 @@ func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ter
 	return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "drift check"), nil
 }
 
+// conflictReadError reports a conflict check that failed to read the
+// database's active tasks before it found any conflict. Nothing was decided, so
+// it travels as an error the dispatcher retries rather than as a rejection: a
+// rejection tells the dispatcher this request can never succeed as sent, and
+// the dispatcher fails the work on it.
+func conflictReadError(req *ternv1.ApplyRequest, err error) error {
+	return fmt.Errorf("conflict check for plan %s on database %s: %w", req.PlanId, req.Database, err)
+}
+
 // refuseAttachKeyingMismatch rejects an attach whose key shape disagrees with
 // the apply's: a dispatch that names its rollout member target and one that
 // does not derive different keys for the same target's work, so without the
@@ -3376,6 +3388,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Local mode: check for active tasks with engine verification
 	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, 0)
+	if conflictErr != nil && !blocking.blocks() {
+		return nil, conflictReadError(req, conflictErr)
+	}
 	if conflictErr != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the

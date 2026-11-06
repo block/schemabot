@@ -1147,7 +1147,10 @@ held apply once its stored row names the apply that took over its work
 (`updateApplyStateFromOperations`, `pkg/api/operator.go`). A control plane retrying an operation
 that never attached dispatches it under its deployment's unchanged key and manifest, so the retry
 lands on that deployment's one remote apply rather than arriving as a newer generation
-(`remoteApplyIdempotencyKey`, `generationOperationKeys`, `pkg/tern/grpc_client.go`).
+(`remoteApplyIdempotencyKey`, `generationOperationKeys`, `pkg/tern/grpc_client.go`). Work found
+active with no remote apply id re-sends its dispatch under the key the earlier dispatch carried, and
+a re-send that gets no verdict leaves the work untouched rather than recording a failure that
+would rotate the key (`hasAmbiguousRemoteDispatchState`, `settleFailedDispatch`, same file).
 
 ### OW-6: There is one way to claim work
 

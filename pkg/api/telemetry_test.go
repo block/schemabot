@@ -1187,6 +1187,81 @@ func TestResumeClaimedApplyCountsAPostTerminalReconcile(t *testing.T) {
 	}
 }
 
+// A drive that re-sent a lost dispatch and got no verdict wrote nothing, and
+// the next claim re-sends the same idempotency key. The operator counts that
+// exit under its own resume failure reason, so a data plane that keeps giving
+// no answer shows as a rate of remote_dispatch_unresolved rather than blending
+// into resume_error. One during shutdown is not counted.
+func TestResumeClaimedApplyCountsAnUnresolvedDispatchReplay(t *testing.T) {
+	unresolved := fmt.Errorf("%w: apply queued gRPC apply apply-42: rpc error: code = Unavailable desc = data plane restarting", tern.ErrRemoteDispatchUnresolved)
+	cases := []struct {
+		name        string
+		cancelCtx   bool
+		wantReasons []string
+	}{
+		{
+			name:        "a replay without a verdict",
+			wantReasons: []string{"remote_dispatch_unresolved"},
+		},
+		{
+			name:      "a replay during shutdown is not counted",
+			cancelCtx: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{resumeErr: unresolved},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: state.Apply.Running,
+			}
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			resumed, err := svc.resumeClaimedApply(ctx, 1, apply, 0, "")
+
+			require.ErrorIs(t, err, tern.ErrRemoteDispatchUnresolved)
+			assert.False(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var reasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != "schemabot.operator.resume_failures_total" {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+						reasons = append(reasons, reason.AsString())
+					}
+				}
+			}
+			assert.Equal(t, tc.wantReasons, reasons)
+		})
+	}
+}
+
 // A resume whose task requeue storage refuses starts nothing, and the next
 // claim repeats it. The operator counts that exit under its own resume failure
 // reason, so a requeue storage keeps refusing shows as a rate of
