@@ -526,45 +526,54 @@ func (w *psClientWrapper) DeployRequestAutoCutover(ctx context.Context, org, dat
 // so the service-token header is spelled out here in the one place these calls
 // are made.
 //
-// path is the endpoint below the base URL, so a failure can name what was called
-// without carrying the host into the returned error.
+// path is the endpoint below the base URL. Every error and log line from here
+// names the endpoint without its query string, so a failure says what was
+// called without carrying the request URL; the page a listing was on is named
+// by the listing's own wrap.
 func (w *psClientWrapper) doRawJSON(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	endpoint, _, _ := strings.Cut(path, "?")
 	httpReq, err := http.NewRequestWithContext(ctx, method, w.baseURL+path, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create %s %s request: %w", method, path, err)
+		return nil, rawRequestError("create", method, endpoint, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", w.tokenName+":"+w.tokenValue)
 	resp, err := w.httpClient.Do(httpReq)
 	if err != nil {
-		// The client reports a failed send as a *url.Error, whose message is the
-		// full request URL, host and query string included. It is rebuilt with
-		// the path in place of the URL, so callers can still match its type and
-		// its cause while the host stays out of the message.
-		endpoint, _, _ := strings.Cut(path, "?")
-		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
-			err = &url.Error{Op: urlErr.Op, URL: endpoint, Err: urlErr.Err}
-		}
-		return nil, fmt.Errorf("send %s %s request: %w", method, endpoint, err)
+		return nil, rawRequestError("send", method, endpoint, err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read %s %s response: %w", method, path, err)
+		return nil, fmt.Errorf("read %s %s response: %w", method, endpoint, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		// The body is logged rather than returned: it is what explains a refusal,
 		// and this is the only place it is still in hand.
 		slog.Error("PlanetScale API request failed",
 			"method", method,
-			"path", path,
+			"path", endpoint,
 			"status_code", resp.StatusCode,
 			"response_body", string(respBody),
 		)
-		return nil, &APIError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: string(respBody)}
+		return nil, &APIError{Method: method, Path: endpoint, StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	return respBody, nil
+}
+
+// rawRequestError wraps a raw request that could not be built or could not be
+// sent. net/http reports both as a *url.Error whose message quotes the full
+// request URL, host and query string included. The error is rebuilt with the
+// endpoint in place of the URL, so callers can still match its type and its
+// cause while the URL stays out of the message. The cause is kept exactly as
+// reported, because transport classification reads its text: a DNS or dial
+// failure underneath still names the host or address it tried to reach.
+func rawRequestError(verb, method, endpoint string, err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = &url.Error{Op: urlErr.Op, URL: endpoint, Err: urlErr.Err}
+	}
+	return fmt.Errorf("%s %s %s request: %w", verb, method, endpoint, err)
 }
 
 func (w *psClientWrapper) DeployDeployRequest(ctx context.Context, req *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
