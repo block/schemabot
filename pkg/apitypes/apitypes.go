@@ -631,9 +631,11 @@ type ForeignKeyCatalog struct {
 // response being written. Reading a database with thousands of tables, or an
 // environment whose targets are each pulled, takes longer than the server-wide
 // write timeout, so the server lifts that timeout for this route to this
-// budget. A client waits at least this long, or it gives up on a response the
-// server is still going to send.
-const PullSchemaBudget = 5 * time.Minute
+// budget. The server stops the read itself before the budget runs out, so a
+// pull that runs out of time still answers with an error. A client waits at
+// least this long, or it gives up on a response the server is still going to
+// send.
+const PullSchemaBudget = 2 * time.Minute
 
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
 type PullSchemaRequest struct {

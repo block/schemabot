@@ -215,3 +215,106 @@ func TestPullSchemaRoute_OutlivesTheServerWideWriteTimeout(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	assert.Equal(t, int32(1), body.TableCount)
 }
+
+// A caller that hangs up while the fetched schema is still being processed is
+// not written a success response. The read finished, but there is no one left
+// to answer, so the pull ends with a warning.
+func TestPullSchemaHandlerWarnsWhenTheCallerDisconnectsAfterTheRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	client := &mockTernClient{
+		pullSchemaHook: func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+			cancel()
+			return &ternv1.PullSchemaResponse{
+				Database:    "orders",
+				Type:        storage.DatabaseTypeMySQL,
+				Environment: "production",
+				Namespaces: map[string]*ternv1.PulledNamespace{
+					"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+				},
+				TableCount: 1,
+			}, nil
+		},
+	}
+	svc, logs := newPullFailureService(t, client)
+
+	w := postPull(t, ctx, svc)
+
+	assert.Empty(t, w.Body.String(), "no response is written to a caller that left")
+	assert.Empty(t, pullLogRecords(t, logs, "ERROR"))
+	var abandoned []map[string]any
+	for _, record := range pullLogRecords(t, logs, "WARN") {
+		if record["msg"] == "pull schema abandoned because the caller disconnected before it finished" {
+			abandoned = append(abandoned, record)
+		}
+	}
+	require.Len(t, abandoned, 1)
+	assert.Equal(t, "orders", abandoned[0]["database"])
+	assert.Equal(t, "production", abandoned[0]["environment"])
+}
+
+// hangingPullClient never finishes a read on its own, standing in for a
+// live-schema read that outlasts the pull budget. It returns only when the
+// context it was given ends.
+type hangingPullClient struct {
+	*mockTernClient
+}
+
+func (c *hangingPullClient) PullSchema(ctx context.Context, _ *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	<-ctx.Done()
+	return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
+}
+
+// A pull whose read outlasts its budget still answers. The read stops short of
+// the connection's write deadline, so the caller gets a 504 with a JSON error
+// over the socket instead of a dropped connection it would retry blindly.
+func TestPullSchemaRoute_AnswersWhenTheReadOutlastsItsBudget(t *testing.T) {
+	client := &hangingPullClient{mockTernClient: &mockTernClient{}}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "us"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{"us": {"production": "tern.example.com:80"}},
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	svc := New(&mockStorage{}, cfg, map[string]tern.Client{"us/production": client}, logger)
+	svc.pullSchemaBudget = 600 * time.Millisecond
+	svc.pullResponseReserve = 300 * time.Millisecond
+
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	server := httptest.NewUnstartedServer(mux)
+	server.Config.WriteTimeout = 50 * time.Millisecond
+	server.Start()
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/api/pull",
+		strings.NewReader(`{"database":"orders","environment":"production","type":"mysql"}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := server.Client().Do(req)
+	require.NoError(t, err, "a pull that runs out of time must still answer")
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
+	var body apitypes.ErrorResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, "pull schema did not finish within 300ms; pull fewer namespaces per request or retry later", body.Error)
+
+	errorLogs := pullLogRecords(t, &logs, "ERROR")
+	require.Len(t, errorLogs, 1, "a pull that runs out of time is logged once")
+	assert.Equal(t, "pull schema did not finish within its budget", errorLogs[0]["msg"])
+	assert.Equal(t, "orders-production", errorLogs[0]["target"])
+}
+
+// The read always stops before the connection's write deadline, so there is
+// time left to send a pull's answer.
+func TestPullResponseReserveLeavesTheReadMostOfTheBudget(t *testing.T) {
+	assert.Greater(t, pullResponseReserve, time.Duration(0))
+	assert.Less(t, pullResponseReserve, apitypes.PullSchemaBudget/2)
+}
