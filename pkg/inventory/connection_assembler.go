@@ -216,7 +216,7 @@ func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]stri
 	// Params are validated on every call, not only at config load: Assemble is
 	// the only gate for inventory sources that construct the assembler
 	// directly.
-	if err := validatePostgresDSNParams(a.Params); err != nil {
+	if err := ValidatePostgresDSNParams(a.Params); err != nil {
 		return "", nil, err
 	}
 	if a.DefaultPort != "" {
@@ -330,12 +330,12 @@ func ValidatePostgresCARef(caRef string) error {
 	return fmt.Errorf("postgres ca_ref must be %q or \"file:<absolute-path>\", got %q", PostgresCARefEmbeddedRDSGlobal, caRef)
 }
 
-// validatePostgresDSNParams enforces the closed parameter allowlist for
+// ValidatePostgresDSNParams enforces the closed parameter allowlist for
 // assembled PostgreSQL DSNs: only sslmode, and only verify-full. Arbitrary
 // libpq parameters could weaken transport security (sslmode downgrades) or
 // smuggle TLS material outside CARef (sslrootcert, sslcert), so unknown keys
 // fail closed rather than pass through.
-func validatePostgresDSNParams(params map[string]string) error {
+func ValidatePostgresDSNParams(params map[string]string) error {
 	for key, value := range params {
 		if key != "sslmode" {
 			return fmt.Errorf("postgres connection params support only \"sslmode\", got %q", key)

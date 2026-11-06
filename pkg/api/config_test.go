@@ -3175,7 +3175,7 @@ connections:
 		Params: map[string]string{
 			"parseTime": "true",
 		},
-	}).Resolve()
+	}).Resolve(storage.DatabaseTypeMySQL)
 	require.NoError(t, err)
 
 	cfg, err := gomysql.ParseDSN(dsn)
@@ -3202,7 +3202,7 @@ database: appdb
 		ConfigRef:   "file:" + configPath,
 		Username:    "app_user",
 		PasswordRef: "file:" + passwordPath,
-	}).Resolve()
+	}).Resolve(storage.DatabaseTypeMySQL)
 	require.NoError(t, err)
 
 	cfg, err := gomysql.ParseDSN(dsn)
@@ -3232,7 +3232,7 @@ connection:
 				Host:     "connection.host",
 				Database: "connection.database",
 			},
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "read database config host")
@@ -3253,7 +3253,7 @@ database: appdb
 			ConfigRef:   "file:" + configPath,
 			Username:    "app_user",
 			PasswordRef: "file:" + passwordPath,
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must contain a string")
@@ -3274,7 +3274,7 @@ database: appdb
 			ConfigRef:   "file:" + configPath,
 			Username:    "app_user",
 			PasswordRef: "file:" + passwordPath,
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must contain an integer")
@@ -3341,6 +3341,269 @@ func TestServerConfig_ValidateRejectsDSNFromWithPostgresDialect(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dsn_from builds a MySQL DSN")
+}
+
+// A database environment's dsn_from is validated at config load against the
+// rules of the DSN its database type assembles: MySQL-family types keep the
+// MySQL shape, a PostgreSQL database takes config_paths.dbname and only the
+// verify-full sslmode param, and either family's path key is refused on the
+// other so a misread config fails at startup rather than at the first
+// connection attempt. A plain dsn is unaffected.
+func TestServerConfig_ValidateDatabaseDSNFromByType(t *testing.T) {
+	dsnFrom := func(mutate func(*DSNFromConfig)) *DSNFromConfig {
+		c := &DSNFromConfig{
+			ConfigRef:   "file:/run/secrets/orders-config.yaml",
+			Username:    "orders_user",
+			PasswordRef: "file:/run/secrets/orders-password",
+		}
+		if mutate != nil {
+			mutate(c)
+		}
+		return c
+	}
+	tests := []struct {
+		name         string
+		databaseType string
+		env          EnvironmentConfig
+		wantErr      string
+	}{
+		{
+			name:         "postgres with dsn_from validates",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.DBName = "connections.primary.dbname"
+				c.Params = map[string]string{"sslmode": "verify-full"}
+			})},
+		},
+		{
+			name:         "postgres rejects a weaker sslmode",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.Params = map[string]string{"sslmode": "require"}
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from: postgres sslmode must be "verify-full", got "require"`,
+		},
+		{
+			name:         "postgres rejects a param outside the allowlist",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.Params = map[string]string{"sslrootcert": "/etc/ssl/ca.pem"}
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from: postgres connection params support only "sslmode", got "sslrootcert"`,
+		},
+		{
+			name:         "postgres rejects the mysql database path",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.Database = "connections.primary.database"
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from config_paths.database is not supported for postgres databases; use config_paths.dbname`,
+		},
+		{
+			name:         "mysql with dsn_from validates",
+			databaseType: storage.DatabaseTypeMySQL,
+			env:          EnvironmentConfig{DSNFrom: dsnFrom(nil)},
+		},
+		{
+			name:         "mysql rejects the postgres dbname path",
+			databaseType: storage.DatabaseTypeMySQL,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.DBName = "connections.primary.dbname"
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from config_paths.dbname is only supported for postgres databases; use config_paths.database`,
+		},
+		{
+			name:         "postgres with dsn validates",
+			databaseType: storage.DatabaseTypePostgres,
+			env:          EnvironmentConfig{DSN: "postgres://orders_user:secret@localhost:5432/orders"},
+		},
+		{
+			name:         "mysql with dsn validates",
+			databaseType: storage.DatabaseTypeMySQL,
+			env:          EnvironmentConfig{DSN: "orders_user:secret@tcp(localhost:3306)/orders"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"orders": {
+						Type:         tt.databaseType,
+						Environments: map[string]EnvironmentConfig{"staging": tt.env},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Equal(t, tt.wantErr, err.Error())
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// A database type with no DSN assembler fails closed rather than falling back
+// to the MySQL shape its driver could not parse.
+func TestDSNFromConfig_ValidateRejectsUnassembledDatabaseType(t *testing.T) {
+	err := (&DSNFromConfig{
+		ConfigRef:   "file:/run/secrets/orders-config.yaml",
+		Username:    "orders_user",
+		PasswordRef: "file:/run/secrets/orders-password",
+	}).Validate(`database "orders" environment "staging"`, "oracle")
+
+	require.Error(t, err)
+	assert.Equal(t, `database "orders" environment "staging" dsn_from is not supported with database type "oracle"; use dsn`, err.Error())
+}
+
+// A PostgreSQL database's dsn_from assembles a libpq URL through the same
+// assembler a target_resolver target uses: every component escaped, the
+// default port 5432, the database name from the dbname path, and
+// sslmode=verify-full. A missing database name or a host with no verified CA
+// fails at resolution instead of producing a DSN that dials the wrong place or
+// trusts the ambient store.
+func TestDSNFromConfig_ResolvePostgres(t *testing.T) {
+	writeSecrets := func(t *testing.T, config string) (configRef, passwordRef string) {
+		t.Helper()
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "database.yaml")
+		passwordPath := filepath.Join(dir, "password")
+		require.NoError(t, os.WriteFile(configPath, []byte(config), 0644))
+		require.NoError(t, os.WriteFile(passwordPath, []byte("p@ss/w:rd?#%\n"), 0600))
+		return "file:" + configPath, "file:" + passwordPath
+	}
+
+	t.Run("default paths", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: Orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: orders
+`)
+		dsn, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.NoError(t, err)
+		assert.Equal(t, "postgresql://orders_user:p%40ss%2Fw%3Ard%3F%23%25@orders.cluster-abc.us-west-2.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
+		verifies, err := postgresconn.VerifiesServerCertificate(dsn)
+		require.NoError(t, err)
+		assert.True(t, verifies, "the connection layer must read the assembled DSN as verify-full")
+	})
+
+	t.Run("custom paths and port", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+connections:
+  primary:
+    host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+    port: 6432
+    dbname: orders_app
+`)
+		dsn, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+			ConfigPaths: DSNFromConfigPaths{
+				Host:   "connections.primary.host",
+				Port:   "connections.primary.port",
+				DBName: "connections.primary.dbname",
+			},
+			Params: map[string]string{"sslmode": "verify-full"},
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.NoError(t, err)
+		assert.Equal(t, "postgresql://orders_user:p%40ss%2Fw%3Ard%3F%23%25@orders.cluster-abc.us-west-2.rds.amazonaws.com:6432/orders_app?sslmode=verify-full", dsn)
+	})
+
+	t.Run("missing dbname fails", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+database: orders
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errPathNotFound)
+		assert.Contains(t, err.Error(), "read database config dbname")
+	})
+
+	t.Run("non-RDS host without a verified CA fails", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: db.example.com
+dbname: orders
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `host "db.example.com" is not an RDS endpoint: dsn_from on a postgres database verifies only RDS hosts, so set dsn for this host instead`)
+	})
+
+	t.Run("empty dbname names the dbname key", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: ""
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.EqualError(t, err, "database config missing dbname")
+	})
+}
+
+// The docs/configuration.md example for a postgres database's dsn_from loads
+// through the strict YAML loader and resolves to a verify-full URL, so the
+// documented spelling, including config_paths.dbname, is the one SchemaBot
+// accepts.
+func TestLoadServerConfigFromFile_PostgresDatabaseDSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	databaseConfigPath := filepath.Join(dir, "orders-config.yaml")
+	passwordPath := filepath.Join(dir, "orders-password")
+	require.NoError(t, os.WriteFile(databaseConfigPath, []byte(`
+connections:
+  primary:
+    host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+    dbname: orders
+`), 0o600))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0o600))
+
+	configPath := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+databases:
+  orders:
+    type: postgres
+    environments:
+      staging:
+        dsn_from:
+          config_ref: "file:`+databaseConfigPath+`"
+          username: "orders_user"
+          password_ref: "file:`+passwordPath+`"
+          config_paths:
+            host: connections.primary.host
+            dbname: connections.primary.dbname
+`), 0o600))
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	dsnFrom := cfg.Databases["orders"].Environments["staging"].DSNFrom
+	require.NotNil(t, dsnFrom)
+	assert.Equal(t, "connections.primary.dbname", dsnFrom.ConfigPaths.DBName)
+
+	dsn, err := dsnFrom.Resolve(storage.DatabaseTypePostgres)
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://orders_user:secret@orders.cluster-abc.us-west-2.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
 }
 
 // An unknown storage dialect is rejected at config validation, before any

@@ -134,6 +134,34 @@ With the `config_paths` example above, SchemaBot reads:
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
 
+The DSN `dsn_from` assembles follows the database type. A `mysql`, `vitess`,
+or `strata` database gets a Go MySQL driver DSN, as above. A `type: postgres`
+database gets a libpq URL built the same way as on a
+[`target_resolver` target](#postgresql-dsn_from-targets): the database name is
+read from `dbname` (set `config_paths.dbname` to change it; `config_paths.database`
+is rejected), the port defaults to 5432, and the URL always carries
+`sslmode=verify-full`. `params` accepts only `sslmode: verify-full`. The host
+must be an RDS endpoint, verified against the embedded RDS CA bundle unless
+`PGSSLROOTCERT` in SchemaBot's environment names other roots, as for any
+verify-full DSN; for any other host use `dsn`.
+
+```yaml
+databases:
+  orders:
+    type: postgres
+    environments:
+      staging:
+        dsn_from:
+          config_ref: "file:/run/secrets/orders-config.yaml"
+          username: "orders_user"
+          password_ref: "file:/run/secrets/orders-password"
+```
+
+```yaml
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: orders
+```
+
 ### Per-target schema overrides
 
 Static `target_resolver.targets` entries require exact lowercase engine types
@@ -1357,8 +1385,8 @@ from the `STORAGE_DSN` environment variable, falling back to `MYSQL_DSN` — a
 legacy name that is honored regardless of dialect. `storage.dsn_from` assembles
 a MySQL-format DSN and is only supported with the `mysql` storage dialect;
 combining it with `postgres` fails config validation. (This restriction is
-specific to the storage database — `dsn_from` on a `target_resolver` target
-supports both `mysql` and `postgres`.) See
+specific to the storage database: `dsn_from` on a `databases` environment or a
+`target_resolver` target supports both `mysql` and `postgres`.) See
 [docs/storage-schema.md](storage-schema.md) for how schema
 bootstrapping differs between the two dialects.
 

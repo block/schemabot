@@ -44,7 +44,7 @@ func TestLocalRegistrationPublishesOnlyAdditions(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"dev"}, environments)
 	require.Equal(t, "env:BILLING", original.Database("billing").Environments["dev"].DSN)
-	dsn, err := original.Database("billing").Environments["dev"].ResolveDSN()
+	dsn, err := original.Database("billing").Environments["dev"].ResolveDSN("postgres")
 	require.NoError(t, err)
 	require.Equal(t, "billing-private", dsn)
 	for name, mutate := range map[string]func(*ServerConfig){

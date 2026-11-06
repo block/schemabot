@@ -1296,7 +1296,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 	dbName := matches[0]
 	dbConfig := config.Databases[dbName]
 	envConfig := dbConfig.Environments[env]
-	targetDSN, err := envConfig.ResolveDSN()
+	targetDSN, err := envConfig.ResolveDSN(dbConfig.Type)
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
