@@ -18,6 +18,9 @@ var ErrListenOnlyRepository = errors.New("repository is listen-only, so SchemaBo
 // repository costs in GitHub requests without changing what its pull requests
 // show.
 type ListenOnlyRepos interface {
+	// HasListenOnlyRepos reports whether any repository is listen-only. When
+	// none is, the client sends every request without inspecting it.
+	HasListenOnlyRepos() bool
 	IsRepoListenOnly(repo string) bool
 }
 
@@ -32,7 +35,8 @@ func WithListenOnlyRepos(repos ListenOnlyRepos) ClientOption {
 }
 
 // listenOnlyTransport sends a request only when it is a read or does not
-// target a listen-only repository. A refused request is counted on the GitHub
+// target a listen-only repository. It sits outside the rate-limit transport,
+// so a refused request never waits on a GitHub cooldown. A refused request is counted on the GitHub
 // request metric with status suppressed, so a listen-only deployment still
 // shows how many writes it would have made.
 type listenOnlyTransport struct {
@@ -43,7 +47,7 @@ type listenOnlyTransport struct {
 }
 
 func newListenOnlyTransport(base http.RoundTripper, repos ListenOnlyRepos, installationID int64, appSlug func() string) http.RoundTripper {
-	if repos == nil {
+	if repos == nil || !repos.HasListenOnlyRepos() {
 		return base
 	}
 	return &listenOnlyTransport{
@@ -59,7 +63,7 @@ func (t *listenOnlyTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if !ok {
 		metricCtx = githubRateLimitContextFromRequest(req)
 	}
-	if metricCtx.repository == "" || !t.repos.IsRepoListenOnly(metricCtx.repository) || isGitHubReadRequest(req, metricCtx.operation) {
+	if t.maySend(req, metricCtx) {
 		return t.base.RoundTrip(req)
 	}
 
@@ -82,7 +86,27 @@ func (t *listenOnlyTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		InstallationID: t.installationID,
 		Status:         metrics.GitHubRequestStatusSuppressed,
 	})
-	return nil, fmt.Errorf("%s %s for %s: %w", req.Method, metricCtx.operation, metricCtx.repository, ErrListenOnlyRepository)
+	target := metricCtx.repository
+	if target == "" {
+		target = "a request that names no repository"
+	}
+	return nil, fmt.Errorf("%s %s for %s: %w", req.Method, metricCtx.operation, target, ErrListenOnlyRepository)
+}
+
+// maySend reports whether a request can reach GitHub. Reads are always sent.
+// A write is sent when it targets a repository that is not listen-only, or
+// when it names no repository at all, such as an installation token exchange.
+// A GraphQL request carries its repository only in the request context, so a
+// GraphQL write without one is refused: its target cannot be told apart from
+// a listen-only repository.
+func (t *listenOnlyTransport) maySend(req *http.Request, metricCtx githubRateLimitContext) bool {
+	if isGitHubReadRequest(req, metricCtx.operation) {
+		return true
+	}
+	if metricCtx.repository != "" {
+		return !t.repos.IsRepoListenOnly(metricCtx.repository)
+	}
+	return githubRateLimitResourceFromRequest(req) != metrics.GitHubRateLimitResourceGraphQL
 }
 
 // isGitHubReadRequest reports whether a request only reads from GitHub. REST

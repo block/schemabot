@@ -232,6 +232,15 @@ func (c *Client) fetchAppSlug() {
 	c.logger.Info("fetched GitHub App slug", "slug", slug)
 }
 
+// newInstallationBaseTransport builds the HTTP transport an installation
+// client sends through. The rate-limit transport wraps the metrics transport
+// directly, because it reads the App and installation identity for its
+// cooldown telemetry from that transport. The listen-only guard wraps both.
+func newInstallationBaseTransport(installationID int64, appSlug func() string, listenOnlyRepos ListenOnlyRepos) http.RoundTripper {
+	metricsTransport := newGitHubMetricsTransport(http.DefaultTransport, installationID, appSlug)
+	return newListenOnlyTransport(newGitHubRateLimitTransport(metricsTransport), listenOnlyRepos, installationID, appSlug)
+}
+
 // ForInstallation returns a GitHub client scoped to a specific installation,
 // reusing the cached client for that installationID when one already exists.
 // The ghinstallation library handles JWT generation, token exchange, caching,
@@ -273,7 +282,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		return existing, nil
 	}
 
-	baseTransport := newGitHubRateLimitTransport(newListenOnlyTransport(newGitHubMetricsTransport(http.DefaultTransport, installationID, c.loadAppSlug), c.listenOnlyRepos, installationID, c.loadAppSlug))
+	baseTransport := newInstallationBaseTransport(installationID, c.loadAppSlug, c.listenOnlyRepos)
 	installationTransport, err := ghinstallation.New(baseTransport, c.appID, installationID, c.privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)

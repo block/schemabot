@@ -27,6 +27,10 @@ const (
 
 type listenOnlyRepoSet map[string]bool
 
+func (s listenOnlyRepoSet) HasListenOnlyRepos() bool {
+	return len(s) > 0
+}
+
 func (s listenOnlyRepoSet) IsRepoListenOnly(repo string) bool {
 	return s[strings.ToLower(repo)]
 }
@@ -126,8 +130,10 @@ func TestListenOnlyTransportWritesToOtherRepositories(t *testing.T) {
 }
 
 // GraphQL sends reads as POST, so a GraphQL request is sent only when its
-// operation is a known read, and an installation token exchange names no
-// repository and is always sent.
+// operation is a known read. A GraphQL request names its repository only in
+// the request context, so a GraphQL write without one is refused rather than
+// assumed to target another repository. An installation token exchange names
+// no repository and is always sent.
 func TestListenOnlyTransportClassifiesRequestsWithoutRepositoryPath(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -139,6 +145,7 @@ func TestListenOnlyTransportClassifiesRequestsWithoutRepositoryPath(t *testing.T
 		{name: "graphql read", method: http.MethodPost, path: "/graphql", operation: metrics.GitHubOperationGraphQLTreeEntries, wantSent: true},
 		{name: "graphql mutation", method: http.MethodPost, path: "/graphql", operation: metrics.GitHubOperationGraphQLMinimizeComment, wantSent: false},
 		{name: "graphql unknown operation", method: http.MethodPost, path: "/graphql", operation: metrics.GitHubOperationUnknown, wantSent: false},
+		{name: "graphql mutation without repository", method: http.MethodPost, path: "/graphql", wantSent: false},
 		{name: "installation token", method: http.MethodPost, path: "/app/installations/42/access_tokens", wantSent: true},
 	}
 	for _, tt := range tests {
@@ -209,4 +216,26 @@ type closeTrackingBody struct {
 func (b *closeTrackingBody) Close() error {
 	b.closed = true
 	return nil
+}
+
+// A deployment without listen-only repositories sends every request without
+// inspecting it, and the rate-limit transport wraps the metrics transport
+// directly either way, so cooldown and quota telemetry keeps the App and
+// installation that made the request.
+func TestInstallationBaseTransportOrder(t *testing.T) {
+	appSlug := func() string { return "schemabot-dev" }
+
+	withoutListenOnly := newInstallationBaseTransport(42, appSlug, listenOnlyRepoSet{})
+	quota, ok := withoutListenOnly.(*githubQuotaWaitTransport)
+	require.True(t, ok, "without listen-only repositories the rate-limit transport is outermost, got %T", withoutListenOnly)
+	assert.Equal(t, int64(42), quota.installationID)
+	assert.Equal(t, "schemabot-dev", quota.appSlug())
+
+	withListenOnly := newInstallationBaseTransport(42, appSlug, listenOnlyRepoSet{listenOnlyTestRepo: true})
+	guard, ok := withListenOnly.(*listenOnlyTransport)
+	require.True(t, ok, "the listen-only guard wraps the rate-limit transport, got %T", withListenOnly)
+	quota, ok = guard.base.(*githubQuotaWaitTransport)
+	require.True(t, ok, "the listen-only guard sends through the rate-limit transport, got %T", guard.base)
+	assert.Equal(t, int64(42), quota.installationID)
+	assert.Equal(t, "schemabot-dev", quota.appSlug())
 }

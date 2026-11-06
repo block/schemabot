@@ -6642,9 +6642,14 @@ repos:
 	assert.False(t, cfg.IsRepoListenOnly("acme/onboarded"))
 	assert.True(t, cfg.AreChecksEnabled("acme/onboarded"))
 	assert.False(t, cfg.IsRepoListenOnly("acme/unlisted"))
+	assert.True(t, cfg.HasListenOnlyRepos())
+
+	onboardedOnly := &ServerConfig{Repos: map[string]RepoConfig{"acme/onboarded": {}}}
+	assert.False(t, onboardedOnly.HasListenOnlyRepos())
 
 	var nilCfg *ServerConfig
 	assert.False(t, nilCfg.IsRepoListenOnly("acme/monorepo"))
+	assert.False(t, nilCfg.HasListenOnlyRepos())
 
 	conflicting := strings.Replace(content, "    listen_only: true\n", "    listen_only: true\n    enable_checks: true\n", 1)
 	require.NotEqual(t, content, conflicting)

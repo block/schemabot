@@ -3594,6 +3594,22 @@ func validateListenOnlyRepo(repo string, repoConfig RepoConfig) error {
 	return nil
 }
 
+// HasListenOnlyRepos reports whether any configured repository is
+// listen-only. A GitHub client installs its listen-only guard only when one
+// is, so a deployment without listen-only repositories sends every request
+// unchanged.
+func (c *ServerConfig) HasListenOnlyRepos() bool {
+	if c == nil {
+		return false
+	}
+	for _, repoConfig := range c.Repos {
+		if repoConfig.ListenOnly {
+			return true
+		}
+	}
+	return false
+}
+
 // IsRepoListenOnly returns whether SchemaBot reads from the repository without
 // ever writing to it. Only a repository configured with listen_only: true is.
 func (c *ServerConfig) IsRepoListenOnly(repo string) bool {

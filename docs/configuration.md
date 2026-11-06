@@ -1960,9 +1960,12 @@ repos:
 For a listen-only repository, SchemaBot:
 - processes its webhooks and reads GitHub the same way it does for any other repository;
 - sends no comments, reactions, review requests, or Check Runs;
-- ignores comment commands, so no apply ever starts from the repository. Auto-plan still runs for any database this deployment manages in the repository, but its plan comment and checks are not posted.
+- ignores comment commands, so no apply ever starts from the repository. Auto-plan still runs for any database this deployment manages in the repository, but its plan comment and checks are not posted;
+- runs the default-branch push and merge queue paths up to the Check Run write, so their coverage and Check Run lookups are measured too.
 
-The GitHub client refuses every request to the repository that is not a read. It does this in its HTTP transport, below every client method. A write path added later is covered too, so the pull request shows nothing from this deployment.
+One path is not measured: the PR aggregate check sync, which reads the PR head and looks up the aggregate Check Run before it writes. A listen-only repository skips it, as any repository with `enable_checks: false` does. Its cost is a few reads per delivery, and it does not grow with the number of files in the pull request.
+
+The GitHub client refuses every request to the repository that is not a read. It does this in its HTTP transport, below every client method. A write path added later is covered too, so the pull request shows nothing from this deployment. A GraphQL write that does not name its repository is refused as well, because the client cannot tell which repository it targets. The client installs this guard only when at least one repository is listen-only.
 
 To read the cost, group `schemabot.github.requests_total` for the repository by `operation`. The client counts each refused write with `status:suppressed`, which shows how much the deployment would have written without counting it as traffic or as an error.
 
