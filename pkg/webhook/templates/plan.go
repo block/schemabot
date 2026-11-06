@@ -2715,30 +2715,70 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	count := fmt.Sprintf("%d unsafe %s detected", n, pluralize("change", n))
-	folded := n > unsafeFindingsFoldThreshold
-	if folded {
-		// GitHub renders <summary> content as HTML, not markdown, so the folded
-		// header bolds with <b> tags instead of asterisks.
-		fmt.Fprintf(sb, "<details>\n<summary>%s <b>Issues</b>: %s</summary>\n\n", glyph.Attention, count)
-	} else {
-		fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, count)
-	}
 	item := 0
-	for _, c := range changes {
-		note := attributionNotes[c.Table]
-		if createsItsTable(c) {
-			note = ""
-		}
-		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, note)
-	}
-	if folded {
-		sb.WriteString("\n</details>\n")
+	if n <= unsafeFindingsFoldThreshold {
+		fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, count)
+		writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
+	} else {
+		writeFoldedUnsafeChanges(sb, &item, count, changes, attributionNotes, databaseType)
 	}
 	if len(attributionNotes) > 0 {
 		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
+}
+
+// writeFoldedUnsafeChanges writes a long unsafe list folded, as a long lint
+// list is. A destructive drop never folds: the drops lead the list, open under
+// the count, and only the findings that destroy nothing fold below them. A
+// list with no drops folds whole, the count in the block's summary.
+func writeFoldedUnsafeChanges(sb *strings.Builder, item *int, count string, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string) {
+	drops, rest := splitDestructiveDrops(changes, databaseType)
+	if len(drops) == 0 {
+		// GitHub renders <summary> content as HTML, not markdown, so the folded
+		// header bolds with <b> tags instead of asterisks.
+		fmt.Fprintf(sb, "<details>\n<summary>%s <b>Issues</b>: %s</summary>\n\n", glyph.Attention, count)
+		writeUnsafeChangeItems(sb, item, rest, attributionNotes)
+		sb.WriteString("\n</details>\n")
+		return
+	}
+	fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, count)
+	writeUnsafeChangeItems(sb, item, drops, attributionNotes)
+	if len(rest) == 0 {
+		return
+	}
+	m := countUnsafeFindings(rest)
+	fmt.Fprintf(sb, "\n<details>\n<summary>%d more unsafe %s</summary>\n\n", m, pluralize("change", m))
+	writeUnsafeChangeItems(sb, item, rest, attributionNotes)
+	sb.WriteString("\n</details>\n")
+}
+
+// writeUnsafeChangeItems writes each change's numbered findings, continuing
+// the running number in item.
+func writeUnsafeChangeItems(sb *strings.Builder, item *int, changes []UnsafeChangeData, attributionNotes map[string]string) {
+	for _, c := range changes {
+		note := attributionNotes[c.Table]
+		if createsItsTable(c) {
+			note = ""
+		}
+		writeUnsafeChangeItem(sb, item, unsafeChangeLabel(c), c.Reason, c.ChangeType, note)
+	}
+}
+
+// splitDestructiveDrops separates the unsafe changes that drop a table,
+// column or index from the rest, each in plan order, so a long list can keep
+// the drops in view while the findings that destroy nothing fold.
+func splitDestructiveDrops(changes []UnsafeChangeData, databaseType string) (drops, rest []UnsafeChangeData) {
+	parser := dropStatementParser(databaseType)
+	for _, c := range changes {
+		if classifyUnsafeDrops(c, databaseType, parser).any() {
+			drops = append(drops, c)
+			continue
+		}
+		rest = append(rest, c)
+	}
+	return drops, rest
 }
 
 // unsafeChangeLabel names an unsafe change's table, with the shards and the
@@ -2917,6 +2957,11 @@ type unsafeDropCounts struct {
 	indexes int
 }
 
+// any reports whether the change drops anything.
+func (c unsafeDropCounts) any() bool {
+	return c.columns+c.tables+c.indexes > 0
+}
+
 func (c unsafeDropCounts) add(other unsafeDropCounts) unsafeDropCounts {
 	return unsafeDropCounts{columns: c.columns + other.columns, tables: c.tables + other.tables, indexes: c.indexes + other.indexes}
 }
@@ -2926,17 +2971,25 @@ func (c unsafeDropCounts) add(other unsafeDropCounts) unsafeDropCounts {
 // back to the words in its reason, so guidance still renders for plans that
 // predate stored DDL.
 func countUnsafeDrops(changes []UnsafeChangeData, databaseType string) unsafeDropCounts {
-	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
-	if err != nil {
-		slog.Warn("destructive drop guidance falls back to the unsafe reasons because no statement parser serves the database type",
-			"database_type", databaseType, "error", err)
-		parser = nil
-	}
+	parser := dropStatementParser(databaseType)
 	var total unsafeDropCounts
 	for _, change := range changes {
 		total = total.add(classifyUnsafeDrops(change, databaseType, parser))
 	}
 	return total
+}
+
+// dropStatementParser is the target dialect's parser for classifying what an
+// unsafe change drops, or nil when no parser serves the database type, in
+// which case classification falls back to the words in each reason.
+func dropStatementParser(databaseType string) ddl.StatementParser {
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if err != nil {
+		slog.Warn("destructive drop classification falls back to the unsafe reasons because no statement parser serves the database type",
+			"database_type", databaseType, "error", err)
+		return nil
+	}
+	return parser
 }
 
 func classifyUnsafeDrops(change UnsafeChangeData, databaseType string, parser ddl.StatementParser) unsafeDropCounts {
@@ -2978,9 +3031,8 @@ const lintWarningsFoldThreshold = 5
 
 // unsafeFindingsFoldThreshold is the finding count above which the unsafe
 // Issues list collapses into a details block, as the lint section does. The
-// header keeps the count in view, and the apply instruction still names the
-// tables `--allow-unsafe` consents to, so folding a long list hides no
-// disclosure an operator confirms against.
+// count stays in view, destructive drops stay open above the fold, and the
+// apply instruction still names every table `--allow-unsafe` consents to.
 const unsafeFindingsFoldThreshold = lintWarningsFoldThreshold
 
 // writeLintViolations writes advisory lint findings. Lint warnings never block

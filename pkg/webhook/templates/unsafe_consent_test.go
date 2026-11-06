@@ -355,3 +355,32 @@ func TestRenderPlanComment_LongUnsafeListFolds(t *testing.T) {
 	assert.Contains(t, out, glyph.Attention+" **Issues**: 5 unsafe changes detected\n1. `loans`:")
 	assert.NotContains(t, out, "<b>Issues</b>")
 }
+
+// A destructive drop never folds. In a long list the drops lead, open under
+// the count and numbered first, and only the findings that destroy nothing
+// fold below them, so a dropped table or column cannot hide among dozens of
+// advisory findings.
+func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = nil
+	for _, table := range []string{"loans", "refunds", "ledger"} {
+		data.UnsafeChanges = append(data.UnsafeChanges,
+			UnsafeChangeData{Table: table, Reason: "Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+			UnsafeChangeData{Table: table, Reason: "Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+		)
+	}
+	data.UnsafeChanges = append(data.UnsafeChanges,
+		UnsafeChangeData{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`"},
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`"},
+	)
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, glyph.Attention+" **Issues**: 8 unsafe changes detected\n"+
+		"1. `transfer_events`: DROP COLUMN discards the column's data\n"+
+		"2. `refund_backfill`: DROP TABLE removes all data\n"+
+		"\n<details>\n<summary>6 more unsafe changes</summary>\n\n"+
+		"3. `loans`: Column `created_at` uses `TIMESTAMP`", "%s", out)
+	assert.Contains(t, out, "8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n")
+	assert.NotContains(t, out, "<b>Issues</b>", "with drops in the list the count stays in the open header")
+	assert.Contains(t, out, "<summary>Destructive drop guidance</summary>")
+}
