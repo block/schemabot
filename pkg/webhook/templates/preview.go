@@ -768,6 +768,22 @@ func PreviewCommentPlanNoChanges() string {
 	})
 }
 
+// PreviewCommentPlanBaseSchemaChanged renders a plan of a branch that is
+// missing a newer change its base branch made to the environment's schema.
+func PreviewCommentPlanBaseSchemaChanged() string {
+	data := previewPlanData()
+	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", ChangedPaths: []string{"schema/staging"}}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanBaseSchemaUnverified renders a plan whose base branch
+// could not be checked for newer changes to the environment's schema.
+func PreviewCommentPlanBaseSchemaUnverified() string {
+	data := previewPlanData()
+	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", Unverified: true}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
 // rollup confirmed the primary plan on every deployment (uniform clean line).
 func PreviewCommentPlanDriftClean() string {

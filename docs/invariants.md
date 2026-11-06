@@ -1775,7 +1775,9 @@ mandatory, is checked at apply time against the current base, and cannot be waiv
 not preserving a stale plan. *Enforced:* `assertBaseSchemaStillCurrent` on both apply entry
 points (`pkg/webhook/schema_freshness.go`, called from `pkg/webhook/apply_handlers.go`). It
 compares Git tree OIDs, stops on GitHub read uncertainty, and takes no `allowUnsafe` argument to
-waive with.
+waive with. A plan whose base is newer, or could not be checked, is never suppressed:
+`planCommentUpToDate` and the auto-plan publication path in `pkg/webhook/plan.go` post it in place
+of the visible comment.
 
 ### RV-3: Consent is explicit, specific, and re-checked
 

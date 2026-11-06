@@ -9,6 +9,7 @@ CREATE TABLE plan_comments (
   github_comment_id bigint NOT NULL,
   github_node_id varchar(255) NOT NULL,
   up_to_date boolean NOT NULL DEFAULT FALSE,
+  base_schema_notice boolean NOT NULL DEFAULT FALSE,
   minimized_at timestamp DEFAULT NULL,
   deleted_at timestamp DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,

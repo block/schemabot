@@ -1501,9 +1501,10 @@ func (ic *InstallationClient) directoryLinkDeclaresNamespace(ctx context.Context
 	return false, nil
 }
 
-// SchemaPathsChangedSinceMergeBase reports whether any schema path has a
-// different Git object on the current tip of the PR's base branch than it had
-// at the PR's merge base. Paths may name directories or symlinks. Comparing
+// SchemaPathsChangedSinceMergeBase returns the schema paths that have a
+// different Git object on the current tip of the PR's base branch than they had
+// at the PR's merge base, in the order given. Paths may name directories or
+// symlinks. Comparing
 // object IDs keeps the guard scoped to schema inputs: commits elsewhere in a
 // busy repository do not make the PR stale.
 //
@@ -1514,35 +1515,36 @@ func (ic *InstallationClient) directoryLinkDeclaresNamespace(ctx context.Context
 // resolved to a pinned tip SHA up front — returned for operator logs — so a
 // base branch advancing mid-check cannot make the merge-base lookup and the
 // tree reads observe different commits.
-func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed bool, baseTipSHA string, err error) {
+//
+// A read that fails on one path still returns the paths already found
+// changed, beside the error: a path proven changed makes the branch stale
+// whatever the paths after it would have shown.
+func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed []string, baseTipSHA string, err error) {
 	baseTipSHA, err = ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
-		return false, "", err
+		return nil, "", err
 	}
 	mergeBaseSHA, err := ic.mergeBaseSHA(ctx, repo, baseTipSHA, headSHA)
 	if err != nil {
-		return false, baseTipSHA, err
+		return nil, baseTipSHA, err
 	}
 
 	levelCache := make(map[string][]TreeEntry)
 	for _, schemaPath := range schemaPaths {
 		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, levelCache)
 		if err != nil {
-			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
+			return changed, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
 		}
 		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseTipSHA, schemaPath, levelCache)
 		if err != nil {
-			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
+			return changed, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
 		}
 
-		if mergeBaseFound != baseFound {
-			return true, baseTipSHA, nil
-		}
-		if mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType) {
-			return true, baseTipSHA, nil
+		if mergeBaseFound != baseFound || (mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType)) {
+			changed = append(changed, schemaPath)
 		}
 	}
-	return false, baseTipSHA, nil
+	return changed, baseTipSHA, nil
 }
 
 // maxSchemaSymlinkReads bounds how many distinct symlinks a schema change
