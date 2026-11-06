@@ -123,7 +123,7 @@ func TestMaterializedPlanCarriesLocalBlockedVerdict(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 21}
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 
-	got, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_local_blocked"))
+	got, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_local_blocked"))
 
 	require.NoError(t, err, "a blocked verdict is not drift; the plan still materializes and admission refuses it")
 	require.NotNil(t, got)
@@ -145,7 +145,7 @@ func TestMaterializedPlanCarriesLocalDirectVerdict(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 22}
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 
-	got, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_local_direct"))
+	got, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_local_direct"))
 
 	require.NoError(t, err)
 	require.NoError(t, got.BlockedApplyError())
@@ -164,7 +164,7 @@ func TestMaterializedShardPlanCarriesLocalBlockedVerdict(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 23}
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 
-	got, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_shard_blocked", "-80"))
+	got, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_shard_blocked", "-80"))
 
 	require.NoError(t, err)
 	require.Error(t, got.BlockedApplyError())
@@ -181,7 +181,7 @@ func TestMaterializedPlanKeepsDispatchedBlockedVerdict(t *testing.T) {
 	req.DdlChanges[0].ExecutionMode = engine.ExecutionModeBlocked
 	req.DdlChanges[0].ModeReason = "the primary's engine refuses this statement"
 
-	got, err := c.planForApplyRequest(t.Context(), req)
+	got, _, err := c.planForApplyRequest(t.Context(), req)
 
 	require.NoError(t, err)
 	change := store.created.Namespaces["testapp"].Tables[0]
@@ -269,7 +269,7 @@ func TestDispatchScopeCarriesReplannedUnsafeVerdict(t *testing.T) {
 			c := newPlanMaterializeClientWithPlan(store, dropUsersLegacyIDReplan(tc.shard))
 			req := dropUsersLegacyIDDispatch("plan_drop_legacy_id", tc.targetShards...)
 
-			plan, err := c.planForApplyRequest(t.Context(), req)
+			plan, _, err := c.planForApplyRequest(t.Context(), req)
 			require.NoError(t, err)
 			require.NotNil(t, plan)
 			stored := plan.Namespaces["testapp"].Tables[0]
@@ -513,13 +513,13 @@ func TestDispatchScopeCarriesSiblingShardUnsafeVerdict(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return stored, nil }, createID: 37}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("-80"))
 
-	first, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_sibling", "-80"))
+	first, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_sibling", "-80"))
 	require.NoError(t, err)
 	require.NotNil(t, first)
 	stored = first
 
 	req := dropUsersLegacyIDDispatch("plan_sibling", "80-")
-	plan, err := c.planForApplyRequest(t.Context(), req)
+	plan, _, err := c.planForApplyRequest(t.Context(), req)
 	require.NoError(t, err, "the stored row is returned; no re-plan runs for the sibling")
 	require.Same(t, first, plan)
 	scope, err := c.dispatchScopeForApply(plan, req)

@@ -2216,16 +2216,20 @@ func shardScopedDispatchOperationKey(changes []storage.TableChange, shard string
 // authoritative DDL changes and schema files, so the plan is materialized from
 // them. A request with neither (a stale apply, or a local-mode apply for a plan
 // that does not exist here) has nothing to materialize and resolves to no plan.
-func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.ApplyRequest) (*storage.Plan, error) {
-	plan, err := c.storage.Plans().Get(ctx, req.PlanId)
+//
+// replanned reports whether this call verified the dispatch against this
+// deployment's live schema, which it does exactly when it materializes the
+// plan. A stored row is returned as it is, unchecked against the dispatch.
+func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.ApplyRequest) (plan *storage.Plan, replanned bool, err error) {
+	plan, err = c.storage.Plans().Get(ctx, req.PlanId)
 	if err != nil {
-		return nil, fmt.Errorf("get plan %s: %w", req.PlanId, err)
+		return nil, false, fmt.Errorf("get plan %s: %w", req.PlanId, err)
 	}
 	if plan != nil {
-		return plan, nil
+		return plan, false, nil
 	}
 	if !applyRequestCarriesPlanPayload(req) {
-		return nil, nil
+		return nil, false, nil
 	}
 	// A table step's ddl_changes name one table of its target's plan, so a plan
 	// built from them would hold that table alone and the target's later steps
@@ -2242,7 +2246,7 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 			// without it. The refusal stays retryable: once the control plane
 			// is upgraded, its next attempt carries the plan and the step runs,
 			// whichever plane was upgraded first.
-			return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment and carries no plan to build it from; refusing to build the plan from one step's table", step, req.PlanId)
+			return nil, false, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment and carries no plan to build it from; refusing to build the plan from one step's table", step, req.PlanId)
 		}
 		c.logger.Info("Apply: building a rollout member's plan from its table step's dispatch",
 			"plan_id", req.PlanId,
@@ -2253,9 +2257,11 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 		)
 		whole := proto.Clone(req).(*ternv1.ApplyRequest)
 		whole.DdlChanges = req.GetPlanDdlChanges()
-		return c.materializeApplyRequestPlan(ctx, whole)
+		plan, err = c.materializeApplyRequestPlan(ctx, whole)
+		return plan, err == nil, err
 	}
-	return c.materializeApplyRequestPlan(ctx, req)
+	plan, err = c.materializeApplyRequestPlan(ctx, req)
+	return plan, err == nil, err
 }
 
 // materializeApplyRequestPlan persists a local plan row from a dispatch
@@ -3127,7 +3133,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// This runs before the blocked and unsafe-change gates so they judge the
 	// verdicts this shard's re-plan set.
 	if scope.shard != "" {
-		if err := c.verifyAttachedShardDispatch(ctx, req, apply, operationKey, &scope); err != nil {
+		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, append(apply.LogAttrs(), "operation_key", operationKey)); err != nil {
 			return c.replayConcurrentAttachOrFail(ctx, req, apply, operationKey,
 				fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err))
 		}
@@ -3314,7 +3320,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	if existing, err := c.existingIdempotentApply(ctx, req); err != nil {
 		return nil, err
 	} else if existing != nil {
-		plan, err := c.planForApplyRequest(ctx, req)
+		// A dispatch that attaches is checked against its own shard by the
+		// attach itself, so whether this call re-planned does not matter here.
+		plan, _, err := c.planForApplyRequest(ctx, req)
 		if err != nil {
 			return nil, fmt.Errorf("resolve plan %s for idempotent re-dispatch: %w", req.PlanId, err)
 		}
@@ -3340,7 +3348,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// Look up the plan, materializing it from the dispatch request when this
 	// deployment did not plan locally (a non-primary deployment of a
 	// multi-deployment apply).
-	plan, err := c.planForApplyRequest(ctx, req)
+	plan, replanned, err := c.planForApplyRequest(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("resolve plan %s for apply: %w", req.PlanId, err)
 	}
@@ -3413,6 +3421,38 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	eng := c.getEngine()
 	if eng == nil {
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+
+	// A shard dispatch creating the apply from a plan row already stored here
+	// is held to the same check as a sibling that attaches later: its shard is
+	// re-planned against live schema and its scope takes that shard's
+	// statement and verdicts. Otherwise the first shard would run the reviewed
+	// DDL unchecked while a drifted sibling is refused, leaving the shards
+	// divergent. A plan this call materialized was already checked against
+	// this dispatch, and a whole-deployment dispatch runs the plan row as it
+	// was planned here.
+	if scope.shard != "" && !replanned {
+		dispatchAttrs := []any{
+			"database", c.config.Database,
+			"environment", req.Environment,
+			"idempotency_key", req.IdempotencyKey,
+		}
+		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, dispatchAttrs); err != nil {
+			c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+				append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "error", err)...)
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+		}
+		// The plan row's blocked verdict was judged above, but this shard's
+		// re-plan can block a change the plan row did not, and no opt-in makes
+		// a statement the engine refuses executable.
+		if err := storage.BlockedChangeError(plan.PlanIdentifier, scope.ddlChanges); err != nil {
+			c.logger.Warn("Apply: refusing shard dispatch whose re-planned scope holds a blocked change; dispatch is rejected",
+				append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "error", err)...)
+			return &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: err.Error(),
+			}, nil
+		}
 	}
 
 	now := time.Now()
