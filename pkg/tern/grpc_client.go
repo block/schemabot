@@ -849,6 +849,9 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64, poll *observerPo
 			continue
 		}
 
+		// The apply has left stopped, so the stop the handoff holds back is
+		// over. A later stop is a new one, and its observer gets it at once.
+		poll.handoff = nil
 		obs.OnProgress(apply, tasks)
 	}
 }

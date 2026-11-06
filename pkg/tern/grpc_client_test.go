@@ -10944,6 +10944,29 @@ func TestObserverPollHoldsTheStopBackFromAnObserverRegisteredWhileStopped(t *tes
 	assert.Equal(t, int32(1), stopped.terminal.Load())
 }
 
+// Once the resumed apply runs, the handoff is over. A second stop within the
+// grace is a new stop, so its observer receives it at once, exactly once.
+func TestObserverPollDeliversASecondStopAfterTheApplyResumes(t *testing.T) {
+	const applyID int64 = 83
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive progress")
+
+	applies.setState(state.Apply.Stopped)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the second stop must reach the resumed observer before the grace ends")
+	// Clearing the observer ends the poll, so nothing can deliver it again.
+	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
 // A start that never moves the row out of stopped did not resume the apply.
 // Once the grace passes, its observer receives the stop and is cleared, so
 // the poller does not tick a stopped apply forever.
