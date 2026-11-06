@@ -1515,6 +1515,10 @@ func (ic *InstallationClient) directoryLinkDeclaresNamespace(ctx context.Context
 // resolved to a pinned tip SHA up front — returned for operator logs — so a
 // base branch advancing mid-check cannot make the merge-base lookup and the
 // tree reads observe different commits.
+//
+// A read that fails on one path still returns the paths already found
+// changed, beside the error: a path proven changed makes the branch stale
+// whatever the paths after it would have shown.
 func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed []string, baseTipSHA string, err error) {
 	baseTipSHA, err = ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
@@ -1529,11 +1533,11 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 	for _, schemaPath := range schemaPaths {
 		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, levelCache)
 		if err != nil {
-			return nil, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
+			return changed, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
 		}
 		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseTipSHA, schemaPath, levelCache)
 		if err != nil {
-			return nil, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
+			return changed, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
 		}
 
 		if mergeBaseFound != baseFound || (mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType)) {

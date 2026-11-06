@@ -2642,13 +2642,21 @@ type PlanComment struct {
 	GitHubNodeID string
 
 	// UpToDate records that the comment showed nothing to act on: no changes,
-	// rollout work, errors, drift, or base-schema notice. A later plan that flips between nothing
-	// to act on and something to act on replaces the comment even when the
-	// schema inputs did not change. The bit does not compare the DDL itself:
+	// rollout work, errors, drift, or base-schema notice. A later plan that
+	// flips between nothing to act on and something to act on replaces the
+	// comment even when the schema inputs did not change. The bit does not compare the DDL itself:
 	// two plans that both have work count as the same outcome. False is the
 	// safe default: a comment not known to be up to date is replaced by an
 	// up-to-date plan.
 	UpToDate bool
+
+	// BaseSchemaNotice records that the comment warned the base branch has
+	// newer changes to the schema, or that it could not check. The base branch
+	// moves without a push to the PR, so a later plan whose notice differs
+	// replaces the comment even when the schema inputs did not change. False
+	// is the right default for a comment recorded without it: such a comment
+	// showed no notice.
+	BaseSchemaNotice bool
 
 	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
 	// means the comment was not minimized — including after a failed

@@ -103,7 +103,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	action string,
 ) (rejected bool, err error) {
 	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, environmentSchemaPaths(schema))
-	if err != nil {
+	if err != nil && len(changed) == 0 {
 		h.logger.Error("apply stopped: could not verify base schema freshness",
 			"repo", repo,
 			"pr", pr,
@@ -129,6 +129,14 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	}
 	if len(changed) == 0 {
 		return false, nil
+	}
+	if err != nil {
+		// A path already proven changed makes the branch stale, so the stale
+		// rejection is the answer even though a later path could not be read.
+		h.logger.Warn("base schema freshness gate found a changed schema path before a later path failed to read; rejecting the apply as stale",
+			"repo", repo, "pr", pr, "environment", environment,
+			"database", schema.Database, "database_type", schema.Type,
+			"changed_paths", changed, "action", action, "error", err)
 	}
 
 	h.logger.Warn("apply rejected: schema path changed on base branch after PR divergence",
@@ -217,7 +225,7 @@ func (h *Handler) planBaseSchemas(ctx context.Context, client *ghclient.Installa
 			}
 		}
 		changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, headSHA, paths)
-		if err != nil {
+		if err != nil && len(changed) == 0 {
 			h.logger.Warn("plan comment will say the base branch could not be checked for newer schema changes; apply checks again before it runs",
 				append(logAttrs, "error", err)...)
 			unverified(prInfo.BaseRef, envs)
@@ -230,9 +238,22 @@ func (h *Handler) planBaseSchemas(ctx context.Context, client *ghclient.Installa
 					envChanged = append(envChanged, path)
 				}
 			}
+			if err != nil && len(envChanged) == 0 {
+				// A later path failed to read before this environment's paths
+				// were all checked, so nothing proves it current.
+				h.logger.Warn("plan comment will say the base branch could not be checked for newer schema changes: a schema path failed to read; apply checks again before it runs",
+					append(logAttrs, "environment", env, "error", err)...)
+				unverified(prInfo.BaseRef, []string{env})
+				continue
+			}
 			if len(envChanged) > 0 {
-				h.logger.Warn("plan is of a branch missing newer schema changes from its base branch; the plan comment says so and apply is blocked until the branch has them",
-					append(logAttrs, "environment", env, "base_tip_sha", baseTipSHA, "changed_paths", envChanged)...)
+				attrs := append(slices.Clone(logAttrs), "environment", env, "base_tip_sha", baseTipSHA, "changed_paths", envChanged)
+				if err != nil {
+					// The paths named may not be all of them, since a later one
+					// failed to read; the branch is stale either way.
+					attrs = append(attrs, "unchecked_paths_error", err)
+				}
+				h.logger.Warn("plan is of a branch missing newer schema changes from its base branch; the plan comment says so and apply is blocked until the branch has them", attrs...)
 			}
 			results[env] = &templates.BaseSchemaData{BaseBranch: prInfo.BaseRef, ChangedPaths: envChanged}
 		}

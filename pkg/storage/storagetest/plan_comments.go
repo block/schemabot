@@ -130,6 +130,35 @@ func TestPlanComments(t *testing.T, h Harness) {
 		assert.True(t, comments[1].UpToDate)
 	})
 
+	t.Run("BaseSchemaNotice_RoundTrips", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A comment recorded without the bit showed no notice, so a later plan
+		// that has one replaces it.
+		plain := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+		withNotice := &storage.PlanComment{
+			Repository:       "org/repo",
+			PullRequest:      42,
+			DatabaseName:     "orders",
+			DatabaseType:     "mysql",
+			EnvironmentScope: "staging",
+			HeadSHA:          "sha2",
+			GitHubCommentID:  200,
+			GitHubNodeID:     "IC_node200",
+			BaseSchemaNotice: true,
+		}
+		require.NoError(t, store.PlanComments().Insert(ctx, withNotice))
+
+		comments, err := store.PlanComments().ListUnretiredForSlot(ctx, "org/repo", 42, "orders", "mysql")
+		require.NoError(t, err)
+		require.Len(t, comments, 2)
+		assert.Equal(t, plain.ID, comments[0].ID)
+		assert.False(t, comments[0].BaseSchemaNotice)
+		assert.Equal(t, withNotice.ID, comments[1].ID)
+		assert.True(t, comments[1].BaseSchemaNotice)
+	})
+
 	t.Run("ListUnretiredForRepoPR", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

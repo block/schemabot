@@ -203,6 +203,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 			Environments: []string{environment},
 			Plans:        map[string]*templates.PlanCommentData{environment: &commentData},
 		}, drift.work.pending > 0),
+		BaseSchemaNotice: commentData.BaseSchema.HasNotice(),
 	}, templates.RenderPlanComment(commentData))
 
 	// When drift blocked the check, or any rollout member has work (the primary
@@ -242,10 +243,11 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 	commentData.Target = target
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
 	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
-		Database:     schemaResult.Database,
-		DatabaseType: schemaResult.Type,
-		Environments: []string{environment},
-		HeadSHA:      schemaResult.HeadSHA,
+		Database:         schemaResult.Database,
+		DatabaseType:     schemaResult.Type,
+		Environments:     []string{environment},
+		HeadSHA:          schemaResult.HeadSHA,
+		BaseSchemaNotice: commentData.BaseSchema.HasNotice(),
 	}, templates.RenderPlanComment(commentData))
 	h.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "plan generated successfully",
@@ -749,11 +751,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	}
 
 	slot := planCommentSlot{
-		Database:     multiEnvData.Database,
-		DatabaseType: multiEnvData.DatabaseType,
-		Environments: multiEnvData.Environments,
-		HeadSHA:      multiEnvData.HeadSHA,
-		UpToDate:     planCommentUpToDate(multiEnvData, rolloutHasWork),
+		Database:         multiEnvData.Database,
+		DatabaseType:     multiEnvData.DatabaseType,
+		Environments:     multiEnvData.Environments,
+		HeadSHA:          multiEnvData.HeadSHA,
+		UpToDate:         planCommentUpToDate(multiEnvData, rolloutHasWork),
+		BaseSchemaNotice: templates.AnyEnvHasBaseSchemaNotice(multiEnvData),
 	}
 
 	// The caller asked not to re-post: either the push left the schema inputs
@@ -763,10 +766,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if !postPlanComment {
 		// A base-schema notice is new information even when the schema inputs
 		// did not change, since the base branch moves without a push to the PR.
-		// A visible comment from a prior head cannot be shown to carry it, so it
-		// is replaced. One rendering this head stays, as any re-plan of an
-		// unchanged head does.
-		keepMatchingOutcome := !templates.AnyEnvHasBaseSchemaNotice(multiEnvData)
+		// A visible comment from a prior head cannot be shown to name the same
+		// paths, so it is replaced. One rendering this head stays, as any
+		// re-plan of an unchanged head does. A notice that no longer applies is
+		// caught by the recorded notice differing from this plan's.
+		keepMatchingOutcome := !slot.BaseSchemaNotice
 		if !h.priorHeadPlanCommentNeedsReplacing(ctx, client, repo, pr, slot, keepMatchingOutcome) {
 			h.logger.Info("auto-plan refreshed checks without posting plan comment because the visible plan comment still answers for this plan",
 				"repo", repo, "pr", pr, "database", slot.Database,

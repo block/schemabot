@@ -15,6 +15,9 @@ import (
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const baseSchemaUsersTable = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
@@ -99,11 +102,7 @@ func TestE2EPlanCommandHasNoNoticeWhenBaseSchemaIsCurrent(t *testing.T) {
 // apply checks again and fails closed.
 func TestE2EPlanCommandSaysBaseSchemaCouldNotBeChecked(t *testing.T) {
 	h, mux, result := newBaseSchemaPlanFlow(t, "webhook_plan_unchecked_base")
-	tip := func() string { return "base-tip-sha" }
-	result.BaseTip.Store(&tip)
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	})
+	registerFailingBaseSchemaComparison(mux, result)
 
 	body := requestPlan(t, h, result, "schemabot plan -e staging")
 
@@ -190,4 +189,77 @@ func TestE2EMultiEnvPlanComparesBaseSchemaOnce(t *testing.T) {
 	assert.Contains(t, body, "Production")
 	assert.Contains(t, body, "is missing newer changes from `main` to `schema`")
 	assert.Equal(t, int32(1), compares.Load(), "one merge-base comparison covers every environment")
+}
+
+// registerFailingBaseSchemaComparison moves the base branch and fails the
+// merge-base comparison the base-schema check reads.
+func registerFailingBaseSchemaComparison(mux *http.ServeMux, result *planFlowResult) {
+	tip := func() string { return "base-tip-sha" }
+	result.BaseTip.Store(&tip)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+}
+
+// GitHub fails the comparison for a plan covering staging and production.
+// Each environment says the check could not run, rather than the comment
+// implying either is current.
+func TestE2EMultiEnvPlanSaysBaseSchemaCouldNotBeChecked(t *testing.T) {
+	h, mux, result := newBaseSchemaPlanFlow(t, "webhook_multienv_plan_unchecked_base", "production")
+	registerFailingBaseSchemaComparison(mux, result)
+
+	body := requestPlan(t, h, result, "schemabot plan")
+
+	assert.Contains(t, body, "Production")
+	assert.Contains(t, body, "**Could not check whether `main` has newer changes to this schema.**")
+	assert.NotContains(t, body, "is missing newer changes")
+}
+
+// A plan narrowed to one rollout target with --target diffs the same branch,
+// so it carries the same notice when the branch is missing a newer base
+// change.
+func TestE2ENarrowedPlanWarnsBranchMissingBaseSchemaChanges(t *testing.T) {
+	p := newNamespacePlacementHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	})
+	registerStaleBaseSchemaComparison(t, p.mux, p.github)
+
+	body := p.comment(t, "schemabot plan -e production --target orders-001")
+
+	assert.Contains(t, body, "**This branch is missing newer changes from `main` to `schema`.**")
+	assert.Contains(t, body, "orders-001")
+}
+
+// A PR shows a plan with DDL that warns the branch is missing a newer base
+// change. The author merges main, a push that touches no schema input. The
+// schema inputs did not change, but the warning no longer holds, so the
+// auto-plan posts a plan without it and the warning's comment goes, rather
+// than leaving reviewers told that apply is blocked.
+func TestE2EAutoPlanSchemaNeutralSyncReplacesPlanWhoseBaseSchemaNoticeNoLongerHolds(t *testing.T) {
+	dbName := "webhook_autoplan_neutral_notice_cleared"
+	f := setupAutoPlanCommentFixture(t, dbName, false)
+	schemaNeutralSync(t, f)
+	require.NoError(t, f.svc.Storage().PlanComments().Insert(t.Context(), &storage.PlanComment{
+		Repository: "octocat/hello-world", PullRequest: 1, DatabaseName: dbName, DatabaseType: "mysql",
+		EnvironmentScope: "staging", HeadSHA: "oldsha", GitHubCommentID: 9001, GitHubNodeID: "IC_shows_notice",
+		BaseSchemaNotice: true,
+	}))
+
+	f.synchronize(t, "oldsha", "newsha")
+
+	select {
+	case body := <-f.result.comments:
+		assert.NotContains(t, body, "is missing newer changes")
+		assert.Contains(t, body, "CREATE TABLE")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment without the base-schema notice")
+	}
+	select {
+	case id := <-f.deleted:
+		assert.Equal(t, "9001", id)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the comment carrying the stale notice to be deleted")
+	}
+	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", false)
 }
