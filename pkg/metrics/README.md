@@ -84,9 +84,10 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.secondary_rate_limit_cooldown_reports_total` | Counter | environment, operation, resource, github_app, installation_id, disposition | Parsed secondary cooldown decisions, including accepted and exceeded allowances |
 | `schemabot.github.wait_duration_seconds` | Histogram (seconds) | environment, operation, resource, github_app, installation_id, layer, reason | Actual elapsed outer read-retry waits, including cancellation/deadline interruptions |
 | `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
-| `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
-| `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
-| `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
+| `schemabot.github.rate_limit.limit` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
+| `schemabot.github.rate_limit.remaining` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
+| `schemabot.github.rate_limit.observation_age_seconds` | Observable gauge | environment, operation, resource, github_app, installation_id | Age of the latest trustworthy installation snapshot; continues increasing during idle periods |
+| `schemabot.github.rate_limit.used` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.target.probe.total` | Counter | database_type, environment, outcome | Startup connectivity probes of enumerated targets, by outcome. This counter sits below the volume bar in [Does it belong in a metric?](#does-it-belong-in-a-metric) — one observation per target per process start — and earns its place as a deploy-time alert instead: a fleet-wide rollout produces a burst of observations at once, and any non-`success` outcome in that burst is a rotated credential, dropped grant, or unreachable target found before the first schema change reaches it. Alert on `outcome != success` per environment after each deploy. Target is omitted to bound cardinality; the paired warn log names it |
 | `schemabot.remote_control_requests.rejected_total` | Counter | operation, engine, database, deployment, environment | Control requests a remote data plane accepted and its own driver then failed, mirrored back so the operator learns the command never took effect — see [Control Operations](#control-operations) |
@@ -313,12 +314,29 @@ should be investigated before relying on branch-protection state.
 
 ### GitHub API Usage
 
-`schemabot.github.rate_limit.remaining` is the most direct primary-rate-limit
-signal. Group it by `github_app`, `installation_id`, and `resource` to see which
-GitHub App deployment, installation, and rate-limit bucket is closest to
-exhaustion. The same labels on `schemabot.github.rate_limit.limit` and
-`schemabot.github.rate_limit.used` show the observed budget size and consumption
-for the latest response.
+`schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}`
+reports the latest trustworthy installation budget, without a repository label.
+Group by `github_app`, `installation_id`, and `resource`, taking the minimum
+across replicas. Snapshots require a named App, positive installation ID, valid
+remaining/limit headers, and a future reset time. They disappear from collection
+when older than 120 seconds or when their reset time passes. Repeated scrapes,
+local quota refusals and secondary cooldown waits do not refresh observation age.
+Older reset windows and delayed larger allowances within a window cannot replace
+a depleted snapshot. Within one window, a lower allowance wins even when it is
+recorded out of receipt order; its original receipt time still controls expiry.
+A new window can increase the allowance.
+
+`schemabot.github.rate_limit.observation_age_seconds` continues increasing after
+snapshot expiry. Above 120 seconds the budget is unknown; idle installations
+legitimately reach this state. Endpoint heartbeat monitoring independently covers
+missing scrapes. Missing quota must not be interpreted as zero or recovery.
+
+The other operation/repository series on `remaining`, `limit` and `used` retain
+the latest diagnostic response values; they can be stale and must not enter a
+quota paging query. All three are observable gauges, registered once with
+`RegisterGitHubRateLimitMetrics` when installing the global metrics provider;
+provider callbacks own the collection state. Server telemetry registers them
+automatically. Embedders configuring their own provider must register them too.
 
 `schemabot.github.requests_total` is the request-volume signal. Group it by
 `category` to separate ordinary reads from content-generating writes. The
@@ -336,7 +354,7 @@ when a `not_found` rate looks anomalous.
 
 Useful dashboard views:
 
-1. Minimum `schemabot.github.rate_limit.remaining` by `github_app`,
+1. Minimum `schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}` by `github_app`,
    `installation_id`, and `resource`.
 2. Request rate from `schemabot.github.requests_total` by `category`,
    `operation`, and `status`.

@@ -1701,6 +1701,8 @@ type GitHubRateLimitSample struct {
 	Limit          int64
 	Remaining      int64
 	Used           int64
+	ObservedAt     time.Time
+	ResetAt        time.Time
 }
 
 // RecordGitHubRateLimit records the latest GitHub primary rate-limit header
@@ -1709,14 +1711,9 @@ func RecordGitHubRateLimit(ctx context.Context, sample GitHubRateLimitSample) {
 	sample.Operation = normalizeGitHubOperation(sample.Operation)
 	sample.Resource = normalizeGitHubRateLimitResource(sample.Resource)
 
-	attrs := gitHubMetricAttributes(sample.Operation, sample.Resource, sample.Repository, sample.GitHubApp, sample.InstallationID)
-
-	recordGauge(ctx, "schemabot.github.rate_limit.limit", sample.Limit,
-		"GitHub primary rate limit for the observed API resource", "{request}", attrs...)
-	recordGauge(ctx, "schemabot.github.rate_limit.remaining", sample.Remaining,
-		"GitHub primary rate limit requests remaining for the observed API resource", "{request}", attrs...)
-	recordGauge(ctx, "schemabot.github.rate_limit.used", sample.Used,
-		"GitHub primary rate limit requests used for the observed API resource", "{request}", attrs...)
+	if recorder := activeGitHubRateLimits.Load(); recorder != nil {
+		recorder.record(sample)
+	}
 }
 
 func gitHubMetricAttributes(operation, resource, repository, githubApp string, installationID int64) []attribute.KeyValue {
