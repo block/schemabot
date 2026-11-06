@@ -3545,8 +3545,65 @@ dbname: orders
 		}).Resolve(storage.DatabaseTypePostgres)
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), `a verified CA is required: host "db.example.com:5432" is not an RDS endpoint`)
+		assert.Contains(t, err.Error(), `host "db.example.com" is not an RDS endpoint: dsn_from on a postgres database verifies only RDS hosts, so set dsn for this host instead`)
 	})
+
+	t.Run("empty dbname names the dbname key", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: ""
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.EqualError(t, err, "database config missing dbname")
+	})
+}
+
+// The docs/configuration.md example for a postgres database's dsn_from loads
+// through the strict YAML loader and resolves to a verify-full URL, so the
+// documented spelling, including config_paths.dbname, is the one SchemaBot
+// accepts.
+func TestLoadServerConfigFromFile_PostgresDatabaseDSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	databaseConfigPath := filepath.Join(dir, "orders-config.yaml")
+	passwordPath := filepath.Join(dir, "orders-password")
+	require.NoError(t, os.WriteFile(databaseConfigPath, []byte(`
+connections:
+  primary:
+    host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+    dbname: orders
+`), 0o600))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0o600))
+
+	configPath := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+databases:
+  orders:
+    type: postgres
+    environments:
+      staging:
+        dsn_from:
+          config_ref: "file:`+databaseConfigPath+`"
+          username: "orders_user"
+          password_ref: "file:`+passwordPath+`"
+          config_paths:
+            host: connections.primary.host
+            dbname: connections.primary.dbname
+`), 0o600))
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	dsnFrom := cfg.Databases["orders"].Environments["staging"].DSNFrom
+	require.NotNil(t, dsnFrom)
+	assert.Equal(t, "connections.primary.dbname", dsnFrom.ConfigPaths.DBName)
+
+	dsn, err := dsnFrom.Resolve(storage.DatabaseTypePostgres)
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://orders_user:secret@orders.cluster-abc.us-west-2.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
 }
 
 // An unknown storage dialect is rejected at config validation, before any

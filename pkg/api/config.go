@@ -31,6 +31,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/dbconn"
 	"gopkg.in/yaml.v3"
 )
 
@@ -4251,7 +4252,7 @@ func (c *DSNFromConfig) Resolve(databaseType string) (string, error) {
 		return "", fmt.Errorf("read database config port: %w", err)
 	}
 	endpoint := externalDatabaseEndpoint{Host: host, Port: port, Database: database}
-	if err := endpoint.validate(); err != nil {
+	if err := endpoint.validate(databaseField); err != nil {
 		return "", err
 	}
 
@@ -4286,9 +4287,17 @@ func (c *DSNFromConfig) Resolve(databaseType string) (string, error) {
 // environment (PGSSLROOTCERT) names other roots, exactly as it does for a
 // target_resolver target.
 func (c *DSNFromConfig) assemblePostgres(endpoint externalDatabaseEndpoint, password string) (string, error) {
+	address := endpoint.address("5432")
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("parse postgres address %q: %w", address, err)
+	}
+	if !dbconn.IsRDSHost(strings.ToLower(host)) {
+		return "", fmt.Errorf("host %q is not an RDS endpoint: dsn_from on a postgres database verifies only RDS hosts, so set dsn for this host instead", host)
+	}
 	assembler := inventory.PostgresConnectionAssembler{Params: c.Params}
 	attrs := map[string]string{inventory.PostgresDBNameAttribute: endpoint.Database}
-	dsn, _, err := assembler.Assemble(endpoint.address("5432"), attrs, &inventory.Credentials{Username: c.Username, Password: password})
+	dsn, _, err := assembler.Assemble(address, attrs, &inventory.Credentials{Username: c.Username, Password: password})
 	if err != nil {
 		return "", fmt.Errorf("assemble postgres DSN: %w", err)
 	}
@@ -4383,12 +4392,15 @@ func valueAtPath(document any, path string) (any, error) {
 	return current, nil
 }
 
-func (e externalDatabaseEndpoint) validate() error {
+// validate reports a missing host or database name. databaseField is the
+// key the database name was read from (database or dbname), so the error
+// names the key the operator has to set.
+func (e externalDatabaseEndpoint) validate(databaseField string) error {
 	if e.Host == "" {
 		return fmt.Errorf("database config missing host")
 	}
 	if e.Database == "" {
-		return fmt.Errorf("database config missing database")
+		return fmt.Errorf("database config missing %s", databaseField)
 	}
 	return nil
 }
