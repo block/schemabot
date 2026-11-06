@@ -119,6 +119,10 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 // deploy request is closed, whether by closing it or by its deploy finishing.
 const deployRequestClosed = "closed"
 
+// deployRequestOpen is the deploy request state PlanetScale reports while a
+// deploy request is neither closed nor finished deploying.
+const deployRequestOpen = "open"
+
 // closeUndeployedDeployRequest retires a deploy request whose cancel was
 // rejected because it has not been deployed. PlanetScale's cancel only reaches
 // a deploy that is queued or running; a deploy request that is still pending

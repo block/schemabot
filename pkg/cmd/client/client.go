@@ -996,9 +996,10 @@ type LogEntry = apitypes.LogEntry
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
 // Otherwise, it fetches logs for the most recent apply in the environment.
-// The response carries the newest limit entries plus whether older ones exist
-// beyond the window.
-func GetLogs(endpoint, database, environment, applyID string, limit int) (*apitypes.LogsResponse, error) {
+// A non-empty target narrows the read to that target's entries and the
+// entries about the apply as a whole. The response carries the newest limit
+// entries plus whether older ones exist beyond the window.
+func GetLogs(endpoint, database, environment, applyID, target string, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -1008,6 +1009,9 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) (*apity
 		values.Set("apply_id", applyID)
 	} else if environment != "" {
 		values.Set("environment", environment)
+	}
+	if target != "" {
+		values.Set("target", target)
 	}
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
@@ -1026,18 +1030,44 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) (*apity
 	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
+	if err := requireScopedLogRead(target, result.Target); err != nil {
+		return nil, err
+	}
 	return &result, nil
 }
 
-func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {
+// requireScopedLogRead refuses a target-scoped read the server answered
+// unscoped. A server that predates scoped reads ignores the target and serves
+// every target's entries interleaved, which would read as the one target's
+// history.
+func requireScopedLogRead(requested, echoed string) error {
+	if requested == "" || echoed == requested {
+		return nil
+	}
+	if echoed == "" {
+		return fmt.Errorf("the server does not support reading one target's logs and returned the whole apply's; upgrade the server or omit --target")
+	}
+	return fmt.Errorf("the server answered a read of target %q with target %q's logs", requested, echoed)
+}
+
+// GetDeploymentLogs retrieves an apply's logs from one data-plane deployment,
+// one source per remote read. A non-empty target keeps only that target's
+// sources.
+func GetDeploymentLogs(endpoint, applyID, deployment, target string, limit int) (*apitypes.DeploymentLogsResponse, error) {
 	values := url.Values{}
 	values.Set("apply_id", applyID)
 	values.Set("deployment", deployment)
+	if target != "" {
+		values.Set("target", target)
+	}
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
 	}
 	var result apitypes.DeploymentLogsResponse
 	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	if err := requireScopedLogRead(target, result.Target); err != nil {
 		return nil, err
 	}
 	return &result, nil

@@ -39,6 +39,9 @@ const maxCommitLatency = 100 * time.Millisecond
 //   - a row the copy could not write into the new table definition (see
 //     rowDataErrorCodes). Every attempt copies the same rows into the same
 //     definition, so only changing the data or the statement clears it.
+//   - a statement the target refuses whatever the moment (see
+//     statementErrorCodes). Every attempt sends the same statement to the
+//     same server, so only changing the statement or the server clears it.
 //
 // Everything else remains retryable. A run refused the table's advisory lock is
 // marked ErrTargetHeld: another run is still working on the table, so the
@@ -49,6 +52,9 @@ func classifyRunnerError(err error) error {
 		return &engine.PermanentError{Err: err}
 	}
 	if isRowDataError(err) {
+		return &engine.PermanentError{Err: err}
+	}
+	if isStatementError(err) {
 		return &engine.PermanentError{Err: err}
 	}
 	if errors.Is(err, dbconn.ErrLockHeld) {
@@ -94,8 +100,24 @@ var rowDataErrorCodes = []uint16{
 	1048, // ER_BAD_NULL_ERROR: a NULL in a column the change makes NOT NULL.
 	1264, // ER_WARN_DATA_OUT_OF_RANGE: a value outside the range of a narrowed numeric type.
 	1265, // WARN_DATA_TRUNCATED: a value the new type or length can only store truncated.
+	1364, // ER_NO_DEFAULT_FOR_FIELD: a row the copy writes with no value for a NOT NULL column the change adds without a default.
 	1366, // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD: a value the new type or character set cannot represent.
 	1406, // ER_DATA_TOO_LONG: a value longer than the new column allows.
+}
+
+// statementErrorCodes are the MySQL codes that say the target refuses the
+// schema change's statement itself, not the rows it copies or the moment it
+// ran. Each one is a property of the statement and the server's configuration
+// or grants, so a retry sends the same statement to the same server and is
+// refused the same way. Fixing the grant or the server setting is an operator
+// action, after which a new apply runs with a fresh budget.
+//
+// Only a refusal that carries its code is matched. Spirit's own privilege
+// check before a copy reports a missing grant as text with no code, so that
+// refusal still spends the retry budget.
+var statementErrorCodes = []uint16{
+	1142, // ER_TABLEACCESS_DENIED_ERROR: the target's user lacks a privilege the change needs.
+	1235, // ER_NOT_SUPPORTED_YET: the server does not support the statement's feature or combination.
 }
 
 // isRowDataError reports whether err is a MySQL error saying a row cannot be
@@ -105,6 +127,12 @@ func isRowDataError(err error) bool {
 	// drivers are linked and their error types are not interchangeable. See
 	// pkg/mysqlerr/number.go.
 	return mysqlerr.Is(err, rowDataErrorCodes...)
+}
+
+// isStatementError reports whether err is a MySQL error saying the target
+// refuses the schema change's statement whatever the moment.
+func isStatementError(err error) bool {
+	return mysqlerr.Is(err, statementErrorCodes...)
 }
 
 // newSpiritMigration builds the Spirit migration for a statement against the

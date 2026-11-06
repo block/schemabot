@@ -28,8 +28,12 @@ type LogEntry struct {
 }
 
 type LogsResponse struct {
-	ApplyID string      `json:"apply_id,omitempty"`
-	Logs    []*LogEntry `json:"logs"`
+	ApplyID string `json:"apply_id,omitempty"`
+	// Target echoes the target the read was narrowed to, empty for a read of
+	// the whole apply. A server that predates scoped reads leaves it empty
+	// whatever was asked, which is how a client detects that it was ignored.
+	Target string      `json:"target,omitempty"`
+	Logs   []*LogEntry `json:"logs"`
 	// Truncated reports that entries older than Logs exist and were left
 	// outside the requested window. A reader that shows a full window without
 	// this signal reads as a complete lifecycle, which is the wrong conclusion
@@ -38,10 +42,12 @@ type LogsResponse struct {
 }
 
 type DeploymentLogsResponse struct {
-	ApplyID    string                 `json:"apply_id"`
-	Deployment string                 `json:"deployment"`
-	Sources    []*DeploymentLogSource `json:"sources"`
-	Errors     []*DeploymentLogError  `json:"errors"`
+	ApplyID    string `json:"apply_id"`
+	Deployment string `json:"deployment"`
+	// Target echoes the target the read was narrowed to, as LogsResponse.Target.
+	Target  string                 `json:"target,omitempty"`
+	Sources []*DeploymentLogSource `json:"sources"`
+	Errors  []*DeploymentLogError  `json:"errors"`
 }
 
 type DeploymentLogSource struct {
@@ -77,21 +83,22 @@ type DeploymentLogError struct {
 // constants rather than parsing error_message strings or HTTP status codes.
 // Use IsRetryableErrorCode to determine whether a given code is retryable.
 const (
-	ErrCodeInvalidRequest       = "invalid_request"        // Malformed request (missing params, bad values)
-	ErrCodeNotFound             = "not_found"              // Resource doesn't exist (unknown apply ID, database)
-	ErrCodeDeploymentNotFound   = "deployment_not_found"   // No tern deployment configured for database/environment
-	ErrCodeEngineError          = "engine_error"           // Schema change engine failure during execution
-	ErrCodeEngineErrorRetryable = "engine_error_retryable" // Schema change engine failure that may recover on retry
-	ErrCodeStorageError         = "storage_error"          // Storage backend (MySQL) read/write failure
-	ErrCodeEngineUnavailable    = "engine_unavailable"     // Schema change engine (Tern) unreachable or RPC error
-	ErrCodeStateSyncFailed      = "state_sync_failed"      // Operation succeeded but local state sync failed
-	ErrCodeActiveApplyExists    = "active_apply_exists"    // Another active apply already exists for the target
-	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
-	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
-	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
-	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
-	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
-	ErrCodeAlreadyStopped       = "already_stopped"        // Stop refused: the schema change is already stopped and no start is queued behind it
+	ErrCodeInvalidRequest          = "invalid_request"           // Malformed request (missing params, bad values)
+	ErrCodeNotFound                = "not_found"                 // Resource doesn't exist (unknown apply ID, database)
+	ErrCodeDeploymentNotFound      = "deployment_not_found"      // No tern deployment configured for database/environment
+	ErrCodeEngineError             = "engine_error"              // Schema change engine failure during execution
+	ErrCodeEngineErrorRetryable    = "engine_error_retryable"    // Schema change engine failure that may recover on retry
+	ErrCodeStorageError            = "storage_error"             // Storage backend (MySQL) read/write failure
+	ErrCodeEngineUnavailable       = "engine_unavailable"        // Schema change engine (Tern) unreachable or RPC error
+	ErrCodeStateSyncFailed         = "state_sync_failed"         // Operation succeeded but local state sync failed
+	ErrCodeActiveApplyExists       = "active_apply_exists"       // Another active apply already exists for the target
+	ErrCodeSourcePolicyDenied      = "source_policy_denied"      // Source repo/path is not authorized for the database
+	ErrCodeLockNotOwned            = "lock_not_owned"            // Lock release denied because the caller is not the owner
+	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
+	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
+	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
+	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
+	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -1859,12 +1866,25 @@ type ProgressOperationResponse struct {
 	// apply was created, because its target already held the change and
 	// nothing ran there.
 	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// EndedBy is set on a failed operation that did not fail on its own: it
+	// waited at a deferred cutover that another operation's end meant could
+	// never run, so SchemaBot stopped it, saved its copy, and failed it. It
+	// names that other operation of the same apply.
+	EndedBy *ProgressOperationRef `json:"ended_by,omitempty"`
 	// RolloutStep is the table step this operation runs, numbered from 1, when
 	// the rollout runs table by table: one operation per target and table.
 	// Omitted for an operation that runs its member's whole change.
 	RolloutStep int    `json:"rollout_step,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+}
+
+// ProgressOperationRef names one operation of an apply by its deployment and
+// operation key, which together identify it. An empty reference ({}) says the
+// operation was failed for another whose row the apply no longer lists.
+type ProgressOperationRef struct {
+	Deployment   string `json:"deployment,omitempty"`
+	OperationKey string `json:"operation_key,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

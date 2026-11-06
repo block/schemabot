@@ -1343,11 +1343,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			return true
 		}
 
-		// Notify observer of terminal state, then clean up
-		if obs := c.getObserver(apply.ID); obs != nil {
-			obs.OnTerminal(apply, tasks)
-			c.clearObserver(apply.ID)
-		}
+		c.notifyTerminalObserver(apply, tasks)
 		return true
 	}
 

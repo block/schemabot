@@ -103,8 +103,12 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	if req.ApplyId != "" {
 		// Use the explicitly requested apply
 		a, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if err != nil || a == nil {
-			return nil, 0, 0, fmt.Errorf("apply %s not found", req.ApplyId)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("load apply %s before start: %w", req.ApplyId, err)
+		}
+		if a == nil {
+			c.logger.Warn("start rejected because the requested apply does not exist", "apply_id", req.ApplyId, "database", c.config.Database)
+			return nil, 0, 0, fmt.Errorf("load apply %s before start: %w", req.ApplyId, storage.ErrApplyNotFound)
 		}
 		apply = a
 		c.logger.Info("Start: found apply", "apply_internal_id", apply.ID, "apply_identifier", apply.ApplyIdentifier, "state", apply.State)
@@ -123,8 +127,15 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 				continue
 			}
 			if task.ApplyID > 0 {
-				a, _ := c.storage.Applies().Get(ctx, task.ApplyID)
-				if a != nil && (apply == nil || a.UpdatedAt.After(apply.UpdatedAt)) {
+				a, err := c.storage.Applies().Get(ctx, task.ApplyID)
+				if err != nil {
+					return nil, 0, 0, fmt.Errorf("load the apply of stopped task %s before start: %w", task.TaskIdentifier, err)
+				}
+				if a == nil {
+					c.logger.Warn("Start: stopped task references an apply that does not exist; skipping it", task.LogAttrs()...)
+					continue
+				}
+				if apply == nil || a.UpdatedAt.After(apply.UpdatedAt) {
 					apply = a
 				}
 			}
@@ -1792,7 +1803,10 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
 	// takeObserver (remove-then-notify, atomically) rather than get/notify/clear:
 	// the drive's terminal path can race deliverTerminalIfSettled's re-check, and
-	// OnTerminal must fire exactly once.
+	// OnTerminal must fire exactly once. Removing first also keeps an observer
+	// registered while OnTerminal runs, as a start of a stopped apply does: a
+	// clear after OnTerminal would delete it, and SetObserver would have kept the
+	// stopped apply's observer in its place.
 	if obs := c.takeObserver(apply.ID); obs != nil {
 		obs.OnTerminal(apply, tasks)
 	}
@@ -2437,7 +2451,7 @@ func isFinalizerHandoffRecordOnly(stored *storage.EngineResumeState) bool {
 // later start resumes the finalizer, except on an engine whose stop is
 // permanent, where the single stop-terminality decision makes it cancelled.
 func finalizerSettledStateForControl(operation storage.ControlOperation, databaseType string) string {
-	if operation == storage.ControlOperationStop && !stopTerminatesChange(databaseType) {
+	if operation == storage.ControlOperationStop && !StopTerminatesChange(databaseType) {
 		return state.ApplyOperation.Stopped
 	}
 	return state.ApplyOperation.Cancelled

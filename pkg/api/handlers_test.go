@@ -33,6 +33,7 @@ import (
 type mockStorage struct {
 	pingErr       error
 	webhookEvents storage.WebhookEventStore
+	driverPools   memoryDriverPools
 }
 
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
@@ -47,8 +48,70 @@ func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
 func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
-func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
-func (m *mockStorage) Close() error                                 { return nil }
+func (m *mockStorage) DriverPools() storage.DriverPoolStore {
+	return &m.driverPools
+}
+func (m *mockStorage) Ping(ctx context.Context) error { return m.pingErr }
+func (m *mockStorage) Close() error                   { return nil }
+
+// memoryDriverPools is an in-memory driver pool store whose
+// heartbeats are always live. With hang set, a heartbeat answers only when its
+// context ends, as a storage call that stops responding would. With pruneErr
+// or listErr set, every prune or list fails with it.
+type memoryDriverPools struct {
+	mu       sync.Mutex
+	servers  map[string]storage.DriverPool
+	beats    int
+	prunes   int
+	hang     bool
+	pruneErr error
+	listErr  error
+}
+
+func (m *memoryDriverPools) Heartbeat(ctx context.Context, server *storage.DriverPool) error {
+	m.mu.Lock()
+	hang := m.hang
+	m.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return fmt.Errorf("heartbeat %s: %w", server.ServerID, ctx.Err())
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.servers == nil {
+		m.servers = map[string]storage.DriverPool{}
+	}
+	m.servers[server.ServerID] = *server
+	m.beats++
+	return nil
+}
+
+func (m *memoryDriverPools) PruneStale(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prunes++
+	return m.pruneErr
+}
+
+func (m *memoryDriverPools) Deregister(_ context.Context, serverID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.servers, serverID)
+	return nil
+}
+
+func (m *memoryDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	servers := make([]*storage.DriverPool, 0, len(m.servers))
+	for _, server := range m.servers {
+		servers = append(servers, &server)
+	}
+	return servers, nil
+}
 
 type mockPlanLookupStore struct {
 	plan *storage.Plan
@@ -463,6 +526,23 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 	return cloneControlRequest(stored), false, nil
 }
 
+func (s *memoryControlRequestStore) RequestPendingCommand(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	commandID, err := req.ControlCommandID()
+	if err != nil {
+		return nil, false, err
+	}
+	existing, err := s.GetByOperation(ctx, req.ApplyID, req.Operation)
+	if err != nil {
+		return nil, false, err
+	}
+	if settled, err := existing.SettledByControlCommand(commandID); err != nil {
+		return nil, false, err
+	} else if settled {
+		return existing, false, nil
+	}
+	return s.RequestPending(ctx, req)
+}
+
 func (s *memoryControlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
 	if err := s.CompletePending(ctx, req.ApplyID, superseded); err != nil {
 		return nil, false, err
@@ -700,7 +780,19 @@ func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) er
 	return nil
 }
 
-func (s *capturingApplyStore) ExpireRetryable(context.Context, int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *capturingApplyStore) ExpireRetryable(context.Context, []string, int) ([]*storage.RetryableApplyExpiration, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) ListAppliesHeldByEndedOperation(context.Context, []string, int) ([]*storage.EndedOperationApply, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) SettleAppliesStoppedForEndedOperation(context.Context, int) ([]*storage.EndedOperationApply, error) {
+	return nil, nil
+}
+
+func (s *capturingApplyStore) ExpireRetryableOperations(context.Context, int) ([]*storage.RetryableOperationExpiration, error) {
 	return nil, nil
 }
 
@@ -908,12 +1000,14 @@ func (s *noopApplyLogStore) Append(context.Context, *storage.ApplyLog) error {
 // chronological order, recording the limit each read asked for.
 type windowedApplyLogStore struct {
 	storage.ApplyLogStore
-	available int
-	lastLimit int
+	available  int
+	lastLimit  int
+	lastFilter storage.ApplyLogFilter
 }
 
 func (s *windowedApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
 	s.lastLimit = filter.Limit
+	s.lastFilter = filter
 	count := min(s.available, filter.Limit)
 	logs := make([]*storage.ApplyLog, 0, count)
 	for id := s.available - count + 1; id <= s.available; id++ {
@@ -1095,7 +1189,7 @@ func (m *mockTernClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*te
 	if m.logsHook != nil {
 		return m.logsHook(req)
 	}
-	return &ternv1.LogsResponse{}, nil
+	return &ternv1.LogsResponse{Target: req.GetTarget()}, nil
 }
 
 // An apply with more history than the requested window returns exactly the
@@ -1232,6 +1326,159 @@ func TestHandleDeploymentLogsKeepsTruncationDetectableAtTheRemoteCap(t *testing.
 	assert.True(t, response.Sources[0].Truncated, "a window at the remote cap still reports its older entries")
 	require.Len(t, response.Sources[0].Logs, tern.MaxLogsLimit-1)
 	assert.Equal(t, "entry 2", response.Sources[0].Logs[0].Message)
+}
+
+// A rollout across two targets reads one target's control-plane history on
+// its own: the read is narrowed to that target's operations and echoes the
+// target, so a client can tell it from an unscoped answer. A read without a
+// target stays the whole apply's, and a target the apply never ran on is
+// refused with the targets it does run on, so a typo is corrected from the
+// error rather than mistaken for a quiet target.
+func TestHandleLogsScopesToTarget(t *testing.T) {
+	apply := &storage.Apply{ID: 15, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001"},
+		{ID: 2, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002"},
+	}
+	logStore := &windowedApplyLogStore{available: 2}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  logStore,
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&target=shop-002", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{2}, logStore.lastFilter.OperationIDs)
+	var scoped apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &scoped))
+	assert.Equal(t, "shop-002", scoped.Target)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Nil(t, logStore.lastFilter.OperationIDs, "a read without a target is the whole apply's")
+	var unscoped apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &unscoped))
+	assert.Empty(t, unscoped.Target)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&target=shop-003", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations in apply \"apply-control\"; its targets are shop-001, shop-002`)
+}
+
+// An apply whose operations name no target has no per-target history to read,
+// so a target read is refused with what to do instead, on the control-plane
+// read and on a deployment read alike, rather than an error listing no targets.
+func TestHandleLogsRefusesTargetOnUntargetedApply(t *testing.T) {
+	apply := &storage.Apply{ID: 19, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  &windowedApplyLogStore{available: 1},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&target=shop-001", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `apply \"apply-control\" has no per-target operations; omit target`)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-001", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `deployment \"region-a\" of apply \"apply-control\" has no per-target operations; omit target`)
+	assert.Empty(t, client.logsReqs, "a refused target fetches nothing")
+}
+
+// A deployment read scoped to one target fetches only that target's
+// data-plane source and asks the data plane for that target's entries; a
+// target with no operations on the deployment is refused before any fetch.
+func TestHandleDeploymentLogsScopesToTarget(t *testing.T) {
+	apply := &storage.Apply{ID: 16, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-b", OperationKind: storage.ApplyOperationKindWork, Target: "shop-003", ExternalID: "remote-b"},
+	}
+	client := &mockTernClient{isRemote: true}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-002", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "shop-002", client.logsReqs[0].Target)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	require.Len(t, response.Sources[0].Operations, 1)
+	assert.Equal(t, "shop-002", response.Sources[0].Operations[0].Target)
+	assert.Equal(t, "shop-002", response.Target)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-003", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" has no operations in deployment \"region-a\" of apply \"apply-control\"; its targets are shop-001, shop-002`)
+	assert.Len(t, client.logsReqs, 1, "a refused target fetches nothing")
+}
+
+// During a rolling upgrade a data plane that predates target reads ignores the
+// target and returns every target's entries. The control plane refuses that
+// source with an upgrade hint rather than showing the whole history as one
+// target's log.
+func TestHandleDeploymentLogsRefusesUnnarrowedTargetRead(t *testing.T) {
+	apply := &storage.Apply{ID: 16, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002", ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true, logsHook: func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: "remote-a", Logs: []*ternv1.ApplyLog{{Id: 1, Level: "info", EventType: "info", Source: "schemabot", Message: "Operation attached: shop-001", CreatedAt: "2026-11-05T10:00:00Z"}}}, nil
+	}}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&target=shop-002", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Empty(t, response.Sources, "an unnarrowed read is never shown as the target's log")
+	require.Len(t, response.Errors, 1)
+	assert.Equal(t, "remote-a", response.Errors[0].ExternalID)
+	assert.Equal(t, "shop-002", response.Errors[0].Target)
+	assert.Equal(t, "UnsupportedCapability", response.Errors[0].Code)
+	assert.Equal(t, "upgrade_required", response.Errors[0].Reason)
+	assert.Equal(t, "The selected data plane does not support reading one target's logs; upgrade it or omit --target.", response.Errors[0].Message)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var unscoped apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &unscoped))
+	assert.Len(t, unscoped.Sources, 2, "a read that names no target asks for no narrowing, so any data plane answers it")
+	assert.Empty(t, unscoped.Errors)
 }
 
 func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
@@ -6202,7 +6449,7 @@ func TestApplyHandler(t *testing.T) {
 		var resp apitypes.ErrorResponse
 		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 		assert.Equal(t, apitypes.ErrCodeActiveApplyExists, resp.ErrorCode)
-		assert.Contains(t, resp.Error, storage.ErrActiveApplyExists.Error())
+		assert.Equal(t, "apply blocked: another apply is still in progress on this database. Wait for it to finish, then apply again.", resp.Error)
 	})
 
 	t.Run("allows direct stored plans without source metadata", func(t *testing.T) {

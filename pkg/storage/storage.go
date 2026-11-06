@@ -124,6 +124,9 @@ type Storage interface {
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
+	// DriverPools returns the driver pool of each server running an operator.
+	DriverPools() DriverPoolStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -374,6 +377,41 @@ type SettingsStore interface {
 	// Delete removes a setting by key. It returns ErrSettingNotFound when no
 	// setting with that key exists.
 	Delete(ctx context.Context, key string) error
+}
+
+// DriverPoolLiveWindow is how recently a server must have heartbeated for
+// DriverPoolStore.ListLive to count its drivers. It matches ApplyLeaseStaleAfter, so a server's drivers leave the
+// count at the moment its leases become reclaimable by peers.
+const DriverPoolLiveWindow = ApplyLeaseStaleAfter
+
+// DriverPoolRetention is how long a server's row outlives its last
+// heartbeat before Heartbeat removes it. A server that exits cleanly removes
+// its own row; this bounds the rows a crashed one leaves behind.
+const DriverPoolRetention = time.Hour
+
+// DriverPoolStore holds the driver pool of each server running an operator:
+// how many drivers it runs. Each server heartbeats its own row, so the drivers live
+// across every replica are read from storage rather than configured, and they
+// follow the replica count as it changes.
+type DriverPoolStore interface {
+	// Heartbeat records that server's operator is running now, with its
+	// driver count, creating its row on the first beat. The time recorded is
+	// the database's clock, so servers whose clocks disagree are still
+	// compared on one.
+	Heartbeat(ctx context.Context, server *DriverPool) error
+
+	// PruneStale removes the rows not heard from within
+	// DriverPoolRetention. A stale row already stops counting once it
+	// leaves DriverPoolLiveWindow, so pruning only keeps the table small.
+	PruneStale(ctx context.Context) error
+
+	// Deregister removes server's row. Removing a row that does not exist is
+	// not an error.
+	Deregister(ctx context.Context, serverID string) error
+
+	// ListLive returns the servers that heartbeated within
+	// DriverPoolLiveWindow, ordered by server ID.
+	ListLive(ctx context.Context) ([]*DriverPool, error)
 }
 
 // WebhookEventStore manages durable webhook inbox rows. It is the storage
@@ -874,11 +912,13 @@ type ApplyStore interface {
 	// finish the projection — every operation is terminal, so no operation-level
 	// claim arm matches, and the one-active-apply guard keeps that target blocked
 	// until the parent settles. Requiring a stale heartbeat is what keeps this off
-	// live rollouts: a driver mid-projection still holds a fresh lease. Applies
-	// with no operation rows are excluded (there is nothing to project from), as
-	// are pending, stopped, and failed_retryable parents, which have their own
-	// resume paths. Returns nil when no such apply exists or it is locked by a
-	// peer.
+	// live rollouts: a driver mid-projection still holds a fresh lease. A row no
+	// claim will ever start — a finalizer whose work failed, or a table step
+	// behind one that can never pass — counts as settled, because the rollout
+	// derivation settles the parent without it. Applies with no operation rows
+	// are excluded (there is nothing to project from), as are pending, stopped,
+	// and failed_retryable parents, which have their own resume paths. Returns
+	// nil when no such apply exists or it is locked by a peer.
 	FindNextApplyForOperationProjection(ctx context.Context, owner string) (*Apply, error)
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
@@ -899,6 +939,37 @@ type ApplyStore interface {
 	// longer matches (another writer rotated or cleared it), in which case the
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease ApplyLease) (bool, error)
+
+	// MarkStaleApplyRetryable moves an apply whose driver is gone from an
+	// active state to failed_retryable, together with the operation named in
+	// req when one is, so its next recovery goes through the retryable claim,
+	// which charges and enforces the retry budget (attempt). The stale-active
+	// claim that would otherwise re-lease it charges nothing, so work that keeps
+	// failing without a driver to record it would retry forever.
+	//
+	// Each row moves only while it is in a state a retry restarts from running:
+	// copying, or staging the change before any rows move. An apply waiting
+	// for a deploy, at or past its cutover, or in its revert window is left to
+	// the stale-active claim, since the retryable claim writes running over the
+	// state it finds and running does not describe work that far along. The
+	// row must also still carry the lease token the caller observed, and that
+	// lease must not be fresh (no owner, or a heartbeat older than
+	// ApplyLeaseStaleAfter). The apply additionally moves only while no
+	// operation under it holds a fresh lease, checked with the parent and its
+	// operations locked so a sibling claim cannot land between the check and
+	// the write, and the operation must belong to the apply. Both rows clear
+	// their lease, record ErrorMessage, and keep no completion time; nothing
+	// else is written, so attempt is left for the claim to charge and the
+	// takeover marker and tasks are untouched.
+	//
+	// The rows move together or not at all, in one transaction. Reports false,
+	// with nothing written, when either row does not match: a newer claim
+	// rotated the token, a live drive holds a lease, the apply row is gone, or
+	// the row has left the restartable states. A terminal or resting apply is
+	// never reopened. The store logs which row refused at debug level; the
+	// caller owns the operator-facing log and keeps the apply's previous state
+	// for it, because a false here means the row is whatever it was before.
+	MarkStaleApplyRetryable(ctx context.Context, req StaleRetryableRequest) (bool, error)
 
 	// SetRevertSkipped records when skip-revert was dispatched for an apply, so
 	// progress consumers can show that revert was skipped and finalization is in
@@ -1017,7 +1088,68 @@ type ApplyStore interface {
 	// ErrRetryableExpiryBusy reports that another instance holds it. The lock is
 	// an efficiency gate, not a safety one: the selection is guarded, so
 	// concurrent passes would be correct but would each pay the full scan.
-	ExpireRetryable(ctx context.Context, limit int) ([]*RetryableApplyExpiration, error)
+	//
+	// It passes over every apply ListAppliesHeldByEndedOperation takes for
+	// endedOperationStopTypes, so the two sweeps never select one apply
+	// between them. Empty passes over none.
+	ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*RetryableApplyExpiration, error)
+
+	// ListAppliesHeldByEndedOperation returns applies that deferred their
+	// cutover, have an operation that ended before the cutover, and still have
+	// other operations running, waiting for the cutover, or not yet started,
+	// oldest first, at most limit of them. An operation has ended when it
+	// failed under the halt policy, or when it waits on a retry the apply has
+	// spent its budget or freshness window for. Such an apply can never run its
+	// cutover for every operation, so the caller stops it. An apply with a
+	// pending stop or cancel is left out: that request is already ending it.
+	// Only applies of the given database types are listed: the caller names the
+	// types whose stop pauses the work, since stopping any other would end the
+	// work it is meant to save.
+	//
+	// One instance lists per pass, guarded by an advisory lock;
+	// ErrEndedOperationStopBusy reports that another instance holds it.
+	ListAppliesHeldByEndedOperation(ctx context.Context, databaseTypes []string, limit int) ([]*EndedOperationApply, error)
+
+	// SettleAppliesStoppedForEndedOperation settles failed the applies that
+	// ListAppliesHeldByEndedOperation found and SchemaBot then stopped (a
+	// pending stop requested by EndedOperationStopCaller), once no operation is
+	// running or driven any more. Each stopped operation settles failed with
+	// EndedByOperationID naming the ended operation, and its tasks stay stopped
+	// so a new apply resumes the work they saved. Returns the applies settled,
+	// oldest first, at most limit of them.
+	//
+	// An apply is taken whole or not at all, under the same lease gate as
+	// ExpireRetryable. The pending stop and any pending cutover are left for
+	// the caller to answer now that the apply is failed. One instance settles
+	// per pass; ErrEndedOperationSettleBusy reports that another instance holds
+	// the lock.
+	SettleAppliesStoppedForEndedOperation(ctx context.Context, limit int) ([]*EndedOperationApply, error)
+
+	// ExpireRetryableOperations transitions failed_retryable operation rows
+	// under running_degraded applies to permanent failed, settling their task
+	// rows against that verdict, once the apply's retry budget or recovery
+	// freshness window is spent. The budget is each operation's own, as it is
+	// for ExpireRetryable: the paused operation's attempt is what decides it.
+	// Returns one entry per operation updated, oldest apply first, over at most
+	// limit applies.
+	//
+	// A rollout whose sibling halt-failed holds the parent at running_degraded
+	// over a paused retry rather than moving it back to failed_retryable, so
+	// ExpireRetryable never reaches the paused row. The parent is left as it
+	// is: expiring the row is what lets the rollout's remaining work settle,
+	// and the rollout projection derives the parent's verdict from its rows
+	// once they have. Healthy siblings — pending, parked at the cutover
+	// barrier, or settled — are not touched.
+	//
+	// Eligibility, locking, and the election are those of ExpireRetryable: an
+	// apply is considered only when no driver holds an operation under it, its
+	// parent and every operation are locked and leases rechecked before the
+	// write, and one instance expires per pass under the same advisory lock,
+	// reporting ErrRetryableExpiryBusy when another holds it. Unlike
+	// ExpireRetryable, an apply the ended-operation sweeps are ending is not
+	// passed over: both settle a paused operation failed, so whichever reaches
+	// the row first records the same verdict on it.
+	ExpireRetryableOperations(ctx context.Context, limit int) ([]*RetryableOperationExpiration, error)
 
 	// WithBranchReconcileElection runs fn on the one instance elected to
 	// reconcile engine branches this pass, under an advisory lock held for as
@@ -1129,11 +1261,55 @@ var ErrRetryableExpiryBusy = errors.New("another instance is expiring retryable 
 // instance but one, not a failure.
 var ErrBranchReconcileBusy = errors.New("another instance is reconciling engine branches")
 
+// ErrEndedOperationStopBusy reports that another instance holds the lock for
+// listing applies held by an ended operation this pass.
+var ErrEndedOperationStopBusy = errors.New("another instance is listing applies held by an ended operation")
+
+// ErrEndedOperationSettleBusy reports that another instance holds the lock for
+// settling applies stopped for an ended operation this pass.
+var ErrEndedOperationSettleBusy = errors.New("another instance is settling applies stopped for an ended operation")
+
+// EndedOperationApply is an apply that deferred its cutover and had an
+// operation end before the cutover ran.
+type EndedOperationApply struct {
+	Apply *Apply
+	// EndedOperation is the operation that ended the apply: the first, by id,
+	// that failed under the halt policy, else the first waiting on a spent
+	// retry.
+	EndedOperation *ApplyOperation
+	// SettledFrom is the state the apply was in when the settle sweep took it,
+	// set only on what that sweep returns; Apply then reads failed.
+	SettledFrom string
+}
+
 // RetryableApplyExpiration is a failed_retryable apply that was made permanent
 // because operator recovery should no longer retry it automatically.
 type RetryableApplyExpiration struct {
 	Apply  *Apply
 	Reason RetryableExpirationReason
+}
+
+// RetryableOperationExpiration is a failed_retryable operation row under a
+// running_degraded apply that was made permanent because operator recovery
+// should no longer retry it automatically. Apply is the parent as it stood when
+// the row was expired; the parent itself is not transitioned.
+type RetryableOperationExpiration struct {
+	Apply     *Apply
+	Operation *ApplyOperation
+	Reason    RetryableExpirationReason
+}
+
+// StaleRetryableRequest names the rows ApplyStore.MarkStaleApplyRetryable moves
+// to failed_retryable and the lease tokens the caller observed on them. An
+// observed token may be empty, for a row whose lease was already handed back;
+// it still has to match the stored token. OperationID is zero when no
+// operation row moves with the apply.
+type StaleRetryableRequest struct {
+	ApplyID             int64
+	ApplyLeaseToken     string
+	OperationID         int64
+	OperationLeaseToken string
+	ErrorMessage        string
 }
 
 // TaskStore manages schema change tasks (individual DDLs within an apply).
@@ -1872,6 +2048,15 @@ type ControlRequestStore interface {
 	// same operation is already pending for the apply, the existing request is
 	// returned with alreadyPending=true.
 	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
+
+	// RequestPendingCommand records req as RequestPending does, for the
+	// operator command req carries (ApplyControlRequest.ControlCommandID). A
+	// settled row that already carries that command is returned unchanged,
+	// with alreadyPending false: the command has run, and re-arming the row
+	// would retry it without the operator asking again. The caller tells that
+	// answer apart by the returned row's status. A req that carries no command
+	// is recorded as RequestPending records it.
+	RequestPendingCommand(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
 
 	// RequestPendingSuperseding records req as RequestPending does and, in the
 	// same transaction, completes the apply's pending request for superseded,

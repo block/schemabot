@@ -103,6 +103,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -149,8 +150,16 @@ type GRPCClient struct {
 	// For GRPCClient, the observer is notified by the local progress poller,
 	// not by the remote engine.
 	observerMu      sync.RWMutex
-	observers       map[int64]ProgressObserver
+	observers       map[int64]*observerRegistration
 	pendingObserver ProgressObserver
+	// observerPollInterval overrides the observer notification cadence; zero
+	// selects the production default. Tests set a short interval so poll-loop
+	// behavior is observable without real-time waits.
+	observerPollInterval time.Duration
+	// observerHandoffGrace overrides how long the poller holds a stop back
+	// from an observer registered during the stop's terminal update; zero
+	// selects defaultObserverHandoffGrace.
+	observerHandoffGrace time.Duration
 
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
@@ -159,6 +168,19 @@ type GRPCClient struct {
 	// unrecognizedStatuses reports remote-reported statuses with no task-state
 	// mapping at the drive's ingest points. Zero value is ready.
 	unrecognizedStatuses unrecognizedStatusReporter
+
+	// cutoverSharesTaken records the cutover request sets this client's drives
+	// have sent to their remote apply and how each is sent from then on
+	// (remoteCutoverShareSend). The durable request in storage stays the
+	// source of truth: after a restart the drive sends its share again, which
+	// a data plane that echoes the command id answers with the request it
+	// holds or the outcome it settled.
+	cutoverSharesTaken sync.Map // cutoverShareKey -> remoteCutoverShareSend
+
+	// progressBatches answers the poll loop's scoped progress polls for
+	// operations that share a remote apply with one BatchProgress call per
+	// round (see pollRemoteProgress).
+	progressBatches remoteProgressBatcher
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -224,10 +246,11 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 // stays within its command timeout only for a handful of environments — the
 // exhausted calls fail closed either way.
 //
-// Fast polls (Progress, Health) keep a sub-second budget: Progress is called
-// on tight drive loops that own their own failure handling, and Health feeds
-// the remote-deployment outage monitor, which must observe an outage promptly
-// rather than ride it out.
+// Fast polls (Progress, BatchProgress, Health, DriverCapacity) keep a
+// sub-second budget: Progress and BatchProgress are called on tight drive loops that own their own failure
+// handling, Health feeds the remote-deployment outage monitor, which must
+// observe an outage promptly rather than ride it out, and DriverCapacity is
+// read while apply creation waits on it.
 //
 // State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
@@ -251,7 +274,9 @@ const retryServiceConfig = `{
 	}, {
 		"name": [
 			{"service": "tern.v1.Tern", "method": "Progress"},
-			{"service": "tern.v1.Tern", "method": "Health"}
+			{"service": "tern.v1.Tern", "method": "BatchProgress"},
+			{"service": "tern.v1.Tern", "method": "Health"},
+			{"service": "tern.v1.Tern", "method": "DriverCapacity"}
 		],
 		"retryPolicy": {
 			"maxAttempts": 3,
@@ -399,10 +424,17 @@ func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
 		return
 	}
 	if c.observers == nil {
-		c.observers = make(map[int64]ProgressObserver)
+		c.observers = make(map[int64]*observerRegistration)
 	}
-	_, alreadyWatching := c.observers[applyID]
-	c.observers[applyID] = observer
+	existing, alreadyWatching := c.observers[applyID]
+	if alreadyWatching && samePointerObserver(existing.observer, observer) {
+		// Re-attaching the observer already registered, as routed calls do,
+		// is not a replacement: keep its registration so the poller does not
+		// hand it a terminal update it already received.
+		c.observerMu.Unlock()
+		return
+	}
+	c.observers[applyID] = &observerRegistration{observer: observer}
 	shouldStartPoller := c.storage != nil && !alreadyWatching
 	c.observerMu.Unlock()
 
@@ -411,8 +443,9 @@ func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
 	}
 }
 
-// Close closes the gRPC connection.
+// Close stops batching progress polls and closes the gRPC connection.
 func (c *GRPCClient) Close() error {
+	c.progressBatches.close()
 	return c.conn.Close()
 }
 
@@ -494,8 +527,58 @@ func (c *GRPCClient) consumePendingObserver() ProgressObserver {
 	return obs
 }
 
+// observerRegistration is one SetObserver call's entry in the observer map.
+// Each call allocates a new one, so a poller tells whether its observer was
+// replaced by comparing pointers. Comparing the observers themselves would
+// panic for an observer whose dynamic type is not comparable.
+type observerRegistration struct {
+	observer ProgressObserver
+}
+
+// samePointerObserver reports whether a and b are the same pointer observer.
+// Only pointers are compared: comparing other dynamic types as interface
+// values can panic.
+func samePointerObserver(a, b ProgressObserver) bool {
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	return va.Kind() == reflect.Pointer && vb.Kind() == reflect.Pointer &&
+		va.Type() == vb.Type() && va.Pointer() == vb.Pointer()
+}
+
+// defaultObserverHandoffGrace bounds how long the poller holds a stop back
+// from an observer registered while the stop's terminal update ran. A start
+// on a single-operation apply registers its observer before the drive moves
+// the row out of stopped, which takes a remote progress check and a remote
+// start. A row still stopped after the grace was not resumed, so the new
+// observer then receives the stop.
+const defaultObserverHandoffGrace = 2 * time.Minute
+
+// terminalHandoff records a stop the poller delivered to one observer before
+// moving on to the observer that replaced it during that update.
+type terminalHandoff struct {
+	reg      *observerRegistration
+	deadline time.Time
+}
+
+// observerPoll is one poller's state, kept outside the poll loop so a failed
+// poll can see which registration it was driving.
+type observerPoll struct {
+	// driving is the registration the poller last read.
+	driving *observerRegistration
+	// deliveringStop is set while the poller delivers a stop.
+	deliveringStop bool
+	handoff        *terminalHandoff
+}
+
 // getObserver returns the observer for an apply, or nil.
 func (c *GRPCClient) getObserver(applyID int64) ProgressObserver {
+	if reg := c.currentRegistration(applyID); reg != nil {
+		return reg.observer
+	}
+	return nil
+}
+
+// currentRegistration returns the apply's observer registration, or nil.
+func (c *GRPCClient) currentRegistration(applyID int64) *observerRegistration {
 	c.observerMu.RLock()
 	defer c.observerMu.RUnlock()
 	return c.observers[applyID]
@@ -506,6 +589,22 @@ func (c *GRPCClient) clearObserver(applyID int64) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
 	delete(c.observers, applyID)
+}
+
+// clearObserverIfCurrent removes the observer for applyID only if reg is still
+// the registered one, and reports whether it removed it. SetObserver treats an
+// existing registration as proof that a poller is already running, so a poller
+// that is about to exit must not blindly delete the map entry — a newer
+// observer may have replaced its own between reads, and deleting that
+// replacement would leave it registered-looking but never polled.
+func (c *GRPCClient) clearObserverIfCurrent(applyID int64, reg *observerRegistration) bool {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	if c.observers[applyID] != reg {
+		return false
+	}
+	delete(c.observers, applyID)
+	return true
 }
 
 // logApplyEvent appends a control-plane apply log entry for gRPC applies. The
@@ -570,8 +669,15 @@ func remoteApplyStateDescription(remoteState ternv1.State) string {
 // process that drives every apply. On a contained panic the observer is
 // cleared and the poller exits; the apply's drive is unaffected.
 func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
+	c.pollObserver(applyID, nil)
+}
+
+// pollObserver runs pollAndNotifyObserver's poll, starting from handoff when a
+// failed poll passes one on.
+func (c *GRPCClient) pollObserver(applyID int64, handoff *terminalHandoff) {
+	poll := &observerPoll{handoff: handoff}
 	err := panicsafe.Call(func() error {
-		c.notifyObserverUntilTerminal(applyID)
+		c.notifyObserverUntilTerminal(applyID, poll)
 		return nil
 	})
 	if err == nil {
@@ -582,7 +688,7 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 		// The poll loop returns nothing, so only a contained panic reaches here
 		// today; keep the signal if that invariant changes.
 		c.baseLogger().Error("observer poll failed; progress and terminal notifications for this apply are stopped", "error", err)
-		c.clearObserver(applyID)
+		c.releaseFailedPoll(applyID, poll)
 		return
 	}
 	attrs := []any{
@@ -597,14 +703,54 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 	}
 	c.baseLogger().Error("observer poll panicked; progress and terminal notifications for this apply are stopped", attrs...)
 	metrics.RecordRecoveredPanic(context.Background(), "observer_poll")
-	c.clearObserver(applyID)
+	c.releaseFailedPoll(applyID, poll)
+}
+
+// releaseFailedPoll clears the registration a failed poller was driving. A
+// start that registered a replacement during the failed callback found the
+// poller running and started none of its own, so the replacement gets a new
+// poller rather than being deleted. If the poll failed while delivering a
+// stop, the new poller holds that stop back from the replacement as the
+// failed one would have.
+func (c *GRPCClient) releaseFailedPoll(applyID int64, poll *observerPoll) {
+	if poll.driving == nil {
+		c.clearObserver(applyID)
+		return
+	}
+	if c.clearObserverIfCurrent(applyID, poll.driving) {
+		return
+	}
+	next := c.currentRegistration(applyID)
+	if next == nil {
+		return
+	}
+	var handoff *terminalHandoff
+	if poll.deliveringStop {
+		handoff = &terminalHandoff{reg: next, deadline: time.Now().Add(c.handoffGrace())}
+	}
+	c.baseLogger().Info("observer poll: observer replaced before its poll failed; starting a poll for the replacement",
+		"apply_row_id", applyID)
+	go c.pollObserver(applyID, handoff)
+}
+
+func (c *GRPCClient) handoffGrace() time.Duration {
+	if c.observerHandoffGrace == 0 {
+		return defaultObserverHandoffGrace
+	}
+	return c.observerHandoffGrace
 }
 
 // notifyObserverUntilTerminal is pollAndNotifyObserver's poll loop: it ticks
 // until the apply reaches a terminal state, the observer is cleared, or the
-// apply row disappears.
-func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
-	ticker := time.NewTicker(5 * time.Second)
+// apply row disappears. It records in poll the registration it is notifying,
+// so a failed poll clears only that one.
+func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64, poll *observerPoll) {
+	interval := c.observerPollInterval
+	if interval == 0 {
+		interval = 5 * time.Second
+	}
+	grace := c.handoffGrace()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Captured from the first successful load so a later transient load failure
@@ -619,11 +765,30 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 	}
 
 	for range ticker.C {
-		obs := c.getObserver(applyID)
-		if obs == nil {
+		reg := c.currentRegistration(applyID)
+		if reg == nil {
 			// Observer was cleared — apply reached terminal state and
 			// OnTerminal already ran. Stop polling.
 			return
+		}
+		poll.driving = reg
+		obs := reg.observer
+
+		// An observer that permanently lost its apply lease to a newer owner
+		// will never publish again — the new owner's observer carries the
+		// apply from here — so ticking it further is pure storage load and log
+		// noise. Clear it and stop, but only while it is still the registered
+		// observer: if a newer registration already replaced it, leave the
+		// replacement in place and drive it on the next tick.
+		if sup, ok := obs.(supersededObserver); ok && sup.Superseded() {
+			if c.clearObserverIfCurrent(applyID, reg) {
+				c.baseLogger().Info("observer poll: observer superseded by a newer apply owner; stopping poll",
+					identArgs()...)
+				return
+			}
+			c.baseLogger().Info("observer poll: superseded observer already replaced by a newer registration; continuing with the replacement",
+				identArgs()...)
+			continue
 		}
 
 		// Load failures here are transient — the ticker retries on the next
@@ -652,11 +817,41 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 		}
 
 		if state.IsTerminalApplyState(apply.State) {
+			stopped := state.IsState(apply.State, state.Apply.Stopped)
+			if handoff := poll.handoff; handoff != nil && handoff.reg == reg && stopped {
+				// The stop was already delivered to the observer this one
+				// replaced. A start can register before its drive moves the
+				// row out of stopped, so wait for the row to move rather
+				// than hand the new observer the stop and clear it.
+				if time.Now().Before(handoff.deadline) {
+					continue
+				}
+				c.applyLogger(apply).Warn("observer poll: apply still stopped after its replacement observer's grace; delivering the stop",
+					append(apply.MutableLogAttrs(), "grace", grace)...)
+			}
+			poll.deliveringStop = stopped
 			obs.OnTerminal(apply, tasks)
-			c.clearObserver(applyID)
-			return
+			poll.deliveringStop = false
+			// Starting a stopped apply registers a new observer, which can land
+			// while OnTerminal is still publishing the stop. That registration
+			// found this poller running and started none of its own, so clear
+			// only the observer just notified and keep driving a replacement.
+			if c.clearObserverIfCurrent(applyID, reg) {
+				return
+			}
+			if stopped {
+				if next := c.currentRegistration(applyID); next != nil {
+					poll.handoff = &terminalHandoff{reg: next, deadline: time.Now().Add(grace)}
+				}
+			}
+			c.applyLogger(apply).Info("observer poll: observer replaced during its terminal update; continuing with the replacement",
+				apply.MutableLogAttrs()...)
+			continue
 		}
 
+		// The apply has left stopped, so the stop the handoff holds back is
+		// over. A later stop is a new one, and its observer gets it at once.
+		poll.handoff = nil
 		obs.OnProgress(apply, tasks)
 	}
 }
@@ -714,6 +909,13 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return nil
 	}
 	logger := c.applyLogger(apply)
+	boundIDs, err := controlReq.CutoverOperationIDs()
+	if err != nil {
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(boundIDs) > 1 {
+		return c.processPendingRemoteCutoverSet(ctx, apply, scope, controlReq, boundIDs, logger)
+	}
 	if cutoverRequestResolvedByApplyState(apply.State) {
 		logger.InfoContext(ctx, "completing pending gRPC cutover request for resolved apply",
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
@@ -1586,7 +1788,7 @@ type undispatchedTerminalization struct {
 
 // stopUndispatchedTerminalization is how a stop settles undispatched work. A
 // stop is resumable on database types that can pause a change and terminal on
-// those that cannot, so the states follow stopTerminatesChange.
+// those that cannot, so the states follow StopTerminatesChange.
 func stopUndispatchedTerminalization(databaseType string) undispatchedTerminalization {
 	terminalization := undispatchedTerminalization{
 		taskState:        state.Task.Stopped,
@@ -1596,7 +1798,7 @@ func stopUndispatchedTerminalization(databaseType string) undispatchedTerminaliz
 		verb:             "stopped",
 		controlOperation: storage.ControlOperationStop,
 	}
-	if stopTerminatesChange(databaseType) {
+	if StopTerminatesChange(databaseType) {
 		terminalization.taskState = state.Task.Cancelled
 		terminalization.applyState = state.Apply.Cancelled
 		terminalization.operationState = state.ApplyOperation.Cancelled
@@ -1741,6 +1943,26 @@ func (c *GRPCClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertReque
 func (c *GRPCClient) Health(ctx context.Context) error {
 	_, err := c.client.Health(ctx, &ternv1.HealthRequest{})
 	return err
+}
+
+// DriverCapacity reads the drivers the deployment's live servers run.
+// It returns nil without an error when the deployment answers Unimplemented,
+// which a deployment running an older SchemaBot does.
+func (c *GRPCClient) DriverCapacity(ctx context.Context) (*DriverCapacity, error) {
+	resp, err := c.client.DriverCapacity(ctx, &ternv1.DriverCapacityRequest{})
+	if status.Code(err) == codes.Unimplemented {
+		c.baseLogger().DebugContext(ctx, "deployment does not report its driver capacity", "address", c.address)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read driver capacity: %w", err)
+	}
+	return &DriverCapacity{
+		LiveServers:            int(resp.GetLiveServers()),
+		Drivers:                int(resp.GetDrivers()),
+		DeferredCutoverDrivers: int(resp.GetDeferredCutoverDrivers()),
+		MaxDriversPerApply:     int(resp.GetMaxDriversPerApply()),
+	}, nil
 }
 
 // applyTaskScope selects which task rows the remote drive re-queries and where
@@ -2102,11 +2324,46 @@ func (c *GRPCClient) logProgressReadFromWholeApply(ctx context.Context, apply *s
 // operation is refused rather than read as this operation's state, and so is
 // an unscoped one unless acceptsUnscopedProgressAnswer allows it.
 func (c *GRPCClient) remoteProgress(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (*ternv1.ProgressResponse, error) {
+	return c.remoteProgressFrom(ctx, apply, scope, remoteID, c.directProgress)
+}
+
+// pollRemoteProgress is remoteProgress for the drive's poll loop. A poll
+// scoped to an operation joins this client's next batched round for its
+// remote apply, so the drives of every target that shares the remote apply
+// ask the data plane once per round between them rather than once each. The
+// answer is checked against the drive's scope exactly as a direct one is.
+func (c *GRPCClient) pollRemoteProgress(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (*ternv1.ProgressResponse, error) {
+	return c.remoteProgressFrom(ctx, apply, scope, remoteID, c.batchedProgress)
+}
+
+// progressFetch asks the data plane for one Progress answer.
+type progressFetch func(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error)
+
+func (c *GRPCClient) directProgress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	return c.client.Progress(ctx, req)
+}
+
+// batchedProgress answers a scoped Progress request from the remote apply's
+// next batched round, and asks directly when the request is unscoped or the
+// round could not answer it.
+func (c *GRPCClient) batchedProgress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	if req.GetApplyOperationId() == "" {
+		return c.directProgress(ctx, req)
+	}
+	key := progressBatchKey{remoteApplyID: req.GetApplyId(), environment: req.GetEnvironment()}
+	resp, err := c.progressBatches.progress(ctx, c.client, c.baseLogger(), key, req.GetApplyOperationId())
+	if errors.Is(err, errProgressBatchFallback) {
+		return c.directProgress(ctx, req)
+	}
+	return resp, err
+}
+
+func (c *GRPCClient) remoteProgressFrom(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string, fetch progressFetch) (*ternv1.ProgressResponse, error) {
 	remoteOperationID, err := scope.remoteOperationScope()
 	if err != nil {
 		return nil, fmt.Errorf("poll remote apply %s for %s: %w", remoteID, apply.ApplyIdentifier, err)
 	}
-	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+	resp, err := fetch(ctx, &ternv1.ProgressRequest{
 		ApplyId:          remoteID,
 		Environment:      apply.Environment,
 		ApplyOperationId: remoteOperationID,
@@ -4847,6 +5104,13 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 					append(storedApply.MutableLogAttrs(), "table", storedTask.TableName, "shard", sh.Shard)...)
 				return
 			}
+			if ctx.Err() != nil {
+				// The reconcile context ended (shutdown, lease release, or its
+				// deadline), so every further shard would fail the same way.
+				// Stop; the next reconcile re-applies the breakdown.
+				logShardProgressEncodeStopped(ctx, logger, storedApply, storedTask, sh.Shard, err)
+				return
+			}
 			logger.ErrorContext(ctx, "failed to encode remote per-shard progress into control-plane storage",
 				append(storedApply.MutableLogAttrs(),
 					"apply_operation_id", *storedTask.ApplyOperationID,
@@ -4854,6 +5118,22 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 					"error", err)...)
 		}
 	}
+}
+
+// logShardProgressEncodeStopped logs why a per-shard progress encode stopped
+// because its reconcile context ended. Cancellation is how a drive stops on
+// shutdown or lease release, so it is routine; a deadline means the reconcile
+// ran out of time and is worth a warning.
+func logShardProgressEncodeStopped(ctx context.Context, logger *slog.Logger, storedApply *storage.Apply, storedTask *storage.Task, shard string, err error) {
+	attrs := append(storedApply.MutableLogAttrs(),
+		"apply_operation_id", *storedTask.ApplyOperationID,
+		"namespace", storedTask.Namespace, "table", storedTask.TableName, "shard", shard,
+		"cause", context.Cause(ctx), "error", err)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		logger.InfoContext(ctx, "stopping remote per-shard progress encode: reconcile context was cancelled", attrs...)
+		return
+	}
+	logger.WarnContext(ctx, "stopping remote per-shard progress encode: reconcile context deadline passed", attrs...)
 }
 
 // reconcileStoredTasksForTerminalRemoteApply force-resolves any stored task the
@@ -5118,7 +5398,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 			// Poll progress from remote Tern
 			remoteID := scope.remoteApplyID(apply)
-			resp, err := c.remoteProgress(ctx, apply, scope, remoteID)
+			resp, err := c.pollRemoteProgress(ctx, apply, scope, remoteID)
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
 					message := fmt.Sprintf("remote apply %s was not found by data plane", remoteID)

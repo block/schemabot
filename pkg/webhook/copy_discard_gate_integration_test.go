@@ -125,11 +125,12 @@ type discardGateFixture struct {
 	dbName  string
 }
 
-// disclosingPlanID stores a plan made against the target as it is now — copy
-// and all — and returns its identifier. It stands for the comment an operator
-// was shown: pinning a confirmation to it is what records that they saw the
-// discard before agreeing to it.
-func (f discardGateFixture) disclosingPlanID(t *testing.T) string {
+// disclosingPlan stores a plan made against the target as it is now — copy and
+// all — and returns its identifier with the copies its comment discloses. It
+// stands for the comment an operator was shown: pinning a confirmation to it,
+// with those copies recorded, is what records that they saw the discard before
+// agreeing to it.
+func (f discardGateFixture) disclosingPlan(t *testing.T) (string, []storage.DisclosedCopy) {
 	t.Helper()
 
 	installClient := ghclient.NewInstallationClientWithSlug(f.client, testLogger(), "schemabot")
@@ -156,7 +157,13 @@ func (f discardGateFixture) disclosingPlanID(t *testing.T) string {
 	stored, err := f.svc.Storage().Plans().Get(t.Context(), planResp.PlanID)
 	require.NoError(t, err)
 	require.NotNil(t, stored, "the disclosing plan must be stored for apply-confirm to load")
-	return planResp.PlanID
+	return planResp.PlanID, rolloutDisclosedCopies(planResp, reviewDriftOutcome{}, false)
+}
+
+// eventsCopyOn is a disclosure of one unfinished copy of `events` on the
+// apply's own target, for tests that record consent without planning.
+func eventsCopyOn(dbName string) []storage.DisclosedCopy {
+	return []storage.DisclosedCopy{{Namespace: dbName, Tables: []string{"events"}}}
 }
 
 // requireLockEventually waits for the durable state a stop leaves behind. The
@@ -493,7 +500,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 
 	h.executeApply(t.Context(), installClient, repo, pr, schemaResult, "staging", 1, "testuser",
 		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true},
-		storedPlan, storedPlan, planResp.PlanID, false)
+		storedPlan, storedPlan, planResp.PlanID, nil)
 
 	select {
 	case body := <-result.comments:
@@ -571,7 +578,7 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 	// posted, and records that this one discloses the discard — without that the
 	// next confirm would load the comment that disclosed nothing and stop again.
 	lock := f.requireLockEventually(t, func(l *storage.Lock) bool {
-		return l.DisclosedCopyDiscard && l.PendingPlanID != noCopyPlanID
+		return len(l.DisclosedCopies) > 0 && l.PendingPlanID != noCopyPlanID
 	}, "the stop must re-pin the confirmation onto the plan it just disclosed")
 	plan, err := f.svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
 	require.NoError(t, err)
@@ -595,14 +602,15 @@ func TestE2EApplyConfirmProceedsWhenDiscardWasDisclosed(t *testing.T) {
 	const dbName = "webhook_copy_discard_consented"
 	f := setupDiscardGate(t, dbName)
 
+	planID, disclosed := f.disclosingPlan(t)
 	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
-		DatabaseName:         dbName,
-		DatabaseType:         "mysql",
-		Repository:           "octocat/hello-world",
-		PullRequest:          1,
-		Owner:                "octocat/hello-world#1",
-		PendingPlanID:        f.disclosingPlanID(t),
-		DisclosedCopyDiscard: true,
+		DatabaseName:    dbName,
+		DatabaseType:    "mysql",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		Owner:           "octocat/hello-world#1",
+		PendingPlanID:   planID,
+		DisclosedCopies: disclosed,
 	}))
 
 	rr := httptest.NewRecorder()
@@ -671,7 +679,7 @@ func TestRepinPendingConfirmationPreservesANewerIntent(t *testing.T) {
 	// confirmation, so the stop leaves it alone.
 	acquire(t, "rollback:the-operator-just-asked-for-this")
 	err := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
-		"plan-the-apply-observed", "plan-disclosing-the-copy", true)
+		"plan-the-apply-observed", "plan-disclosing-the-copy", eventsCopyOn(dbName))
 	require.ErrorIs(t, err, storage.ErrLockIntentChanged)
 
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -679,20 +687,21 @@ func TestRepinPendingConfirmationPreservesANewerIntent(t *testing.T) {
 	require.NotNil(t, lock)
 	assert.Equal(t, "rollback:the-operator-just-asked-for-this", lock.PendingPlanID,
 		"the newer intent must survive the stop")
-	assert.False(t, lock.DisclosedCopyDiscard,
+	assert.Empty(t, lock.DisclosedCopies,
 		"declining to re-pin leaves the copy gate armed for the next confirm")
 
 	// With the observed intent still in place, the re-pin moves the confirmation
 	// onto the disclosing plan and records what that comment showed.
 	acquire(t, "plan-the-apply-observed")
 	require.NoError(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
-		"plan-the-apply-observed", "plan-disclosing-the-copy", true))
+		"plan-the-apply-observed", "plan-disclosing-the-copy", eventsCopyOn(dbName)))
 
 	lock, err = f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 	require.NotNil(t, lock)
 	assert.Equal(t, "plan-disclosing-the-copy", lock.PendingPlanID)
-	assert.True(t, lock.DisclosedCopyDiscard)
+	assert.Equal(t, eventsCopyOn(dbName), lock.DisclosedCopies)
+	assert.True(t, lock.DisclosedCopyDiscard, "a build that reads only the flag still sees the disclosure")
 }
 
 // releasingRepinStorage wraps the service's storage so a test can release the
@@ -758,7 +767,7 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 			}
 
 			repinErr := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
-				"plan-the-apply-observed", "plan-disclosing-the-copy", true)
+				"plan-the-apply-observed", "plan-disclosing-the-copy", eventsCopyOn(dbName))
 			require.ErrorIs(t, repinErr, storage.ErrLockIntentChanged)
 			if tt.releasedDuringWrite {
 				require.NoError(t, locks.releaseErr)
@@ -780,7 +789,7 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 	// A stop that observed no pending confirmation has nothing to move, so it
 	// must not take the free lock either.
 	require.Error(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
-		"", "plan-disclosing-the-copy", true))
+		"", "plan-disclosing-the-copy", eventsCopyOn(dbName)))
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 	assert.Nil(t, lock, "a re-pin with no observed intent must not create a lock")

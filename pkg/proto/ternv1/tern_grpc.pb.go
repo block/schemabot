@@ -25,11 +25,13 @@ const (
 	Tern_CompareSchemaFileChange_FullMethodName = "/tern.v1.Tern/CompareSchemaFileChange"
 	Tern_Apply_FullMethodName                   = "/tern.v1.Tern/Apply"
 	Tern_Progress_FullMethodName                = "/tern.v1.Tern/Progress"
+	Tern_BatchProgress_FullMethodName           = "/tern.v1.Tern/BatchProgress"
 	Tern_Logs_FullMethodName                    = "/tern.v1.Tern/Logs"
 	Tern_Cutover_FullMethodName                 = "/tern.v1.Tern/Cutover"
 	Tern_Revert_FullMethodName                  = "/tern.v1.Tern/Revert"
 	Tern_SkipRevert_FullMethodName              = "/tern.v1.Tern/SkipRevert"
 	Tern_Health_FullMethodName                  = "/tern.v1.Tern/Health"
+	Tern_DriverCapacity_FullMethodName          = "/tern.v1.Tern/DriverCapacity"
 	Tern_Stop_FullMethodName                    = "/tern.v1.Tern/Stop"
 	Tern_Cancel_FullMethodName                  = "/tern.v1.Tern/Cancel"
 	Tern_Start_FullMethodName                   = "/tern.v1.Tern/Start"
@@ -133,6 +135,19 @@ type TernClient interface {
 	//
 	// Unknown apply IDs return NOT_FOUND.
 	Progress(ctx context.Context, in *ProgressRequest, opts ...grpc.CallOption) (*ProgressResponse, error)
+	// BatchProgress answers Progress for several operations of one apply in a
+	// single call. The rollout members of one deployment share its apply, each
+	// with its own operation, so a caller driving many of them asks once per
+	// poll instead of once per member, and the apply, its tasks, and its
+	// operations are read once for all of them.
+	//
+	// Each entry of the answer is what Progress scoped to that operation would
+	// return, or the error it would fail with. An error that concerns the whole
+	// apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+	//
+	// A deployment that answers Unimplemented predates the RPC, and the caller
+	// asks Progress once per operation.
+	BatchProgress(ctx context.Context, in *BatchProgressRequest, opts ...grpc.CallOption) (*BatchProgressResponse, error)
 	// Logs returns a bounded recent window of durable apply logs. It is read-only.
 	Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (*LogsResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
@@ -161,6 +176,15 @@ type TernClient interface {
 	SkipRevert(ctx context.Context, in *SkipRevertRequest, opts ...grpc.CallOption) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
+	// DriverCapacity reports the drivers this deployment's operators run, so a
+	// caller can refuse up front an apply that could never have all its
+	// operations here waiting at a deferred cutover at once.
+	//
+	// A deployment that answers also runs the cutover of every operation a
+	// CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+	// must not send an apply started with defer_cutover to a deployment that
+	// answers Unimplemented.
+	DriverCapacity(ctx context.Context, in *DriverCapacityRequest, opts ...grpc.CallOption) (*DriverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -285,6 +309,16 @@ func (c *ternClient) Progress(ctx context.Context, in *ProgressRequest, opts ...
 	return out, nil
 }
 
+func (c *ternClient) BatchProgress(ctx context.Context, in *BatchProgressRequest, opts ...grpc.CallOption) (*BatchProgressResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchProgressResponse)
+	err := c.cc.Invoke(ctx, Tern_BatchProgress_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *ternClient) Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (*LogsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LogsResponse)
@@ -329,6 +363,16 @@ func (c *ternClient) Health(ctx context.Context, in *HealthRequest, opts ...grpc
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HealthResponse)
 	err := c.cc.Invoke(ctx, Tern_Health_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) DriverCapacity(ctx context.Context, in *DriverCapacityRequest, opts ...grpc.CallOption) (*DriverCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DriverCapacityResponse)
+	err := c.cc.Invoke(ctx, Tern_DriverCapacity_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +525,19 @@ type TernServer interface {
 	//
 	// Unknown apply IDs return NOT_FOUND.
 	Progress(context.Context, *ProgressRequest) (*ProgressResponse, error)
+	// BatchProgress answers Progress for several operations of one apply in a
+	// single call. The rollout members of one deployment share its apply, each
+	// with its own operation, so a caller driving many of them asks once per
+	// poll instead of once per member, and the apply, its tasks, and its
+	// operations are read once for all of them.
+	//
+	// Each entry of the answer is what Progress scoped to that operation would
+	// return, or the error it would fail with. An error that concerns the whole
+	// apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+	//
+	// A deployment that answers Unimplemented predates the RPC, and the caller
+	// asks Progress once per operation.
+	BatchProgress(context.Context, *BatchProgressRequest) (*BatchProgressResponse, error)
 	// Logs returns a bounded recent window of durable apply logs. It is read-only.
 	Logs(context.Context, *LogsRequest) (*LogsResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
@@ -509,6 +566,15 @@ type TernServer interface {
 	SkipRevert(context.Context, *SkipRevertRequest) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
+	// DriverCapacity reports the drivers this deployment's operators run, so a
+	// caller can refuse up front an apply that could never have all its
+	// operations here waiting at a deferred cutover at once.
+	//
+	// A deployment that answers also runs the cutover of every operation a
+	// CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+	// must not send an apply started with defer_cutover to a deployment that
+	// answers Unimplemented.
+	DriverCapacity(context.Context, *DriverCapacityRequest) (*DriverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -590,6 +656,9 @@ func (UnimplementedTernServer) Apply(context.Context, *ApplyRequest) (*ApplyResp
 func (UnimplementedTernServer) Progress(context.Context, *ProgressRequest) (*ProgressResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Progress not implemented")
 }
+func (UnimplementedTernServer) BatchProgress(context.Context, *BatchProgressRequest) (*BatchProgressResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchProgress not implemented")
+}
 func (UnimplementedTernServer) Logs(context.Context, *LogsRequest) (*LogsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Logs not implemented")
 }
@@ -604,6 +673,9 @@ func (UnimplementedTernServer) SkipRevert(context.Context, *SkipRevertRequest) (
 }
 func (UnimplementedTernServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Health not implemented")
+}
+func (UnimplementedTernServer) DriverCapacity(context.Context, *DriverCapacityRequest) (*DriverCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DriverCapacity not implemented")
 }
 func (UnimplementedTernServer) Stop(context.Context, *StopRequest) (*StopResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Stop not implemented")
@@ -748,6 +820,24 @@ func _Tern_Progress_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Tern_BatchProgress_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchProgressRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).BatchProgress(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_BatchProgress_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).BatchProgress(ctx, req.(*BatchProgressRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Tern_Logs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(LogsRequest)
 	if err := dec(in); err != nil {
@@ -834,6 +924,24 @@ func _Tern_Health_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TernServer).Health(ctx, req.(*HealthRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_DriverCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DriverCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).DriverCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_DriverCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).DriverCapacity(ctx, req.(*DriverCapacityRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -960,6 +1068,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Tern_Progress_Handler,
 		},
 		{
+			MethodName: "BatchProgress",
+			Handler:    _Tern_BatchProgress_Handler,
+		},
+		{
 			MethodName: "Logs",
 			Handler:    _Tern_Logs_Handler,
 		},
@@ -978,6 +1090,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Health",
 			Handler:    _Tern_Health_Handler,
+		},
+		{
+			MethodName: "DriverCapacity",
+			Handler:    _Tern_DriverCapacity_Handler,
 		},
 		{
 			MethodName: "Stop",

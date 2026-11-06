@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/metrics"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/hmarr/codeowners"
+
+	"github.com/block/schemabot/pkg/panicsafe"
 )
 
 // Review states returned by the GitHub API.
@@ -41,7 +45,7 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 
 	for {
 		var resp *gh.Response
-		reviews, err := retryGitHubUnavailableRead(ctx, ic.logger, "list PR reviews", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.PullRequestReview, error) {
+		reviews, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListReviews, "list PR reviews", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.PullRequestReview, error) {
 			list, listResp, listErr := ic.client.PullRequests.ListReviews(ctx, owner, repoName, pr, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -87,7 +91,8 @@ func GetApprovedReviewers(reviews []*ReviewInfo) []string {
 // GetApprovedReviews returns, for each user whose latest decisive review is
 // APPROVED, that approving review, so callers can see which commit each
 // approval was given on. Latest-decisive-review semantics match
-// GetApprovedReviewers.
+// GetApprovedReviewers. Approvals come in the order they were given, so
+// comments that name approvers name them the same way every time.
 func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
 	latest := make(map[string]*ReviewInfo)
 	for _, r := range reviews {
@@ -109,6 +114,12 @@ func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
 			approved = append(approved, r)
 		}
 	}
+	slices.SortFunc(approved, func(a, b *ReviewInfo) int {
+		if c := a.SubmittedAt.Compare(b.SubmittedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(strings.ToLower(a.User), strings.ToLower(b.User))
+	})
 	return approved
 }
 
@@ -140,11 +151,41 @@ func (ic *InstallationClient) FetchCodeownersRuleset(ctx context.Context, repo, 
 	return nil, nil
 }
 
+// UnmatchableCodeownersRuleError reports a CODEOWNERS rule the parser accepts
+// but cannot match. Error() names only the path being matched, so it can reach
+// a PR comment; Panic carries the recovered value and stack for server-side
+// logs, where the identifiers needed to triage it live.
+type UnmatchableCodeownersRuleError struct {
+	Path  string
+	Panic *panicsafe.Error
+}
+
+func (e *UnmatchableCodeownersRuleError) Error() string {
+	return fmt.Sprintf("match CODEOWNERS path %s: the CODEOWNERS file holds a rule that cannot be matched; fix the rule on the base branch", e.Path)
+}
+
+func (e *UnmatchableCodeownersRuleError) Unwrap() error {
+	return e.Panic
+}
+
 // MatchCodeownersPath finds the owners for a specific file path using CODEOWNERS rules.
 // Last matching rule wins (standard CODEOWNERS semantics).
 // Returns nil, nil if no rule matches. Returns an error if pattern matching fails.
+//
+// The parser panics on some rules it accepts, such as a bare `/ @owner`, and
+// CODEOWNERS is repository content, so a panic is returned as an
+// *UnmatchableCodeownersRuleError: the review gate then fails closed with a
+// reason instead of never answering.
 func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeowners.Owner, error) {
-	rule, err := ruleset.Match(filePath)
+	var rule *codeowners.Rule
+	recovered, err := panicsafe.Catch(func() error {
+		var matchErr error
+		rule, matchErr = ruleset.Match(filePath)
+		return matchErr
+	})
+	if recovered != nil {
+		return nil, &UnmatchableCodeownersRuleError{Path: filePath, Panic: recovered}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("match CODEOWNERS path %s: %w", filePath, err)
 	}
@@ -191,7 +232,7 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 
 	for {
 		var resp *gh.Response
-		users, err := retryGitHubUnavailableRead(ctx, ic.logger, "list team members", []any{"org", org, "team_slug", slug}, func(ctx context.Context) ([]*gh.User, error) {
+		users, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListTeamMembers, "list team members", []any{"org", org, "team_slug", slug}, func(ctx context.Context) ([]*gh.User, error) {
 			list, listResp, listErr := ic.client.Teams.ListTeamMembersBySlug(ctx, org, slug, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)

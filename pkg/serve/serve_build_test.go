@@ -21,6 +21,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -36,10 +37,12 @@ type stubTernClient struct{ tern.Client }
 func TestServerRegisterGRPCRegistersTernService(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	cfg := &api.ServerConfig{}
+	store := mysqlstore.New(nil)
 	srv := &Server{
 		cfg:             cfg,
 		dataPlaneClient: stubTernClient{},
-		svc:             api.New(mysqlstore.New(nil), cfg, nil, logger),
+		svc:             api.New(store, cfg, nil, logger),
+		storage:         store,
 		logger:          logger,
 	}
 
@@ -413,10 +416,12 @@ func TestServerRegisterGRPCThreadsStorageSchemaService(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logger := slog.New(slog.DiscardHandler)
 			cfg := &api.ServerConfig{}
+			store := mysqlstore.New(nil)
 			srv := &Server{
 				cfg:             cfg,
 				dataPlaneClient: stubTernClient{},
-				svc:             api.New(mysqlstore.New(nil), cfg, nil, logger),
+				svc:             api.New(store, cfg, nil, logger),
+				storage:         store,
 				logger:          logger,
 				storageSchema:   tc.storageSchema,
 			}
@@ -431,6 +436,64 @@ func TestServerRegisterGRPCThreadsStorageSchemaService(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, database, resp.GetReport().GetDatabase(),
 				"the plan must come from the adapter bound to this instance's storage")
+		})
+	}
+}
+
+// driverPoolsStorage is storage whose driver pools answer
+// ListLive with fixed servers.
+type driverPoolsStorage struct {
+	storage.Storage
+	servers []*storage.DriverPool
+}
+
+func (s driverPoolsStorage) DriverPools() storage.DriverPoolStore {
+	return liveDriverPools{servers: s.servers}
+}
+
+type liveDriverPools struct {
+	storage.DriverPoolStore
+	servers []*storage.DriverPool
+}
+
+func (s liveDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
+	return s.servers, nil
+}
+
+// A control plane checks a deferred apply against what this instance reports
+// over gRPC, so the registration an embedder gets reports the live servers of
+// its own storage and the max_drivers_per_apply its own drivers run one apply
+// under, the default when the config leaves it unset.
+func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		maxDriversPerApply int
+		want               int32
+	}{
+		{name: "configured", maxDriversPerApply: 6, want: 6},
+		{name: "unset", want: storage.DefaultMaxDriversPerApply},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := slog.New(slog.DiscardHandler)
+			cfg := &api.ServerConfig{MaxDriversPerApply: tc.maxDriversPerApply}
+			store := driverPoolsStorage{servers: []*storage.DriverPool{
+				{ServerID: "host-a/1/operator", Drivers: 4},
+			}}
+			srv := &Server{
+				cfg:             cfg,
+				dataPlaneClient: stubTernClient{},
+				svc:             api.New(mysqlstore.New(nil), cfg, nil, logger),
+				storage:         store,
+				logger:          logger,
+			}
+
+			resp, err := dialRegisteredTernServer(t, srv).DriverCapacity(t.Context(), &ternv1.DriverCapacityRequest{})
+
+			require.NoError(t, err)
+			assert.Equal(t, int32(1), resp.GetLiveServers())
+			assert.Equal(t, int32(4), resp.GetDrivers())
+			assert.Equal(t, int32(3), resp.GetDeferredCutoverDrivers())
+			assert.Equal(t, tc.want, resp.GetMaxDriversPerApply())
 		})
 	}
 }

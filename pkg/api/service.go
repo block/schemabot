@@ -189,7 +189,10 @@ type Service struct {
 	// claimingStopped records that stopRecovery has been closed, so the claim
 	// gate can be closed ahead of StopOperator and closed at most once.
 	claimingStopped bool
-	recoveryWg      sync.WaitGroup
+	// driverPoolServerID is this run's row in driver_pools,
+	// set by StartOperator and removed by StopOperator.
+	driverPoolServerID string
+	recoveryWg         sync.WaitGroup
 	// maintenanceWg holds the reaper passes, which share the driver lifecycle
 	// but claim nothing and drive nothing. They are waited on apart from the
 	// drivers so that a reaper which does not return cannot decide whether the
@@ -197,7 +200,11 @@ type Service struct {
 	maintenanceWg        sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
-	retryableExpiryEvery time.Duration
+	// operatorHeartbeatEvery overrides OperatorHeartbeatInterval in tests.
+	operatorHeartbeatEvery time.Duration
+	// operatorHeartbeatDeadline overrides operatorHeartbeatTimeout in tests.
+	operatorHeartbeatDeadline time.Duration
+	retryableExpiryEvery      time.Duration
 	// driversBusy counts this process's operator drivers that currently hold
 	// claimed work; it backs the drivers-busy gauge.
 	driversBusy atomic.Int64
@@ -711,7 +718,7 @@ func malformedTokenError(key, ref, resolved, requirement string) error {
 
 func (s *Service) newLocalTernClient(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
 	// Resolve target DSN (handles env:, file: prefixes and structured DSN sources)
-	targetDSN, err := envConfig.ResolveDSN()
+	targetDSN, err := envConfig.ResolveDSN(dbType)
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
 	}

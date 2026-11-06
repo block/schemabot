@@ -1040,11 +1040,15 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
+	// The driver capacity is that of the operators sharing this instance's
+	// storage, since those are the operators that run what a control plane
+	// sends here, and they share this instance's per-apply cap.
+	maxDriversPerApply := storage.BuildOptions(storage.WithMaxDriversPerApply(s.cfg.MaxDriversPerApply)).MaxDriversPerApply
+	opts := []tern.ServerOption{tern.WithDriverCapacity(s.storage.DriverPools(), maxDriversPerApply)}
 	// The storage-schema service answers for this instance's own storage
 	// database, which is the only way a control plane can read it: a data
 	// plane's storage is reachable from the data plane, and the gRPC endpoint
 	// is the connection that already exists between the two.
-	opts := []tern.ServerOption{}
 	if s.storageSchema != nil {
 		opts = append(opts, tern.WithStorageSchemaService(s.storageSchema))
 	}
@@ -1292,7 +1296,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 	dbName := matches[0]
 	dbConfig := config.Databases[dbName]
 	envConfig := dbConfig.Environments[env]
-	targetDSN, err := envConfig.ResolveDSN()
+	targetDSN, err := envConfig.ResolveDSN(dbConfig.Type)
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}

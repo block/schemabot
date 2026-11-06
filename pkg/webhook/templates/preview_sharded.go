@@ -16,7 +16,10 @@ func previewShardStatuses(ops []presentation.Operation) []ShardStatus {
 	derived := presentation.Derive(ops).Deployments
 	out := make([]ShardStatus, 0, len(derived))
 	for _, d := range derived {
-		out = append(out, ShardStatus{Shard: d.Deployment, Emoji: d.Emoji, Label: d.Label, State: d.State, Error: d.Error})
+		out = append(out, ShardStatus{
+			Shard: d.Deployment, Emoji: d.Emoji, Label: d.Label, State: d.State, Error: d.Error,
+			StoppedAtCutover: d.Presentation == presentation.StateStoppedAtCutover, EndedBy: d.EndedBy,
+		})
 	}
 	return out
 }
@@ -207,6 +210,42 @@ func PreviewCommentShardedSummaryFailed() string {
 			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
 		}},
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "cancelled"}},
+	})
+}
+
+// PreviewCommentShardedSummaryStoppedAtCutover renders the terminal summary
+// for a sharded apply that deferred its cutover. Shard -40 failed while the
+// other shards had copied and waited at the cutover, which could then never
+// run for every shard, so SchemaBot stopped them, saved their copies, and
+// failed the apply. The first failure names -40 alone, and a note says the
+// stopped shards resume on a new apply.
+func PreviewCommentShardedSummaryStoppedAtCutover() string {
+	endedBy := &presentation.OperationRef{Deployment: "-40"}
+	return RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "shop",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		RequestedBy: previewRequestedBy,
+		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "shop_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Failed,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Failed},
+					{Shard: "40-80", Status: state.Task.Stopped},
+					{Shard: "80-c0", Status: state.Task.Stopped},
+					{Shard: "c0-", Status: state.Task.Stopped},
+				},
+			}},
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-40", State: state.ApplyOperation.Failed, Barrier: true, Error: "resolve shard primary for `-40`: context deadline exceeded"},
+				{Deployment: "40-80", State: state.ApplyOperation.Failed, Barrier: true, EndedBy: endedBy},
+				{Deployment: "80-c0", State: state.ApplyOperation.Failed, Barrier: true, EndedBy: endedBy},
+				{Deployment: "c0-", State: state.ApplyOperation.Failed, Barrier: true, EndedBy: endedBy},
+			}),
+			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		}},
 	})
 }
 

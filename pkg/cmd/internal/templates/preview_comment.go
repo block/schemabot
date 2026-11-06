@@ -27,6 +27,7 @@ func previewCommentErrorsOutput() {
 		{"GENERIC ERROR", webhooktemplates.PreviewCommentErrorGeneric},
 		{"AUTO-PLAN: GENERIC ERROR", webhooktemplates.PreviewCommentErrorGenericAutoPlan},
 		{"MISSING -e FLAG", webhooktemplates.PreviewCommentMissingEnv},
+		{"MISSING -e FLAG ON A CONTROL COMMAND", webhooktemplates.PreviewCommentControlMissingEnv},
 		{"INVALID COMMAND", webhooktemplates.PreviewCommentInvalidCmd},
 	}
 
@@ -101,6 +102,9 @@ func previewCommentAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (COPY DISCARDED ON ANOTHER TARGET, PAUSED)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutCopyDiscardedPaused())
+		}},
 		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
@@ -124,6 +128,7 @@ func previewCommentAllOutput() {
 		{"GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGeneric()) }},
 		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
+		{"MISSING -E FLAG ON A CONTROL COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentControlMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"APPLY ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
@@ -237,6 +242,9 @@ func previewCommentPlanAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (COPY DISCARDED ON ANOTHER TARGET, PAUSED)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutCopyDiscardedPaused())
+		}},
 		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
@@ -263,6 +271,7 @@ func previewCommentPlanAllOutput() {
 		{"GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGeneric()) }},
 		{"AUTO-PLAN: GENERIC ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentErrorGenericAutoPlan()) }},
 		{"MISSING -E FLAG", func() { fmt.Print(webhooktemplates.PreviewCommentMissingEnv()) }},
+		{"MISSING -E FLAG ON A CONTROL COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentControlMissingEnv()) }},
 		{"INVALID COMMAND", func() { fmt.Print(webhooktemplates.PreviewCommentInvalidCmd()) }},
 	}
 	printSections(sections)
@@ -293,6 +302,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED BY OTHER PR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByOtherPR()) }},
 		{"APPLY BLOCKED BY CLI", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCLI()) }},
 		{"APPLY BLOCKED: ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgress()) }},
+		{"APPLY BLOCKED: ALREADY APPLYING THE LATEST COMMIT", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgressLatestCommit()) }},
 		{"APPLY BLOCKED: PR CLOSED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedClosedPR()) }},
 		{"APPLY BLOCKED: PR MERGED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedMergedPR()) }},
 		{"APPLY BLOCKED: BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
@@ -318,6 +328,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: ENVIRONMENT NOT IN PROMOTION ORDER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUnlistedEnvironment()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (NO OPERATORS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredNoOperators()) }},
+		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVER NOT AUTHORIZED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredUnauthorizedApprover()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApproval()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT, PR TARGETS ANOTHER BRANCH)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApprovalOtherBranch()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (UNCHANGED FILE, CHANGED BASE)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredChangedBase()) }},
@@ -449,6 +460,8 @@ func previewCommentShardedAllOutput() {
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
 		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
+		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A SHARD FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryStoppedAtCutover()) }},
+		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A TABLE FAILED ON A KEYSPACE'S ONLY SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStoppedAtCutoverOnOnlyShard()) }},
 		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}
 	printSections(sections)

@@ -506,6 +506,7 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 		assert.Equal(t, state.Apply.Cancelled, entry.NewState)
 		assert.Contains(t, entry.Message, "derived")
 		assert.Contains(t, entry.Message, state.Apply.Cancelled)
+		assert.True(t, entry.ApplyWide, "the parent's state belongs to every target, not to the operation whose drive projected it")
 	})
 
 	t.Run("lost compare-and-swap appends nothing", func(t *testing.T) {
@@ -1670,6 +1671,28 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		require.Len(t, control.completed, 1, "the stop landed on every operation, so its request completes; the cancel is still deliverable")
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
+	})
+
+	// SchemaBot's stop for an ended operation is the mark the ended-operation
+	// settle selects on, and the settle answers it once the apply is failed.
+	// The drive tail that reaches it first leaves it pending, so the apply
+	// held open behind the failure still settles.
+	t.Run("leaves SchemaBot's stop for an ended operation to the settle", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-degraded", State: state.Apply.RunningDegraded}}
+		stop := pendingRequest(storage.ControlOperationStop)
+		stop.RequestedBy = storage.EndedOperationStopCaller
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop: stop,
+		}}
+		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed},
+			{ID: 2, Deployment: "region-a", State: state.ApplyOperation.Stopped},
+		}}
+		svc := newStopReconcileTestService(applies, ops, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Empty(t, control.completed, "the settle answers SchemaBot's stop once the apply is failed")
+		assert.Empty(t, control.failed)
 	})
 
 	t.Run("fails a pending cutover when a cancel settled the apply", func(t *testing.T) {
@@ -2977,13 +3000,6 @@ func TestWakesReachThePoolAndTheReservedDriver(t *testing.T) {
 		assert.Len(t, svc.operatorWake, 1)
 		assert.Empty(t, svc.reservedDriverWake)
 	})
-}
-
-func TestDeferredCutoverDriversLeavesOneDriverPerPod(t *testing.T) {
-	assert.Equal(t, 0, deferredCutoverDrivers(0))
-	assert.Equal(t, 1, deferredCutoverDrivers(1), "a single driver is not reserved")
-	assert.Equal(t, 1, deferredCutoverDrivers(2))
-	assert.Equal(t, 3, deferredCutoverDrivers(4))
 }
 
 // A panic in the pre-claim stop-reconciliation probe is contained the same

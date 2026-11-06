@@ -67,7 +67,7 @@
   },
   {
     "name": "cli-cutover",
-    "title": "Choose when to cut over.",
+    "title": "Choose when the cutover runs.",
     "frames": [
       {
         "seconds": 2,
@@ -682,37 +682,37 @@
       {
         "seconds": 0.9,
         "command": "",
-        "caption": "Each target cuts over as soon as its own copy is ready",
+        "caption": "Each target runs its cutover as soon as its own copy is ready",
         "output": "\u001b[38;5;205m⣾ \u001b[0mRunning... 1 cutting over · 3 running (4 targets)\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.28%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 16,815,000 / 27,000,000 · ETA: 4m 3s\n       • \u001b[2mTargets: 4 (3 copying, 1 cutting over)\u001b[0m\n           \u001b[36m◉ shop-001\u001b[0m: 65.00% · 3,900,000 / 6,000,000 rows · ETA: 1m 45s\n           \u001b[36m◉ shop-002\u001b[0m: 46.00% · 4,140,000 / 9,000,000 rows · ETA: 4m 3s\n           \u001b[36m◉ shop-003\u001b[0m: 57.00% · 4,275,000 / 7,500,000 rows · ETA: 2m 41s\n           \u001b[33m● shop-004\u001b[0m: cutting over\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.9,
         "command": "",
-        "caption": "Each target cuts over as soon as its own copy is ready",
+        "caption": "Each target runs its cutover as soon as its own copy is ready",
         "output": "\u001b[38;5;205m⣾ \u001b[0mRunning... 1 completed · 3 running (4 targets)\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.89%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 19,680,000 / 27,000,000 · ETA: 3m 13s\n       • \u001b[2mTargets: 4 (3 copying, 1 complete)\u001b[0m\n           \u001b[36m◉ shop-001\u001b[0m: 80.00% · 4,800,000 / 6,000,000 rows · ETA: 1m 0s\n           \u001b[36m◉ shop-002\u001b[0m: 57.00% · 5,130,000 / 9,000,000 rows · ETA: 3m 13s\n           \u001b[36m◉ shop-003\u001b[0m: 70.00% · 5,250,000 / 7,500,000 rows · ETA: 1m 52s\n           \u001b[32m✓ shop-004\u001b[0m: 4,500,000 rows\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.9,
         "command": "",
-        "caption": "Each target cuts over as soon as its own copy is ready",
+        "caption": "Each target runs its cutover as soon as its own copy is ready",
         "output": "\u001b[38;5;205m⣾ \u001b[0mRunning... 1 completed · 3 running (4 targets)\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 83.50%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 22,545,000 / 27,000,000 · ETA: 2m 24s\n       • \u001b[2mTargets: 4 (3 copying, 1 complete)\u001b[0m\n           \u001b[36m◉ shop-001\u001b[0m: 95.00% · 5,700,000 / 6,000,000 rows · ETA: 15s\n           \u001b[36m◉ shop-002\u001b[0m: 68.00% · 6,120,000 / 9,000,000 rows · ETA: 2m 24s\n           \u001b[36m◉ shop-003\u001b[0m: 83.00% · 6,225,000 / 7,500,000 rows · ETA: 1m 3s\n           \u001b[32m✓ shop-004\u001b[0m: 4,500,000 rows\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.9,
         "command": "",
-        "caption": "Each target cuts over as soon as its own copy is ready",
+        "caption": "Each target runs its cutover as soon as its own copy is ready",
         "output": "\u001b[38;5;205m⣾ \u001b[0mRunning... 1 completed · 1 cutting over · 2 running (4 targets)\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 91.89%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 24,810,000 / 27,000,000 · ETA: 1m 34s\n       • \u001b[2mTargets: 4 (2 copying, 1 cutting over, 1 complete)\u001b[0m\n           \u001b[33m● shop-001\u001b[0m: cutting over\n           \u001b[36m◉ shop-002\u001b[0m: 79.00% · 7,110,000 / 9,000,000 rows · ETA: 1m 34s\n           \u001b[36m◉ shop-003\u001b[0m: 96.00% · 7,200,000 / 7,500,000 rows · ETA: 15s\n           \u001b[32m✓ shop-004\u001b[0m: 4,500,000 rows\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.9,
         "command": "",
-        "caption": "Each target cuts over as soon as its own copy is ready",
+        "caption": "Each target runs its cutover as soon as its own copy is ready",
         "output": "\u001b[38;5;205m⣾ \u001b[0mRunning... 2 completed · 1 cutting over · 1 running (4 targets)\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 96.33%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 26,010,000 / 27,000,000 · ETA: 49s\n       • \u001b[2mTargets: 4 (1 copying, 1 cutting over, 2 complete)\u001b[0m\n           \u001b[32m✓ shop-001\u001b[0m: 6,000,000 rows\n           \u001b[36m◉ shop-002\u001b[0m: 89.00% · 8,010,000 / 9,000,000 rows · ETA: 49s\n           \u001b[33m● shop-003\u001b[0m: cutting over\n           \u001b[32m✓ shop-004\u001b[0m: 4,500,000 rows\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.9,
         "command": "",
-        "caption": "Each target cuts over as soon as its own copy is ready",
+        "caption": "Each target runs its cutover as soon as its own copy is ready",
         "output": "\u001b[38;5;205m⣾ \u001b[0mRunning... 3 completed · 1 running (4 targets)\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 99.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 26,730,000 / 27,000,000 · ETA: 13s\n       • \u001b[2mTargets: 4 (1 copying, 3 complete)\u001b[0m\n           \u001b[32m✓ shop-001\u001b[0m: 6,000,000 rows\n           \u001b[36m◉ shop-002\u001b[0m: 97.00% · 8,730,000 / 9,000,000 rows · ETA: 13s\n           \u001b[32m✓ shop-003\u001b[0m: 7,500,000 rows\n           \u001b[32m✓ shop-004\u001b[0m: 4,500,000 rows\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
