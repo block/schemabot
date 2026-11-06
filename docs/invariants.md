@@ -1262,8 +1262,11 @@ target write, which excludes SchemaBot's applies and says so (`WithExclusiveTarg
 `pkg/storage/internal/sqlstore/applies.go`); the engine-side guards that retain rather than
 reclaim what a schema change SchemaBot did not start could own
 (`pkg/engine/spirit/cancelled_artifacts.go`, and for an operator-supplied branch
-`pkg/engine/planetscale/branch_cleanup.go`); and the cancel's reclaim of a
-cancelled apply's stored engine state, which runs only on the driver consuming
+`pkg/engine/planetscale/branch_cleanup.go`); the cancel's release of a
+cancelled apply's copies, which names only the shards of the tasks the
+consuming drive's claim covers, so it never reaches a shard a sibling
+operation's drive is still copying (`pkg/tern/local_cancelled_artifacts.go`);
+and the cancel's reclaim of a cancelled apply's stored engine state, which runs only on the driver consuming
 the cancel and under a deadline inside the claim's staleness window
 (`pkg/tern/local_cancelled_resume_state.go`); and the branch reconcile pass,
 which deletes a SchemaBot branch only while holding the apply target it belongs

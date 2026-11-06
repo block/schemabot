@@ -480,6 +480,18 @@ func TestLocalClient_OperationStopAgainstCompletedEngineSettlesTasksNotParent(t 
 // multiOpTargetDrainerEngine is multiOpResumeEngine for an engine that runs
 // each target as its own schema change, so the stop sweep sends a stop per task
 // with live work.
+// multiOpReleaseRecordingEngine records each cancel's release request, so a
+// test can check which shards each drive's release was allowed to reach.
+type multiOpReleaseRecordingEngine struct {
+	*multiOpTargetDrainerEngine
+	releases []*engine.ReleaseArtifactsRequest
+}
+
+func (e *multiOpReleaseRecordingEngine) ReleaseCancelledArtifacts(_ context.Context, req *engine.ReleaseArtifactsRequest) (*engine.ReleaseArtifactsResult, error) {
+	e.releases = append(e.releases, req)
+	return &engine.ReleaseArtifactsResult{}, nil
+}
+
 type multiOpTargetDrainerEngine struct {
 	*multiOpResumeEngine
 }
@@ -647,15 +659,19 @@ func requireEachOperationSettlesUnderItsOwnLease(t *testing.T, operation storage
 		t.Skip("skipping integration test in short mode")
 	}
 	f := newMultiOpResumeFixture(t, []string{state.Task.Running})
-	f.client.spiritEngine = &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}
+	releaser := &multiOpReleaseRecordingEngine{multiOpTargetDrainerEngine: &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}}
+	f.client.spiritEngine = releaser
 	ctx := t.Context()
 
+	_, err := f.leaseDB.ExecContext(ctx, `UPDATE tasks SET shard = ? WHERE task_identifier = ?`, "-80", f.tasks[0].TaskIdentifier)
+	require.NoError(t, err)
+	f.tasks[0].Shard = "-80"
 	sibling := *f.tasks[0]
 	sibling.ID = 0
 	sibling.TaskIdentifier = f.tasks[0].TaskIdentifier + "-sibling"
 	sibling.ApplyOperationID = &f.siblingOpID
 	sibling.Shard = "80-"
-	_, err := f.stor.Tasks().Create(ctx, &sibling)
+	_, err = f.stor.Tasks().Create(ctx, &sibling)
 	require.NoError(t, err)
 	_, err = f.leaseDB.ExecContext(ctx, `
 		UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
@@ -693,6 +709,11 @@ func requireEachOperationSettlesUnderItsOwnLease(t *testing.T, operation storage
 		"the sibling's task is the sibling drive's to record, under its own lease")
 	assert.False(t, siblingWoken, "the sibling's drive keeps running so it consumes the request at its next checkpoint")
 	requireControlRequestStatus(t, f.stor, f.apply.ID, operation, storage.ControlRequestPending)
+	if operation == storage.ControlOperationCancel {
+		require.Len(t, releaser.releases, 1, "the first drive reclaims what its own cancel stopped")
+		assert.Equal(t, []string{"-80"}, releaser.releases[0].TargetShards,
+			"the first drive's release never reaches the shard the sibling's drive is still copying")
+	}
 
 	standDown, err = consume(siblingCtx)
 	require.NoError(t, err, "the sibling drive must record the still-pending request on its own task")
@@ -702,6 +723,10 @@ func requireEachOperationSettlesUnderItsOwnLease(t *testing.T, operation storage
 	assert.False(t, siblingWoken)
 	if operation == storage.ControlOperationCancel {
 		assert.Equal(t, 2, f.eng.cancelCalls, "each drive cancels its own shard's engine work")
+		require.Len(t, releaser.releases, 2)
+		assert.Equal(t, []string{"80-"}, releaser.releases[1].TargetShards, "the sibling drive reclaims its own shard's copy")
+	} else {
+		assert.Empty(t, releaser.releases, "a stop keeps the copy so a start can resume it")
 	}
 	f.requireParentUntouched(t)
 }
