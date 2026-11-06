@@ -435,7 +435,7 @@ func TestK8sMultiTarget_TwoTableRolloutCompletes(t *testing.T) {
 // every target's read keeps. A target the rollout never ran on is refused.
 func requireTargetLogsScoped(t *testing.T, endpoint, applyID string) {
 	t.Helper()
-	whole, err := client.GetLogs(endpoint, "", "", applyID, "", 500)
+	whole, err := client.GetLogs(endpoint, "", "", applyID, client.LogScope{}, 500)
 	require.NoError(t, err)
 	require.False(t, whole.Truncated, "the whole log fits one read")
 	inWhole := make(map[int64]bool, len(whole.Logs))
@@ -444,7 +444,7 @@ func requireTargetLogsScoped(t *testing.T, endpoint, applyID string) {
 	}
 	readBy := make(map[int64]int, len(whole.Logs))
 	for _, target := range mtTargets {
-		scoped, err := client.GetLogs(endpoint, "", "", applyID, target, 500)
+		scoped, err := client.GetLogs(endpoint, "", "", applyID, client.LogScope{Target: target}, 500)
 		require.NoError(t, err, "read target %s", target)
 		assert.Equal(t, target, scoped.Target)
 		require.NotEmpty(t, scoped.Logs, "target %s logged its operations", target)
@@ -462,7 +462,7 @@ func requireTargetLogsScoped(t *testing.T, endpoint, applyID string) {
 	}
 	assert.Positive(t, ownEntries, "some entries belong to exactly one target")
 
-	_, err = client.GetLogs(endpoint, "", "", applyID, "dsid-shard-999", 50)
+	_, err = client.GetLogs(endpoint, "", "", applyID, client.LogScope{Target: "dsid-shard-999"}, 50)
 	require.ErrorContains(t, err, `target "dsid-shard-999" has no operations`)
 }
 

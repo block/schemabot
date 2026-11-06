@@ -32,8 +32,10 @@ type LogsResponse struct {
 	// Target echoes the target the read was narrowed to, empty for a read of
 	// the whole apply. A server that predates scoped reads leaves it empty
 	// whatever was asked, which is how a client detects that it was ignored.
-	Target string      `json:"target,omitempty"`
-	Logs   []*LogEntry `json:"logs"`
+	Target string `json:"target,omitempty"`
+	// Shard echoes the shard the read was narrowed to, as Target.
+	Shard string      `json:"shard,omitempty"`
+	Logs  []*LogEntry `json:"logs"`
 	// Truncated reports that entries older than Logs exist and were left
 	// outside the requested window. A reader that shows a full window without
 	// this signal reads as a complete lifecycle, which is the wrong conclusion
@@ -44,8 +46,10 @@ type LogsResponse struct {
 type DeploymentLogsResponse struct {
 	ApplyID    string `json:"apply_id"`
 	Deployment string `json:"deployment"`
-	// Target echoes the target the read was narrowed to, as LogsResponse.Target.
+	// Target and Shard echo the scope the read was narrowed to, as in
+	// LogsResponse.
 	Target  string                 `json:"target,omitempty"`
+	Shard   string                 `json:"shard,omitempty"`
 	Sources []*DeploymentLogSource `json:"sources"`
 	Errors  []*DeploymentLogError  `json:"errors"`
 }

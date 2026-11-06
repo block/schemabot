@@ -2105,6 +2105,76 @@ GET /api/logs?apply_id=apply-example-73&deployment=us-east&target=shop-002
 
 </details>
 
+### Read one shard's log
+
+A sharded apply runs each shard's work as its own operation, and every one of
+them writes into the same log. Add `shard` (CLI: `--shard`) to read one shard:
+the response keeps the entries of the operations keyed to that shard and the
+entries about the apply as a whole, and drops every other shard's. Shard names
+such as `-80` repeat across targets, so a shard read without `target` covers
+that shard on every target; add `target` to read one target's shard. `shard`
+also narrows a [deployment read](#read-deployment-logs): the data plane is asked
+for that shard's entries, and each source credits only that shard's operations.
+Both responses echo `shard` the way they echo `target`.
+
+<details>
+<summary>Read one shard of one target</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&target=shop-002&shard=-80
+```
+
+The response has the same shape as the full log, with `"target": "shop-002"`
+and `"shard": "-80"` echoed.
+
+</details>
+
+A shard the read's operations never ran on returns `400` and names the shards
+they do run on. An apply whose operations are not divided by shard, such as an
+unsharded target's, returns `400` too, rather than its whole log:
+
+<details>
+<summary>Unknown shard (HTTP 400)</summary>
+
+```json
+{
+  "error": "shard \"c0-\" has no operations in target \"shop-002\" of apply \"apply-example-73\"; its shards are -80, 80-",
+  "error_code": ""
+}
+```
+
+</details>
+
+A data plane that predates shard reads cannot narrow its log to one shard. A
+deployment read never shows its entries as the shard's log: that source moves
+to `errors` with reason `upgrade_required`, and the other sources still return.
+
+<details>
+<summary>Shard read from a data plane that predates shard reads</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&deployment=us-east&shard=-80
+```
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "deployment": "us-east",
+  "shard": "-80",
+  "sources": [],
+  "errors": [{
+    "external_id": "remote-apply-example-73",
+    "target": "shop-production",
+    "operations": [{"operation_key": "main/-80/orders", "target": "shop-production", "operation_kind": "work"}],
+    "code": "UnsupportedCapability",
+    "reason": "upgrade_required",
+    "message": "The selected data plane does not support reading one shard's logs; upgrade it or omit --shard."
+  }]
+}
+```
+
+</details>
+
 ### Read deployment logs
 
 In local mode, omit `--deployment`. In [gRPC mode](release.md#two-planes-and-deploy-ordering),
@@ -2181,7 +2251,12 @@ source holding that target's entries plus the entries about the remote apply
 as a whole, such as its state changes; another target's entries never appear
 in it. A successful HTTP
 response can still contain source errors. Keep the readable sources and report
-the missing ones; do not treat partial logs as a complete record.
+the missing ones; do not treat partial logs as a complete record. Only
+`remote_log_read_failed` is worth retrying. `upgrade_required` needs a newer
+data plane, `malformed_remote_log` returned records SchemaBot cannot decode,
+and `remote_log_not_found` means the data plane has nothing to read for the
+request, such as a shard its own records do not carry; its message says how to
+read the source instead.
 
 <details>
 <summary>Partial result example (HTTP 200)</summary>

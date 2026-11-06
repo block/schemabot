@@ -2765,10 +2765,8 @@ type ApplyLog struct {
 // between that listing and the log read.
 func LogOperationsOnTarget(ops []*ApplyOperation, target string) []int64 {
 	var operationIDs []int64
-	for _, op := range ops {
-		if op.Target == target {
-			operationIDs = append(operationIDs, op.ID)
-		}
+	for _, op := range OperationsOnTarget(ops, target) {
+		operationIDs = append(operationIDs, op.ID)
 	}
 	return operationIDs
 }
@@ -2786,6 +2784,72 @@ func DistinctOperationTargets(ops []*ApplyOperation) []string {
 	}
 	slices.Sort(targets)
 	return targets
+}
+
+// OperationsOnTarget keeps the operations of ops that run on target.
+func OperationsOnTarget(ops []*ApplyOperation, target string) []*ApplyOperation {
+	var onTarget []*ApplyOperation
+	for _, op := range ops {
+		if op.Target == target {
+			onTarget = append(onTarget, op)
+		}
+	}
+	return onTarget
+}
+
+// OperationShard returns the shard a sharded work operation runs on: the shard
+// of its ShardOperationKey, on its own or behind the operation's target, as
+// state.ShardWorkKey reads it. An operation that covers no single shard (a
+// whole-target key, a rollout step, a group finalizer) reports false. No
+// component can contain the delimiter, so the component count tells the key
+// shapes apart, with one exception: a group finalizer behind its target
+// ("shop-002/main/group_finalizer") has as many components as a shard key on
+// its own, so the operation's kind rules it out.
+func OperationShard(kind, key, target string) (string, bool) {
+	if kind == ApplyOperationKindGroupFinalizer {
+		return "", false
+	}
+	// A key whose namespace happens to equal the target ("main/-80/orders" on
+	// target "main") is a shard key on its own, so the target prefix is
+	// stripped only when what remains is a whole shard key.
+	if target != "" {
+		if rest, ok := strings.CutPrefix(key, target+OperationKeyDelimiter); ok {
+			if _, shard, _, ok := state.ShardWorkKey(rest); ok {
+				return shard, true
+			}
+		}
+	}
+	_, shard, _, ok := state.ShardWorkKey(key)
+	return shard, ok
+}
+
+// LogOperationsOnShard returns the ApplyLogFilter.OperationIDs of a log read
+// scoped to shard: the IDs of the operations whose work runs on it, or nil when
+// none does. A read that also names a target narrows ops to it first, since a
+// shard name such as "-80" repeats across targets.
+func LogOperationsOnShard(ops []*ApplyOperation, shard string) []int64 {
+	var operationIDs []int64
+	for _, op := range ops {
+		if opShard, ok := OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && opShard == shard {
+			operationIDs = append(operationIDs, op.ID)
+		}
+	}
+	return operationIDs
+}
+
+// DistinctOperationShards lists the distinct shards ops' keys scope them to, in
+// sorted order. An operation that covers no single shard adds none.
+func DistinctOperationShards(ops []*ApplyOperation) []string {
+	seen := make(map[string]bool, len(ops))
+	var shards []string
+	for _, op := range ops {
+		if shard, ok := OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && !seen[shard] {
+			seen[shard] = true
+			shards = append(shards, shard)
+		}
+	}
+	slices.Sort(shards)
+	return shards
 }
 
 // ApplyLogFilter specifies criteria for listing apply logs.

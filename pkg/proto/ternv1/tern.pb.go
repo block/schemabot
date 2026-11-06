@@ -3133,13 +3133,18 @@ func (x *OperationProgress) GetErrorMessage() string {
 }
 
 type LogsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ApplyId       string                 `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
-	Target        string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
-	Database      string                 `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"`
-	Type          string                 `protobuf:"bytes,4,opt,name=type,proto3" json:"type,omitempty"`
-	Environment   string                 `protobuf:"bytes,5,opt,name=environment,proto3" json:"environment,omitempty"`
-	Limit         int32                  `protobuf:"varint,6,opt,name=limit,proto3" json:"limit,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ApplyId     string                 `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Target      string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
+	Database    string                 `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"`
+	Type        string                 `protobuf:"bytes,4,opt,name=type,proto3" json:"type,omitempty"`
+	Environment string                 `protobuf:"bytes,5,opt,name=environment,proto3" json:"environment,omitempty"`
+	Limit       int32                  `protobuf:"varint,6,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Optional shard of a sharded apply to read: only the operations whose work
+	// runs on that shard contribute their entries, alongside the entries that
+	// apply to the whole apply. Composes with target, since a shard name repeats
+	// across targets. Empty reads every shard.
+	Shard         string `protobuf:"bytes,7,opt,name=shard,proto3" json:"shard,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3214,6 +3219,13 @@ func (x *LogsRequest) GetLimit() int32 {
 		return x.Limit
 	}
 	return 0
+}
+
+func (x *LogsRequest) GetShard() string {
+	if x != nil {
+		return x.Shard
+	}
+	return ""
 }
 
 type ApplyLog struct {
@@ -3340,7 +3352,12 @@ type LogsResponse struct {
 	// when the read covers every target. A data plane that predates target log
 	// reads ignores the field and leaves this empty, so a caller that asked for
 	// one target must treat a missing or different echo as an unnarrowed read.
-	Target        string `protobuf:"bytes,3,opt,name=target,proto3" json:"target,omitempty"`
+	Target string `protobuf:"bytes,3,opt,name=target,proto3" json:"target,omitempty"`
+	// The shard the read was narrowed to, echoing LogsRequest.shard; empty when
+	// the read covers every shard. A data plane that predates LogsRequest.shard
+	// ignores the field and leaves this empty, so a caller that asked for one
+	// shard must treat a missing or different echo as an unnarrowed read.
+	Shard         string `protobuf:"bytes,4,opt,name=shard,proto3" json:"shard,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3392,6 +3409,13 @@ func (x *LogsResponse) GetLogs() []*ApplyLog {
 func (x *LogsResponse) GetTarget() string {
 	if x != nil {
 		return x.Target
+	}
+	return ""
+}
+
+func (x *LogsResponse) GetShard() string {
+	if x != nil {
+		return x.Shard
 	}
 	return ""
 }
@@ -5764,14 +5788,15 @@ const file_tern_proto_rawDesc = "" +
 	"\bprogress\x18\x02 \x01(\v2\x19.tern.v1.ProgressResponseR\bprogress\x12\x1d\n" +
 	"\n" +
 	"error_code\x18\x03 \x01(\x05R\terrorCode\x12#\n" +
-	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\"\xa8\x01\n" +
+	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\"\xbe\x01\n" +
 	"\vLogsRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x1a\n" +
 	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x04 \x01(\tR\x04type\x12 \n" +
 	"\venvironment\x18\x05 \x01(\tR\venvironment\x12\x14\n" +
-	"\x05limit\x18\x06 \x01(\x05R\x05limit\"\xa9\x02\n" +
+	"\x05limit\x18\x06 \x01(\x05R\x05limit\x12\x14\n" +
+	"\x05shard\x18\a \x01(\tR\x05shard\"\xa9\x02\n" +
 	"\bApplyLog\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x1c\n" +
 	"\atask_id\x18\x02 \x01(\x03H\x00R\x06taskId\x88\x01\x01\x12\x14\n" +
@@ -5787,11 +5812,12 @@ const file_tern_proto_rawDesc = "" +
 	"created_at\x18\n" +
 	" \x01(\tR\tcreatedAtB\n" +
 	"\n" +
-	"\b_task_id\"h\n" +
+	"\b_task_id\"~\n" +
 	"\fLogsResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12%\n" +
 	"\x04logs\x18\x02 \x03(\v2\x11.tern.v1.ApplyLogR\x04logs\x12\x16\n" +
-	"\x06target\x18\x03 \x01(\tR\x06target\"\x94\x02\n" +
+	"\x06target\x18\x03 \x01(\tR\x06target\x12\x14\n" +
+	"\x05shard\x18\x04 \x01(\tR\x05shard\"\x94\x02\n" +
 	"\rShardProgress\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1f\n" +

@@ -22,20 +22,21 @@ import (
 // GET /api/logs/{database}?environment=staging&limit=50
 // GET /api/logs/{database}?apply_id=apply_abc123&limit=50
 // GET /api/logs/{database}?apply_id=apply_abc123&target=shop-002
+// GET /api/logs/{database}?apply_id=apply_abc123&target=shop-002&shard=-80
 func (s *Service) handleLogs(w http.ResponseWriter, r *http.Request) {
 	database := storage.CanonicalKey(r.PathValue("database"))
 	environment := storage.CanonicalKey(r.URL.Query().Get("environment"))
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
 	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
-	target := r.URL.Query().Get("target")
+	scope := logScope{target: r.URL.Query().Get("target"), shard: r.URL.Query().Get("shard")}
 
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
 	}
 
-	s.handleLogsCommon(w, r, database, environment, applyID, deployment, target, limitStr)
+	s.handleLogsCommon(w, r, database, environment, applyID, deployment, scope, limitStr)
 }
 
 // handleLogsWithoutDatabase returns apply logs for a specific apply ID.
@@ -44,18 +45,18 @@ func (s *Service) handleLogsWithoutDatabase(w http.ResponseWriter, r *http.Reque
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
 	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
-	target := r.URL.Query().Get("target")
+	scope := logScope{target: r.URL.Query().Get("target"), shard: r.URL.Query().Get("shard")}
 
 	if applyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
 		return
 	}
 
-	s.handleLogsCommon(w, r, "", "", applyID, deployment, target, limitStr)
+	s.handleLogsCommon(w, r, "", "", applyID, deployment, scope, limitStr)
 }
 
 // handleLogsCommon is the shared implementation for log handlers.
-func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, database, environment, applyID, deployment, target, limitStr string) {
+func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, database, environment, applyID, deployment string, scope logScope, limitStr string) {
 
 	limit := 50
 	if limitStr != "" {
@@ -100,28 +101,29 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		if len(applies) == 0 {
 			s.writeJSON(w, http.StatusOK, withLogScope(map[string]any{
 				"logs": []any{},
-			}, target))
+			}, scope))
 			return
 		}
 		apply = applies[0]
 	}
 	if deployment != "" {
-		s.handleDeploymentLogs(w, r, apply, deployment, target, limit)
+		s.handleDeploymentLogs(w, r, apply, deployment, scope, limit)
 		return
 	}
 
 	var operationIDs []int64
-	if target != "" {
+	if !scope.wholeApply() {
 		ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 		if err != nil {
-			s.logger.Error("failed to list apply operations for target logs",
-				append(apply.LogAttrs(), "target", target, "error", err)...)
+			s.logger.Error("failed to list apply operations for scoped logs",
+				append(apply.LogAttrs(), "target", scope.target, "shard", scope.shard, "error", err)...)
 			s.writeError(w, http.StatusInternalServerError, "failed to list apply operations")
 			return
 		}
-		operationIDs = storage.LogOperationsOnTarget(ops, target)
-		if len(operationIDs) == 0 {
-			s.writeError(w, http.StatusBadRequest, targetNotInApplyMessage(fmt.Sprintf("apply %q", apply.ApplyIdentifier), ops, target))
+		var refusal string
+		operationIDs, refusal = scope.operations(fmt.Sprintf("apply %q", apply.ApplyIdentifier), ops)
+		if refusal != "" {
+			s.writeError(w, http.StatusBadRequest, refusal)
 			return
 		}
 	}
@@ -165,15 +167,18 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		"logs":      logEntries,
 		"apply_id":  apply.ApplyIdentifier,
 		"truncated": truncated,
-	}, target))
+	}, scope))
 }
 
-// withLogScope echoes the target a read was narrowed to. A server that
-// predates scoped reads ignores the parameter and serves the whole log, so the
-// echo is how a client tells a scoped read from an unscoped one.
-func withLogScope(body map[string]any, target string) map[string]any {
-	if target != "" {
-		body["target"] = target
+// withLogScope echoes the target and shard a read was narrowed to. A server
+// that predates scoped reads ignores the parameters and serves the whole log,
+// so the echo is how a client tells a scoped read from an unscoped one.
+func withLogScope(body map[string]any, scope logScope) map[string]any {
+	if scope.target != "" {
+		body["target"] = scope.target
+	}
+	if scope.shard != "" {
+		body["shard"] = scope.shard
 	}
 	return body
 }
@@ -202,6 +207,47 @@ func clampLogWindow[T any](logs []T, limit int) ([]T, bool) {
 		return logs, false
 	}
 	return logs[len(logs)-limit:], true
+}
+
+// logScope is the part of an apply a log read covers: one target, one shard of
+// a sharded apply, or one shard of one target, since shard names repeat across
+// targets. The zero scope is the whole apply.
+type logScope struct {
+	target string
+	shard  string
+}
+
+func (sc logScope) wholeApply() bool {
+	return sc.target == "" && sc.shard == ""
+}
+
+// operations returns the ApplyLogFilter.OperationIDs of a read of this scope
+// over ops. When the scope covers none of them, it returns instead a refusal
+// naming the targets or shards the operations do run on, so a mistyped name can
+// be corrected from the error alone; where names whose operations ops belong
+// to, such as `apply "apply-a"`.
+func (sc logScope) operations(where string, ops []*storage.ApplyOperation) ([]int64, string) {
+	var operationIDs []int64
+	if sc.target != "" {
+		onTarget := storage.OperationsOnTarget(ops, sc.target)
+		if len(onTarget) == 0 {
+			return nil, targetNotInApplyMessage(where, ops, sc.target)
+		}
+		operationIDs = storage.LogOperationsOnTarget(onTarget, sc.target)
+		ops = onTarget
+		where = fmt.Sprintf("target %q of %s", sc.target, where)
+	}
+	if sc.shard == "" {
+		return operationIDs, ""
+	}
+	if operationIDs = storage.LogOperationsOnShard(ops, sc.shard); len(operationIDs) > 0 {
+		return operationIDs, ""
+	}
+	shards := storage.DistinctOperationShards(ops)
+	if len(shards) == 0 {
+		return nil, fmt.Sprintf("%s runs no per-shard operations; omit shard", where)
+	}
+	return nil, fmt.Sprintf("shard %q has no operations in %s; its shards are %s", sc.shard, where, strings.Join(shards, ", "))
 }
 
 // targetNotInApplyMessage names the targets ops do run on, so a mistyped
@@ -276,6 +322,32 @@ func fetchesOnTarget(fetches map[string]*deploymentLogFetch, undispatched []*sto
 	return kept, keptUndispatched
 }
 
+// fetchesOnShard keeps the reads and undispatched operations of one shard, and
+// within each kept read only the operations keyed to it, so a deployment read
+// scoped to that shard fetches only its sources and credits only its
+// operations.
+func fetchesOnShard(fetches map[string]*deploymentLogFetch, undispatched []*storage.ApplyOperation, shard string) (map[string]*deploymentLogFetch, []*storage.ApplyOperation) {
+	kept := make(map[string]*deploymentLogFetch, len(fetches))
+	for key, fetch := range fetches {
+		var onShard []*apitypes.LogOperationProvenance
+		for _, op := range fetch.operations {
+			if opShard, ok := storage.OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && opShard == shard {
+				onShard = append(onShard, op)
+			}
+		}
+		if len(onShard) > 0 {
+			kept[key] = &deploymentLogFetch{target: fetch.target, externalID: fetch.externalID, operations: onShard}
+		}
+	}
+	var keptUndispatched []*storage.ApplyOperation
+	for _, op := range undispatched {
+		if opShard, ok := storage.OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && opShard == shard {
+			keptUndispatched = append(keptUndispatched, op)
+		}
+	}
+	return kept, keptUndispatched
+}
+
 // sortedFetchKeys orders the grouped reads deterministically, so a fan-out
 // across several targets renders in the same order on every read.
 func sortedFetchKeys(fetches map[string]*deploymentLogFetch) []string {
@@ -287,7 +359,7 @@ func sortedFetchKeys(fetches map[string]*deploymentLogFetch) []string {
 	return keys
 }
 
-func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment, target string, limit int) {
+func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment string, scope logScope, limit int) {
 	ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if err != nil {
 		s.logger.Error("failed to list apply operations for data-plane logs",
@@ -320,21 +392,26 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	fetches, undispatched := deploymentLogFetches(apply, ops, deployment)
-	if target != "" {
+	if !scope.wholeApply() {
 		onDeployment := make([]*storage.ApplyOperation, 0, len(ops))
 		for _, op := range ops {
 			if op.Deployment == deployment {
 				onDeployment = append(onDeployment, op)
 			}
 		}
-		if len(storage.LogOperationsOnTarget(onDeployment, target)) == 0 {
-			s.writeError(w, http.StatusBadRequest, targetNotInApplyMessage(fmt.Sprintf("deployment %q of apply %q", deployment, apply.ApplyIdentifier), onDeployment, target))
+		if _, refusal := scope.operations(fmt.Sprintf("deployment %q of apply %q", deployment, apply.ApplyIdentifier), onDeployment); refusal != "" {
+			s.writeError(w, http.StatusBadRequest, refusal)
 			return
 		}
 		// Narrow after grouping, not before: grouping reads the apply's own
 		// remote id when the apply has a single operation, and dropping the
 		// other targets' operations first would fake that case.
-		fetches, undispatched = fetchesOnTarget(fetches, undispatched, target)
+		if scope.target != "" {
+			fetches, undispatched = fetchesOnTarget(fetches, undispatched, scope.target)
+		}
+		if scope.shard != "" {
+			fetches, undispatched = fetchesOnShard(fetches, undispatched, scope.shard)
+		}
 	}
 	for _, op := range undispatched {
 		// An operation without a remote apply id has not been dispatched to
@@ -348,7 +425,7 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no remote operation logs; omit --deployment to read control-plane logs", deployment))
 		return
 	}
-	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Target: target, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
+	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Target: scope.target, Shard: scope.shard, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
 	keys := sortedFetchKeys(fetches)
 	// The data plane serves at most tern.MaxLogsLimit entries per read and
 	// silently serves the cap to larger requests, which would swallow the
@@ -365,20 +442,30 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 	requestLimit := int32(min(int64(logFetchLimit(limit)), math.MaxInt32))
 	for _, key := range keys {
 		fetch := fetches[key]
-		resp, fetchErr := client.Logs(r.Context(), &ternv1.LogsRequest{ApplyId: fetch.externalID, Target: fetch.target, Database: apply.Database, Type: apply.DatabaseType, Environment: apply.Environment, Limit: requestLimit})
+		resp, fetchErr := client.Logs(r.Context(), &ternv1.LogsRequest{ApplyId: fetch.externalID, Target: fetch.target, Shard: scope.shard, Database: apply.Database, Type: apply.DatabaseType, Environment: apply.Environment, Limit: requestLimit})
 		if fetchErr != nil {
 			s.recordDeploymentLogFailure(apply, deploymentLogsOperation, deployment, fetch, fetchErr)
-			result.Errors = append(result.Errors, deploymentLogError(fetch, fetchErr))
+			result.Errors = append(result.Errors, deploymentLogError(fetch, scope, fetchErr))
 			continue
 		}
-		if target != "" && resp.GetTarget() != target {
+		if scope.target != "" && resp.GetTarget() != scope.target {
 			// A data plane that predates target reads ignores the target and
 			// returns every target's entries, which must not be shown as one
 			// target's log.
 			s.logger.Warn("data plane did not narrow a log read to the requested target; refusing its entries",
 				append(apply.LogAttrs(),
-					"operation", deploymentLogsOperation, "operation_deployment", deployment, "target", target, "external_id", fetch.externalID, "echoed_target", resp.GetTarget())...)
+					"operation", deploymentLogsOperation, "operation_deployment", deployment, "target", scope.target, "external_id", fetch.externalID, "echoed_target", resp.GetTarget())...)
 			result.Errors = append(result.Errors, deploymentLogTargetUnsupportedError(fetch))
+			continue
+		}
+		if resp.GetShard() != scope.shard {
+			// A data plane that predates shard reads ignores the shard and
+			// returns every shard's entries, which must not be shown as one
+			// shard's log.
+			s.logger.Warn("data plane did not narrow a log read to the requested shard; refusing its entries",
+				append(apply.LogAttrs(),
+					"operation", deploymentLogsOperation, "operation_deployment", deployment, "target", fetch.target, "external_id", fetch.externalID, "shard", scope.shard, "echoed_shard", resp.GetShard())...)
+			result.Errors = append(result.Errors, deploymentLogShardUnsupportedError(fetch))
 			continue
 		}
 		remoteLogs, truncated := clampLogWindow(resp.Logs, limit)
@@ -415,14 +502,34 @@ func deploymentLogEntry(applyID string, log *ternv1.ApplyLog) (*apitypes.LogEntr
 	return &apitypes.LogEntry{ID: log.Id, ApplyID: applyID, TaskID: log.TaskId, Level: log.Level, EventType: log.EventType, Source: log.Source, Message: log.Message, OldState: log.OldState, NewState: log.NewState, Metadata: metadata, CreatedAt: createdAt}, nil
 }
 
-func deploymentLogError(fetch *deploymentLogFetch, err error) *apitypes.DeploymentLogError {
+// deploymentLogError reports a source whose data-plane read failed. Only a
+// transport or storage failure is worth retrying: a data plane that predates
+// log reads needs an upgrade, and one that finds nothing to read for the
+// requested scope will answer the same way every time.
+func deploymentLogError(fetch *deploymentLogFetch, scope logScope, err error) *apitypes.DeploymentLogError {
 	result := &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "RemoteLogReadFailed", Reason: "remote_log_read_failed", Message: "Data-plane logs could not be read; check server logs and retry."}
-	if status.Code(err) == codes.Unimplemented {
+	switch status.Code(err) {
+	case codes.Unimplemented:
 		result.Code = "UnsupportedCapability"
 		result.Reason = "upgrade_required"
 		result.Message = "The selected data plane does not support log reads; upgrade it and retry."
+	case codes.NotFound:
+		result.Code = "RemoteLogNotFound"
+		result.Reason = "remote_log_not_found"
+		result.Message = remoteLogNotFoundMessage(scope)
 	}
 	return result
+}
+
+// remoteLogNotFoundMessage says what an operator can do when the data plane has
+// nothing to read. A shard read fails this way when the data plane records no
+// operation on that shard, even though the control plane does, so reading
+// without the shard is the way to see the source's entries.
+func remoteLogNotFoundMessage(scope logScope) string {
+	if scope.shard != "" {
+		return "The selected data plane records no operation on this shard; read the log without --shard."
+	}
+	return "The selected data plane has no log for this apply; check server logs."
 }
 
 // deploymentLogsOperation and engineLogsOperation name the two callers of the
@@ -438,6 +545,12 @@ const (
 // not narrow a target-scoped read, because it predates target reads.
 func deploymentLogTargetUnsupportedError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
 	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "UnsupportedCapability", Reason: "upgrade_required", Message: "The selected data plane does not support reading one target's logs; upgrade it or omit --target."}
+}
+
+// deploymentLogShardUnsupportedError reports a source whose data plane did
+// not narrow a shard-scoped read, because it predates shard reads.
+func deploymentLogShardUnsupportedError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
+	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "UnsupportedCapability", Reason: "upgrade_required", Message: "The selected data plane does not support reading one shard's logs; upgrade it or omit --shard."}
 }
 
 // deploymentLogRecordError reports a source whose log records could not be

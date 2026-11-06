@@ -1189,7 +1189,7 @@ func (m *mockTernClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*te
 	if m.logsHook != nil {
 		return m.logsHook(req)
 	}
-	return &ternv1.LogsResponse{Target: req.GetTarget()}, nil
+	return &ternv1.LogsResponse{Target: req.GetTarget(), Shard: req.GetShard()}, nil
 }
 
 // An apply with more history than the requested window returns exactly the
@@ -1481,6 +1481,157 @@ func TestHandleDeploymentLogsRefusesUnnarrowedTargetRead(t *testing.T) {
 	assert.Empty(t, unscoped.Errors)
 }
 
+// A sharded rollout reads one shard's control-plane history on its own, alone
+// or within one target, since shard names repeat across targets. A shard the
+// target never ran on is refused with the shards it does run on, and an apply
+// not divided by shard is refused rather than answered with its whole log.
+func TestHandleLogsScopesToShard(t *testing.T) {
+	apply := &storage.Apply{ID: 17, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.TargetOperationKey("shop-001", storage.ShardOperationKey("main", "-80", "orders"))},
+		{ID: 2, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.TargetOperationKey("shop-001", storage.ShardOperationKey("main", "80-", "orders"))},
+		{ID: 3, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-002", OperationKey: storage.TargetOperationKey("shop-002", storage.ShardOperationKey("main", "-80", "orders"))},
+		{ID: 4, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-003", OperationKey: storage.TargetOperationKey("shop-003", "")},
+	}
+	logStore := &windowedApplyLogStore{available: 2}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  logStore,
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	read := func(query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&"+query, nil)
+		w := httptest.NewRecorder()
+		service.handleLogsWithoutDatabase(w, req)
+		return w
+	}
+
+	w := read("shard=-80")
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{1, 3}, logStore.lastFilter.OperationIDs)
+	var scoped apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &scoped))
+	assert.Equal(t, "-80", scoped.Shard)
+	assert.Empty(t, scoped.Target)
+
+	w = read("target=shop-001&shard=-80")
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{1}, logStore.lastFilter.OperationIDs)
+
+	w = read("target=shop-002&shard=80-")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `shard \"80-\" has no operations in target \"shop-002\" of apply \"apply-control\"; its shards are -80`)
+
+	w = read("target=shop-003&shard=-80")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `target \"shop-003\" of apply \"apply-control\" runs no per-shard operations; omit shard`)
+}
+
+// A sharded apply on a single target keys its operations by shard alone, with
+// no target in front, so --shard narrows the read without --target.
+func TestHandleLogsScopesSingleTargetApplyToShard(t *testing.T) {
+	apply := &storage.Apply{ID: 17, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "orders", OperationKey: storage.ShardOperationKey("main", "-80", "orders")},
+		{ID: 2, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "orders", OperationKey: storage.ShardOperationKey("main", "80-", "orders")},
+		{ID: 3, ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "orders", OperationKey: storage.ShardOperationKey("main", "80-", "customers")},
+	}
+	logStore := &windowedApplyLogStore{available: 2}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		applyLogs:  logStore,
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	read := func(query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&"+query, nil)
+		w := httptest.NewRecorder()
+		service.handleLogsWithoutDatabase(w, req)
+		return w
+	}
+
+	w := read("shard=80-")
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []int64{2, 3}, logStore.lastFilter.OperationIDs, "every table's operation on the shard")
+	var scoped apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &scoped))
+	assert.Equal(t, "80-", scoped.Shard)
+	assert.Empty(t, scoped.Target)
+
+	w = read("shard=c0-")
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `shard \"c0-\" has no operations in apply \"apply-control\"; its shards are -80, 80-`)
+}
+
+// A deployment read scoped to one shard asks the shared data-plane apply for
+// that shard's entries and credits only the operations keyed to it, so the
+// other shards' operations are not listed as the source of lines they did not
+// write.
+func TestHandleDeploymentLogsScopesToShard(t *testing.T) {
+	apply := &storage.Apply{ID: 18, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.ShardOperationKey("main", "-80", "orders"), ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.ShardOperationKey("main", "80-", "orders"), ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&shard=80-", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "80-", client.logsReqs[0].Shard)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	require.Len(t, response.Sources[0].Operations, 1)
+	assert.Equal(t, "main/80-/orders", response.Sources[0].Operations[0].OperationKey)
+	assert.Equal(t, "80-", response.Shard)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&shard=c0-", nil)
+	w = httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), `shard \"c0-\" has no operations in deployment \"region-a\" of apply \"apply-control\"; its shards are -80, 80-`)
+	assert.Len(t, client.logsReqs, 1, "a refused shard fetches nothing")
+}
+
+// During a rolling upgrade a data plane that predates shard reads ignores the
+// shard and returns every shard's entries. The control plane refuses that
+// source with an upgrade hint rather than showing the whole history as one
+// shard's log.
+func TestHandleDeploymentLogsRefusesUnnarrowedShardRead(t *testing.T) {
+	apply := &storage.Apply{ID: 18, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.ShardOperationKey("main", "-80", "orders"), ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKind: storage.ApplyOperationKindWork, Target: "shop-001", OperationKey: storage.ShardOperationKey("main", "80-", "orders"), ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true, logsHook: func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: "remote-a", Logs: []*ternv1.ApplyLog{{Id: 1, Level: "info", EventType: "info", Source: "schemabot", Message: "Copy started on -80", CreatedAt: "2026-11-05T10:00:00Z"}}}, nil
+	}}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&shard=80-", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Empty(t, response.Sources, "an unnarrowed read is never shown as the shard's log")
+	require.Len(t, response.Errors, 1)
+	assert.Equal(t, "remote-a", response.Errors[0].ExternalID)
+	assert.Equal(t, "UnsupportedCapability", response.Errors[0].Code)
+	assert.Equal(t, "upgrade_required", response.Errors[0].Reason)
+	assert.Equal(t, "The selected data plane does not support reading one shard's logs; upgrade it or omit --shard.", response.Errors[0].Message)
+}
+
 func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
 	_, err := deploymentLogEntry("remote-a", &ternv1.ApplyLog{CreatedAt: "not-a-time", MetadataJson: []byte(`{}`)})
 	require.ErrorContains(t, err, "created_at")
@@ -1499,18 +1650,30 @@ func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
 
 func TestDeploymentLogErrorIsSanitizedAndIncludesProvenance(t *testing.T) {
 	fetch := &deploymentLogFetch{target: "cluster-a", externalID: "remote-a", operations: []*apitypes.LogOperationProvenance{{OperationKey: "commerce/-80/orders", Target: "cluster-a", OperationKind: "work"}}}
-	got := deploymentLogError(fetch, status.Error(codes.Unavailable, "dial secret.example:443"))
+	got := deploymentLogError(fetch, logScope{}, status.Error(codes.Unavailable, "dial secret.example:443"))
 	assert.Equal(t, "RemoteLogReadFailed", got.Code)
 	assert.NotContains(t, got.Message, "secret.example")
 	assert.Equal(t, fetch.operations, got.Operations)
 
-	got = deploymentLogError(fetch, status.Error(codes.Unimplemented, "method Logs not implemented"))
+	got = deploymentLogError(fetch, logScope{}, status.Error(codes.Unimplemented, "method Logs not implemented"))
 	assert.Equal(t, "UnsupportedCapability", got.Code)
 	assert.Equal(t, "upgrade_required", got.Reason)
 
+	// A read the data plane finds nothing for is never presented as worth
+	// retrying, and a shard read names the way to see the source's entries.
+	got = deploymentLogError(fetch, logScope{shard: "-80"}, status.Error(codes.NotFound, "apply remote-a runs no per-shard operations on target cluster-a"))
+	assert.Equal(t, "RemoteLogNotFound", got.Code)
+	assert.Equal(t, "remote_log_not_found", got.Reason)
+	assert.Equal(t, "The selected data plane records no operation on this shard; read the log without --shard.", got.Message)
+	assert.NotContains(t, got.Message, "retry")
+
+	got = deploymentLogError(fetch, logScope{}, status.Error(codes.NotFound, "apply remote-a not found"))
+	assert.Equal(t, "RemoteLogNotFound", got.Code)
+	assert.Equal(t, "The selected data plane has no log for this apply; check server logs.", got.Message)
+
 	// The gRPC client wraps Unimplemented with upgrade guidance before it
 	// reaches this mapping; detection must see through the wrapping.
-	got = deploymentLogError(fetch, fmt.Errorf("selected data plane does not support log reads; upgrade that data plane: %w", status.Error(codes.Unimplemented, "method Logs not implemented")))
+	got = deploymentLogError(fetch, logScope{}, fmt.Errorf("selected data plane does not support log reads; upgrade that data plane: %w", status.Error(codes.Unimplemented, "method Logs not implemented")))
 	assert.Equal(t, "UnsupportedCapability", got.Code)
 	assert.Equal(t, "upgrade_required", got.Reason)
 
