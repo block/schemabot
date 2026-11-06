@@ -572,7 +572,7 @@ func TestSchemaPathsChangedSinceMergeBase(t *testing.T) {
 		tipTreeSHA   string
 		mergeHasPath bool
 		tipHasPath   bool
-		wantChanged  bool
+		wantChanged  []string
 	}{
 		{
 			name:         "same schema tree ignores unrelated base commits",
@@ -587,19 +587,19 @@ func TestSchemaPathsChangedSinceMergeBase(t *testing.T) {
 			tipTreeSHA:   "schema-tree-new",
 			mergeHasPath: true,
 			tipHasPath:   true,
-			wantChanged:  true,
+			wantChanged:  []string{"schema"},
 		},
 		{
 			name:        "schema path added on base is stale",
 			tipTreeSHA:  "schema-tree-new",
 			tipHasPath:  true,
-			wantChanged: true,
+			wantChanged: []string{"schema"},
 		},
 		{
 			name:         "schema path removed on base is stale",
 			mergeTreeSHA: "schema-tree-old",
 			mergeHasPath: true,
-			wantChanged:  true,
+			wantChanged:  []string{"schema"},
 		},
 		{
 			name: "path absent at both commits is unchanged",
@@ -718,7 +718,7 @@ func TestSchemaPathsChangedSinceMergeBaseDetectsSymlinkRetarget(t *testing.T) {
 	changed, baseTipSHA, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"schema/base", "schema/production"})
 
 	require.NoError(t, err)
-	assert.True(t, changed)
+	assert.Equal(t, []string{"schema/production"}, changed, "only the retargeted symlink changed")
 	assert.Equal(t, "base-tip-sha", baseTipSHA)
 	assert.Equal(t, int32(1), mergeRootRequests.Load())
 	assert.Equal(t, int32(1), baseRootRequests.Load())
@@ -744,7 +744,7 @@ func TestSchemaPathsChangedSinceMergeBaseUsesRootTreeSHA(t *testing.T) {
 	changed, _, err := ic.SchemaPathsChangedSinceMergeBase(t.Context(), "octocat/hello-world", "main", "head-sha", []string{"."})
 
 	require.NoError(t, err)
-	assert.False(t, changed, "different commit SHAs with the same root tree are unchanged")
+	assert.Empty(t, changed, "different commit SHAs with the same root tree are unchanged")
 }
 
 func setupRateLimitedTestGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {

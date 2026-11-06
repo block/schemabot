@@ -101,11 +101,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 	requestedBy string,
 	action string,
 ) (rejected bool, err error) {
-	schemaPaths := []string{schema.SchemaPath}
-	if schema.SchemaLinkPath != "" {
-		schemaPaths = append(schemaPaths, schema.SchemaLinkPath)
-	}
-	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, schemaPaths)
+	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, environmentSchemaPaths(schema))
 	if err != nil {
 		h.logger.Error("apply stopped: could not verify base schema freshness",
 			"repo", repo,
@@ -130,7 +126,7 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 		}))
 		return false, fmt.Errorf("base schema freshness gate compare %s against %s tip for %s#%d: %w", schema.SchemaPath, prInfo.BaseRef, repo, pr, err)
 	}
-	if !changed {
+	if len(changed) == 0 {
 		return false, nil
 	}
 
@@ -155,4 +151,47 @@ func (h *Handler) assertBaseSchemaStillCurrent(
 		SchemaPath:  schema.SchemaPath,
 	}))
 	return true, nil
+}
+
+// environmentSchemaPaths are the paths whose content decides an environment's
+// schema: its schema root and, when one names it, the environment's symlink.
+// Retargeting the symlink changes the schema as surely as editing a file.
+func environmentSchemaPaths(schema *ghclient.SchemaRequestResult) []string {
+	paths := []string{schema.SchemaPath}
+	if schema.SchemaLinkPath != "" {
+		paths = append(paths, schema.SchemaLinkPath)
+	}
+	return paths
+}
+
+// planBaseSchema reports, for a plan comment, whether the PR's base branch
+// changed the environment's schema after the PR branched off it. The plan
+// diffs the branch's schema, so a branch missing a newer base change gets a
+// plan that could undo it; the comment says so, and the apply gate
+// (assertBaseSchemaStillCurrent) refuses to run until the branch has the
+// change. A check GitHub cannot answer is shown as unverified rather than
+// left out, and the apply gate checks again and fails closed.
+func (h *Handler) planBaseSchema(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) *templates.BaseSchemaData {
+	logAttrs := []any{
+		"repo", repo, "pr", pr, "environment", environment,
+		"database", schema.Database, "database_type", schema.Type,
+		"schema_path", schema.SchemaPath, "head_sha", schema.HeadSHA,
+	}
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Warn("plan comment will say the base branch could not be checked for newer schema changes: fetch PR failed; apply checks again before it runs",
+			append(logAttrs, "error", err)...)
+		return &templates.BaseSchemaData{Unverified: true}
+	}
+	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, schema.HeadSHA, environmentSchemaPaths(schema))
+	if err != nil {
+		h.logger.Warn("plan comment will say the base branch could not be checked for newer schema changes; apply checks again before it runs",
+			append(logAttrs, "base_ref", prInfo.BaseRef, "error", err)...)
+		return &templates.BaseSchemaData{BaseBranch: prInfo.BaseRef, Unverified: true}
+	}
+	if len(changed) > 0 {
+		h.logger.Warn("plan is of a branch missing newer schema changes from its base branch; the plan comment says so and apply is blocked until the branch has them",
+			append(logAttrs, "base_ref", prInfo.BaseRef, "base_tip_sha", baseTipSHA, "changed_paths", changed)...)
+	}
+	return &templates.BaseSchemaData{BaseBranch: prInfo.BaseRef, ChangedPaths: changed}
 }

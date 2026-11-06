@@ -260,6 +260,10 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
+	// BaseSchema says whether the PR's base branch changed this environment's
+	// schema after the PR branched off it. Nil when it was not checked.
+	BaseSchema *BaseSchemaData
+
 	// MemberApplyRefusal says why a PR apply cannot run the plan of
 	// MemberApplyRefusalTarget, one of the targets' plans this comment
 	// renders, whether or not the primary target has work of its own, naming
@@ -580,6 +584,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 
 	sb.WriteString("\n")
 
+	// A branch missing newer base-branch schema changes is shown first, since
+	// it says the plan below may not be the change the PR means to make.
+	writeBaseSchema(&sb, data.BaseSchema)
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the primary plan is a clean no-op.
@@ -2071,6 +2078,42 @@ func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []st
 		presentation.CoveragePhrase(noun, len(members), total), strings.Join(inlineCodeList(members), ", "))
 }
 
+// BaseSchemaData describes how an environment's schema on the PR branch
+// compares to the PR's base branch.
+type BaseSchemaData struct {
+	// BaseBranch is the branch the PR merges into.
+	BaseBranch string
+	// ChangedPaths are the environment's schema paths the base branch changed
+	// after the PR branched off it. Empty when the branch has every change.
+	ChangedPaths []string
+	// Unverified means GitHub could not answer whether the base branch
+	// changed the schema.
+	Unverified bool
+}
+
+// writeBaseSchema warns that the plan is of a branch that is missing newer
+// schema changes from its base branch. The plan diffs the branch's schema, so
+// it would undo those changes, and apply refuses to run until the branch has
+// them. It leads the plan, before any work it lists, so the reader knows the
+// plan is not what merging would apply.
+func writeBaseSchema(sb *strings.Builder, base *BaseSchemaData) {
+	if base == nil {
+		return
+	}
+	baseBranch := "the base branch"
+	if base.BaseBranch != "" {
+		baseBranch = inlineCode(base.BaseBranch)
+	}
+	switch {
+	case base.Unverified:
+		fmt.Fprintf(sb, "%s **Could not check whether %s has newer changes to this schema.** Apply checks again before it runs.\n\n",
+			glyph.Attention, baseBranch)
+	case len(base.ChangedPaths) > 0:
+		fmt.Fprintf(sb, "%s **This branch is missing newer changes from %s to %s.** This plan could undo them, and apply is blocked until the branch has them. Merge %s into this branch to plan again.\n\n",
+			glyph.Attention, baseBranch, strings.Join(inlineCodeList(base.ChangedPaths), ", "), baseBranch)
+	}
+}
+
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
 // line when every member passed its contract and none will refuse a change, or
 // a per-member breakdown naming which members diverged, could not be planned or
@@ -3440,6 +3483,7 @@ func titleDatabaseType(databaseType string) string {
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
+	writeBaseSchema(sb, plan.BaseSchema)
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's primary plan is a clean no-op.
