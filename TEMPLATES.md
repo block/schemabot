@@ -911,6 +911,94 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-many-unsafe-changes"></a><strong>MySQL Plan (Many Unsafe Changes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `loans` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    `updated_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `refunds` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    `updated_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `ledger` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    `updated_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+DROP TABLE `refund_backfill`;
+```
+
+⚠️ **Issues**: 8 unsafe changes detected
+
+**Destructive drops** (2)
+1. `transfer_events`: DROP COLUMN discards the column's data
+2. `refund_backfill`: DROP TABLE removes all data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
+
+</details>
+
+<details>
+<summary><b>Other unsafe changes</b> (6)</summary>
+
+3. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+4. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+6. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+7. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+
+</details>
+
+📋 **Plan**: **3** tables to create, **1** table to alter, **1** table to drop
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-change-attributed-to-another-pr"></a><strong>MySQL Plan (Change Attributed To Another PR)</strong></summary>
 
 

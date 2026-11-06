@@ -820,7 +820,7 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	}
 	return unsafeConsent{
 		findings:    countUnsafeFindings(changes),
-		tables:      unsafeChangeTables(changes),
+		tables:      unsafeChangeTables(changes, data.DatabaseType),
 		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
 	}, true
 }
@@ -854,18 +854,21 @@ func (c unsafeConsent) instruction() string {
 // The unsafe findings above list every one, so the rest are only counted.
 const unsafeConsentTablesShown = 2
 
-// unsafeChangeTables names what the unsafe changes touch, each once in
-// first-appearance order, comma-separated: a table by its code span and a
+// unsafeChangeTables names what the unsafe changes touch, each once,
+// comma-separated, the destructive drops' names first so a capped list never
+// hides a dropped table behind the count, then the rest in first-appearance
+// order: a table by its code span and a
 // VSchema by its namespace. The names match the ones the unsafe findings list
 // above uses, so the reader can match one to the other. Which targets and
 // shards each change runs on is the findings list's to say, so the consent
 // sentence stays one short clause however wide the rollout. Past
 // unsafeConsentTablesShown the rest are counted, unless naming the one left
 // over is as short as counting it.
-func unsafeChangeTables(changes []UnsafeChangeData) string {
+func unsafeChangeTables(changes []UnsafeChangeData, databaseType string) string {
+	drops, rest := splitDestructiveDrops(changes, databaseType)
 	seen := make(map[string]bool, len(changes))
 	var names []string
-	for _, c := range changes {
+	for _, c := range append(drops, rest...) {
 		name := unsafeConsentName(c)
 		if seen[name] {
 			continue
@@ -2712,46 +2715,74 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 // table, carries the attribution for tables another pull request changed, so
 // the reader learns where a change came from on the finding itself, and how
 // to make a destructive drop safe.
+//
+// A list that mixes destructive drops with other findings splits in two, as
+// writeGroupedUnsafeChanges describes. A long list with no drops folds whole,
+// as a long lint list does, with the count in the block's summary.
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	count := fmt.Sprintf("%d unsafe %s detected", n, pluralize("change", n))
-	item := 0
-	if n <= unsafeFindingsFoldThreshold {
-		fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, count)
-		writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
-	} else {
-		writeFoldedUnsafeChanges(sb, &item, count, changes, attributionNotes, databaseType)
-	}
-	if len(attributionNotes) > 0 {
-		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
-	}
-	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
-}
-
-// writeFoldedUnsafeChanges writes a long unsafe list folded, as a long lint
-// list is. A destructive drop never folds: the drops lead the list, open under
-// the count, and only the findings that destroy nothing fold below them. A
-// list with no drops folds whole, the count in the block's summary.
-func writeFoldedUnsafeChanges(sb *strings.Builder, item *int, count string, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string) {
+	fold := n > unsafeFindingsFoldThreshold
 	drops, rest := splitDestructiveDrops(changes, databaseType)
-	if len(drops) == 0 {
+	if fold && len(drops) == 0 {
 		// GitHub renders <summary> content as HTML, not markdown, so the folded
 		// header bolds with <b> tags instead of asterisks.
 		fmt.Fprintf(sb, "<details>\n<summary>%s <b>Issues</b>: %s</summary>\n\n", glyph.Attention, count)
-		writeUnsafeChangeItems(sb, item, rest, attributionNotes)
+		item := 0
+		writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
 		sb.WriteString("\n</details>\n")
+		writeUnsafeAttributionDisclosure(sb, attributionNotes)
+		sb.WriteString("\n")
 		return
 	}
 	fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, count)
-	writeUnsafeChangeItems(sb, item, drops, attributionNotes)
-	if len(rest) == 0 {
+	if writeGroupedUnsafeChanges(sb, drops, rest, attributionNotes, databaseType, isMySQL, fold) {
+		writeUnsafeAttributionDisclosure(sb, attributionNotes)
+		sb.WriteString("\n")
 		return
 	}
+	item := 0
+	writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
+	writeUnsafeAttributionDisclosure(sb, attributionNotes)
+	sb.WriteString("\n")
+	writeUnsafeDropGuidance(sb, drops, databaseType, isMySQL)
+}
+
+// writeGroupedUnsafeChanges writes an unsafe list that mixes destructive drops
+// with other findings as two groups below its header, and reports false,
+// writing nothing, for a list that is all drops or has none. The drops lead
+// under their own heading with the drop guidance beneath them, so a dropped
+// table or column reads apart from findings that destroy nothing; the other
+// findings follow under theirs, folded when fold is set. Drops never fold, so
+// none can hide among dozens of advisory findings. Numbering runs straight
+// through both groups, so the last number is the header's count.
+func writeGroupedUnsafeChanges(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, fold bool) bool {
+	if len(drops) == 0 || len(rest) == 0 {
+		return false
+	}
+	item := 0
+	fmt.Fprintf(sb, "\n**Destructive drops** (%d)\n", countUnsafeFindings(drops))
+	writeUnsafeChangeItems(sb, &item, drops, attributionNotes)
+	sb.WriteString("\n")
+	writeUnsafeDropGuidance(sb, drops, databaseType, isMySQL)
 	m := countUnsafeFindings(rest)
-	fmt.Fprintf(sb, "\n<details>\n<summary>%d more unsafe %s</summary>\n\n", m, pluralize("change", m))
-	writeUnsafeChangeItems(sb, item, rest, attributionNotes)
+	if !fold {
+		fmt.Fprintf(sb, "**Other unsafe changes** (%d)\n", m)
+		writeUnsafeChangeItems(sb, &item, rest, attributionNotes)
+		return true
+	}
+	fmt.Fprintf(sb, "<details>\n<summary><b>Other unsafe changes</b> (%d)</summary>\n\n", m)
+	writeUnsafeChangeItems(sb, &item, rest, attributionNotes)
 	sb.WriteString("\n</details>\n")
+	return true
+}
+
+// writeUnsafeAttributionDisclosure explains why another pull request's change
+// shows up as one to undo, when any finding carries an attribution note.
+func writeUnsafeAttributionDisclosure(sb *strings.Builder, attributionNotes map[string]string) {
+	if len(attributionNotes) > 0 {
+		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
+	}
 }
 
 // writeUnsafeChangeItems writes each change's numbered findings, continuing
@@ -2767,8 +2798,9 @@ func writeUnsafeChangeItems(sb *strings.Builder, item *int, changes []UnsafeChan
 }
 
 // splitDestructiveDrops separates the unsafe changes that drop a table,
-// column or index from the rest, each in plan order, so a long list can keep
-// the drops in view while the findings that destroy nothing fold.
+// column, index or partition from the rest, each in plan order, so the drops
+// render under their own heading and stay in view while the findings that
+// destroy nothing fold.
 func splitDestructiveDrops(changes []UnsafeChangeData, databaseType string) (drops, rest []UnsafeChangeData) {
 	parser := dropStatementParser(databaseType)
 	for _, c := range changes {
@@ -2952,18 +2984,24 @@ func unsafeDropIndexUsageTargets(drops unsafeDropCounts) (actionTarget, invisibl
 // changes, so the guidance can name the kind of object an application must
 // stop relying on before the drop is allowed.
 type unsafeDropCounts struct {
-	columns int
-	tables  int
-	indexes int
+	columns    int
+	tables     int
+	indexes    int
+	partitions int
 }
 
 // any reports whether the change drops anything.
 func (c unsafeDropCounts) any() bool {
-	return c.columns+c.tables+c.indexes > 0
+	return c.columns+c.tables+c.indexes+c.partitions > 0
 }
 
 func (c unsafeDropCounts) add(other unsafeDropCounts) unsafeDropCounts {
-	return unsafeDropCounts{columns: c.columns + other.columns, tables: c.tables + other.tables, indexes: c.indexes + other.indexes}
+	return unsafeDropCounts{
+		columns:    c.columns + other.columns,
+		tables:     c.tables + other.tables,
+		indexes:    c.indexes + other.indexes,
+		partitions: c.partitions + other.partitions,
+	}
 }
 
 // countUnsafeDrops classifies each unsafe change through the target dialect's
@@ -2996,7 +3034,7 @@ func classifyUnsafeDrops(change UnsafeChangeData, databaseType string, parser dd
 	if parser != nil && strings.TrimSpace(change.DDL) != "" {
 		targets, err := parser.DropTargets(change.DDL)
 		if err == nil {
-			return dropCountsWithTableFallback(unsafeDropCounts{columns: targets.Columns, tables: targets.Tables, indexes: targets.Indexes}, change.ChangeType)
+			return dropCountsWithTableFallback(unsafeDropCounts{columns: targets.Columns, tables: targets.Tables, indexes: targets.Indexes, partitions: targets.Partitions}, change.ChangeType)
 		}
 		slog.Warn("destructive drop guidance falls back to the unsafe reason because the statement did not parse",
 			"table", change.Table, "database_type", databaseType, "error", err)
@@ -3007,6 +3045,8 @@ func classifyUnsafeDrops(change UnsafeChangeData, databaseType string, parser dd
 		columns: strings.Count(upperReason, "DROP COLUMN"),
 		tables:  strings.Count(upperReason, "DROP TABLE"),
 		indexes: strings.Count(upperReason, "DROP INDEX"),
+		partitions: strings.Count(upperReason, "DROP PARTITION") +
+			strings.Count(upperReason, "TRUNCATE PARTITION"),
 	}, change.ChangeType)
 }
 
