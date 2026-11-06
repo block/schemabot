@@ -279,11 +279,18 @@ func (h *Handler) retireStalePlanCommentsForPR(ctx context.Context, client *ghcl
 // nothing replacing it — minimized comments are never automatically restored,
 // and deleted comments cannot be restored at all. On a fetch failure or a
 // moved head nothing is retired — the newer head's own plan outcome sweeps
-// instead. attrs name what is being swept.
+// instead. A run whose context has ended skips the sweep without an error:
+// the sweep is cleanup, and the next supersede sweep finishes it. attrs name
+// what is being swept.
 func (h *Handler) planSweepHeadIsCurrent(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, attrs ...any) bool {
 	sweepAttrs := append([]any{"repo", repo, "pr", pr, "head_sha", headSHA}, attrs...)
 
 	freshPR, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil && ctx.Err() != nil {
+		h.logger.Info("skipping stale plan comment sweep because its run has ended; prior plan comments stay visible until the next supersede sweep",
+			append(sweepAttrs, "cause", context.Cause(ctx), "error", err)...)
+		return false
+	}
 	if err != nil {
 		h.logger.Error("failed to verify PR head for stale plan comment sweep; prior plan comments stay visible until the next supersede sweep",
 			append(sweepAttrs, "error", err)...)

@@ -119,6 +119,11 @@ var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader d
 // an operator intervenes.
 var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 
+// ErrLogsTargetNotInApply is returned by a Logs read scoped to a target the
+// apply has no operation on. An empty result would read as a target that wrote
+// nothing, so the read refuses instead.
+var ErrLogsTargetNotInApply = errors.New("apply has no operation on the requested target")
+
 // ErrTaskRequeueRefused is returned by a resume whose write putting a
 // failed_retryable task back to pending for a retry, or a stopped task back to
 // pending for a start, did not land. The drive exits with the task row still at

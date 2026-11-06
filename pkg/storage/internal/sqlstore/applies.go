@@ -145,6 +145,14 @@ func claimableApplyStates() []string {
 // doing, and an exhausted budget would then settle failed a change that has
 // already cut over. Those applies stay with the stale-active claim, which
 // rotates the lease and leaves the state alone.
+//
+// Recovering is one of them. It is entered only from waiting_for_cutover, when
+// a resume finds the engine's cutover checkpoint and reattaches to it, so the
+// copy is already behind it; the resume path reads the state to know it must
+// look for that checkpoint rather than re-plan. The cost of leaving it out is
+// that a driver that keeps dying during the reattach is never charged to the
+// retry budget; the stale-active claim keeps rotating the lease instead, as it
+// does for waiting_for_cutover itself.
 func retryRestartableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
@@ -153,7 +161,6 @@ func retryRestartableApplyStates() []string {
 		state.Apply.Checksumming,
 		state.Apply.PostChecksum,
 		state.Apply.Resuming,
-		state.Apply.Recovering,
 		state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
@@ -485,7 +492,7 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 		return err
 	}
 	if len(holders) > 0 {
-		return activeApplyExistsError(database, dbType, environment, deployments, holders[0].identifier)
+		return activeApplyExistsError(database, dbType, environment, deployments, holders[0])
 	}
 	return checkNoInProgressRolloutForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
 }
@@ -515,7 +522,7 @@ func checkNoActiveApplyForNewGeneration(ctx context.Context, tx *rebindTx, diale
 			return nil, err
 		}
 		if !held {
-			return nil, activeApplyExistsError(database, dbType, environment, deployments, holder.identifier)
+			return nil, activeApplyExistsError(database, dbType, environment, deployments, holder)
 		}
 		slog.WarnContext(ctx, "admitting a new generation past an earlier one held open for operations that never attached; the new generation takes over its work and its driver settles it on its next pass",
 			"database", database, "database_type", dbType, "environment", environment, "deployments", deployments,
@@ -565,8 +572,14 @@ func markAdmittedPast(ctx context.Context, tx *rebindTx, holder activeApplyHolde
 	return nil
 }
 
-func activeApplyExistsError(database, dbType, environment string, deployments []string, holderIdentifier string) error {
-	return fmt.Errorf("active apply %s exists for %s/%s/%s deployments %v: %w", holderIdentifier, database, dbType, environment, deployments, storage.ErrActiveApplyExists)
+func activeApplyExistsError(database, dbType, environment string, deployments []string, holder activeApplyHolder) error {
+	return &storage.ActiveApplyError{
+		HolderApplyID: holder.identifier,
+		HolderState:   holder.state,
+		Database:      database,
+		Environment:   environment,
+		Detail:        fmt.Sprintf("active apply %s (state %s) exists for %s/%s/%s deployments %v", holder.identifier, holder.state, database, dbType, environment, deployments),
+	}
 }
 
 // activeApplyHolder is a non-terminal apply reserving one of the deployments
@@ -787,8 +800,14 @@ func checkNoInProgressRolloutForTargets(ctx context.Context, tx *rebindTx, diale
 	if err != nil {
 		return fmt.Errorf("check in-progress rollouts for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	return fmt.Errorf("apply %s (state %s) still has a %s operation on deployment %s and holds its targets among %v for %s/%s/%s: %w",
-		holderIdentifier, holderState, busyState, busyDeployment, deployments, database, dbType, environment, storage.ErrActiveApplyExists)
+	return &storage.ActiveApplyError{
+		HolderApplyID: holderIdentifier,
+		HolderState:   holderState,
+		Database:      database,
+		Environment:   environment,
+		Detail: fmt.Sprintf("apply %s (state %s) still has a %s operation on deployment %s and holds its targets among %v for %s/%s/%s",
+			holderIdentifier, holderState, busyState, busyDeployment, deployments, database, dbType, environment),
+	}
 }
 
 func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {

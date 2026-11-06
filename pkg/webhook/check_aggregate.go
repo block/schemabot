@@ -48,19 +48,42 @@ func (h *Handler) isAggregateParticipant(repo string) bool {
 	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
-// leaderExpectsParticipantsForPR reports whether this deployment is the
-// aggregate leader for repo and the PR's changed files touch at least one
-// expected participant's paths. Such a PR carries schema work owned by another
-// deployment even when the leader itself has none, so the leader's aggregate
-// must fold the participants' Check Runs (fail-closed) rather than pass on
-// "no managed schema changes". Returns false for non-leaders — the expected set
-// only exists on the leader.
-func (h *Handler) leaderExpectsParticipantsForPR(repo string, files []ghclient.PRFile) bool {
+// hasAggregateRole reports whether this deployment is the aggregate leader or
+// an aggregate participant for repo.
+func (h *Handler) hasAggregateRole(repo string) bool {
 	config, ok := h.serverConfig()
 	if !ok {
 		return false
 	}
-	return len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0
+	role := config.AggregateRoleForRepo(repo)
+	return role == api.AggregateRoleLeader || role == api.AggregateRoleParticipant
+}
+
+// leaderParticipantsForPR returns the participants this deployment, as the
+// aggregate leader for repo, must fold for the PR at headSHA. A PR that selects
+// any carries schema work owned by another deployment even when the leader
+// itself has none, so the leader's aggregate must fold the participants' Check
+// Runs (fail-closed) rather than pass on "no managed schema changes".
+//
+// listed is the PR's raw changed-file listing and proposed is that listing
+// narrowed to what the PR proposes against the default branch. Every path that
+// decides whether to fold (the fold itself, auto-plan, and the plan command's
+// refresh) asks this one question, so a participant that kept a non-passing run
+// on the head after narrowing dropped it gates all of them alike. Non-leaders
+// get no participants: the expected set only exists on the leader. A failed
+// participant read is returned as an error so the caller publishes nothing.
+func (h *Handler) leaderParticipantsForPR(
+	ctx context.Context, client checkRunFinder,
+	repo string, pr int, headSHA string,
+	listed, proposed []ghclient.PRFile,
+) ([]api.ExpectedTenant, error) {
+	config, ok := h.serverConfig()
+	if !ok {
+		return nil, nil
+	}
+	return h.participantsExpectedOnHead(ctx, client, repo, pr, headSHA,
+		config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)),
+		config.ExpectedParticipantChecksForPR(repo, prFilePaths(proposed)))
 }
 
 // participantPathsTouched reports whether the PR selects this participant's

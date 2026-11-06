@@ -1,7 +1,9 @@
 package tern
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -972,6 +974,7 @@ type mockTaskStore struct {
 	updated             []*storage.Task
 	upsertedShards      []*storage.Task
 	upsertShardErr      error
+	upsertShardCalls    int
 }
 
 func (m *mockTaskStore) Get(context.Context, string) (*storage.Task, error) {
@@ -1017,6 +1020,7 @@ func (m *mockTaskStore) Update(_ context.Context, task *storage.Task) error {
 }
 
 func (m *mockTaskStore) UpsertShardProgress(_ context.Context, task *storage.Task) error {
+	m.upsertShardCalls++
 	if m.upsertShardErr != nil {
 		return m.upsertShardErr
 	}
@@ -1029,6 +1033,7 @@ type mockApplyLogStore struct {
 	storage.ApplyLogStore
 	logs        []*storage.ApplyLog
 	recentLimit int
+	lastFilter  storage.ApplyLogFilter
 }
 
 // Append records the line the way the real store does: a cancelled context is
@@ -1048,6 +1053,12 @@ func (m *mockApplyLogStore) GetByApply(context.Context, int64) ([]*storage.Apply
 
 func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit int) ([]*storage.ApplyLog, error) {
 	m.recentLimit = limit
+	return m.logs, nil
+}
+
+func (m *mockApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
+	m.recentLimit = filter.Limit
+	m.lastFilter = filter
 	return m.logs, nil
 }
 
@@ -6994,6 +7005,80 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 			assert.NotEmpty(t, s.Shard, "no per-shard row may be stored without a shard name")
 		}
 	})
+
+	t.Run("stops at the first shard once the reconcile context ends", func(t *testing.T) {
+		// A drive stopping on shutdown or lease release cancels its reconcile
+		// context. Every remaining shard write would fail the same way, so the
+		// encode stops after the first one and logs the stop once instead of an
+		// error per shard. A cancel is routine and logs at Info; a reconcile
+		// that ran out of time logs at Warn.
+		tests := []struct {
+			name      string
+			endCtx    func(ctx context.Context) (context.Context, context.CancelFunc)
+			ctxErr    error
+			wantMsg   string
+			wantLevel string
+		}{
+			{
+				name: "cancelled",
+				endCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+					ctx, cancel := context.WithCancel(ctx)
+					cancel()
+					return ctx, cancel
+				},
+				ctxErr:    context.Canceled,
+				wantMsg:   "stopping remote per-shard progress encode: reconcile context was cancelled",
+				wantLevel: "INFO",
+			},
+			{
+				name: "deadline passed",
+				endCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+					return context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				},
+				ctxErr:    context.DeadlineExceeded,
+				wantMsg:   "stopping remote per-shard progress encode: reconcile context deadline passed",
+				wantLevel: "WARN",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				storedTask := newStoredTask()
+				tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+				var logs bytes.Buffer
+				client := &GRPCClient{
+					storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}},
+					logger:  slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+				}
+				ctx, cancel := tt.endCtx(storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"}))
+				defer cancel()
+				tasks.upsertShardErr = fmt.Errorf("look up shard task: %w", tt.ctxErr)
+
+				client.syncShardProgressFromRemote(ctx, apply, storedTask, remoteTables()[0].Shards, now)
+
+				assert.Equal(t, 1, tasks.upsertShardCalls, "no shard write may follow the first one once the context has ended")
+				assert.NotContains(t, logs.String(), "failed to encode remote per-shard progress")
+				stop := logEntryWithMessage(t, logs.String(), tt.wantMsg)
+				assert.Equal(t, tt.wantLevel, stop["level"])
+				assert.Equal(t, remoteTables()[0].Shards[0].Shard, stop["shard"])
+			})
+		}
+	})
+}
+
+// logEntryWithMessage decodes the JSON log lines in logs and returns the one
+// entry whose msg is want, failing the test unless exactly one matches.
+func logEntryWithMessage(t *testing.T, logs, want string) map[string]any {
+	t.Helper()
+	var matches []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), "log line is JSON: %s", line)
+		if entry["msg"] == want {
+			matches = append(matches, entry)
+		}
+	}
+	require.Len(t, matches, 1, "exactly one %q log entry in:\n%s", want, logs)
+	return matches[0]
 }
 
 func TestGRPCClient_SyncUnchangedProgressAdvancesUpdatedAt(t *testing.T) {
@@ -10545,14 +10630,16 @@ func (o *supersededFakeObserver) Superseded() bool { return o.superseded.Load() 
 func TestClearObserverIfCurrent(t *testing.T) {
 	oldObs := &supersededFakeObserver{}
 	newObs := &supersededFakeObserver{}
-	client := &GRPCClient{observers: map[int64]ProgressObserver{1: oldObs}}
+	oldReg := &observerRegistration{observer: oldObs}
+	newReg := &observerRegistration{observer: newObs}
+	client := &GRPCClient{observers: map[int64]*observerRegistration{1: oldReg}}
 
-	client.observers[1] = newObs
-	assert.False(t, client.clearObserverIfCurrent(1, oldObs),
+	client.observers[1] = newReg
+	assert.False(t, client.clearObserverIfCurrent(1, oldReg),
 		"a replaced observer must not clear its replacement")
 	assert.Same(t, newObs, client.getObserver(1), "the replacement stays registered")
 
-	assert.True(t, client.clearObserverIfCurrent(1, newObs),
+	assert.True(t, client.clearObserverIfCurrent(1, newReg),
 		"the current observer clears itself")
 	assert.Nil(t, client.getObserver(1))
 }
@@ -10783,4 +10870,263 @@ func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 			t.Errorf("%s has no deadline class; add it to the heavy or control list", method)
 		}
 	}
+}
+
+// switchableApplyStore serves one apply whose state a test changes while a
+// poller reads it.
+type switchableApplyStore struct {
+	storage.ApplyStore
+	mu    sync.Mutex
+	apply storage.Apply
+	// gets counts reads, so a test can wait for the poller to tick.
+	gets atomic.Int32
+}
+
+func (s *switchableApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	s.gets.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	apply := s.apply
+	return &apply, nil
+}
+
+// switchableStorage serves a switchableApplyStore in place of the mock store.
+type switchableStorage struct {
+	*mockStorage
+	applies *switchableApplyStore
+}
+
+func (s *switchableStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *switchableApplyStore) setState(applyState string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apply.State = applyState
+}
+
+// blockingTerminalObserver holds OnTerminal until released, standing in for a
+// comment observer still publishing its terminal comment and Check Run.
+type blockingTerminalObserver struct {
+	entered  chan struct{}
+	release  chan struct{}
+	progress atomic.Int32
+	terminal atomic.Int32
+}
+
+func newBlockingTerminalObserver() *blockingTerminalObserver {
+	return &blockingTerminalObserver{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (o *blockingTerminalObserver) OnProgress(*storage.Apply, []*storage.Task) {
+	o.progress.Add(1)
+}
+
+func (o *blockingTerminalObserver) OnTerminal(*storage.Apply, []*storage.Task) {
+	o.terminal.Add(1)
+	select {
+	case o.entered <- struct{}{}:
+	default:
+	}
+	<-o.release
+}
+
+// nonComparableObserver is a valid ProgressObserver whose dynamic type cannot
+// be compared: comparing two of them as interface values panics.
+type nonComparableObserver struct {
+	*blockingTerminalObserver
+	labels []string
+}
+
+// Starting a stopped apply registers a new observer for it while the stopped
+// observer may still be publishing its terminal update. The poll loop that
+// delivered the stop must hand the apply to the new observer rather than
+// clear it: the new registration started no poller of its own, so clearing it
+// leaves the resumed apply with no progress or terminal updates at all. The
+// hand-off must not depend on the observers being comparable.
+func TestObserverPollKeepsAnObserverRegisteredDuringTerminal(t *testing.T) {
+	for name, wrap := range map[string]func(*blockingTerminalObserver) ProgressObserver{
+		"pointer observer": func(o *blockingTerminalObserver) ProgressObserver { return o },
+		"non-comparable observer": func(o *blockingTerminalObserver) ProgressObserver {
+			return nonComparableObserver{o, []string{"resume"}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			const applyID int64 = 78
+			applies := &switchableApplyStore{apply: storage.Apply{
+				ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
+			}}
+			client := &GRPCClient{
+				storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
+				observerPollInterval: 10 * time.Millisecond,
+			}
+
+			stopped := newBlockingTerminalObserver()
+			client.SetObserver(applyID, wrap(stopped))
+			select {
+			case <-stopped.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the stopped apply never reached its observer's OnTerminal")
+			}
+
+			resumed := newBlockingTerminalObserver()
+			close(resumed.release)
+			applies.setState(state.Apply.Running)
+			client.SetObserver(applyID, wrap(resumed))
+			close(stopped.release)
+
+			require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+				5*time.Second, 10*time.Millisecond,
+				"the resumed apply's observer must receive progress")
+
+			applies.setState(state.Apply.Completed)
+			require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+				5*time.Second, 10*time.Millisecond,
+				"the resumed apply's observer must receive its terminal update and then be cleared")
+			assert.Equal(t, int32(1), stopped.terminal.Load(), "the stopped observer's terminal update runs once")
+		})
+	}
+}
+
+// panickingTerminalObserver panics in OnTerminal once released, standing in
+// for an observer whose terminal update fails while a start registers its
+// replacement.
+type panickingTerminalObserver struct {
+	*blockingTerminalObserver
+}
+
+func (o *panickingTerminalObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
+	o.blockingTerminalObserver.OnTerminal(apply, tasks)
+	panic("terminal update failed")
+}
+
+// newHandoffTestClient returns a client polling a stopped apply, and waits for
+// stopped's OnTerminal to start.
+func newHandoffTestClient(t *testing.T, applyID int64, stopped ProgressObserver, entered <-chan struct{}, grace time.Duration) (*GRPCClient, *switchableApplyStore) {
+	t.Helper()
+	applies := &switchableApplyStore{apply: storage.Apply{
+		ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
+	}}
+	client := &GRPCClient{
+		storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
+		observerPollInterval: 10 * time.Millisecond,
+		observerHandoffGrace: grace,
+	}
+	client.SetObserver(applyID, stopped)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stopped apply never reached its observer's OnTerminal")
+	}
+	return client, applies
+}
+
+// waitForTicks waits until the poller has read the apply n more times.
+func waitForTicks(t *testing.T, applies *switchableApplyStore, n int32) {
+	t.Helper()
+	start := applies.gets.Load()
+	require.Eventually(t, func() bool { return applies.gets.Load() >= start+n },
+		5*time.Second, 5*time.Millisecond, "the poller stopped ticking")
+}
+
+// On a single-operation apply, a start registers its observer before the
+// drive moves the row out of stopped. The poller must not hand that observer
+// the stop it already delivered, nor clear it: it waits for the row to move.
+func TestObserverPollHoldsTheStopBackFromAnObserverRegisteredWhileStopped(t *testing.T) {
+	const applyID int64 = 79
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	waitForTicks(t, applies, 5)
+	assert.Equal(t, int32(0), resumed.terminal.Load(), "the resumed observer must not receive the earlier stop")
+	assert.Same(t, resumed, client.getObserver(applyID), "the resumed observer must stay registered")
+
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive progress")
+	applies.setState(state.Apply.Completed)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive its terminal update and then be cleared")
+	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
+// Once the resumed apply runs, the handoff is over. A second stop within the
+// grace is a new stop, so its observer receives it at once, exactly once.
+func TestObserverPollDeliversASecondStopAfterTheApplyResumes(t *testing.T) {
+	const applyID int64 = 83
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive progress")
+
+	applies.setState(state.Apply.Stopped)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the second stop must reach the resumed observer before the grace ends")
+	// Clearing the observer ends the poll, so nothing can deliver it again.
+	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
+// A start that never moves the row out of stopped did not resume the apply.
+// Once the grace passes, its observer receives the stop and is cleared, so
+// the poller does not tick a stopped apply forever.
+func TestObserverPollDeliversTheStopOnceTheHandoffGracePasses(t *testing.T) {
+	const applyID int64 = 80
+	stopped := newBlockingTerminalObserver()
+	client, _ := newHandoffTestClient(t, applyID, stopped, stopped.entered, 50*time.Millisecond)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the observer of a start that never resumed must receive the stop and be cleared")
+}
+
+// If the stopped observer's terminal update panics after a start registered
+// its replacement, the replacement must still be polled rather than deleted.
+func TestObserverPollKeepsAReplacementWhenTheTerminalUpdatePanics(t *testing.T) {
+	const applyID int64 = 81
+	inner := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, &panickingTerminalObserver{inner}, inner.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(inner.release)
+
+	waitForTicks(t, applies, 2)
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the replacement must be polled after the panic")
+	applies.setState(state.Apply.Completed)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond)
+}
+
+// Routed calls re-attach the observer already registered. That is not a
+// replacement, so the observer receives its terminal update once.
+func TestObserverPollTreatsAReattachedObserverAsTheSameRegistration(t *testing.T) {
+	const applyID int64 = 82
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	client.SetObserver(applyID, stopped)
+	close(stopped.release)
+
+	require.Eventually(t, func() bool { return client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the observer is cleared after its terminal update")
+	waitForTicks(t, applies, 0)
+	assert.Equal(t, int32(1), stopped.terminal.Load())
 }

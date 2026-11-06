@@ -4256,6 +4256,9 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 			OldState:  apply.State,
 			NewState:  derived,
 			CreatedAt: s.clock.Now(),
+			// The projecting drive holds one operation's lease, but the
+			// parent's state is every target's.
+			ApplyWide: true,
 		}, "how the derived apply state was reached", append(apply.LogAttrs(), "driver", driverID)...)
 	}
 

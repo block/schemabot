@@ -3219,7 +3219,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 
 	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+	// The dispatch request holds no operation lease, so the entry names the
+	// attached operation itself; left unattributed it would read as about the
+	// whole apply and show in every target's log.
+	c.logOperationEvent(ctx, apply.ID, operation.ID, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
 	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attached")
 	c.logger.Info("Apply: attached operation to keyed apply",
@@ -4066,11 +4069,15 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if apply == nil {
 		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, storage.ErrApplyNotFound)
 	}
-	logs, err := c.storage.ApplyLogs().GetRecentByApply(ctx, apply.ID, limit)
+	operationIDs, err := c.logOperationsForTarget(ctx, apply, req.Target)
+	if err != nil {
+		return nil, err
+	}
+	logs, err := c.storage.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: apply.ID, OperationIDs: operationIDs, Limit: limit})
 	if err != nil {
 		return nil, fmt.Errorf("get recent logs for apply %s: %w", req.ApplyId, err)
 	}
-	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
+	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Target: req.Target, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
 	for _, log := range logs {
 		entry := &ternv1.ApplyLog{Id: log.ID, Level: log.Level, EventType: log.EventType, Source: log.Source, Message: log.Message, OldState: log.OldState, NewState: log.NewState, MetadataJson: log.Metadata, CreatedAt: log.CreatedAt.UTC().Format(time.RFC3339Nano)}
 		if log.TaskID != nil {
@@ -4079,6 +4086,51 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 		resp.Logs = append(resp.Logs, entry)
 	}
 	return resp, nil
+}
+
+// logOperationsForTarget returns the operations whose logs a Logs read for
+// target covers. One data-plane apply can drive several targets of a rollout,
+// and a read for one of them must return that target's entries, not the whole
+// apply's: the caller renders one section per target, so an unscoped read
+// would repeat every target's lines under each. It returns nil, an unscoped
+// read, when no target is named. A named target the apply has no operation on
+// is an error when the apply spans several targets, never an empty read that
+// looks like a quiet target.
+func (c *LocalClient) logOperationsForTarget(ctx context.Context, apply *storage.Apply, target string) ([]int64, error) {
+	if target == "" {
+		return nil, nil
+	}
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list operations of apply %s for logs of target %s: %w", apply.ApplyIdentifier, target, err)
+	}
+	if operationIDs := storage.LogOperationsOnTarget(ops, target); len(operationIDs) > 0 {
+		return operationIDs, nil
+	}
+	targets := storage.DistinctOperationTargets(ops)
+	if len(targets) > 1 {
+		return nil, fmt.Errorf("apply %s has no operation on target %s, only on %s: %w", apply.ApplyIdentifier, target, strings.Join(targets, ", "), ErrLogsTargetNotInApply)
+	}
+	// A remote apply that drives one target holds only that target's log, and
+	// a single-target dispatch may record its target under another name than
+	// the caller's (the database name when the request named none), so every
+	// operation listed here is the target's. The IDs stay explicit for the
+	// reason LogOperationsOnTarget gives: an operation that joins the apply
+	// after this listing belongs to another target.
+	if len(ops) > 0 {
+		c.logger.Debug("logs read for a target the single-target apply records under another name; serving its listed operations",
+			append(apply.LogAttrs(), "target", target, "recorded_targets", targets)...)
+		listed := make([]int64, 0, len(ops))
+		for _, op := range ops {
+			listed = append(listed, op.ID)
+		}
+		return listed, nil
+	}
+	// An apply with no recorded operation has no operation to scope by, and its
+	// entries name none, so its whole log is the answer.
+	c.logger.Debug("logs read for a target on an apply with no recorded operation; serving its whole log",
+		append(apply.LogAttrs(), "target", target)...)
+	return nil, nil
 }
 
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's

@@ -995,7 +995,7 @@ func operationLeaseAbsenceContext(ctx context.Context, t *storage.Task, op *stor
 
 // logApplyEvent appends a log entry for an apply operation.
 func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *int64, level, eventType, source, message string, oldState, newState string) {
-	log := &storage.ApplyLog{
+	c.appendApplyEvent(ctx, &storage.ApplyLog{
 		ApplyID:   applyID,
 		TaskID:    taskID,
 		Level:     level,
@@ -1005,9 +1005,29 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 		OldState:  oldState,
 		NewState:  newState,
 		CreatedAt: time.Now(),
-	}
+	})
+}
+
+// logOperationEvent records an event about one operation from a path that
+// holds no lease on it, where Append cannot attribute the entry from the
+// context, so a read scoped to another target or shard leaves it out.
+func (c *LocalClient) logOperationEvent(ctx context.Context, applyID, operationID int64, level, eventType, source, message string, oldState, newState string) {
+	c.appendApplyEvent(ctx, &storage.ApplyLog{
+		ApplyID:          applyID,
+		ApplyOperationID: &operationID,
+		Level:            level,
+		EventType:        eventType,
+		Source:           source,
+		Message:          message,
+		OldState:         oldState,
+		NewState:         newState,
+		CreatedAt:        time.Now(),
+	})
+}
+
+func (c *LocalClient) appendApplyEvent(ctx context.Context, log *storage.ApplyLog) {
 	if err := c.storage.ApplyLogs().Append(ctx, log); err != nil {
-		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "event_message", message)
+		c.logger.Warn("failed to log apply event", "error", err, "event", log.EventType, "event_message", log.Message)
 	}
 }
 
