@@ -99,6 +99,25 @@ func TestPlanCommentUpToDate(t *testing.T) {
 			data:           templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{"staging": noChanges()}},
 			rolloutHasWork: true,
 		},
+		{
+			name: "a branch missing newer base-branch schema changes",
+			data: templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{
+				"staging": {BaseSchema: &templates.BaseSchemaData{BaseBranch: "main", ChangedPaths: []string{"schema/staging"}}},
+			}},
+		},
+		{
+			name: "a branch whose base schema could not be checked",
+			data: templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{
+				"staging": {BaseSchema: &templates.BaseSchemaData{BaseBranch: "main", Unverified: true}},
+			}},
+		},
+		{
+			name: "a branch with every base-branch schema change",
+			data: templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{
+				"staging": {BaseSchema: &templates.BaseSchemaData{BaseBranch: "main"}},
+			}},
+			upToDate: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

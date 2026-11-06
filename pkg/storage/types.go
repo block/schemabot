@@ -2642,7 +2642,7 @@ type PlanComment struct {
 	GitHubNodeID string
 
 	// UpToDate records that the comment showed nothing to act on: no changes,
-	// rollout work, errors, or drift. A later plan that flips between nothing
+	// rollout work, errors, drift, or base-schema notice. A later plan that flips between nothing
 	// to act on and something to act on replaces the comment even when the
 	// schema inputs did not change. The bit does not compare the DDL itself:
 	// two plans that both have work count as the same outcome. False is the

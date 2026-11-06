@@ -120,6 +120,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, mux, "newsha")
 	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
@@ -191,6 +192,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, mux, "newsha")
 	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
@@ -264,6 +266,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, mux, "newsha")
 	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
@@ -1245,6 +1248,7 @@ func TestE2EAutoPlanNoChangesWithoutPriorPlanSkipsComment(t *testing.T) {
 func schemaNeutralSync(t *testing.T, f *autoPlanCommentFixture) {
 	t.Helper()
 	f.result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, f.mux, "newsha")
 	registerCompareFiles(t, f.mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),

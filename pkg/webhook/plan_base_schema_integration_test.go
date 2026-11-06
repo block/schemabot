@@ -3,10 +3,12 @@
 package webhook
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,10 +20,12 @@ import (
 const baseSchemaUsersTable = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 
 // newBaseSchemaPlanFlow serves a PR proposing a users table to a handler
-// planning dbName against a real target.
-func newBaseSchemaPlanFlow(t *testing.T, dbName string) (*Handler, *http.ServeMux, *planFlowResult) {
+// planning dbName against a real target, in staging and any further
+// environments named.
+func newBaseSchemaPlanFlow(t *testing.T, dbName string, environments ...string) (*Handler, *http.ServeMux, *planFlowResult) {
 	t.Helper()
 	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, environments...)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -106,4 +110,84 @@ func TestE2EPlanCommandSaysBaseSchemaCouldNotBeChecked(t *testing.T) {
 	assert.Contains(t, body, "**Could not check whether `main` has newer changes to this schema.** Apply checks again before it runs.")
 	assert.NotContains(t, body, "is missing newer changes")
 	assert.Contains(t, body, "CREATE TABLE `users`")
+}
+
+// registerStaleBaseSchemaComparisonForHead serves the stale merge-base
+// comparison for a PR head other than the default, on top of the routes
+// registerStaleBaseSchemaComparison serves.
+func registerStaleBaseSchemaComparisonForHead(t *testing.T, mux *http.ServeMux, headSHA string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		}))
+	})
+}
+
+// A push whose auto-plan finds no DDL would normally post no comment on a PR
+// that has never shown one, since the passing check run says it all. A branch
+// missing main's newer schema change is not that case: apply will refuse it,
+// so the auto-plan posts the notice. The check run still passes, since the
+// notice is comment text and changes no check state.
+func TestE2EAutoPlanNoChangesWarnsBranchMissingBaseSchemaChanges(t *testing.T) {
+	dbName := "webhook_autoplan_nochange_stale_base"
+	f := setupNoChangesAutoPlan(t, dbName)
+	registerStaleBaseSchemaComparison(t, f.mux, f.result)
+
+	f.synchronize(t, "", "abc123")
+
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "**This branch is missing newer changes from `main` to `schema`.**")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment carrying the base-schema notice")
+	}
+	requireOnlyVisiblePlanComment(t, f, dbName, "abc123", false)
+}
+
+// A PR shows a plan with DDL, then main changes the schema and the author
+// pushes a commit that touches no schema input. Such a push normally keeps the
+// visible plan, since its schema inputs did not change. The base branch moved
+// without a push to the PR, though, so the visible plan cannot carry the
+// notice: the auto-plan posts one that does and the prior head's plan goes.
+func TestE2EAutoPlanSchemaNeutralSyncReplacesPlanWithoutBaseSchemaNotice(t *testing.T) {
+	dbName := "webhook_autoplan_neutral_stale_base"
+	f := setupAutoPlanCommentFixture(t, dbName, false)
+	schemaNeutralSync(t, f)
+	registerStaleBaseSchemaComparison(t, f.mux, f.result)
+	registerStaleBaseSchemaComparisonForHead(t, f.mux, "newsha")
+	insertPlanCommentRowWithOutcome(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "oldsha", 9001, "IC_shows_ddl", false)
+
+	f.synchronize(t, "oldsha", "newsha")
+
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "**This branch is missing newer changes from `main` to `schema`.**")
+		assert.Contains(t, body, "CREATE TABLE")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment carrying the base-schema notice")
+	}
+	select {
+	case id := <-f.deleted:
+		assert.Equal(t, "9001", id)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the prior head's plan comment to be deleted")
+	}
+	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", false)
+}
+
+// A plan covering staging and production checks both environments' schema
+// against main in one comparison: one read of main's tip and one merge-base
+// lookup, however many environments the comment covers.
+func TestE2EMultiEnvPlanComparesBaseSchemaOnce(t *testing.T) {
+	h, mux, result := newBaseSchemaPlanFlow(t, "webhook_multienv_plan_one_compare", "production")
+	var compares atomic.Int32
+	registerStaleBaseSchemaComparisonWithHook(t, mux, result, func() { compares.Add(1) })
+
+	body := requestPlan(t, h, result, "schemabot plan")
+
+	assert.Contains(t, body, "Staging")
+	assert.Contains(t, body, "Production")
+	assert.Contains(t, body, "is missing newer changes from `main` to `schema`")
+	assert.Equal(t, int32(1), compares.Load(), "one merge-base comparison covers every environment")
 }

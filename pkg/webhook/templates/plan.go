@@ -2091,6 +2091,24 @@ type BaseSchemaData struct {
 	Unverified bool
 }
 
+// HasNotice reports whether the plan comment shows a base-schema notice: the
+// branch is missing newer base-branch changes, or that could not be checked.
+func (b *BaseSchemaData) HasNotice() bool {
+	return b != nil && (b.Unverified || len(b.ChangedPaths) > 0)
+}
+
+// AnyEnvHasBaseSchemaNotice reports whether any environment's plan shows a
+// base-schema notice. A plan with nothing else to show still has to render
+// it, since it says the plan may not be what merging would apply.
+func AnyEnvHasBaseSchemaNotice(data MultiEnvPlanCommentData) bool {
+	for _, plan := range data.Plans {
+		if plan != nil && plan.BaseSchema.HasNotice() {
+			return true
+		}
+	}
+	return false
+}
+
 // writeBaseSchema warns that the plan is of a branch that is missing newer
 // schema changes from its base branch. The plan diffs the branch's schema, so
 // it would undo those changes, and apply refuses to run until the branch has
@@ -3347,12 +3365,13 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 	hasErrors := len(data.Errors) > 0
 
 	// If no environments have changes and no errors, show simple message — unless
-	// a deployment drifted, which must still surface even when the reviewed
+	// a deployment drifted, or the branch is missing newer base-branch schema
+	// changes, either of which must still surface even when the reviewed
 	// primary plans are clean no-ops. The ignore_namespaces disclosure still
 	// renders underneath it: an all-clean result is exactly where a reviewer
 	// needs to see that a namespace was withheld rather than genuinely
 	// unchanged.
-	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) {
+	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) && !AnyEnvHasBaseSchemaNotice(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
 		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) {
 			sb.WriteString("\n")

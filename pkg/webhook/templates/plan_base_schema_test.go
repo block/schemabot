@@ -98,3 +98,32 @@ func TestRenderMultiEnvPlanCommentScopesBaseSchemaNoticeToItsEnvironment(t *test
 	noticeAt := strings.Index(out, "is missing newer changes")
 	assert.True(t, stagingAt < noticeAt && noticeAt < productionAt, "the notice renders in the staging section")
 }
+
+// Two environments with no DDL would collapse into the combined no-changes
+// line, which renders no environment section. A base-schema notice still
+// renders, since the plan may not be what merging would apply even when it
+// has nothing to do, and apply can still refuse the branch.
+func TestRenderMultiEnvPlanCommentEmptyPlansKeepBaseSchemaNotice(t *testing.T) {
+	for name, base := range map[string]struct {
+		data   *BaseSchemaData
+		notice string
+	}{
+		"stale":      {&BaseSchemaData{BaseBranch: "main", ChangedPaths: []string{"schema/staging"}}, "is missing newer changes from `main` to `schema/staging`"},
+		"unverified": {&BaseSchemaData{BaseBranch: "main", Unverified: true}, "Could not check whether `main` has newer changes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			staging := &PlanCommentData{Database: "testapp", Environment: "staging", IsMySQL: true, BaseSchema: base.data}
+			production := &PlanCommentData{Database: "testapp", Environment: "production", IsMySQL: true, BaseSchema: &BaseSchemaData{BaseBranch: "main"}}
+			data := MultiEnvPlanCommentData{
+				Database:     "testapp",
+				Environments: []string{"staging", "production"},
+				Plans:        map[string]*PlanCommentData{"staging": staging, "production": production},
+			}
+			require.True(t, AnyEnvHasBaseSchemaNotice(data))
+
+			out := RenderMultiEnvPlanComment(data)
+			assert.Contains(t, out, base.notice)
+			assert.NotContains(t, out, "No schema changes detected** for any environment")
+		})
+	}
+}
