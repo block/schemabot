@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -59,7 +60,7 @@ func TestRenderPlanComment_UnsafeShownOnPlanNotOnRunningApply(t *testing.T) {
 	apply := RenderPlanComment(data)
 	assert.NotContains(t, apply, "**Issues**", "the running apply comment leaves the consented unsafe changes out")
 	assert.NotContains(t, apply, "DROP COLUMN is destructive")
-	assert.NotContains(t, apply, "Destructive drop guidance")
+	assert.NotContains(t, apply, glyph.Tip+" Before allowing a destructive drop")
 	assert.Contains(t, apply, "DROP COLUMN `email`", "the DDL itself stays visible on the apply comment")
 	assert.Contains(t, apply, "**Applying automatically**")
 }

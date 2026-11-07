@@ -2754,8 +2754,8 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attribu
 // under their own heading with the drop guidance beneath them, so a dropped
 // table or column reads apart from findings that destroy nothing; the other
 // findings follow under theirs, folded when fold is set. Drops never fold, so
-// none can hide among dozens of advisory findings. Numbering runs straight
-// through both groups, so the last number is the header's count.
+// none can hide among dozens of advisory findings. Each group numbers from
+// one, so its last number is the count in its heading.
 func writeGroupedUnsafeChanges(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, fold bool) bool {
 	if len(drops) == 0 || len(rest) == 0 {
 		return false
@@ -2766,6 +2766,7 @@ func writeGroupedUnsafeChanges(sb *strings.Builder, drops, rest []UnsafeChangeDa
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, drops, databaseType, isMySQL)
 	m := countUnsafeFindings(rest)
+	item = 0
 	if !fold {
 		fmt.Fprintf(sb, "**Other unsafe changes** (%d)\n", m)
 		writeUnsafeChangeItems(sb, &item, rest, attributionNotes)
@@ -2919,6 +2920,9 @@ func countUnsafeFindings(changes []UnsafeChangeData) int {
 	return n
 }
 
+// writeUnsafeDropGuidance writes, open beneath the drops, a tip on making each
+// kind of destructive drop safe: what to deploy first, and for an index, how
+// to prove nothing relies on it.
 func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {
 	drops := countUnsafeDrops(changes, databaseType)
 	applicationUsageTarget, hasApplicationUsageTarget := unsafeDropApplicationUsageTarget(drops)
@@ -2927,18 +2931,16 @@ func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, da
 		return
 	}
 
-	sb.WriteString("<details>\n<summary>Destructive drop guidance</summary>\n\n")
 	if hasApplicationUsageTarget {
-		fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", applicationUsageTarget)
+		fmt.Fprintf(sb, "%s Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", glyph.Tip, applicationUsageTarget)
 	}
 	if hasIndexUsageTarget {
 		if isMySQL {
-			fmt.Fprintf(sb, "Before dropping %s in MySQL, first make %s invisible and verify application queries no longer rely on %s for safe performance.\n\n", indexActionTarget, indexInvisibleTarget, indexQueryTarget)
+			fmt.Fprintf(sb, "%s Before dropping %s in MySQL, first make %s invisible and verify application queries no longer rely on %s for safe performance.\n\n", glyph.Tip, indexActionTarget, indexInvisibleTarget, indexQueryTarget)
 		} else {
-			fmt.Fprintf(sb, "Before allowing a destructive drop, verify application queries no longer rely on %s for safe performance.\n\n", indexInvisibleTarget)
+			fmt.Fprintf(sb, "%s Before allowing a destructive drop, verify application queries no longer rely on %s for safe performance.\n\n", glyph.Tip, indexInvisibleTarget)
 		}
 	}
-	sb.WriteString("</details>\n\n")
 }
 
 func unsafeDropApplicationUsageTarget(drops unsafeDropCounts) (string, bool) {
@@ -3087,7 +3089,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	count := fmt.Sprintf("%d advisory %s", n, pluralize("finding", n))
 
 	if n <= lintWarningsFoldThreshold {
-		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %s\n", count)
+		fmt.Fprintf(sb, "%s **Lint Warnings**: %s\n", glyph.Tip, count)
 		for _, w := range warnings {
 			writeLintLine(sb, w.Table, w)
 		}
@@ -3097,7 +3099,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
-	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %s</summary>\n\n", count)
+	fmt.Fprintf(sb, "<details>\n<summary>%s <b>Lint Warnings</b>: %s</summary>\n\n", glyph.Tip, count)
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**%s**\n", inlineCode(group.table))

@@ -891,12 +891,7 @@ ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 ⚠️ **Issues**: 1 unsafe change detected
 1. `orders`: DROP COLUMN discards the column's data
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
-</details>
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
 
 📋 **Plan**: **2** tables to alter
 
@@ -967,22 +962,17 @@ DROP TABLE `refund_backfill`;
 1. `transfer_events`: DROP COLUMN discards the column's data
 2. `refund_backfill`: DROP TABLE removes all data
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
-
-</details>
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
 
 <details>
 <summary><b>Other unsafe changes</b> (6)</summary>
 
-3. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-4. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-6. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-7. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+1. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+2. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+3. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+4. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+5. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
 
 </details>
 
@@ -1022,12 +1012,7 @@ DROP TABLE `reconcile_state`;
 
 A plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
-
-</details>
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
 
 📋 **Plan**: **1** table to alter, **1** table to drop
 
@@ -2635,12 +2620,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
-</details>
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
 
 **🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
@@ -2671,12 +2651,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
-
-</details>
+💡 Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
 
 **🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
@@ -7225,12 +7200,7 @@ DROP TABLE `audit_log`;
 ⚠️ **Issues**: 1 unsafe change detected
 1. `audit_log`: DROP TABLE removes all data
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
-
-</details>
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
 
 📋 **Plan**: **1** table to drop
 
@@ -7269,12 +7239,7 @@ DROP TABLE `audit_log`;
 **⛔ Rollback rejected**: 1 unsafe change detected
 1. `audit_log`: DROP TABLE removes all data
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
-
-</details>
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
 
 **🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
 ```
@@ -10146,12 +10111,7 @@ ALTER TABLE `mutes`
 ⚠️ **Issues**: 1 unsafe change detected
 1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
-</details>
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
 
 📋 **Plan**: **1** table to alter
 

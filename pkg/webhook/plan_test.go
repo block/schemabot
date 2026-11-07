@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -245,7 +246,7 @@ func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T
 	assert.Equal(t, ddl, data.UnsafeChanges[0].DDL, "the DDL is threaded so the guidance can parse it")
 
 	rendered := templates.RenderPlanComment(data)
-	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
+	assert.Contains(t, rendered, glyph.Tip+" Before allowing a destructive drop")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
 }
 
@@ -280,7 +281,7 @@ func TestRenderMultiEnvPlanComment_PostgresDropGuidanceClassifiedFromDDL(t *test
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
 
-	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
+	assert.Contains(t, rendered, glyph.Tip+" Before allowing a destructive drop")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped table.")
 }
 
