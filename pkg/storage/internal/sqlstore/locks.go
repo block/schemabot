@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -112,9 +113,52 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 	// constraint makes the INSERT the arbiter when two callers race past the
 	// Get above. The INSERT loser sees a duplicate-key error, not a held lock:
 	// re-read and treat a same-owner winner as success.
-	disclosed, err := encodeDisclosedCopies(lock)
+	inserted, err := s.insertLock(ctx, lock, acquirer)
 	if err != nil {
 		return err
+	}
+	if inserted {
+		return nil
+	}
+	winner, err := s.readInsertRaceWinner(ctx, lock)
+	if err != nil {
+		return err
+	}
+	if winner == nil {
+		// The winner released the lock between the duplicate-key error and the
+		// read. This caller observed no pin, so a free key is the state it asked
+		// for: claim it once more. Only once, so a key that keeps changing hands
+		// reports ErrLockHeld below instead of racing without bound.
+		inserted, err = s.insertLock(ctx, lock, acquirer)
+		if err != nil {
+			return err
+		}
+		if inserted {
+			return nil
+		}
+		winner, err = s.readInsertRaceWinner(ctx, lock)
+		if err != nil {
+			return err
+		}
+	}
+	if winner == nil {
+		slog.Warn("lock changed hands twice during acquire; reporting it held",
+			"database", lock.DatabaseName, "database_type", lock.DatabaseType, "owner", lock.Owner)
+		return storage.ErrLockHeld
+	}
+	if winner.Owner != lock.Owner {
+		return storage.ErrLockHeld
+	}
+	return s.refreshPendingConfirmation(ctx, lock, winner, observedPendingPlanID)
+}
+
+// insertLock creates the lock row and sets lock.ID to it. It reports
+// inserted=false with a nil error when another caller's row already holds the
+// key, which the caller resolves by reading that row.
+func (s *lockStore) insertLock(ctx context.Context, lock *storage.Lock, acquirer lockAcquirerColumns) (inserted bool, err error) {
+	disclosed, err := encodeDisclosedCopies(lock)
+	if err != nil {
+		return false, err
 	}
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard,
@@ -124,27 +168,24 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 		disclosed, acquirer.subject, acquirer.operatorGroups)
 	if err == nil {
 		lock.ID = id
-		return nil
+		return true, nil
 	}
-	if !s.classifier.IsDuplicateKey(err) {
-		return fmt.Errorf("insert lock for %s/%s owner=%s: %w",
-			lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
+	if s.classifier.IsDuplicateKey(err) {
+		return false, nil
 	}
+	return false, fmt.Errorf("insert lock for %s/%s owner=%s: %w",
+		lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
+}
 
-	winner, getErr := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
-	if getErr != nil {
-		return fmt.Errorf("read lock after insert race for %s/%s: %w",
-			lock.DatabaseName, lock.DatabaseType, getErr)
+// readInsertRaceWinner reads the row that beat this caller's INSERT; nil means
+// the winner has released it since.
+func (s *lockStore) readInsertRaceWinner(ctx context.Context, lock *storage.Lock) (*storage.Lock, error) {
+	winner, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
+	if err != nil {
+		return nil, fmt.Errorf("read lock after insert race for %s/%s: %w",
+			lock.DatabaseName, lock.DatabaseType, err)
 	}
-	if winner == nil {
-		// Released between the duplicate-key error and this read: another owner
-		// holds it logically, so report ErrLockHeld rather than retry-loop.
-		return storage.ErrLockHeld
-	}
-	if winner.Owner != lock.Owner {
-		return storage.ErrLockHeld
-	}
-	return s.refreshPendingConfirmation(ctx, lock, winner, observedPendingPlanID)
+	return winner, nil
 }
 
 // encodeDisclosedCopies renders the disclosed_copies column: NULL when the

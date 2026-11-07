@@ -61,6 +61,12 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("MarkDeletedPreservesStamp", func(t *testing.T) { testPostgresMarkDeletedPreservesStamp(t, h) })
 	t.Run("LockUpdatedAtAdvances", func(t *testing.T) { testPostgresLockUpdatedAtAdvances(t, h) })
 	t.Run("LockAcquireSameOwnerConcurrent", func(t *testing.T) { testPostgresLockAcquireSameOwnerConcurrent(t, h) })
+	t.Run("LockAcquireInsertRaceReleasedBeforeReread", func(t *testing.T) {
+		testLockAcquireInsertRaceReleasedBeforeReread(t, func(t *testing.T, b func(binder) binder) *lockStore {
+			t.Helper()
+			return &lockStore{db: newRebindDB(h.db, b(PostgresDialect{})), dialect: PostgresDialect{}, identity: PostgresDialect{}, classifier: NewPostgresErrorClassifier()}
+		}, func(t *testing.T) { clearPostgresTables(t, h.db) })
+	})
 	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
 	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
