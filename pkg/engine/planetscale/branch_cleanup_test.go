@@ -523,6 +523,9 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		wantNoReads bool
 		wantLog     string
 		wantLevel   string
+		// wantPermissionHint is the permission_hint the outcome log carries;
+		// "" asserts it carries none.
+		wantPermissionHint string
 	}{
 		{name: "a deploy request PlanetScale refused is closed and its branch deleted",
 			createdDR: refused, reread: refused, wantCloses: []uint64{91}, wantDelete: "deleted",
@@ -564,6 +567,10 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		{name: "a failed branch delete is logged for manual cleanup",
 			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: errors.New("branch delete refused"), wantCloses: []uint64{91}, wantDelete: "failed",
 			wantLog: "failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota", wantLevel: "ERROR"},
+		{name: "a branch delete refused for permission names the missing delete_branch permission",
+			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: &ps.Error{Code: ps.ErrPermission}, wantCloses: []uint64{91}, wantDelete: "failed",
+			wantLog: "failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota", wantLevel: "ERROR",
+			wantPermissionHint: "the service token lacks the delete_branch permission; grant it to the token on this database"},
 		{name: "a drive that ends after the deploy request leaves both for the driver that takes over",
 			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, recorded: true, wantNoReads: true,
 			wantLog: "drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply", wantLevel: "INFO"},
@@ -650,6 +657,11 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 			assert.Equal(t, tt.wantLevel, record["level"])
 			assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
 			assert.Equal(t, float64(91), record["deploy_request"])
+			if tt.wantPermissionHint != "" {
+				assert.Equal(t, tt.wantPermissionHint, record["permission_hint"])
+			} else {
+				assert.NotContains(t, record, "permission_hint")
+			}
 		})
 	}
 }
@@ -860,25 +872,51 @@ func TestApply_LeaseLostDuringTheDeleteOfARecordedBranchAbandonsIt(t *testing.T)
 // A branch the reclaim could not delete is still against quota, so the failure
 // is logged at error level with everything an operator needs to find the apply
 // and delete the branch by hand: the apply, the organization, the PlanetScale
-// database, the branch, and the failure that ended the drive.
+// database, the branch, and the failure that ended the drive. A delete
+// PlanetScale refused for permission also names the permission the service
+// token is missing, so the operator knows what to grant.
 func TestReclaimBranchAfterFailedResume_LogsAFailedDeleteForTriage(t *testing.T) {
-	var logs bytes.Buffer
-	client := &resumeReclaimClient{deleteErr: errors.New("branch delete refused")}
-	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-commerce-1a2b"}, "apply-1a2b3c4d5e6f7890")
-	req.Logger = slog.New(slog.NewJSONHandler(&logs, nil)).With("apply_id", "apply-1a2b3c4d5e6f7890")
-	cause := engine.NewPermanentError("apply keyspace commerce: vschema rejected")
+	tests := []struct {
+		name      string
+		deleteErr error
+		wantError string
+		// wantPermissionHint is the permission_hint the log carries; ""
+		// asserts it carries none.
+		wantPermissionHint string
+	}{
+		{name: "a delete that fails for another reason names no permission",
+			deleteErr: errors.New("branch delete refused"), wantError: "branch delete refused"},
+		{name: "a delete refused for permission names the missing delete_branch permission",
+			deleteErr: &ps.Error{Code: ps.ErrPermission}, wantError: "",
+			wantPermissionHint: "the service token lacks the delete_branch permission; grant it to the token on this database"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			client := &resumeReclaimClient{deleteErr: tt.deleteErr}
+			req := resumeRequest(t, &psMetadata{BranchName: "schemabot-commerce-1a2b"}, "apply-1a2b3c4d5e6f7890")
+			req.Logger = slog.New(slog.NewJSONHandler(&logs, nil)).With("apply_id", "apply-1a2b3c4d5e6f7890")
+			cause := engine.NewPermanentError("apply keyspace commerce: vschema rejected")
 
-	conformanceEngine(client).reclaimBranchAfterFailedResume(t.Context(), client, "org", req, "schemabot-commerce-1a2b", cause)
+			conformanceEngine(client).reclaimBranchAfterFailedResume(t.Context(), client, "org", req, "schemabot-commerce-1a2b", cause)
 
-	var record map[string]any
-	require.NoError(t, json.Unmarshal(logs.Bytes(), &record), "exactly one log line: %s", logs.String())
-	assert.Equal(t, "ERROR", record["level"])
-	assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
-	assert.Equal(t, "org", record["organization"])
-	assert.Equal(t, "testdb", record["planetscale_database"])
-	assert.Equal(t, "schemabot-commerce-1a2b", record["branch"])
-	assert.Equal(t, "apply keyspace commerce: vschema rejected", record["apply_error"])
-	assert.Equal(t, "branch delete refused", record["error"])
+			var record map[string]any
+			require.NoError(t, json.Unmarshal(logs.Bytes(), &record), "exactly one log line: %s", logs.String())
+			assert.Equal(t, "ERROR", record["level"])
+			assert.Equal(t, "failed to delete the branch left behind by a failed apply; delete it manually to reclaim branch quota", record["msg"])
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
+			assert.Equal(t, "org", record["organization"])
+			assert.Equal(t, "testdb", record["planetscale_database"])
+			assert.Equal(t, "schemabot-commerce-1a2b", record["branch"])
+			assert.Equal(t, "apply keyspace commerce: vschema rejected", record["apply_error"])
+			assert.Equal(t, tt.wantError, record["error"])
+			if tt.wantPermissionHint != "" {
+				assert.Equal(t, tt.wantPermissionHint, record["permission_hint"])
+			} else {
+				assert.NotContains(t, record, "permission_hint")
+			}
+		})
+	}
 }
 
 // A Vitess drive fails the apply for good on any engine error, classified or
@@ -1493,6 +1531,8 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 		wantReclaimed []string
 		wantKept      []string
 		wantErr       string
+		// wantKeptReason, when set, is the exact reason a kept branch carries.
+		wantKeptReason string
 	}{
 		{
 			name: "a branch with no deploy request is deleted", meta: &psMetadata{BranchName: ownedBranch},
@@ -1509,7 +1549,14 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 		{
 			name: "a delete that fails reports the branch as left in place", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: errors.New("planetscale unavailable"),
 			wantAttempts: []string{ownedBranch}, wantKept: []string{"branch " + ownedBranch},
-			wantErr: "delete branch " + ownedBranch + " of the cancelled apply on commerce: planetscale unavailable",
+			wantErr:        "delete branch " + ownedBranch + " of the cancelled apply on commerce: planetscale unavailable",
+			wantKeptReason: "the delete failed; delete it by hand to reclaim branch quota",
+		},
+		{
+			name: "a delete refused for permission names the missing delete_branch permission", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: &ps.Error{Code: ps.ErrPermission},
+			wantAttempts: []string{ownedBranch}, wantKept: []string{"branch " + ownedBranch},
+			wantErr:        "delete branch " + ownedBranch + " of the cancelled apply on commerce: ",
+			wantKeptReason: "the service token lacks the delete_branch permission; grant it to the token on this database, then delete the branch by hand to reclaim branch quota",
 		},
 	}
 	for _, tt := range tests {
@@ -1535,6 +1582,9 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 			assert.Equal(t, tt.wantReclaimed, result.Reclaimed)
 			assert.Equal(t, tt.wantKept, result.Kept)
 			assert.Equal(t, len(tt.wantKept) > 0, result.KeptReason != "", "a kept branch carries its reason")
+			if tt.wantKeptReason != "" {
+				assert.Equal(t, tt.wantKeptReason, result.KeptReason)
+			}
 		})
 	}
 

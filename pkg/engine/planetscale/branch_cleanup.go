@@ -2,6 +2,7 @@ package planetscale
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -42,8 +43,8 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 	}
 	if err != nil {
 		logger.Error("failed to delete the branch left behind by a failed apply; delete it manually to reclaim branch quota",
-			"organization", org, "planetscale_database", database, "branch", branch,
-			"apply_error", cause, "error", err)
+			append([]any{"organization", org, "planetscale_database", database, "branch", branch,
+				"apply_error", cause}, branchDeleteFailureAttrs(err)...)...)
 		return
 	}
 	if alreadyGone {
@@ -74,6 +75,29 @@ func deleteBranch(ctx context.Context, client psclient.PSClient, org, database, 
 		return true, nil
 	}
 	return false, err
+}
+
+// missingDeleteBranchPermission tells the operator why PlanetScale refused a
+// branch delete for permission: the service token was not granted
+// delete_branch, which only a failure or a cancel uses, so it is the
+// permission most likely to be missing.
+const missingDeleteBranchPermission = "the service token lacks the delete_branch permission; grant it to the token on this database"
+
+// branchDeleteRefusedForPermission reports whether PlanetScale refused a
+// branch delete because the service token may not delete branches.
+func branchDeleteRefusedForPermission(err error) bool {
+	var psErr *ps.Error
+	return errors.As(err, &psErr) && psErr.Code == ps.ErrPermission
+}
+
+// branchDeleteFailureAttrs returns the log attributes for a failed branch
+// delete: the error, and the missing permission when PlanetScale refused the
+// delete for permission.
+func branchDeleteFailureAttrs(err error) []any {
+	if branchDeleteRefusedForPermission(err) {
+		return []any{"error", err, "permission_hint", missingDeleteBranchPermission}
+	}
+	return []any{"error", err}
 }
 
 // deployRequestCloseTimeout bounds the read and the close that retire the
@@ -225,7 +249,7 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 			append(attrs, "error", err)...)
 	case err != nil:
 		logger.Error("failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota",
-			append(attrs, "error", err)...)
+			append(attrs, branchDeleteFailureAttrs(err)...)...)
 	case alreadyGone:
 		logger.Info("the branch of a failed apply was already gone after closing its deploy request", attrs...)
 	default:
@@ -331,6 +355,9 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 	if err != nil {
 		result.Kept = []string{branch}
 		result.KeptReason = "the delete failed; delete it by hand to reclaim branch quota"
+		if branchDeleteRefusedForPermission(err) {
+			result.KeptReason = missingDeleteBranchPermission + ", then delete the branch by hand to reclaim branch quota"
+		}
 		return result, fmt.Errorf("delete branch %s of the cancelled apply on %s: %w", meta.BranchName, req.Database, err)
 	}
 	if alreadyGone {

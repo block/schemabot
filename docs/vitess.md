@@ -76,11 +76,12 @@ still deleted.
 
 Without `delete_branch` the delete is refused. The apply still fails with its
 own error, and SchemaBot logs the refused delete at error level with the
-organization, database, and branch to delete by hand. A cancel still
-resolves, and its apply log names the branch left in place and says to
-delete it by hand. Grant only `delete_branch`, not
-`delete_production_branch`: SchemaBot deletes only the development branches
-it creates.
+organization, database, and branch to delete by hand, plus a
+`permission_hint` naming the missing `delete_branch` permission. A cancel
+still resolves, and its apply log names the branch left in place and the
+missing `delete_branch` permission, and says to delete the branch by hand.
+Grant only `delete_branch`, not `delete_production_branch`: SchemaBot
+deletes only the development branches it creates.
 
 ## Reclaiming orphaned branches
 
