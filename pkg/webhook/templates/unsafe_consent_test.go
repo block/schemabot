@@ -379,7 +379,7 @@ func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
 	)
 
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, glyph.Attention+" **Issues**: 8 unsafe changes detected, including 2 destructive drops\n"+
+	assert.Contains(t, out, glyph.Attention+" **Issues**: 8 unsafe changes detected (2 drops)\n"+
 		"1. `transfer_events`: **DROP COLUMN discards the column's data**\n"+
 		"2. `refund_backfill`: **DROP TABLE removes all data**\n"+
 		"3. `loans`: Column `created_at` uses `TIMESTAMP`", "%s", out)
@@ -402,7 +402,7 @@ func TestRenderPlanComment_EveryDropStaysOpen(t *testing.T) {
 	}
 
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "**Issues**: 12 unsafe changes detected, including 6 destructive drops\n", "%s", out)
+	assert.Contains(t, out, "**Issues**: 12 unsafe changes detected (6 drops)\n", "%s", out)
 	assert.Contains(t, out, "6. `f_archive`: **DROP TABLE removes all data**\n"+
 		"\n<details>\n<summary>6 more unsafe changes</summary>\n\n7. `loans`:", "%s", out)
 }
@@ -417,7 +417,7 @@ func TestRenderUnsafeChangesBlocked_LeadsWithDrops(t *testing.T) {
 	)
 
 	out := RenderUnsafeChangesBlocked(*data)
-	assert.Contains(t, out, "**"+glyph.Refused+" Apply rejected**: 7 unsafe changes detected, including 1 destructive drop\n"+
+	assert.Contains(t, out, "**"+glyph.Refused+" Apply rejected**: 7 unsafe changes detected (1 drop)\n"+
 		"1. `refund_backfill`: **DROP TABLE removes all data**\n"+
 		"2. `loans`:", "%s", out)
 	assert.Contains(t, out, "\n<details>\n<summary>2 more unsafe changes</summary>\n\n6. `ledger`:", "%s", out)
@@ -432,23 +432,28 @@ func TestRenderPlanComment_DropOnlyListIsPlain(t *testing.T) {
 	out := RenderPlanComment(*data)
 	assert.Contains(t, out, "**Issues**: 2 unsafe changes detected\n"+
 		"1. `transfer_events`: DROP COLUMN discards the column's data\n", "%s", out)
-	assert.NotContains(t, out, "including", "%s", out)
+	assert.NotContains(t, out, "detected (", "%s", out)
 }
 
-// A partition drop discards the partition's rows, so it is a destructive drop:
-// it leads the list rather than folding with the findings that destroy
-// nothing. Classification reads the statement, and the reason when the
-// statement is unavailable.
-func TestRenderPlanComment_PartitionDropIsADestructiveDrop(t *testing.T) {
-	for _, drop := range []UnsafeChangeData{
-		{Table: "events", Reason: "Unsafe operation detected: \"DROP PARTITION\"", DDL: "ALTER TABLE `events` DROP PARTITION `p2020`"},
-		{Table: "events", Reason: "Unsafe operation detected: \"TRUNCATE PARTITION\""},
+// Every kind of destructive drop leads the list and counts in the header: a
+// dropped column, index or partition as much as a dropped table. A partition
+// drop discards the partition's rows, so it counts with the rest.
+// Classification reads the statement, and the reason when the statement is
+// unavailable.
+func TestRenderPlanComment_EveryKindOfDropLeads(t *testing.T) {
+	for name, drop := range map[string]UnsafeChangeData{
+		"column":             {Table: "events", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `events` DROP COLUMN `legacy_ref`"},
+		"index":              {Table: "events", Reason: "DROP INDEX removes the index", DDL: "ALTER TABLE `events` DROP INDEX `idx_legacy_ref`"},
+		"partition":          {Table: "events", Reason: "Unsafe operation detected: \"DROP PARTITION\"", DDL: "ALTER TABLE `events` DROP PARTITION `p2020`"},
+		"truncate partition": {Table: "events", Reason: "Unsafe operation detected: \"TRUNCATE PARTITION\""},
 	} {
-		data := unsafeConsentPlan("staging")
-		data.UnsafeChanges = append(timestampFindings(), drop)
+		t.Run(name, func(t *testing.T) {
+			data := unsafeConsentPlan("staging")
+			data.UnsafeChanges = append(timestampFindings(), drop)
 
-		out := RenderPlanComment(*data)
-		assert.Contains(t, out, "including 1 destructive drop\n1. `events`: **Unsafe operation detected:", "%s", out)
-		assert.Contains(t, out, "<summary>2 more unsafe changes</summary>", "%s", out)
+			out := RenderPlanComment(*data)
+			assert.Contains(t, out, "detected (1 drop)\n1. `events`: **", "%s", out)
+			assert.Contains(t, out, "<summary>2 more unsafe changes</summary>", "%s", out)
+		})
 	}
 }

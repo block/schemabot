@@ -2734,7 +2734,7 @@ func unsafeCountPhrase(drops, rest []UnsafeChangeData) string {
 	if len(drops) == 0 || len(rest) == 0 {
 		return phrase
 	}
-	return fmt.Sprintf("%s, including %d destructive %s", phrase, d, pluralize("drop", d))
+	return fmt.Sprintf("%s (%d %s)", phrase, d, pluralize("drop", d))
 }
 
 // writeUnsafeFindingList writes the unsafe findings as one numbered list, one

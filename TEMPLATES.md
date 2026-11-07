@@ -956,7 +956,7 @@ ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;
 DROP TABLE `refund_backfill`;
 ```
 
-⚠️ **Issues**: 8 unsafe changes detected, including 2 destructive drops
+⚠️ **Issues**: 8 unsafe changes detected (2 drops)
 1. `transfer_events`: **DROP COLUMN discards the column's data**
 2. `refund_backfill`: **DROP TABLE removes all data**
 3. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
