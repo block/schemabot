@@ -270,13 +270,11 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
-	fmt.Fprintf(sb, "**"+glyph.Refused+" %s**: %d unsafe %s detected\n", rejected, unsafeCount, pluralize("change", unsafeCount))
-	item := 0
-	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, "")
-	}
+	drops, rest := splitDestructiveDrops(data.UnsafeChanges, data.DatabaseType)
+	fmt.Fprintf(sb, "**%s %s**: %s\n", glyph.Refused, rejected, unsafeCountPhrase(drops, rest))
+	writeUnsafeFindingList(sb, drops, rest, nil)
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
+	writeUnsafeDropGuidance(sb, drops, data.DatabaseType, data.IsMySQL)
 
 	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
 	// is consent to destroy the data, and whether the change is this pull
@@ -287,7 +285,7 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 
 	consent := unsafeConsent{
 		findings:    unsafeCount,
-		tables:      unsafeChangeTables(data.UnsafeChanges),
+		tables:      unsafeChangeTables(data.UnsafeChanges, data.DatabaseType),
 		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
 	}
 	fmt.Fprintf(sb, "**%s To proceed with these destructive changes**, %s:\n", glyph.Escalation, consent.instruction())

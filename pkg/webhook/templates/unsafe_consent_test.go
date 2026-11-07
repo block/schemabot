@@ -148,13 +148,13 @@ func TestRenderPlanComment_PausedCommentListsTheUnsafeChangesItConsentsTo(t *tes
 	out := RenderPlanComment(*data)
 	assert.Contains(t, out, "⚠️ **Issues**: 2 unsafe changes detected\n1. `transfer_events`: DROP COLUMN discards the column's data (changed by open PR [acme/payments#4790](https://github.com/acme/payments/pull/4790))\n2. `refund_backfill`: DROP TABLE removes all data\n")
 	assert.NotContains(t, out, "Check before applying", "the attribution folds into its finding")
-	assert.Contains(t, out, "Destructive drop guidance")
+	assert.Contains(t, out, glyph.Tip+" Before allowing a destructive drop")
 	assert.Contains(t, fencedCommands(t, out), "schemabot apply-confirm -e staging --allow-unsafe")
 
 	data.PendingManualConfirmation = false
 	out = RenderPlanComment(*data)
 	assert.NotContains(t, out, "**Issues**", "the running comment leaves the consented unsafe changes out")
-	assert.NotContains(t, out, "Destructive drop guidance", "the guidance is out of reach once the apply runs")
+	assert.NotContains(t, out, glyph.Tip+" Before allowing a destructive drop", "the guidance is out of reach once the apply runs")
 	assert.NotContains(t, out, "changed by open PR", "the attribution coaches a decision the running apply no longer offers")
 	assert.NotContains(t, out, "Check before applying")
 	assert.Contains(t, out, "**Applying automatically**")
@@ -325,5 +325,135 @@ func TestRenderPlanComment_UnsafeConsentCoversOtherTargets(t *testing.T) {
 	out := RenderPlanComment(data)
 	_, footer, found := strings.Cut(out, "▶️ **To apply**")
 	require.True(t, found, "the comment offers an apply")
-	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes on `users` and `legacy`:\n```\nschemabot apply -e production\n```\n", footer)
+	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes on `legacy` and `users`:\n```\nschemabot apply -e production\n```\n", footer, "the dropped table is named first")
+}
+
+// timestampFindings is six advisory unsafe findings, two on each of three
+// tables, enough to push a list past the fold.
+func timestampFindings() []UnsafeChangeData {
+	var changes []UnsafeChangeData
+	for _, table := range []string{"loans", "refunds", "ledger"} {
+		changes = append(changes,
+			UnsafeChangeData{Table: table, Reason: "Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+			UnsafeChangeData{Table: table, Reason: "Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+		)
+	}
+	return changes
+}
+
+// A long unsafe list shows its first findings and folds the rest, as a long
+// lint list folds, so it stops burying the plan under it. The header keeps the
+// count in view, numbering runs on into the fold, and the apply instruction
+// still counts every finding. A fold that would hide a single finding shows it
+// instead, so a list one past the threshold stays open.
+func TestRenderPlanComment_LongUnsafeListFolds(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = append(timestampFindings(), UnsafeChangeData{Table: "payouts", Reason: "Column `paid_at` uses `TIMESTAMP` which overflows on 2038-01-19."})
+	require.Greater(t, len(data.UnsafeChanges), unsafeFindingsFoldThreshold+1)
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, glyph.Attention+" **Issues**: 7 unsafe changes detected\n"+
+		"1. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n", "%s", out)
+	assert.Contains(t, out, "5. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
+		"\n<details>\n<summary>2 more unsafe changes</summary>\n\n"+
+		"6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
+		"7. `payouts`: Column `paid_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n", "%s", out)
+	assert.Contains(t, out, "to confirm 7 unsafe changes on `loans`, `refunds` and 2 more:")
+
+	data.UnsafeChanges = timestampFindings()
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, "6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n", "%s", out)
+	assert.NotContains(t, out, "<details>\n<summary>1 more", "a fold never hides a single finding")
+}
+
+// Destructive drops lead the unsafe list, in bold and announced in the
+// header, so a dropped table or column reads apart from findings that destroy
+// nothing without a section of its own. The drop guidance follows the list as
+// a tip. In a long list the drops count toward the findings shown, so a drop
+// cannot fold behind dozens of advisory findings.
+func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = append(timestampFindings(),
+		UnsafeChangeData{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`"},
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`"},
+	)
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, glyph.Attention+" **Issues**: 8 unsafe changes detected (2 drops)\n"+
+		"1. `transfer_events`: **DROP COLUMN discards the column's data**\n"+
+		"2. `refund_backfill`: **DROP TABLE removes all data**\n"+
+		"3. `loans`: Column `created_at` uses `TIMESTAMP`", "%s", out)
+	assert.Contains(t, out, "5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
+		"\n<details>\n<summary>3 more unsafe changes</summary>\n\n6. `refunds`:", "%s", out)
+	assert.Contains(t, out, "8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n\n"+
+		glyph.Tip+" Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.\n", "%s", out)
+	assert.Contains(t, out, "to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:",
+		"the consent sentence names the dropped tables before it starts counting")
+}
+
+// More drops than the list shows before folding all stay open: a drop never
+// folds, and only the findings after them do.
+func TestRenderPlanComment_EveryDropStaysOpen(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = timestampFindings()
+	for _, table := range []string{"a_archive", "b_archive", "c_archive", "d_archive", "e_archive", "f_archive"} {
+		data.UnsafeChanges = append(data.UnsafeChanges,
+			UnsafeChangeData{Table: table, Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `" + table + "`"})
+	}
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "**Issues**: 12 unsafe changes detected (6 drops)\n", "%s", out)
+	assert.Contains(t, out, "6. `f_archive`: **DROP TABLE removes all data**\n"+
+		"\n<details>\n<summary>6 more unsafe changes</summary>\n\n7. `loans`:", "%s", out)
+}
+
+// The apply refusal is where the operator decides whether to pass
+// --allow-unsafe, so it lists the unsafe changes the way the plan comment
+// does: drops first and in bold, the rest folded past the first findings.
+func TestRenderUnsafeChangesBlocked_LeadsWithDrops(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = append(timestampFindings(),
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`"},
+	)
+
+	out := RenderUnsafeChangesBlocked(*data)
+	assert.Contains(t, out, "**"+glyph.Refused+" Apply rejected**: 7 unsafe changes detected (1 drop)\n"+
+		"1. `refund_backfill`: **DROP TABLE removes all data**\n"+
+		"2. `loans`:", "%s", out)
+	assert.Contains(t, out, "\n<details>\n<summary>2 more unsafe changes</summary>\n\n6. `ledger`:", "%s", out)
+	assert.Contains(t, out, "</details>\n\n"+glyph.Tip+" Before allowing a destructive drop", "%s", out)
+	assert.Contains(t, out, "to confirm 7 unsafe changes on `refund_backfill`, `loans` and 2 more:", "%s", out)
+}
+
+// A list of only drops has nothing to set them apart from, so its findings
+// are not bolded and its header does not count drops separately.
+func TestRenderPlanComment_DropOnlyListIsPlain(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "**Issues**: 2 unsafe changes detected\n"+
+		"1. `transfer_events`: DROP COLUMN discards the column's data\n", "%s", out)
+	assert.NotContains(t, out, "detected (", "%s", out)
+}
+
+// Every kind of destructive drop leads the list and counts in the header: a
+// dropped column, index or partition as much as a dropped table. A partition
+// drop discards the partition's rows, so it counts with the rest.
+// Classification reads the statement, and the reason when the statement is
+// unavailable.
+func TestRenderPlanComment_EveryKindOfDropLeads(t *testing.T) {
+	for name, drop := range map[string]UnsafeChangeData{
+		"column":             {Table: "events", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `events` DROP COLUMN `legacy_ref`"},
+		"index":              {Table: "events", Reason: "DROP INDEX removes the index", DDL: "ALTER TABLE `events` DROP INDEX `idx_legacy_ref`"},
+		"partition":          {Table: "events", Reason: "Unsafe operation detected: \"DROP PARTITION\"", DDL: "ALTER TABLE `events` DROP PARTITION `p2020`"},
+		"truncate partition": {Table: "events", Reason: "Unsafe operation detected: \"TRUNCATE PARTITION\""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := unsafeConsentPlan("staging")
+			data.UnsafeChanges = append(timestampFindings(), drop)
+
+			out := RenderPlanComment(*data)
+			assert.Contains(t, out, "detected (1 drop)\n1. `events`: **", "%s", out)
+			assert.Contains(t, out, "<summary>2 more unsafe changes</summary>", "%s", out)
+		})
+	}
 }

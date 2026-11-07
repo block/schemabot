@@ -1199,7 +1199,7 @@ func TestRenderPlanComment_DisclosesAnotherTargetsUnsafeChangeUnderIt(t *testing
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "**Issues**: 2 unsafe changes detected\n1. `users`: has_timestamp: column created_at uses TIMESTAMP\n2. `legacy` on target `primary/testapp_3`: DROP TABLE removes all data\n",
+	assert.Contains(t, out, "**Issues**: 2 unsafe changes detected (1 drop)\n1. `legacy` on target `primary/testapp_3`: **DROP TABLE removes all data**\n2. `users`: has_timestamp: column created_at uses TIMESTAMP\n",
 		"the unsafe changes are listed under the targets that carry them")
 	assert.Contains(t, out, "schemabot apply -e production", "the apply is offered, since --allow-unsafe covers every target")
 	assert.NotContains(t, out, "cannot apply every target")
