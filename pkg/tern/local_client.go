@@ -3434,10 +3434,24 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			"environment", req.Environment,
 			"idempotency_key", req.IdempotencyKey,
 		}
-		if err := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, dispatchAttrs); err != nil {
+		if verifyErr := c.verifyShardDispatchAgainstLiveSchema(ctx, req, &scope, dispatchAttrs); verifyErr != nil {
+			// A same-key dispatch that created the apply while this one was
+			// between its key lookup and its re-plan may already have run the
+			// change, and then the re-plan no longer lists it and reads as
+			// drift. Resolve by key so the winner's apply is replayed, as the
+			// create below does when it loses that race; when nothing holds
+			// the key, the drift stands.
+			if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
+				return nil, errors.Join(fmt.Errorf("apply for plan %s: %w", req.PlanId, verifyErr),
+					fmt.Errorf("re-resolve idempotency key after the drift check failed: %w", lookupErr))
+			} else if existing != nil {
+				c.logger.Info("Apply: idempotency key resolved a create race after this dispatch's drift check failed",
+					append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey, "shard", scope.shard)...)
+				return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "create_race")
+			}
 			c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
-				append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "error", err)...)
-			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+				append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "error", verifyErr)...)
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, verifyErr)
 		}
 		// The plan row's blocked verdict was judged above, but this shard's
 		// re-plan can block a change the plan row did not, and no opt-in makes

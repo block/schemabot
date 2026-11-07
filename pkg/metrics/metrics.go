@@ -1126,6 +1126,9 @@ var knownRemoteApplyDedupOutcomes = map[string]bool{
 //     wants to see spike during an incident).
 //   - "conflict_race" / "create_race": a concurrent same-key dispatch was
 //     resolved to the winning apply instead of a spurious rejection or error.
+//     "create_race" covers a winner found at the create itself and one found
+//     after this dispatch's drift check failed because the winner had
+//     already run the change.
 //   - "key_collision_refused": a stored apply's environment/database/type
 //     disagreed with the request, so the dispatch was refused fail-closed
 //     (a safety event worth investigating).

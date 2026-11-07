@@ -405,6 +405,53 @@ func TestLocalClient_Apply_CreatingShardDispatchFromStoredPlanDriftFailsClosed(t
 	requireNoApplyForKey(t, stor, key)
 }
 
+// Two same-key -80 dispatches both find no apply under the key. The winner
+// creates the apply while the loser is between that lookup and its re-plan,
+// so the loser's re-plan reads -80 as drifted. The loser must resolve the key
+// again and replay the winner's apply and operation, as it would had it lost
+// the race at the create itself, rather than refuse a dispatch the winner has
+// already accepted.
+func TestLocalClient_Apply_CreatingShardDispatchDriftAfterConcurrentCreateReplaysWinner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:creating-drift-race-test"
+
+	// The concurrent winner creates the apply under the key as the loser's
+	// re-plan starts; it carries no schema files, so it runs from the plan
+	// row without a re-plan of its own.
+	var winner *ternv1.ApplyResponse
+	replans := replanShardAfter(t, client, "-80", func(hookCtx context.Context) {
+		resp, err := client.Apply(hookCtx, shardDispatchRequest(planID, key, "-80"))
+		require.NoError(t, err)
+		require.True(t, resp.Accepted, "the winning dispatch must be accepted: %s", resp.ErrorMessage)
+		winner = resp
+	}, engine.TableChange{
+		Table:     "users",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(100)",
+	})
+
+	resp, err := client.Apply(ctx, shardDispatchWithSchemaFiles(planID, key, "-80"))
+	require.NoError(t, err, "the losing dispatch must replay the winner, not fail on drift")
+	require.NotNil(t, winner, "the concurrent create must have run before the re-plan")
+	require.True(t, resp.Accepted, "the losing dispatch must be replayed, not refused: %s", resp.ErrorMessage)
+	assert.Equal(t, winner.ApplyId, resp.ApplyId, "the loser must resolve to the winner's apply")
+	assert.Equal(t, winner.ApplyOperationId, resp.ApplyOperationId, "the loser must resolve to the winner's operation row")
+	assert.Equal(t, "testdb/-80/users", resp.OperationKey)
+	assert.Equal(t, int32(1), replans.Load(), "the losing dispatch re-plans its shard once before resolving the key")
+
+	apply, err := stor.Applies().GetByIdempotencyKey(ctx, key)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the replayed dispatch must not insert a duplicate operation")
+}
+
 // A creating shard dispatch whose shard still needs exactly the reviewed
 // change is admitted from the stored plan row, and its task runs -80's own
 // rendering of the statement, as an attaching sibling's does.
