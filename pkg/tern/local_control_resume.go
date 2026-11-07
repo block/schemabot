@@ -2095,13 +2095,17 @@ func finalizerNamespaceFromKey(operationKey, target string, targetQualified bool
 //
 // A failure ends the operation one of two ways. A permanent engine error, a
 // rejected apply, a permanent progress poll failure, or a non-success terminal
-// state fails it for good. An error retrying can cure, whether a storage read
-// or a retryable engine error, pauses it as failed_retryable with the error
-// recorded: the claim re-drives it under the parent apply's retry budget, and
-// the re-drive is safe because the VSchema apply is idempotent and a stored
-// handoff makes it reattach to work already in flight. When the engine refused
-// the work outright, the drive withdraws the handoff it wrote, so the re-drive
-// starts fresh and honors a cancel or stop the operator issued in between.
+// state fails it for good, and the drive returns that cause. An error retrying
+// can cure, whether a storage read or a retryable engine error, pauses it as
+// failed_retryable with the error recorded: the claim re-drives it under the
+// parent apply's retry budget, and the re-drive is safe because the VSchema
+// apply is idempotent and a stored handoff makes it reattach to work already
+// in flight. A stored pause ends the drive without an error, the way a work
+// operation's pause does: the operation row carries the reason and the parent
+// projection surfaces it, so the operator records the drive as resumed rather
+// than as a resume failure. When the engine refused the work outright, the
+// drive withdraws the handoff it wrote, so the re-drive starts fresh and honors
+// a cancel or stop the operator issued in between.
 func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation) error {
 	planID, err := storage.PlanIDForOperation(apply, op)
 	if err != nil {
@@ -2146,6 +2150,13 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	// that was cancelled records neither: its error describes the driver, not
 	// the VSchema work, and the driver that reclaims the row decides its outcome.
 	//
+	// What the drive returns follows what was recorded, not what went wrong. A
+	// stored pause returns nil: the pause is the drive's outcome, the row carries
+	// the cause, and the operator reads the drive as resumed, as it does a work
+	// operation that paused its tasks. A permanent failure returns its cause,
+	// and so does a pause storage refused, since the row then still reads active
+	// and only the error says why the drive ended.
+	//
 	// withdrawHandoff withdraws this drive's own handoff record alongside the
 	// pause, for a cause that proves the engine refused the work: nothing is
 	// live, so the re-drive must read the row as never handed to the engine and
@@ -2174,7 +2185,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 			}
 			c.logger.Warn("group_finalizer paused for retry; the parent apply's retry budget bounds the re-claims",
 				append(append(op.LogAttrs(), apply.IdentityLogAttrs()...), "error", cause)...)
-			return cause
+			return nil
 		}
 		if markErr := c.storage.ApplyOperations().MarkFailed(ctx, op.ID, cause.Error()); markErr != nil {
 			c.logger.Error("group_finalizer: failed to mark operation failed",
