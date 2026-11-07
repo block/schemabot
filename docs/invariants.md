@@ -871,10 +871,10 @@ control-owned states (`stopped`, `failed_retryable`) are never overwritten by ac
 and active states advance strictly forward through the lifecycle.
 
 The guard belongs to the drive loop, which is where stale polls come from, and nothing else
-assigns task state. That is a consequence of OW-8: every writer of a task row is a driver or an
-elected reaper, so every write either goes through this resolution or is a reaper settling a row
-no driver is touching. *Enforced:* the forward-only state resolution
-the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
+assigns task state. That is a consequence of OW-8: every writer of a task row is a driver, an
+elected reaper, or the conflict check settling a task whose lease has gone stale, so every write
+either goes through this resolution or lands on a row no driver is touching. *Enforced:* the
+forward-only state resolution the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
 outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
 `pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
@@ -1040,10 +1040,13 @@ stale comments or overwriting newer state.
 
 The token is what a driver writes under, so a write made by something that is not driving has none
 to present and the predicate is empty. That is only safe where such a write cannot race a driver.
-The elected reaper is the sole non-driver writer (OW-8), and it earns that by writing only rows
-whose drive liveness signal has gone quiet for longer than the operator's whole recovery budget,
-re-asserted on the guarded write rather than trusted from the scan. Any new non-driver write needs
-a precondition that actually excludes a live driver. *Enforced:* a token
+Two non-driver writers exist (OW-8), and each earns it with a precondition the store re-asserts on
+the write rather than trusting from the scan. The elected reaper writes only rows whose drive
+liveness signal has gone quiet for longer than the operator's whole recovery budget. The conflict
+check settles a task only while no drive holds its operation's lease at the moment of the write,
+and pauses that task's apply and operation for retry only while each still carries the lease token
+it read and that token's heartbeat is older than the staleness window. Any new non-driver write
+needs a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
 `pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
@@ -1178,17 +1181,20 @@ work it does not own. *Enforced:* scope checks and token-guarded claim release i
 (`pkg/api/operator.go`) and operation lease checks before conflict resolution
 (`pkg/tern/local_apply.go`, `pkg/storage/internal/sqlstore/tasks.go`).
 
-### OW-8: Only drivers and elected reapers write apply and task rows
+### OW-8: Only drivers, elected reapers, and the bounded conflict check write apply and task rows
 
 Two classes of writer touch apply, apply-operation, and task rows: the driver holding that row's
 lease, and the elected reaper settling rows no driver is coming back for. One bounded writer sits
 outside both classes: the conflict check settles a task whose lease has gone stale from this
 process's own engine report and, when that settlement rests `failed_retryable`, pauses the task's
-apply and operation for retry. It writes under the precondition a peer claim uses, the lease
-token it read together with a heartbeat older than the staleness window, so a live driver
-excludes it the same way (OW-2), and the apply and operation states it writes are non-terminal
-ones any later claim undoes. Nothing else writes these rows, and a request goroutine serving a
-read never does.
+apply and operation for retry. Its two writes carry different guards. The task settlement lands
+only while no drive holds a fresh lease on the task's operation, checked by the store at the
+write; a task that records no operation has no such lease, and its settlement rests on the apply
+lease having read stale before the engine was asked. The retry pause lands only while the apply
+and operation still carry the lease tokens the conflict check read and those tokens' heartbeats
+are older than the staleness window, the precondition a peer claim uses, so a live driver excludes
+it the same way (OW-2). The apply and operation states it writes are non-terminal ones any later
+claim undoes. Nothing else writes these rows, and a request goroutine serving a read never does.
 
 The reason is narrower than "reads and writes should not race", and survives the observation that
 a particular reader write would almost always have agreed with the driver. The guarantee OW-2
