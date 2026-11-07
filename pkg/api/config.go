@@ -1871,6 +1871,15 @@ type RepoConfig struct {
 	// own safety gates. Defaults to true when not configured.
 	EnableChecks *bool `yaml:"enable_checks,omitempty"`
 
+	// ListenOnly makes SchemaBot read from this repository without ever
+	// writing to it: webhooks are processed and GitHub is read as for any
+	// repository, but no comment, reaction, review request, or Check Run is
+	// sent, and comment commands are ignored, so no apply ever starts from
+	// it. It lets a deployment measure what a repository costs in GitHub
+	// requests before that repository is onboarded. Listen-only implies
+	// enable_checks: false, and cannot be combined with an aggregate role.
+	ListenOnly bool `yaml:"listen_only,omitempty"`
+
 	// GitHubApp names the App in ServerConfig.Apps that owns webhooks and
 	// outbound GitHub API calls for this repository. Required when Apps is
 	// configured and must match a key in ServerConfig.Apps. Setting it
@@ -2618,6 +2627,9 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("repos repository key %q must be canonical", repo)
 		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
+			return err
+		}
+		if err := validateListenOnlyRepo(repo, repoConfig); err != nil {
 			return err
 		}
 		if err := validateRepoActorAuthorization(repo, repoConfig); err != nil {
@@ -3546,16 +3558,66 @@ func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 
 // AreChecksEnabled returns whether SchemaBot should publish GitHub Check Runs
 // for the given repository. Repositories not present in the server-side repo
-// config use the default enabled behavior.
+// config use the default enabled behavior. A listen-only repository never
+// publishes Check Runs.
 func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 	if c == nil || len(c.Repos) == 0 {
 		return true
 	}
 	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
-	if !ok || repoConfig.EnableChecks == nil {
+	if !ok {
+		return true
+	}
+	if repoConfig.ListenOnly {
+		return false
+	}
+	if repoConfig.EnableChecks == nil {
 		return true
 	}
 	return *repoConfig.EnableChecks
+}
+
+// validateListenOnlyRepo rejects settings that ask a listen-only repository
+// to write to GitHub. Check Runs are writes, and an aggregate leader or
+// participant exists to publish or nudge a check other deployments rely on,
+// so either combination would be a config that cannot do what it says.
+func validateListenOnlyRepo(repo string, repoConfig RepoConfig) error {
+	if !repoConfig.ListenOnly {
+		return nil
+	}
+	if repoConfig.EnableChecks != nil && *repoConfig.EnableChecks {
+		return fmt.Errorf("repos %q: listen_only cannot be combined with enable_checks: true, because a listen-only repository never publishes Check Runs", repo)
+	}
+	if repoConfig.Aggregate != nil {
+		return fmt.Errorf("repos %q: listen_only cannot be combined with aggregate, because a listen-only repository never publishes or nudges a check", repo)
+	}
+	return nil
+}
+
+// HasListenOnlyRepos reports whether any configured repository is
+// listen-only. A GitHub client installs its listen-only guard only when one
+// is, so a deployment without listen-only repositories sends every request
+// unchanged.
+func (c *ServerConfig) HasListenOnlyRepos() bool {
+	if c == nil {
+		return false
+	}
+	for _, repoConfig := range c.Repos {
+		if repoConfig.ListenOnly {
+			return true
+		}
+	}
+	return false
+}
+
+// IsRepoListenOnly returns whether SchemaBot reads from the repository without
+// ever writing to it. Only a repository configured with listen_only: true is.
+func (c *ServerConfig) IsRepoListenOnly(repo string) bool {
+	if c == nil {
+		return false
+	}
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
+	return ok && repoConfig.ListenOnly
 }
 
 // DeletesUnactionedPlanComments returns whether this server uses the
