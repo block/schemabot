@@ -2754,28 +2754,43 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attribu
 // under their own heading with the drop guidance beneath them, so a dropped
 // table or column reads apart from findings that destroy nothing; the other
 // findings follow under theirs, folded when fold is set. Drops never fold, so
-// none can hide among dozens of advisory findings. Each group numbers from
-// one, so its last number is the count in its heading.
+// none can hide among dozens of advisory findings.
 func writeGroupedUnsafeChanges(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, fold bool) bool {
 	if len(drops) == 0 || len(rest) == 0 {
 		return false
 	}
-	item := 0
-	fmt.Fprintf(sb, "\n**Destructive drops** (%d)\n", countUnsafeFindings(drops))
-	writeUnsafeChangeItems(sb, &item, drops, attributionNotes)
+	sb.WriteString("\n")
+	writeUnsafeGroup(sb, "Destructive drop", "Destructive drops", drops, attributionNotes, false)
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, drops, databaseType, isMySQL)
-	m := countUnsafeFindings(rest)
-	item = 0
-	if !fold {
-		fmt.Fprintf(sb, "**Other unsafe changes** (%d)\n", m)
-		writeUnsafeChangeItems(sb, &item, rest, attributionNotes)
-		return true
-	}
-	fmt.Fprintf(sb, "<details>\n<summary><b>Other unsafe changes</b> (%d)</summary>\n\n", m)
-	writeUnsafeChangeItems(sb, &item, rest, attributionNotes)
-	sb.WriteString("\n</details>\n")
+	writeUnsafeGroup(sb, "Other unsafe change", "Other unsafe changes", rest, attributionNotes, fold)
 	return true
+}
+
+// writeUnsafeGroup writes one group of a split unsafe list. A group of one
+// finding names it on the heading's line, with the heading singular and no
+// count or number, since a one-item list says nothing the line does not; it
+// never folds, since folding would hide a line behind a summary as long as
+// it. A larger group counts its findings in the heading and numbers them from
+// one, so the last number is the count, folded when fold is set.
+func writeUnsafeGroup(sb *strings.Builder, singular, plural string, changes []UnsafeChangeData, attributionNotes map[string]string, fold bool) {
+	m := countUnsafeFindings(changes)
+	if m == 1 {
+		c := changes[0]
+		fmt.Fprintf(sb, "**%s** — %s\n", singular, unsafeFindingLines(unsafeChangeLabel(c), c.Reason, c.ChangeType, unsafeChangeNote(c, attributionNotes))[0])
+		return
+	}
+	item := 0
+	if !fold {
+		fmt.Fprintf(sb, "**%s** (%d)\n", plural, m)
+		writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
+		return
+	}
+	// GitHub renders <summary> content as HTML, not markdown, so the folded
+	// heading bolds with <b> tags instead of asterisks.
+	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b> (%d)</summary>\n\n", plural, m)
+	writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
+	sb.WriteString("\n</details>\n")
 }
 
 // writeUnsafeAttributionDisclosure explains why another pull request's change
@@ -2790,12 +2805,17 @@ func writeUnsafeAttributionDisclosure(sb *strings.Builder, attributionNotes map[
 // the running number in item.
 func writeUnsafeChangeItems(sb *strings.Builder, item *int, changes []UnsafeChangeData, attributionNotes map[string]string) {
 	for _, c := range changes {
-		note := attributionNotes[c.Table]
-		if createsItsTable(c) {
-			note = ""
-		}
-		writeUnsafeChangeItem(sb, item, unsafeChangeLabel(c), c.Reason, c.ChangeType, note)
+		writeUnsafeChangeItem(sb, item, unsafeChangeLabel(c), c.Reason, c.ChangeType, unsafeChangeNote(c, attributionNotes))
 	}
+}
+
+// unsafeChangeNote is the attribution a change's findings carry, none for a
+// change that creates its table.
+func unsafeChangeNote(c UnsafeChangeData, attributionNotes map[string]string) string {
+	if createsItsTable(c) {
+		return ""
+	}
+	return attributionNotes[c.Table]
 }
 
 // splitDestructiveDrops separates the unsafe changes that drop a table,
@@ -2882,24 +2902,32 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 // carrying the engine's change type when one is known so the finding explains
 // itself.
 func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType, note string) {
+	for _, line := range unsafeFindingLines(table, reason, changeType, note) {
+		*n++
+		fmt.Fprintf(sb, "%d. %s\n", *n, line)
+	}
+}
+
+// unsafeFindingLines is one line per finding in a table's unsafe reason,
+// unnumbered: the table, the finding, and the attribution note when there is
+// one. A change with no parseable reason still gets a line.
+func unsafeFindingLines(table, reason, changeType, note string) []string {
 	suffix := ""
 	if note != "" {
 		suffix = " (" + note + ")"
 	}
 	reasons := ui.LintReasons(reason)
 	if len(reasons) == 0 {
-		*n++
 		if changeType != "" {
-			fmt.Fprintf(sb, "%d. %s: %s%s\n", *n, table, changeType, suffix)
-		} else {
-			fmt.Fprintf(sb, "%d. %s%s\n", *n, table, suffix)
+			return []string{fmt.Sprintf("%s: %s%s", table, changeType, suffix)}
 		}
-		return
+		return []string{table + suffix}
 	}
+	lines := make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		*n++
-		fmt.Fprintf(sb, "%d. %s: %s%s\n", *n, table, ui.CodeQuoteIdentifiers(r), suffix)
+		lines = append(lines, fmt.Sprintf("%s: %s%s", table, ui.CodeQuoteIdentifiers(r), suffix))
 	}
+	return lines
 }
 
 // countUnsafeFindings sums the individual lint findings across changes, so

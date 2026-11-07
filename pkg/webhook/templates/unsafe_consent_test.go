@@ -409,8 +409,7 @@ func TestRenderUnsafeChangesBlocked_GroupsDrops(t *testing.T) {
 
 	out := RenderUnsafeChangesBlocked(*data)
 	assert.Contains(t, out, "**"+glyph.Refused+" Apply rejected**: 7 unsafe changes detected\n\n"+
-		"**Destructive drops** (1)\n"+
-		"1. `refund_backfill`: DROP TABLE removes all data\n"+
+		"**Destructive drop** — `refund_backfill`: DROP TABLE removes all data\n"+
 		"\n"+glyph.Tip+" Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.\n\n"+
 		"<details>\n<summary><b>Other unsafe changes</b> (6)</summary>\n\n1. `loans`:", "%s", out)
 	assert.Contains(t, out, "6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n\n", "%s", out)
@@ -418,7 +417,9 @@ func TestRenderUnsafeChangesBlocked_GroupsDrops(t *testing.T) {
 }
 
 // A short list that mixes a drop with other findings splits into the same two
-// groups, both open, so the drop is set apart without any click.
+// groups, both open, so the drop is set apart without any click. A group of
+// one finding names it on its heading's line, singular, with no count or
+// number.
 func TestRenderPlanComment_ShortUnsafeListGroupsDrops(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.UnsafeChanges = []UnsafeChangeData{
@@ -428,11 +429,32 @@ func TestRenderPlanComment_ShortUnsafeListGroupsDrops(t *testing.T) {
 
 	out := RenderPlanComment(*data)
 	assert.Contains(t, out, glyph.Attention+" **Issues**: 2 unsafe changes detected\n\n"+
-		"**Destructive drops** (1)\n"+
-		"1. `transfer_events`: DROP COLUMN discards the column's data\n", "%s", out)
-	assert.Contains(t, out, "\n\n**Other unsafe changes** (1)\n"+
-		"1. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n", "%s", out)
-	assert.NotContains(t, out, "<summary><b>Other unsafe changes</b>", "a short list never folds")
+		"**Destructive drop** — `transfer_events`: DROP COLUMN discards the column's data\n", "%s", out)
+	assert.Contains(t, out, "\n\n**Other unsafe change** — "+
+		"`loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n", "%s", out)
+	assert.NotContains(t, out, "<summary>", "a short list never folds")
+	assert.NotContains(t, out, "(1)", "a group of one carries no count")
+}
+
+// In a long list whose other findings come to one, that finding stays on its
+// heading's line rather than folding: a summary would be as long as the line
+// it hides.
+func TestRenderPlanComment_LoneOtherFindingNeverFolds(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = nil
+	for _, table := range []string{"a_archive", "b_archive", "c_archive", "d_archive", "e_archive"} {
+		data.UnsafeChanges = append(data.UnsafeChanges,
+			UnsafeChangeData{Table: table, Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `" + table + "`"})
+	}
+	data.UnsafeChanges = append(data.UnsafeChanges,
+		UnsafeChangeData{Table: "loans", Reason: "Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19."})
+	require.Greater(t, countUnsafeFindings(data.UnsafeChanges), unsafeFindingsFoldThreshold)
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "**Destructive drops** (5)\n1. `a_archive`: DROP TABLE removes all data\n", "%s", out)
+	assert.Contains(t, out, "5. `e_archive`: DROP TABLE removes all data\n", "%s", out)
+	assert.Contains(t, out, "**Other unsafe change** — `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n", "%s", out)
+	assert.NotContains(t, out, "<summary>", "%s", out)
 }
 
 // A partition drop discards the partition's rows, so it is a destructive drop:
@@ -455,7 +477,7 @@ func TestRenderPlanComment_PartitionDropIsADestructiveDrop(t *testing.T) {
 		data.UnsafeChanges = append(data.UnsafeChanges, drop)
 
 		out := RenderPlanComment(*data)
-		assert.Contains(t, out, "**Destructive drops** (1)\n1. `events`: Unsafe operation detected:", "%s", out)
+		assert.Contains(t, out, "**Destructive drop** — `events`: Unsafe operation detected:", "%s", out)
 		assert.Contains(t, out, "<summary><b>Other unsafe changes</b> (6)</summary>", "%s", out)
 	}
 }
