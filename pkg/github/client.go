@@ -233,12 +233,26 @@ func (c *Client) fetchAppSlug() {
 }
 
 // newInstallationBaseTransport builds the HTTP transport an installation
-// client sends through. The rate-limit transport wraps the metrics transport
-// directly, because it reads the App and installation identity for its
-// cooldown telemetry from that transport. The listen-only guard wraps both.
-func newInstallationBaseTransport(installationID int64, appSlug func() string, listenOnlyRepos ListenOnlyRepos) http.RoundTripper {
-	metricsTransport := newGitHubMetricsTransport(http.DefaultTransport, installationID, appSlug)
-	return newListenOnlyTransport(newGitHubRateLimitTransport(metricsTransport), listenOnlyRepos, installationID, appSlug)
+// client and its token exchanges send through. The rate-limit transport wraps
+// the metrics transport directly, because it reads the App and installation
+// identity for its cooldown telemetry from that transport.
+func newInstallationBaseTransport(installationID int64, appSlug func() string) http.RoundTripper {
+	return newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, installationID, appSlug))
+}
+
+// newInstallationTransport builds the transport an installation client sends
+// API requests through. The listen-only guard wraps the installation token
+// transport rather than sitting under it, so a token exchange never reaches
+// the guard. A token exchange carries the context of the API request that
+// triggered it, which names that request's repository, so a guard under it
+// would refuse the exchange and with it every read of a listen-only
+// repository.
+func newInstallationTransport(appID, installationID int64, privateKey []byte, appSlug func() string, listenOnlyRepos ListenOnlyRepos) (http.RoundTripper, error) {
+	installationTransport, err := ghinstallation.New(newInstallationBaseTransport(installationID, appSlug), appID, installationID, privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
+	}
+	return newListenOnlyTransport(installationTransport, listenOnlyRepos, installationID, appSlug), nil
 }
 
 // ForInstallation returns a GitHub client scoped to a specific installation,
@@ -282,10 +296,9 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		return existing, nil
 	}
 
-	baseTransport := newInstallationBaseTransport(installationID, c.loadAppSlug, c.listenOnlyRepos)
-	installationTransport, err := ghinstallation.New(baseTransport, c.appID, installationID, c.privateKey)
+	installationTransport, err := newInstallationTransport(c.appID, installationID, c.privateKey, c.loadAppSlug, c.listenOnlyRepos)
 	if err != nil {
-		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
+		return nil, err
 	}
 	httpc := &http.Client{Transport: installationTransport, Timeout: 30 * time.Second}
 	ghClient := gh.NewClient(httpc)

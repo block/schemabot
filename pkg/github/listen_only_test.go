@@ -2,7 +2,11 @@ package github
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
@@ -12,7 +16,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/bradleyfalzon/ghinstallation/v2"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -218,24 +224,93 @@ func (b *closeTrackingBody) Close() error {
 	return nil
 }
 
-// A deployment without listen-only repositories sends every request without
-// inspecting it, and the rate-limit transport wraps the metrics transport
-// directly either way, so cooldown and quota telemetry keeps the App and
-// installation that made the request.
-func TestInstallationBaseTransportOrder(t *testing.T) {
-	appSlug := func() string { return "acme-schemabot" }
-
-	withoutListenOnly := newInstallationBaseTransport(42, appSlug, listenOnlyRepoSet{})
-	quota, ok := withoutListenOnly.(*githubQuotaWaitTransport)
-	require.True(t, ok, "without listen-only repositories the rate-limit transport is outermost, got %T", withoutListenOnly)
+// The rate-limit transport wraps the metrics transport directly, so cooldown
+// and quota telemetry keeps the App and installation that made the request.
+func TestInstallationBaseTransportKeepsRateLimitIdentity(t *testing.T) {
+	quota, ok := newInstallationBaseTransport(42, func() string { return "acme-schemabot" }).(*githubQuotaWaitTransport)
+	require.True(t, ok, "the rate-limit transport is the outermost base transport")
 	assert.Equal(t, int64(42), quota.installationID)
 	assert.Equal(t, "acme-schemabot", quota.appSlug())
+}
 
-	withListenOnly := newInstallationBaseTransport(42, appSlug, listenOnlyRepoSet{listenOnlyTestRepo: true})
+// A deployment without listen-only repositories sends every request through
+// the installation token transport unchanged. With one, the listen-only guard
+// wraps the token transport, so token exchanges never reach the guard.
+func TestInstallationTransportOrder(t *testing.T) {
+	key := testInstallationPrivateKey(t)
+
+	withoutListenOnly, err := newInstallationTransport(1, 42, key, nil, listenOnlyRepoSet{})
+	require.NoError(t, err)
+	_, ok := withoutListenOnly.(*ghinstallation.Transport)
+	assert.True(t, ok, "without listen-only repositories the token transport is outermost, got %T", withoutListenOnly)
+
+	withListenOnly, err := newInstallationTransport(1, 42, key, nil, listenOnlyRepoSet{listenOnlyTestRepo: true})
+	require.NoError(t, err)
 	guard, ok := withListenOnly.(*listenOnlyTransport)
-	require.True(t, ok, "the listen-only guard wraps the rate-limit transport, got %T", withListenOnly)
-	quota, ok = guard.base.(*githubQuotaWaitTransport)
-	require.True(t, ok, "the listen-only guard sends through the rate-limit transport, got %T", guard.base)
-	assert.Equal(t, int64(42), quota.installationID)
-	assert.Equal(t, "acme-schemabot", quota.appSlug())
+	require.True(t, ok, "the listen-only guard is outermost, got %T", withListenOnly)
+	_, ok = guard.base.(*ghinstallation.Transport)
+	assert.True(t, ok, "the listen-only guard sends through the token transport, got %T", guard.base)
+}
+
+// The first request an installation client sends is often a read of a
+// listen-only repository, and the token exchange it triggers carries that
+// read's context. The exchange still reaches GitHub, so the read succeeds,
+// and a write to the same repository is still refused.
+func TestListenOnlyInstallationClientExchangesTokenForRead(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		received []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		received = append(received, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/app/installations/42/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "ghs_test", "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
+			return
+		}
+		assert.Equal(t, "token ghs_test", r.Header.Get("Authorization"), "API requests use the exchanged installation token")
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+	}))
+	t.Cleanup(server.Close)
+
+	transport, err := newInstallationTransport(1, 42, testInstallationPrivateKey(t), nil, listenOnlyRepoSet{listenOnlyTestRepo: true})
+	require.NoError(t, err)
+	guard, ok := transport.(*listenOnlyTransport)
+	require.True(t, ok)
+	tokenTransport, ok := guard.base.(*ghinstallation.Transport)
+	require.True(t, ok)
+	tokenTransport.BaseURL = server.URL
+
+	client := gh.NewClient(&http.Client{Transport: transport})
+	client.DisableRateLimitCheck = true
+	baseURL, err := url.Parse(server.URL + "/")
+	require.NoError(t, err)
+	client.BaseURL = baseURL
+	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "acme-schemabot")
+
+	// FindCheckRunByName names its repository in the request context, which
+	// the token exchange it triggers inherits.
+	run, _, err := ic.FindCheckRunByName(t.Context(), listenOnlyTestRepo, "abc123", "SchemaBot")
+	require.NoError(t, err, "a read of a listen-only repository must not be blocked by its token exchange")
+	assert.Nil(t, run)
+
+	_, _, err = ic.CreateIssueComment(t.Context(), listenOnlyTestRepo, 1, "plan")
+	require.ErrorIs(t, err, ErrListenOnlyRepository)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{
+		"POST /app/installations/42/access_tokens",
+		"GET /repos/acme/monorepo/commits/abc123/check-runs",
+	}, received)
+}
+
+func testInstallationPrivateKey(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 }

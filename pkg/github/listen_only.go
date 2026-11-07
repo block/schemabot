@@ -35,8 +35,9 @@ func WithListenOnlyRepos(repos ListenOnlyRepos) ClientOption {
 }
 
 // listenOnlyTransport sends a request only when it is a read or does not
-// target a listen-only repository. It sits outside the rate-limit transport,
-// so a refused request never waits on a GitHub cooldown. A refused request is counted on the GitHub
+// target a listen-only repository. It sits outside the installation token
+// transport and the rate-limit transport, so a token exchange never reaches
+// it and a refused request never waits on a GitHub cooldown. A refused request is counted on the GitHub
 // request metric with status suppressed, so a listen-only deployment still
 // shows how many writes it would have made.
 type listenOnlyTransport struct {
@@ -95,7 +96,7 @@ func (t *listenOnlyTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 // maySend reports whether a request can reach GitHub. Reads are always sent.
 // A write is sent when it targets a repository that is not listen-only, or
-// when it names no repository at all, such as an installation token exchange.
+// when it names no repository at all.
 // A GraphQL request carries its repository only in the request context, so a
 // GraphQL write without one is refused: its target cannot be told apart from
 // a listen-only repository.
