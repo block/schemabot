@@ -918,6 +918,31 @@ type mockApplyStore struct {
 	laterUpdateErr  error // returned by every Update after the first successful one
 	updates         []*storage.Apply
 	revertSkippedAt *time.Time
+	// staleRetryableMoves is what MarkStaleApplyRetryable reports, and
+	// staleRetryableErr the error it returns; staleRetryableRequests records
+	// every request it was given.
+	staleRetryableMoves    bool
+	staleRetryableErr      error
+	staleRetryableRequests []storage.StaleRetryableRequest
+}
+
+// MarkStaleApplyRetryable records the request and, when configured to move the
+// apply, writes the transition the real store makes onto the stored apply.
+func (m *mockApplyStore) MarkStaleApplyRetryable(_ context.Context, req storage.StaleRetryableRequest) (bool, error) {
+	m.staleRetryableRequests = append(m.staleRetryableRequests, req)
+	if m.staleRetryableErr != nil {
+		return false, m.staleRetryableErr
+	}
+	if !m.staleRetryableMoves || m.apply == nil {
+		return false, nil
+	}
+	m.apply.State = state.Apply.FailedRetryable
+	m.apply.ErrorMessage = req.ErrorMessage
+	m.apply.CompletedAt = nil
+	m.apply.LeaseOwner = ""
+	m.apply.LeaseToken = ""
+	m.apply.LeaseAcquiredAt = nil
+	return true, nil
 }
 
 func (m *mockApplyStore) SetRevertSkipped(_ context.Context, _ int64, at time.Time) error {

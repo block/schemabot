@@ -925,9 +925,11 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
 resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
-retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the per-operation budget in
-the redispatch claim (`FindNextApplyOperation`,
+retrying can cure instead of failing it (`driveGroupFinalizer`, same file), the conflict check,
+which pauses a stale apply for retry when its engine reports a retryable failure so the next
+recovery is charged against the budget (`pauseStaleApplyForRetry` in `pkg/tern/local_apply.go`),
+and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the
+per-operation budget in the redispatch claim (`FindNextApplyOperation`,
 `pkg/storage/internal/sqlstore/apply_operations.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
@@ -1182,8 +1184,14 @@ work it does not own. *Enforced:* scope checks and token-guarded claim release i
 ### OW-8: Only drivers and elected reapers write apply and task rows
 
 Two classes of writer touch apply, apply-operation, and task rows: the driver holding that row's
-lease, and the elected reaper settling rows no driver is coming back for. Nothing else does, and a
-request goroutine serving a read never does.
+lease, and the elected reaper settling rows no driver is coming back for. One bounded writer sits
+outside both classes: the conflict check settles a task whose lease has gone stale from this
+process's own engine report and, when that settlement rests `failed_retryable`, pauses the task's
+apply and operation for retry. It writes under the precondition a peer claim uses, the lease
+token it read together with a heartbeat older than the staleness window, so a live driver
+excludes it the same way (OW-2), and the apply and operation states it writes are non-terminal
+ones any later claim undoes. Nothing else writes these rows, and a request goroutine serving a
+read never does.
 
 The reason is narrower than "reads and writes should not race", and survives the observation that
 a particular reader write would almost always have agreed with the driver. The guarantee OW-2
@@ -1207,8 +1215,11 @@ including when what is stored is a task that has outlived its apply's verdict (U
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
 gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
 `lockUndrivenApplies`, `pkg/storage/internal/sqlstore/apply_operations.go`,
-`pkg/storage/internal/sqlstore/applies.go`), and a read path that builds progress from
-stored rows without writing them (`pkg/api/progress_handlers.go`).
+`pkg/storage/internal/sqlstore/applies.go`), the stale-lease guards the conflict check's task
+settlement and retry pause write under (`tryResolveStaleTask`, `pauseStaleApplyForRetry`,
+`pkg/tern/local_apply.go`; `MarkStaleApplyRetryable`, `pkg/storage/internal/sqlstore/applies.go`),
+and a read path that builds progress from stored rows without writing them
+(`pkg/api/progress_handlers.go`).
 
 ### OW-9: An advisory lock is only exclusion where the session holds still
 
