@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -628,6 +629,61 @@ func TestTasks(t *testing.T, h Harness) {
 		require.Error(t, err)
 	})
 
+	// A failure message carries engine and database error text with no bound
+	// of its own. A write that records one longer than the error_message
+	// column holds lands with the message cut to the column on a character
+	// boundary, on the task, its apply and its operation alike, instead of
+	// being refused on every attempt and leaving the failure unrecorded.
+	t.Run("FailureMessage_PastColumnWidth_IsCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_long_failure_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_long_failure", 905)
+		// The leading byte puts every two-byte character at an odd offset, so
+		// the column's byte width falls inside a character.
+		long := "x" + strings.Repeat("é", 40_000)
+		want := "x" + strings.Repeat("é", 32_765) + "…"
+
+		task := newTask(apply, "task_long_failure", "orders", time.Now().UTC().Truncate(time.Second))
+		task.ErrorMessage = long
+		_, err := store.Tasks().Create(ctx, task)
+		require.NoError(t, err, "a task created with a long failure message is stored")
+		created, err := store.Tasks().Get(ctx, "task_long_failure")
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		assertStoredMessage(t, want, created.ErrorMessage, "the insert cuts the message on a character boundary")
+
+		created.State = state.Task.Failed
+		created.ErrorMessage = long
+		require.NoError(t, store.Tasks().Update(ctx, created), "a task's failed verdict with a long message is stored")
+		failedTask, err := store.Tasks().Get(ctx, "task_long_failure")
+		require.NoError(t, err)
+		assert.Equal(t, state.Task.Failed, failedTask.State)
+		assertStoredMessage(t, want, failedTask.ErrorMessage, "the task update cuts the message")
+
+		apply.State = state.Apply.Failed
+		apply.ErrorMessage = long
+		require.NoError(t, store.Applies().Update(ctx, apply), "an apply's failure with a long message is stored")
+		failedApply, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, state.Apply.Failed, failedApply.State)
+		assertStoredMessage(t, want, failedApply.ErrorMessage, "the apply update cuts the message")
+
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "primary", OperationKey: "orders",
+			OperationKind: storage.ApplyOperationKindWork, ErrorMessage: long,
+		})
+		require.NoError(t, err, "an operation created with a long failure message is stored")
+		createdOp, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		assertStoredMessage(t, want, createdOp.ErrorMessage, "the operation insert cuts the message")
+		require.NoError(t, store.ApplyOperations().MarkFailed(ctx, opID, long), "an operation's failure with a long message is stored")
+		failedOp, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		assert.Equal(t, state.ApplyOperation.Failed, failedOp.State)
+		assertStoredMessage(t, want, failedOp.ErrorMessage, "marking the operation failed cuts the message")
+	})
+
 	t.Run("ReapStrandedActive_RejectsNonPositiveLimit", func(t *testing.T) {
 		store := h.NewStorage(t)
 		_, err := store.Tasks().ReapStrandedActive(t.Context(), 0)
@@ -653,6 +709,17 @@ func newTask(apply *storage.Apply, identifier, table string, createdAt time.Time
 		DDLAction:      "alter",
 		CreatedAt:      createdAt,
 		UpdatedAt:      createdAt,
+	}
+}
+
+// assertStoredMessage compares a long stored message by its length and its
+// end, where a cut shows, before comparing it whole, so a mismatch reports
+// something readable instead of two messages too long to print.
+func assertStoredMessage(t *testing.T, want, got, msg string) {
+	t.Helper()
+	if assert.Equal(t, len(want), len(got), "%s: stored length in bytes", msg) &&
+		assert.Equal(t, want[len(want)-16:], got[len(got)-16:], "%s: end of the stored message", msg) {
+		assert.True(t, want == got, "%s: stored message", msg)
 	}
 }
 

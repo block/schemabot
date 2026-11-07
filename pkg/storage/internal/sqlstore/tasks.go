@@ -92,7 +92,7 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
-		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
+		task.State, nullString(storedErrorMessage(task.ErrorMessage)), string(options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
@@ -257,7 +257,7 @@ func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	boundEngineReportedFields(task)
 	args := []any{
-		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
+		task.State, nullString(storedErrorMessage(task.ErrorMessage)), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID), task.DDL,
 		task.StartedAt, task.CompletedAt,
@@ -520,7 +520,7 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
-			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
+			task.State, nullString(storedErrorMessage(task.ErrorMessage)), string(options), task.Attempt,
 			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
@@ -1235,7 +1235,7 @@ func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Ta
 	args := []any{taskState}
 	if state.IsState(parent.State, state.Apply.Failed) {
 		setClause = "state = ?, error_message = COALESCE(NULLIF(error_message, ''), ?), completed_at = COALESCE(completed_at, NOW())"
-		args = []any{taskState, nullString(parent.ErrorMessage)}
+		args = []any{taskState, nullString(storedErrorMessage(parent.ErrorMessage))}
 	}
 	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
 	args = append(args, task.ID, task.State)
