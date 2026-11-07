@@ -72,14 +72,15 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		// The drives that settled the tree handed their leases back, as a
 		// finished drive does. A leftover fresh lease would hold its slot under
 		// the driver cap until it went stale, and the redispatch would wait.
-		// Each operation has also spent all but its last attempt, so the
-		// redispatch raises the parent to the operation's final attempt.
+		// Each operation has also spent all but its last attempt and failed
+		// longer ago than its backoff, so the redispatch is admitted now and
+		// raises the parent to the operation's final attempt.
 		_, err := store.db.ExecContext(ctx, `
 			UPDATE apply_operations
 			SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
-			    attempt = ?
+			    attempt = ?, updated_at = ?
 			WHERE apply_id = ?
-		`, maxRecoveryAttempts-1, apply.ID)
+		`, maxRecoveryAttempts-1, time.Now().UTC().Add(-2*storage.MaxRecoveryBackoff), apply.ID)
 		require.NoError(t, err)
 
 		// The redispatch claim rotates a lease onto one operation and spends the

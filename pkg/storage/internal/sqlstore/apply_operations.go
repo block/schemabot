@@ -2054,6 +2054,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, stringArgs(redispatchParents)...)
 	queryArgs = append(queryArgs, maxRecoveryAttempts)
 	queryArgs = append(queryArgs, redispatchWindowArgs...)
+	// Backoff bypass: an accepted stop or cancel reaches a failed_retryable
+	// operation only through the drive a redispatch starts, so the request
+	// claims it at once rather than after the backoff (CO-2). The claim is
+	// otherwise the same redispatch: it rotates the lease, spends an attempt,
+	// and stays under the fan-out cap.
+	queryArgs = append(queryArgs,
+		storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs, stringArgs(crashRecoveryParents)...)
@@ -2148,6 +2155,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// non-completed, and
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
+	redispatchBackoff := redispatchBackoffGate(s.dialect)
 	// The guarded arms differ in the equal-timestamp case for the same reason
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
 	// out of stopped atomically with its lease rotation, so no peer can match it
@@ -2270,8 +2278,23 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								AND apply_operations.attempt < ?
 								AND `+redispatchWindow+`
 								-- Names no column of a, but belongs to this arm
-								-- alone: a deliberate redispatch starts work, so
-								-- it is capped; crash recovery below is not.
+								-- alone: the backoff spaces deliberate
+								-- redispatches, which crash recovery below must
+								-- not wait on. A pending stop or cancel is
+								-- delivered by the drive this claim starts, so it
+								-- does not wait either.
+								AND (
+									`+redispatchBackoff+`
+									OR EXISTS (
+										SELECT 1
+										FROM apply_control_requests cr
+										WHERE cr.apply_id = apply_operations.apply_id
+											AND cr.operation IN (?, ?)
+											AND cr.status = ?
+									)
+								)
+								-- Likewise: a deliberate redispatch starts work,
+								-- so it is capped; crash recovery below is not.
 								AND `+driverCap+notDeferred+deferredQueue+`
 							)
 							OR (
@@ -2535,6 +2558,31 @@ func redispatchDrivesUnderOperationLease(ctx context.Context, tx *rebindTx, ad *
 		return false, fmt.Errorf("count tasks of redispatched apply_operation %d: %w", ad.ID, err)
 	}
 	return tasks == 0, nil
+}
+
+// redispatchBackoffGate holds a failed_retryable operation back from a
+// deliberate redispatch until storage.RecoveryBackoff for its own attempt has
+// passed since it failed. Without it, an interruption that outlasts a few
+// drives (a data plane restarting, say) spends the whole retry budget while it
+// lasts, and the apply fails although the work would have resumed moments
+// later.
+//
+// updated_at is when the row failed: the failing write stamps it, and
+// ReleaseFinishedClaim carries it forward when the drive lets go of the row.
+// The schedule is unrolled into a CASE over the operation's attempt so the
+// cutoffs are literals both dialects compare the same way; every attempt at or
+// past the cap shares the ELSE arm.
+func redispatchBackoffGate(d Dialect) string {
+	cutoff := func(backoff time.Duration) string {
+		return d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(backoff.Microseconds())), IntervalMicrosecond)
+	}
+	var gate strings.Builder
+	gate.WriteString("apply_operations.updated_at <= CASE")
+	for attempt := 0; storage.RecoveryBackoff(attempt) < storage.MaxRecoveryBackoff; attempt++ {
+		fmt.Fprintf(&gate, " WHEN apply_operations.attempt = %d THEN %s", attempt, cutoff(storage.RecoveryBackoff(attempt)))
+	}
+	fmt.Fprintf(&gate, " ELSE %s END", cutoff(storage.MaxRecoveryBackoff))
+	return gate.String()
 }
 
 // moveRedispatchToRunning moves a failed_retryable operation to running when
@@ -2878,6 +2926,14 @@ func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID in
 // re-leases active rows without changing their state. Reports false when the
 // lease no longer matches, meaning another writer already rotated or cleared
 // it and the row has moved on.
+//
+// A failed_retryable row under a parent in redispatchParentStates keeps its
+// heartbeat instead: the deliberate redispatch arm offers it again without
+// reading its staleness, and its updated_at is the failure time the redispatch
+// backoff counts from (and, under a degraded rollout, the pause time the
+// recovery window reads), so a backdate would skip the backoff for an
+// operation whose drive was handed back on shutdown. Under any other active
+// parent the row is crash recovery's, which needs the stale heartbeat.
 func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
 	if !lease.Valid() {
 		return false, fmt.Errorf("release claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
@@ -2887,12 +2943,21 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	// boundary and fail the claim's strict comparison.
 	staleBackdate := storage.ApplyLeaseStaleAfter + time.Second
 	staleHeartbeat := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(staleBackdate.Microseconds())), IntervalMicrosecond)
+	redispatchParents := redispatchParentStates()
+	args := append([]any{state.ApplyOperation.FailedRetryable}, stringArgs(redispatchParents)...)
+	args = append(args, lease.OperationID, lease.Token)
 	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE apply_operations
 		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
-		    updated_at = %s
+		    updated_at = CASE
+		        WHEN state = ? AND EXISTS (
+		            SELECT 1 FROM applies a
+		            WHERE a.id = apply_operations.apply_id AND a.state IN (%s)
+		        ) THEN updated_at
+		        ELSE %s
+		    END
 		WHERE id = ? AND lease_token = ?
-	`, staleHeartbeat), lease.OperationID, lease.Token)
+	`, placeholders(len(redispatchParents)), staleHeartbeat), args...)
 	if err != nil {
 		return false, fmt.Errorf("release claim for apply_operation %d: %w", lease.OperationID, err)
 	}

@@ -114,12 +114,13 @@ func requestControlBy(t *testing.T, store storage.Storage, applyID int64, operat
 // failed_retryable operation. Each round redispatches every one of those
 // operations, which spends one attempt of its budget and raises its apply's
 // attempt to it, then fails each retryably again and hands its lease back, as
-// a drive whose retry failed does. The applies share each round because a
-// deferred apply's waiting operation holds back the redispatch of a later
-// deferred apply's until it is claimed. The parity suite spends the budget
-// through the storage interface because it cannot backdate the counter with
-// dialect-specific SQL.
-func spendRetryBudget(t *testing.T, store storage.Storage, applyIDs ...int64) {
+// a drive whose retry failed does, and ages the failure past the redispatch
+// backoff, as the next retry would after waiting it out. The applies share
+// each round because a deferred apply's waiting operation holds back the
+// redispatch of a later deferred apply's until it is claimed. The parity suite
+// spends the budget through the storage interface because it cannot backdate
+// the counter with dialect-specific SQL.
+func spendRetryBudget(t *testing.T, h Harness, store storage.Storage, applyIDs ...int64) {
 	t.Helper()
 	ctx := t.Context()
 	for range storage.MaxRecoveryAttempts {
@@ -139,6 +140,7 @@ func spendRetryBudget(t *testing.T, store storage.Storage, applyIDs ...int64) {
 			released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
 			require.NoError(t, err)
 			require.True(t, released)
+			h.AgeApplyOperation(t, store, claimed.ID, storage.MaxRecoveryBackoff+time.Second)
 		}
 	}
 }
@@ -237,7 +239,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Empty(t, endedApplyIdentifiers(listed), "an apply with retry budget left is not held")
 
-		spendRetryBudget(t, store, apply.ID)
+		spendRetryBudget(t, h, store, apply.ID)
 		listed, err = store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, listed, 1)
@@ -448,7 +450,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.FailedRetryable, taskState: state.Task.FailedRetryable},
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
 		)
-		spendRetryBudget(t, store, apply.ID)
+		spendRetryBudget(t, h, store, apply.ID)
 		requestControlBy(t, store, apply.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
 
 		settled, err := store.Applies().SettleAppliesStoppedForEndedOperation(ctx, 10)
@@ -608,7 +610,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		}
 		held, _ := createEndedOperationApply(t, store, "apply_ended_expiry_held", 962, state.Apply.FailedRetryable, true, ops...)
 		plain, _ := createEndedOperationApply(t, store, "apply_ended_expiry_plain", 963, state.Apply.FailedRetryable, true, ops...)
-		spendRetryBudget(t, store, held.ID, plain.ID)
+		spendRetryBudget(t, h, store, held.ID, plain.ID)
 		requestControlBy(t, store, held.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
 
 		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)

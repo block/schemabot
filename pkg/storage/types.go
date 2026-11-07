@@ -28,6 +28,34 @@ import (
 // attempt, rather than costing the apply one attempt per operation.
 const MaxRecoveryAttempts = 10
 
+const (
+	// RecoveryBackoffBase is the wait before an operation's second automatic
+	// redispatch. See RecoveryBackoff.
+	RecoveryBackoffBase = 5 * time.Second
+	// MaxRecoveryBackoff caps the wait between automatic redispatches.
+	MaxRecoveryBackoff = time.Minute
+)
+
+// RecoveryBackoff is how long a failed_retryable operation waits, from the
+// moment it failed, before its next automatic redispatch, given how many
+// redispatches it has already had. The first is immediate, so a one-off
+// interruption costs no time. Each one after that waits twice as long as the
+// one before, up to MaxRecoveryBackoff, so the budget is spread over an outage
+// of several minutes instead of being spent while the outage lasts.
+func RecoveryBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	backoff := RecoveryBackoffBase
+	for range attempt - 1 {
+		backoff *= 2
+		if backoff >= MaxRecoveryBackoff {
+			return MaxRecoveryBackoff
+		}
+	}
+	return backoff
+}
+
 // ApplyTargetLockWait is how long a claim blocks waiting for another instance
 // to release an apply target's advisory lock. It is the longest a statement on
 // the storage pool legitimately blocks, which makes it the floor any
@@ -1511,7 +1539,8 @@ type ApplyOperation struct {
 	// heartbeat, or an in-flight drive whose driver died), so the
 	// count records only retries. It is the operation's retry budget: a
 	// deliberate redispatch is admitted only while it is below
-	// MaxRecoveryAttempts. It is never reset, so the budget counts every
+	// MaxRecoveryAttempts, and it picks the redispatch backoff
+	// (RecoveryBackoff). It is never reset, so the budget counts every
 	// redispatch in the operation's life. applies.attempt records the highest
 	// of any of its operations; a sibling's retry raises that but never this
 	// row's. It is not a dispatch generation: the operation-scoped

@@ -44,6 +44,11 @@ func (h postgresHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
 	return NewPostgres(db)
 }
 
+func (postgresHarness) AgeApplyOperation(t *testing.T, store storage.Storage, operationID int64, age time.Duration) {
+	t.Helper()
+	ageParityApplyOperation(t, store, operationID, age)
+}
+
 func TestPostgresStorageParity(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_parity")
 	db, err := postgresconn.Open(dsn)
