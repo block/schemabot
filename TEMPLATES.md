@@ -956,25 +956,23 @@ ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;
 DROP TABLE `refund_backfill`;
 ```
 
-⚠️ **Issues**: 8 unsafe changes detected
-
-**Destructive drops** (2)
-1. `transfer_events`: DROP COLUMN discards the column's data
-2. `refund_backfill`: DROP TABLE removes all data
-
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
+⚠️ **Issues**: 8 unsafe changes detected, including 2 destructive drops
+1. `transfer_events`: **DROP COLUMN discards the column's data**
+2. `refund_backfill`: **DROP TABLE removes all data**
+3. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+4. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
 
 <details>
-<summary><b>Other unsafe changes</b> (6)</summary>
+<summary>3 more unsafe changes</summary>
 
-1. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-2. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-3. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-4. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-5. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+6. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+7. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
 
 </details>
+
+💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
 
 📋 **Plan**: **3** tables to create, **1** table to alter, **1** table to drop
 

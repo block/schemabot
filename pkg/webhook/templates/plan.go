@@ -2715,82 +2715,71 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 // table, carries the attribution for tables another pull request changed, so
 // the reader learns where a change came from on the finding itself, and how
 // to make a destructive drop safe.
-//
-// A list that mixes destructive drops with other findings splits in two, as
-// writeGroupedUnsafeChanges describes. A long list with no drops folds whole,
-// as a long lint list does, with the count in the block's summary.
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
-	n := countUnsafeFindings(changes)
-	count := fmt.Sprintf("%d unsafe %s detected", n, pluralize("change", n))
-	fold := n > unsafeFindingsFoldThreshold
 	drops, rest := splitDestructiveDrops(changes, databaseType)
-	if fold && len(drops) == 0 {
-		// GitHub renders <summary> content as HTML, not markdown, so the folded
-		// header bolds with <b> tags instead of asterisks.
-		fmt.Fprintf(sb, "<details>\n<summary>%s <b>Issues</b>: %s</summary>\n\n", glyph.Attention, count)
-		item := 0
-		writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
-		sb.WriteString("\n</details>\n")
-		writeUnsafeAttributionDisclosure(sb, attributionNotes)
-		sb.WriteString("\n")
-		return
-	}
-	fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, count)
-	if writeGroupedUnsafeChanges(sb, drops, rest, attributionNotes, databaseType, isMySQL, fold) {
-		writeUnsafeAttributionDisclosure(sb, attributionNotes)
-		sb.WriteString("\n")
-		return
-	}
-	item := 0
-	writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
+	fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, unsafeCountPhrase(drops, rest))
+	writeUnsafeFindingList(sb, drops, rest, attributionNotes)
 	writeUnsafeAttributionDisclosure(sb, attributionNotes)
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, drops, databaseType, isMySQL)
 }
 
-// writeGroupedUnsafeChanges writes an unsafe list that mixes destructive drops
-// with other findings as two groups below its header, and reports false,
-// writing nothing, for a list that is all drops or has none. The drops lead
-// under their own heading with the drop guidance beneath them, so a dropped
-// table or column reads apart from findings that destroy nothing; the other
-// findings follow under theirs, folded when fold is set. Drops never fold, so
-// none can hide among dozens of advisory findings.
-func writeGroupedUnsafeChanges(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, fold bool) bool {
+// unsafeCountPhrase counts the unsafe findings for a header, and when they
+// mix destructive drops with findings that destroy nothing, how many are
+// drops, so the reader knows a drop is in the list before reading it.
+func unsafeCountPhrase(drops, rest []UnsafeChangeData) string {
+	d := countUnsafeFindings(drops)
+	n := d + countUnsafeFindings(rest)
+	phrase := fmt.Sprintf("%d unsafe %s detected", n, pluralize("change", n))
 	if len(drops) == 0 || len(rest) == 0 {
-		return false
+		return phrase
 	}
-	sb.WriteString("\n")
-	writeUnsafeGroup(sb, "Destructive drop", "Destructive drops", drops, attributionNotes, false)
-	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, drops, databaseType, isMySQL)
-	writeUnsafeGroup(sb, "Other unsafe change", "Other unsafe changes", rest, attributionNotes, fold)
-	return true
+	return fmt.Sprintf("%s, including %d destructive %s", phrase, d, pluralize("drop", d))
 }
 
-// writeUnsafeGroup writes one group of a split unsafe list. A group of one
-// finding names it on the heading's line, with the heading singular and no
-// count or number, since a one-item list says nothing the line does not; it
-// never folds, since folding would hide a line behind a summary as long as
-// it. A larger group counts its findings in the heading and numbers them from
-// one, so the last number is the count, folded when fold is set.
-func writeUnsafeGroup(sb *strings.Builder, singular, plural string, changes []UnsafeChangeData, attributionNotes map[string]string, fold bool) {
-	m := countUnsafeFindings(changes)
-	if m == 1 {
-		c := changes[0]
-		fmt.Fprintf(sb, "**%s** — %s\n", singular, unsafeFindingLines(unsafeChangeLabel(c), c.Reason, c.ChangeType, unsafeChangeNote(c, attributionNotes))[0])
+// writeUnsafeFindingList writes the unsafe findings as one numbered list, one
+// line per finding, so the list is exactly as long as the header's count and
+// operators can reference a finding by its number. The destructive drops come
+// first, so a drop never sits below dozens of advisory findings, and in a
+// list that also carries findings that destroy nothing, the drops' findings
+// are bold to set them apart; a list of only drops has nothing to set them
+// apart from. A long list shows its first findings and folds the rest,
+// as unsafeFindingsShown decides; numbering runs on into the fold.
+func writeUnsafeFindingList(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string) {
+	emphasize := len(rest) > 0
+	var lines []string
+	for _, c := range drops {
+		lines = append(lines, unsafeFindingLines(c, attributionNotes, emphasize)...)
+	}
+	dropLines := len(lines)
+	for _, c := range rest {
+		lines = append(lines, unsafeFindingLines(c, attributionNotes, false)...)
+	}
+	shown := unsafeFindingsShown(len(lines), dropLines)
+	for i, line := range lines[:shown] {
+		fmt.Fprintf(sb, "%d. %s\n", i+1, line)
+	}
+	hidden := len(lines) - shown
+	if hidden == 0 {
 		return
 	}
-	item := 0
-	if !fold {
-		fmt.Fprintf(sb, "**%s** (%d)\n", plural, m)
-		writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
-		return
+	fmt.Fprintf(sb, "\n<details>\n<summary>%d more unsafe %s</summary>\n\n", hidden, pluralize("change", hidden))
+	for i, line := range lines[shown:] {
+		fmt.Fprintf(sb, "%d. %s\n", shown+i+1, line)
 	}
-	// GitHub renders <summary> content as HTML, not markdown, so the folded
-	// heading bolds with <b> tags instead of asterisks.
-	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b> (%d)</summary>\n\n", plural, m)
-	writeUnsafeChangeItems(sb, &item, changes, attributionNotes)
 	sb.WriteString("\n</details>\n")
+}
+
+// unsafeFindingsShown is how many of a list's findings render open: the
+// first unsafeFindingsFoldThreshold, or every destructive drop when there are
+// more, since a drop never folds. A fold that would hide a single finding
+// shows it instead, since its summary would be as long as the line it hides.
+func unsafeFindingsShown(total, drops int) int {
+	shown := max(unsafeFindingsFoldThreshold, drops)
+	if total-shown <= 1 {
+		return total
+	}
+	return shown
 }
 
 // writeUnsafeAttributionDisclosure explains why another pull request's change
@@ -2801,27 +2790,10 @@ func writeUnsafeAttributionDisclosure(sb *strings.Builder, attributionNotes map[
 	}
 }
 
-// writeUnsafeChangeItems writes each change's numbered findings, continuing
-// the running number in item.
-func writeUnsafeChangeItems(sb *strings.Builder, item *int, changes []UnsafeChangeData, attributionNotes map[string]string) {
-	for _, c := range changes {
-		writeUnsafeChangeItem(sb, item, unsafeChangeLabel(c), c.Reason, c.ChangeType, unsafeChangeNote(c, attributionNotes))
-	}
-}
-
-// unsafeChangeNote is the attribution a change's findings carry, none for a
-// change that creates its table.
-func unsafeChangeNote(c UnsafeChangeData, attributionNotes map[string]string) string {
-	if createsItsTable(c) {
-		return ""
-	}
-	return attributionNotes[c.Table]
-}
-
 // splitDestructiveDrops separates the unsafe changes that drop a table,
 // column, index or partition from the rest, each in plan order, so the drops
-// render under their own heading and stay in view while the findings that
-// destroy nothing fold.
+// lead the list and stay in view while the findings that destroy nothing
+// fold.
 func splitDestructiveDrops(changes []UnsafeChangeData, databaseType string) (drops, rest []UnsafeChangeData) {
 	parser := dropStatementParser(databaseType)
 	for _, c := range changes {
@@ -2895,37 +2867,34 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 	return caller.PullRequestMarkdownLink(repo, pr)
 }
 
-// writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
-// per finding, so the rendered list is exactly as long as the heading's count
-// and operators can reference a finding by its number. n carries the running
-// number across tables; a change with no parseable reason still gets a line,
-// carrying the engine's change type when one is known so the finding explains
-// itself.
-func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType, note string) {
-	for _, line := range unsafeFindingLines(table, reason, changeType, note) {
-		*n++
-		fmt.Fprintf(sb, "%d. %s\n", *n, line)
-	}
-}
-
-// unsafeFindingLines is one line per finding in a table's unsafe reason,
-// unnumbered: the table, the finding, and the attribution note when there is
-// one. A change with no parseable reason still gets a line.
-func unsafeFindingLines(table, reason, changeType, note string) []string {
+// unsafeFindingLines is one unnumbered line per finding in a change's unsafe
+// reason: the table, the finding, and the change's attribution note, which a
+// change that creates its table never carries. emphasize bolds the findings,
+// as the list does for a destructive drop. A change with no parseable reason
+// still gets a line, carrying the engine's change type when one is known so
+// the finding explains itself.
+func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string, emphasize bool) []string {
+	table := unsafeChangeLabel(c)
 	suffix := ""
-	if note != "" {
+	if note := attributionNotes[c.Table]; note != "" && !createsItsTable(c) {
 		suffix = " (" + note + ")"
 	}
-	reasons := ui.LintReasons(reason)
+	finding := func(text string) string {
+		if emphasize {
+			return "**" + text + "**"
+		}
+		return text
+	}
+	reasons := ui.LintReasons(c.Reason)
 	if len(reasons) == 0 {
-		if changeType != "" {
-			return []string{fmt.Sprintf("%s: %s%s", table, changeType, suffix)}
+		if c.ChangeType != "" {
+			return []string{fmt.Sprintf("%s: %s%s", table, finding(c.ChangeType), suffix)}
 		}
 		return []string{table + suffix}
 	}
 	lines := make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		lines = append(lines, fmt.Sprintf("%s: %s%s", table, ui.CodeQuoteIdentifiers(r), suffix))
+		lines = append(lines, fmt.Sprintf("%s: %s%s", table, finding(ui.CodeQuoteIdentifiers(r)), suffix))
 	}
 	return lines
 }
@@ -3099,10 +3068,11 @@ func dropCountsWithTableFallback(drops unsafeDropCounts, changeType string) unsa
 // the plan comment while the count stays visible in the header.
 const lintWarningsFoldThreshold = 5
 
-// unsafeFindingsFoldThreshold is the finding count above which the unsafe
-// Issues list collapses into a details block, as the lint section does. The
-// count stays in view, destructive drops stay open above the fold, and the
-// apply instruction still names every table `--allow-unsafe` consents to.
+// unsafeFindingsFoldThreshold is how many unsafe findings a long Issues list
+// shows before folding the rest into a details block, as the lint section
+// folds. The count stays in view, destructive drops stay open above the fold,
+// and the apply instruction still names every table `--allow-unsafe`
+// consents to.
 const unsafeFindingsFoldThreshold = lintWarningsFoldThreshold
 
 // writeLintViolations writes advisory lint findings. Lint warnings never block

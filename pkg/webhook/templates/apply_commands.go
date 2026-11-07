@@ -270,17 +270,11 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
-	fmt.Fprintf(sb, "**"+glyph.Refused+" %s**: %d unsafe %s detected\n", rejected, unsafeCount, pluralize("change", unsafeCount))
 	drops, rest := splitDestructiveDrops(data.UnsafeChanges, data.DatabaseType)
-	fold := unsafeCount > unsafeFindingsFoldThreshold
-	if writeGroupedUnsafeChanges(sb, drops, rest, nil, data.DatabaseType, data.IsMySQL, fold) {
-		sb.WriteString("\n")
-	} else {
-		item := 0
-		writeUnsafeChangeItems(sb, &item, data.UnsafeChanges, nil)
-		sb.WriteString("\n")
-		writeUnsafeDropGuidance(sb, drops, data.DatabaseType, data.IsMySQL)
-	}
+	fmt.Fprintf(sb, "**%s %s**: %s\n", glyph.Refused, rejected, unsafeCountPhrase(drops, rest))
+	writeUnsafeFindingList(sb, drops, rest, nil)
+	sb.WriteString("\n")
+	writeUnsafeDropGuidance(sb, drops, data.DatabaseType, data.IsMySQL)
 
 	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
 	// is consent to destroy the data, and whether the change is this pull
