@@ -2357,9 +2357,62 @@ func TestResumeReplanFailsOnAnUnreadableResumeState(t *testing.T) {
 	_, err := client.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{ID: 7})
 
 	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
 	assert.Contains(t, err.Error(), "decode engine resume state before settling task task-orders")
 	for _, task := range tasks {
 		assert.Equal(t, state.Task.CuttingOver, task.State, "table %s", task.TableName)
+	}
+}
+
+// resumeStateReadsThenFail answers the first `reads` engine resume state reads
+// from the embedded store and fails every read after them, as storage that
+// goes away part-way through a resume does.
+type resumeStateReadsThenFail struct {
+	*exactProgressApplyOperationStore
+	reads int
+	err   error
+}
+
+func (s *resumeStateReadsThenFail) GetEngineResumeState(ctx context.Context, operationID int64) (*storage.EngineResumeState, error) {
+	if s.reads == 0 {
+		return nil, s.err
+	}
+	s.reads--
+	return s.exactProgressApplyOperationStore.GetEngineResumeState(ctx, operationID)
+}
+
+// A paused Vitess apply resumes with its stored resume state readable, so the
+// first re-plan keeps both tables active for the reattach. The final re-plan
+// inside the grouped launch then cannot read the state. The deploy request the
+// engine accepted is still open, so the drive exits with the read error and
+// writes no terminal state: the apply stays paused for a later claim to
+// reattach, instead of being failed with its revert window abandoned.
+func TestResumeExitsWithoutTerminalStateWhenFinalReplanCannotReadResumeState(t *testing.T) {
+	eng := &acceptedCutoverEngine{}
+	client, apply, tasks, applies := acceptedCutoverFixture(storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.FailedRetryable, eng)
+	apply.State = state.Apply.FailedRetryable
+	applies.stored = *apply
+	store := client.storage.(*exactProgressStorage)
+	// The first re-plan reads the state once per table; the final re-plan's
+	// first read fails.
+	store.applyOperations = &resumeStateReadsThenFail{
+		exactProgressApplyOperationStore: store.applyOperations.(*exactProgressApplyOperationStore),
+		reads:                            len(tasks),
+		err:                              errors.New("storage unavailable"),
+	}
+	taskStore := client.storage.Tasks().(*stateRecordingTaskStore)
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, map[string]string{}, false, false)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.Contains(t, err.Error(), "storage unavailable")
+	assert.Empty(t, eng.reattached, "the engine is not handed a resume the drive could not verify")
+	assert.Equal(t, state.Apply.FailedRetryable, applies.stored.State, "the apply row keeps the pause it was claimed in")
+	assert.NotContains(t, taskStore.states, state.Task.Failed, "no task is written failed")
+	assert.NotContains(t, taskStore.states, state.Task.Completed, "no task is written completed")
+	for _, task := range tasks {
+		assert.False(t, state.IsTerminalTaskState(task.State), "table %s stays non-terminal in %s", task.TableName, task.State)
 	}
 }
 

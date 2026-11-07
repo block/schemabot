@@ -1065,8 +1065,12 @@ func taskInRevertPhase(task *storage.Task) bool {
 // The deploy request is read from the PlanetScale resume blob through
 // psMetadataForStorage, the projection tern already reads that blob through
 // for display and revert deadlines; only the Vitess database type reaches the
-// read. A storage read failure and an undecodable blob are errors, so the
-// resume fails rather than settles a task whose engine work it cannot rule out.
+// read. A storage read failure and an undecodable blob are errors marked
+// errGroupedResumeStateUnavailable, so the resume fails rather than settles a
+// task whose engine work it cannot rule out, and the drive exits without
+// recording a terminal state: the re-plan runs again inside the grouped
+// launch, where an unmarked error would fail the apply permanently and
+// abandon the accepted deploy request.
 func (c *LocalClient) taskReattachesToAcceptedWork(ctx context.Context, task *storage.Task) (bool, error) {
 	if !recoveryReattachesToAcceptedWork(c.config.Type) {
 		return false, nil
@@ -1076,14 +1080,14 @@ func (c *LocalClient) taskReattachesToAcceptedWork(ctx context.Context, task *st
 	}
 	stored, err := c.loadStoredEngineResumeState(ctx, task, "resume re-plan settlement")
 	if err != nil {
-		return false, fmt.Errorf("load engine resume state before settling task %s from the resume re-plan: %w", task.TaskIdentifier, err)
+		return false, fmt.Errorf("%w: load engine resume state before settling task %s from the resume re-plan: %w", errGroupedResumeStateUnavailable, task.TaskIdentifier, err)
 	}
 	if stored == nil {
 		return false, nil
 	}
 	meta, err := decodePSMetadataForStorage(stored.Metadata)
 	if err != nil {
-		return false, fmt.Errorf("decode engine resume state before settling task %s from the resume re-plan: %w", task.TaskIdentifier, err)
+		return false, fmt.Errorf("%w: decode engine resume state before settling task %s from the resume re-plan: %w", errGroupedResumeStateUnavailable, task.TaskIdentifier, err)
 	}
 	return meta != nil && meta.DeployRequestID != 0, nil
 }
