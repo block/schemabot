@@ -1,7 +1,9 @@
 package tern
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -516,9 +518,12 @@ func TestGRPCClient_Close(t *testing.T) {
 // server defaults to STATE_COMPLETED.
 type capturingTernServer struct {
 	ternv1.UnimplementedTernServer
-	mu                sync.Mutex
-	applyReq          *ternv1.ApplyRequest
-	applyErr          error
+	mu       sync.Mutex
+	applyReq *ternv1.ApplyRequest
+	applyErr error
+	// applyResponse, when set, is the answer to every Apply in place of an
+	// accepted dispatch.
+	applyResponse     *ternv1.ApplyResponse
 	remoteApplyID     string
 	remoteOperationID string
 	cancelApplyID     string
@@ -555,13 +560,16 @@ type capturingTernServer struct {
 	startCaller            string
 	// startHook, when set, runs on every Start with the call's 1-based number
 	// and returns that call's error in place of startErr.
-	startHook        func(call int) error
-	stopCalls        int
-	cancelCalls      int
-	stopRefusal      string // when set, Stop answers Accepted=false with this reason
-	cancelRefusal    string // when set, Cancel answers Accepted=false with this reason
-	omitOperationKey bool   // emulate a data plane that does not echo the operation key
-	echoOperationKey string // when set, echoed in place of the derived key, emulating a response for another operation
+	startHook func(call int) error
+	stopCalls int
+	// progressCallsAtFirstStop is how many Progress calls came before the
+	// first Stop, so a test can tell when a drive delivered its stop.
+	progressCallsAtFirstStop int
+	cancelCalls              int
+	stopRefusal              string // when set, Stop answers Accepted=false with this reason
+	cancelRefusal            string // when set, Cancel answers Accepted=false with this reason
+	omitOperationKey         bool   // emulate a data plane that does not echo the operation key
+	echoOperationKey         string // when set, echoed in place of the derived key, emulating a response for another operation
 	// omitProgressScope emulates a data plane that ignores a progress
 	// request's apply_operation_id and answers for the whole apply.
 	omitProgressScope bool
@@ -629,9 +637,13 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 	omitOperationKey := s.omitOperationKey
 	echoOperationKey := s.echoOperationKey
 	err := s.applyErr
+	applyResponse := s.applyResponse
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if applyResponse != nil {
+		return applyResponse, nil
 	}
 	operationKey := ""
 	switch {
@@ -668,6 +680,9 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 	s.stopApplyID = req.ApplyId
 	s.stopCaller = req.Caller
 	s.stopCalls++
+	if s.stopCalls == 1 {
+		s.progressCallsAtFirstStop = s.progressCalls
+	}
 	err := s.stopErr
 	refusal := s.stopRefusal
 	s.mu.Unlock()
@@ -796,6 +811,12 @@ func (s *capturingTernServer) startWasCalled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.startCalled
+}
+
+func (s *capturingTernServer) getProgressCallsAtFirstStop() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.progressCallsAtFirstStop
 }
 
 func (s *capturingTernServer) getStopApplyID() string {
@@ -947,6 +968,7 @@ type mockTaskStore struct {
 	updated             []*storage.Task
 	upsertedShards      []*storage.Task
 	upsertShardErr      error
+	upsertShardCalls    int
 }
 
 func (m *mockTaskStore) Get(context.Context, string) (*storage.Task, error) {
@@ -992,6 +1014,7 @@ func (m *mockTaskStore) Update(_ context.Context, task *storage.Task) error {
 }
 
 func (m *mockTaskStore) UpsertShardProgress(_ context.Context, task *storage.Task) error {
+	m.upsertShardCalls++
 	if m.upsertShardErr != nil {
 		return m.upsertShardErr
 	}
@@ -1004,6 +1027,7 @@ type mockApplyLogStore struct {
 	storage.ApplyLogStore
 	logs        []*storage.ApplyLog
 	recentLimit int
+	lastFilter  storage.ApplyLogFilter
 }
 
 // Append records the line the way the real store does: a cancelled context is
@@ -1023,6 +1047,12 @@ func (m *mockApplyLogStore) GetByApply(context.Context, int64) ([]*storage.Apply
 
 func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit int) ([]*storage.ApplyLog, error) {
 	m.recentLimit = limit
+	return m.logs, nil
+}
+
+func (m *mockApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
+	m.recentLimit = filter.Limit
+	m.lastFilter = filter
 	return m.logs, nil
 }
 
@@ -3044,188 +3074,128 @@ func TestGRPCClient_ResumeApplyOperationCancelsOperationStoppedBeforeDispatch(t 
 	assert.NotNil(t, cancelReq, "the apply-level cancel request must remain pending for sibling operations")
 }
 
-func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingCancel(t *testing.T) {
-	// An apply that is running with no remote apply id may or may not have
-	// created a remote apply whose dispatch response was lost, so a pending
-	// cancel cannot be satisfied locally without risking an orphan. The drive
-	// leaves the cancel to the dispatch ambiguity guard, which fails the apply
-	// closed and fails the pending cancel with the same message — a failed apply
-	// is never claimed again, so nothing later could answer the request, and the
-	// operator must see the rejection rather than a command pending forever.
-	server := &capturingTernServer{}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
-
-	apply := &storage.Apply{
-		ID:              9,
-		ApplyIdentifier: "apply-ambiguous-cancel",
-		PlanID:          99,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "staging",
-		State:           state.Apply.Running,
+func TestGRPCClient_ResumeApplyLostDispatchDeliversPendingControlRequests(t *testing.T) {
+	// An apply running with no remote apply id may have a remote apply whose
+	// dispatch response was lost, so a pending stop or cancel cannot be
+	// satisfied locally: that would report the change stopped or cancelled
+	// while it kept running on the target. The drive re-sends the dispatch under
+	// its original key, recovers the remote apply id, and delivers the
+	// operator's command to the remote apply that actually exists. Cancel is
+	// the stronger intent, so it is delivered first when both are pending.
+	// The remote apply here has already completed, so each request settles on
+	// that real outcome: a stop is satisfied by the finished change, and a
+	// cancel is refused because the change is already live on the target.
+	cancelTooLate := "the schema change completed before the cancel could take effect"
+	testCases := []struct {
+		name         string
+		requests     []storage.ControlOperation
+		wantCancelID string
+		wantStopID   string
+		wantStatus   map[storage.ControlOperation]storage.ControlRequestStatus
+		wantMessage  map[storage.ControlOperation]string
+	}{
+		{
+			name:         "cancel",
+			requests:     []storage.ControlOperation{storage.ControlOperationCancel},
+			wantCancelID: "remote-recovered",
+			wantStatus:   map[storage.ControlOperation]storage.ControlRequestStatus{storage.ControlOperationCancel: storage.ControlRequestFailed},
+			wantMessage:  map[storage.ControlOperation]string{storage.ControlOperationCancel: cancelTooLate},
+		},
+		{
+			name:       "stop",
+			requests:   []storage.ControlOperation{storage.ControlOperationStop},
+			wantStopID: "remote-recovered",
+			wantStatus: map[storage.ControlOperation]storage.ControlRequestStatus{storage.ControlOperationStop: storage.ControlRequestCompleted},
+		},
+		{
+			name:         "cancel and stop",
+			requests:     []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop},
+			wantCancelID: "remote-recovered",
+			wantStatus: map[storage.ControlOperation]storage.ControlRequestStatus{
+				storage.ControlOperationCancel: storage.ControlRequestFailed,
+				storage.ControlOperationStop:   storage.ControlRequestCompleted,
+			},
+			wantMessage: map[storage.ControlOperation]string{storage.ControlOperationCancel: cancelTooLate},
+		},
 	}
-	task := &storage.Task{
-		ID:             11,
-		TaskIdentifier: "task-users",
-		ApplyID:        apply.ID,
-		TableName:      "users",
-		State:          state.Task.Running,
-	}
-	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
-		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationCancel,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: "cli:alice",
-	}}}
-	client.storage = &mockStorage{
-		applies:         &mockApplyStore{apply: apply},
-		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
-		logs:            &mockApplyLogStore{},
-		controlRequests: controlRequests,
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &capturingTernServer{remoteApplyID: "remote-recovered"}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
+			apply := &storage.Apply{
+				ID:              9,
+				ApplyIdentifier: "apply-lost-dispatch-control",
+				PlanID:          99,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.Running,
+			}
+			task := &storage.Task{
+				ID:             11,
+				TaskIdentifier: "task-users",
+				ApplyID:        apply.ID,
+				TableName:      "users",
+				State:          state.Task.Running,
+			}
+			controlRequests := &testControlRequestStore{}
+			for _, op := range tc.requests {
+				controlRequests.requests = append(controlRequests.requests, &storage.ApplyControlRequest{
+					ApplyID:     apply.ID,
+					Operation:   op,
+					Status:      storage.ControlRequestPending,
+					RequestedBy: "cli:alice",
+				})
+			}
+			client.storage = &mockStorage{
+				applies:         &mockApplyStore{apply: apply},
+				tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+				logs:            &mockApplyLogStore{},
+				controlRequests: controlRequests,
+				plans:           &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-lost-dispatch-control"}},
+			}
 
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err, "the ambiguity guard fails the apply closed rather than cancelling work it cannot account for")
-	assert.Empty(t, server.getCancelApplyID(), "no remote cancel is addressable without a remote apply id")
-	assert.Equal(t, state.Apply.Failed, apply.State)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
 
-	cancelReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
-	require.NoError(t, err)
-	require.NotNil(t, cancelReq)
-	assert.Equal(t, storage.ControlRequestFailed, cancelReq.Status, "the guard must fail the pending cancel so the operator sees the rejection")
-	assert.Contains(t, cancelReq.ErrorMessage, "remote dispatch state is ambiguous")
-}
+			require.NoError(t, client.ResumeApply(ctx, apply))
 
-func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingStop(t *testing.T) {
-	// A stop carries the same orphan risk as a cancel: an apply running with no
-	// remote apply id may already have a remote apply the control plane cannot
-	// see, and settling the stop locally would report the change stopped while it
-	// ran on to cutover — with the apply left terminal, nothing would ever
-	// revisit it. The drive leaves the stop to the dispatch ambiguity guard,
-	// which fails the apply closed and fails the pending stop with the same
-	// message, since a failed apply is never claimed again.
-	server := &capturingTernServer{}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
-
-	apply := &storage.Apply{
-		ID:              9,
-		ApplyIdentifier: "apply-ambiguous-stop",
-		PlanID:          99,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "staging",
-		State:           state.Apply.Running,
-	}
-	task := &storage.Task{
-		ID:             11,
-		TaskIdentifier: "task-users",
-		ApplyID:        apply.ID,
-		TableName:      "users",
-		State:          state.Task.Running,
-	}
-	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
-		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationStop,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: "cli:alice",
-	}}}
-	client.storage = &mockStorage{
-		applies:         &mockApplyStore{apply: apply},
-		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
-		logs:            &mockApplyLogStore{},
-		controlRequests: controlRequests,
-	}
-
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err, "the ambiguity guard fails the apply closed rather than reporting a stop it cannot account for")
-	assert.Empty(t, server.getStopApplyID(), "no remote stop is addressable without a remote apply id")
-	assert.Equal(t, state.Apply.Failed, apply.State, "the apply must not be recorded stopped while remote work may still be running")
-	assert.Equal(t, state.Task.Failed, task.State)
-
-	stopReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
-	require.NoError(t, err)
-	require.NotNil(t, stopReq)
-	assert.Equal(t, storage.ControlRequestFailed, stopReq.Status, "the guard must fail the pending stop so the operator sees the rejection")
-	assert.Contains(t, stopReq.ErrorMessage, "remote dispatch state is ambiguous")
-}
-
-func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingCancelAndStop(t *testing.T) {
-	// An operator who cancels an unresponsive apply and then stops it leaves both
-	// requests pending. The drive processes cancel first, so a stop path that
-	// settled locally would take over from the unhandled cancel and route around
-	// the dispatch ambiguity guard entirely. Both requests must defer to the
-	// guard, and the guard must fail both once it has failed the apply closed.
-	server := &capturingTernServer{}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
-
-	apply := &storage.Apply{
-		ID:              9,
-		ApplyIdentifier: "apply-ambiguous-cancel-stop",
-		PlanID:          99,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "staging",
-		State:           state.Apply.Running,
-	}
-	task := &storage.Task{
-		ID:             11,
-		TaskIdentifier: "task-users",
-		ApplyID:        apply.ID,
-		TableName:      "users",
-		State:          state.Task.Running,
-	}
-	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
-		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
-		{ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
-	}}
-	client.storage = &mockStorage{
-		applies:         &mockApplyStore{apply: apply},
-		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
-		logs:            &mockApplyLogStore{},
-		controlRequests: controlRequests,
-	}
-
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err, "a second pending request must not carry the drive past the ambiguity guard")
-	assert.Equal(t, state.Apply.Failed, apply.State)
-	assert.Empty(t, server.getCancelApplyID())
-	assert.Empty(t, server.getStopApplyID())
-
-	for _, op := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
-		req, err := controlRequests.GetByOperation(t.Context(), apply.ID, op)
-		require.NoError(t, err)
-		require.NotNilf(t, req, "the %s request must exist", op)
-		assert.Equalf(t, storage.ControlRequestFailed, req.Status, "the guard must fail the pending %s request so the operator sees the rejection", op)
-		assert.Contains(t, req.ErrorMessage, "remote dispatch state is ambiguous")
+			req := server.getApplyRequest()
+			require.NotNil(t, req, "the drive must re-send the dispatch rather than settle the request locally")
+			assert.Equal(t, remoteApplyIdempotencyKey(apply, wholeApplyTaskScope()), req.IdempotencyKey)
+			assert.Equal(t, "remote-recovered", apply.ExternalID)
+			assert.Equal(t, state.Apply.Completed, apply.State)
+			assert.Equal(t, tc.wantCancelID, server.getCancelApplyID())
+			assert.Equal(t, tc.wantStopID, server.getStopApplyID())
+			for _, op := range tc.requests {
+				got, err := controlRequests.GetByOperation(t.Context(), apply.ID, op)
+				require.NoError(t, err)
+				require.NotNilf(t, got, "the %s request must exist", op)
+				assert.Equalf(t, tc.wantStatus[op], got.Status, "the %s request must settle on the remote apply's outcome", op)
+				assert.Containsf(t, got.ErrorMessage, tc.wantMessage[op], "the %s request message", op)
+				assert.NotContainsf(t, got.ErrorMessage, "ambiguous", "the %s request must settle on a real outcome", op)
+			}
+		})
 	}
 }
 
-func TestGRPCClient_ResumeApplyOperationAmbiguousDispatchLeavesApplyCancelPending(t *testing.T) {
-	// An operation recorded past its first dispatch with no remote apply id is
-	// the ambiguous lost-dispatch shape, and the guard fails that operation
-	// closed. The apply-level cancel request is shared across deployments, so
-	// the guard must leave it pending: a sibling with its own remote apply still
-	// needs to observe the command, and the operator projection settles the
-	// request once the parent apply derives terminal.
-	server := &capturingTernServer{}
+func TestGRPCClient_ResumeApplyOperationLostDispatchLeavesApplyCancelPending(t *testing.T) {
+	// An operation recorded past its first dispatch with no remote apply id may
+	// have a remote apply whose dispatch response was lost. The drive re-sends
+	// the operation's dispatch under its deployment's unchanged key and stores
+	// the remote apply id on the operation. The apply-level cancel request is
+	// shared across deployments, so the drive leaves it pending: a sibling with
+	// its own remote apply still needs to observe the command, and the operator
+	// projection settles the request once the parent apply derives terminal.
+	server := &capturingTernServer{remoteApplyID: "remote-west"}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
 
 	apply := &storage.Apply{
 		ID:              7,
-		ApplyIdentifier: "apply-multi-op-ambiguous-cancel",
+		ApplyIdentifier: "apply-multi-op-lost-dispatch-cancel",
 		PlanID:          99,
 		Database:        "testdb",
 		DatabaseType:    storage.DatabaseTypeMySQL,
@@ -3258,14 +3228,22 @@ func TestGRPCClient_ResumeApplyOperationAmbiguousDispatchLeavesApplyCancelPendin
 		logs:            &mockApplyLogStore{},
 		controlRequests: controlRequests,
 		operations:      operationStore,
+		plans:           &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-multi-op-lost-dispatch"}},
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
-	err := client.ResumeApplyOperation(ctx, apply, operationID)
-	require.Error(t, err, "the ambiguity guard fails the operation closed rather than cancelling work it cannot account for")
-	assert.Empty(t, server.getCancelApplyID(), "no remote cancel is addressable without a remote apply id")
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "the drive must re-send the operation's dispatch")
+	scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, operationID)
+	require.NoError(t, err)
+	assert.Equal(t, remoteApplyIdempotencyKey(apply, scope), req.IdempotencyKey, "the re-sent dispatch must carry the deployment's unchanged key")
+	assert.Equal(t, "remote-west", operationStore.ops[operationID].ExternalID)
+	assert.Equal(t, "remote-east", operationStore.ops[siblingID].EngineResumeContext, "the sibling's remote id must be untouched")
+	assert.Equal(t, "remote-west", server.getCancelApplyID(), "the cancel must reach the recovered remote apply")
 
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
@@ -6969,6 +6947,80 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 			assert.NotEmpty(t, s.Shard, "no per-shard row may be stored without a shard name")
 		}
 	})
+
+	t.Run("stops at the first shard once the reconcile context ends", func(t *testing.T) {
+		// A drive stopping on shutdown or lease release cancels its reconcile
+		// context. Every remaining shard write would fail the same way, so the
+		// encode stops after the first one and logs the stop once instead of an
+		// error per shard. A cancel is routine and logs at Info; a reconcile
+		// that ran out of time logs at Warn.
+		tests := []struct {
+			name      string
+			endCtx    func(ctx context.Context) (context.Context, context.CancelFunc)
+			ctxErr    error
+			wantMsg   string
+			wantLevel string
+		}{
+			{
+				name: "cancelled",
+				endCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+					ctx, cancel := context.WithCancel(ctx)
+					cancel()
+					return ctx, cancel
+				},
+				ctxErr:    context.Canceled,
+				wantMsg:   "stopping remote per-shard progress encode: reconcile context was cancelled",
+				wantLevel: "INFO",
+			},
+			{
+				name: "deadline passed",
+				endCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+					return context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				},
+				ctxErr:    context.DeadlineExceeded,
+				wantMsg:   "stopping remote per-shard progress encode: reconcile context deadline passed",
+				wantLevel: "WARN",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				storedTask := newStoredTask()
+				tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+				var logs bytes.Buffer
+				client := &GRPCClient{
+					storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}},
+					logger:  slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+				}
+				ctx, cancel := tt.endCtx(storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Token: "lease-tok"}))
+				defer cancel()
+				tasks.upsertShardErr = fmt.Errorf("look up shard task: %w", tt.ctxErr)
+
+				client.syncShardProgressFromRemote(ctx, apply, storedTask, remoteTables()[0].Shards, now)
+
+				assert.Equal(t, 1, tasks.upsertShardCalls, "no shard write may follow the first one once the context has ended")
+				assert.NotContains(t, logs.String(), "failed to encode remote per-shard progress")
+				stop := logEntryWithMessage(t, logs.String(), tt.wantMsg)
+				assert.Equal(t, tt.wantLevel, stop["level"])
+				assert.Equal(t, remoteTables()[0].Shards[0].Shard, stop["shard"])
+			})
+		}
+	})
+}
+
+// logEntryWithMessage decodes the JSON log lines in logs and returns the one
+// entry whose msg is want, failing the test unless exactly one matches.
+func logEntryWithMessage(t *testing.T, logs, want string) map[string]any {
+	t.Helper()
+	var matches []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), "log line is JSON: %s", line)
+		if entry["msg"] == want {
+			matches = append(matches, entry)
+		}
+	}
+	require.Len(t, matches, 1, "exactly one %q log entry in:\n%s", want, logs)
+	return matches[0]
 }
 
 func TestGRPCClient_SyncUnchangedProgressAdvancesUpdatedAt(t *testing.T) {
@@ -7706,53 +7758,6 @@ func TestGRPCClient_MarkRemoteApplyFailedReturnsTaskLoadError(t *testing.T) {
 	assert.Contains(t, err.Error(), "load tasks after remote gRPC apply failed")
 	assert.Contains(t, err.Error(), "task storage unavailable")
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
-}
-
-func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T) {
-	// A stale active gRPC apply without an external_id is ambiguous: the prior
-	// driver may have sent the remote Apply RPC and crashed before persisting the
-	// returned data-plane ID. Fail closed instead of dispatching a duplicate
-	// remote schema change.
-	server := &capturingTernServer{remoteApplyID: "remote-duplicate"}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
-
-	apply := &storage.Apply{
-		ID:              8,
-		ApplyIdentifier: "apply-ambiguous-dispatch",
-		PlanID:          100,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "staging",
-		State:           state.Apply.Running,
-	}
-	task := &storage.Task{
-		ID:             12,
-		TaskIdentifier: "task-ambiguous-dispatch",
-		ApplyID:        apply.ID,
-		TableName:      "users",
-		State:          state.Task.Running,
-	}
-	client.storage = &mockStorage{
-		applies: &mockApplyStore{apply: apply},
-		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
-		plans: &mockPlanStore{plan: &storage.Plan{
-			ID:             apply.PlanID,
-			PlanIdentifier: "plan-ambiguous-dispatch",
-		}},
-	}
-
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "remote dispatch state is ambiguous")
-
-	assert.Nil(t, server.getApplyRequest(), "ambiguous apply should not be dispatched to remote Tern")
-	assert.Equal(t, state.Apply.Failed, apply.State)
-	assert.Contains(t, apply.ErrorMessage, "remote dispatch state is ambiguous")
-	assert.Equal(t, state.Task.Failed, task.State)
-	assert.Contains(t, task.ErrorMessage, "remote dispatch state is ambiguous")
 }
 
 func TestGRPCClient_ResumeApplyDoesNotFailStateWhenRemoteDispatchOutcomeIsAmbiguous(t *testing.T) {
@@ -10520,14 +10525,16 @@ func (o *supersededFakeObserver) Superseded() bool { return o.superseded.Load() 
 func TestClearObserverIfCurrent(t *testing.T) {
 	oldObs := &supersededFakeObserver{}
 	newObs := &supersededFakeObserver{}
-	client := &GRPCClient{observers: map[int64]ProgressObserver{1: oldObs}}
+	oldReg := &observerRegistration{observer: oldObs}
+	newReg := &observerRegistration{observer: newObs}
+	client := &GRPCClient{observers: map[int64]*observerRegistration{1: oldReg}}
 
-	client.observers[1] = newObs
-	assert.False(t, client.clearObserverIfCurrent(1, oldObs),
+	client.observers[1] = newReg
+	assert.False(t, client.clearObserverIfCurrent(1, oldReg),
 		"a replaced observer must not clear its replacement")
 	assert.Same(t, newObs, client.getObserver(1), "the replacement stays registered")
 
-	assert.True(t, client.clearObserverIfCurrent(1, newObs),
+	assert.True(t, client.clearObserverIfCurrent(1, newReg),
 		"the current observer clears itself")
 	assert.Nil(t, client.getObserver(1))
 }
@@ -10758,4 +10765,263 @@ func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 			t.Errorf("%s has no deadline class; add it to the heavy or control list", method)
 		}
 	}
+}
+
+// switchableApplyStore serves one apply whose state a test changes while a
+// poller reads it.
+type switchableApplyStore struct {
+	storage.ApplyStore
+	mu    sync.Mutex
+	apply storage.Apply
+	// gets counts reads, so a test can wait for the poller to tick.
+	gets atomic.Int32
+}
+
+func (s *switchableApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	s.gets.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	apply := s.apply
+	return &apply, nil
+}
+
+// switchableStorage serves a switchableApplyStore in place of the mock store.
+type switchableStorage struct {
+	*mockStorage
+	applies *switchableApplyStore
+}
+
+func (s *switchableStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *switchableApplyStore) setState(applyState string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apply.State = applyState
+}
+
+// blockingTerminalObserver holds OnTerminal until released, standing in for a
+// comment observer still publishing its terminal comment and Check Run.
+type blockingTerminalObserver struct {
+	entered  chan struct{}
+	release  chan struct{}
+	progress atomic.Int32
+	terminal atomic.Int32
+}
+
+func newBlockingTerminalObserver() *blockingTerminalObserver {
+	return &blockingTerminalObserver{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (o *blockingTerminalObserver) OnProgress(*storage.Apply, []*storage.Task) {
+	o.progress.Add(1)
+}
+
+func (o *blockingTerminalObserver) OnTerminal(*storage.Apply, []*storage.Task) {
+	o.terminal.Add(1)
+	select {
+	case o.entered <- struct{}{}:
+	default:
+	}
+	<-o.release
+}
+
+// nonComparableObserver is a valid ProgressObserver whose dynamic type cannot
+// be compared: comparing two of them as interface values panics.
+type nonComparableObserver struct {
+	*blockingTerminalObserver
+	labels []string
+}
+
+// Starting a stopped apply registers a new observer for it while the stopped
+// observer may still be publishing its terminal update. The poll loop that
+// delivered the stop must hand the apply to the new observer rather than
+// clear it: the new registration started no poller of its own, so clearing it
+// leaves the resumed apply with no progress or terminal updates at all. The
+// hand-off must not depend on the observers being comparable.
+func TestObserverPollKeepsAnObserverRegisteredDuringTerminal(t *testing.T) {
+	for name, wrap := range map[string]func(*blockingTerminalObserver) ProgressObserver{
+		"pointer observer": func(o *blockingTerminalObserver) ProgressObserver { return o },
+		"non-comparable observer": func(o *blockingTerminalObserver) ProgressObserver {
+			return nonComparableObserver{o, []string{"resume"}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			const applyID int64 = 78
+			applies := &switchableApplyStore{apply: storage.Apply{
+				ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
+			}}
+			client := &GRPCClient{
+				storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
+				observerPollInterval: 10 * time.Millisecond,
+			}
+
+			stopped := newBlockingTerminalObserver()
+			client.SetObserver(applyID, wrap(stopped))
+			select {
+			case <-stopped.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the stopped apply never reached its observer's OnTerminal")
+			}
+
+			resumed := newBlockingTerminalObserver()
+			close(resumed.release)
+			applies.setState(state.Apply.Running)
+			client.SetObserver(applyID, wrap(resumed))
+			close(stopped.release)
+
+			require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+				5*time.Second, 10*time.Millisecond,
+				"the resumed apply's observer must receive progress")
+
+			applies.setState(state.Apply.Completed)
+			require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+				5*time.Second, 10*time.Millisecond,
+				"the resumed apply's observer must receive its terminal update and then be cleared")
+			assert.Equal(t, int32(1), stopped.terminal.Load(), "the stopped observer's terminal update runs once")
+		})
+	}
+}
+
+// panickingTerminalObserver panics in OnTerminal once released, standing in
+// for an observer whose terminal update fails while a start registers its
+// replacement.
+type panickingTerminalObserver struct {
+	*blockingTerminalObserver
+}
+
+func (o *panickingTerminalObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
+	o.blockingTerminalObserver.OnTerminal(apply, tasks)
+	panic("terminal update failed")
+}
+
+// newHandoffTestClient returns a client polling a stopped apply, and waits for
+// stopped's OnTerminal to start.
+func newHandoffTestClient(t *testing.T, applyID int64, stopped ProgressObserver, entered <-chan struct{}, grace time.Duration) (*GRPCClient, *switchableApplyStore) {
+	t.Helper()
+	applies := &switchableApplyStore{apply: storage.Apply{
+		ID: applyID, ApplyIdentifier: "apply-resumed", State: state.Apply.Stopped,
+	}}
+	client := &GRPCClient{
+		storage:              &switchableStorage{mockStorage: &mockStorage{tasks: &mockTaskStore{}}, applies: applies},
+		observerPollInterval: 10 * time.Millisecond,
+		observerHandoffGrace: grace,
+	}
+	client.SetObserver(applyID, stopped)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stopped apply never reached its observer's OnTerminal")
+	}
+	return client, applies
+}
+
+// waitForTicks waits until the poller has read the apply n more times.
+func waitForTicks(t *testing.T, applies *switchableApplyStore, n int32) {
+	t.Helper()
+	start := applies.gets.Load()
+	require.Eventually(t, func() bool { return applies.gets.Load() >= start+n },
+		5*time.Second, 5*time.Millisecond, "the poller stopped ticking")
+}
+
+// On a single-operation apply, a start registers its observer before the
+// drive moves the row out of stopped. The poller must not hand that observer
+// the stop it already delivered, nor clear it: it waits for the row to move.
+func TestObserverPollHoldsTheStopBackFromAnObserverRegisteredWhileStopped(t *testing.T) {
+	const applyID int64 = 79
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	waitForTicks(t, applies, 5)
+	assert.Equal(t, int32(0), resumed.terminal.Load(), "the resumed observer must not receive the earlier stop")
+	assert.Same(t, resumed, client.getObserver(applyID), "the resumed observer must stay registered")
+
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive progress")
+	applies.setState(state.Apply.Completed)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive its terminal update and then be cleared")
+	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
+// Once the resumed apply runs, the handoff is over. A second stop within the
+// grace is a new stop, so its observer receives it at once, exactly once.
+func TestObserverPollDeliversASecondStopAfterTheApplyResumes(t *testing.T) {
+	const applyID int64 = 83
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the resumed apply's observer must receive progress")
+
+	applies.setState(state.Apply.Stopped)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the second stop must reach the resumed observer before the grace ends")
+	// Clearing the observer ends the poll, so nothing can deliver it again.
+	assert.Equal(t, int32(1), stopped.terminal.Load())
+}
+
+// A start that never moves the row out of stopped did not resume the apply.
+// Once the grace passes, its observer receives the stop and is cleared, so
+// the poller does not tick a stopped apply forever.
+func TestObserverPollDeliversTheStopOnceTheHandoffGracePasses(t *testing.T) {
+	const applyID int64 = 80
+	stopped := newBlockingTerminalObserver()
+	client, _ := newHandoffTestClient(t, applyID, stopped, stopped.entered, 50*time.Millisecond)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(stopped.release)
+
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the observer of a start that never resumed must receive the stop and be cleared")
+}
+
+// If the stopped observer's terminal update panics after a start registered
+// its replacement, the replacement must still be polled rather than deleted.
+func TestObserverPollKeepsAReplacementWhenTheTerminalUpdatePanics(t *testing.T) {
+	const applyID int64 = 81
+	inner := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, &panickingTerminalObserver{inner}, inner.entered, time.Hour)
+
+	resumed := newBlockingTerminalObserver()
+	close(resumed.release)
+	client.SetObserver(applyID, resumed)
+	close(inner.release)
+
+	waitForTicks(t, applies, 2)
+	applies.setState(state.Apply.Running)
+	require.Eventually(t, func() bool { return resumed.progress.Load() > 0 },
+		5*time.Second, 10*time.Millisecond, "the replacement must be polled after the panic")
+	applies.setState(state.Apply.Completed)
+	require.Eventually(t, func() bool { return resumed.terminal.Load() == 1 && client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond)
+}
+
+// Routed calls re-attach the observer already registered. That is not a
+// replacement, so the observer receives its terminal update once.
+func TestObserverPollTreatsAReattachedObserverAsTheSameRegistration(t *testing.T) {
+	const applyID int64 = 82
+	stopped := newBlockingTerminalObserver()
+	client, applies := newHandoffTestClient(t, applyID, stopped, stopped.entered, time.Hour)
+
+	client.SetObserver(applyID, stopped)
+	close(stopped.release)
+
+	require.Eventually(t, func() bool { return client.getObserver(applyID) == nil },
+		5*time.Second, 10*time.Millisecond, "the observer is cleared after its terminal update")
+	waitForTicks(t, applies, 0)
+	assert.Equal(t, int32(1), stopped.terminal.Load())
 }

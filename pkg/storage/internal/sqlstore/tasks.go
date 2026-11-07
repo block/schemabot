@@ -277,6 +277,14 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		if !opLease.Valid() {
 			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
 		}
+		// The guarded statement matches only the leased operation's rows, so a
+		// task of another operation would update nothing while the lease check
+		// still passed, and the caller would read a write that never landed as
+		// one that did.
+		if task.ApplyOperationID == nil || *task.ApplyOperationID != opLease.OperationID {
+			return fmt.Errorf("update task %d (%s) of operation %s under the lease for operation %d: %w",
+				task.ID, task.TaskIdentifier, taskOperationLabel(task), opLease.OperationID, storage.ErrTaskOutsideOperationLease)
+		}
 		guard = taskGuardOperation
 		args = append(args, opLease.OperationID, opLease.Token)
 		verifyLeaseStillOwned = func() error { return ensureOperationLeaseStillOwned(ctx, s.db, opLease) }
@@ -306,6 +314,14 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		return verifyLeaseStillOwned()
 	}
 	return nil
+}
+
+// taskOperationLabel names a task's operation for an error message.
+func taskOperationLabel(task *storage.Task) string {
+	if task.ApplyOperationID == nil {
+		return "none"
+	}
+	return strconv.FormatInt(*task.ApplyOperationID, 10)
 }
 
 // UpsertShardProgress creates or updates the per-shard task row for

@@ -84,6 +84,11 @@ var (
 	// operation to remain unleased but a live drive owns it.
 	ErrOperationLeaseActive = errors.New("operation lease is active")
 
+	// ErrTaskOutsideOperationLease is returned when a task write under an
+	// operation lease names a task of another operation, or of none. The lease
+	// authorizes writes to its own operation's tasks only.
+	ErrTaskOutsideOperationLease = errors.New("task is outside the held operation lease")
+
 	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
 	// apply's superseded_by marker to a different successor. The marker is
 	// write-once, so a second claimant means the takeover is ambiguous.
@@ -132,3 +137,28 @@ var (
 	// ErrWebhookEventLeaseLost is returned when a driver no longer owns a durable webhook event.
 	ErrWebhookEventLeaseLost = errors.New("webhook event lease lost")
 )
+
+// ActiveApplyError reports the apply that already holds a target another apply
+// asked for. It matches ErrActiveApplyExists, and carries the holder's
+// identifier and state so a caller can tell the operator what to do next
+// without presenting the error text.
+type ActiveApplyError struct {
+	// HolderApplyID is the identifier of the apply holding the target.
+	HolderApplyID string
+	// HolderState is the holding apply's own state. It can be terminal when
+	// the apply has ended but one of its operations is still in progress,
+	// which keeps the rollout's targets reserved.
+	HolderState string
+	Database    string
+	Environment string
+	// Detail is the store's full account of the conflict, for the log line.
+	Detail string
+}
+
+func (e *ActiveApplyError) Error() string {
+	return e.Detail + ": " + ErrActiveApplyExists.Error()
+}
+
+func (e *ActiveApplyError) Unwrap() error {
+	return ErrActiveApplyExists
+}

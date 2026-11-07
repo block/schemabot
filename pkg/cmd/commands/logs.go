@@ -33,6 +33,8 @@ type LogsCmd struct {
 	Limit       int    `short:"n" help:"Show the newest N log entries" default:"50"`
 	Follow      bool   `short:"f" help:"Print the newest N entries, then poll for new ones until interrupted"`
 	Deployment  string `help:"Read logs from the selected data-plane deployment"`
+	Target      string `help:"Show only one target's entries, plus the entries about the whole apply"`
+	Shard       string `help:"Show only one shard's entries of a sharded apply, plus the entries about the whole apply; with --target, that target's shard. Join a shard that starts with - to the flag: --shard=-80"`
 	JSON        bool   `help:"Output as JSON"`
 }
 
@@ -64,23 +66,24 @@ func (cmd *LogsCmd) Run(ctx context.Context, g *Globals) error {
 		return err
 	}
 
+	scope := client.LogScope{Target: cmd.Target, Shard: cmd.Shard}
 	switch {
 	case cmd.Follow && cmd.Deployment != "":
-		return followDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, cmd.Limit)
+		return followDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit)
 	case cmd.Follow:
-		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Limit)
+		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit)
 	case cmd.Deployment != "":
-		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, cmd.Limit, cmd.JSON)
+		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit, cmd.JSON)
 	default:
-		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Limit, cmd.JSON)
+		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit, cmd.JSON)
 	}
 }
 
-func showDeploymentLogs(endpoint, applyID, deployment string, limit int, outputJSON bool) error {
+func showDeploymentLogs(endpoint, applyID, deployment string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.DeploymentLogsResponse
 	err := withLoading("Loading data-plane logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, limit)
+		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
 		return loadErr
 	})
 	if err != nil {
@@ -127,11 +130,11 @@ func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperation
 }
 
 // showLogs displays logs once and exits.
-func showLogs(endpoint, database, environment, applyID string, limit int, outputJSON bool) error {
+func showLogs(endpoint, database, environment, applyID string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.LogsResponse
 	err := withLoading("Loading logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, limit)
+		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, scope, limit)
 		return loadErr
 	})
 	if err != nil {
@@ -171,19 +174,20 @@ func printFollowGapNotice() {
 
 // followLogs prints the newest initialLimit entries, then polls for new ones
 // until the command context is cancelled (Ctrl+C).
-func followLogs(ctx context.Context, endpoint, database, environment, applyID string, initialLimit int) error {
+func followLogs(ctx context.Context, endpoint, database, environment, applyID string, scope client.LogScope, initialLimit int) error {
+	header := scopeHeader(scope)
 	switch {
 	case applyID != "" && database == "":
-		fmt.Printf("Following logs for %s... (Ctrl+C to stop)\n\n", applyID)
+		fmt.Printf("Following logs for %s%s... (Ctrl+C to stop)\n\n", applyID, header)
 	case applyID != "":
-		fmt.Printf("Following logs for %s (apply %s)... (Ctrl+C to stop)\n\n", database, applyID)
+		fmt.Printf("Following logs for %s (apply %s)%s... (Ctrl+C to stop)\n\n", database, applyID, header)
 	default:
-		fmt.Printf("Following logs for %s/%s... (Ctrl+C to stop)\n\n", database, environment)
+		fmt.Printf("Following logs for %s/%s%s... (Ctrl+C to stop)\n\n", database, environment, header)
 	}
 
 	state := &followState{}
 	fetch := func(limit int) (*apitypes.LogsResponse, error) {
-		return client.GetLogs(endpoint, database, environment, applyID, limit)
+		return client.GetLogs(endpoint, database, environment, applyID, scope, limit)
 	}
 	emit := func(result *apitypes.LogsResponse, initial bool) {
 		switch {
@@ -197,15 +201,28 @@ func followLogs(ctx context.Context, endpoint, database, environment, applyID st
 	return runFollowLoop(ctx, fetch, emit, initialLimit, followInterval)
 }
 
+// scopeHeader names the target and shard a followed read is narrowed to, for
+// the header that opens the tail.
+func scopeHeader(scope client.LogScope) string {
+	var header string
+	if scope.Target != "" {
+		header += ", target " + scope.Target
+	}
+	if scope.Shard != "" {
+		header += ", shard " + scope.Shard
+	}
+	return header
+}
+
 // followDeploymentLogs tails data-plane logs: it prints the newest
 // initialLimit entries from every remote source, then polls for new ones
 // until the command context is cancelled (Ctrl+C).
-func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, initialLimit int) error {
-	fmt.Printf("Following data-plane logs for %s on %s... (Ctrl+C to stop)\n\n", applyID, deployment)
+func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, scope client.LogScope, initialLimit int) error {
+	fmt.Printf("Following data-plane logs for %s on %s%s... (Ctrl+C to stop)\n\n", applyID, deployment, scopeHeader(scope))
 
 	state := newDeploymentFollowState()
 	fetch := func(limit int) (*apitypes.DeploymentLogsResponse, error) {
-		return client.GetDeploymentLogs(endpoint, applyID, deployment, limit)
+		return client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
 	}
 	// The loop-wide initial flag is unused here: each source owes the
 	// truncation notice to its own first successful read, which for a source

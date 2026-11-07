@@ -515,12 +515,17 @@ or from one request that covers them all, never by a lookup per file.
 *Breaks if violated:* an App installation's rate limit is shared by every pull request in every
 repository it serves, so routine edits in one large repository use it up and required checks stop
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
-configs, probing each directory once (`pkg/github/config.go`), and
+configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
+(`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
+symlinks from one diff of the change, or from directory listings batched across those paths when
+GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
+the server's configuration names every directory the repository's configs can sit in, and reads a
+symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
-(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
-hundred one-line edits outside its schema directory and requires the same GitHub requests. It
-covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
-a repository whose tree GitHub truncates.
+(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
+one-line edits outside its schema directory and requires the same GitHub requests. It covers an
+auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
+repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
@@ -584,7 +589,9 @@ scope and pending contributions for missing local results (`pkg/webhook/aggregat
 path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
 match, which all read the schema paths a PR vacates as well as those it changes
 (`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
-`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`);
+`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`), with
+the narrowing to what a PR proposes keeping every vacated schema or config path the default branch
+still holds (`PRFilesProposedAgainstDefaultBranch` in `pkg/github/client.go`);
 required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
 `pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
 multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
@@ -1140,7 +1147,10 @@ held apply once its stored row names the apply that took over its work
 (`updateApplyStateFromOperations`, `pkg/api/operator.go`). A control plane retrying an operation
 that never attached dispatches it under its deployment's unchanged key and manifest, so the retry
 lands on that deployment's one remote apply rather than arriving as a newer generation
-(`remoteApplyIdempotencyKey`, `generationOperationKeys`, `pkg/tern/grpc_client.go`).
+(`remoteApplyIdempotencyKey`, `generationOperationKeys`, `pkg/tern/grpc_client.go`). Work found
+active with no remote apply id re-sends its dispatch under the key the earlier dispatch carried, and
+a re-send that gets no verdict leaves the work untouched rather than recording a failure that
+would rotate the key (`hasAmbiguousRemoteDispatchState`, `settleFailedDispatch`, same file).
 
 ### OW-6: There is one way to claim work
 
@@ -1203,9 +1213,9 @@ stored rows without writing them (`pkg/api/progress_handlers.go`).
 ### OW-9: An advisory lock is only exclusion where the session holds still
 
 Every guarantee SchemaBot has across instances that is not a lease predicate is one advisory
-lock: the storage bootstrap, the apply target lock behind OW-5, and reaper election. All three
-are session-scoped, so all three are exclusion only while a connection keeps reaching the same
-server session.
+lock: the storage bootstrap, the apply target lock behind OW-5, reaper election, and the pending
+drops cleanup lock behind RV-5. All four are session-scoped, so all four are exclusion only while
+a connection keeps reaching the same server session.
 
 That is a property of the connection and not of the lock. It holds against a database, and
 against a pooler that gives a client its own session for the connection's lifetime. It does not
@@ -1230,7 +1240,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
 `releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
-lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`; `releaseCleanupLock`,
+`pkg/pendingdrops/cleaner.go`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1770,7 +1781,9 @@ mandatory, is checked at apply time against the current base, and cannot be waiv
 not preserving a stale plan. *Enforced:* `assertBaseSchemaStillCurrent` on both apply entry
 points (`pkg/webhook/schema_freshness.go`, called from `pkg/webhook/apply_handlers.go`). It
 compares Git tree OIDs, stops on GitHub read uncertainty, and takes no `allowUnsafe` argument to
-waive with.
+waive with. A plan whose base is newer, or could not be checked, is never suppressed:
+`planCommentUpToDate` and the auto-plan publication path in `pkg/webhook/plan.go` post it in place
+of the visible comment.
 
 ### RV-3: Consent is explicit, specific, and re-checked
 
@@ -1804,6 +1817,9 @@ dispatch scope, an attaching shard dispatch re-planned against its own shard and
 shard's verdict, and a shard dispatch this deployment could not re-plan (it carries no schema
 files) treated as unsafe (`verifyAttachedShardDispatch` and `restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+`pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
+mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
+`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeVSchemaChangesWithoutOptIn` in
 `pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
@@ -1996,9 +2012,11 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval counts only for the schema change it reviewed: it was
-given on the commit being applied, or on an earlier commit at which the change's own effect on every
-schema input is provably the same, or the change has stopped touching an input that newer default
+their own review requirement. An approval that the reviewer withdrew or that the repository
+dismissed does not count. An approval counts only for the schema change it reviewed, unless the
+change's target branch dismisses stale approvals itself or the review policy turns re-approval
+off: it was given on the commit being applied, or on an earlier commit at which the change's own
+effect on every schema input is provably the same, or the change has stopped touching an input that newer default
 branch content has changed since, so any difference between the two came from newer content on the
 repository's default branch; when that cannot be proved, the approval does not count. A change
 targeting any other branch keeps an approval only where its own effect and its base content are
@@ -2011,7 +2029,9 @@ generates no statement the approval did not cover: with `SameTableChange`
 (`pkg/ddl/table_change.go`) for MySQL-family table files, `SameVSchemaChange`
 (`pkg/ddl/vschema_change.go`) for a Vitess keyspace's VSchema, and on the environment's primary
 target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for PostgreSQL
-files.
+files. Whether the target branch dismisses stale approvals is read by
+`BaseBranchDismissesStaleApprovals` (`pkg/github/branch_rules.go`); when it cannot be read, the
+gate compares.
 
 ### AZ-5: Commands never guess
 

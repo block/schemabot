@@ -59,21 +59,24 @@ func TestLogRequestQueryValuesAreEncoded(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Clone(t.Context()))
 		w.Header().Set("Content-Type", "application/json")
-		_, err := w.Write([]byte(`{"logs":[],"sources":[],"errors":[]}`))
-		require.NoError(t, err)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"logs": []any{}, "sources": []any{}, "errors": []any{}, "target": r.URL.Query().Get("target"), "shard": r.URL.Query().Get("shard")}))
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := GetLogs(server.URL, "", "", "apply/a & b", 17)
+	_, err := GetLogs(server.URL, "", "", "apply/a & b", LogScope{Target: "shop/a & b", Shard: "-80"}, 17)
 	require.NoError(t, err)
-	_, err = GetDeploymentLogs(server.URL, "apply/a & b", "data plane/one", 23)
+	_, err = GetDeploymentLogs(server.URL, "apply/a & b", "data plane/one", LogScope{Target: "shop/a & b", Shard: "80-"}, 23)
 	require.NoError(t, err)
 	require.Len(t, requests, 2)
 	assert.Equal(t, "apply/a & b", requests[0].URL.Query().Get("apply_id"))
 	assert.Equal(t, "17", requests[0].URL.Query().Get("limit"))
+	assert.Equal(t, "shop/a & b", requests[0].URL.Query().Get("target"))
+	assert.Equal(t, "-80", requests[0].URL.Query().Get("shard"))
 	assert.Equal(t, "apply/a & b", requests[1].URL.Query().Get("apply_id"))
 	assert.Equal(t, "data plane/one", requests[1].URL.Query().Get("deployment"))
 	assert.Equal(t, "23", requests[1].URL.Query().Get("limit"))
+	assert.Equal(t, "shop/a & b", requests[1].URL.Query().Get("target"))
+	assert.Equal(t, "80-", requests[1].URL.Query().Get("shard"))
 }
 
 func TestCallPullSchemaAPIError(t *testing.T) {
@@ -523,4 +526,47 @@ func TestGenerateCLIOwnerIsCanonical(t *testing.T) {
 		owner := GenerateCLIOwner()
 		assert.Equal(t, storage.CanonicalKey(owner), owner)
 	})
+}
+
+// A server that predates scoped reads ignores target and shard and serves the
+// whole apply's log. The client refuses that answer rather than present every
+// target's or shard's entries as the one's history, and still accepts an
+// unscoped read from the same server.
+func TestScopedLogReadRefusesAnUnscopedAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"apply_id":"apply-a","logs":[],"sources":[],"errors":[]}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := GetLogs(server.URL, "", "", "apply-a", LogScope{Target: "shop-002"}, 10)
+	require.ErrorContains(t, err, "does not support reading one target's logs")
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{Target: "shop-002"}, 10)
+	require.ErrorContains(t, err, "does not support reading one target's logs")
+	_, err = GetLogs(server.URL, "", "", "apply-a", LogScope{Shard: "-80"}, 10)
+	require.ErrorContains(t, err, "does not support reading one shard's logs and returned the whole apply's; upgrade the server or omit --shard")
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{Shard: "-80"}, 10)
+	require.ErrorContains(t, err, "does not support reading one shard's logs and returned the whole apply's; upgrade the server or omit --shard")
+
+	_, err = GetLogs(server.URL, "", "", "apply-a", LogScope{}, 10)
+	require.NoError(t, err)
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{}, 10)
+	require.NoError(t, err)
+}
+
+// A server that answers a shard read with another shard's log is refused too,
+// naming both shards, rather than shown as the requested shard's history.
+func TestScopedLogReadRefusesAnotherShardsAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"apply_id":"apply-a","shard":"80-","logs":[],"sources":[],"errors":[]}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := GetLogs(server.URL, "", "", "apply-a", LogScope{Shard: "-80"}, 10)
+	require.EqualError(t, err, `the server answered a read of shard "-80" with shard "80-"'s logs`)
+	_, err = GetDeploymentLogs(server.URL, "apply-a", "region-a", LogScope{Shard: "-80"}, 10)
+	require.EqualError(t, err, `the server answered a read of shard "-80" with shard "80-"'s logs`)
 }

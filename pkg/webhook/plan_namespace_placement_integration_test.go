@@ -58,6 +58,7 @@ type namespacePlacementHarness struct {
 	store      storage.Storage
 	handler    *Handler
 	github     *planFlowResult
+	mux        *http.ServeMux
 	production *namespaceSelectingTernClient
 }
 
@@ -143,6 +144,7 @@ func newMultiEnvPlanHarnessWithRepo(t *testing.T, productionTargets []api.Target
 		store:   st,
 		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
 		github:  result,
+		mux:     mux,
 	}
 }
 

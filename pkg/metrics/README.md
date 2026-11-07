@@ -80,10 +80,14 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
+| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP or local prevention; investigate shared quota usage and blocked work (see guidance below) |
+| `schemabot.github.secondary_rate_limit_cooldown_reports_total` | Counter | environment, operation, resource, github_app, installation_id, disposition | Parsed secondary cooldown decisions, including accepted and exceeded allowances |
+| `schemabot.github.wait_duration_seconds` | Histogram (seconds) | environment, operation, resource, github_app, installation_id, layer, reason | Actual elapsed outer read-retry waits, including cancellation/deadline interruptions |
 | `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
-| `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
-| `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
-| `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
+| `schemabot.github.rate_limit.limit` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
+| `schemabot.github.rate_limit.remaining` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
+| `schemabot.github.rate_limit.observation_age_seconds` | Observable gauge | environment, operation, resource, github_app, installation_id | Age of the latest trustworthy installation snapshot; continues increasing during idle periods |
+| `schemabot.github.rate_limit.used` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.target.probe.total` | Counter | database_type, environment, outcome | Startup connectivity probes of enumerated targets, by outcome. This counter sits below the volume bar in [Does it belong in a metric?](#does-it-belong-in-a-metric) — one observation per target per process start — and earns its place as a deploy-time alert instead: a fleet-wide rollout produces a burst of observations at once, and any non-`success` outcome in that burst is a rotated credential, dropped grant, or unreachable target found before the first schema change reaches it. Alert on `outcome != success` per environment after each deploy. Target is omitted to bound cardinality; the paired warn log names it |
 | `schemabot.remote_control_requests.rejected_total` | Counter | operation, engine, database, deployment, environment | Control requests a remote data plane accepted and its own driver then failed, mirrored back so the operator learns the command never took effect — see [Control Operations](#control-operations) |
@@ -175,17 +179,17 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_branch_rules`, `get_combined_status`, `get_pull_request_review_protection`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
 **resource** (GitHub API): `core`, `graphql`, `search`, `code_search`, `integration_manifest`, `source_import`, `code_scanning_upload`, `actions_runner_registration`, `scim`, `dependency_snapshots`, `dependency_sbom`, `audit_log`
 
-**status** (GitHub API): `success`, `error`, `not_found` (a 404 answer to a read operation — an expected "no" from probes like schemabot.yaml lookups; 404s on auth and write operations stay `error`), `transport_error` (no HTTP response: dial/TLS failure or deadline — the signature of GitHub being unreachable), `cancelled` (SchemaBot cancelled the request itself, e.g. during shutdown), `unknown`
+**status** (GitHub API): `success`, `error`, `not_found` (a 404 answer to a read operation — an expected "no" from probes like schemabot.yaml lookups; 404s on auth and write operations stay `error`), `transport_error` (no HTTP response: dial/TLS failure or deadline — the signature of GitHub being unreachable), `cancelled` (SchemaBot cancelled the request itself, e.g. during shutdown), `suppressed` (a write SchemaBot refused to send because the repository is `listen_only`; it never reached GitHub), `unknown`
 
-**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `stranded_active_task_reaper_error`, `stranded_control_request_reaper_error`, `branch_reconcile_error`, `unknown`
+**reason** (operator claim failures): `expire_retryable_error`, `expire_degraded_retry_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `stranded_active_task_reaper_error`, `stranded_control_request_reaper_error`, `branch_reconcile_error`, `unknown`
 
-**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `lease_presumed_lost`, `retry_budget_exhausted`, `recovery_window_expired`, `drive_panic`, `drive_stalled`, `operation_no_tasks`, `apply_tasks_not_loaded`, `apply_task_row_missing`, `task_requeue_refused` (storage refused the write putting a task back to `pending` for a retry or a start; the task row stays at rest and the next claim retries the requeue), `task_verdict_refused` (storage refused the write recording a task's terminal outcome; the apply stays active, an operation drive's row is left claimable, and the next claim settles the apply from the stored task rows), `remote_operation_never_starts` (the data plane settled the remote apply a rollout member belongs to before that member started, so it will never run there; the drive settled the member's tasks the way the remote apply settled and the rollout derives its verdict from them), `post_terminal_reconcile` (the drive stored the apply's terminal outcome but an answer owed after it, such as completing the pending start, did not land; the operator's post-drive settlement retries it, and the reaper's stranded control-request sweep answers what that settlement could not once the apply is quiescent)
+**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `lease_presumed_lost`, `retry_budget_exhausted`, `recovery_window_expired`, `drive_panic`, `drive_stalled`, `operation_no_tasks`, `apply_tasks_not_loaded`, `apply_task_row_missing`, `task_requeue_refused` (storage refused the write putting a task back to `pending` for a retry or a start; the task row stays at rest and the next claim retries the requeue), `task_verdict_refused` (storage refused the write recording a task's terminal outcome; the apply stays active, an operation drive's row is left claimable, and the next claim settles the apply from the stored task rows), `remote_operation_never_starts` (the data plane settled the remote apply a rollout member belongs to before that member started, so it will never run there; the drive settled the member's tasks the way the remote apply settled and the rollout derives its verdict from them), `remote_dispatch_unresolved` (a drive re-sent the dispatch of active work whose remote apply id never reached storage, and the data plane gave no verdict; the apply stays active with its attempt unchanged and the next claim, about once per lease staleness window, re-sends the same idempotency key, so a sustained rate means a data plane that is not answering), `post_terminal_reconcile` (the drive stored the apply's terminal outcome but an answer owed after it, such as completing the pending start, did not land; the operator's post-drive settlement retries it, and the reaper's stranded control-request sweep answers what that settlement could not once the apply is quiescent)
 
 **operation** (storage schema refusals): `alter`, `drop` — the statement types the plan's linters can flag as unsafe
 
@@ -310,12 +314,29 @@ should be investigated before relying on branch-protection state.
 
 ### GitHub API Usage
 
-`schemabot.github.rate_limit.remaining` is the most direct primary-rate-limit
-signal. Group it by `github_app`, `installation_id`, and `resource` to see which
-GitHub App deployment, installation, and rate-limit bucket is closest to
-exhaustion. The same labels on `schemabot.github.rate_limit.limit` and
-`schemabot.github.rate_limit.used` show the observed budget size and consumption
-for the latest response.
+`schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}`
+reports the latest trustworthy installation budget, without a repository label.
+Group by `github_app`, `installation_id`, and `resource`, taking the minimum
+across replicas. Snapshots require a named App, positive installation ID, valid
+remaining/limit headers, and a future reset time. They disappear from collection
+when older than 120 seconds or when their reset time passes. Repeated scrapes,
+local quota refusals and secondary cooldown waits do not refresh observation age.
+Older reset windows and delayed larger allowances within a window cannot replace
+a depleted snapshot. Within one window, a lower allowance wins even when it is
+recorded out of receipt order; its original receipt time still controls expiry.
+A new window can increase the allowance.
+
+`schemabot.github.rate_limit.observation_age_seconds` continues increasing after
+snapshot expiry. Above 120 seconds the budget is unknown; idle installations
+legitimately reach this state. Endpoint heartbeat monitoring independently covers
+missing scrapes. Missing quota must not be interpreted as zero or recovery.
+
+The other operation/repository series on `remaining`, `limit` and `used` retain
+the latest diagnostic response values; they can be stale and must not enter a
+quota paging query. All three are observable gauges, registered once with
+`RegisterGitHubRateLimitMetrics` when installing the global metrics provider;
+provider callbacks own the collection state. Server telemetry registers them
+automatically. Embedders configuring their own provider must register them too.
 
 `schemabot.github.requests_total` is the request-volume signal. Group it by
 `category` to separate ordinary reads from content-generating writes. The
@@ -333,7 +354,7 @@ when a `not_found` rate looks anomalous.
 
 Useful dashboard views:
 
-1. Minimum `schemabot.github.rate_limit.remaining` by `github_app`,
+1. Minimum `schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}` by `github_app`,
    `installation_id`, and `resource`.
 2. Request rate from `schemabot.github.requests_total` by `category`,
    `operation`, and `status`.
@@ -599,3 +620,63 @@ func RecordXxx(ctx context.Context, database, environment, status string) {
 ```
 
 The OTel SDK deduplicates instruments with the same name, so calling `Int64Counter` on every invocation is safe and cheap after the first registration.
+
+## GitHub quota, cooldown reports and retry waiting
+
+HTTP attempt metrics remain unchanged. A primary quota rejection increments
+`primary_rate_limit_rejections_total` once at its producing layer, with
+`origin=http` for an actual quota response and `origin=local` for a prevented
+request. A bypass advisory is not a local rejection. Generic permission failures
+remain HTTP errors. HTTP-origin quota rejections intentionally overlap HTTP
+errors; never add these counters together into one error total.
+Quota refusals with a missing or unrecognized resource header still count as
+HTTP-origin rejections with `resource=unknown`; their response handling is unchanged.
+
+Each HTTP-origin primary quota detection also emits a `GitHub primary quota exhausted`
+warning with `repo`, `operation`, `github_app`, `installation_id`, `resource`, and
+`reset_time` (UTC). Local refusals do not emit this warning. Missing or unfamiliar
+resources use `unknown`; requests without repository attribution use `repo=unknown`.
+Repeated HTTP detections can still produce repeated warnings, including for
+unknown buckets that the limiter cannot cache.
+
+On a quota alert, find this warning for the installation/resource and check the
+reset time. The logged repository encountered exhaustion; it is not necessarily
+the repository that consumed the shared budget. Compare `requests_total` volume
+by repository and operation for that installation/resource before exhaustion to
+locate excess traffic, then reduce avoidable requests or repeated redrives. After
+reset, verify fresh successful checks for affected repositories before declaring
+recovery. Keep the rejection counter as the direct alert signal, including
+locally blocked calls; use the warning for investigation context.
+
+Secondary limiter callbacks emit one report with disposition: `accepted`,
+`single_sleep_limit_exceeded`, or `total_sleep_limit_exceeded`. The existing
+five-second per-sleep allowance is unchanged. No total allowance is enabled in
+production; the internal constructor registers its callback together with any
+explicit total allowance. Callers supplying dependency context overrides must
+retain the instrumentation callbacks when overriding allowances.
+
+These are limiter decisions before any sleep. One accepted report can delay
+many callers; shared waiters and cancelled inner sleeps add no reports. Declined
+cooldowns can report repeatedly during one throttling episode. Display report
+counts separately by disposition. Alert tuning initially selects only repeated
+`single_sleep_limit_exceeded` reports; accepted reports stay diagnostic.
+
+`wait_duration_seconds` observes only positive outer waits at `layer=read_retry`,
+with `reason=secondary_rate_limit` for typed secondary errors or
+`reason=transient_error` otherwise. Its count/distribution describe individual
+waits; its sum is aggregate actual caller-seconds and includes interrupted waits.
+A killed process can lose an in-flight observation. Do not infer final logical
+operation failure rates from cooldown reports or outer waits. Retry policy and
+dependency versions are unchanged.
+
+All three instruments omit repository, PR, SHA, reset timestamps and error text.
+Unavailable App/installation/resource/operation identities use explicit `unknown`.
+The Prometheus registry exports the counter names with dots replaced by
+underscores (retaining `_total`), and the histogram as
+`schemabot_github_wait_duration_seconds_{bucket,sum,count}`. Datadog collection
+can rename these; verify each org's counter, sum and count mappings in staging.
+Never sum dotted OTLP and OpenMetrics aliases. Event-driven absence is not a
+health signal; retain heartbeat coverage. Baseline cooldown reports and outer
+waiting separately before choosing warning thresholds. Quota silence alone does
+not prove blocked checks recovered: verify fresh successful work for the same
+installation/resource.

@@ -3175,7 +3175,7 @@ connections:
 		Params: map[string]string{
 			"parseTime": "true",
 		},
-	}).Resolve()
+	}).Resolve(storage.DatabaseTypeMySQL)
 	require.NoError(t, err)
 
 	cfg, err := gomysql.ParseDSN(dsn)
@@ -3202,7 +3202,7 @@ database: appdb
 		ConfigRef:   "file:" + configPath,
 		Username:    "app_user",
 		PasswordRef: "file:" + passwordPath,
-	}).Resolve()
+	}).Resolve(storage.DatabaseTypeMySQL)
 	require.NoError(t, err)
 
 	cfg, err := gomysql.ParseDSN(dsn)
@@ -3232,7 +3232,7 @@ connection:
 				Host:     "connection.host",
 				Database: "connection.database",
 			},
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "read database config host")
@@ -3253,7 +3253,7 @@ database: appdb
 			ConfigRef:   "file:" + configPath,
 			Username:    "app_user",
 			PasswordRef: "file:" + passwordPath,
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must contain a string")
@@ -3274,7 +3274,7 @@ database: appdb
 			ConfigRef:   "file:" + configPath,
 			Username:    "app_user",
 			PasswordRef: "file:" + passwordPath,
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must contain an integer")
@@ -3341,6 +3341,269 @@ func TestServerConfig_ValidateRejectsDSNFromWithPostgresDialect(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dsn_from builds a MySQL DSN")
+}
+
+// A database environment's dsn_from is validated at config load against the
+// rules of the DSN its database type assembles: MySQL-family types keep the
+// MySQL shape, a PostgreSQL database takes config_paths.dbname and only the
+// verify-full sslmode param, and either family's path key is refused on the
+// other so a misread config fails at startup rather than at the first
+// connection attempt. A plain dsn is unaffected.
+func TestServerConfig_ValidateDatabaseDSNFromByType(t *testing.T) {
+	dsnFrom := func(mutate func(*DSNFromConfig)) *DSNFromConfig {
+		c := &DSNFromConfig{
+			ConfigRef:   "file:/run/secrets/orders-config.yaml",
+			Username:    "orders_user",
+			PasswordRef: "file:/run/secrets/orders-password",
+		}
+		if mutate != nil {
+			mutate(c)
+		}
+		return c
+	}
+	tests := []struct {
+		name         string
+		databaseType string
+		env          EnvironmentConfig
+		wantErr      string
+	}{
+		{
+			name:         "postgres with dsn_from validates",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.DBName = "connections.primary.dbname"
+				c.Params = map[string]string{"sslmode": "verify-full"}
+			})},
+		},
+		{
+			name:         "postgres rejects a weaker sslmode",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.Params = map[string]string{"sslmode": "require"}
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from: postgres sslmode must be "verify-full", got "require"`,
+		},
+		{
+			name:         "postgres rejects a param outside the allowlist",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.Params = map[string]string{"sslrootcert": "/etc/ssl/ca.pem"}
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from: postgres connection params support only "sslmode", got "sslrootcert"`,
+		},
+		{
+			name:         "postgres rejects the mysql database path",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.Database = "connections.primary.database"
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from config_paths.database is not supported for postgres databases; use config_paths.dbname`,
+		},
+		{
+			name:         "mysql with dsn_from validates",
+			databaseType: storage.DatabaseTypeMySQL,
+			env:          EnvironmentConfig{DSNFrom: dsnFrom(nil)},
+		},
+		{
+			name:         "mysql rejects the postgres dbname path",
+			databaseType: storage.DatabaseTypeMySQL,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.DBName = "connections.primary.dbname"
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from config_paths.dbname is only supported for postgres databases; use config_paths.database`,
+		},
+		{
+			name:         "postgres with dsn validates",
+			databaseType: storage.DatabaseTypePostgres,
+			env:          EnvironmentConfig{DSN: "postgres://orders_user:secret@localhost:5432/orders"},
+		},
+		{
+			name:         "mysql with dsn validates",
+			databaseType: storage.DatabaseTypeMySQL,
+			env:          EnvironmentConfig{DSN: "orders_user:secret@tcp(localhost:3306)/orders"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"orders": {
+						Type:         tt.databaseType,
+						Environments: map[string]EnvironmentConfig{"staging": tt.env},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Equal(t, tt.wantErr, err.Error())
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// A database type with no DSN assembler fails closed rather than falling back
+// to the MySQL shape its driver could not parse.
+func TestDSNFromConfig_ValidateRejectsUnassembledDatabaseType(t *testing.T) {
+	err := (&DSNFromConfig{
+		ConfigRef:   "file:/run/secrets/orders-config.yaml",
+		Username:    "orders_user",
+		PasswordRef: "file:/run/secrets/orders-password",
+	}).Validate(`database "orders" environment "staging"`, "oracle")
+
+	require.Error(t, err)
+	assert.Equal(t, `database "orders" environment "staging" dsn_from is not supported with database type "oracle"; use dsn`, err.Error())
+}
+
+// A PostgreSQL database's dsn_from assembles a libpq URL through the same
+// assembler a target_resolver target uses: every component escaped, the
+// default port 5432, the database name from the dbname path, and
+// sslmode=verify-full. A missing database name or a host with no verified CA
+// fails at resolution instead of producing a DSN that dials the wrong place or
+// trusts the ambient store.
+func TestDSNFromConfig_ResolvePostgres(t *testing.T) {
+	writeSecrets := func(t *testing.T, config string) (configRef, passwordRef string) {
+		t.Helper()
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "database.yaml")
+		passwordPath := filepath.Join(dir, "password")
+		require.NoError(t, os.WriteFile(configPath, []byte(config), 0644))
+		require.NoError(t, os.WriteFile(passwordPath, []byte("p@ss/w:rd?#%\n"), 0600))
+		return "file:" + configPath, "file:" + passwordPath
+	}
+
+	t.Run("default paths", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: Orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: orders
+`)
+		dsn, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.NoError(t, err)
+		assert.Equal(t, "postgresql://orders_user:p%40ss%2Fw%3Ard%3F%23%25@orders.cluster-abc.us-west-2.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
+		verifies, err := postgresconn.VerifiesServerCertificate(dsn)
+		require.NoError(t, err)
+		assert.True(t, verifies, "the connection layer must read the assembled DSN as verify-full")
+	})
+
+	t.Run("custom paths and port", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+connections:
+  primary:
+    host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+    port: 6432
+    dbname: orders_app
+`)
+		dsn, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+			ConfigPaths: DSNFromConfigPaths{
+				Host:   "connections.primary.host",
+				Port:   "connections.primary.port",
+				DBName: "connections.primary.dbname",
+			},
+			Params: map[string]string{"sslmode": "verify-full"},
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.NoError(t, err)
+		assert.Equal(t, "postgresql://orders_user:p%40ss%2Fw%3Ard%3F%23%25@orders.cluster-abc.us-west-2.rds.amazonaws.com:6432/orders_app?sslmode=verify-full", dsn)
+	})
+
+	t.Run("missing dbname fails", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+database: orders
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errPathNotFound)
+		assert.Contains(t, err.Error(), "read database config dbname")
+	})
+
+	t.Run("non-RDS host without a verified CA fails", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: db.example.com
+dbname: orders
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `host "db.example.com" is not an RDS endpoint: dsn_from on a postgres database verifies only RDS hosts, so set dsn for this host instead`)
+	})
+
+	t.Run("empty dbname names the dbname key", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: ""
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.EqualError(t, err, "database config missing dbname")
+	})
+}
+
+// The docs/configuration.md example for a postgres database's dsn_from loads
+// through the strict YAML loader and resolves to a verify-full URL, so the
+// documented spelling, including config_paths.dbname, is the one SchemaBot
+// accepts.
+func TestLoadServerConfigFromFile_PostgresDatabaseDSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	databaseConfigPath := filepath.Join(dir, "orders-config.yaml")
+	passwordPath := filepath.Join(dir, "orders-password")
+	require.NoError(t, os.WriteFile(databaseConfigPath, []byte(`
+connections:
+  primary:
+    host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+    dbname: orders
+`), 0o600))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0o600))
+
+	configPath := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+databases:
+  orders:
+    type: postgres
+    environments:
+      staging:
+        dsn_from:
+          config_ref: "file:`+databaseConfigPath+`"
+          username: "orders_user"
+          password_ref: "file:`+passwordPath+`"
+          config_paths:
+            host: connections.primary.host
+            dbname: connections.primary.dbname
+`), 0o600))
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	dsnFrom := cfg.Databases["orders"].Environments["staging"].DSNFrom
+	require.NotNil(t, dsnFrom)
+	assert.Equal(t, "connections.primary.dbname", dsnFrom.ConfigPaths.DBName)
+
+	dsn, err := dsnFrom.Resolve(storage.DatabaseTypePostgres)
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://orders_user:secret@orders.cluster-abc.us-west-2.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
 }
 
 // An unknown storage dialect is rejected at config validation, before any
@@ -4335,6 +4598,106 @@ databases:
 `)
 			require.NoError(t, err)
 			assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		})
+	}
+}
+
+// Re-approval follows the PR's base branch unless the instance or the
+// database sets require_reapproval. A database's own value overrides the
+// instance-wide one in either direction and needs the review gate on for the
+// database; another database on the instance keeps the instance-wide rule.
+func TestServerConfig_ReviewPolicyReapproval(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+	config := func(instance, orders string) string {
+		return "review_policy:\n  enabled: true\n" + instance + `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+` + orders + `
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    operator_users:
+      - mona
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`
+	}
+	const (
+		instanceTrue  = "  require_reapproval: true\n"
+		instanceFalse = "  require_reapproval: false\n"
+		ordersTrue    = "      require_reapproval: true"
+		ordersFalse   = "      require_reapproval: false"
+		ordersUnset   = "      enabled: false"
+	)
+
+	for _, tt := range []struct {
+		name             string
+		instance, orders string
+		wantOrders       Reapproval
+		wantPayments     Reapproval
+	}{
+		{"unset everywhere follows the base branch", "", ordersUnset, ReapprovalFollowsBaseBranch, ReapprovalFollowsBaseBranch},
+		{"instance true covers every database", instanceTrue, ordersUnset, ReapprovalRequired, ReapprovalRequired},
+		{"instance false covers every database", instanceFalse, ordersUnset, ReapprovalNotRequired, ReapprovalNotRequired},
+		{"a database can require it alone", "", ordersTrue, ReapprovalRequired, ReapprovalFollowsBaseBranch},
+		{"a database can opt out alone", "", ordersFalse, ReapprovalNotRequired, ReapprovalFollowsBaseBranch},
+		{"a database can require it when the instance opts out", instanceFalse, ordersTrue, ReapprovalRequired, ReapprovalNotRequired},
+		{"a database can opt out when the instance requires it", instanceTrue, ordersFalse, ReapprovalNotRequired, ReapprovalRequired},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadConfig(t, config(tt.instance, tt.orders))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantOrders, cfg.ReviewPolicyReapprovalForDatabase("orders"))
+			assert.Equal(t, tt.wantPayments, cfg.ReviewPolicyReapprovalForDatabase("payments"))
+		})
+	}
+
+	t.Run("a database that opts into the gate can set it with it", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+      require_reapproval: false
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.Equal(t, ReapprovalNotRequired, cfg.ReviewPolicyReapprovalForDatabase("orders"))
+	})
+
+	for _, value := range []string{"true", "false"} {
+		t.Run("a database that sets it to "+value+" without the gate is rejected", func(t *testing.T) {
+			_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      require_reapproval: `+value+`
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+			require.ErrorContains(t, err, "databases.orders.review_policy.require_reapproval needs the review gate on for the database")
 		})
 	}
 }
@@ -6246,4 +6609,89 @@ func targetNames(targets ...string) []TargetEntry {
 		entries = append(entries, TargetEntry{Target: target})
 	}
 	return entries
+}
+
+// A listen-only repository loads from YAML, matches case-insensitively, and
+// never publishes Check Runs; repositories beside it are unaffected.
+func TestLoadServerConfigListenOnlyRepository(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+tern_deployments:
+  default:
+    staging: "tern-staging:9090"
+repos:
+  acme/monorepo:
+    listen_only: true
+  acme/onboarded: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0o644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err, "LoadServerConfigFromFile")
+
+	assert.True(t, cfg.IsRepoListenOnly("acme/monorepo"))
+	assert.True(t, cfg.IsRepoListenOnly("ACME/Monorepo"))
+	assert.False(t, cfg.AreChecksEnabled("acme/monorepo"))
+	assert.False(t, cfg.IsRepoListenOnly("acme/onboarded"))
+	assert.True(t, cfg.AreChecksEnabled("acme/onboarded"))
+	assert.False(t, cfg.IsRepoListenOnly("acme/unlisted"))
+	assert.True(t, cfg.HasListenOnlyRepos())
+
+	onboardedOnly := &ServerConfig{Repos: map[string]RepoConfig{"acme/onboarded": {}}}
+	assert.False(t, onboardedOnly.HasListenOnlyRepos())
+
+	var nilCfg *ServerConfig
+	assert.False(t, nilCfg.IsRepoListenOnly("acme/monorepo"))
+	assert.False(t, nilCfg.HasListenOnlyRepos())
+
+	conflicting := strings.Replace(content, "    listen_only: true\n", "    listen_only: true\n    enable_checks: true\n", 1)
+	require.NotEqual(t, content, conflicting)
+	require.NoError(t, os.WriteFile(configPath, []byte(conflicting), 0o644), "write conflicting config file")
+	_, err = LoadServerConfigFromFile(configPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "listen_only cannot be combined with enable_checks: true")
+}
+
+// listen_only cannot be combined with settings that would publish or nudge a
+// check, since a listen-only repository never writes to GitHub.
+func TestValidateListenOnlyRepo(t *testing.T) {
+	enableChecks := true
+	disableChecks := false
+	tests := []struct {
+		name    string
+		config  RepoConfig
+		wantErr string
+	}{
+		{name: "listen-only alone", config: RepoConfig{ListenOnly: true}},
+		{name: "listen-only with checks disabled", config: RepoConfig{ListenOnly: true, EnableChecks: &disableChecks}},
+		{name: "checks enabled without listen-only", config: RepoConfig{EnableChecks: &enableChecks}},
+		{
+			name:    "listen-only with checks enabled",
+			config:  RepoConfig{ListenOnly: true, EnableChecks: &enableChecks},
+			wantErr: `repos "acme/monorepo": listen_only cannot be combined with enable_checks: true`,
+		},
+		{
+			name:    "listen-only aggregate participant",
+			config:  RepoConfig{ListenOnly: true, Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
+			wantErr: `repos "acme/monorepo": listen_only cannot be combined with aggregate`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateListenOnlyRepo("acme/monorepo", tt.config)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
 }

@@ -180,6 +180,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
 	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
@@ -202,6 +203,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 			Environments: []string{environment},
 			Plans:        map[string]*templates.PlanCommentData{environment: &commentData},
 		}, drift.work.pending > 0),
+		BaseSchemaNotice: commentData.BaseSchema.HasNotice(),
 	}, templates.RenderPlanComment(commentData))
 
 	// When drift blocked the check, or any rollout member has work (the primary
@@ -236,14 +238,16 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "environment", environment,
 		"target", target, "narrowed_to", planResp.NarrowedTo, "plan_id", planResp.PlanID, "head_sha", schemaResult.HeadSHA)
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.Target = target
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
 	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
-		Database:     schemaResult.Database,
-		DatabaseType: schemaResult.Type,
-		Environments: []string{environment},
-		HeadSHA:      schemaResult.HeadSHA,
+		Database:         schemaResult.Database,
+		DatabaseType:     schemaResult.Type,
+		Environments:     []string{environment},
+		HeadSHA:          schemaResult.HeadSHA,
+		BaseSchemaNotice: commentData.BaseSchema.HasNotice(),
 	}, templates.RenderPlanComment(commentData))
 	h.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "plan generated successfully",
@@ -531,6 +535,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		planFailedEnvironments = append(planFailedEnvironments, env)
 	}
 
+	// plannedSchemas are the environments whose plan reaches the comment, so
+	// their base-schema freshness is checked together once every one has planned.
+	plannedSchemas := map[string]*ghclient.SchemaRequestResult{}
 	for _, env := range environments {
 		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
 		if err != nil {
@@ -638,12 +645,16 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint(), h.cliName())
+		plannedSchemas[env] = schemaResult
 		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
 		h.annotateMemberApplyRefusal(ctx, &commentData, planResp, env, drift, repo, pr)
 		multiEnvData.Plans[env] = &commentData
+	}
+	for env, base := range h.planBaseSchemas(ctx, client, repo, pr, plannedSchemas) {
+		multiEnvData.Plans[env].BaseSchema = base
 	}
 
 	// When every environment fails before a schema request resolves, no
@@ -740,11 +751,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	}
 
 	slot := planCommentSlot{
-		Database:     multiEnvData.Database,
-		DatabaseType: multiEnvData.DatabaseType,
-		Environments: multiEnvData.Environments,
-		HeadSHA:      multiEnvData.HeadSHA,
-		UpToDate:     planCommentUpToDate(multiEnvData, rolloutHasWork),
+		Database:         multiEnvData.Database,
+		DatabaseType:     multiEnvData.DatabaseType,
+		Environments:     multiEnvData.Environments,
+		HeadSHA:          multiEnvData.HeadSHA,
+		UpToDate:         planCommentUpToDate(multiEnvData, rolloutHasWork),
+		BaseSchemaNotice: templates.AnyEnvHasBaseSchemaNotice(multiEnvData),
 	}
 
 	// The caller asked not to re-post: either the push left the schema inputs
@@ -752,7 +764,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// operator asked for an apply rather than a plan. The visible plan comment
 	// stays the PR's answer unless its outcome no longer matches this plan.
 	if !postPlanComment {
-		if !h.priorHeadPlanCommentNeedsReplacing(ctx, client, repo, pr, slot, true) {
+		// A base-schema notice is new information even when the schema inputs
+		// did not change, since the base branch moves without a push to the PR.
+		// A visible comment from a prior head cannot be shown to name the same
+		// paths, so it is replaced. One rendering this head stays, as any
+		// re-plan of an unchanged head does. A notice that no longer applies is
+		// caught by the recorded notice differing from this plan's.
+		keepMatchingOutcome := !slot.BaseSchemaNotice
+		if !h.priorHeadPlanCommentNeedsReplacing(ctx, client, repo, pr, slot, keepMatchingOutcome) {
 			h.logger.Info("auto-plan refreshed checks without posting plan comment because the visible plan comment still answers for this plan",
 				"repo", repo, "pr", pr, "database", slot.Database,
 				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate)
@@ -785,12 +804,15 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 }
 
 // planCommentUpToDate reports whether the plan shows nothing to act on: no
-// changes on any rollout member, no errors in any environment or plan, and no
-// deployment drift. A member with work keeps the check pending, and a drifted
-// or unverifiable deployment fails it closed, even when every primary plan is
-// a clean no-op, so neither is up to date.
+// changes on any rollout member, no errors in any environment or plan, no
+// deployment drift, and no base-schema notice. A member with work keeps the
+// check pending, and a drifted or unverifiable deployment fails it closed,
+// even when every primary plan is a clean no-op, so neither is up to date. A
+// branch missing newer base-branch schema changes, or one that could not be
+// checked, has a merge to make or an apply refusal ahead, so it is not up to
+// date either.
 func planCommentUpToDate(data templates.MultiEnvPlanCommentData, rolloutHasWork bool) bool {
-	if rolloutHasWork || len(data.Errors) > 0 || templates.AnyEnvHasDriftToShow(data) {
+	if rolloutHasWork || len(data.Errors) > 0 || templates.AnyEnvHasDriftToShow(data) || templates.AnyEnvHasBaseSchemaNotice(data) {
 		return false
 	}
 	for _, plan := range data.Plans {

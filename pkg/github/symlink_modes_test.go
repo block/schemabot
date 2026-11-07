@@ -1,7 +1,6 @@
 package github
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -84,8 +83,7 @@ func TestParseDiffModes(t *testing.T) {
 		"+++ b/my dir/file.txt",
 	}, "\n")
 
-	modes, err := parseDiffModes(diff)
-	require.NoError(t, err)
+	modes := parseDiffModes(diff)
 
 	assert.Equal(t, map[string]bool{
 		"orders/schema/staging":    false,
@@ -131,8 +129,7 @@ func TestParseDiffModesKeepsBothSidesOfATypeChange(t *testing.T) {
 		"+now regular",
 	}, "\n")
 
-	modes, err := parseDiffModes(diff)
-	require.NoError(t, err)
+	modes := parseDiffModes(diff)
 
 	assert.True(t, modes.base["docs/was_symlink"], "the path was a symlink before the change")
 	assert.False(t, modes.head["docs/was_symlink"], "the path is a regular file after the change")
@@ -165,24 +162,24 @@ func TestParseDiffModesReadsRenameAndCopyPathsFromTheirHeaders(t *testing.T) {
 		"+y",
 	}, "\n")
 
-	modes, err := parseDiffModes(diff)
-	require.NoError(t, err)
+	modes := parseDiffModes(diff)
 
 	assert.Equal(t, map[string]bool{"orders/schema/old env": true, "docs/src.md": false}, modes.base)
 	assert.Equal(t, map[string]bool{"orders/schema/new env": true, "docs/copy.md": false}, modes.head)
 }
 
-// A line longer than the scanner can buffer ends the scan, so the files after
-// it would lose their modes; the parse reports the scan failure instead.
-func TestParseDiffModesReturnsAnErrorForAnOverlongLine(t *testing.T) {
+// A file whose content is one very long line, such as a minified bundle, must
+// not cut the files after it off from their modes.
+func TestParseDiffModesReadsTheFilesAfterAnOverlongLine(t *testing.T) {
 	var diff strings.Builder
 	diff.WriteString("diff --git a/web/bundle.min.js b/web/bundle.min.js\nindex 1111111..2222222 100644\n--- a/web/bundle.min.js\n+++ b/web/bundle.min.js\n@@ -1 +1 @@\n-x\n+")
 	diff.WriteString(strings.Repeat("a", 17<<20))
 	diff.WriteString("\ndiff --git a/schema/db/staging b/schema/db/staging\nindex 3333333..4444444 120000\n")
 
-	_, err := parseDiffModes(diff.String())
+	modes := parseDiffModes(diff.String())
 
-	require.ErrorIs(t, err, bufio.ErrTooLong)
+	assert.Equal(t, map[string]bool{"web/bundle.min.js": false, "schema/db/staging": true}, modes.base)
+	assert.Equal(t, map[string]bool{"web/bundle.min.js": false, "schema/db/staging": true}, modes.head)
 }
 
 // symlinkModesServer fakes the GitHub endpoints SymlinkModes uses and counts
@@ -300,6 +297,15 @@ func writeDiffTooLarge(t *testing.T, w http.ResponseWriter) {
 	}))
 }
 
+func writeDiffTimedOut(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	assert.NoError(t, json.NewEncoder(w).Encode(gh.ErrorResponse{
+		Message: "Sorry, this diff is taking too long to generate.",
+		Errors:  []gh.Error{{Resource: "PullRequest", Field: "diff", Code: "timeout"}},
+	}))
+}
+
 // A PR with fifty one-line edits in deeply nested files and one repointed
 // environment symlink reads every mode from a single compare diff of its
 // base and head commits: no tree is read and no GraphQL query is sent,
@@ -355,6 +361,25 @@ func TestSymlinkModesFallsBackToBatchedGraphQLWhenDiffTooLarge(t *testing.T) {
 	assert.Equal(t, SymlinkMode{Head: true, Base: false}, modes["orders/schema/staging"])
 	assert.Equal(t, SymlinkMode{}, modes["gone/link"])
 	assert.Equal(t, SymlinkMode{}, modes["svc/pkg149/Main.java"])
+}
+
+// GitHub answers a diff that takes too long to generate with 422 rather than
+// 406. That says nothing about the commits, so the modes come from GraphQL
+// the same way as for a diff that is too large.
+func TestSymlinkModesFallsBackToGraphQLWhenTheDiffIsSlow(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTimedOut(t, w) }
+	s.trees["head1:orders/schema"] = []graphQLTreeEntry{{Name: "staging", Mode: 40960}}
+	s.trees["base1:orders/schema"] = []graphQLTreeEntry{{Name: "staging", Mode: 0o100644}}
+
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{
+		{Path: "orders/schema/staging", AtHead: true, AtBase: true},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, s.compareCount())
+	assert.Equal(t, [][]string{{"orders/schema"}, {"orders/schema"}}, s.graphQLQueries())
+	assert.Equal(t, SymlinkMode{Head: true, Base: false}, modes["orders/schema/staging"])
 }
 
 // A pure rename carries no mode in the diff, so only its paths are read

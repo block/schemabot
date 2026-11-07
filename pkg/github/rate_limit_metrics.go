@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
 )
@@ -15,6 +16,7 @@ const (
 	headerRateLimitLimit     = "X-RateLimit-Limit"
 	headerRateLimitRemaining = "X-RateLimit-Remaining"
 	headerRateLimitUsed      = "X-RateLimit-Used"
+	headerRateLimitReset     = "X-RateLimit-Reset"
 )
 
 type githubRateLimitContextKey struct{}
@@ -116,6 +118,7 @@ func gitHubTransportFailureStatus(rtErr error) string {
 }
 
 func recordGitHubResponseHeaders(ctx context.Context, req *http.Request, resp *http.Response, installationID int64, githubApp string) {
+	observedAt := time.Now()
 	metricCtx, hasMetricCtx := githubRateLimitContextFrom(ctx)
 	if !hasMetricCtx {
 		metricCtx = githubRateLimitContextFromRequest(req)
@@ -143,6 +146,7 @@ func recordGitHubResponseHeaders(ctx context.Context, req *http.Request, resp *h
 		used = limit - remaining
 	}
 
+	reset, _ := parseGitHubRateLimitHeader(resp.Header, headerRateLimitReset)
 	metrics.RecordGitHubRateLimit(ctx, metrics.GitHubRateLimitSample{
 		Operation:      metricCtx.operation,
 		Resource:       resource,
@@ -152,6 +156,8 @@ func recordGitHubResponseHeaders(ctx context.Context, req *http.Request, resp *h
 		Limit:          limit,
 		Remaining:      remaining,
 		Used:           used,
+		ObservedAt:     observedAt,
+		ResetAt:        time.Unix(reset, 0),
 	})
 }
 
@@ -425,7 +431,9 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationFetchFileContent,
 		metrics.GitHubOperationFetchGitTree,
 		metrics.GitHubOperationFetchPullRequest,
+		metrics.GitHubOperationGetBranchRules,
 		metrics.GitHubOperationGetCombinedStatus,
+		metrics.GitHubOperationGetPullRequestReviewProtection,
 		metrics.GitHubOperationGetTeamMembership,
 		metrics.GitHubOperationGraphQLStatusCheckRollup,
 		metrics.GitHubOperationGraphQLTreeEntries,

@@ -2455,3 +2455,42 @@ func TestResumeReplanKeepsLandedStatementActiveForAcceptedWork(t *testing.T) {
 		})
 	}
 }
+
+// Starting a stopped apply registers a new observer for it, which can land
+// while the stopped drive is still delivering its terminal update. The drive
+// must leave that registration in place: clearing after OnTerminal would
+// delete it, leaving the resumed drive with no observer to report progress or
+// its outcome to.
+func TestFinalizeSequentialApplyKeepsAnObserverRegisteredDuringTerminal(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Running, 0)
+	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders", State: state.Task.Stopped}
+	client, _ := newFailureLogTestClient(apply, []*storage.Task{task})
+	// The registration starts a poller; keep it from ticking during the test.
+	client.observerPollIntervalOverride = time.Hour
+	t.Cleanup(func() {
+		if client.observerPollCancel != nil {
+			client.observerPollCancel()
+		}
+	})
+
+	stopped := newBlockingTerminalObserver()
+	client.SetObserver(apply.ID, stopped)
+	finalized := make(chan error, 1)
+	go func() {
+		finalized <- client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{task}, nil, true)
+	}()
+	select {
+	case <-stopped.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stopped drive never reached its observer's OnTerminal")
+	}
+
+	resumed := newBlockingTerminalObserver()
+	client.SetObserver(apply.ID, resumed)
+	close(stopped.release)
+	require.NoError(t, <-finalized)
+
+	assert.Same(t, resumed, client.getObserver(apply.ID),
+		"the observer registered for the resume stays registered after the stopped drive settles")
+	assert.Equal(t, int32(1), stopped.terminal.Load())
+}

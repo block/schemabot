@@ -37,6 +37,151 @@ func TestRenderReviewRequired(t *testing.T) {
 	assert.NotContains(t, result, "earlier commit", "no approval on an earlier commit means no explanation line")
 }
 
+// A reviewer who is not an authorized reviewer for the database approved the
+// PR. The comment says that approval does not count, and since the listed
+// reviewers include a team, it offers adding the approver to one as the other
+// way to unblock the apply.
+func TestRenderReviewRequired_UnauthorizedApprover(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:              "payments",
+		Environment:           "production",
+		RequestedBy:           "alice",
+		OperatorReviewers:     []string{"org/payments-operators"},
+		OtherReviewers:        []string{"org/dba-team"},
+		PRAuthor:              "alice",
+		UnauthorizedApprovers: []string{"dave"},
+	})
+
+	assert.Contains(t, result, "\nSchema changes require approval from an authorized reviewer before applying.\n")
+	assert.Contains(t, result, "\n@dave approved, but isn't an authorized reviewer for `payments`, so that approval doesn't count.\n")
+	assert.Contains(t, result, "\n### Next steps\n1. Request a review from anyone listed above, or add @dave to @org/payments-operators\n2. Then run `schemabot apply -e production` again\n")
+	assert.NotContains(t, result, "Once approved", "the second step also follows adding the approver to a team")
+	assertBefore(t, result, "@dave approved", "**Operators of `payments`**",
+		"the explanation precedes the reviewer lists")
+}
+
+// Several unauthorized reviewers approved, and every listed reviewer is a
+// user. A user cannot be added to another user, so the comment only asks for
+// a review from someone listed.
+func TestRenderReviewRequired_UnauthorizedApproversWithoutTeams(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:              "payments",
+		Environment:           "staging",
+		RequestedBy:           "alice",
+		OtherReviewers:        []string{"bob", "carol"},
+		PRAuthor:              "alice",
+		UnauthorizedApprovers: []string{"dave", "erin"},
+	})
+
+	assert.Contains(t, result, "\n@dave and @erin approved, but aren't authorized reviewers for `payments`, so those approvals don't count.\n")
+	assert.Contains(t, result, "\n### Next steps\n1. Request a review from anyone listed above\n2. Once approved, run `schemabot apply -e staging` again\n")
+	assert.NotContains(t, result, "or add @")
+}
+
+// Several unauthorized reviewers approved and the database has an operator
+// team, so the next step offers adding every one of them to it.
+func TestRenderReviewRequired_UnauthorizedApproversWithTeam(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:              "payments",
+		Environment:           "staging",
+		RequestedBy:           "alice",
+		OperatorReviewers:     []string{"org/payments-operators"},
+		PRAuthor:              "alice",
+		UnauthorizedApprovers: []string{"dave", "erin", "frank"},
+	})
+
+	assert.Contains(t, result, "\n@dave, @erin and @frank approved, but aren't authorized reviewers for `payments`, so those approvals don't count.\n")
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave, @erin and @frank to @org/payments-operators\n2. Then run `schemabot apply -e staging` again\n")
+}
+
+// The only team listed is an admin team, which grants approval for every
+// database, so the next step does not offer adding the approver to it.
+func TestRenderReviewRequired_UnauthorizedApproverWithOnlyAdminTeam(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:              "payments",
+		Environment:           "staging",
+		RequestedBy:           "alice",
+		OtherReviewers:        []string{"org/schema-reviewers"},
+		PRAuthor:              "alice",
+		UnauthorizedApprovers: []string{"dave"},
+	})
+
+	assert.Contains(t, result, "\n@dave approved, but isn't an authorized reviewer for `payments`, so that approval doesn't count.\n")
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above\n2. Once approved, run `schemabot apply -e staging` again\n")
+}
+
+// The database has two operator teams and an admin team. The next step names
+// both operator teams and leaves the admin team out.
+func TestRenderReviewRequired_UnauthorizedApproverWithTwoOperatorTeams(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:                     "payments",
+		Environment:                  "staging",
+		RequestedBy:                  "alice",
+		OperatorReviewers:            []string{"org/payments-operators", "carol", "org/payments-oncall"},
+		OtherReviewers:               []string{"org/schema-reviewers"},
+		PRAuthor:                     "alice",
+		UnauthorizedApprovers:        []string{"dave", "erin"},
+		UnauthorizedEarlierApprovers: []string{"erin"},
+	})
+
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave to @org/payments-operators or @org/payments-oncall, or add @erin to one of them and ask them to approve the latest commit\n2. Then run `schemabot apply -e staging` again\n")
+}
+
+// An unauthorized reviewer approved an earlier commit, so joining a team is
+// not enough on its own: the next step also asks them to approve the latest
+// commit.
+func TestRenderReviewRequired_UnauthorizedEarlierApprover(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:                     "payments",
+		Environment:                  "staging",
+		RequestedBy:                  "alice",
+		OperatorReviewers:            []string{"org/payments-operators"},
+		PRAuthor:                     "alice",
+		UnauthorizedApprovers:        []string{"dave"},
+		UnauthorizedEarlierApprovers: []string{"dave"},
+	})
+
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave to @org/payments-operators and ask them to approve the latest commit\n2. Then run `schemabot apply -e staging` again\n")
+}
+
+// One unauthorized reviewer approved the head and another an earlier commit.
+// Each gets the remedy that unblocks the apply for them.
+func TestRenderReviewRequired_UnauthorizedHeadAndEarlierApprovers(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:                     "payments",
+		Environment:                  "staging",
+		RequestedBy:                  "alice",
+		OperatorReviewers:            []string{"org/payments-operators"},
+		PRAuthor:                     "alice",
+		UnauthorizedApprovers:        []string{"dave", "erin"},
+		UnauthorizedEarlierApprovers: []string{"erin"},
+	})
+
+	assert.Contains(t, result, "\n@dave and @erin approved, but aren't authorized reviewers for `payments`, so those approvals don't count.\n")
+	assert.Contains(t, result, "\n1. Request a review from anyone listed above, or add @dave to @org/payments-operators, or add @erin to it and ask them to approve the latest commit\n2. Then run `schemabot apply -e staging` again\n")
+}
+
+// One reviewer approved an earlier commit whose schema change differs, and
+// another approved without being authorized. Both are named with their own
+// reason, and the next step leads with the reviewer who knows the change.
+func TestRenderReviewRequired_UnauthorizedAndChangedApprovers(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:              "payments",
+		Environment:           "staging",
+		RequestedBy:           "alice",
+		OperatorReviewers:     []string{"org/payments-operators"},
+		OtherReviewers:        []string{"bob"},
+		PRAuthor:              "alice",
+		ChangedApprovers:      []string{"bob"},
+		UnauthorizedApprovers: []string{"dave"},
+	})
+
+	assert.Contains(t, result, "\n@dave approved, but isn't an authorized reviewer for `payments`, so that approval doesn't count.\n")
+	assert.Contains(t, result, "\n@bob approved an earlier commit, but this PR's schema change is different now. That approval no longer counts, so the latest commit needs a new approval.\n")
+	assert.Contains(t, result, "\n1. Ask @bob or anyone listed above to approve the latest commit, or add @dave to @org/payments-operators\n2. Then run `schemabot apply -e staging` again\n")
+	assert.NotContains(t, result, "Schema changes require approval", "the earlier-commit explanation replaces the generic line")
+}
+
 // An authorized reviewer whose approval was given on an earlier commit sees
 // why that approval, still visible on the PR, does not satisfy the gate: the
 // PR's schema change is different at the latest commit.

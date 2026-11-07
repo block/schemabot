@@ -197,7 +197,7 @@ func (s *Service) pendingDropsTargets(ctx context.Context) ([]pendingdrops.Targe
 			if !envConfig.HasLocalDSN() {
 				continue
 			}
-			dsn, err := envConfig.ResolveDSN()
+			dsn, err := envConfig.ResolveDSN(dbConfig.Type)
 			if err != nil {
 				unresolved++
 				s.logger.Error("pending drops cleaner skipping target because its DSN could not be resolved; quarantined tables on this target will not be cleaned",

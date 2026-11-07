@@ -70,6 +70,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path"
@@ -1064,21 +1065,53 @@ func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schema
 // whose merge base is the unmoved base tip "def456", so the base-schema
 // freshness gate sees no base-branch schema change for that head. Tests that
 // serve a head other than the default "abc123" register their head here.
+//
+// Asked for a diff, it serves the PR's changed files as the diff of the merge
+// base and the head, every one a regular file, which is what the PR's file
+// listing reads their modes from.
 func registerFreshBaseComparison(t *testing.T, mux *http.ServeMux, headSHA string) {
 	t.Helper()
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456..."+headSHA, func(w http.ResponseWriter, r *http.Request) {
+		if wantsDiff(r) {
+			writeCommitFilesDiff(t, w, servedPRFiles(t, mux))
+			return
+		}
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
 			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
 		}))
 	})
 }
 
+// registerCompareFiles serves files as the comparison of baseSHA and headSHA,
+// as a file listing or, when asked for one, as a diff of regular files.
 func registerCompareFiles(t *testing.T, mux *http.ServeMux, baseSHA, headSHA string, files []*gh.CommitFile) {
 	t.Helper()
 
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+baseSHA+"..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+baseSHA+"..."+headSHA, func(w http.ResponseWriter, r *http.Request) {
+		if wantsDiff(r) {
+			writeCommitFilesDiff(t, w, files)
+			return
+		}
 		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("ahead"), Files: files}))
 	})
+}
+
+// wantsDiff reports whether a compare request asks for the raw diff rather
+// than the JSON comparison.
+func wantsDiff(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "diff")
+}
+
+// servedPRFiles reads the changed files the fake serves for PR 1, the same
+// way the client lists them, without counting as a request to the fake.
+func servedPRFiles(t *testing.T, mux *http.ServeMux) []*gh.CommitFile {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/repos/octocat/hello-world/pulls/1/files?per_page=100", nil))
+	require.Equal(t, http.StatusOK, rec.Code, "the fake serves PR 1's changed files")
+	var files []*gh.CommitFile
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &files))
+	return files
 }
 
 // setupE2EServiceMultiEnv creates a real api.Service with staging and production environments.
