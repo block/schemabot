@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/ratelimit"
@@ -251,6 +252,13 @@ type Service struct {
 	webhookInboxWg       sync.WaitGroup
 	webhookInboxInterval time.Duration
 
+	// pullSchemaBudget is how long POST /api/pull may hold its connection, and
+	// pullResponseReserve is the part of it kept back for writing the answer:
+	// the read stops at pullSchemaBudget-pullResponseReserve so a pull that runs
+	// out of time can still send its error.
+	pullSchemaBudget    time.Duration
+	pullResponseReserve time.Duration
+
 	// Operator stuck-pending apply monitor loop management.
 	stuckPendingMu     sync.Mutex
 	stuckPendingCancel context.CancelFunc
@@ -421,6 +429,8 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		retryableExpiryEvery: RetryableExpiryInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
+		pullSchemaBudget:     apitypes.PullSchemaBudget,
+		pullResponseReserve:  pullResponseReserve,
 		pendingObservers:     make(map[pendingObserverKey]*pendingObserverEntry),
 		heldClaims:           make(map[int64]heldClaim),
 		heldOperationClaims:  make(map[int64]heldOperationClaim),

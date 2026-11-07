@@ -571,3 +571,10 @@ func TestNoTokenAllowedOverInsecureRemote(t *testing.T) {
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrInsecureTokenTransport)
 }
+
+// The pull client waits past the server's pull budget. A client that gave up
+// first would abandon a large database's pull the server was still going to
+// answer, and its retry would start the same read over.
+func TestPullClientOutwaitsTheServerPullBudget(t *testing.T) {
+	assert.Greater(t, pullHTTPClient.Timeout, apitypes.PullSchemaBudget)
+}

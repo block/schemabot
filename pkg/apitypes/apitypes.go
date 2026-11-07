@@ -637,6 +637,16 @@ type ForeignKeyCatalog struct {
 	OnDelete          string   `json:"on_delete,omitempty"`
 }
 
+// PullSchemaBudget bounds one POST /api/pull, from the request arriving to the
+// response being written. Reading a database with thousands of tables, or an
+// environment whose targets are each pulled, takes longer than the server-wide
+// write timeout, so the server lifts that timeout for this route to this
+// budget. The server stops the read itself before the budget runs out, so a
+// pull that runs out of time still answers with an error. A client waits at
+// least this long, or it gives up on a response the server is still going to
+// send.
+const PullSchemaBudget = 2 * time.Minute
+
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
 type PullSchemaRequest struct {
 	Database    string `json:"database"`

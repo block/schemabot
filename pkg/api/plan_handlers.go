@@ -236,8 +236,38 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.ExecutePullSchema(r.Context(), req)
+	// Reading a large database's live schema outlasts the server-wide write
+	// timeout, so this route gets its own budget. Without it the read finishes
+	// and its response is lost on a connection already closed under it. The
+	// read itself stops a reserve short of that budget, so a pull that runs out
+	// of time still has a connection to send its error on.
+	ctx, cancel := s.extendOperatorWriteDeadline(w, r, s.pullSchemaBudget)
+	defer cancel()
+	readCtx, cancelRead := context.WithTimeout(ctx, s.pullSchemaBudget-s.pullResponseReserve)
+	defer cancelRead()
+
+	resp, err := s.ExecutePullSchema(readCtx, req)
+
+	// A caller that hangs up mid-pull cancels the read, and steps after the
+	// read can still finish without noticing. Nothing failed on this side and
+	// there is no one left to answer, so the pull ends here with a warning
+	// rather than an error or a response written to a closed connection.
+	if r.Context().Err() != nil {
+		attrs := []any{"database", req.Database, "environment", req.Environment}
+		if err != nil {
+			attrs = pullFailureLogAttrs(req, err)
+		}
+		s.logger.Warn("pull schema abandoned because the caller disconnected before it finished", attrs...)
+		return
+	}
 	if err != nil {
+		if pullReadOutranItsBudget(readCtx, r) {
+			s.logger.Error("pull schema did not finish within its budget",
+				append(pullFailureLogAttrs(req, err), "budget", s.pullSchemaBudget-s.pullResponseReserve)...)
+			s.writeError(w, http.StatusGatewayTimeout,
+				fmt.Sprintf("pull schema did not finish within %s; pull fewer namespaces per request or retry later", s.pullSchemaBudget-s.pullResponseReserve))
+			return
+		}
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("pull schema rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
@@ -268,22 +298,39 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if unavailableErr, ok := errors.AsType[*RemoteDeploymentUnavailableError](err); ok {
-			s.logger.Error("pull schema failed because remote deployment is unavailable",
-				"database", req.Database,
-				"environment", req.Environment,
-				"deployment", unavailableErr.Deployment,
-				"target", unavailableErr.Target,
-				"error", err)
+		if _, ok := errors.AsType[*RemoteDeploymentUnavailableError](err); ok {
+			s.logger.Error("pull schema failed because remote deployment is unavailable", pullFailureLogAttrs(req, err)...)
 			s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "pull schema failed: "+err.Error())
 			return
 		}
-		s.logger.Error("pull schema failed", "database", req.Database, "environment", req.Environment, "error", err)
+		s.logger.Error("pull schema failed", pullFailureLogAttrs(req, err)...)
 		s.writeError(w, http.StatusInternalServerError, "pull schema failed: "+err.Error())
 		return
 	}
 
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// pullResponseReserve is the part of the pull budget kept back for writing the
+// answer. The read stops this far short of the write deadline, so a pull that
+// runs out of time answers with an error instead of a dropped connection.
+const pullResponseReserve = 15 * time.Second
+
+// pullReadOutranItsBudget reports whether a pull's read was stopped by its own
+// deadline rather than by the caller leaving.
+func pullReadOutranItsBudget(readCtx context.Context, r *http.Request) bool {
+	return errors.Is(readCtx.Err(), context.DeadlineExceeded) && r.Context().Err() == nil
+}
+
+// pullFailureLogAttrs are the identifiers a failed pull is logged with. When
+// the failure is one target's read, they name that target, namespace, and
+// data-plane endpoint, so the single log line says where the read went.
+func pullFailureLogAttrs(req apitypes.PullSchemaRequest, err error) []any {
+	attrs := []any{"database", req.Database, "environment", req.Environment}
+	if memberErr, ok := errors.AsType[*memberPullError](err); ok {
+		attrs = append(attrs, memberErr.logAttrs()...)
+	}
+	return append(attrs, "error", err)
 }
 
 // ExecutePullSchema resolves a configured database route and fetches its live schema.
