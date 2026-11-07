@@ -190,6 +190,12 @@ type LocalConfig struct {
 	// api.Service.RegisterEngine); NewLocalClient uses the matching factory for a
 	// Type that has no built-in engine.
 	EngineFactories map[string]EngineFactory
+
+	// PendingControlReads is shared with the other clients that drive the same
+	// applies against the same storage, so drives of one apply on different
+	// clients share their reads of its pending control requests. Nil gives the
+	// client a set of its own.
+	PendingControlReads *SharedPendingControlReads
 }
 
 // EngineFactory builds an Engine for a database type this build does not
@@ -251,6 +257,10 @@ type LocalClient struct {
 	cancelMu              sync.Mutex
 	cancelApply           context.CancelCauseFunc
 	cancelApplyGeneration uint64
+
+	// pendingControlReads lets the drives of one apply share their reads of
+	// its pending control requests. Nil reads storage on every check.
+	pendingControlReads *SharedPendingControlReads
 
 	// observers holds per-apply progress observers. The progress poller notifies
 	// the observer on state changes and terminal state. Cleared on terminal state.
@@ -373,10 +383,11 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			DSN:      cfg.TargetDSN,
 			Metadata: maps.Clone(cfg.Metadata),
 		}).WithTableOwner(cfg.TableOwner),
-		customEngine:      customEngine,
-		psClientFunc:      psClientFunc,
-		logger:            logger,
-		heartbeatInterval: defaultHeartbeatInterval,
+		customEngine:        customEngine,
+		psClientFunc:        psClientFunc,
+		logger:              logger,
+		heartbeatInterval:   defaultHeartbeatInterval,
+		pendingControlReads: pendingControlReadsOrNew(cfg.PendingControlReads),
 	}, nil
 }
 
