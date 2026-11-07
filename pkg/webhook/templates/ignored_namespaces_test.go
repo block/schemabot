@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -137,4 +138,52 @@ func TestRenderMultiEnvPlanComment_IgnoredNamespacesOnAllCleanPerEnv(t *testing.
 	assert.Contains(t, out, "✅ **No schema changes detected** for any environment.")
 	assert.Contains(t, out, "ℹ️ **Staging**: namespaces excluded from this plan by `ignore_namespaces`: `fixtures_staging`")
 	assert.Contains(t, out, "ℹ️ **Production**: namespaces excluded from this plan by `ignore_namespaces`: `fixtures_production`")
+}
+
+// ignoredNamespaceNames returns n distinct shard namespace names.
+func ignoredNamespaceNames(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("shop_%d_staging", i+2)
+	}
+	return names
+}
+
+// A pattern entry can withhold a long run of shard namespaces. Up to the inline
+// limit they stay on the disclosure line; past it the line leads with the count
+// and folds the names into a collapsed block, so the list does not stand above
+// the plan as a wall of names while the count stays visible.
+func TestRenderPlanComment_IgnoredNamespacesFoldPastInlineLimit(t *testing.T) {
+	render := func(ignored []string) string {
+		return RenderPlanComment(PlanCommentData{
+			Database: "shop", Environment: "staging", IsMySQL: true,
+			IgnoredNamespaces: ignored,
+		})
+	}
+
+	atLimit := render(ignoredNamespaceNames(exemptTablesInlineLimit))
+	assert.Contains(t, atLimit, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `shop_2_staging`, `shop_3_staging`, `shop_4_staging`, `shop_5_staging`, `shop_6_staging`\n")
+	assert.NotContains(t, atLimit, "<details>")
+
+	folded := render(ignoredNamespaceNames(exemptTablesInlineLimit + 2))
+	assert.Contains(t, folded, "<details>\n<summary>ℹ️ 7 namespaces excluded from this plan by <code>ignore_namespaces</code></summary>\n\n"+
+		"`shop_2_staging`, `shop_3_staging`, `shop_4_staging`, `shop_5_staging`, `shop_6_staging`, `shop_7_staging`, `shop_8_staging`\n\n</details>")
+	assert.NotContains(t, folded, "Namespaces excluded from this plan by `ignore_namespaces`:")
+}
+
+// The per-environment disclosure on an all-clean plan folds the same way, and
+// keeps the environment label on the visible summary line.
+func TestRenderMultiEnvPlanComment_IgnoredNamespacesPerEnvFold(t *testing.T) {
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "shop", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{
+			"staging":    {Environment: "staging", IsMySQL: true, IgnoredNamespaces: ignoredNamespaceNames(exemptTablesInlineLimit + 1)},
+			"production": {Environment: "production", IsMySQL: true, IgnoredNamespaces: []string{"shop_fixtures"}},
+		},
+	})
+
+	assert.Contains(t, out, "<summary>ℹ️ <b>Staging</b>: 6 namespaces excluded from this plan by <code>ignore_namespaces</code></summary>")
+	assert.Contains(t, out, "`shop_2_staging`, `shop_3_staging`, `shop_4_staging`, `shop_5_staging`, `shop_6_staging`, `shop_7_staging`\n\n</details>")
+	assert.Contains(t, out, "ℹ️ **Production**: namespaces excluded from this plan by `ignore_namespaces`: `shop_fixtures`")
 }

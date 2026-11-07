@@ -38,8 +38,10 @@ type SchemabotConfig struct {
 	Type     DatabaseType `yaml:"type,omitempty" json:"type,omitempty"`
 	// IgnoreNamespaces lists namespace subdirectories of the schema root that
 	// SchemaBot must not reconcile against the live database — for example a
-	// keyspace that only exists in local test infrastructure. Ignored
-	// namespaces are excluded from plans, applies, and checks.
+	// keyspace that only exists in local test infrastructure. An entry is a
+	// namespace name or, wrapped in slashes, a regular expression over the
+	// whole name. Ignored namespaces are excluded from plans, applies, and
+	// checks.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces,omitempty" json:"ignore_namespaces,omitempty"`
 	// IgnoreTables lists live tables SchemaBot must not reconcile — for example
 	// the bookkeeping table of a versioned schema change tool, or a table
