@@ -416,7 +416,7 @@ func TestMaterializedPlanCarriesReplannedVSchemaUnsafeRecords(t *testing.T) {
 				Metadata:  tc.replanned,
 			}}})
 
-			plan, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+			plan, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 				PlanId: "plan_vschema_replanned",
 				DdlChanges: []*ternv1.TableChange{
 					{TableName: "VSchema: testapp", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "testapp", Metadata: tc.dispatched},

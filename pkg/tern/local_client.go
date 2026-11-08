@@ -3458,10 +3458,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			// change, and then the re-plan no longer lists it and reads as
 			// drift. Resolve by key so the winner's apply is replayed, as the
 			// create below does when it loses that race; when nothing holds
-			// the key, the drift stands.
+			// the key, the drift stands. When the key cannot be read, the
+			// dispatch was never judged: a winner may hold the key, so the
+			// drift is not yet known to stand, and the lookup error is
+			// carried alone so a re-sent dispatch is retried rather than
+			// failed for good on the drift's permanent error.
 			if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
-				return nil, errors.Join(fmt.Errorf("apply for plan %s: %w", req.PlanId, verifyErr),
-					fmt.Errorf("re-resolve idempotency key after the drift check failed: %w", lookupErr))
+				c.logger.Warn("Apply: drift check failed and the idempotency key could not be re-read; dispatch is retryable",
+					append(dispatchAttrs, "plan_id", req.PlanId, "shard", scope.shard, "drift_error", verifyErr, "error", lookupErr)...)
+				return nil, fmt.Errorf("apply for plan %s: re-resolve idempotency key after the drift check failed (%s): %w", req.PlanId, verifyErr.Error(), lookupErr)
 			} else if existing != nil {
 				c.logger.Info("Apply: idempotency key resolved a create race after this dispatch's drift check failed",
 					append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey, "shard", scope.shard)...)

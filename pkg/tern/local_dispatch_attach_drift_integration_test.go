@@ -4,6 +4,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -419,6 +423,7 @@ func TestLocalClient_Apply_CreatingShardDispatchDriftAfterConcurrentCreateReplay
 	stor, client, planID := setupAttachDispatchClient(t)
 	ctx := t.Context()
 	const key = "schemabot:v1:creating-drift-race-test"
+	reader := newApplyMetricsReader(t)
 
 	// The concurrent winner creates the apply under the key as the loser's
 	// re-plan starts; it carries no schema files, so it runs from the plan
@@ -443,6 +448,8 @@ func TestLocalClient_Apply_CreatingShardDispatchDriftAfterConcurrentCreateReplay
 	assert.Equal(t, winner.ApplyOperationId, resp.ApplyOperationId, "the loser must resolve to the winner's operation row")
 	assert.Equal(t, "testdb/-80/users", resp.OperationKey)
 	assert.Equal(t, int32(1), replans.Load(), "the losing dispatch re-plans its shard once before resolving the key")
+	assert.Equal(t, int64(1), remoteApplyDedupCount(t, reader, "create_race"),
+		"the replay after a failed drift check must be counted as a create race")
 
 	apply, err := stor.Applies().GetByIdempotencyKey(ctx, key)
 	require.NoError(t, err)
@@ -450,6 +457,122 @@ func TestLocalClient_Apply_CreatingShardDispatchDriftAfterConcurrentCreateReplay
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Len(t, ops, 1, "the replayed dispatch must not insert a duplicate operation")
+}
+
+// A creating -80 dispatch re-plans its shard as drifted, then cannot re-read
+// the idempotency key to tell a concurrent winner from real drift because
+// storage fails. The dispatch was never judged: a winner may hold the key, so
+// the drift is not yet known to stand. The error must stay retryable so a
+// re-sent dispatch is tried again rather than failed for good, and no apply
+// is created.
+func TestLocalClient_Apply_CreatingShardDispatchDriftWithFailedKeyLookupIsRetryable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	const key = "schemabot:v1:creating-drift-lookup-failure-test"
+
+	// The first key lookup, before the plan is resolved, finds no apply; the
+	// re-lookup after the drift check fails cannot reach storage.
+	lookups := failIdempotencyKeyLookupAfter(t, client, 1)
+	replans := replanShardAfter(t, client, "-80", nil, engine.TableChange{
+		Table:     "users",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(100)",
+	})
+
+	_, err := client.Apply(t.Context(), shardDispatchWithSchemaFiles(planID, key, "-80"))
+	require.Error(t, err, "a dispatch whose key re-lookup failed cannot be admitted")
+	assert.True(t, engine.IsRetryable(err), "a failed key re-lookup never judged the dispatch, so a re-sent one must be retried: %v", err)
+	assert.ErrorIs(t, err, errIdempotencyKeyStorageUnavailable)
+	assert.Contains(t, err.Error(), "drifted from the reviewed plan", "the error must still name the drift the re-lookup was resolving")
+	assert.Equal(t, int32(2), lookups.Load(), "the dispatch re-reads the key once after the drift check fails")
+	assert.Equal(t, int32(1), replans.Load(), "the creating dispatch re-plans its shard once")
+	requireNoApplyForKey(t, stor, key)
+}
+
+// errIdempotencyKeyStorageUnavailable stands in for a storage failure on the
+// idempotency key lookup.
+var errIdempotencyKeyStorageUnavailable = errors.New("idempotency key storage unavailable")
+
+// failIdempotencyKeyLookupAfter makes the client's idempotency key lookups
+// fail with errIdempotencyKeyStorageUnavailable once more than allowed calls
+// have succeeded, counting every lookup. The real storage is put back before
+// the client is closed.
+func failIdempotencyKeyLookupAfter(t *testing.T, client *LocalClient, allowed int32) *atomic.Int32 {
+	t.Helper()
+	real := client.storage
+	t.Cleanup(func() { client.storage = real })
+	store := &failingIdempotencyKeyStorage{Storage: real, allowed: allowed}
+	client.storage = store
+	return &store.lookups
+}
+
+type failingIdempotencyKeyStorage struct {
+	storage.Storage
+	allowed int32
+	lookups atomic.Int32
+}
+
+func (s *failingIdempotencyKeyStorage) Applies() storage.ApplyStore {
+	return &failingIdempotencyKeyApplyStore{ApplyStore: s.Storage.Applies(), parent: s}
+}
+
+type failingIdempotencyKeyApplyStore struct {
+	storage.ApplyStore
+	parent *failingIdempotencyKeyStorage
+}
+
+func (s *failingIdempotencyKeyApplyStore) GetByIdempotencyKey(ctx context.Context, key string) (*storage.Apply, error) {
+	if s.parent.lookups.Add(1) > s.parent.allowed {
+		return nil, errIdempotencyKeyStorageUnavailable
+	}
+	return s.ApplyStore.GetByIdempotencyKey(ctx, key)
+}
+
+// newApplyMetricsReader installs a manual OTel reader for the test's lifetime
+// so the client's apply metrics can be collected and asserted.
+func newApplyMetricsReader(t *testing.T) *sdkmetric.ManualReader {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		// t.Context() is already cancelled when cleanup runs; detach so the
+		// provider shutdown is not spuriously aborted.
+		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
+	})
+	return reader
+}
+
+// remoteApplyDedupCount returns how many remote apply dedup replays the
+// reader has collected under the given outcome, failing the test when the
+// counter was never recorded.
+func remoteApplyDedupCount(t *testing.T, reader *sdkmetric.ManualReader, outcome string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.remote_apply_dedup_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "metric %s must be an int64 sum", m.Name)
+			var total int64
+			for _, point := range sum.DataPoints {
+				if got, ok := point.Attributes.Value("outcome"); ok && got.AsString() == outcome {
+					total += point.Value
+				}
+			}
+			return total
+		}
+	}
+	t.Fatal("metric schemabot.remote_apply_dedup_total was never recorded")
+	return 0
 }
 
 // A creating shard dispatch whose shard still needs exactly the reviewed
