@@ -257,9 +257,9 @@ func TestReleaseFetch_KeepsTokenOnSameOriginRedirect(t *testing.T) {
 // A repository host that redirects a read to a server on another origin hands
 // the request to a server the token was not sent to. The redirect is followed,
 // so a public file still arrives, but the second server never sees the token.
-// Another hostname, another port of the same hostname, and an https to http
-// downgrade all leave the origin; net/http alone strips the header only for
-// the first of them.
+// Another port of the same hostname and an https to http downgrade both leave
+// the origin, and net/http keeps the header across both, so only the redirect
+// policy withholds it.
 func TestReleaseFetch_WithholdsTokenFromAnotherOrigin(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -268,11 +268,6 @@ func TestReleaseFetch_WithholdsTokenFromAnotherOrigin(t *testing.T) {
 		// destination server's own URL.
 		target func(destination string) string
 	}{
-		{
-			name:      "another host",
-			newSource: httptest.NewServer,
-			target:    func(destination string) string { return strings.Replace(destination, "127.0.0.1", "localhost", 1) },
-		},
 		{
 			name:      "another port",
 			newSource: httptest.NewServer,
@@ -300,6 +295,34 @@ func TestReleaseFetch_WithholdsTokenFromAnotherOrigin(t *testing.T) {
 	}
 }
 
+// A repository host that redirects a read to one of its own subdomains, on the
+// same scheme and port, hands the request to another host. net/http keeps the
+// header across a redirect to a subdomain, so only the redirect policy keeps
+// the token from it; a redirect to an unrelated hostname would not test the
+// policy, because net/http drops the header for that itself. The test server's
+// client routes example.com and its subdomains to the server, so both hosts
+// are served by it and told apart by the Host header.
+func TestReleaseFetch_WithholdsTokenFromAnotherHost(t *testing.T) {
+	authByHost := map[string]string{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authByHost[r.Host] = r.Header.Get("Authorization")
+		if r.Host == "example.com" {
+			http.Redirect(w, r, "https://uploads.example.com"+r.URL.Path, http.StatusTemporaryRedirect)
+			return
+		}
+		answerSchemaFile(t)(w, r)
+	}))
+	t.Cleanup(server.Close)
+	client := releaseFetchClient(false)
+	client.Transport = server.Client().Transport
+
+	require.NoError(t, fetchReleasePathWithToken(t, client, "https://example.com"))
+	assert.Equal(t, map[string]string{
+		"example.com":         "Bearer " + releaseFetchToken,
+		"uploads.example.com": "",
+	}, authByHost, "the redirect reaches the other host, and only the host the token was sent to receives it")
+}
+
 // A chain that leaves the origin and comes back stays unauthenticated: the
 // request arriving back at the first origin was shaped by a server the token
 // was never sent to.
@@ -324,8 +347,8 @@ func TestReleaseFetch_WithholdsTokenAfterChainLeavesOrigin(t *testing.T) {
 // A subdomain is another origin. net/http keeps the header across a redirect
 // to a subdomain of the first host; the policy removes it. A redirect that
 // spells the first origin's default port explicitly is the same origin and
-// keeps it. The policy is exercised directly because a subdomain of a test
-// server's address does not resolve.
+// keeps it. The policy is exercised directly, so the requests can name hosts
+// and ports no test server listens on.
 func TestRefuseInsecureRedirect_WithholdsTokenFromSubdomain(t *testing.T) {
 	withToken := func(rawURL string) *http.Request {
 		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
