@@ -422,7 +422,8 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	// The listener is bound before Serve starts, so the address is usable as
 	// soon as this returns: a dial waits in the listen backlog until Serve
 	// accepts it, and an RPC waits while its connection is still connecting,
-	// bounded by the caller's own deadline.
+	// until gRPC's connect timeout or the caller's deadline, whichever is
+	// first.
 	go func() { _ = grpcSrv.Serve(grpcListener) }()
 	t.Cleanup(func() { grpcSrv.GracefulStop() })
 

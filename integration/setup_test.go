@@ -284,7 +284,8 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	// The listener is bound before Serve starts, so the address is usable as
 	// soon as this returns: a dial waits in the listen backlog until Serve
 	// accepts it, and an RPC waits while its connection is still connecting,
-	// bounded by the caller's own deadline.
+	// until gRPC's connect timeout or the caller's deadline, whichever is
+	// first.
 	go func() { _ = grpcSrv.Serve(grpcListener) }()
 
 	return grpcAddress, nil
