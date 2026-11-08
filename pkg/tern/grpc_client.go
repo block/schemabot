@@ -4523,8 +4523,9 @@ func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Ap
 // lastSuccess for the full lease staleness window, so a peer driver can
 // already have reclaimed the stale row — that case wraps
 // ErrApplyLeasePresumedLost so the operator records the displacement exactly
-// once. A transient failure inside the window returns nil so the drive keeps
-// polling and the heartbeat is retried on the next tick. The remote Tern keeps
+// once. A transient failure inside the window, including a write that timed
+// out, returns nil so the drive keeps polling and the heartbeat is retried on
+// the next tick. The remote Tern keeps
 // executing either way; the next claimant reattaches to it.
 // The logger is expected to carry the apply's identity attributes already
 // bound, so each line appends only the mutable snapshot.
@@ -4539,6 +4540,11 @@ func driveEndingHeartbeatFailure(logger *slog.Logger, apply *storage.Apply, hbEr
 			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		return fmt.Errorf("heartbeat gRPC apply %s: %w (heartbeats failing since %s): %w",
 			apply.ApplyIdentifier, ErrApplyLeasePresumedLost, lastSuccess.UTC().Format(time.RFC3339), hbErr)
+	}
+	if errors.Is(hbErr, storage.ErrLeaseHeartbeatTimedOut) {
+		logger.Warn("gRPC drive heartbeat attempt timed out; it counts as a failed heartbeat toward the lease staleness window and will be retried",
+			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		return nil
 	}
 	logger.Warn("gRPC drive heartbeat failed; will retry",
 		append(apply.MutableLogAttrs(), "error", hbErr)...)
@@ -5481,9 +5487,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// Heartbeat: bump updated_at to maintain the lease. A multi-operation
 			// drive heartbeats its own operation row; every other drive
 			// heartbeats the parent applies row.
-			err := c.heartbeatScopedDrive(ctx, apply, scope)
+			// Each write runs under its own deadline, so one that hangs
+			// counts toward the staleness window instead of stalling this
+			// loop, and with it the presumed-lost check.
+			attemptStart := time.Now()
+			err := storage.HeartbeatLeaseAttempt(ctx, attemptStart, lastHeartbeatSuccess, func(attemptCtx context.Context) error {
+				return c.heartbeatScopedDrive(attemptCtx, apply, scope)
+			})
 			if err == nil {
-				lastHeartbeatSuccess = time.Now()
+				lastHeartbeatSuccess = attemptStart
 				continue
 			}
 			if ctx.Err() != nil {
