@@ -81,6 +81,17 @@ func TestPostgresStorageParity(t *testing.T) {
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db), postgresAdvisoryLockWaiter(h.db))
 	})
+	t.Run("ApplyTargetLockPrecedesApplyRowLocks", func(t *testing.T) {
+		testApplyTargetLockPrecedesApplyRowLocks(t, func(t *testing.T, locker namedlock.Locker) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			dialect := PostgresDialect{}
+			return NewWithDependencies(Dependencies{
+				DB: h.db, Binder: dialect, Dialect: dialect, Identity: dialect,
+				Locker: locker, Classifier: NewPostgresErrorClassifier(),
+			})
+		}, namedlock.Postgres{}, postgresApplyRowLocks(h.db))
+	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
 	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
 }
