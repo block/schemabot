@@ -1933,11 +1933,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		return nil
 	}
 
-	// Notify observer of terminal state, then clean up
-	if obs := c.getObserver(apply.ID); obs != nil {
-		obs.OnTerminal(apply, tasks)
-		c.clearObserver(apply.ID)
-	}
+	c.notifyTerminalObserver(apply, tasks)
 	return nil
 }
 

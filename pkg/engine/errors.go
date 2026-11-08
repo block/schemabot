@@ -83,10 +83,12 @@ func IsNotReady(err error) bool {
 // to start work and cannot tell whether the backend started it: the request
 // failed in a way that does not prove a refusal, and reading the work's state
 // did not settle the question. The work may be running, so the
-// schema change is not failed. The engine has recorded resume state naming the
-// work, and a recovery attempt re-observes that same work instead of starting
-// it again, so callers must pause the apply for recovery rather than record a
-// failure, on every database type.
+// schema change is not failed. Callers never record it as a failure, but how
+// they wait depends on the work: an apply pauses for recovery, because the
+// engine has recorded resume state naming the work and a recovery attempt
+// re-observes that same work instead of starting it again; a cutover holds its
+// control request pending and sends the cutover again on a later tick, because
+// the sentinel drop that releases the cutover is idempotent.
 type OutcomeUnknownError struct {
 	Err error
 }

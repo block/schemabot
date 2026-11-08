@@ -2,8 +2,10 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -50,6 +52,13 @@ type CommentObserver struct {
 		Warn(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
+
+	// superseded latches once the observer's own lease loses the apply to a
+	// newer claim. Losing the own lease is permanent for this observer — the
+	// lease token never becomes current again — so later side-effect checks
+	// skip the storage re-read and log at debug instead of repeating the
+	// takeover warning on every progress tick.
+	superseded atomic.Bool
 
 	// OnTerminalHook is called after the summary comment is posted.
 	// Used by the webhook handler to update check runs on terminal state.
@@ -228,7 +237,9 @@ func (o *CommentObserver) SetApplyID(id int64) {
 // to correlate GitHub side effects with an apply: repo, PR, and the apply
 // identifier. Without them, a log search scoped to one apply silently misses
 // every GitHub-side failure for that apply.
-func (o *CommentObserver) logError(apply *storage.Apply, msg string, args ...any) {
+// logFields builds the observer's triage attributes — repo, PR, and (when the
+// apply is in hand) its identifiers — followed by the call-specific args.
+func (o *CommentObserver) logFields(apply *storage.Apply, args ...any) []any {
 	fields := []any{
 		"repo", o.repo,
 		"pr", o.pr,
@@ -240,7 +251,11 @@ func (o *CommentObserver) logError(apply *storage.Apply, msg string, args ...any
 			"environment", apply.Environment,
 		)
 	}
-	o.logger.Error(msg, append(fields, args...)...)
+	return append(fields, args...)
+}
+
+func (o *CommentObserver) logError(apply *storage.Apply, msg string, args ...any) {
+	o.logger.Error(msg, o.logFields(apply, args...)...)
 }
 
 func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any) {
@@ -852,12 +867,22 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	if o.aggregateTerminalCASWinner {
 		return true
 	}
+	// A superseded observer never regains the apply — its lease token is gone
+	// for good — so skip the storage re-read and keep the log at debug; the
+	// takeover already warned once when the latch was set.
+	if o.superseded.Load() {
+		o.logger.Debug("observer: apply lease superseded by a newer owner; skipping GitHub side effect",
+			o.logFields(apply, "operation", operation)...)
+		return false
+	}
+
 	// PR apply observers are created before the durable apply row is claimed, so
 	// they may not have a lease at construction time. Once progress callbacks pass
 	// the claimed apply, fall back to the apply's current lease and use it as the
 	// authority for external GitHub writes.
 	lease := o.applyLease
-	if !lease.Valid() && apply != nil {
+	holdsOwnLease := lease.Valid()
+	if !holdsOwnLease && apply != nil {
 		lease = apply.Lease()
 	}
 	if !lease.Valid() {
@@ -874,22 +899,88 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	// or check updates after a newer operator owner has claimed the apply.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := o.stor.Applies().CheckLease(ctx, lease); err != nil {
-		if apply != nil && !apply.Lease().Valid() {
-			// This observer's construction-time lease no longer matches, and
-			// the apply row records no parent lease at all — the lease was
-			// released back (an operation-scoped drive holds the parent only
-			// transiently per dispatch wave), not claimed by a newer owner.
-			// The durable progress-comment authority decides instead.
-			return o.progressCommentAuthorityOwnsObserver(apply, operation)
-		}
-		o.logError(apply, "observer: apply lease no longer owns apply; skipping GitHub side effect",
+	err := o.stor.Applies().CheckLease(ctx, lease)
+	if err == nil {
+		return true
+	}
+	if apply != nil && !apply.Lease().Valid() {
+		// This observer's construction-time lease no longer matches, and
+		// the apply row records no parent lease at all — the lease was
+		// released back (an operation-scoped drive holds the parent only
+		// transiently per dispatch wave), not claimed by a newer owner.
+		// The durable progress-comment authority decides instead.
+		return o.progressCommentAuthorityOwnsObserver(apply, operation)
+	}
+	if holdsOwnLease && errors.Is(err, storage.ErrApplyLeaseLost) {
+		return o.ownLeaseLostStillOwnsObserver(ctx, apply, operation, lease, err)
+	}
+	switch {
+	case errors.Is(err, storage.ErrApplyLeaseLost):
+		// The fallback lease was read from the apply row moments ago, so losing
+		// it means a concurrent claim landed between the two reads. The next
+		// tick reads the new lease from a fresh row and publishes normally.
+		o.logger.Warn("observer: apply lease changed between reads; skipping GitHub side effect until the next tick",
+			o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "error", err)...)
+	default:
+		// Storage failed, so ownership is unknown — fail closed for this side
+		// effect without latching; the next check retries the read.
+		o.logError(apply, "observer: apply lease check failed; skipping GitHub side effect",
 			"operation", operation,
 			"lease_owner", lease.Owner,
 			"error", err)
+	}
+	return false
+}
+
+// ownLeaseLostStillOwnsObserver decides a failed check of the observer's own
+// lease from a fresh read of the apply row, never from the callback's
+// snapshot. The snapshot can predate a release of the parent lease, and a
+// release is not a takeover: only a fresh row holding a different lease proves
+// a newer driver claimed the apply (OW-4), so only that latches supersession.
+// A row with no lease defers to the progress-comment authority, and anything
+// else skips this side effect and retries on the next check.
+func (o *CommentObserver) ownLeaseLostStillOwnsObserver(ctx context.Context, apply *storage.Apply, operation string, lease storage.ApplyLease, checkErr error) bool {
+	fresh, err := o.stor.Applies().Get(ctx, lease.ApplyID)
+	if err != nil {
+		o.logError(apply, "observer: apply lease check failed and the apply row could not be re-read; skipping GitHub side effect",
+			"operation", operation,
+			"lease_owner", lease.Owner,
+			"lease_error", checkErr,
+			"error", err)
 		return false
 	}
-	return true
+	if fresh == nil {
+		o.logger.Warn("observer: apply row not found after its lease check failed; skipping GitHub side effect",
+			o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "error", checkErr)...)
+		return false
+	}
+	current := fresh.Lease()
+	if !current.Valid() {
+		// The parent lease was released back since the snapshot, not claimed
+		// by a newer driver, so the durable progress-comment authority decides.
+		return o.progressCommentAuthorityOwnsObserver(fresh, operation)
+	}
+	if current.Token == lease.Token {
+		// The fresh row still carries this observer's lease, so nothing proves
+		// a takeover. Skip this side effect and check again on the next one.
+		o.logger.Warn("observer: apply lease check failed but the apply row still carries this observer's lease; skipping GitHub side effect until the next check",
+			o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "error", checkErr)...)
+		return false
+	}
+	// A newer driver holds the apply. That is expected during a handover and
+	// permanent for this observer, so warn once and latch; the new driver's
+	// observer publishes from here on.
+	o.superseded.Store(true)
+	o.logger.Warn("observer: apply lease superseded by a newer owner; this observer stops publishing GitHub side effects",
+		o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "new_lease_owner", current.Owner, "error", checkErr)...)
+	return false
+}
+
+// Superseded reports whether this observer permanently lost its apply lease to
+// a newer owner. Pollers use it to stop driving an observer that will never
+// publish again.
+func (o *CommentObserver) Superseded() bool {
+	return o.superseded.Load()
 }
 
 // progressCommentAuthorityOwnsObserver reports whether this observer may

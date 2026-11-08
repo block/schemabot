@@ -98,10 +98,14 @@ type StatementParser interface {
 	CanonicalizeUnqualified(ddl string) string
 }
 
+// DropTargets counts what a statement drops. Partitions counts the partition
+// clauses that discard rows (DROP PARTITION, TRUNCATE PARTITION), one per
+// named partition.
 type DropTargets struct {
-	Tables  int
-	Columns int
-	Indexes int
+	Tables     int
+	Columns    int
+	Indexes    int
+	Partitions int
 }
 
 // defaultParser backs the package-level SplitStatements, ClassifyStatement, and
@@ -354,6 +358,8 @@ func (tidbStatementParser) DropTargets(stmt string) (DropTargets, error) {
 				targets.Columns++
 			case ast.AlterTableDropIndex:
 				targets.Indexes++
+			case ast.AlterTableDropPartition, ast.AlterTableTruncatePartition:
+				targets.Partitions += max(len(spec.PartitionNames), 1)
 			}
 		}
 	}

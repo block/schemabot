@@ -665,7 +665,7 @@ resumes each stopped target from its own checkpoint:
 
 ![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)
 
-### Choose when to cut over
+### Choose when to run the cutover
 
 For engines that support deferred cutover, start the apply with
 `--defer-cutover` to hold the final swap. Copying can finish while the live
@@ -687,7 +687,7 @@ the swap has finished.
 
 ### Manage PlanetScale deploy requests
 
-For a Vitess database using PlanetScale, use the CLI to deploy, cut over,
+For a Vitess database using PlanetScale, use the CLI to deploy, run the cutover,
 revert, or close the revert window while following progress across shards.
 This example uses
 `shop` registered as a Vitess database, `type: vitess` in `schema/schemabot.yaml`,
@@ -701,7 +701,7 @@ prompt. During copying, **Esc** detaches and **c** cancels the deploy request
 permanently; PlanetScale cancellation cannot be resumed.
 
 The CLI and PlanetScale console control the same deployment, with PlanetScale
-as the source of truth. You can cut over, revert, or close the revert window
+as the source of truth. You can run the cutover, revert, or close the revert window
 from either interface. If you act in the console, the CLI watcher follows
 along automatically; there is no need to repeat the action.
 
@@ -912,6 +912,38 @@ In local mode, omit `--deployment`: the stored log includes engine activity.
 In gRPC mode, add it with a deployment name from the apply's progress to read
 remote engine details such as copying, throttling, or cutover. It requires an
 explicit apply ID. See [deployment log examples](schema-intelligence.md#read-deployment-logs).
+
+A multi-target apply logs every target into one history. `--target` narrows
+either read to one target: its own entries plus the entries about the apply as
+a whole, such as state changes.
+
+```console
+$ schemabot logs apply-example-73 --target shop-002
+11:47:07 [INF] Apply queued: apply-example-73
+11:48:12 [INF] [orders] acquired advisory lock
+11:52:40 [INF] [orders] Table complete
+...
+```
+
+A target the apply never ran on is refused, and the error lists the targets it
+did run on.
+
+`--shard` narrows a sharded apply's read to one shard, such as `-80`. Shard
+names repeat across targets, so add `--target` to read one target's shard. A
+shard name that starts with `-` has to be joined to the flag with `=`, since
+`--shard -80` reads `-80` as a flag of its own:
+
+```console
+$ schemabot logs apply-example-73 --target shop-002 --shard=-80 --follow
+Following logs for apply-example-73, target shop-002, shard -80... (Ctrl+C to stop)
+```
+
+A shard the apply never ran on is refused, and the error lists the shards it did
+run on. An apply not divided by shard, such as an unsharded target's, is refused
+too; read it without `--shard`. A shard read keeps the entries about the apply
+as a whole, but not those of a namespace's group finalizer, the step that runs
+once the namespace's DDL has landed on every shard. They belong to no one
+shard, so read them with `--target` alone or with no scope.
 
 ### Explain a blocked check
 
@@ -1159,7 +1191,7 @@ specific state. The bar is 20 squares wide; filled squares represent percent com
 
 **Waiting for cutover** — yellow bar at 100%:
 ```
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
 ```
 
@@ -1223,7 +1255,7 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 | Cutting over | `Cutover in progress - please wait...` |
 | Stopped | `To resume from where it stopped:` followed by `schemabot start <id> -e <env>` |
 
-A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target SchemaBot cuts over next, and a stopped rollout ends on the same resume command as a single target.
+A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target whose cutover SchemaBot runs next, and a stopped rollout ends on the same resume command as a single target.
 
 </details>
 
@@ -1257,6 +1289,14 @@ $ schemabot databases --json
 for the entire command, which also prints the plan and other messages.
 For fully structured writes, use the API. `progress` has no JSON output flag;
 use `status --json` for a structured snapshot.
+
+`plan` exits non-zero when any environment's plan is one `apply` refuses
+whatever its flags: the plan reports errors, a rollout member needs attention,
+or a change is blocked by the engine. stdout still carries the whole plan, as
+text or as the single `--json` document, and nothing is added to it. Refusals a
+flag or a narrowed apply lifts, such as unsafe changes or rollout members that
+run under their own plans, leave the exit status at 0, as does a plan that
+finds changes to apply.
 
 For agents and automated processes, `apply --no-watch` and `rollback --no-watch`
 return after submission without opening an interactive watcher. Retain the new

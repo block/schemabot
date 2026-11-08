@@ -79,11 +79,11 @@ func TestPlanCommentCommandsCarryScopedDatabase(t *testing.T) {
 			}
 
 			unscoped := tc.render(data)
-			assert.Contains(t, unscoped, "\n"+tc.unscope+"\n", "an unscoped command is answered with a bare command")
+			assert.Contains(t, fencedCommands(t, unscoped), tc.unscope, "an unscoped command is answered with a bare command")
 			assert.NotContains(t, unscoped, " -d ")
 
 			data.ScopedDatabase = "orders"
-			assert.Contains(t, tc.render(data), "\n"+tc.scoped+"\n", "a -d command is answered with the same database")
+			assert.Contains(t, fencedCommands(t, tc.render(data)), tc.scoped, "a -d command is answered with the same database")
 		})
 	}
 }

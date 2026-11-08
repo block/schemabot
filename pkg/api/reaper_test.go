@@ -496,13 +496,29 @@ func TestRunStrandedReaperPassReportsTaskSettlementsThatLandedBeforeAFailure(t *
 // context so a pass cut short by shutdown can be modelled.
 type expiringApplyStore struct {
 	storage.ApplyStore
-	expirations []*storage.RetryableApplyExpiration
-	expireErr   error
-	limit       int
+	expirations          []*storage.RetryableApplyExpiration
+	operationExpirations []*storage.RetryableOperationExpiration
+	expireErr            error
+	expireOperationsErr  error
+	limit                int
+	operationLimit       int
+	stopTypes            []string
 }
 
-func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *expiringApplyStore) ExpireRetryableOperations(ctx context.Context, limit int) ([]*storage.RetryableOperationExpiration, error) {
+	s.operationLimit = limit
+	if s.expireOperationsErr != nil {
+		return nil, s.expireOperationsErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.operationExpirations, nil
+}
+
+func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {
 	s.limit = limit
+	s.stopTypes = endedOperationStopTypes
 	// Expirations and an error are mutually exclusive, and deliberately so: the
 	// real pass settles its whole batch in one transaction, so a failure rolls
 	// back everything it had matched. A double that could hand back both would
@@ -682,4 +698,127 @@ func TestRunRetryableExpiryPassBoundsTheBatch(t *testing.T) {
 	svc.runRetryableExpiryPass(t.Context())
 
 	assert.Equal(t, retryableExpiryBatch, applies.limit)
+	assert.Equal(t, retryableExpiryBatch, applies.operationLimit,
+		"the degraded-rollout sweep in the same pass is bounded the same way")
+	assert.Equal(t, endedOperationStoppableDatabaseTypes, applies.stopTypes, "expiry passes over what the ended operation sweep stops")
+}
+
+// degradedRollout is a running_degraded rollout whose region-b deployment
+// paused on a retryable failure and spent the rollout's whole retry budget.
+func degradedRollout() (*storage.Apply, *storage.ApplyOperation) {
+	apply := expiredApply()
+	apply.State = state.Apply.RunningDegraded
+	op := &storage.ApplyOperation{
+		ID:         7,
+		ApplyID:    apply.ID,
+		Deployment: "region-b",
+		State:      state.ApplyOperation.Failed,
+	}
+	return apply, op
+}
+
+func degradedBudgetExpiration() []*storage.RetryableOperationExpiration {
+	apply, op := degradedRollout()
+	return []*storage.RetryableOperationExpiration{
+		{Apply: apply, Operation: op, Reason: storage.RetryableExpirationAttemptBudget},
+	}
+}
+
+// Giving up on one deployment of a rollout does not settle the rollout: its
+// other deployments are still running. The apply log therefore records which
+// deployment recovery abandoned and why, as an entry with no state transition,
+// and the pass publishes no terminal summary — the rollout's outcome is
+// published once its remaining deployments settle.
+func TestRunRetryableExpiryPassRecordsAnAbandonedDeploymentWithoutSettlingTheRollout(t *testing.T) {
+	applyLogs := &capturingApplyLogStore{}
+	svc := newTestService()
+	svc.storage = &mockStorageWithApplyStores{
+		applies:   &expiringApplyStore{operationExpirations: degradedBudgetExpiration()},
+		applyLogs: applyLogs,
+	}
+	svc.OnApplyTerminalSummary = func(_ context.Context, a *storage.Apply, _ []*storage.Task) error {
+		t.Fatalf("a rollout with deployments still running must not publish a terminal summary, got one for %s", a.ApplyIdentifier)
+		return nil
+	}
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	require.Len(t, applyLogs.logs, 1)
+	entry := applyLogs.logs[0]
+	assert.Equal(t, storage.LogLevelError, entry.Level)
+	assert.Equal(t, int64(42), entry.ApplyID)
+	assert.Contains(t, entry.Message, "deployment region-b")
+	assert.Contains(t, entry.Message,
+		fmt.Sprintf("%d of %d attempts", storage.MaxRecoveryAttempts, storage.MaxRecoveryAttempts))
+	assert.Contains(t, entry.Message, string(storage.RetryableExpirationAttemptBudget))
+	assert.Empty(t, entry.OldState, "the apply does not transition when one of its deployments is abandoned")
+	assert.Empty(t, entry.NewState, "the apply does not transition when one of its deployments is abandoned")
+}
+
+// The abandoned deployment is the routing key an operator needs, and it is not
+// the parent apply's deployment, so the expiry line names both.
+func TestRunRetryableExpiryPassLogsNameTheAbandonedDeployment(t *testing.T) {
+	var logBuf bytes.Buffer
+	svc, _ := retryableExpiryService(&expiringApplyStore{operationExpirations: degradedBudgetExpiration()})
+	svc.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	line := requireLogLine(t, decodeLogLines(t, logBuf.Bytes()), "operator: retryable operation expired under degraded rollout")
+	assert.Equal(t, "apply-42", line["apply_id"])
+	assert.Equal(t, "payments", line["database"])
+	assert.Equal(t, "staging", line["environment"])
+	assert.Equal(t, "region-a", line["deployment"])
+	assert.Equal(t, "region-b", line["operation_deployment"])
+	assert.Equal(t, state.Apply.RunningDegraded, line["state"])
+	assert.Equal(t, float64(storage.MaxRecoveryAttempts), line["attempt"])
+	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), line["reason"])
+}
+
+// The resume-failure counter is the signal an operator alerts on when recovery
+// gives up, so an abandoned deployment counts under the deployment that was
+// abandoned and the reason recovery stopped, not under the parent apply's
+// deployment.
+func TestRunRetryableExpiryPassCountsTheAbandonedDeploymentAsAResumeFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, _ := retryableExpiryService(&expiringApplyStore{operationExpirations: degradedBudgetExpiration()})
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	points := collectCounterPoints(t, reader, "schemabot.operator.resume_failures_total")
+	require.Len(t, points, 1)
+	assert.Equal(t, int64(1), points[0].Value)
+	assert.Equal(t, "payments", attributeValue(t, points[0], "database"))
+	assert.Equal(t, "region-b", attributeValue(t, points[0], "deployment"))
+	assert.Equal(t, "staging", attributeValue(t, points[0], "environment"))
+	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), attributeValue(t, points[0], "reason"))
+}
+
+// The degraded-rollout sweep fails apart from the apply sweep, under its own
+// reason, so an operator alerting on claim failures can tell which one broke.
+// A failure in it does not undo the apply sweep's committed expirations.
+func TestRunRetryableExpiryPassDegradedSweepStorageErrorIsItsOwnFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, applyLogs := retryableExpiryService(&expiringApplyStore{
+		expirations:         budgetExpiration(),
+		expireOperationsErr: errors.New("apply_operations table unavailable"),
+	})
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	assert.Equal(t, []string{"expire_degraded_retry_error"}, claimFailureReasons(t, reader),
+		"the failure is recorded under the degraded-rollout sweep's own reason")
+	require.Len(t, applyLogs.logs, 1, "the apply sweep's expiration is still recorded")
+	assert.Equal(t, state.Apply.Failed, applyLogs.logs[0].NewState)
+}
+
+// Losing the degraded-rollout election is the expected outcome on every
+// instance but one, so a busy sweep records no failure.
+func TestRunRetryableExpiryPassDegradedSweepBusyIsNotAFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, _ := retryableExpiryService(&expiringApplyStore{expireOperationsErr: storage.ErrRetryableExpiryBusy})
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	assert.Empty(t, claimFailureReasons(t, reader), "an unelected degraded-rollout sweep is not a failure")
 }

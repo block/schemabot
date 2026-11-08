@@ -139,7 +139,7 @@ func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
 		data.DeferCutover = true
 		out := RenderApplyInProgress(data)
 		assert.Contains(t, out, "This PR's apply `apply-abc123` is waiting for cutover, so a second apply cannot start.")
-		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
+		assert.Contains(t, out, "To run the cutover:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
 		assert.Contains(t, out, "Once it completes, "+applyAgain)
 		assert.Less(t, strings.Index(out, "schemabot cutover"), strings.Index(out, "schemabot apply"))
 	})
@@ -157,7 +157,7 @@ func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
 		data := base
 		data.ApplyState = state.Apply.WaitingForDeploy
 		out := RenderApplyInProgress(data)
-		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
+		assert.Contains(t, out, "To run the cutover:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
 	})
 
 	t.Run("an open revert window names skip-revert", func(t *testing.T) {
@@ -181,7 +181,7 @@ func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
 		data.ApplyState = state.Apply.WaitingForCutover
 		data.DeferCutover = true
 		out = RenderApplyInProgress(data)
-		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n\n"+followProgress,
+		assert.Contains(t, out, "To run the cutover:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n\n"+followProgress,
 			"the command that moves the running apply on is still offered")
 		assert.NotContains(t, out, "schemabot apply")
 	})
@@ -193,7 +193,7 @@ func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
 		data.DeferCutover = true
 		out := RenderApplyInProgress(data)
 		assert.Contains(t, out, "This PR's production apply `apply-abc123` is waiting for cutover, so a second apply cannot start.")
-		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e production --tenant payments\n```\n")
+		assert.Contains(t, out, "To run the cutover:\n```\nschemabot cutover apply-abc123 -e production --tenant payments\n```\n")
 		assert.Contains(t, out, "Once it completes, "+applyAgain, "the apply to run again stays in the requested environment")
 
 		data.ApplyState = state.Apply.RevertWindow

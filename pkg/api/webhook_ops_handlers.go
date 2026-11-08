@@ -513,19 +513,19 @@ func resolveRepoInstallationClient(ctx context.Context, cfg *ServerConfig, repo 
 	if err != nil {
 		return nil, 0, err
 	}
-	return resolveAppInstallationClient(ctx, app, repo, logger)
+	return resolveAppInstallationClient(ctx, app, repo, logger, ghclient.WithListenOnlyRepos(cfg))
 }
 
 // resolveAppInstallationClient builds an installation-scoped GitHub client for
 // app's installation on repo. An error wrapping ghclient.ErrAppNotInstalled
 // means GitHub confirmed app has no installation covering repo.
-func resolveAppInstallationClient(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (*ghclient.InstallationClient, int64, error) {
+func resolveAppInstallationClient(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger, opts ...ghclient.ClientOption) (*ghclient.InstallationClient, int64, error) {
 	creds, err := app.Config.ResolveCredentials()
 	if err != nil {
 		return nil, 0, fmt.Errorf("app %q: %w", app.Name, err)
 	}
-	client := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
-		ghclient.WithTrustedCheckAppSlugs(app.Config.TrustedCheckAppSlugs))
+	opts = append([]ghclient.ClientOption{ghclient.WithTrustedCheckAppSlugs(app.Config.TrustedCheckAppSlugs)}, opts...)
+	client := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger, opts...)
 	installationID, err := client.InstallationIDForRepo(ctx, repo)
 	if err != nil {
 		return nil, 0, fmt.Errorf("resolve GitHub App %q installation for %s: %w", app.Name, repo, err)

@@ -418,10 +418,12 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the image
-      # build or the testcontainer-based tests below.
+      # build or the testcontainer-based tests below. The metadata tests start
+      # mysql:8.0 under a per-operation deadline that has no room for a pull.
       - name: "Pre-pull external images"
         run: |
           scripts/ci/prepull-images.sh \
+            mysql:8.0 \
             testcontainers/ryuk:0.13.0 \
             --dockerfile deploy/local/Dockerfile.localscale
       - name: "Build LocalScale image"
@@ -762,7 +764,10 @@ jobs:
     name: "E2E K8s Tests"
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
-    runs-on: ubuntu-latest
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
     # Sized so setup (checkout, Go, cache restore, minikube start, plus the
     # script's own image build and deploy — measured at about four minutes)
     # plus the E2E_TEST_TIMEOUT set on the Deploy and test step lands inside
@@ -851,7 +856,10 @@ jobs:
     name: "E2E K8s Etre Tests"
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
-    runs-on: ubuntu-latest
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
     # Sized so setup (checkout, Go, cache restore, minikube start, plus the
     # script's own build of both images and the deploy — typically a little
     # over five minutes, but measured as high as six and a half) plus the
@@ -994,7 +1002,10 @@ jobs:
     name: "E2E K8s Multi-Target Tests (${{ matrix.shard }})"
     needs: [changes, e2e-k8s-multi-target-matrix]
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
-    runs-on: ubuntu-latest
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
     # Sized so setup (checkout, Go, cache restore, minikube start, the script's
     # own image builds, and standing up one MySQL server per target beside Etre
     # and ministack) plus the E2E_TEST_TIMEOUT set on the Deploy and test step
@@ -1091,7 +1102,10 @@ jobs:
     name: "E2E K8s Vitess Tests"
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
-    runs-on: ubuntu-latest
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
     # Most of the budget is vtcombo coming up: it initializes a sidecar database
     # per shard of every keyspace the stack declares before the suite can start.
     timeout-minutes: 20

@@ -196,6 +196,18 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	// A listen-only repository never runs a command: a command either writes
+	// to the PR or starts work SchemaBot could not report back on.
+	if h.isRepoListenOnly(repo) {
+		h.logger.Info("ignoring command from listen-only repository",
+			"repo", repo, "pr", pr, "action", result.Action, "comment_id", result.CommentID,
+			"requested_by", requestedBy, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "repository is listen-only",
+		})
+		return
+	}
+
 	// Every command response below — acknowledgment reactions, usage-error
 	// comments, and dispatched work alike — needs the installation ID, so a
 	// delivery without one is rejected before any command handling.
@@ -1039,6 +1051,14 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 		h.logger.Warn("durable issue_comment delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "installation_id", installationID)
 		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo)
+		return false, nil
+	}
+	// The request path refuses commands from a listen-only repository before
+	// enqueueing them; this catches a row enqueued before the repository
+	// became listen-only.
+	if h.isRepoListenOnly(repo) {
+		h.logger.Info("durable issue_comment delivery completed without dispatch because the repository is listen-only",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "installation_id", installationID)
 		return false, nil
 	}
 

@@ -37,3 +37,15 @@ func DeferredCutoverHeldAtOnce(ops []*ApplyOperation) int {
 	}
 	return width
 }
+
+// DeferredCutoverDrivers reports how many of one server's drivers may run work
+// for an apply deferring its cutover: all but the one the server keeps for
+// other work, so deferred applies together never leave every driver waiting on
+// a person. A server with a single driver keeps none back, so its only driver
+// can still run a deferred apply.
+func DeferredCutoverDrivers(drivers int) int {
+	if drivers < 2 {
+		return drivers
+	}
+	return drivers - 1
+}

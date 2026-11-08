@@ -36,6 +36,24 @@ func (c logsErrorClient) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.Log
 	return nil, c.err
 }
 
+type startErrorClient struct {
+	Client
+	err error
+}
+
+func (c startErrorClient) Start(context.Context, *ternv1.StartRequest) (*ternv1.StartResponse, error) {
+	return nil, c.err
+}
+
+type stopErrorClient struct {
+	Client
+	err error
+}
+
+func (c stopErrorClient) Stop(context.Context, *ternv1.StopRequest) (*ternv1.StopResponse, error) {
+	return nil, c.err
+}
+
 type applyErrorClient struct {
 	Client
 	err error
@@ -87,23 +105,43 @@ func TestServerProgressMapsMissingApplyDataToNotFound(t *testing.T) {
 	}
 }
 
-func TestServerLogsMapsErrorsToStatusCode(t *testing.T) {
+// A remote caller of logs, start, or stop must be able to tell an apply that
+// does not exist from a storage failure by status code alone: the two cases
+// call for different operator actions and the error text is the only other
+// thing that crosses the gRPC boundary.
+func TestServerApplyLookupsMapErrorsToStatusCode(t *testing.T) {
+	calls := map[string]func(ctx context.Context, err error) error{
+		"logs": func(ctx context.Context, err error) error {
+			_, callErr := NewServer(logsErrorClient{err: err}, slog.Default()).Logs(ctx, &ternv1.LogsRequest{ApplyId: "apply-123"})
+			return callErr
+		},
+		"start": func(ctx context.Context, err error) error {
+			_, callErr := NewServer(startErrorClient{err: err}, slog.Default()).Start(ctx, &ternv1.StartRequest{ApplyId: "apply-123"})
+			return callErr
+		},
+		"stop": func(ctx context.Context, err error) error {
+			_, callErr := NewServer(stopErrorClient{err: err}, slog.Default()).Stop(ctx, &ternv1.StopRequest{ApplyId: "apply-123"})
+			return callErr
+		},
+	}
 	testCases := []struct {
 		name string
 		err  error
 		want codes.Code
 	}{
-		{name: "missing apply", err: fmt.Errorf("get apply missing: %w", storage.ErrApplyNotFound), want: codes.NotFound},
-		{name: "storage failure", err: errors.New("storage unavailable"), want: codes.Internal},
+		{name: "missing apply", err: fmt.Errorf("load apply apply-123: %w", storage.ErrApplyNotFound), want: codes.NotFound},
+		{name: "storage failure", err: errors.New("load apply apply-123: read applies row: i/o timeout"), want: codes.Internal},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(logsErrorClient{err: tc.err}, slog.Default())
-			_, err := server.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-123"})
-			require.Error(t, err)
-			assert.Equal(t, tc.want, status.Code(err))
-		})
+	for name, call := range calls {
+		for _, tc := range testCases {
+			t.Run(name+" "+tc.name, func(t *testing.T) {
+				err := call(t.Context(), tc.err)
+				require.Error(t, err)
+				assert.Equal(t, tc.want, status.Code(err))
+				assert.Contains(t, status.Convert(err).Message(), "apply-123")
+			})
+		}
 	}
 }
 
@@ -184,6 +222,13 @@ func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
 			name: "progress",
 			call: func(ctx context.Context) error {
 				_, err := server.Progress(ctx, &ternv1.ProgressRequest{})
+				return err
+			},
+		},
+		{
+			name: "batch progress",
+			call: func(ctx context.Context) error {
+				_, err := server.BatchProgress(ctx, &ternv1.BatchProgressRequest{})
 				return err
 			},
 		},
@@ -366,4 +411,141 @@ func TestServerHealthDoesNotLogWhenHealthy(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ok", resp.GetStatus())
 	assert.Empty(t, logs.String())
+}
+
+// liveDriverPools is a driver pool store that answers ListLive
+// with fixed servers, or with err.
+type liveDriverPools struct {
+	storage.DriverPoolStore
+	servers []*storage.DriverPool
+	err     error
+}
+
+func (s liveDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
+	return s.servers, s.err
+}
+
+// A control plane checks a deferred apply against what the deployment reports
+// over gRPC: the drivers of its live servers together, the ones of them that
+// may hold a deferred cutover (all but the one each server keeps for other
+// work), and the max_drivers_per_apply it runs one apply under.
+func TestDriverCapacitySumsTheLiveServersDrivers(t *testing.T) {
+	servers := liveDriverPools{servers: []*storage.DriverPool{
+		{ServerID: "host-a/1/operator", Drivers: 4},
+		{ServerID: "host-b/1/operator", Drivers: 6},
+		{ServerID: "host-c/1/operator", Drivers: 1},
+	}}
+	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default(), WithDriverCapacity(servers, 16)))
+
+	capacity, err := client.DriverCapacity(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, &DriverCapacity{LiveServers: 3, Drivers: 11, DeferredCutoverDrivers: 9, MaxDriversPerApply: 16}, capacity)
+}
+
+// A deployment that does not report its driver capacity answers
+// Unimplemented, as one running an older SchemaBot does, and the client reads
+// that as no capacity rather than as a failure, so apply creation refuses to
+// defer the cutover of operations sent there instead of erroring.
+func TestDriverCapacityIsNilWhenTheDeploymentDoesNotReportIt(t *testing.T) {
+	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default()))
+
+	capacity, err := client.DriverCapacity(t.Context())
+
+	require.NoError(t, err)
+	assert.Nil(t, capacity)
+}
+
+// A deployment that cannot read its own driver pools answers
+// Unavailable, which the client returns as an error, so apply creation refuses
+// a deferred apply with that error rather than admitting it against an
+// unknown capacity. Health is unaffected, so the deployment keeps serving
+// every apply that does not defer its cutover.
+func TestDriverCapacityFailsWhenDriverPoolsCannotBeRead(t *testing.T) {
+	servers := liveDriverPools{err: errors.New("read driver pools: connection refused")}
+	server := NewServer(healthErrorClient{}, slog.Default(), WithDriverCapacity(servers, 2))
+	client := newRetryTestClient(t, server)
+
+	capacity, err := client.DriverCapacity(t.Context())
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(errors.Unwrap(err)))
+	assert.Nil(t, capacity)
+	require.NoError(t, client.Health(t.Context()))
+}
+
+// conflictReadFailureStorage serves a stored plan and an unused idempotency
+// key, and fails every read of the database's tasks.
+type conflictReadFailureStorage struct {
+	storage.Storage
+	plan *storage.Plan
+}
+
+func (s conflictReadFailureStorage) Plans() storage.PlanStore {
+	return conflictReadFailurePlanStore{plan: s.plan}
+}
+
+func (conflictReadFailureStorage) Applies() storage.ApplyStore {
+	return conflictReadFailureApplyStore{}
+}
+
+func (conflictReadFailureStorage) Tasks() storage.TaskStore {
+	return conflictReadFailureTaskStore{}
+}
+
+type conflictReadFailurePlanStore struct {
+	storage.PlanStore
+	plan *storage.Plan
+}
+
+func (s conflictReadFailurePlanStore) Get(context.Context, string) (*storage.Plan, error) {
+	return s.plan, nil
+}
+
+type conflictReadFailureApplyStore struct {
+	storage.ApplyStore
+}
+
+func (conflictReadFailureApplyStore) GetByIdempotencyKey(context.Context, string) (*storage.Apply, error) {
+	return nil, nil
+}
+
+type conflictReadFailureTaskStore struct {
+	storage.TaskStore
+}
+
+func (conflictReadFailureTaskStore) GetByDatabase(context.Context, string) ([]*storage.Task, error) {
+	return nil, errors.New("tasks storage unavailable")
+}
+
+func TestServerApplyReportsAFailedConflictReadAsRetryable(t *testing.T) {
+	// A dispatch whose conflict check cannot read the database's active tasks
+	// was never judged, so a later send may succeed. The data plane answers
+	// with a retryable gRPC error rather than a rejection, because the control
+	// plane fails the work on any rejection: a re-sent dispatch could not
+	// otherwise tell a transient storage failure from a refusal that will
+	// never pass.
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: conflictReadFailureStorage{plan: &storage.Plan{
+			PlanIdentifier: "plan-123",
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+		}},
+		logger: slog.Default(),
+	}
+	server := NewServer(client, slog.Default())
+
+	resp, err := server.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:         "plan-123",
+		Database:       "testdb",
+		Type:           storage.DatabaseTypeMySQL,
+		Environment:    "staging",
+		IdempotencyKey: "key-123",
+	})
+	require.Error(t, err)
+	assert.Nil(t, resp, "a failed conflict read is not a rejection")
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Contains(t, err.Error(), "tasks storage unavailable")
+	assert.True(t, isRetryableRemoteApplyError(err), "the control plane retries a failed conflict read")
 }

@@ -57,8 +57,8 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	// Single next-action points at the cutover-ready deployment, even though the
 	// aggregate is still running. The apply was not deferred, so SchemaBot cuts
 	// eu over itself and the comment offers no command to run.
-	assert.Contains(t, out, "SchemaBot will cut over `eu` next — no action needed.")
-	assert.NotContains(t, out, "To cut over")
+	assert.Contains(t, out, "SchemaBot will run the cutover for `eu` next — no action needed.")
+	assert.NotContains(t, out, "To run the cutover")
 	assert.NotContains(t, out, "schemabot cutover")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
@@ -1130,7 +1130,7 @@ func TestRenderMultiDeploymentApplyComment_DeferredCutoverOffersCommand(t *testi
 		Details:     deferredCutoverDetails(),
 	})
 
-	assert.Contains(t, out, "To cut over `eu`:\n```\nschemabot cutover apply-123 -e production\n```")
+	assert.Contains(t, out, "To run the cutover for `eu`:\n```\nschemabot cutover apply-123 -e production\n```")
 	assert.NotContains(t, out, "--deployment")
 	assert.NotContains(t, out, "no action needed")
 }
@@ -1149,7 +1149,7 @@ func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *t
 		Details:     deferredCutoverDetails(),
 	})
 
-	assert.Contains(t, out, "To cut over `primary/testapp-002`:")
+	assert.Contains(t, out, "To run the cutover for `primary/testapp-002`:")
 }
 
 // A member name is assembled from server config, so it reaches the comment as
@@ -1194,7 +1194,7 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 		Details:     deferredCutoverDetails(),
 	})
 	assert.NotContains(t, cutover, "\n## Injected")
-	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
+	assert.Contains(t, cutover, "To run the cutover for `` us` ## Injected [click](https://example.invalid) ``:")
 
 	// The automatic form names the member in the same prose position.
 	automatic := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
@@ -1205,7 +1205,7 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 		Environment: "production",
 	})
 	assert.NotContains(t, automatic, "\n## Injected")
-	assert.Contains(t, automatic, "SchemaBot will cut over `` us` ## Injected [click](https://example.invalid) `` next — no action needed.")
+	assert.Contains(t, automatic, "SchemaBot will run the cutover for `` us` ## Injected [click](https://example.invalid) `` next — no action needed.")
 }
 
 // Every control command addresses the whole apply, so a rollout writes its
@@ -1282,11 +1282,11 @@ func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAc
 		"deferred cutover ready beside a copying sibling": {
 			ops:          []presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)},
 			deferCutover: true,
-			lead:         "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n",
+			lead:         "To run the cutover for `us`:\n```\nschemabot cutover apply-123 -e production\n```\n",
 		},
 		"automatic cutover ready beside a copying sibling": {
 			ops:  []presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)},
-			lead: "SchemaBot will cut over `us` next — no action needed.\n",
+			lead: "SchemaBot will run the cutover for `us` next — no action needed.\n",
 		},
 		"revert window beside a running sibling": {
 			ops:  []presentation.Operation{rollingOp("us", so.RevertWindow), rollingOp("eu", so.Running)},
@@ -1393,8 +1393,8 @@ func TestRenderMultiDeploymentApplyComment_PausedRolloutWithPendingCutoverShares
 		deferCutover bool
 		cutoverLine  string
 	}{
-		{name: "deferred", deferCutover: true, cutoverLine: "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"},
-		{name: "automatic", cutoverLine: "SchemaBot will cut over `us` next — no action needed.\n"},
+		{name: "deferred", deferCutover: true, cutoverLine: "To run the cutover for `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"},
+		{name: "automatic", cutoverLine: "SchemaBot will run the cutover for `us` next — no action needed.\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
@@ -2581,6 +2581,21 @@ func TestRenderMultiDeploymentApplyComment_EveryTargetParkedReadsItsPhase(t *tes
 	assert.Contains(t, out, "- Targets: 2 (2 waiting for cutover)\n"+
 		"  - ● `testapp-001`: waiting for cutover\n"+
 		"  - ● `testapp-002`: waiting for cutover\n", "%s", out)
+}
+
+// Every target waiting for its deploy request reads with the glyph the
+// single-deployment comment and the CLI progress table give that state, so the
+// rolled-up line does not borrow the cutover glyph for a different meaning.
+func TestRenderMultiDeploymentApplyComment_WaitingForDeployReadsOneGlyph(t *testing.T) {
+	ops := rollingTargets(2)
+	ops[0].State, ops[1].State = so.WaitingForDeploy, so.WaitingForDeploy
+	staged := func(database string) *ApplyStatusCommentData {
+		return tablesDetail(database, TableProgressData{TableName: "orders", Status: state.Task.WaitingForDeploy})
+	}
+	out := renderTargets(presentation.Derive(ops), staged("testapp_001"), staged("testapp_002"))
+	assert.Contains(t, out, "**`orders`**: "+ui.WaitingForDeploy+"\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (2 waiting for deploy)\n", "%s", out)
+	assert.NotContains(t, out, "🟡 Waiting for deploy", "%s", out)
 }
 
 // A target that has reported no table progress counts toward a rolled-up

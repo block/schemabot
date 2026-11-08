@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/stretchr/testify/assert"
@@ -31,6 +32,7 @@ func newGitHubMetricsTestReader(t *testing.T) *sdkmetric.ManualReader {
 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	require.NoError(t, metrics.RegisterGitHubRateLimitMetrics(mp))
 	prevMP := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
@@ -38,6 +40,13 @@ func newGitHubMetricsTestReader(t *testing.T) *sdkmetric.ManualReader {
 		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
 	})
 	return reader
+}
+
+// The diff fetch and the GraphQL directory listing only read, so they are
+// counted against the read category rather than falling into unknown.
+func TestGitHubRequestCategoryClassifiesSymlinkModeOperationsAsReads(t *testing.T) {
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, gitHubRequestCategory(metrics.GitHubOperationFetchDiff))
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, gitHubRequestCategory(metrics.GitHubOperationGraphQLTreeEntries))
 }
 
 func TestGitHubRateLimitTransportRecordsHeaders(t *testing.T) {
@@ -536,5 +545,109 @@ func attributeValueString(value attribute.Value) string {
 		return strconv.FormatInt(value.AsInt64(), 10)
 	default:
 		return value.String()
+	}
+}
+
+// Paging snapshots require complete, valid quota headers and an installation
+// identity. Diagnostic samples remain available when reset metadata is absent.
+func TestGitHubTransportQuotaSnapshots(t *testing.T) {
+	tests := []struct {
+		name         string
+		change       func(http.Header)
+		installation int64
+		app          string
+		wantSnapshot bool
+	}{
+		{name: "valid", installation: 42, app: "example-app", wantSnapshot: true},
+		{name: "zero remaining", installation: 42, app: "example-app", wantSnapshot: true, change: func(h http.Header) { h.Set(headerRateLimitRemaining, "0") }},
+		{name: "missing reset", installation: 42, app: "example-app", change: func(h http.Header) { h.Del(headerRateLimitReset) }},
+		{name: "malformed reset", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitReset, "tomorrow") }},
+		{name: "expired reset", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitReset, "1") }},
+		{name: "malformed remaining", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "unknown") }},
+		{name: "negative remaining", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "-1") }},
+		{name: "over limit", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "15001") }},
+		{name: "zero limit", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitLimit, "0") }},
+		{name: "zero limit and remaining", installation: 42, app: "example-app", change: func(h http.Header) {
+			h.Set(headerRateLimitLimit, "0")
+			h.Set(headerRateLimitRemaining, "0")
+		}},
+		{name: "app JWT", app: "example-app"},
+		{name: "missing app", installation: 42},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newGitHubMetricsTestReader(t)
+			rt := NewMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				header := http.Header{}
+				header.Set(headerRateLimitLimit, "15000")
+				header.Set(headerRateLimitRemaining, "1999")
+				// Use the wire header name independently of the production constant.
+				header.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+				header.Set(headerRateLimitResource, "core")
+				if tt.change != nil {
+					tt.change(header)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader("{}")), Request: req}, nil
+			}), tt.installation, func() string { return tt.app })
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/pulls/1", nil)
+			require.NoError(t, err)
+			beforeResponse := time.Now()
+			resp, err := rt.RoundTrip(req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			var data metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &data))
+			maxAge := time.Since(beforeResponse).Seconds()
+			var snapshots, ages int
+			for _, scope := range data.ScopeMetrics {
+				for _, m := range scope.Metrics {
+					if m.Name == "schemabot.github.rate_limit.observation_age_seconds" {
+						gauge, ok := m.Data.(metricdata.Gauge[float64])
+						require.True(t, ok)
+						for _, point := range gauge.DataPoints {
+							ages++
+							op, _ := point.Attributes.Value("operation")
+							assert.Equal(t, metrics.GitHubOperationRateLimitSnapshot, op.AsString())
+							app, _ := point.Attributes.Value("github_app")
+							assert.Equal(t, tt.app, app.AsString())
+							installation, _ := point.Attributes.Value("installation_id")
+							assert.Equal(t, strconv.FormatInt(tt.installation, 10), installation.AsString())
+							resource, _ := point.Attributes.Value("resource")
+							assert.Equal(t, "core", resource.AsString())
+							_, hasRepository := point.Attributes.Value("repository")
+							assert.False(t, hasRepository)
+							assert.GreaterOrEqual(t, point.Value, float64(0))
+							assert.LessOrEqual(t, point.Value, maxAge)
+						}
+					}
+					if m.Name != "schemabot.github.rate_limit.remaining" {
+						continue
+					}
+					gauge, ok := m.Data.(metricdata.Gauge[int64])
+					require.True(t, ok)
+					for _, point := range gauge.DataPoints {
+						op, _ := point.Attributes.Value("operation")
+						if op.AsString() != metrics.GitHubOperationRateLimitSnapshot {
+							continue
+						}
+						snapshots++
+						_, hasRepository := point.Attributes.Value("repository")
+						assert.False(t, hasRepository)
+						if tt.name == "zero remaining" {
+							assert.Zero(t, point.Value)
+						} else {
+							assert.Equal(t, int64(1999), point.Value)
+						}
+					}
+				}
+			}
+			if tt.wantSnapshot {
+				assert.Equal(t, 1, snapshots)
+				assert.Equal(t, 1, ages)
+			} else {
+				assert.Zero(t, snapshots)
+				assert.Zero(t, ages)
+			}
+		})
 	}
 }

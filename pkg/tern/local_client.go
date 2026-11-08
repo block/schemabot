@@ -3108,7 +3108,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
 	// resolve into. Adoption is a create-path outcome only.
-	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
+	blocking, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
+	if err != nil && !blocking.blocks() {
+		return nil, conflictReadError(req, err)
+	}
 	if err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -3219,7 +3222,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 
 	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+	// The dispatch request holds no operation lease, so the entry names the
+	// attached operation itself; left unattributed it would read as about the
+	// whole apply and show in every target's log.
+	c.logOperationEvent(ctx, apply.ID, operation.ID, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
 	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attached")
 	c.logger.Info("Apply: attached operation to keyed apply",
@@ -3267,6 +3273,15 @@ func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ter
 		return nil, verifyErr
 	}
 	return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "drift check"), nil
+}
+
+// conflictReadError reports a conflict check that failed to read the
+// database's active tasks before it found any conflict. Nothing was decided, so
+// it travels as an error the dispatcher retries rather than as a rejection: a
+// rejection tells the dispatcher this request can never succeed as sent, and
+// the dispatcher fails the work on it.
+func conflictReadError(req *ternv1.ApplyRequest, err error) error {
+	return fmt.Errorf("conflict check for plan %s on database %s: %w", req.PlanId, req.Database, err)
 }
 
 // refuseAttachKeyingMismatch rejects an attach whose key shape disagrees with
@@ -3373,6 +3388,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Local mode: check for active tasks with engine verification
 	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, 0)
+	if conflictErr != nil && !blocking.blocks() {
+		return nil, conflictReadError(req, conflictErr)
+	}
 	if conflictErr != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
@@ -3655,22 +3673,6 @@ func recordedStateOverride(taskDerived, recorded string) string {
 	return taskDerived
 }
 
-// progressScopeOperation resolves the operation a progress request is scoped
-// to, or nil when the request asks about the whole apply. An id that does not
-// parse, names no operation, or names an operation of another apply is
-// refused: answering for the whole apply instead would report the rollout
-// member's siblings' work as its own.
-func (c *LocalClient) progressScopeOperation(ctx context.Context, apply *storage.Apply, applyOperationID string) (*storage.ApplyOperation, error) {
-	if applyOperationID == "" {
-		return nil, nil
-	}
-	op, err := c.applyOperationOfApply(ctx, apply, applyOperationID)
-	if err != nil {
-		return nil, fmt.Errorf("scope progress of apply %s to its operation: %w", apply.ApplyIdentifier, err)
-	}
-	return op, nil
-}
-
 // notAnOperationOfApplyError is applyOperationOfApply's answer that the id a
 // request names is not one of the apply's operations: it does not parse,
 // names no operation, or names another apply's. It is the caller's to refuse,
@@ -3718,25 +3720,24 @@ func (c *LocalClient) applyOperationOfApply(ctx context.Context, apply *storage.
 // A request that names an apply_operation_id is answered for that one
 // operation: its tasks, and its own row in place of the apply record.
 func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
-	var tasks []*storage.Task
-	var err error
-
 	if req.ApplyId == "" {
 		return nil, fmt.Errorf("apply_id is required")
 	}
-
-	apply, lookupErr := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-	if lookupErr != nil {
-		return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, lookupErr)
-	}
-	if apply == nil {
-		return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, storage.ErrApplyNotFound)
-	}
-	tasks, err = c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	reads, err := c.readProgress(ctx, req.ApplyId)
 	if err != nil {
-		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
+		return nil, err
 	}
-	scopedOp, err := c.progressScopeOperation(ctx, apply, req.GetApplyOperationId())
+	return c.progressFromReads(ctx, reads, req.GetApplyOperationId())
+}
+
+// progressFromReads builds the Progress answer for one apply from the rows
+// reads holds, scoped to applyOperationID when it is set. Every answer built
+// from the same reads shares the apply's rows, so a BatchProgress call reads
+// them once for all the operations it answers.
+func (c *LocalClient) progressFromReads(ctx context.Context, reads *progressReads, applyOperationID string) (*ternv1.ProgressResponse, error) {
+	apply := reads.apply
+	tasks := reads.tasks
+	scopedOp, err := reads.scopeOperation(ctx, c, applyOperationID)
 	if err != nil {
 		return nil, err
 	}
@@ -3749,7 +3750,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			if err != nil {
 				return nil, err
 			}
-			settled, err := c.settledControlRequests(ctx, apply)
+			settled, err := reads.settledControlRequests(ctx, c)
 			if err != nil {
 				c.logger.Error("progress: serving a task-less operation without its apply's settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
 					append(scopedOp.LogAttrs(), "error", err)...)
@@ -3758,7 +3759,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				State:                  storageStateToProto(scopedOp.State),
 				Engine:                 c.protoEngine(),
 				SettledControlRequests: settled,
-				ApplyOperationId:       req.GetApplyOperationId(),
+				ApplyOperationId:       applyOperationID,
 				ApplyState:             storageStateToProto(apply.State),
 				OperationNeverStarts:   neverStarts,
 			}, nil
@@ -3772,16 +3773,16 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		// fields (VSchema status/diff, branch) from the operations' resume
 		// metadata. An apply with neither tasks nor operations is genuinely
 		// taskless work and stays the fail-closed not-found case.
-		ops, opErr := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+		ops, opErr := reads.listOperations(ctx, c)
 		if opErr != nil {
-			return nil, fmt.Errorf("list apply_operations for apply %s: %w", req.ApplyId, opErr)
+			return nil, opErr
 		}
 		if len(ops) == 0 {
-			return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
+			return nil, fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, storage.ErrTaskNotFound)
 		}
 		c.logger.Info("Progress: serving task-less apply from operations",
-			"apply_id", req.ApplyId, "operation_count", len(ops), "state", apply.State)
-		settled, err := c.settledControlRequests(ctx, apply)
+			"apply_id", apply.ApplyIdentifier, "operation_count", len(ops), "state", apply.State)
+		settled, err := reads.settledControlRequests(ctx, c)
 		if err != nil {
 			c.logger.Error("progress: serving a task-less apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
 				append(apply.LogAttrs(), "error", err)...)
@@ -3793,7 +3794,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		}, nil
 	}
 
-	c.logger.Debug("Progress: found tasks", "count", len(tasks), "database", c.config.Database, "apply_id", req.ApplyId)
+	c.logger.Debug("Progress: found tasks", "count", len(tasks), "database", c.config.Database, "apply_id", apply.ApplyIdentifier)
 	for _, t := range tasks {
 		c.logger.Debug("Progress: task", "task_id", t.TaskIdentifier, "state", t.State, "is_terminal", state.IsTerminalTaskState(t.State))
 	}
@@ -3873,7 +3874,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// engine resume state every tick. Readers never poll the engine — an
 	// instance-local engine has no live result to read, and for an externally-
 	// authoritative engine the drive keeps stored current.
-	engineMetadata := c.loadStoredProgressMetadata(ctx, activeTask)
+	engineMetadata := c.loadStoredProgressMetadata(ctx, reads, activeTask)
 	var vitessApplyIsInstant bool
 	if c.config.Type == storage.DatabaseTypeVitess {
 		vitessApplyIsInstant = engineMetadata["is_instant"] == "true"
@@ -3964,7 +3965,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// failure there must not read as this member's.
 	if scopedOp != nil {
 		overallState = recordedStateOverride(overallState, scopedOp.State)
-	} else if applyRec, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && applyRec != nil {
+	} else if applyRec, err := reads.recordedApply(ctx, c); err == nil && applyRec != nil {
 		if overridden := recordedStateOverride(overallState, applyRec.State); overridden != overallState {
 			c.logger.Debug("Progress: overriding task-derived state with the apply record",
 				"task_derived", overallState, "apply_record", applyRec.State)
@@ -4001,7 +4002,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		ErrorMessage: errorMessage,
 	}
 	if scopedOp != nil {
-		resp.ApplyOperationId = req.GetApplyOperationId()
+		resp.ApplyOperationId = applyOperationID
 		resp.ApplyState = storageStateToProto(apply.State)
 		neverStarts, err := c.operationNeverStarts(ctx, scopedOp, apply)
 		if err != nil {
@@ -4022,9 +4023,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	// Populate apply_id and engine from the apply record.
 	// The apply record's engine is the source of truth (set at apply creation time).
-	if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && apply != nil {
+	if apply, err := reads.recordedApply(ctx, c); err == nil && apply != nil {
 		resp.ApplyId = apply.ApplyIdentifier
-		settled, err := c.settledControlRequests(ctx, apply)
+		settled, err := reads.settledControlRequests(ctx, c)
 		if err != nil {
 			c.logger.Error("progress: serving an apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
 				append(apply.LogAttrs(), "error", err)...)
@@ -4083,11 +4084,15 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if apply == nil {
 		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, storage.ErrApplyNotFound)
 	}
-	logs, err := c.storage.ApplyLogs().GetRecentByApply(ctx, apply.ID, limit)
+	operationIDs, err := c.logOperationsFor(ctx, apply, req.Target, req.Shard)
+	if err != nil {
+		return nil, err
+	}
+	logs, err := c.storage.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: apply.ID, OperationIDs: operationIDs, Limit: limit})
 	if err != nil {
 		return nil, fmt.Errorf("get recent logs for apply %s: %w", req.ApplyId, err)
 	}
-	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
+	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Target: req.Target, Shard: req.Shard, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
 	for _, log := range logs {
 		entry := &ternv1.ApplyLog{Id: log.ID, Level: log.Level, EventType: log.EventType, Source: log.Source, Message: log.Message, OldState: log.OldState, NewState: log.NewState, MetadataJson: log.Metadata, CreatedAt: log.CreatedAt.UTC().Format(time.RFC3339Nano)}
 		if log.TaskID != nil {
@@ -4096,6 +4101,79 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 		resp.Logs = append(resp.Logs, entry)
 	}
 	return resp, nil
+}
+
+// logOperationsFor returns the operations whose logs a Logs read for target
+// and shard covers. One data-plane apply can drive several targets of a
+// rollout, and every shard of a sharded target, and a read for one of them must
+// return its entries, not the whole apply's: the caller renders one section per
+// target, so an unscoped read would repeat every target's lines under each. It
+// returns nil, an unscoped read, when neither is named. A named target or shard
+// the apply has no operation on is an error, never an empty read that looks
+// like a quiet target or shard; the one exception is a single-target apply that
+// records its target under another name.
+func (c *LocalClient) logOperationsFor(ctx context.Context, apply *storage.Apply, target, shard string) ([]int64, error) {
+	if target == "" && shard == "" {
+		return nil, nil
+	}
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list operations of apply %s for logs of target %q shard %q: %w", apply.ApplyIdentifier, target, shard, err)
+	}
+	var operationIDs []int64
+	if target != "" {
+		operationIDs, ops, err = c.logOperationsOnTarget(apply, ops, target)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if shard == "" {
+		return operationIDs, nil
+	}
+	if operationIDs = storage.LogOperationsOnShard(ops, shard); len(operationIDs) > 0 {
+		return operationIDs, nil
+	}
+	where := "apply " + apply.ApplyIdentifier
+	if target != "" {
+		where = fmt.Sprintf("target %s of apply %s", target, apply.ApplyIdentifier)
+	}
+	shards := storage.DistinctOperationShards(ops)
+	if len(shards) == 0 {
+		return nil, fmt.Errorf("%s runs no per-shard operations, so it has no log for shard %s: %w", where, shard, ErrLogsShardNotInApply)
+	}
+	return nil, fmt.Errorf("%s has no operation on shard %s, only on %s: %w", where, shard, strings.Join(shards, ", "), ErrLogsShardNotInApply)
+}
+
+// logOperationsOnTarget narrows ops to target's, returning their IDs and the
+// operations themselves so a shard read can narrow further.
+func (c *LocalClient) logOperationsOnTarget(apply *storage.Apply, ops []*storage.ApplyOperation, target string) ([]int64, []*storage.ApplyOperation, error) {
+	if onTarget := storage.OperationsOnTarget(ops, target); len(onTarget) > 0 {
+		return storage.LogOperationsOnTarget(onTarget, target), onTarget, nil
+	}
+	targets := storage.DistinctOperationTargets(ops)
+	if len(targets) > 1 {
+		return nil, nil, fmt.Errorf("apply %s has no operation on target %s, only on %s: %w", apply.ApplyIdentifier, target, strings.Join(targets, ", "), ErrLogsTargetNotInApply)
+	}
+	// A remote apply that drives one target holds only that target's log, and
+	// a single-target dispatch may record its target under another name than
+	// the caller's (the database name when the request named none), so every
+	// operation listed here is the target's. The IDs stay explicit for the
+	// reason LogOperationsOnTarget gives: an operation that joins the apply
+	// after this listing belongs to another target.
+	if len(ops) > 0 {
+		c.logger.Debug("logs read for a target the single-target apply records under another name; serving its listed operations",
+			append(apply.LogAttrs(), "target", target, "recorded_targets", targets)...)
+		listed := make([]int64, 0, len(ops))
+		for _, op := range ops {
+			listed = append(listed, op.ID)
+		}
+		return listed, ops, nil
+	}
+	// An apply with no recorded operation has no operation to scope by, and its
+	// entries name none, so its whole log is the answer.
+	c.logger.Debug("logs read for a target on an apply with no recorded operation; serving its whole log",
+		append(apply.LogAttrs(), "target", target)...)
+	return nil, ops, nil
 }
 
 // loadStoredShardsByTable loads the persisted per-shard rows for an apply's
@@ -4169,13 +4247,13 @@ func (c *LocalClient) settledControlRequests(ctx context.Context, apply *storage
 // loadStoredProgressMetadata reads the operation's durable progress display
 // metadata. Vitess resume metadata is overlaid last because its established
 // display keys remain authoritative when both sources contain the same key.
-func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, task *storage.Task) map[string]string {
+func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, reads *progressReads, task *storage.Task) map[string]string {
 	operationID, err := applyOperationIDForTask(task)
 	if err != nil {
 		c.logger.Debug("progress: no apply operation for display metadata", "task_id", task.TaskIdentifier, "error", err)
 		return nil
 	}
-	op, err := c.storage.ApplyOperations().Get(ctx, operationID)
+	op, err := reads.operation(ctx, c, operationID)
 	if err != nil {
 		c.logger.Warn("progress response will omit stored metadata: failed to load apply operation", "task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
 		return nil

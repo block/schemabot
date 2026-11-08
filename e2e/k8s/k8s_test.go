@@ -228,7 +228,7 @@ func waitForControlPlaneApplyLogs(t *testing.T, endpoint string, applyID, tableN
 	var lastErr error
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
-			result, err := client.GetLogs(endpoint, "", "", applyID, 50)
+			result, err := client.GetLogs(endpoint, "", "", applyID, client.LogScope{}, 50)
 			lastErr = err
 			if err != nil {
 				return false
@@ -445,7 +445,7 @@ func waitForControlPlaneFailureLog(t *testing.T, endpoint, applyID, failureMessa
 	var lastErr error
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
-			result, err := client.GetLogs(endpoint, "", "", applyID, 50)
+			result, err := client.GetLogs(endpoint, "", "", applyID, client.LogScope{}, 50)
 			lastErr = err
 			if err != nil {
 				return false

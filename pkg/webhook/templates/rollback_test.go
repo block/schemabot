@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -68,8 +69,9 @@ func TestRenderRollbackPlanComment_ListsUnsafeChanges(t *testing.T) {
 	assert.Contains(t, rendered, "1. `audit_log`: DROP TABLE removes all data")
 	assert.Contains(t, rendered, "2. `orders` (shard `80-`)")
 	assert.Contains(t, rendered, "`legacy`")
-	assert.Contains(t, rendered, "To confirm this rollback, add `--allow-unsafe` to confirm 2 unsafe changes")
-	assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging\n```")
+	assert.Contains(t, rendered, "To confirm this rollback:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes")
+	assert.Contains(t, fencedCommands(t, rendered), "schemabot rollback-confirm -e staging")
+	assert.NotContains(t, rendered, glyph.Tip+" Before allowing", "the confirm footer carries the drop steps")
 }
 
 // rollback-confirm without --allow-unsafe on a rollback plan with unsafe
@@ -99,7 +101,7 @@ func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 		assert.Contains(t, rendered, "DROP TABLE `audit_log`")
 		assert.Contains(t, rendered, "**⛔ Rollback rejected**: 1 unsafe change detected")
 		assert.Contains(t, rendered, "1. `audit_log`: DROP TABLE removes all data")
-		assert.Contains(t, rendered, "add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:\n```\nschemabot rollback-confirm -e staging\n```")
+		assert.Contains(t, rendered, "Add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:\n   ```\n   schemabot rollback-confirm -e staging\n   ```")
 		assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
 		assert.Contains(t, rendered, "The lock still pins this rollback plan")
 		assert.Contains(t, rendered, "```\nschemabot unlock\n```")
@@ -110,7 +112,7 @@ func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 		tenantData := data
 		tenantData.Tenant = "acme"
 		rendered := RenderRollbackUnsafeChangesBlocked(tenantData)
-		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --tenant acme\n```")
+		assert.Contains(t, fencedCommands(t, rendered), "schemabot rollback-confirm -e staging --tenant acme")
 		assert.Contains(t, rendered, "```\nschemabot unlock --tenant acme\n```")
 	})
 
@@ -118,7 +120,7 @@ func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 		deferredData := data
 		deferredData.DeferCutover = true
 		rendered := RenderRollbackUnsafeChangesBlocked(deferredData)
-		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --defer-cutover\n```")
+		assert.Contains(t, fencedCommands(t, rendered), "schemabot rollback-confirm -e staging --defer-cutover")
 	})
 }
 

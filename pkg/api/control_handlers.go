@@ -879,7 +879,7 @@ func (h *cutoverTurnHold) message() string {
 		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
 			h.blocker, h.parked)
 	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not run their cutover; stop the schema change and apply again",
 			h.blocker, h.blockerState, h.parked)
 	default:
 		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",
@@ -1107,6 +1107,16 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
+	// SchemaBot's own stop of an apply whose deferred cutover can no longer
+	// run is told apart by its caller: the drive tail leaves it for the settle
+	// and retry expiry skips the apply. A stop sent under that caller would
+	// hold the apply open with nothing to settle it, so it is refused.
+	if caller == storage.EndedOperationStopCaller {
+		s.logger.Warn("operator: refused a stop sent under the caller SchemaBot reserves for its own stop",
+			append(apply.LogAttrs(), "caller", caller)...)
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for SchemaBot's own stop; send the stop under your own name", caller)
+	}
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")

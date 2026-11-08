@@ -69,7 +69,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
 	var reservedWake chan struct{}
-	if deferredCutoverDrivers(driverCount) < driverCount {
+	if storage.DeferredCutoverDrivers(driverCount) < driverCount {
 		reservedWake = make(chan struct{}, 1)
 	}
 	driverCtx, cancel := tern.NewOperatorContext(ctx)
@@ -126,6 +126,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 	s.maintenanceWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, expiryEvery, "ended operation", s.runEndedOperationPass)
+	})
+	s.maintenanceWg.Go(func() {
 		s.operatorHeartbeatLoop(driverCtx, stop, heartbeatEvery, server)
 	})
 	if pass, ok := s.branchReconcilePass(); ok {
@@ -140,7 +143,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// to the default in storage. Log the resolved cap beside the pool size.
 	s.logger.Info("operator started",
 		"drivers", driverCount,
-		"deferred_cutover_drivers", deferredCutoverDrivers(driverCount),
+		"deferred_cutover_drivers", storage.DeferredCutoverDrivers(driverCount),
 		"server_id", server.ServerID,
 		"heartbeat_interval", heartbeatEvery,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
@@ -1038,15 +1041,6 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan 
 // run a deferred apply.
 const reservedDriverID = 0
 
-// deferredCutoverDrivers reports how many of a pool of drivers may run work
-// for an apply deferring its cutover.
-func deferredCutoverDrivers(drivers int) int {
-	if drivers < 2 {
-		return drivers
-	}
-	return drivers - 1
-}
-
 // operationClaimOptions returns the filter driverID's operation claims run
 // under: the reserved driver skips deferred-cutover work (see reservedDriverID).
 func (s *Service) operationClaimOptions(driverID int) []storage.OperationClaimOption {
@@ -1834,7 +1828,7 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 // settled lets the driver run the claim ladder again at once. Every settled
 // state does except failed_retryable: that is the one settled state the copy
 // claim offers again immediately, so re-running the ladder on it would spend
-// the apply's retry budget back to back rather than one attempt per poll
+// that operation's retry budget back to back rather than one attempt per poll
 // (ST-9).
 func (s *Service) settledOperationOutcome(ctx context.Context, driverID int, op *storage.ApplyOperation) claimOutcome {
 	current, err := s.storage.ApplyOperations().Get(ctx, op.ID)
@@ -2542,6 +2536,15 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger
 	if controlReq == nil {
 		return nil
 	}
+	// The stop SchemaBot records for an ended operation marks the apply as the
+	// ended-operation settle's, which fails the apply and then answers the
+	// stop. Completing it here would leave the apply open with nothing to
+	// settle it.
+	if controlReq.RequestedBy == storage.EndedOperationStopCaller {
+		logger.Debug("operator: leaving SchemaBot's stop for an ended operation to the settle that fails the apply",
+			apply.LogAttrs()...)
+		return nil
+	}
 
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
@@ -3209,6 +3212,22 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 				"apply_operation_id", applyOperationID,
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "remote_operation_never_starts")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrRemoteDispatchUnresolved) && ctx.Err() == nil {
+			// The drive re-sent a dispatch whose remote apply id never reached
+			// storage and got no verdict. It wrote nothing, so the apply stays
+			// active with its attempt unchanged, and the next claim re-sends the
+			// same idempotency key; repeats can never create a second remote
+			// apply. This reason makes a data plane that keeps giving no answer
+			// visible as a rate. Until it answers, the apply holds its database
+			// and a pending stop or cancel waits for the remote apply id it needs.
+			logger.Error("operator: re-sent gRPC dispatch got no verdict; the apply stays active and the next claim re-sends the same idempotency key",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "remote_dispatch_unresolved")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
@@ -4253,6 +4272,9 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 			OldState:  apply.State,
 			NewState:  derived,
 			CreatedAt: s.clock.Now(),
+			// The projecting drive holds one operation's lease, but the
+			// parent's state is every target's.
+			ApplyWide: true,
 		}, "how the derived apply state was reached", append(apply.LogAttrs(), "driver", driverID)...)
 	}
 

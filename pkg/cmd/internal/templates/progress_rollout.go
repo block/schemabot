@@ -110,6 +110,15 @@ func RolloutCoverage(model presentation.Apply, groups []presentation.Group) stri
 	return presentation.CoveragePhrase(rolloutNoun(label), n, n)
 }
 
+// RolloutStoppedAtCutoverNote explains the rollout's members that SchemaBot
+// stopped at the cutover because another member failed, and that applying
+// again resumes their saved copies, or "" when none was stopped at the
+// cutover. It names the members as the rollout's counts do.
+func RolloutStoppedAtCutoverNote(model presentation.Apply, groups []presentation.Group) string {
+	noun := rolloutNoun(RolloutCountsUnit(groups))
+	return presentation.StoppedAtCutoverOf(model.Deployments).Note(noun, func(name string) string { return name })
+}
+
 // rolloutNoun is the noun for what RolloutCountsUnit's label counts.
 func rolloutNoun(label string) presentation.Noun {
 	if label == "Targets" {
@@ -895,11 +904,12 @@ func rollupTaskStatus(statuses []string) string {
 
 // writeTargetAttention names each failed or retrying target with its error
 // and the data-plane operation and apply to look at, the way a sharded apply
-// names a failed shard.
+// names a failed shard. A target stopped at the cutover for another's failure
+// does not need attention of its own.
 func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Group) {
 	var attention []int
 	for _, i := range g.Members {
-		if isTargetFailureState(v.Model.Deployments[i].State) {
+		if v.Model.Deployments[i].FailedOrRetrying() {
 			attention = append(attention, i)
 		}
 	}
@@ -928,12 +938,6 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 	if more := len(attention) - rolloutAttentionLimit; more > 0 {
 		fmt.Fprintf(b, "    %s…and %d more%s\n", ANSIDim, more, ANSIReset)
 	}
-}
-
-// isTargetFailureState reports whether a target's operation failed, or failed
-// and is being retried.
-func isTargetFailureState(opState string) bool {
-	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
 // memberTargetName is a member's target, or its name when it carries none.
@@ -965,10 +969,10 @@ func FormatRolloutFooter(v RolloutView) string {
 		// each cutover; otherwise SchemaBot cuts the ready member over itself,
 		// and offering the command would contradict that.
 		if !v.DeferCutover {
-			fmt.Fprintf(&b, "SchemaBot will cut over %s next — no action needed.\n", next.Name)
+			fmt.Fprintf(&b, "SchemaBot will run the cutover for %s next — no action needed.\n", next.Name)
 			break
 		}
-		writeRolloutCommand(&b, fmt.Sprintf("To cut over %s", next.Name), applyCommand("cutover"))
+		writeRolloutCommand(&b, fmt.Sprintf("To run the cutover for %s", next.Name), applyCommand("cutover"))
 	case presentation.NextActionResume:
 		writeRolloutCommand(&b, ResumeLabel, applyCommand("start"))
 	case presentation.NextActionReviewFailure:

@@ -99,6 +99,8 @@ func previewCommentAllOutput() {
 		{"DEPLOYMENT DRIFT (CLEAN, BLOCKED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftCleanBlocked()) }},
 		{"DEPLOYMENT DRIFT (DETECTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftDetected()) }},
 		{"DEPLOYMENT DRIFT (COULD NOT VERIFY)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftUnverified()) }},
+		{"PLAN OF A BRANCH MISSING NEWER BASE SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBaseSchemaChanged()) }},
+		{"PLAN WHOSE BASE SCHEMA COULD NOT BE CHECKED", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBaseSchemaUnverified()) }},
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
@@ -203,6 +205,7 @@ func previewCommentPlanAllOutput() {
 		{"POSTGRES PLAN (ENGINE-BLOCKED CHANGE, TWO CAUSES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlockedPostgres()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"MYSQL PLAN (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnsafe()) }},
+		{"MYSQL PLAN (MANY UNSAFE CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyUnsafeChanges()) }},
 		{"MYSQL PLAN (CHANGE ATTRIBUTED TO ANOTHER PR)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanAttributedChange()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED, APPLYING)", func() {
@@ -239,6 +242,8 @@ func previewCommentPlanAllOutput() {
 		{"DEPLOYMENT DRIFT (CLEAN, BLOCKED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftCleanBlocked()) }},
 		{"DEPLOYMENT DRIFT (DETECTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftDetected()) }},
 		{"DEPLOYMENT DRIFT (COULD NOT VERIFY)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDriftUnverified()) }},
+		{"PLAN OF A BRANCH MISSING NEWER BASE SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBaseSchemaChanged()) }},
+		{"PLAN WHOSE BASE SCHEMA COULD NOT BE CHECKED", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBaseSchemaUnverified()) }},
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
@@ -328,6 +333,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: ENVIRONMENT NOT IN PROMOTION ORDER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUnlistedEnvironment()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (NO OPERATORS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredNoOperators()) }},
+		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVER NOT AUTHORIZED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredUnauthorizedApprover()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApproval()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT, PR TARGETS ANOTHER BRANCH)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApprovalOtherBranch()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (UNCHANGED FILE, CHANGED BASE)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredChangedBase()) }},
@@ -459,6 +465,8 @@ func previewCommentShardedAllOutput() {
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
 		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
+		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A SHARD FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryStoppedAtCutover()) }},
+		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A TABLE FAILED ON A KEYSPACE'S ONLY SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStoppedAtCutoverOnOnlyShard()) }},
 		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}
 	printSections(sections)

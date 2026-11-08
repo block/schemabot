@@ -119,6 +119,16 @@ var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader d
 // an operator intervenes.
 var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 
+// ErrLogsTargetNotInApply is returned by a Logs read scoped to a target the
+// apply has no operation on. An empty result would read as a target that wrote
+// nothing, so the read refuses instead.
+var ErrLogsTargetNotInApply = errors.New("apply has no operation on the requested target")
+
+// ErrLogsShardNotInApply is returned by a Logs read scoped to a shard none of
+// the apply's operations (on the requested target, when one is named) runs on.
+// It refuses for the same reason as ErrLogsTargetNotInApply.
+var ErrLogsShardNotInApply = errors.New("apply has no operation on the requested shard")
+
 // ErrTaskRequeueRefused is returned by a resume whose write putting a
 // failed_retryable task back to pending for a retry, or a stopped task back to
 // pending for a start, did not land. The drive exits with the task row still at
@@ -301,4 +311,28 @@ type ShutdownHalter interface {
 	// no longer holds the target. It is not an operator stop: the applies it
 	// halts stay active for reclaim.
 	HaltForShutdown(ctx context.Context) error
+}
+
+// DriverCapacity is the drivers a deployment's live servers run.
+type DriverCapacity struct {
+	// LiveServers is how many of the deployment's servers reported their
+	// drivers within its live window.
+	LiveServers int
+	// Drivers is how many drivers those servers run, together.
+	Drivers int
+	// DeferredCutoverDrivers is how many of those drivers may hold an
+	// operation waiting at a deferred cutover.
+	DeferredCutoverDrivers int
+	// MaxDriversPerApply is how many operations of one apply the deployment
+	// runs at once.
+	MaxDriversPerApply int
+}
+
+// DriverCapacityReader is a client for a deployment whose operators run its
+// operations on another plane. Every operation sent there runs on one of that
+// plane's drivers, so a deferred apply is checked against that plane's drivers
+// as well as this one's. A nil capacity with no error is a deployment that
+// does not report it, and a deferred apply that needs it is refused there.
+type DriverCapacityReader interface {
+	DriverCapacity(ctx context.Context) (*DriverCapacity, error)
 }

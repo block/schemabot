@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -220,7 +221,8 @@ func TestE2ESingleEnvPlanFailureOverOldSuccessFailsAggregate(t *testing.T) {
 // both environments fails in each: neither has schema files to plan. Each
 // failure replaces its environment's stored row, so the aggregate fails, and a
 // later fold from stored check state still fails instead of passing on the old
-// success rows.
+// success rows. The published aggregate reads from those rows, so it shows the
+// fixed plan-failed summary and not the failure text the comment carries.
 func TestE2EAllEnvPlanFailureOverOldSuccessFailsAggregate(t *testing.T) {
 	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 	p := newMultiEnvPlanHarnessWithRepo(t, []api.TargetEntry{
@@ -242,11 +244,54 @@ func TestE2EAllEnvPlanFailureOverOldSuccessFailsAggregate(t *testing.T) {
 	aggregate := p.lastAggregate()
 	require.NotNil(t, aggregate, "the aggregate check run is published")
 	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion)
+	require.NotNil(t, aggregate.Output)
+	assert.Contains(t, aggregate.Output.Summary, planFailedCheckSummary, "the aggregate reads each environment's stored row")
+	assert.NotContains(t, aggregate.Output.Summary, "no schema files found", "the failure text stays on the plan comment")
 
 	p.handler.updateAggregateCheck(t.Context(), p.client, "octocat/hello-world", 1, "abc123")
 	aggregate = p.lastAggregate()
 	require.NotNil(t, aggregate, "the refold publishes the aggregate check run")
 	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "a refold must not pass the aggregate on the old success rows")
+}
+
+// A pull request's staging and production checks both passed on an earlier
+// plan. The repository's config then ignores staging's only namespace, so
+// staging has no schema files to plan, and production's schema files declare a
+// namespace no targets entry selects, so production's plan is refused by its
+// namespace placement. Every environment failed, and the failing row
+// recording production's refusal cannot be stored. Staging's failure still
+// replaces its stored row, and the failing aggregate posted in production's
+// place carries the placement block, so no fold passes the aggregate on the
+// old success rows.
+func TestE2EAllEnvPlanFailureWithUnstoredPlacementRefusalHoldsAggregate(t *testing.T) {
+	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	p := newMultiEnvPlanHarnessWithRepo(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+	}, &namespaceSelectingTernClient{}, func(st storage.Storage) storage.Storage {
+		return &envPlanResultFailingStorage{Storage: st, env: "production"}
+	}, map[string]string{
+		"ns_{env}/orders.sql": table,
+	}, "ignore_namespaces:\n  - ns_staging\n")
+	p.seedPassingChecks(t, "staging", "production")
+
+	body := p.comment(t, "schemabot plan")
+	assert.Contains(t, body, "no schema files found", "staging fails outright")
+	assert.Contains(t, body, `declares namespaces [ns_production] that no targets entry selects`, "production's plan is refused by its placement")
+
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "staging")
+	assert.Equal(t, checkConclusionFailure, byEnv["staging"].Conclusion, "staging's failed plan replaces its old success row")
+	assert.Equal(t, planFailedCheckSummary, byEnv["staging"].ChangeSummary)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionSuccess, byEnv["production"].Conclusion, "the refusal could not replace production's old row")
+
+	aggregates := p.publishedAggregates()
+	require.NotEmpty(t, aggregates, "the aggregate check run is published")
+	assertNoPassingAggregate(t, aggregates, "production's unstored placement refusal")
+	last := aggregates[len(aggregates)-1]
+	require.NotNil(t, last.Output)
+	assert.Equal(t, namespacePlacementUnstoredSummary, last.Output.Summary, "the block-carrying aggregate is posted last")
+	p.assertAggregateBlocked(t, checkstate.BlockNamespacePlacementRefused)
 }
 
 // A pull request plans staging and production together from a repository the
@@ -356,6 +401,13 @@ func TestE2EUnstoredPlanFailureBlocksOnlyItsEnvironmentAggregate(t *testing.T) {
 // it set out to post is not both published and stored: a caller about to fold
 // the aggregate from stored check state reads false as "do not fold". It
 // reports true only once the block is in place.
+//
+// An auto-plan run or a plan command that reached its work deadline still
+// lands the block, because the deadline is often the failure being reported.
+// Each run's context is built the way production builds it. The post's own
+// budget still ends when the context the run was started from is cancelled
+// (lease loss or shutdown), even part-way through the post, and it reads the
+// PR head again instead of trusting a head cached before a push replaced it.
 func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T) {
 	disabled := false
 	tests := []struct {
@@ -363,9 +415,27 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 		headSHA      string
 		createStatus int
 		repos        map[string]api.RepoConfig
-		want         bool
+		// command starts the run as a PR command instead of an auto-plan run.
+		command bool
+		// pastDeadline runs the post after the run's work deadline has passed.
+		// cachedHead seeds a PR-info cache on the context the run was started
+		// from.
+		pastDeadline      bool
+		cachedHead        string
+		runCancelled      bool
+		cancelRunOnPRRead bool
+		want              bool
 	}{
 		{name: "posted and stored", headSHA: "abc123", createStatus: http.StatusCreated, want: true},
+		{name: "run deadline passed", headSHA: "abc123", createStatus: http.StatusCreated, pastDeadline: true, want: true},
+		{name: "plan command deadline passed", headSHA: "abc123", createStatus: http.StatusCreated, command: true, pastDeadline: true, want: true},
+		{name: "run deadline passed after a push replaced the cached head", headSHA: "newsha456", createStatus: http.StatusCreated,
+			pastDeadline: true, cachedHead: "abc123"},
+		{name: "run cancelled", headSHA: "abc123", createStatus: http.StatusCreated, runCancelled: true},
+		{name: "run cancelled after its deadline passed", headSHA: "abc123", createStatus: http.StatusCreated,
+			pastDeadline: true, runCancelled: true},
+		{name: "run cancelled during the post after its deadline passed", headSHA: "abc123", createStatus: http.StatusCreated,
+			pastDeadline: true, cancelRunOnPRRead: true},
 		{name: "check publishing disabled", headSHA: "abc123", createStatus: http.StatusCreated,
 			repos: map[string]api.RepoConfig{"octocat/hello-world": {EnableChecks: &disabled}}},
 		{name: "head moved", headSHA: "newsha456", createStatus: http.StatusCreated},
@@ -377,7 +447,38 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 			mux := http.NewServeMux()
 			server := httptest.NewServer(mux)
 			t.Cleanup(server.Close)
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			h := newE2EHandler(t, svc, client)
+			installClient := ghclient.NewInstallationClient(client, h.logger)
+
+			parent, cancelRun := context.WithCancel(t.Context())
+			t.Cleanup(cancelRun)
+			if tt.cachedHead != "" {
+				parent = ghclient.WithPRInfo(parent, "octocat/hello-world", 1, &ghclient.PullRequestInfo{HeadSHA: tt.cachedHead, BaseRef: "main"})
+			}
+			var ctx context.Context
+			var cancelWork context.CancelFunc
+			if tt.command {
+				ctx, cancelWork = h.commandContext(parent, commandTimeout)
+			} else {
+				ctx, cancelWork = autoPlanContext(parent)
+			}
+			t.Cleanup(cancelWork)
+			if tt.pastDeadline {
+				var cancelPast context.CancelFunc
+				ctx, cancelPast = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				t.Cleanup(cancelPast)
+			}
+			if tt.runCancelled {
+				cancelRun()
+			}
+
+			var checkRunPosts int
 			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+				if tt.cancelRunOnPRRead {
+					cancelRun()
+				}
 				_ = json.NewEncoder(w).Encode(gh.PullRequest{
 					Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(tt.headSHA)},
 					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
@@ -385,17 +486,17 @@ func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T
 				})
 			})
 			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+				checkRunPosts++
 				w.WriteHeader(tt.createStatus)
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
 			})
-			client := gh.NewClient(nil)
-			client.BaseURL, _ = url.Parse(server.URL + "/")
-			h := newE2EHandler(t, svc, client)
-			installClient := ghclient.NewInstallationClient(client, h.logger)
 
-			got := h.postFailingAggregatesWithBlock(t.Context(), installClient, "octocat/hello-world", 1, "abc123",
+			got := h.postFailingAggregatesWithBlock(ctx, installClient, "octocat/hello-world", 1, "abc123",
 				map[string]string{"production": planFailedUnstoredSummary}, planFailedUnrecordedBlock)
 			assert.Equal(t, tt.want, got)
+			if tt.cachedHead != "" || tt.runCancelled || tt.cancelRunOnPRRead {
+				assert.Zero(t, checkRunPosts, "no Check Run is published")
+			}
 
 			stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
 			require.NoError(t, err)

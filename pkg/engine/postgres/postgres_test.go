@@ -87,11 +87,18 @@ func TestExecutionVerdict(t *testing.T) {
 				Disposition: router.DispositionExecute, ExecSQL: []string{"ALTER TABLE public.users ADD COLUMN email text"}},
 		},
 		{
-			name: "copy and swap",
+			name: "copy and swap the engine does not carry",
 			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
 				Disposition: router.DispositionUnavailable},
 			wantMode:   engine.ExecutionModeBlocked,
 			wantReason: `statement for table "users" requires copy-and-swap, which is unavailable`,
+		},
+		{
+			name: "copy and swap the engine carries",
+			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
+				Disposition: router.DispositionExecute},
+			wantMode:   engine.ExecutionModeBlocked,
+			wantReason: `statement for table "users" requires copy-and-swap, which SchemaBot's PostgreSQL support does not run yet`,
 		},
 		{
 			name: "unavailable without copy-and-swap backend",

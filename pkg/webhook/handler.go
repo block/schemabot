@@ -1233,6 +1233,28 @@ func (h *Handler) effectiveInstallationID(ctx context.Context, payloadID int64) 
 	return 0
 }
 
+// isRepoListenOnly reports whether SchemaBot reads this repository without
+// ever writing to it. The GitHub client refuses every write to such a
+// repository on its own; handlers check this only to skip work whose whole
+// purpose is a write, so the refusal does not show up as an error.
+func (h *Handler) isRepoListenOnly(repo string) bool {
+	return h.service != nil && h.service.Config().IsRepoListenOnly(repo)
+}
+
+// shouldRunPassingAggregateChecks reports whether a push or merge_group
+// delivery runs its passing aggregate path. A listen-only repository runs it,
+// so its coverage and Check Run lookups are measured like any other
+// repository's, and postPassingAggregateChecks skips the writes. Every other
+// repository runs it only when it publishes checks.
+func (h *Handler) shouldRunPassingAggregateChecks(ctx context.Context, repo, operation string) bool {
+	if h.isRepoListenOnly(repo) {
+		h.logger.Info("running passing aggregate reads for listen-only repository; no Check Runs will be posted",
+			"repo", repo, "operation", operation)
+		return true
+	}
+	return h.shouldPublishChecks(ctx, repo, operation)
+}
+
 // isRepoAllowed reports whether the repository is permitted by config. Mirrors
 // the per-handler allowlist check so repo-webhook dispatch can skip installation
 // resolution for repos this deployment does not manage.

@@ -891,22 +891,104 @@ ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 ⚠️ **Issues**: 1 unsafe change detected
 1. `orders`: DROP COLUMN discards the column's data
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
-</details>
-
 📋 **Plan**: **2** tables to alter
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
+   ```
+   schemabot apply -e staging
+   ```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-many-unsafe-changes"></a><strong>MySQL Plan (Many Unsafe Changes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `loans` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    `updated_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
 ```
-schemabot apply -e staging
+
+```sql
+CREATE TABLE `refunds` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    `updated_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
 ```
+
+```sql
+CREATE TABLE `ledger` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    `updated_at` timestamp NOT NULL DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;
+```
+
+```sql
+DROP TABLE `refund_backfill`;
+```
+
+⚠️ **Issues**: 9 unsafe changes detected (3 drops)
+1. `transfer_events`: DROP COLUMN discards the column's data
+2. `payouts`: DROP INDEX removes the index
+3. `refund_backfill`: DROP TABLE removes all data
+4. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+5. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+
+<details>
+<summary>4 more unsafe changes</summary>
+
+6. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+7. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+8. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+9. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+
+</details>
+
+📋 **Plan**: **3** tables to create, **2** tables to alter, **1** table to drop
+
+
+---
+
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped table and column.
+2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.
+3. Add `--allow-unsafe` to confirm 9 unsafe changes on `transfer_events`, `payouts` and 4 more:
+   ```
+   schemabot apply -e staging
+   ```
 
 </details>
 
@@ -934,22 +1016,17 @@ DROP TABLE `reconcile_state`;
 
 A plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
-
-</details>
-
 📋 **Plan**: **1** table to alter, **1** table to drop
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
-```
-schemabot apply -e staging
-```
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped table and column.
+2. Add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
+   ```
+   schemabot apply -e staging
+   ```
 
 </details>
 
@@ -2212,6 +2289,126 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="plan-of-a-branch-missing-newer-base-schema-changes"></a><strong>Plan Of A Branch Missing Newer Base Schema Changes</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **This branch is missing newer changes from `main` to `schema/staging`.** This plan could undo them, and apply is blocked until the branch has them. Merge `main` into this branch to plan again.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="plan-whose-base-schema-could-not-be-checked"></a><strong>Plan Whose Base Schema Could Not Be Checked</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **Could not check whether `main` has newer changes to this schema.** Apply checks again before it runs.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+💡 **Lint Warnings**: 2 advisory findings
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="rollout-plans-converging"></a><strong>Rollout Plans (Converging)</strong></summary>
 
 
@@ -2547,17 +2744,12 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
-</details>
-
-**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
-```
-schemabot apply -e staging
-```
+**🚨 To proceed with these destructive changes**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+   ```
+   schemabot apply -e staging
+   ```
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -2583,17 +2775,12 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
-
-</details>
-
-**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
-```
-schemabot apply -e staging
-```
+**🚨 To proceed with these destructive changes**:
+1. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+   ```
+   schemabot apply -e staging
+   ```
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -4469,6 +4656,32 @@ Schema changes require approval from an authorized reviewer before applying.
 ### Next steps
 1. Request a review from anyone listed above
 2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-required-approver-not-authorized"></a><strong>Apply Blocked: Review Required (Approver Not Authorized)</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `production`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Schema changes require approval from an authorized reviewer before applying.
+
+@jdoe approved, but isn't an authorized reviewer for `testapp`, so that approval doesn't count.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+
+### Next steps
+1. Request a review from anyone listed above, or add @jdoe to @acme/testapp-operators
+2. Then run `schemabot apply -e production` again
 
 </details>
 
@@ -7111,21 +7324,16 @@ DROP TABLE `audit_log`;
 ⚠️ **Issues**: 1 unsafe change detected
 1. `audit_log`: DROP TABLE removes all data
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
-
-</details>
-
 📋 **Plan**: **1** table to drop
 
 ---
 
-To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
-```
-schemabot rollback-confirm -e staging
-```
+To confirm this rollback:
+1. Deploy application code that no longer reads from or writes to the dropped table.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+   ```
+   schemabot rollback-confirm -e staging
+   ```
 
 To cancel, comment:
 ```
@@ -7155,17 +7363,12 @@ DROP TABLE `audit_log`;
 **⛔ Rollback rejected**: 1 unsafe change detected
 1. `audit_log`: DROP TABLE removes all data
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
-
-</details>
-
-**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
-```
-schemabot rollback-confirm -e staging
-```
+**🚨 To proceed with these destructive changes**:
+1. Deploy application code that no longer reads from or writes to the dropped table.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+   ```
+   schemabot rollback-confirm -e staging
+   ```
 
 The lock still pins this rollback plan, so the command above, with `--allow-unsafe`, confirms it.
 
@@ -9016,7 +9219,7 @@ _No details available yet._
 
 ---
 
-SchemaBot will cut over `eu` next — no action needed.
+SchemaBot will run the cutover for `eu` next — no action needed.
 
 To stop this schema change:
 ```
@@ -9365,7 +9568,7 @@ _No details available yet._
 
 ---
 
-To cut over `eu`:
+To run the cutover for `eu`:
 ```
 schemabot cutover apply-a1b2c3d4e5f6 -e production
 ```
@@ -10032,22 +10235,17 @@ ALTER TABLE `mutes`
 ⚠️ **Issues**: 1 unsafe change detected
 1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
-<details>
-<summary>Destructive drop guidance</summary>
-
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
-</details>
-
 📋 **Plan**: **1** table to alter
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
-```
-schemabot apply -e production
-```
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
+   ```
+   schemabot apply -e production
+   ```
 
 </details>
 
@@ -10341,6 +10539,87 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="summary-deferred-cutover-stopped-after-a-shard-failed"></a><strong>Summary: Deferred Cutover Stopped After A Shard Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `shop` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 1 failed, 3 stopped at cutover
+
+> ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+
+> ⏹️ 3 shards stopped at the cutover because <code>-40</code> failed. Their copies are saved, so applying again resumes them.
+
+#### Keyspace `shop_sharded`
+
+**`mutes`**: ❌ Failed
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
+| `40-80` | ⏹️ stopped at cutover — -40 failed; copy saved |
+| `80-c0` | ⏹️ stopped at cutover — -40 failed; copy saved |
+| `c0-` | ⏹️ stopped at cutover — -40 failed; copy saved |
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="summary-deferred-cutover-stopped-after-a-table-failed-on-a-keyspaces-only-shard"></a><strong>Summary: Deferred Cutover Stopped After A Table Failed On A Keyspace's Only Shard</strong></summary>
+
+
+## ❌ Schema Change Failed — Staging
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
+
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
+
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
+
+> ⏹️ 2 tables stopped at the cutover because <code>users</code> failed. Their copies are saved, so applying again resumes them.
+
+**`orders`** — Stopped
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`** — Failed at 30.00%
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`** — Stopped
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="summary-cancelled-after-partial-landing"></a><strong>Summary: Cancelled After Partial Landing</strong></summary>
 
 
@@ -10409,7 +10688,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-SchemaBot will cut over us-east next — no action needed.
+SchemaBot will run the cutover for us-east next — no action needed.
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 
@@ -10613,7 +10892,7 @@ To stop this schema change:
        • Targets: 1 (1 waiting for cutover)
            ● payments-003: waiting for cutover
 
-To cut over prod/payments-001:
+To run the cutover for prod/payments-001:
   schemabot cutover apply-multi-a1b2c3d4 -e production
 
 ```
@@ -10745,6 +11024,53 @@ To resume from where it stopped:
            ○ 40-80: cancelled
            ○ 80-c0: cancelled
            ○ c0-: cancelled
+    ~ VSchema (shop_001): Cancelled
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-deferred-cutover-stopped-after-a-shard-failed"></a><strong>Sharded Deferred Cutover Stopped After A Shard Failed</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Failed                                 │
+│  Shards:       1 failed, 3 stopped at cutover         │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Options:      ⏸️ Defer Cutover                       │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     1m                                     │
+└───────────────────────────────────────────────────────┘
+
+  shard -40: resolve shard primary for -40: context deadline exceeded
+
+  ⏹️ 3 shards stopped at the cutover because -40 failed. Their copies are saved, so applying again resumes them.
+
+
+  ── shop_001 ──
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+
+       • Shards: 4 (1 failed, 3 stopped)
+           ✗ -40: failed
+           ○ 40-80: stopped at 100.00% · 1,466,232 / 1,466,232 rows
+           ○ 80-c0: stopped at 100.00% · 1,402,118 / 1,402,118 rows
+           ○ c0-: stopped at 100.00% · 1,389,004 / 1,389,004 rows
     ~ VSchema (shop_001): Cancelled
           "tables": {
             "orders": {
@@ -11374,7 +11700,7 @@ ESC detach • s stop
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-SchemaBot will cut over us-east next — no action needed.
+SchemaBot will run the cutover for us-east next — no action needed.
 
 ESC detach • s stop
 ```

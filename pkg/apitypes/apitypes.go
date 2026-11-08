@@ -28,8 +28,14 @@ type LogEntry struct {
 }
 
 type LogsResponse struct {
-	ApplyID string      `json:"apply_id,omitempty"`
-	Logs    []*LogEntry `json:"logs"`
+	ApplyID string `json:"apply_id,omitempty"`
+	// Target echoes the target the read was narrowed to, empty for a read of
+	// the whole apply. A server that predates scoped reads leaves it empty
+	// whatever was asked, which is how a client detects that it was ignored.
+	Target string `json:"target,omitempty"`
+	// Shard echoes the shard the read was narrowed to, as Target.
+	Shard string      `json:"shard,omitempty"`
+	Logs  []*LogEntry `json:"logs"`
 	// Truncated reports that entries older than Logs exist and were left
 	// outside the requested window. A reader that shows a full window without
 	// this signal reads as a complete lifecycle, which is the wrong conclusion
@@ -38,10 +44,14 @@ type LogsResponse struct {
 }
 
 type DeploymentLogsResponse struct {
-	ApplyID    string                 `json:"apply_id"`
-	Deployment string                 `json:"deployment"`
-	Sources    []*DeploymentLogSource `json:"sources"`
-	Errors     []*DeploymentLogError  `json:"errors"`
+	ApplyID    string `json:"apply_id"`
+	Deployment string `json:"deployment"`
+	// Target and Shard echo the scope the read was narrowed to, as in
+	// LogsResponse.
+	Target  string                 `json:"target,omitempty"`
+	Shard   string                 `json:"shard,omitempty"`
+	Sources []*DeploymentLogSource `json:"sources"`
+	Errors  []*DeploymentLogError  `json:"errors"`
 }
 
 type DeploymentLogSource struct {
@@ -1860,12 +1870,25 @@ type ProgressOperationResponse struct {
 	// apply was created, because its target already held the change and
 	// nothing ran there.
 	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// EndedBy is set on a failed operation that did not fail on its own: it
+	// waited at a deferred cutover that another operation's end meant could
+	// never run, so SchemaBot stopped it, saved its copy, and failed it. It
+	// names that other operation of the same apply.
+	EndedBy *ProgressOperationRef `json:"ended_by,omitempty"`
 	// RolloutStep is the table step this operation runs, numbered from 1, when
 	// the rollout runs table by table: one operation per target and table.
 	// Omitted for an operation that runs its member's whole change.
 	RolloutStep int    `json:"rollout_step,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+}
+
+// ProgressOperationRef names one operation of an apply by its deployment and
+// operation key, which together identify it. An empty reference ({}) says the
+// operation was failed for another whose row the apply no longer lists.
+type ProgressOperationRef struct {
+	Deployment   string `json:"deployment,omitempty"`
+	OperationKey string `json:"operation_key,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -75,6 +76,7 @@ func previewCLIMultiDeployAllOutput() {
 		{"SHARDED APPLY ON A KEYSPACE'S ONLY SHARD", previewCLISingleShardApplyCompleted},
 		{"SHARDED APPLY COPYING ACROSS FOUR SHARDS", previewCLIShardedApplyRunning},
 		{"SHARDED APPLY WITH A FAILED SHARD", previewCLIShardedApplyFailed},
+		{"SHARDED DEFERRED CUTOVER STOPPED AFTER A SHARD FAILED", previewCLIShardedApplyStoppedAtCutover},
 	}
 	for i, section := range sections {
 		if i > 0 {
@@ -259,4 +261,29 @@ func multiDeploymentProgressData(ops []ProgressOperation, tables []TableProgress
 		Operations:  ops,
 		Tables:      tables,
 	}
+}
+
+// previewCLIShardedApplyStoppedAtCutover is a sharded apply that deferred its
+// cutover. Shard -40 failed while the other three had copied and waited at
+// the cutover, which could then never run for every shard, so SchemaBot
+// stopped them, saved their copies, and failed the apply.
+func previewCLIShardedApplyStoppedAtCutover() {
+	data := shardedPreviewProgress(state.Apply.Failed, state.ApplyOperation.Cancelled, "cancelled", []ShardProgress{
+		{Shard: "-40", Status: state.Task.Failed},
+		{Shard: "40-80", Status: state.Task.Stopped, RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+		{Shard: "80-c0", Status: state.Task.Stopped, RowsCopied: 1402118, RowsTotal: 1402118, PercentComplete: 100},
+		{Shard: "c0-", Status: state.Task.Stopped, RowsCopied: 1389004, RowsTotal: 1389004, PercentComplete: 100},
+	}, TableProgress{Status: state.Task.Failed})
+	data.CompletedAt = previewTime.Add(-3 * time.Minute).Format(time.RFC3339)
+	data.Options = map[string]string{"defer_cutover": "true"}
+	failed := data.Operations[0]
+	for i := range data.Operations[:4] {
+		data.Operations[i].State = state.ApplyOperation.Failed
+		if i > 0 {
+			data.Operations[i].EndedBy = &presentation.OperationRef{Deployment: failed.Deployment, OperationKey: failed.OperationKey}
+		}
+	}
+	data.Operations[0].ErrorMessage = "resolve shard primary for -40: context deadline exceeded"
+	data.ErrorMessage = firstOperationError(data.Operations)
+	WriteProgress(data)
 }

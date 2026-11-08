@@ -824,7 +824,7 @@ func rolloutDemo() Demo {
 	for i, p := range steps {
 		caption := "Every target copies at once"
 		if i >= 4 {
-			caption = "Each target cuts over as soon as its own copy is ready"
+			caption = "Each target runs its cutover as soon as its own copy is ready"
 		}
 		frames = append(frames, Frame{0.9, "", caption, watchView(rolloutProgress(rolloutApplyID, rolloutTargets, p))})
 	}
@@ -986,7 +986,7 @@ func main() {
 		frames = append(frames, Frame{0.18, "", "Follow the row copy to completion", live(p, state.Apply.Running, false, "")})
 	}
 	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
-	demos = append(demos, Demo{Name: "cli-cutover", Title: "Choose when to cut over.", Frames: frames})
+	demos = append(demos, Demo{Name: "cli-cutover", Title: "Choose when the cutover runs.", Frames: frames})
 	// This scenario illustrates a terminal that supports labeled links.
 	previousHyperlinks := ui.Hyperlinks
 	ui.Hyperlinks = true

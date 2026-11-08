@@ -120,6 +120,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeSkipsComment(t *testing.T) {
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, mux, "newsha")
 	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
@@ -191,6 +192,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, mux, "newsha")
 	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
@@ -264,6 +266,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, mux, "newsha")
 	registerCompareFiles(t, mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
@@ -1251,6 +1254,7 @@ func TestE2EAutoPlanNoChangesWithoutPriorPlanSkipsComment(t *testing.T) {
 func schemaNeutralSync(t *testing.T, f *autoPlanCommentFixture) {
 	t.Helper()
 	f.result.HeadSHAs = []string{"newsha"}
+	registerFreshBaseComparison(t, f.mux, "newsha")
 	registerCompareFiles(t, f.mux, "oldsha", "newsha", []*gh.CommitFile{{
 		Filename: new("app/service.go"),
 		Status:   new("modified"),
@@ -1366,8 +1370,8 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
 		filesFetchedOnce.Do(func() { close(filesFetched) })
 		files := []*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
-			{Filename: new("main.go"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(6), Deletions: new(2)},
+			{Filename: new("main.go"), Status: new("modified"), Additions: new(14), Deletions: new(3)},
 		}
 		_ = json.NewEncoder(w).Encode(files)
 	})
@@ -2060,7 +2064,7 @@ func TestE2EAutoPlanUsesRepositoryEnvironmentCoverage(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	result := setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{
 		"users.sql": "CREATE TABLE users (id BIGINT PRIMARY KEY)",
-	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}})
+	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)}})
 	h := newE2EHandler(t, svc, client)
 	drainWebhookWorkOnCleanup(t, h)
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: "abc123", headRef: "feature-branch"}, nil)

@@ -132,6 +132,25 @@ service Tern {
     };
   }
 
+  // BatchProgress answers Progress for several operations of one apply in a
+  // single call. The rollout members of one deployment share its apply, each
+  // with its own operation, so a caller driving many of them asks once per
+  // poll instead of once per member, and the apply, its tasks, and its
+  // operations are read once for all of them.
+  //
+  // Each entry of the answer is what Progress scoped to that operation would
+  // return, or the error it would fail with. An error that concerns the whole
+  // apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+  //
+  // A deployment that answers Unimplemented predates the RPC, and the caller
+  // asks Progress once per operation.
+  rpc BatchProgress(BatchProgressRequest) returns (BatchProgressResponse) {
+    option (google.api.http) = {
+      post: "/v1/batch-progress"
+      body: "*"
+    };
+  }
+
   // Logs returns a bounded recent window of durable apply logs. It is read-only.
   rpc Logs(LogsRequest) returns (LogsResponse) {
     option (google.api.http) = {
@@ -186,6 +205,20 @@ service Tern {
   rpc Health(HealthRequest) returns (HealthResponse) {
     option (google.api.http) = {
       get: "/v1/health"
+    };
+  }
+
+  // DriverCapacity reports the drivers this deployment's operators run, so a
+  // caller can refuse up front an apply that could never have all its
+  // operations here waiting at a deferred cutover at once.
+  //
+  // A deployment that answers also runs the cutover of every operation a
+  // CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+  // must not send an apply started with defer_cutover to a deployment that
+  // answers Unimplemented.
+  rpc DriverCapacity(DriverCapacityRequest) returns (DriverCapacityResponse) {
+    option (google.api.http) = {
+      get: "/v1/driver-capacity"
     };
   }
 
@@ -905,6 +938,36 @@ message ProgressRequest {
   string apply_operation_id = 3;
 }
 
+message BatchProgressRequest {
+  // Apply ID for the schema change to inspect.
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
+  // The operations to answer for: apply_operation_id values a dispatch
+  // returned in ApplyResponse. Each is answered as a ProgressRequest scoped
+  // to it would be.
+  repeated string apply_operation_ids = 3;
+}
+
+message BatchProgressResponse {
+  string apply_id = 1;
+  // One entry per requested operation, in request order.
+  repeated OperationProgress operations = 2;
+}
+
+// OperationProgress is the answer for one operation of a BatchProgress call.
+message OperationProgress {
+  // The apply_operation_id this entry answers for, echoed from the request.
+  string apply_operation_id = 1;
+  // What Progress scoped to this operation returns. Unset when error_code is.
+  ProgressResponse progress = 2;
+  // The gRPC status code Progress scoped to this operation fails with, or 0
+  // (OK) when progress is set.
+  int32 error_code = 3;
+  // The message of that failure.
+  string error_message = 4;
+}
+
 message LogsRequest {
   string apply_id = 1;
   string target = 2;
@@ -912,6 +975,11 @@ message LogsRequest {
   string type = 4;
   string environment = 5;
   int32 limit = 6;
+  // Optional shard of a sharded apply to read: only the operations whose work
+  // runs on that shard contribute their entries, alongside the entries that
+  // apply to the whole apply. Composes with target, since a shard name repeats
+  // across targets. Empty reads every shard.
+  string shard = 7;
 }
 
 message ApplyLog {
@@ -930,6 +998,16 @@ message ApplyLog {
 message LogsResponse {
   string apply_id = 1;
   repeated ApplyLog logs = 2;
+  // The target the read was narrowed to, echoing LogsRequest.target; empty
+  // when the read covers every target. A data plane that predates target log
+  // reads ignores the field and leaves this empty, so a caller that asked for
+  // one target must treat a missing or different echo as an unnarrowed read.
+  string target = 3;
+  // The shard the read was narrowed to, echoing LogsRequest.shard; empty when
+  // the read covers every shard. A data plane that predates LogsRequest.shard
+  // ignores the field and leaves this empty, so a caller that asked for one
+  // shard must treat a missing or different echo as an unnarrowed read.
+  string shard = 4;
 }
 
 // ShardProgress contains progress information for a single Vitess shard.
@@ -1112,6 +1190,29 @@ message HealthRequest {}
 // HealthResponse is the health check response.
 message HealthResponse {
   string status = 1;
+}
+
+// DriverCapacityRequest asks a deployment for the drivers its operators run.
+message DriverCapacityRequest {}
+
+// DriverCapacityResponse is the drivers a deployment's live servers
+// run, counted from the servers that reported within the live window.
+message DriverCapacityResponse {
+  // live_servers is how many of the deployment's servers reported their
+  // drivers within the live window.
+  int32 live_servers = 1;
+  // drivers is how many drivers those servers run, together.
+  int32 drivers = 2;
+  // deferred_cutover_drivers is how many of those drivers may hold an
+  // operation waiting at a deferred cutover: each server's drivers less the
+  // one it keeps for other work. A waiting operation keeps its driver until
+  // its cutover runs.
+  int32 deferred_cutover_drivers = 3;
+  // max_drivers_per_apply is how many operations of one apply the deployment
+  // runs at once. An operation waiting at its cutover keeps counting, so an
+  // apply that sends the deployment more operations than this can never have
+  // all of them waiting together.
+  int32 max_drivers_per_apply = 4;
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.

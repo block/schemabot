@@ -132,7 +132,7 @@ func TestApplyConflictMessageNarrowsToWhatWasProven(t *testing.T) {
 				Repository: "acme/payments", PullRequest: 12,
 			},
 			want: "Table xfers shard -40 is held by a schema change (Waiting for cutover) on acme/payments#12; " +
-				"it holds the database until it is cut over or cancelled.",
+				"it holds the database until its cutover runs or it is cancelled.",
 		},
 		{
 			name: "a multi-table atomic change names no table, so the shard carries the subject",

@@ -427,6 +427,54 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, state.Task.Completed, reloaded.State, "a drive that has ended must not reopen a terminal task")
 	})
 
+	// An operation lease authorizes writes to its own operation's tasks only. A
+	// write under it that names a sibling operation's task, or a task of no
+	// operation, is refused rather than reported as landed, so a caller never
+	// counts a task as settled when its row did not move.
+	t.Run("Update_OperationLeaseRefusesTasksOutsideItsOperation", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_outside_operation_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_outside_operation", 910)
+		for _, deployment := range []string{"region-a", "region-b"} {
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: deployment, OperationKey: "schema",
+			})
+			require.NoError(t, err)
+		}
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		require.Len(t, ops, 2)
+		siblingID := ops[0].ID
+		if siblingID == claimed.ID {
+			siblingID = ops[1].ID
+		}
+		opCtx := storage.WithOperationLease(ctx, claimed.Lease())
+
+		createdAt := time.Now().UTC().Truncate(time.Second)
+		siblings := newTask(apply, "task_outside_operation_sibling", "users", createdAt)
+		siblings.ApplyOperationID = &siblingID
+		unowned := newTask(apply, "task_outside_operation_unowned", "orders", createdAt)
+		for _, task := range []*storage.Task{siblings, unowned} {
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+			loaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, loaded)
+
+			loaded.State = state.Task.Stopped
+			require.ErrorIs(t, store.Tasks().Update(opCtx, loaded), storage.ErrTaskOutsideOperationLease,
+				"task %s is outside the held operation lease", task.TaskIdentifier)
+			reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, reloaded)
+			assert.Equal(t, state.Task.Pending, reloaded.State, "a write outside the held operation lease must not land on task %s", task.TaskIdentifier)
+		}
+	})
+
 	t.Run("ExpireRetryable_TerminalizesUnfinishedTasks", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -464,7 +512,7 @@ func TestTasks(t *testing.T, h Harness) {
 			require.True(t, released)
 		}
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)

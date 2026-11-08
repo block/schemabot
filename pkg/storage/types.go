@@ -20,6 +20,12 @@ import (
 // is terminalized as failed. The original apply attempt is separate. Surfaced
 // in operator-facing progress (the PR comment's retry counter) and enforced by
 // the storage claim/expiry paths.
+//
+// The budget is per operation. Each operation of an apply counts its own
+// redispatches, and the apply's attempt records the highest of them, so the
+// apply is terminalized once any one operation has spent its budget. One
+// interruption that reaches every operation at once costs each of them one
+// attempt, rather than costing the apply one attempt per operation.
 const MaxRecoveryAttempts = 10
 
 // ApplyTargetLockWait is how long a claim blocks waiting for another instance
@@ -1503,12 +1509,15 @@ type ApplyOperation struct {
 	// the operation is failed_retryable and so is its parent apply. It does not
 	// advance on a crash-recovery re-lease (a still-active parent with a stale
 	// heartbeat, or an in-flight drive whose driver died), so the
-	// count records only retries. It is the operation-local counterpart to
-	// applies.attempt: a sibling operation's retry advances the shared parent
-	// attempt but never this row's. It is a record for triage, not a dispatch
-	// generation: the operation-scoped idempotency key ignores it, so every
-	// dispatch of a deployment, retries included, carries the same key and
-	// lands on the deployment's one remote apply (OW-5).
+	// count records only retries. It is the operation's retry budget: a
+	// deliberate redispatch is admitted only while it is below
+	// MaxRecoveryAttempts. It is never reset, so the budget counts every
+	// redispatch in the operation's life. applies.attempt records the highest
+	// of any of its operations; a sibling's retry raises that but never this
+	// row's. It is not a dispatch generation: the operation-scoped
+	// idempotency key ignores it, so every dispatch of a deployment, retries
+	// included, carries the same key and lands on the deployment's one remote
+	// apply (OW-5).
 	Attempt int
 
 	// AlreadyConverged is true for an operation recorded completed when its
@@ -1524,6 +1533,14 @@ type ApplyOperation struct {
 	// and one operation runs one target's step. Zero is an operation that runs
 	// a member's whole change.
 	RolloutStep int
+
+	// EndedByOperationID names the sibling operation whose failure ended this
+	// one, or 0 when it ended on its own outcome. It is set when an apply that
+	// deferred its cutover fails because one operation ended before the
+	// cutover: SchemaBot stops the operations still waiting and settles them
+	// failed, and this records which sibling they failed for. Their tasks stay
+	// stopped, because the work they did is saved and a new apply resumes it.
+	EndedByOperationID int64
 
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
@@ -2020,18 +2037,91 @@ func (r *ApplyControlRequest) CutoverOperationIDs() ([]int64, error) {
 	return nil, nil
 }
 
+// cutoverOutcomeUnknownSinceMetadataKey records when a cutover request's
+// outcome became unknown: a send whose answer was lost may have started the
+// cutover. Its value is an object keyed by the decimal apply_operation id the
+// send was for, "0" for a request not bound to an operation, each holding the
+// moment that operation's send first lost its answer. A request bound to a
+// set of operations is sent once per member, so the stamps are kept apart:
+// one member's lost answer says nothing about another member's first send. It
+// lives on the request row, so it outlasts the drive that sent the request
+// and is cleared when the row is re-armed for a new command.
+const cutoverOutcomeUnknownSinceMetadataKey = "outcome_unknown_since"
+
+// cutoverOutcomeUnknownStamps decodes the per-operation stamps under
+// cutoverOutcomeUnknownSinceMetadataKey from the request's metadata, and
+// returns the remaining metadata fields so a stamp can be written back
+// without losing them.
+func (r *ApplyControlRequest) cutoverOutcomeUnknownStamps() (map[string]json.RawMessage, map[string]time.Time, error) {
+	fields := map[string]json.RawMessage{}
+	stamps := map[string]time.Time{}
+	if r == nil || len(r.Metadata) == 0 {
+		return fields, stamps, nil
+	}
+	if err := json.Unmarshal(r.Metadata, &fields); err != nil {
+		return nil, nil, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	raw, ok := fields[cutoverOutcomeUnknownSinceMetadataKey]
+	if !ok {
+		return fields, stamps, nil
+	}
+	if err := json.Unmarshal(raw, &stamps); err != nil {
+		return nil, nil, fmt.Errorf("parse %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
+	}
+	return fields, stamps, nil
+}
+
+// CutoverOutcomeUnknownSince returns when the request's send for operationID
+// (0 for a request not bound to an operation) first lost its answer, or the
+// zero time when no send for that operation has.
+func (r *ApplyControlRequest) CutoverOutcomeUnknownSince(operationID int64) (time.Time, error) {
+	_, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return stamps[strconv.FormatInt(operationID, 10)], nil
+}
+
+// WithCutoverOutcomeUnknownSince returns the request's metadata with since
+// recorded as the moment its send for operationID (0 for a request not bound
+// to an operation) lost its answer, keeping every other key and every other
+// operation's stamp.
+func (r *ApplyControlRequest) WithCutoverOutcomeUnknownSince(operationID int64, since time.Time) ([]byte, error) {
+	fields, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return nil, err
+	}
+	stamps[strconv.FormatInt(operationID, 10)] = since.UTC()
+	raw, err := json.Marshal(stamps)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
+	}
+	fields[cutoverOutcomeUnknownSinceMetadataKey] = raw
+	metadata, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return metadata, nil
+}
+
 // ForwardingControlRequestCaller is the requester recorded for a control
 // request that reached this plane over the data-plane RPC boundary. The control
 // RPCs carry no operator identity, so this names the path the request arrived
 // on rather than the person who issued it.
 const ForwardingControlRequestCaller = "tern-grpc"
 
+// EndedOperationStopCaller is the requester recorded for the stop SchemaBot
+// itself requests on an apply that deferred its cutover when one of its
+// operations ends before the cutover. No operator issued it, so it names
+// SchemaBot.
+const EndedOperationStopCaller = "schemabot"
+
 // ControlRequestNamesAnOperator reports whether a requester identifies the
 // operator who issued the command. Only such a value is worth showing in the
 // PR notice, whose whole purpose is telling an operator which of their commands
 // did not take effect.
 func ControlRequestNamesAnOperator(requestedBy string) bool {
-	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller
 }
 
 // IsMirroredRemoteRejection reports whether this row exists only to carry
@@ -2552,13 +2642,21 @@ type PlanComment struct {
 	GitHubNodeID string
 
 	// UpToDate records that the comment showed nothing to act on: no changes,
-	// rollout work, errors, or drift. A later plan that flips between nothing
-	// to act on and something to act on replaces the comment even when the
-	// schema inputs did not change. The bit does not compare the DDL itself:
+	// rollout work, errors, drift, or base-schema notice. A later plan that
+	// flips between nothing to act on and something to act on replaces the
+	// comment even when the schema inputs did not change. The bit does not compare the DDL itself:
 	// two plans that both have work count as the same outcome. False is the
 	// safe default: a comment not known to be up to date is replaced by an
 	// up-to-date plan.
 	UpToDate bool
+
+	// BaseSchemaNotice records that the comment warned the base branch has
+	// newer changes to the schema, or that it could not check. The base branch
+	// moves without a push to the PR, so a later plan whose notice differs
+	// replaces the comment even when the schema inputs did not change. False
+	// is the right default for a comment recorded without it: such a comment
+	// showed no notice.
+	BaseSchemaNotice bool
 
 	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
 	// means the comment was not minimized — including after a failed
@@ -2622,6 +2720,20 @@ type ApplyLog struct {
 	// TaskID points to tasks.id (optional, for task-specific events).
 	TaskID *int64
 
+	// ApplyOperationID points to apply_operations.id: the operation whose
+	// drive wrote the entry. Append fills it from the operation lease on the
+	// context when the caller leaves it unset, so every entry an
+	// operation-scoped drive writes is attributed to its operation, including
+	// the ones no single task owns. Nil for an entry about the whole apply.
+	ApplyOperationID *int64
+
+	// ApplyWide marks an entry about the whole apply that an operation's drive
+	// writes under its own lease, such as the parent state it projects from
+	// every operation. Append leaves ApplyOperationID nil for it, so a read
+	// scoped to any one target still shows it. It is not stored: an entry
+	// with no operation and no task is how storage records an apply-wide one.
+	ApplyWide bool
+
 	// Level is the log level: "debug", "info", "warn", "error".
 	Level string
 
@@ -2646,6 +2758,100 @@ type ApplyLog struct {
 	CreatedAt time.Time
 }
 
+// LogOperationsOnTarget returns the ApplyLogFilter.OperationIDs of a log read
+// scoped to target: the IDs of the apply's operations that run on it, or nil
+// when none does. The IDs stay explicit even when every operation the caller
+// listed runs on target, since another target's operation can join the apply
+// between that listing and the log read.
+func LogOperationsOnTarget(ops []*ApplyOperation, target string) []int64 {
+	var operationIDs []int64
+	for _, op := range OperationsOnTarget(ops, target) {
+		operationIDs = append(operationIDs, op.ID)
+	}
+	return operationIDs
+}
+
+// DistinctOperationTargets lists the distinct targets of ops in sorted order.
+// An operation that names no target adds none.
+func DistinctOperationTargets(ops []*ApplyOperation) []string {
+	seen := make(map[string]bool, len(ops))
+	var targets []string
+	for _, op := range ops {
+		if op.Target != "" && !seen[op.Target] {
+			seen[op.Target] = true
+			targets = append(targets, op.Target)
+		}
+	}
+	slices.Sort(targets)
+	return targets
+}
+
+// OperationsOnTarget keeps the operations of ops that run on target.
+func OperationsOnTarget(ops []*ApplyOperation, target string) []*ApplyOperation {
+	var onTarget []*ApplyOperation
+	for _, op := range ops {
+		if op.Target == target {
+			onTarget = append(onTarget, op)
+		}
+	}
+	return onTarget
+}
+
+// OperationShard returns the shard a sharded work operation runs on: the shard
+// of its ShardOperationKey, on its own or behind the operation's target, as
+// state.ShardWorkKey reads it. An operation that covers no single shard (a
+// whole-target key, a rollout step, a group finalizer) reports false. No
+// component can contain the delimiter, so the component count tells the key
+// shapes apart, with one exception: a group finalizer behind its target
+// ("shop-002/main/group_finalizer") has as many components as a shard key on
+// its own, so the operation's kind rules it out.
+func OperationShard(kind, key, target string) (string, bool) {
+	if kind == ApplyOperationKindGroupFinalizer {
+		return "", false
+	}
+	// A key whose namespace happens to equal the target ("main/-80/orders" on
+	// target "main") is a shard key on its own, so the target prefix is
+	// stripped only when what remains is a whole shard key.
+	if target != "" {
+		if rest, ok := strings.CutPrefix(key, target+OperationKeyDelimiter); ok {
+			if _, shard, _, ok := state.ShardWorkKey(rest); ok {
+				return shard, true
+			}
+		}
+	}
+	_, shard, _, ok := state.ShardWorkKey(key)
+	return shard, ok
+}
+
+// LogOperationsOnShard returns the ApplyLogFilter.OperationIDs of a log read
+// scoped to shard: the IDs of the operations whose work runs on it, or nil when
+// none does. A read that also names a target narrows ops to it first, since a
+// shard name such as "-80" repeats across targets.
+func LogOperationsOnShard(ops []*ApplyOperation, shard string) []int64 {
+	var operationIDs []int64
+	for _, op := range ops {
+		if opShard, ok := OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && opShard == shard {
+			operationIDs = append(operationIDs, op.ID)
+		}
+	}
+	return operationIDs
+}
+
+// DistinctOperationShards lists the distinct shards ops' keys scope them to, in
+// sorted order. An operation that covers no single shard adds none.
+func DistinctOperationShards(ops []*ApplyOperation) []string {
+	seen := make(map[string]bool, len(ops))
+	var shards []string
+	for _, op := range ops {
+		if shard, ok := OperationShard(op.OperationKind, op.OperationKey, op.Target); ok && !seen[shard] {
+			seen[shard] = true
+			shards = append(shards, shard)
+		}
+	}
+	slices.Sort(shards)
+	return shards
+}
+
 // ApplyLogFilter specifies criteria for listing apply logs.
 type ApplyLogFilter struct {
 	ApplyID   int64  // Required: filter by apply
@@ -2653,6 +2859,12 @@ type ApplyLogFilter struct {
 	Level     string // Optional: filter by level
 	EventType string // Optional: filter by event type
 	Limit     int    // Optional: limit results (default 100)
+
+	// OperationIDs, when non-empty, keeps the entries attributed to one of
+	// these operations, written by the operation's drive or about one of its
+	// tasks, plus the entries about the whole apply, which name no operation
+	// and no task. Entries attributed to any other operation are left out.
+	OperationIDs []int64
 }
 
 // EngineResumeState stores opaque resume data owned by the engine package.
