@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -129,7 +130,7 @@ func appendAgentHint(body, hint string) string {
 	if hint == "" {
 		return body
 	}
-	return strings.TrimRight(body, "\n") + "\n\n<!-- 💡 " + hint + " -->"
+	return strings.TrimRight(body, "\n") + "\n\n<!-- " + glyph.Tip + " " + hint + " -->"
 }
 
 // RenderSupportChannelFooter appends a support-channel footer to a rendered PR comment.

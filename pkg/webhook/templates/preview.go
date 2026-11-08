@@ -418,6 +418,49 @@ func PreviewCommentPlanUnsafe() string {
 	})
 }
 
+// PreviewCommentPlanManyUnsafeChanges renders a sample plan whose unsafe list
+// is long and mixes destructive drops of a table, a column and an index with
+// findings that destroy nothing: the drops lead the list, the rest fold past
+// the first findings, and the apply instruction numbers each drop's safety
+// step ahead of the consent.
+func PreviewCommentPlanManyUnsafeChanges() string {
+	timestamp := func(column string) string {
+		return "Column `" + column + "` uses `TIMESTAMP` which overflows on 2038-01-19."
+	}
+	var statements []string
+	var unsafe []UnsafeChangeData
+	for _, table := range []string{"loans", "refunds", "ledger"} {
+		statements = append(statements, "CREATE TABLE `"+table+"` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;")
+		unsafe = append(unsafe,
+			UnsafeChangeData{Table: table, Reason: timestamp("created_at"), ChangeType: "create"},
+			UnsafeChangeData{Table: table, Reason: timestamp("updated_at"), ChangeType: "create"},
+		)
+	}
+	statements = append(statements,
+		"ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;",
+		"ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;",
+		"DROP TABLE `refund_backfill`;",
+	)
+	unsafe = append(unsafe,
+		UnsafeChangeData{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data", ChangeType: "alter", DDL: "ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;"},
+		UnsafeChangeData{Table: "payouts", Reason: "DROP INDEX removes the index", ChangeType: "alter", DDL: "ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;"},
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`;"},
+	)
+	return RenderPlanComment(PlanCommentData{
+		Database:         "testapp",
+		SchemaName:       "testapp",
+		Environment:      "staging",
+		HeadSHA:          previewHeadSHA,
+		Repository:       previewRepository,
+		RequestedBy:      previewRequestedBy,
+		IsMySQL:          true,
+		DatabaseType:     "mysql",
+		Changes:          []KeyspaceChangeData{{Keyspace: "testapp", Statements: statements}},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    unsafe,
+	})
+}
+
 // PreviewCommentPlanAttributedChange renders a sample plan whose destructive
 // changes target tables another open pull request applied but has not merged
 // yet, so each entry is annotated with its owner. Attribution is table-grained,
@@ -766,6 +809,22 @@ func PreviewCommentPlanNoChanges() string {
 		DatabaseType: "mysql",
 		Changes:      nil,
 	})
+}
+
+// PreviewCommentPlanBaseSchemaChanged renders a plan of a branch that is
+// missing a newer change its base branch made to the environment's schema.
+func PreviewCommentPlanBaseSchemaChanged() string {
+	data := previewPlanData()
+	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", ChangedPaths: []string{"schema/staging"}}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanBaseSchemaUnverified renders a plan whose base branch
+// could not be checked for newer changes to the environment's schema.
+func PreviewCommentPlanBaseSchemaUnverified() string {
+	data := previewPlanData()
+	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", Unverified: true}
+	return RenderPlanComment(data)
 }
 
 // PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
@@ -1523,6 +1582,21 @@ func PreviewCommentReviewRequired() string {
 		OperatorReviewers: []string{"acme/testapp-operators"},
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
+	})
+}
+
+// PreviewCommentReviewRequiredUnauthorizedApprover renders the "review
+// required" comment when the PR's only approval comes from a reviewer who is
+// not an authorized reviewer for the database.
+func PreviewCommentReviewRequiredUnauthorizedApprover() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:              "testapp",
+		Environment:           "production",
+		RequestedBy:           previewRequestedBy,
+		OperatorReviewers:     []string{"acme/testapp-operators"},
+		OtherReviewers:        []string{"acme/schema-reviewers"},
+		PRAuthor:              previewRequestedBy,
+		UnauthorizedApprovers: []string{"jdoe"},
 	})
 }
 

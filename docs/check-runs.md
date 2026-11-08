@@ -697,7 +697,8 @@ the checks that instance owns:
   <owner/name>`) scans just that one; `--all-repos` scans every repository
   declared in the instance's `repos:` config. A legacy single-App config
   declares no repos, so there `--all-repos` is rejected and repositories must
-  be named explicitly. Repositories with `enable_checks: false` are skipped,
+  be named explicitly. Repositories with `enable_checks: false` (including
+  `listen_only` repositories, which never publish checks) are skipped,
   not scanned — the server refuses to create their checks, so every open PR
   would trivially read as missing one. The skip is reported, never an error:
   an `--all-repos` sweep keeps going, and naming a disabled repository

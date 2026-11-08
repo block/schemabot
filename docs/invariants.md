@@ -515,12 +515,17 @@ or from one request that covers them all, never by a lookup per file.
 *Breaks if violated:* an App installation's rate limit is shared by every pull request in every
 repository it serves, so routine edits in one large repository use it up and required checks stop
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
-configs, probing each directory once (`pkg/github/config.go`), and
+configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
+(`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
+symlinks from one diff of the change, or from directory listings batched across those paths when
+GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
+the server's configuration names every directory the repository's configs can sit in, and reads a
+symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
-(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
-hundred one-line edits outside its schema directory and requires the same GitHub requests. It
-covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
-a repository whose tree GitHub truncates.
+(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
+one-line edits outside its schema directory and requires the same GitHub requests. It covers an
+auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
+repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
@@ -584,7 +589,9 @@ scope and pending contributions for missing local results (`pkg/webhook/aggregat
 path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
 match, which all read the schema paths a PR vacates as well as those it changes
 (`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
-`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`);
+`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`), with
+the narrowing to what a PR proposes keeping every vacated schema or config path the default branch
+still holds (`PRFilesProposedAgainstDefaultBranch` in `pkg/github/client.go`);
 required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
 `pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
 multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
@@ -864,10 +871,10 @@ control-owned states (`stopped`, `failed_retryable`) are never overwritten by ac
 and active states advance strictly forward through the lifecycle.
 
 The guard belongs to the drive loop, which is where stale polls come from, and nothing else
-assigns task state. That is a consequence of OW-8: every writer of a task row is a driver or an
-elected reaper, so every write either goes through this resolution or is a reaper settling a row
-no driver is touching. *Enforced:* the forward-only state resolution
-the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
+assigns task state. That is a consequence of OW-8: every writer of a task row is a driver, an
+elected reaper, or the conflict check settling a task whose lease has gone stale, so every write
+either goes through this resolution or lands on a row no driver is touching. *Enforced:* the
+forward-only state resolution the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
 outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
 `pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
@@ -918,9 +925,11 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
 resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
-retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the per-operation budget in
-the redispatch claim (`FindNextApplyOperation`,
+retrying can cure instead of failing it (`driveGroupFinalizer`, same file), the conflict check,
+which pauses a stale apply for retry when its engine reports a retryable failure so the next
+recovery is charged against the budget (`pauseStaleApplyForRetry` in `pkg/tern/local_apply.go`),
+and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the
+per-operation budget in the redispatch claim (`FindNextApplyOperation`,
 `pkg/storage/internal/sqlstore/apply_operations.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
@@ -1031,10 +1040,13 @@ stale comments or overwriting newer state.
 
 The token is what a driver writes under, so a write made by something that is not driving has none
 to present and the predicate is empty. That is only safe where such a write cannot race a driver.
-The elected reaper is the sole non-driver writer (OW-8), and it earns that by writing only rows
-whose drive liveness signal has gone quiet for longer than the operator's whole recovery budget,
-re-asserted on the guarded write rather than trusted from the scan. Any new non-driver write needs
-a precondition that actually excludes a live driver. *Enforced:* a token
+Two non-driver writers exist (OW-8), and each earns it with a precondition the store re-asserts on
+the write rather than trusting from the scan. The elected reaper writes only rows whose drive
+liveness signal has gone quiet for longer than the operator's whole recovery budget. The conflict
+check settles a task only while no drive holds its operation's lease at the moment of the write,
+and pauses that task's apply and operation for retry only while each still carries the lease token
+it read and that token's heartbeat is older than the staleness window. Any new non-driver write
+needs a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
 `pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
@@ -1140,7 +1152,10 @@ held apply once its stored row names the apply that took over its work
 (`updateApplyStateFromOperations`, `pkg/api/operator.go`). A control plane retrying an operation
 that never attached dispatches it under its deployment's unchanged key and manifest, so the retry
 lands on that deployment's one remote apply rather than arriving as a newer generation
-(`remoteApplyIdempotencyKey`, `generationOperationKeys`, `pkg/tern/grpc_client.go`).
+(`remoteApplyIdempotencyKey`, `generationOperationKeys`, `pkg/tern/grpc_client.go`). Work found
+active with no remote apply id re-sends its dispatch under the key the earlier dispatch carried, and
+a re-send that gets no verdict leaves the work untouched rather than recording a failure that
+would rotate the key (`hasAmbiguousRemoteDispatchState`, `settleFailedDispatch`, same file).
 
 ### OW-6: There is one way to claim work
 
@@ -1169,11 +1184,20 @@ work it does not own. *Enforced:* scope checks and token-guarded claim release i
 (`pkg/api/operator.go`) and operation lease checks before conflict resolution
 (`pkg/tern/local_apply.go`, `pkg/storage/internal/sqlstore/tasks.go`).
 
-### OW-8: Only drivers and elected reapers write apply and task rows
+### OW-8: Only drivers, elected reapers, and the bounded conflict check write apply and task rows
 
 Two classes of writer touch apply, apply-operation, and task rows: the driver holding that row's
-lease, and the elected reaper settling rows no driver is coming back for. Nothing else does, and a
-request goroutine serving a read never does.
+lease, and the elected reaper settling rows no driver is coming back for. One bounded writer sits
+outside both classes: the conflict check settles a task whose lease has gone stale from this
+process's own engine report and, when that settlement rests `failed_retryable`, pauses the task's
+apply and operation for retry. Its two writes carry different guards. The task settlement lands
+only while no drive holds a fresh lease on the task's operation, checked by the store at the
+write; a task that records no operation has no such lease, and its settlement rests on the apply
+lease having read stale before the engine was asked. The retry pause lands only while the apply
+and operation still carry the lease tokens the conflict check read and those tokens' heartbeats
+are older than the staleness window, the precondition a peer claim uses, so a live driver excludes
+it the same way (OW-2). The apply and operation states it writes are non-terminal ones any later
+claim undoes. Nothing else writes these rows, and a request goroutine serving a read never does.
 
 The reason is narrower than "reads and writes should not race", and survives the observation that
 a particular reader write would almost always have agreed with the driver. The guarantee OW-2
@@ -1197,15 +1221,18 @@ including when what is stored is a task that has outlived its apply's verdict (U
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
 gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
 `lockUndrivenApplies`, `pkg/storage/internal/sqlstore/apply_operations.go`,
-`pkg/storage/internal/sqlstore/applies.go`), and a read path that builds progress from
-stored rows without writing them (`pkg/api/progress_handlers.go`).
+`pkg/storage/internal/sqlstore/applies.go`), the stale-lease guards the conflict check's task
+settlement and retry pause write under (`tryResolveStaleTask`, `pauseStaleApplyForRetry`,
+`pkg/tern/local_apply.go`; `MarkStaleApplyRetryable`, `pkg/storage/internal/sqlstore/applies.go`),
+and a read path that builds progress from stored rows without writing them
+(`pkg/api/progress_handlers.go`).
 
 ### OW-9: An advisory lock is only exclusion where the session holds still
 
 Every guarantee SchemaBot has across instances that is not a lease predicate is one advisory
-lock: the storage bootstrap, the apply target lock behind OW-5, and reaper election. All three
-are session-scoped, so all three are exclusion only while a connection keeps reaching the same
-server session.
+lock: the storage bootstrap, the apply target lock behind OW-5, reaper election, and the pending
+drops cleanup lock behind RV-5. All four are session-scoped, so all four are exclusion only while
+a connection keeps reaching the same server session.
 
 That is a property of the connection and not of the lock. It holds against a database, and
 against a pooler that gives a client its own session for the connection's lifetime. It does not
@@ -1230,7 +1257,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
 `releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
-lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`; `releaseCleanupLock`,
+`pkg/pendingdrops/cleaner.go`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1768,7 +1796,9 @@ mandatory, is checked at apply time against the current base, and cannot be waiv
 not preserving a stale plan. *Enforced:* `assertBaseSchemaStillCurrent` on both apply entry
 points (`pkg/webhook/schema_freshness.go`, called from `pkg/webhook/apply_handlers.go`). It
 compares Git tree OIDs, stops on GitHub read uncertainty, and takes no `allowUnsafe` argument to
-waive with.
+waive with. A plan whose base is newer, or could not be checked, is never suppressed:
+`planCommentUpToDate` and the auto-plan publication path in `pkg/webhook/plan.go` post it in place
+of the visible comment.
 
 ### RV-3: Consent is explicit, specific, and re-checked
 
@@ -1803,6 +1833,9 @@ its own shard and stamped with that shard's verdict, and a shard dispatch this d
 not re-plan (it carries no schema files) treated as unsafe
 (`verifyShardDispatchAgainstLiveSchema` and `restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+`pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
+mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
+`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeVSchemaChangesWithoutOptIn` in
 `pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
@@ -1996,9 +2029,11 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval counts only for the schema change it reviewed: it was
-given on the commit being applied, or on an earlier commit at which the change's own effect on every
-schema input is provably the same, or the change has stopped touching an input that newer default
+their own review requirement. An approval that the reviewer withdrew or that the repository
+dismissed does not count. An approval counts only for the schema change it reviewed, unless the
+change's target branch dismisses stale approvals itself or the review policy turns re-approval
+off: it was given on the commit being applied, or on an earlier commit at which the change's own
+effect on every schema input is provably the same, or the change has stopped touching an input that newer default
 branch content has changed since, so any difference between the two came from newer content on the
 repository's default branch; when that cannot be proved, the approval does not count. A change
 targeting any other branch keeps an approval only where its own effect and its base content are
@@ -2011,7 +2046,9 @@ generates no statement the approval did not cover: with `SameTableChange`
 (`pkg/ddl/table_change.go`) for MySQL-family table files, `SameVSchemaChange`
 (`pkg/ddl/vschema_change.go`) for a Vitess keyspace's VSchema, and on the environment's primary
 target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for PostgreSQL
-files.
+files. Whether the target branch dismisses stale approvals is read by
+`BaseBranchDismissesStaleApprovals` (`pkg/github/branch_rules.go`); when it cannot be read, the
+gate compares.
 
 ### AZ-5: Commands never guess
 

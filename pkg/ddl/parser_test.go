@@ -334,6 +334,8 @@ func TestTiDBDropTargets(t *testing.T) {
 		{"alter drops two indexes", "ALTER TABLE t DROP INDEX a, DROP INDEX b", DropTargets{Indexes: 2}, false},
 		{"drop column shorthand", "ALTER TABLE t DROP c", DropTargets{Columns: 1}, false},
 		{"drop primary key", "ALTER TABLE t DROP PRIMARY KEY", DropTargets{}, false},
+		{"drop partitions", "ALTER TABLE t DROP PARTITION p2020, p2021", DropTargets{Partitions: 2}, false},
+		{"truncate partition", "ALTER TABLE t TRUNCATE PARTITION p2020", DropTargets{Partitions: 1}, false},
 		{"create table", "CREATE TABLE t (id bigint)", DropTargets{}, false},
 		// Spirit rejects a compound whose statements are not all ALTER TABLE
 		// before the single-statement guard runs; the all-ALTER compound is

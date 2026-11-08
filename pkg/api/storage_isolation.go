@@ -36,7 +36,7 @@ func (c *ServerConfig) ValidateStorageIsolation() error {
 				slog.Debug("storage isolation requires a resolved target connection and namespace", "database", name, "environment", environment)
 				continue
 			}
-			targetDSN, err := target.ResolveDSN()
+			targetDSN, err := target.ResolveDSN(db.Type)
 			if err != nil {
 				return fmt.Errorf("resolve database %q environment %q: %w", name, environment, err)
 			}

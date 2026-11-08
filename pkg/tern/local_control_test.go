@@ -3385,18 +3385,90 @@ type revertScopeEngine struct {
 	engine.Engine
 	revertReq     *engine.ControlRequest
 	skipRevertReq *engine.ControlRequest
+	// answer, when set, supplies the result the engine returns for both
+	// controls; unset, the engine accepts them.
+	answer func() *engine.ControlResult
 }
 
 func (e *revertScopeEngine) Name() string { return "revert-scope" }
 
 func (e *revertScopeEngine) Revert(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.revertReq = req
-	return &engine.ControlResult{Accepted: true}, nil
+	return e.result(), nil
 }
 
 func (e *revertScopeEngine) SkipRevert(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.skipRevertReq = req
-	return &engine.ControlResult{Accepted: true}, nil
+	return e.result(), nil
+}
+
+func (e *revertScopeEngine) result() *engine.ControlResult {
+	if e.answer != nil {
+		return e.answer()
+	}
+	return &engine.ControlResult{Accepted: true}
+}
+
+// An engine that answers a revert or skip-revert without accepting it, or
+// without any result at all, has refused the control. The caller must be told
+// it was refused, with the engine's reason when it gave one, never that it was
+// accepted.
+func TestLocalClientRevertWindowControlsReportTheEnginesRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		answer            func() *engine.ControlResult
+		wantAccepted      bool
+		wantRevertMessage string
+		wantSkipMessage   string
+	}{
+		{
+			name: "refused with a reason",
+			answer: func() *engine.ControlResult {
+				return &engine.ControlResult{Accepted: false, Message: "deploy request is not in its revert window"}
+			},
+			wantAccepted:      false,
+			wantRevertMessage: "deploy request is not in its revert window",
+			wantSkipMessage:   "deploy request is not in its revert window",
+		},
+		{
+			name:              "refused without a reason",
+			answer:            func() *engine.ControlResult { return &engine.ControlResult{Accepted: false} },
+			wantAccepted:      false,
+			wantRevertMessage: "the engine did not accept the revert",
+			wantSkipMessage:   "the engine did not accept the skip-revert",
+		},
+		{
+			name:              "no result",
+			answer:            func() *engine.ControlResult { return nil },
+			wantAccepted:      false,
+			wantRevertMessage: "the engine returned no result for the revert",
+			wantSkipMessage:   "the engine returned no result for the skip-revert",
+		},
+		{
+			name:         "accepted",
+			answer:       func() *engine.ControlResult { return &engine.ControlResult{Accepted: true} },
+			wantAccepted: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, eng := newRevertScopeLocalClient()
+			eng.answer = tc.answer
+
+			resp, err := client.Revert(t.Context(), &ternv1.RevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+			require.NoError(t, err, "an engine refusal is a response, not an error the caller would retry")
+			require.NotNil(t, resp)
+			require.NotNil(t, eng.revertReq, "the revert reached the engine")
+			assert.Equal(t, tc.wantAccepted, resp.Accepted, "revert")
+			assert.Equal(t, tc.wantRevertMessage, resp.ErrorMessage, "revert")
+
+			resp2, err := client.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+			require.NoError(t, err, "an engine refusal is a response, not an error the caller would retry")
+			require.NotNil(t, resp2)
+			require.NotNil(t, eng.skipRevertReq, "the skip-revert reached the engine")
+			assert.Equal(t, tc.wantAccepted, resp2.Accepted, "skip-revert")
+			assert.Equal(t, tc.wantSkipMessage, resp2.ErrorMessage, "skip-revert")
+		})
+	}
 }
 
 // newRevertScopeLocalClient builds a client over one database whose staging and

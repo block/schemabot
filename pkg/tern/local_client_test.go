@@ -16,6 +16,7 @@ import (
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -177,6 +178,143 @@ func TestLocalClientLogsValidationAndConversion(t *testing.T) {
 	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: MaxLogsLimit + 1})
 	require.NoError(t, err)
 	assert.Equal(t, MaxLogsLimit, logs.recentLimit)
+}
+
+// A data-plane apply that drives two targets of a rollout serves each target's
+// log read from that target's operations only, so the control plane's
+// per-target sections do not each repeat the whole apply. A read for the only
+// target still names its operations, so a sibling that joins mid-read stays
+// out. A single-target apply that records its target under another name
+// serves the operations it has, named the same way; a read for no target, or
+// on an apply with no recorded operation, is the whole log; and a target a
+// multi-target apply never ran on is refused rather than answered with an
+// empty log.
+func TestLocalClientLogsScopesToTarget(t *testing.T) {
+	op := func(id int64, target string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 9, Target: target}
+	}
+
+	t.Run("one of several targets", func(t *testing.T) {
+		client, logs := newLogsClient(op(1, "shop-001"), op(2, "shop-002"), op(3, "shop-002"))
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002"})
+		require.NoError(t, err)
+		assert.Equal(t, int64(9), logs.lastFilter.ApplyID)
+		assert.ElementsMatch(t, []int64{2, 3}, logs.lastFilter.OperationIDs)
+		assert.Equal(t, "shop-002", resp.Target, "the response names the target it was narrowed to")
+	})
+
+	t.Run("the only target", func(t *testing.T) {
+		client, logs := newLogsClient(op(1, "shop-001"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1}, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("a single-target apply recorded under another name", func(t *testing.T) {
+		client, logs := newLogsClient(op(1, "orders"), op(2, ""))
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []int64{1, 2}, logs.lastFilter.OperationIDs, "an operation that joins after the listing stays out")
+		assert.Equal(t, "shop-001", resp.Target)
+	})
+
+	t.Run("an apply with no recorded operation", func(t *testing.T) {
+		client, logs := newLogsClient()
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001"})
+		require.NoError(t, err)
+		assert.Nil(t, logs.lastFilter.OperationIDs)
+		assert.Equal(t, "shop-001", resp.Target)
+	})
+
+	t.Run("no target", func(t *testing.T) {
+		client, logs := newLogsClient(op(1, "shop-001"), op(2, "shop-002"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a"})
+		require.NoError(t, err)
+		assert.Nil(t, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("a target the apply never ran on", func(t *testing.T) {
+		client, _ := newLogsClient(op(1, "shop-001"), op(2, "shop-002"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-003"})
+		require.ErrorIs(t, err, ErrLogsTargetNotInApply)
+		assert.Equal(t, codes.NotFound, applyLookupErrorCode(err))
+	})
+}
+
+// newLogsClient builds a LocalClient whose apply-a (ID 9) runs ops, and
+// returns the log store so a test can read the filter its Logs read used.
+func newLogsClient(ops ...*storage.ApplyOperation) (*LocalClient, *mockApplyLogStore) {
+	logs := &mockApplyLogStore{}
+	byID := make(map[int64]*storage.ApplyOperation, len(ops))
+	for _, op := range ops {
+		byID[op.ID] = op
+	}
+	return &LocalClient{logger: slog.New(slog.DiscardHandler), storage: &mockStorage{
+		applies:    &mockApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-a"}},
+		logs:       logs,
+		operations: &mockApplyOperationStore{ops: byID},
+	}}, logs
+}
+
+// A data-plane apply that drives every shard of a sharded target serves a
+// shard's log read from the operations keyed to that shard only. Naming the
+// target too narrows to its own shard, since shard names repeat across
+// targets; a shard the apply never ran on, or an apply whose operations are
+// not divided by shard, is refused rather than answered with an empty log.
+func TestLocalClientLogsScopesToShard(t *testing.T) {
+	op := func(id int64, target, key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 9, Target: target, OperationKey: key}
+	}
+	sharded := []*storage.ApplyOperation{
+		op(1, "shop-001", storage.ShardOperationKey("main", "-80", "orders")),
+		op(2, "shop-001", storage.ShardOperationKey("main", "80-", "orders")),
+		op(3, "shop-001", "main/group_finalizer"),
+		op(4, "shop-002", storage.TargetOperationKey("shop-002", storage.ShardOperationKey("main", "-80", "orders"))),
+	}
+
+	t.Run("one shard across targets", func(t *testing.T) {
+		client, logs := newLogsClient(sharded...)
+		resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Shard: "-80"})
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []int64{1, 4}, logs.lastFilter.OperationIDs)
+		assert.Equal(t, "-80", resp.Shard, "the response names the shard it was narrowed to")
+	})
+
+	t.Run("one shard of one target", func(t *testing.T) {
+		client, logs := newLogsClient(sharded...)
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001", Shard: "-80"})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{1}, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("one shard of a single-target apply", func(t *testing.T) {
+		client, logs := newLogsClient(op(1, "orders", storage.ShardOperationKey("main", "-80", "orders")), op(2, "orders", storage.ShardOperationKey("main", "80-", "orders")), op(3, "orders", "main/group_finalizer"))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Shard: "80-"})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2}, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("a shard of a single-target apply recorded under another name", func(t *testing.T) {
+		client, logs := newLogsClient(op(1, "orders", storage.ShardOperationKey("main", "-80", "orders")), op(2, "orders", storage.ShardOperationKey("main", "80-", "orders")))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-001", Shard: "80-"})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2}, logs.lastFilter.OperationIDs)
+	})
+
+	t.Run("a shard the apply never ran on", func(t *testing.T) {
+		client, _ := newLogsClient(sharded...)
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Target: "shop-002", Shard: "80-"})
+		require.ErrorIs(t, err, ErrLogsShardNotInApply)
+		assert.ErrorContains(t, err, "target shop-002 of apply apply-a has no operation on shard 80-, only on -80")
+		assert.Equal(t, codes.NotFound, applyLookupErrorCode(err))
+	})
+
+	t.Run("an apply not divided by shard", func(t *testing.T) {
+		client, _ := newLogsClient(op(1, "shop-001", storage.TargetOperationKey("shop-001", "")))
+		_, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Shard: "-80"})
+		require.ErrorIs(t, err, ErrLogsShardNotInApply)
+		assert.ErrorContains(t, err, "apply apply-a runs no per-shard operations, so it has no log for shard -80", "a shard read that names no target names none")
+	})
 }
 
 type pullSchemaPSClient struct {

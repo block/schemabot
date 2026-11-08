@@ -475,6 +475,24 @@ func TestLocalClient_Apply_MemberTargetsShareTheDeploymentsApply(t *testing.T) {
 	assert.Equal(t, "payments-001", byKey["payments-001"].Target)
 	assert.Equal(t, "payments-002", byKey["payments-002"].Target)
 
+	// The second target's attach is logged against its own operation, so it
+	// shows in payments-002's log and not in payments-001's, while the apply's
+	// queue event, which is about the whole apply, shows in both.
+	targetMessages := func(target string) []string {
+		logs, err := client.Logs(ctx, &ternv1.LogsRequest{ApplyId: first.ApplyId, Target: target, Limit: 100})
+		require.NoError(t, err)
+		messages := make([]string, 0, len(logs.Logs))
+		for _, entry := range logs.Logs {
+			messages = append(messages, entry.Message)
+		}
+		return messages
+	}
+	firstLog, secondLog := targetMessages("payments-001"), targetMessages("payments-002")
+	assert.Contains(t, secondLog, "Operation attached: payments-002")
+	assert.NotContains(t, firstLog, "Operation attached: payments-002", "payments-001's log leaves out its sibling's attach")
+	assert.Contains(t, firstLog, "Apply queued: "+first.ApplyId)
+	assert.Contains(t, secondLog, "Apply queued: "+first.ApplyId)
+
 	// The apply names the plan of the target dispatched first. Each target's
 	// drive runs the plan its own operation names, so payments-002 runs
 	// payments-002's plan and never payments-001's.

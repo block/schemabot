@@ -599,3 +599,89 @@ func TestLocalClient_CancelStoppedApplySettlesCancelled(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "a cancelled apply must not be claimable again")
 }
+
+// A stop consumed by a drive that holds only its operation's lease records the
+// stop on the apply's tasks and leaves the apply row alone. Under that lease the
+// apply row belongs to the apply-state projection, so the drive does not
+// attempt a write storage would refuse; it stands down cleanly, and the
+// projection settles the apply and completes the durable request from the
+// operations the drives settle.
+func TestLocalClient_StopUnderOperationLeaseLeavesApplyRowToProjection(t *testing.T) {
+	requireOperationLeaseControlLeavesApplyRow(t, storage.ControlOperationStop, state.Task.Stopped)
+}
+
+// The cancel twin of the stop case above: a cancel consumed under an operation
+// lease alone cancels the apply's tasks and leaves the apply row to the
+// apply-state projection.
+func TestLocalClient_CancelUnderOperationLeaseLeavesApplyRowToProjection(t *testing.T) {
+	requireOperationLeaseControlLeavesApplyRow(t, storage.ControlOperationCancel, state.Task.Cancelled)
+}
+
+func requireOperationLeaseControlLeavesApplyRow(t *testing.T, operation storage.ControlOperation, wantTaskState string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, _ := newTasklessControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, []storage.TableChange{{
+		Namespace: "testdb",
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN operation_lease_note VARCHAR(255)",
+		Operation: "alter",
+	}})
+
+	op, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "op-driver-"+t.Name())
+	require.NoError(t, err)
+	require.NotNil(t, op, "the queued apply's operation row must be claimable")
+	require.Equal(t, apply.ID, op.ApplyID, "the claimed operation row must belong to the dispatched apply")
+
+	switch operation {
+	case storage.ControlOperationStop:
+		resp, err := client.Stop(ctx, &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier, Environment: localClientTestEnvironment})
+		require.NoError(t, err)
+		require.True(t, resp.Accepted)
+	case storage.ControlOperationCancel:
+		resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier, Environment: localClientTestEnvironment})
+		require.NoError(t, err)
+		require.True(t, resp.Accepted)
+	default:
+		require.FailNow(t, "unsupported control operation", "operation=%s", operation)
+	}
+	requireControlRequestStatus(t, stor, apply.ID, operation, storage.ControlRequestPending)
+
+	opCtx := storage.WithOperationLease(ctx, op.Lease())
+	reloaded, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	var standDown bool
+	if operation == storage.ControlOperationStop {
+		standDown, err = client.processPendingStopControlRequest(opCtx, reloaded)
+	} else {
+		standDown, err = client.processPendingCancelControlRequest(opCtx, reloaded)
+	}
+	require.NoError(t, err, "consuming the request under an operation lease must not attempt the apply row write")
+	assert.True(t, standDown, "the drive must stand down after consuming the request")
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, wantTaskState, tasks[0].State, "the request must be recorded on the apply's task")
+
+	parent, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Pending, parent.State,
+		"the apply row belongs to the apply-state projection and must not be written under an operation lease")
+
+	requireControlRequestStatus(t, stor, apply.ID, operation, storage.ControlRequestPending)
+}

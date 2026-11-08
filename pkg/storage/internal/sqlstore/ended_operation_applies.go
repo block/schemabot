@@ -307,7 +307,7 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 	for _, apply := range applies {
 		candidateIDs = append(candidateIDs, apply.ID)
 	}
-	undriven, err := s.lockUndrivenApplies(ctx, tx, candidateIDs)
+	undriven, err := s.lockUndrivenApplies(ctx, tx, "ended operation settlement", candidateIDs)
 	if err != nil {
 		return nil, err
 	}

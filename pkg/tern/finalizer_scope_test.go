@@ -225,11 +225,14 @@ func TestOperationKeysLeadWithTarget(t *testing.T) {
 
 // The remote drive's shard-scope guard recognizes per-shard work in both key
 // shapes, so a targets-list shard operation whose tasks carry no shard is
-// refused before dispatch just as a single-target one is.
-func TestIsShardWorkOperationKey(t *testing.T) {
+// refused before dispatch just as a single-target one is. A group finalizer is
+// never per-shard work, including behind its target, where its key has as many
+// components as a shard key.
+func TestIsShardWorkOperation(t *testing.T) {
 	cases := []struct {
 		key    string
 		target string
+		kind   string
 		want   bool
 	}{
 		{key: "ns_0/-80/orders", target: "orders-001", want: true},
@@ -237,13 +240,18 @@ func TestIsShardWorkOperationKey(t *testing.T) {
 		{key: "orders-002/ns_0/-80/orders", target: "orders-001", want: false},
 		{key: "orders-001/ns_0/-80/orders", target: "", want: false},
 		{key: "orders/-80/orders", target: "orders", want: true},
-		{key: "ns_0/group_finalizer", target: "orders-001", want: false},
+		{key: "ns_0/group_finalizer", target: "orders-001", kind: storage.ApplyOperationKindGroupFinalizer, want: false},
+		{key: "orders-001/ns_0/group_finalizer", target: "orders-001", kind: storage.ApplyOperationKindGroupFinalizer, want: false},
 		{key: "orders-001", target: "orders-001", want: false},
 		{key: "", target: "orders-001", want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key+" on "+tc.target, func(t *testing.T) {
-			assert.Equal(t, tc.want, isShardWorkOperationKey(tc.key, tc.target))
+			kind := tc.kind
+			if kind == "" {
+				kind = storage.ApplyOperationKindWork
+			}
+			assert.Equal(t, tc.want, isShardWorkOperation(&storage.ApplyOperation{OperationKey: tc.key, Target: tc.target, OperationKind: kind}))
 		})
 	}
 }

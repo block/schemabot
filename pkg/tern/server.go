@@ -328,12 +328,26 @@ func (s *Server) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.Log
 	}
 	resp, err := s.client.Logs(ctx, req)
 	if err != nil {
-		if errors.Is(err, storage.ErrApplyNotFound) {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(applyLookupErrorCode(err), err.Error())
 	}
 	return resp, nil
+}
+
+// applyLookupErrorCode carries the difference between an apply that does not
+// exist and a storage failure across the gRPC boundary, so a remote caller can
+// branch on the status code the way an in-process caller branches on the
+// sentinel.
+func applyLookupErrorCode(err error) codes.Code {
+	if errors.Is(err, storage.ErrApplyNotFound) {
+		return codes.NotFound
+	}
+	if errors.Is(err, ErrLogsTargetNotInApply) {
+		return codes.NotFound
+	}
+	if errors.Is(err, ErrLogsShardNotInApply) {
+		return codes.NotFound
+	}
+	return codes.Internal
 }
 
 func (s *Server) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
@@ -353,7 +367,7 @@ func (s *Server) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.Sto
 	}
 	resp, err := s.client.Stop(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(applyLookupErrorCode(err), err.Error())
 	}
 	return resp, nil
 }
@@ -375,7 +389,7 @@ func (s *Server) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.S
 	}
 	resp, err := s.client.Start(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(applyLookupErrorCode(err), err.Error())
 	}
 	return resp, nil
 }

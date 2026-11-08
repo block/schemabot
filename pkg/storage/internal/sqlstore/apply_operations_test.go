@@ -2057,6 +2057,165 @@ func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchRaisesParen
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
 }
 
+// A rollout under on_failure "continue" whose region-a halt-failed while
+// region-b paused retryable is derived running_degraded, and the projection
+// holds it there: nothing moves the parent back to failed_retryable. Claiming
+// region-b's row is still a deliberate retry, so it is charged like one — the
+// row moves to running, its own attempt advances, and the parent is raised to
+// that attempt — rather than being re-leased for free as crash recovery.
+func TestApplyOperationStore_FindNextApplyOperation_DegradedRolloutRedispatchConsumesParentBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_budget", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	setOperationAttempt(t, retryID, maxRecoveryAttempts-1)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the paused operation under a degraded rollout must be reclaimable within budget")
+	assert.Equal(t, retryID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Running, claimed.State, "a deliberate redispatch moves the row to running")
+	assert.Equal(t, maxRecoveryAttempts, claimed.Attempt, "a deliberate redispatch advances the operation attempt")
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a redispatch under a degraded rollout raises the parent to the operation's own attempt")
+}
+
+// A deployment that pauses on a retryable failure just now, under a rollout
+// that has been degraded for two days, is still inside its retry window. The
+// window is the age of the pause, and a degraded parent's updated_at is the
+// age of the sibling's failure, not of this pause: the projection leaves a
+// state it re-derives unchanged, so nothing wrote the parent when region-b
+// paused. The paused row's own updated_at did move, and that is what the
+// window reads.
+func TestApplyOperationStore_FindNextApplyOperation_DegradedRolloutFreshPauseInsideRecoveryWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_old_parent", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() - INTERVAL ? DAY WHERE id = ?
+	`, retryableRecoveryFreshnessDays+1, apply.ID)
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, retryID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a fresh pause with its budget intact is retried however long the rollout has been degraded")
+	assert.Equal(t, retryID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+	assert.Equal(t, 1, claimed.Attempt)
+}
+
+// The converse: a pause that is itself older than the window is not retried
+// under a degraded rollout, even when the parent was written more recently.
+// The parent's timestamp is not the pause's, in either direction.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsDegradedRolloutStalePauseOutsideRecoveryWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_old_pause", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL ? DAY WHERE id = ?
+	`, retryableRecoveryFreshnessDays+1, retryID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pause older than the recovery window is not retried, whatever the parent's timestamp says")
+	assertApplyOperationState(t, store, retryID, state.ApplyOperation.FailedRetryable)
+}
+
+// Once a degraded rollout's retry budget is spent, its paused operation is left
+// alone even when the parent and the row are both stale: the row is a retry
+// nobody admitted, so there is no crashed drive to recover and crash recovery
+// must not re-lease it on every staleness window. No claim arm reaches it from
+// here — a cancel requested now stays pending too, since nothing drives the
+// apply to deliver it — so the row parks until the expiry sweep settles it, the
+// same way a plain failed_retryable apply with its budget spent parks until
+// ExpireRetryable fails it; the stranded control-request sweep then answers
+// any request left on the settled apply.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsDegradedRolloutRetryBudgetExhausted(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_degraded_spent", 1, state.Apply.RunningDegraded, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	setOperationAttempt(t, retryID, maxRecoveryAttempts)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, retryID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a paused operation under a degraded rollout must park once the retry budget is spent, however stale its rows")
+
+	assertApplyOperationState(t, store, retryID, state.ApplyOperation.FailedRetryable)
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a parked retry is not charged again")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget
 // verifies OC-5 Part B2's guard: a single-operation apply with tasks is driven
 // under the parent lease, whose ClaimApplyByID increments the parent attempt,
