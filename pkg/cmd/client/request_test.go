@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -149,6 +150,7 @@ func TestDoGetIntoCarriesTheRetryAfterHeader(t *testing.T) {
 	assert.Equal(t, http.StatusTooManyRequests, apiErr.Status)
 	assert.Empty(t, apiErr.ErrorCode)
 	assert.Equal(t, 30*time.Second, apiErr.RetryAfterHeader)
+	assert.Zero(t, apiErr.RetryAfterHeaderUncapped)
 }
 
 // RetryAfter decides whether to retry from the error code alone, and when it
@@ -183,6 +185,9 @@ func TestParseRetryAfterHeader(t *testing.T) {
 		name  string
 		value string
 		want  time.Duration
+		// wantUncapped is the delay the header asked for when the bound cut
+		// it short, and zero when the header is within the bound.
+		wantUncapped time.Duration
 	}{
 		{name: "absent", value: "", want: 0},
 		{name: "delta seconds", value: "45", want: 45 * time.Second},
@@ -194,14 +199,22 @@ func TestParseRetryAfterHeader(t *testing.T) {
 		{name: "signed seconds", value: "+5", want: 0},
 		{name: "fractional seconds", value: "1.5", want: 0},
 		{name: "seconds at the bound", value: "300", want: 5 * time.Minute},
-		{name: "seconds past the bound", value: "86400", want: maxRetryAfterHeader},
-		{name: "seconds too large to represent", value: "99999999999999999999", want: maxRetryAfterHeader},
-		{name: "HTTP date past the bound", value: "Fri, 31 Dec 9999 23:59:59 GMT", want: maxRetryAfterHeader},
+		{name: "seconds one past the bound", value: "301", want: maxRetryAfterHeader, wantUncapped: 301 * time.Second},
+		{name: "seconds an hour past the bound", value: "3600", want: maxRetryAfterHeader, wantUncapped: time.Hour},
+		{name: "seconds past the bound", value: "86400", want: maxRetryAfterHeader, wantUncapped: 24 * time.Hour},
+		{name: "longest seconds a duration holds", value: "9223372036", want: maxRetryAfterHeader, wantUncapped: 9223372036 * time.Second},
+		{name: "seconds too long for a duration", value: "9223372037", want: maxRetryAfterHeader, wantUncapped: time.Duration(math.MaxInt64)},
+		{name: "seconds too large to represent", value: "99999999999999999999", want: maxRetryAfterHeader, wantUncapped: time.Duration(math.MaxInt64)},
+		{name: "HTTP date at the bound", value: now.Add(5 * time.Minute).Format(http.TimeFormat), want: maxRetryAfterHeader},
+		{name: "HTTP date an hour away", value: now.Add(time.Hour).Format(http.TimeFormat), want: maxRetryAfterHeader, wantUncapped: time.Hour},
+		{name: "HTTP date past the bound", value: "Fri, 31 Dec 9999 23:59:59 GMT", want: maxRetryAfterHeader, wantUncapped: time.Duration(math.MaxInt64)},
 		{name: "malformed", value: "soon", want: 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, parseRetryAfterHeader(tc.value, now))
+			after, uncapped := parseRetryAfterHeader(tc.value, now)
+			assert.Equal(t, tc.want, after)
+			assert.Equal(t, tc.wantUncapped, uncapped)
 		})
 	}
 }
