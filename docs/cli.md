@@ -1072,6 +1072,13 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
+are. Each says on stderr that it was canceled and reports any work it had
+already finished, then exits 130, the status a shell reports for an
+interrupted process, so a script can tell an interrupted run from one that
+failed or left findings. Checks already recreated and deliveries already
+redelivered are not undone.
+
 An `--all-repos` sweep skips a declared repository the server's GitHub App is
 not installed on, names it, and keeps scanning the rest. The skip still makes
 the run exit nonzero, because that repository was never read. Any other scan

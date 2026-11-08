@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -711,6 +713,43 @@ func TestChecksBackfillAllReposStopsWhenAScanFails(t *testing.T) {
 	assert.Contains(t, runErr.Error(), "scan octo/flaky open PRs for missing or stuck Check Runs")
 	assert.Contains(t, runErr.Error(), "502 Bad Gateway")
 	assert.Equal(t, []string{"octo/alpha", "octo/flaky"}, server.scannedRepos(), "the sweep stops at the failed repository")
+	assert.Empty(t, output)
+	assert.Equal(t, 1, ExitCodeFor(runErr), "a failed scan is a failure, not an interrupt")
+}
+
+// An operator presses Ctrl-C while a sweep is waiting on a scan. The command
+// says the backfill was canceled and exits with the interrupt status, so a
+// script can tell an interrupted sweep from one that failed or left findings.
+func TestChecksBackfillCancelExitsInterrupted(t *testing.T) {
+	hold := newHoldingHandler(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/checks/scan", r.URL.Path)
+		// The server notices the client hanging up only once the body is read.
+		_, err := io.Copy(io.Discard, r.Body)
+		assert.NoError(t, err)
+		hold.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", DryRun: true, StuckAfter: "1h", JSON: true}
+
+	done := make(chan error, 1)
+	var runErr error
+	var output string
+	stderr := captureStderr(t, func() {
+		output = captureStdout(func() {
+			go func() { done <- cmd.Run(ctx, &Globals{Endpoint: server.URL}) }()
+			awaitSignal(t, hold.inFlight, "the scan to reach the server")
+			cancel()
+			runErr = awaitSignal(t, done, "the canceled backfill to end")
+		})
+	})
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	require.ErrorIs(t, runErr, context.Canceled)
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.Equal(t, "checks backfill canceled\n", stderr)
 	assert.Empty(t, output)
 }
 
