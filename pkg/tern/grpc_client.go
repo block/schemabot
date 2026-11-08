@@ -4527,30 +4527,44 @@ func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Ap
 // ErrApplyLeasePresumedLost so the operator records the displacement exactly
 // once. A transient failure inside the window, including a write that timed
 // out, returns nil so the drive keeps polling and the heartbeat is retried on
-// the next tick. The remote Tern keeps
-// executing either way; the next claimant reattaches to it.
+// the next tick. The remote Tern keeps executing either way; the next claimant
+// reattaches to it.
+//
 // The logger is expected to carry the apply's identity attributes already
-// bound, so each line appends only the mutable snapshot.
+// bound. The heartbeat runs apart from the poll loop and sees the apply only
+// as it was when polling started, so each line adds the attributes that stay
+// fixed while polling and leaves out the apply state, which the poll moves on.
 func driveEndingHeartbeatFailure(logger *slog.Logger, apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
 	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
 		logger.Warn("gRPC drive heartbeat lost the lease; current owner will stop driving and writing apply state",
-			append(apply.MutableLogAttrs(), "error", hbErr)...)
+			append(driveHeartbeatLogAttrs(apply), "error", hbErr)...)
 		return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, hbErr)
 	}
 	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
 		logger.Warn("gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state",
-			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+			append(driveHeartbeatLogAttrs(apply), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		return fmt.Errorf("heartbeat gRPC apply %s: %w (heartbeats failing since %s): %w",
 			apply.ApplyIdentifier, ErrApplyLeasePresumedLost, lastSuccess.UTC().Format(time.RFC3339), hbErr)
 	}
 	if errors.Is(hbErr, storage.ErrLeaseHeartbeatTimedOut) {
 		logger.Warn("gRPC drive heartbeat attempt timed out; it counts as a failed heartbeat toward the lease staleness window and will be retried",
-			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+			append(driveHeartbeatLogAttrs(apply), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		return nil
 	}
 	logger.Warn("gRPC drive heartbeat failed; will retry",
-		append(apply.MutableLogAttrs(), "error", hbErr)...)
+		append(driveHeartbeatLogAttrs(apply), "error", hbErr)...)
 	return nil
+}
+
+// driveHeartbeatLogAttrs returns the apply attributes that stay fixed while a
+// drive polls the remote Tern, the deployment and the remote apply's
+// identifier, for log lines from the heartbeat that runs beside the poll.
+func driveHeartbeatLogAttrs(apply *storage.Apply) []any {
+	attrs := []any{"deployment", apply.Deployment}
+	if apply.ExternalID != "" {
+		attrs = append(attrs, "external_id", apply.ExternalID)
+	}
+	return attrs
 }
 
 func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable bool, scope applyTaskScope) error {

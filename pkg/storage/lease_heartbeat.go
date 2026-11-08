@@ -35,9 +35,10 @@ var ErrLeaseHeartbeatTimedOut = errors.New("lease heartbeat attempt timed out")
 // now and lastSuccess come from the caller's clock. The deadline is applied as
 // a duration from now so a caller on an injected clock stays consistent with
 // itself. An attempt that starts with the window already spent gets no time at
-// all, so it fails at once and the caller stops on it. A timed-out attempt returns an error wrapping
-// ErrLeaseHeartbeatTimedOut. When ctx itself ends, the write's error is returned
-// unchanged so the caller can tell shutdown from a slow store.
+// all, so it fails at once and the caller stops on it. A timed-out attempt
+// returns an error wrapping ErrLeaseHeartbeatTimedOut. When ctx itself ends,
+// the write's error is returned unchanged so the caller can tell shutdown from
+// a slow store.
 func HeartbeatLeaseAttempt(ctx context.Context, now, lastSuccess time.Time, heartbeat func(context.Context) error) error {
 	timeout := max(min(LeaseHeartbeatAttemptTimeout, lastSuccess.Add(ApplyLeaseStaleAfter).Sub(now)), 0)
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)

@@ -3468,7 +3468,9 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 // cancels the run when they stop for the full stall window.
 //
 // A resumed operation is also marked running from here once its engine works
-// again, and the parent re-derived from it (advanceResumePromotion).
+// again, and the parent re-derived from it (advanceResumePromotion). Both run
+// under a deadline of their own (afterOperationHeartbeatStopsDrive), so a
+// storage call in them that hangs cannot stop the loop from heartbeating.
 //
 // Returns a stop func that is safe to call more than once. It returns only
 // once the heartbeat has exited, so no parent projection from a tick can land
@@ -3500,11 +3502,7 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 				})
 				if err == nil {
 					lastSuccess = attemptStart
-					if s.operationDriveStalled(hbCtx, driverID, op, &applySnapshot, driveStart) {
-						cancelRun()
-						return
-					}
-					if s.advanceResumePromotion(hbCtx, driverID, op, &applySnapshot, &resume) == resumeLeaseLost {
+					if s.afterOperationHeartbeatStopsDrive(hbCtx, driverID, op, &applySnapshot, driveStart, &resume) {
 						cancelRun()
 						return
 					}
@@ -3526,6 +3524,22 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 		stop()
 		<-exited
 	}
+}
+
+// afterOperationHeartbeatStopsDrive runs the checks that follow a successful
+// operation heartbeat, the drive stall check and the resumed operation's
+// promotion, and reports whether the run must be cancelled. Their storage reads
+// and writes share one deadline of storage.LeaseHeartbeatAttemptTimeout, so a
+// call that hangs on a half-open connection is cut off and retried on the next
+// tick instead of holding the heartbeat loop away from its next write and from
+// the presumed-lost check that follows a failed one.
+func (s *Service) afterOperationHeartbeatStopsDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, driveStart time.Time, resume *resumePromotion) bool {
+	ctx, cancel := context.WithTimeout(ctx, storage.LeaseHeartbeatAttemptTimeout)
+	defer cancel()
+	if s.operationDriveStalled(ctx, driverID, op, apply, driveStart) {
+		return true
+	}
+	return s.advanceResumePromotion(ctx, driverID, op, apply, resume) == resumeLeaseLost
 }
 
 // resumePromotion is what the heartbeat still owes a resumed operation: marking
