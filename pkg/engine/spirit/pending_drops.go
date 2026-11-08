@@ -57,7 +57,16 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 
 	targets := dropTableTargets(dropStmt, database)
 	tables := make([]pendingdrops.TableMove, 0, len(targets))
+	// The copies already in pending drops are noted before each table is
+	// checked, so none of them can hold a table that the check then finds on
+	// the target. When the RENAME below is overtaken, only a copy that appeared
+	// after this point can be where the table went.
+	var copiesBeforeRename []pendingdrops.QuarantinedTable
 	for _, target := range targets {
+		existingCopies, err := e.existingRecordedCopies(ctx, db, target)
+		if err != nil {
+			return fmt.Errorf("note which recorded copies of `%s`.`%s` are already in pending drops: %w", target.schema, target.table, err)
+		}
 		exists, err := tableExistsInSchema(ctx, db, target.schema, target.table)
 		if err != nil {
 			return fmt.Errorf("check table `%s`.`%s` exists: %w", target.schema, target.table, err)
@@ -68,6 +77,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			}
 			continue
 		}
+		copiesBeforeRename = append(copiesBeforeRename, existingCopies...)
 		tables = append(tables, pendingdrops.TableMove{SchemaName: target.schema, TableName: target.table})
 	}
 
@@ -108,7 +118,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		if !mysqlerr.Is(err, erNoSuchTable) {
 			return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
 		}
-		return e.resolveOvertakenQuarantine(ctx, db, moved, err)
+		return e.resolveOvertakenQuarantine(ctx, db, moved, copiesBeforeRename, err)
 	}
 	for _, table := range moved {
 		e.logger.Info("DROP TABLE intercepted: table quarantined in pending drops and recoverable until the retention period expires",
@@ -145,7 +155,12 @@ const erNoSuchTable = 1146
 // every table is now at a destination this schema change recorded for it.
 // Anything less returns renameErr: a table still on the target was not
 // quarantined, and a table found nowhere is not held by SchemaBot.
-func (e *Engine) resolveOvertakenQuarantine(ctx context.Context, db *sql.DB, moved []pendingdrops.QuarantinedTable, renameErr error) error {
+//
+// A recorded copy in copiesBeforeRename does not count. It was already in
+// pending drops while the table was still on the target, so it holds an older
+// table of the same name, and the rows of the table that just went missing
+// are not in it.
+func (e *Engine) resolveOvertakenQuarantine(ctx context.Context, db *sql.DB, moved, copiesBeforeRename []pendingdrops.QuarantinedTable, renameErr error) error {
 	copies := make([]pendingdrops.QuarantinedTable, 0, len(moved))
 	for _, table := range moved {
 		target := dropTarget{schema: table.SchemaName, table: table.TableName}
@@ -162,13 +177,18 @@ func (e *Engine) resolveOvertakenQuarantine(ctx context.Context, db *sql.DB, mov
 		if err != nil {
 			return fmt.Errorf("quarantine DROP TABLE targets: %w; checking whether an earlier attempt already moved them failed: %w", renameErr, err)
 		}
-		prior, found, err := findRecordedCopy(ctx, db, recorded)
+		candidates := slices.DeleteFunc(slices.Clone(recorded), func(prior pendingdrops.QuarantinedTable) bool {
+			return containsCopy(copiesBeforeRename, prior)
+		})
+		prior, found, err := findRecordedCopy(ctx, db, candidates)
 		if err != nil {
 			return fmt.Errorf("quarantine DROP TABLE targets: %w; checking whether an earlier attempt already moved them failed: %w", renameErr, err)
 		}
 		if !found {
-			e.changeLogger().Warn("quarantine RENAME found a DROP TABLE target missing and no pending drops copy this schema change recorded holds it; failing the statement",
-				"database", target.schema, "table", target.table, "recorded_copies", len(recorded))
+			e.changeLogger().Warn("quarantine RENAME found a DROP TABLE target missing and no copy this schema change recorded that appeared after the table was checked holds it; failing the statement",
+				"database", target.schema, "table", target.table,
+				"recorded_copies", len(recorded),
+				"copies_already_present_before_rename", len(recorded)-len(candidates))
 			return fmt.Errorf("quarantine DROP TABLE targets: %w", renameErr)
 		}
 		copies = append(copies, prior)
@@ -341,6 +361,36 @@ func findRecordedCopy(ctx context.Context, db *sql.DB, recorded []pendingdrops.Q
 		}
 	}
 	return pendingdrops.QuarantinedTable{}, false, nil
+}
+
+// existingRecordedCopies returns the copies recorded for target that are in
+// pending drops now. The existence of each copy is checked only when the
+// schema change recorded any, so a target with no record costs one read of
+// the quarantine log.
+func (e *Engine) existingRecordedCopies(ctx context.Context, db *sql.DB, target dropTarget) ([]pendingdrops.QuarantinedTable, error) {
+	recorded, err := e.recordedQuarantines(ctx, db, target)
+	if err != nil {
+		return nil, err
+	}
+	var existing []pendingdrops.QuarantinedTable
+	for _, prior := range recorded {
+		exists, err := tableExistsInSchema(ctx, db, prior.QuarantineSchema, prior.QuarantineTable)
+		if err != nil {
+			return nil, fmt.Errorf("check recorded pending drops table `%s` exists: %w", prior.QuarantineTable, err)
+		}
+		if exists {
+			existing = append(existing, prior)
+		}
+	}
+	return existing, nil
+}
+
+// containsCopy reports whether copies names the same pending drops table as
+// table.
+func containsCopy(copies []pendingdrops.QuarantinedTable, table pendingdrops.QuarantinedTable) bool {
+	return slices.ContainsFunc(copies, func(c pendingdrops.QuarantinedTable) bool {
+		return c.QuarantineSchema == table.QuarantineSchema && c.QuarantineTable == table.QuarantineTable
+	})
 }
 
 // quarantinedSourceTables names the source tables of moved as `schema`.`table`

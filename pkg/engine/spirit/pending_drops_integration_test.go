@@ -726,6 +726,23 @@ func breakQuarantineLog(t *testing.T, db *sql.DB) {
 	require.NoError(t, err, "create a quarantine log with the wrong shape")
 }
 
+// makeQuarantineLogReadOnly leaves a view under the quarantine log's name that
+// reads like an empty log but refuses every insert, so the quarantine can
+// check its record and cannot write one.
+func makeQuarantineLogReadOnly(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", pendingdrops.Database),
+		fmt.Sprintf("CREATE TABLE `%s`.`log_base` (quarantine_table varchar(64), source_schema varchar(64), "+
+			"source_table varchar(64), apply_identifier varchar(255), quarantined_at datetime(3))", pendingdrops.Database),
+		fmt.Sprintf("CREATE VIEW `%s`.`%s` AS SELECT DISTINCT quarantine_table, source_schema, source_table, apply_identifier, quarantined_at FROM `%s`.`log_base`",
+			pendingdrops.Database, pendingdrops.LogTable, pendingdrops.Database),
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+}
+
 // engineForApply returns an engine tracking a running schema change that
 // belongs to the named apply, the way Apply leaves it before the DROP phase.
 func engineForApply(t *testing.T, dsn, applyIdentifier string) *Engine {
@@ -750,7 +767,7 @@ func TestEngine_DropPhase_RefusesToQuarantineWhenTheLogCannotBeWritten(t *testin
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
 	cleanupPendingDropsDB(t, db)
-	breakQuarantineLog(t, db)
+	makeQuarantineLogReadOnly(t, db)
 
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE `probe_keep` (id INT PRIMARY KEY AUTO_INCREMENT)")
 	require.NoError(t, err, "create probe_keep")
@@ -765,7 +782,7 @@ func TestEngine_DropPhase_RefusesToQuarantineWhenTheLogCannotBeWritten(t *testin
 	exists, err := tableExistsInSchema(t.Context(), db, database, "probe_keep")
 	require.NoError(t, err)
 	assert.True(t, exists, "the table stays in place when its quarantine cannot be recorded")
-	assert.Equal(t, []string{pendingdrops.LogTable}, listQuarantinedTables(t, db), "no copy lands in pending drops")
+	assert.Equal(t, []string{"log_base", pendingdrops.LogTable}, listQuarantinedTables(t, db), "no copy lands in pending drops")
 }
 
 // A DROP TABLE target that is missing is resolved against the target's
@@ -1019,9 +1036,11 @@ func quarantineOvertakenBy(t *testing.T, db *sql.DB, dsn, lockedTables, overtaki
 	locker, err := db.Conn(t.Context())
 	require.NoError(t, err, "open locking connection")
 	t.Cleanup(func() {
-		cleanupCtx := context.WithoutCancel(t.Context())
-		_, _ = locker.ExecContext(cleanupCtx, "UNLOCK TABLES")
-		_ = locker.Close()
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+		defer cancel()
+		_, err := locker.ExecContext(cleanupCtx, "UNLOCK TABLES")
+		assert.NoError(t, err, "release the lock on %s", lockedTables)
+		assert.NoError(t, locker.Close(), "close the locking connection")
 	})
 	_, err = locker.ExecContext(t.Context(), "LOCK TABLES "+lockedTables)
 	require.NoError(t, err, "lock %s", lockedTables)
@@ -1168,4 +1187,44 @@ func TestEngine_DropPhase_FailsWhenOvertakenRenameLeavesATableInPlace(t *testing
 	require.Error(t, err, "a table still on the target must fail the statement")
 	assert.Contains(t, err.Error(), "Error 1146", "the server's error is returned unchanged")
 	assert.True(t, tableExists(t, db, "overtaken_recreated"), "the second table is still on the target")
+}
+
+// An earlier attempt of this apply quarantined `overtaken_sessions`, and the
+// table has since been created again with new rows. While the quarantine
+// RENAME of the new table waits, something other than SchemaBot drops it
+// outright. The earlier copy is still in pending drops, but it was there before
+// the RENAME was issued, so it holds the old rows and not the ones just
+// dropped. The statement fails with the server's error rather than report the
+// new table as recoverable.
+func TestEngine_DropPhase_FailsWhenOvertakenByADropAndOnlyAnOlderCopyExists(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const olderCopy = "20260101000000000_overtaken_sessions"
+	recordEarlierCopy(t, db, "overtaken_sessions", olderCopy)
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE `%s`.`%s` (id INT PRIMARY KEY)", pendingdrops.Database, olderCopy))
+	require.NoError(t, err, "create the earlier copy of overtaken_sessions")
+	_, err = db.ExecContext(t.Context(),
+		fmt.Sprintf("INSERT INTO `%s`.`%s` (id) VALUES (1)", pendingdrops.Database, olderCopy))
+	require.NoError(t, err, "seed the earlier copy with the old rows")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `overtaken_sessions` (id INT PRIMARY KEY)")
+	require.NoError(t, err, "create overtaken_sessions again")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `overtaken_sessions` (id) VALUES (2)")
+	require.NoError(t, err, "seed the new overtaken_sessions with new rows")
+
+	err = quarantineOvertakenBy(t, db, dsn, "`overtaken_sessions` READ",
+		"DROP TABLE `testdb`.`overtaken_sessions`", "DROP TABLE `overtaken_sessions`")
+	require.Error(t, err, "a copy older than the RENAME does not hold the dropped table")
+	assert.Contains(t, err.Error(), "Error 1146", "the server's error is returned unchanged")
+	assert.Contains(t, err.Error(), "RENAME TABLE `testdb`.`overtaken_sessions`")
+	assert.False(t, tableExists(t, db, "overtaken_sessions"), "the new table is gone from the target")
+	assert.Equal(t, []string{olderCopy, pendingdrops.LogTable}, listQuarantinedTables(t, db),
+		"only the earlier copy is in pending drops")
+	var ids string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		fmt.Sprintf("SELECT GROUP_CONCAT(id ORDER BY id) FROM `%s`.`%s`", pendingdrops.Database, olderCopy)).Scan(&ids),
+		"read the earlier copy")
+	assert.Equal(t, "1", ids, "the earlier copy holds only the old rows, not the dropped table's")
 }

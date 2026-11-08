@@ -75,19 +75,22 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
 **A resumed schema change does not quarantine a table twice.** Before resuming,
 SchemaBot plans again against the live schema. A table an earlier attempt moved
 into `_pending_drops` is no longer part of the diff, so its completed DROP is
-not sent to the engine again. If the engine replays a stopped DROP phase in the
-same process, through its own start path, it skips a missing source table only
-when this attempt recorded moving that table and any recorded copy still
-exists. The record is written before the rename is issued, so a rename the
-server completes after a stop has abandoned it is still recognized on the
-replay. When that abandoned rename is still queued and lands ahead of the
-replay's own rename, the replay's rename finds no table; the drop succeeds only
-if every table it names is at a copy this schema change recorded, and fails
-otherwise. The record does not outlive the process; a resume on another server
-relies on the re-plan above. Any other missing table still fails unless the
-statement says `IF EXISTS`, and a recorded copy that retention has since
-removed fails too: the drop is final, and the message says so and asks for the
-schema change to be planned again against the live schema.
+not sent to the engine again. If the engine replays a stopped DROP phase, it
+skips a missing source table only when an earlier attempt of the same apply
+recorded moving that table and any recorded copy still exists. The record is
+the quarantine log on the target (see below), keyed by the apply, so a replay
+in another process or after a restart finds it too; a schema change that names
+no apply has only a record kept in the process that ran it. The record is
+written before the rename is issued, so a rename the server completes after a
+stop has abandoned it is still recognized on the replay. When that abandoned
+rename is still queued and lands ahead of the replay's own rename, the replay's
+rename finds no table; the drop succeeds only if every table it names is at a
+recorded copy that was not yet in `_pending_drops` when the replay checked the
+table, and fails otherwise. A copy that was already there holds an older table
+of the same name, not the one that just went missing. Any other missing table
+still fails unless the statement says `IF EXISTS`, and a recorded copy that
+retention has since removed fails too: the drop is final, and the message says
+so and asks for the schema change to be planned again against the live schema.
 
 **Cancelling a schema change quarantines its copy too.** A cancelled change
 leaves a shadow table holding every row copied so far, and — if its cutover had already
