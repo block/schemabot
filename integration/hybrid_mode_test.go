@@ -146,9 +146,6 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 
 	addr := listener.Addr().String()
 
-	// Wait for server readiness
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
-
 	// =========================================================================
 	// Test 1: Plan for local-mode database (uses LocalClient)
 	// =========================================================================
