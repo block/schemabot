@@ -19,14 +19,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/testcontainers/testcontainers-go"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
@@ -284,23 +281,11 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	}
 	grpcAddress = grpcListener.Addr().String()
 
+	// The listener is bound before Serve starts, so the address is usable as
+	// soon as this returns: a dial waits in the listen backlog until Serve
+	// accepts it, and an RPC waits while its connection is still connecting,
+	// bounded by the caller's own deadline.
 	go func() { _ = grpcSrv.Serve(grpcListener) }()
-
-	// Wait for server to be ready
-	conn, err := grpc.NewClient(grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return "", fmt.Errorf("create gRPC client: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-	readyCtx, readyCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer readyCancel()
-	conn.Connect()
-	for conn.GetState() != connectivity.Ready {
-
-		if !conn.WaitForStateChange(readyCtx, conn.GetState()) {
-			return "", fmt.Errorf("gRPC server not ready: context expired")
-		}
-	}
 
 	return grpcAddress, nil
 }
