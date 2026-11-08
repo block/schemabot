@@ -2456,6 +2456,57 @@ func TestResumeReplanKeepsLandedStatementActiveForAcceptedWork(t *testing.T) {
 	}
 }
 
+// A terminal task is never reattached to, whatever its stored resume state
+// records. A cancelled task whose change the re-plan finds landed is the one
+// terminal state that reaches the reattach decision, and it must not return to
+// the active set: a drive would otherwise reattach to a deploy request the
+// task's own verdict already closed.
+func TestResumeReplanDoesNotReattachATerminalTask(t *testing.T) {
+	client, apply, tasks, _ := acceptedCutoverFixture(storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.Cancelled, &acceptedCutoverEngine{})
+
+	reattach, err := client.taskReattachesToAcceptedWork(t.Context(), tasks[0])
+	require.NoError(t, err)
+	assert.False(t, reattach, "a terminal task is never reattached to")
+
+	rp, err := client.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{ID: 7})
+	require.NoError(t, err)
+	assert.Empty(t, rp.ActiveTasks, "a terminal task does not return to the active set")
+}
+
+// The outcome of a reattached deploy request comes from engine progress alone.
+// When the provider reports the request failed or cancelled after the live
+// schema already matched the reviewed target, the apply ends failed or
+// cancelled with its tasks in the same state; the schema match never settles
+// any task completed.
+func TestResumeReattachedDeployRequestThatFailsOrIsCancelledEndsTheApplyThere(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		result    *engine.ProgressResult
+		wantTask  string
+		wantApply string
+	}{
+		{"failed", &engine.ProgressResult{State: engine.StateFailed, ErrorMessage: "deploy request failed"}, state.Task.Failed, state.Apply.Failed},
+		{"cancelled", &engine.ProgressResult{State: engine.StateCancelled}, state.Task.Cancelled, state.Apply.Cancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := &acceptedCutoverEngine{afterOutage: []*engine.ProgressResult{tc.result}}
+			client, apply, tasks, applies := acceptedCutoverFixture(storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.FailedRetryable, eng)
+			apply.State = state.Apply.FailedRetryable
+			applies.stored = *apply
+			taskStore := client.storage.Tasks().(*stateRecordingTaskStore)
+
+			require.NoError(t, client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, map[string]string{}, false, false))
+
+			require.Len(t, eng.reattached, 1, "the resume reattaches to the deploy request")
+			assert.Equal(t, tc.wantApply, applies.stored.State)
+			assert.NotContains(t, taskStore.states, state.Task.Completed, "no task is written completed")
+			for _, task := range tasks {
+				assert.Equal(t, tc.wantTask, task.State, "table %s", task.TableName)
+			}
+		})
+	}
+}
+
 // Starting a stopped apply registers a new observer for it, which can land
 // while the stopped drive is still delivering its terminal update. The drive
 // must leave that registration in place: clearing after OnTerminal would

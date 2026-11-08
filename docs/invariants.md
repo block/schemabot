@@ -923,7 +923,8 @@ completeness test over it (`pkg/state/metadata.go`).
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
 *Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
-resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
+resume re-plan that settles a task whose change already landed and whose stored resume state records
+no deploy request to reattach to (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
 retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
 (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the per-operation budget in
@@ -1388,9 +1389,9 @@ request names and that apply's own live task (`activeTaskForControlApply`,
 `pkg/tern/local_control.go`), the drive loops that act on its answer
 (`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
 `pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`), and the resume re-plan, which
-keeps a task whose engine accepted work it reattaches to active rather than settling it from a
-schema comparison, so a revert window the drive never recorded is still reached
-(`taskReattachesToAcceptedWork`, `pkg/tern/local_control_resume.go`).
+keeps a task whose stored resume state records a deploy request active rather than settling it
+from a schema comparison, so the resume reattaches to that request and a revert window the drive
+never recorded is still reached (`taskReattachesToAcceptedWork`, `pkg/tern/local_control_resume.go`).
 
 ### CO-6: Commands act only where they have an effect
 

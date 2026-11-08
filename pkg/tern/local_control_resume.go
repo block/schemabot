@@ -1060,9 +1060,16 @@ func taskInRevertPhase(task *storage.Task) bool {
 // engine work the task's stored resume state names, instead of settling the
 // task from a schema comparison. It holds for a non-terminal task on an engine
 // whose recovery reattaches to accepted work (recoveryReattachesToAcceptedWork)
-// when the task's operation has persisted resume state naming a deploy
-// request: the engine accepted the work, and it keeps running at the provider
-// whatever this drive concludes.
+// when the task's operation has persisted resume state recording a deploy
+// request: the engine handed the work to the provider, and it keeps running
+// there whatever this drive concludes.
+//
+// The signal is the recorded deploy request, not a cutover. The engine records
+// the request's ID before the provider has finished computing its diff, so the
+// row also names a request that was never deployed. That is safe to reattach
+// to: the engine's resume reads the provider's own state for the request and
+// handles each one it can be in, so the engine-reported state decides the
+// task's outcome, never the stored row.
 //
 // After an accepted cutover the live schema matches the reviewed target, so a
 // schema match cannot tell a finished change from one whose revert window is
@@ -1106,7 +1113,7 @@ func (c *LocalClient) taskReattachesToAcceptedWork(ctx context.Context, task *st
 // keepAcceptedWorkTaskActive logs why a task the resume re-plan would have
 // settled stays active instead: taskReattachesToAcceptedWork holds for it.
 func (c *LocalClient) keepAcceptedWorkTaskActive(task *storage.Task) {
-	c.logger.Info("keeping task active through resume re-plan although the re-plan finds its change landed: its stored resume state names a deploy request the engine accepted, so the resume reattaches and engine progress decides its terminal state",
+	c.logger.Info("keeping task active through resume re-plan although the re-plan finds its change landed: its stored resume state records a deploy request, so the resume reattaches to it and engine progress decides its terminal state",
 		task.LogAttrs()...)
 }
 
