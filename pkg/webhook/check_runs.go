@@ -176,13 +176,13 @@ var narrowedApplyBlock = checkBlockReason{
 }
 
 // planFailedUnrecordedBlock is carried by the failing aggregate posted for an
-// environment that could not plan while another environment of the same plan
-// did, when the failing check row recording that could not be stored either.
-// Stored check state then holds nothing of the failure, so a fold from it, on
-// this plan or on a later plan of another environment, could pass on the
-// environments that did plan. The block keeps every such fold off the
-// aggregate until auto-plan re-verifies the PR and durably invalidates prior
-// successful results. Only replacement results can then pass the aggregate.
+// environment that could not plan, when the failing check row recording that
+// could not be stored either. Stored check state then holds nothing of the
+// failure, so a fold from it, on this plan or on a later plan, could pass on
+// the environments that did plan or on the environment's earlier passing row.
+// The block keeps every such fold off the aggregate until auto-plan
+// re-verifies the PR and durably invalidates prior successful results. Only
+// replacement results can then pass the aggregate.
 var planFailedUnrecordedBlock = checkBlockReason{
 	blockingReason: checkstate.BlockPlanFailedUnrecorded,
 	message:        planFailedUnstoredSummary,
