@@ -130,6 +130,8 @@ import (
 const (
 	grpcProgressPollInterval       = 500 * time.Millisecond
 	maxGRPCProgressPollErrorStreak = 10
+	// grpcDriveHeartbeatInterval is how often a gRPC drive renews its lease.
+	grpcDriveHeartbeatInterval = 10 * time.Second
 )
 
 var grpcStoppedAfterStartGracePeriod = 30 * time.Second
@@ -5455,6 +5457,12 @@ func applyProgressRank(applyState string) int {
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
 //
+// The heartbeat runs in its own goroutine, apart from the poll. A poll step
+// blocked on a storage read that never returns must not hold up the heartbeat,
+// or the presumed-lost check behind it, so a heartbeat that decides the drive
+// must end cancels the poll and its error is returned in place of whatever the
+// cancelled poll step reports.
+//
 // releaseAtCutoverBarrier mirrors the LocalClient copy drive: when set, an
 // operation-scoped barrier copy drive exits the moment the remote reaches
 // waiting_for_cutover so the operator persists the parked operation row and
@@ -5464,12 +5472,76 @@ func applyProgressRank(applyState string) int {
 // single-operation / whole-apply drives (which keep waiting for a manual
 // cutover unchanged).
 func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool, scope applyTaskScope, releaseAtCutoverBarrier bool) error {
+	pollCtx, stopPoll := context.WithCancel(ctx)
+	defer stopPoll()
+	waitHeartbeat := c.startDriveHeartbeat(pollCtx, apply, scope, stopPoll)
+	pollErr := c.pollRemoteUntilDone(pollCtx, apply, allowStoppedAfterStart, scope, releaseAtCutoverBarrier)
+	stopPoll()
+	if stopErr := waitHeartbeat(); stopErr != nil {
+		return stopErr
+	}
+	return pollErr
+}
+
+// startDriveHeartbeat refreshes the drive's lease every
+// grpcDriveHeartbeatInterval until ctx ends. A multi-operation drive
+// heartbeats its own operation row; every other drive heartbeats the parent
+// applies row. Each write runs under its own deadline, so one that hangs
+// counts toward the staleness window instead of stalling the loop. When
+// driveEndingHeartbeatFailure decides the drive must end, the heartbeat calls
+// stopPoll and exits. The returned wait blocks until the heartbeat has exited
+// and returns the error that ended the drive, or nil when it stopped because
+// ctx ended.
+func (c *GRPCClient) startDriveHeartbeat(ctx context.Context, apply *storage.Apply, scope applyTaskScope, stopPoll context.CancelFunc) (wait func() error) {
+	logger := c.applyLogger(apply)
+	// The poll goes on mutating its apply while the heartbeat runs, so the
+	// heartbeat reads its own copy.
+	applySnapshot := *apply
+	var stopErr error
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		ticker := time.NewTicker(grpcDriveHeartbeatInterval)
+		defer ticker.Stop()
+		lastSuccess := time.Now()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				attemptStart := time.Now()
+				err := storage.HeartbeatLeaseAttempt(ctx, attemptStart, lastSuccess, func(attemptCtx context.Context) error {
+					return c.heartbeatScopedDrive(attemptCtx, &applySnapshot, scope)
+				})
+				if err == nil {
+					lastSuccess = attemptStart
+					continue
+				}
+				if ctx.Err() != nil {
+					// The drive is shutting down; the failed write is
+					// cancellation fallout, not lease trouble.
+					return
+				}
+				if driveErr := driveEndingHeartbeatFailure(logger, &applySnapshot, err, lastSuccess); driveErr != nil {
+					stopErr = driveErr
+					stopPoll()
+					return
+				}
+			}
+		}
+	}()
+	return func() error {
+		<-exited
+		return stopErr
+	}
+}
+
+// pollRemoteUntilDone is pollForCompletion's poll loop; its heartbeat runs
+// beside it in startDriveHeartbeat.
+func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool, scope applyTaskScope, releaseAtCutoverBarrier bool) error {
 	logger := c.applyLogger(apply)
 	ticker := time.NewTicker(grpcProgressPollInterval)
 	defer ticker.Stop()
-
-	heartbeatTicker := time.NewTicker(10 * time.Second)
-	defer heartbeatTicker.Stop()
 
 	consecutiveProgressErrors := 0
 	loggedStoppedAfterStart := false
@@ -5477,35 +5549,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	loggedWholeApplyProgress := false
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
-	lastHeartbeatSuccess := time.Now()
 	parked := newParkedPoll()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-heartbeatTicker.C:
-			// Heartbeat: bump updated_at to maintain the lease. A multi-operation
-			// drive heartbeats its own operation row; every other drive
-			// heartbeats the parent applies row.
-			// Each write runs under its own deadline, so one that hangs
-			// counts toward the staleness window instead of stalling this
-			// loop, and with it the presumed-lost check.
-			attemptStart := time.Now()
-			err := storage.HeartbeatLeaseAttempt(ctx, attemptStart, lastHeartbeatSuccess, func(attemptCtx context.Context) error {
-				return c.heartbeatScopedDrive(attemptCtx, apply, scope)
-			})
-			if err == nil {
-				lastHeartbeatSuccess = attemptStart
-				continue
-			}
-			if ctx.Err() != nil {
-				// The drive is shutting down; the failed write is cancellation
-				// fallout, not lease trouble.
-				return ctx.Err()
-			}
-			if stopErr := driveEndingHeartbeatFailure(logger, apply, err, lastHeartbeatSuccess); stopErr != nil {
-				return stopErr
-			}
 		case <-ticker.C:
 			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
 				continue

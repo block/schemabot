@@ -166,6 +166,62 @@ func TestStartApplyHeartbeatThatHangsStopsTheDrive(t *testing.T) {
 	}
 }
 
+// hangingControlRequestStore is a control request store whose pending read is
+// stuck on a half-open storage connection, returning only once its context
+// ends.
+type hangingControlRequestStore struct {
+	storage.ControlRequestStore
+	reads atomic.Int32
+}
+
+func (s *hangingControlRequestStore) ListPending(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	s.reads.Add(1)
+	<-ctx.Done()
+	return nil, fmt.Errorf("list pending control requests for apply %d: %w", applyID, ctx.Err())
+}
+
+// hangingStorage serves the stores a gRPC drive's poll loop reads first, each
+// stuck the way a half-open storage connection leaves them.
+type hangingStorage struct {
+	storage.Storage
+	applies         *hangingHeartbeatApplyStore
+	controlRequests *hangingControlRequestStore
+}
+
+func (s *hangingStorage) Applies() storage.ApplyStore                  { return s.applies }
+func (s *hangingStorage) ControlRequests() storage.ControlRequestStore { return s.controlRequests }
+
+// TestGRPCPollWithHungStorageEndsTheDrive covers a gRPC drive whose storage
+// connection has gone half-open: its heartbeat writes time out, and its poll
+// loop is blocked in the pending control request read, which never returns.
+// The heartbeat runs apart from the poll, so the blocked read cannot hold it
+// up. Once the heartbeat has failed for the whole staleness window the drive
+// ends with ErrApplyLeasePresumedLost, no later than a peer may reclaim the
+// row, so two drivers never supervise the same remote apply at once.
+func TestGRPCPollWithHungStorageEndsTheDrive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		apply := leaseHeartbeatTestApply()
+		store := &hangingStorage{
+			applies:         &hangingHeartbeatApplyStore{},
+			controlRequests: &hangingControlRequestStore{},
+		}
+		client := &GRPCClient{storage: store, logger: discardLogger()}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 2*storage.ApplyLeaseStaleAfter)
+		defer cancel()
+		driveStart := time.Now()
+		err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
+
+		require.ErrorIs(t, err, ErrApplyLeasePresumedLost,
+			"a drive whose storage hangs must end once a peer can reclaim its work")
+		assert.ErrorIs(t, err, storage.ErrLeaseHeartbeatTimedOut)
+		assert.LessOrEqual(t, time.Since(driveStart), storage.ApplyLeaseStaleAfter,
+			"the drive must end no later than a peer may reclaim the row")
+		assert.Equal(t, int32(1), store.controlRequests.reads.Load(), "the poll stayed blocked in its first read")
+		assert.GreaterOrEqual(t, store.applies.attempts.Load(), int32(2), "each hung heartbeat is cut off and retried")
+	})
+}
+
 // TestStartApplyHeartbeatFollowsTheDriveScope covers which row a local drive
 // keeps alive. An operation-scoped drive holds only its operation lease — the
 // parent applies row belongs to the parent lease and the rollout projection —
