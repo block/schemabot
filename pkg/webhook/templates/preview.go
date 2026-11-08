@@ -419,9 +419,10 @@ func PreviewCommentPlanUnsafe() string {
 }
 
 // PreviewCommentPlanManyUnsafeChanges renders a sample plan whose unsafe list
-// is long and mixes destructive drops with findings that destroy nothing: the
-// drops lead under their own heading with the drop guidance beneath them, and
-// the other findings fold below.
+// is long and mixes destructive drops of a table, a column and an index with
+// findings that destroy nothing: the drops lead the list, the rest fold past
+// the first findings, and the apply instruction numbers each drop's safety
+// step ahead of the consent.
 func PreviewCommentPlanManyUnsafeChanges() string {
 	timestamp := func(column string) string {
 		return "Column `" + column + "` uses `TIMESTAMP` which overflows on 2038-01-19."
@@ -437,10 +438,12 @@ func PreviewCommentPlanManyUnsafeChanges() string {
 	}
 	statements = append(statements,
 		"ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;",
+		"ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;",
 		"DROP TABLE `refund_backfill`;",
 	)
 	unsafe = append(unsafe,
 		UnsafeChangeData{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data", ChangeType: "alter", DDL: "ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;"},
+		UnsafeChangeData{Table: "payouts", Reason: "DROP INDEX removes the index", ChangeType: "alter", DDL: "ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;"},
 		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`;"},
 	)
 	return RenderPlanComment(PlanCommentData{

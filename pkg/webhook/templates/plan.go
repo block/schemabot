@@ -2799,20 +2799,18 @@ func unsafeCountPhrase(drops, rest []UnsafeChangeData) string {
 // writeUnsafeFindingList writes the unsafe findings as one numbered list, one
 // line per finding, so the list is exactly as long as the header's count and
 // operators can reference a finding by its number. The destructive drops come
-// first, so a drop never sits below dozens of advisory findings, and in a
-// list that also carries findings that destroy nothing, the drops' findings
-// are bold to set them apart; a list of only drops has nothing to set them
-// apart from. A long list shows its first findings and folds the rest,
-// as unsafeFindingsShown decides; numbering runs on into the fold.
+// first, so a drop never sits below dozens of advisory findings; the
+// header's drop count and each finding's own text say which ones they are.
+// A long list shows its first findings and folds the rest, as
+// unsafeFindingsShown decides; numbering runs on into the fold.
 func writeUnsafeFindingList(sb *strings.Builder, drops, rest []UnsafeChangeData, attributionNotes map[string]string) {
-	emphasize := len(rest) > 0
 	var lines []string
 	for _, c := range drops {
-		lines = append(lines, unsafeFindingLines(c, attributionNotes, emphasize)...)
+		lines = append(lines, unsafeFindingLines(c, attributionNotes)...)
 	}
 	dropLines := len(lines)
 	for _, c := range rest {
-		lines = append(lines, unsafeFindingLines(c, attributionNotes, false)...)
+		lines = append(lines, unsafeFindingLines(c, attributionNotes)...)
 	}
 	shown := unsafeFindingsShown(len(lines), dropLines)
 	for i, line := range lines[:shown] {
@@ -2928,32 +2926,25 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 
 // unsafeFindingLines is one unnumbered line per finding in a change's unsafe
 // reason: the table, the finding, and the change's attribution note, which a
-// change that creates its table never carries. emphasize bolds the findings,
-// as the list does for a destructive drop. A change with no parseable reason
+// change that creates its table never carries. A change with no parseable reason
 // still gets a line, carrying the engine's change type when one is known so
 // the finding explains itself.
-func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string, emphasize bool) []string {
+func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) []string {
 	table := unsafeChangeLabel(c)
 	suffix := ""
 	if note := attributionNotes[c.Table]; note != "" && !createsItsTable(c) {
 		suffix = " (" + note + ")"
 	}
-	finding := func(text string) string {
-		if emphasize {
-			return "**" + text + "**"
-		}
-		return text
-	}
 	reasons := ui.LintReasons(c.Reason)
 	if len(reasons) == 0 {
 		if c.ChangeType != "" {
-			return []string{fmt.Sprintf("%s: %s%s", table, finding(c.ChangeType), suffix)}
+			return []string{fmt.Sprintf("%s: %s%s", table, c.ChangeType, suffix)}
 		}
 		return []string{table + suffix}
 	}
 	lines := make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		lines = append(lines, fmt.Sprintf("%s: %s%s", table, finding(ui.CodeQuoteIdentifiers(r)), suffix))
+		lines = append(lines, fmt.Sprintf("%s: %s%s", table, ui.CodeQuoteIdentifiers(r), suffix))
 	}
 	return lines
 }

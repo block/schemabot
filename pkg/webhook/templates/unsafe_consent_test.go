@@ -367,11 +367,11 @@ func TestRenderPlanComment_LongUnsafeListFolds(t *testing.T) {
 	assert.NotContains(t, out, "<details>\n<summary>1 more", "a fold never hides a single finding")
 }
 
-// Destructive drops lead the unsafe list, in bold and announced in the
-// header, so a dropped table or column reads apart from findings that destroy
-// nothing without a section of its own. The drop guidance follows the list as
-// a tip. In a long list the drops count toward the findings shown, so a drop
-// cannot fold behind dozens of advisory findings.
+// Destructive drops lead the unsafe list and are counted in the header, so a
+// dropped table or column reads apart from findings that destroy nothing
+// without a section of its own. The steps that make the drops safe lead the
+// apply instruction. In a long list the drops count toward the findings
+// shown, so a drop cannot fold behind dozens of advisory findings.
 func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.UnsafeChanges = append(timestampFindings(),
@@ -381,8 +381,8 @@ func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
 
 	out := RenderPlanComment(*data)
 	assert.Contains(t, out, glyph.Attention+" **Issues**: 8 unsafe changes detected (2 drops)\n"+
-		"1. `transfer_events`: **DROP COLUMN discards the column's data**\n"+
-		"2. `refund_backfill`: **DROP TABLE removes all data**\n"+
+		"1. `transfer_events`: DROP COLUMN discards the column's data\n"+
+		"2. `refund_backfill`: DROP TABLE removes all data\n"+
 		"3. `loans`: Column `created_at` uses `TIMESTAMP`", "%s", out)
 	assert.Contains(t, out, "5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
 		"\n<details>\n<summary>3 more unsafe changes</summary>\n\n6. `refunds`:", "%s", out)
@@ -404,13 +404,13 @@ func TestRenderPlanComment_EveryDropStaysOpen(t *testing.T) {
 
 	out := RenderPlanComment(*data)
 	assert.Contains(t, out, "**Issues**: 12 unsafe changes detected (6 drops)\n", "%s", out)
-	assert.Contains(t, out, "6. `f_archive`: **DROP TABLE removes all data**\n"+
+	assert.Contains(t, out, "6. `f_archive`: DROP TABLE removes all data\n"+
 		"\n<details>\n<summary>6 more unsafe changes</summary>\n\n7. `loans`:", "%s", out)
 }
 
 // The apply refusal is where the operator decides whether to pass
 // --allow-unsafe, so it lists the unsafe changes the way the plan comment
-// does: drops first and in bold, the rest folded past the first findings.
+// does: drops first, the rest folded past the first findings.
 func TestRenderUnsafeChangesBlocked_LeadsWithDrops(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.UnsafeChanges = append(timestampFindings(),
@@ -419,15 +419,15 @@ func TestRenderUnsafeChangesBlocked_LeadsWithDrops(t *testing.T) {
 
 	out := RenderUnsafeChangesBlocked(*data)
 	assert.Contains(t, out, "**"+glyph.Refused+" Apply rejected**: 7 unsafe changes detected (1 drop)\n"+
-		"1. `refund_backfill`: **DROP TABLE removes all data**\n"+
+		"1. `refund_backfill`: DROP TABLE removes all data\n"+
 		"2. `loans`:", "%s", out)
 	assert.Contains(t, out, "\n<details>\n<summary>2 more unsafe changes</summary>\n\n6. `ledger`:", "%s", out)
 	assert.Contains(t, out, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add", "%s", out)
 	assert.Contains(t, out, "to confirm 7 unsafe changes on `refund_backfill`, `loans` and 2 more:", "%s", out)
 }
 
-// A list of only drops has nothing to set them apart from, so its findings
-// are not bolded and its header does not count drops separately.
+// A list of only drops has nothing to set them apart from, so its header does
+// not count drops separately.
 func TestRenderPlanComment_DropOnlyListIsPlain(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	out := RenderPlanComment(*data)
@@ -453,7 +453,8 @@ func TestRenderPlanComment_EveryKindOfDropLeads(t *testing.T) {
 			data.UnsafeChanges = append(timestampFindings(), drop)
 
 			out := RenderPlanComment(*data)
-			assert.Contains(t, out, "detected (1 drop)\n1. `events`: **", "%s", out)
+			assert.Contains(t, out, "detected (1 drop)\n1. `events`: ", "%s", out)
+			assert.Contains(t, out, "\n2. `loans`: Column `created_at`", "%s", out)
 			assert.Contains(t, out, "<summary>2 more unsafe changes</summary>", "%s", out)
 		})
 	}

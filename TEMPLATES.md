@@ -953,33 +953,39 @@ ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;
 ```
 
 ```sql
+ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;
+```
+
+```sql
 DROP TABLE `refund_backfill`;
 ```
 
-⚠️ **Issues**: 8 unsafe changes detected (2 drops)
-1. `transfer_events`: **DROP COLUMN discards the column's data**
-2. `refund_backfill`: **DROP TABLE removes all data**
-3. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-4. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+⚠️ **Issues**: 9 unsafe changes detected (3 drops)
+1. `transfer_events`: DROP COLUMN discards the column's data
+2. `payouts`: DROP INDEX removes the index
+3. `refund_backfill`: DROP TABLE removes all data
+4. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+5. `loans`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
 
 <details>
-<summary>3 more unsafe changes</summary>
+<summary>4 more unsafe changes</summary>
 
-6. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-7. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
-8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+6. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+7. `refunds`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+8. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.
+9. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.
 
 </details>
 
-📋 **Plan**: **3** tables to create, **1** table to alter, **1** table to drop
+📋 **Plan**: **3** tables to create, **2** tables to alter, **1** table to drop
 
 
 ---
 
 ▶️ **To apply**:
 1. Deploy application code that no longer reads from or writes to the dropped table and column.
-2. Add `--allow-unsafe` to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:
+2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.
+3. Add `--allow-unsafe` to confirm 9 unsafe changes on `transfer_events`, `payouts` and 4 more:
    ```
    schemabot apply -e staging
    ```
