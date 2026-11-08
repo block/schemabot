@@ -16,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/pendingdrops"
 )
 
@@ -104,7 +105,10 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		)
 	}
 	if err := pendingdrops.MoveTablesTo(ctx, db, moved); err != nil {
-		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
+		if !mysqlerr.Is(err, erNoSuchTable) {
+			return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
+		}
+		return e.resolveOvertakenQuarantine(ctx, db, moved, err)
 	}
 	for _, table := range moved {
 		e.logger.Info("DROP TABLE intercepted: table quarantined in pending drops and recoverable until the retention period expires",
@@ -123,6 +127,62 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			fmt.Sprintf("table `%s`.`%s` quarantined as `%s`.`%s`; recoverable until the pending drops retention period expires",
 				table.SchemaName, table.TableName, table.QuarantineSchema, table.QuarantineTable))
 		metrics.RecordPendingDropMoved(ctx, table.SchemaName)
+	}
+	return nil
+}
+
+// erNoSuchTable is ER_NO_SUCH_TABLE, which the quarantine RENAME returns when a
+// source table is gone by the time the server runs it.
+const erNoSuchTable = 1146
+
+// resolveOvertakenQuarantine decides what a quarantine RENAME that found a
+// source table missing means. The tables were all present when this attempt
+// checked them, so another statement moved one away while the RENAME waited.
+// The expected one is a RENAME an earlier attempt of this schema change
+// abandoned while it waited on a metadata lock, which the server completed
+// first at the destination that attempt recorded. RENAME TABLE moves every
+// table or none, so this attempt moved nothing; the statement is done only if
+// every table is now at a destination this schema change recorded for it.
+// Anything less returns renameErr: a table still on the target was not
+// quarantined, and a table found nowhere is not held by SchemaBot.
+func (e *Engine) resolveOvertakenQuarantine(ctx context.Context, db *sql.DB, moved []pendingdrops.QuarantinedTable, renameErr error) error {
+	copies := make([]pendingdrops.QuarantinedTable, 0, len(moved))
+	for _, table := range moved {
+		target := dropTarget{schema: table.SchemaName, table: table.TableName}
+		stillOnTarget, err := tableExistsInSchema(ctx, db, target.schema, target.table)
+		if err != nil {
+			return fmt.Errorf("quarantine DROP TABLE targets: %w; checking whether an earlier attempt already moved them failed: %w", renameErr, err)
+		}
+		if stillOnTarget {
+			e.changeLogger().Warn("quarantine RENAME found a DROP TABLE target missing, and this target is still in place and was not quarantined; failing the statement",
+				"database", target.schema, "table", target.table)
+			return fmt.Errorf("quarantine DROP TABLE targets: %w", renameErr)
+		}
+		recorded, err := e.recordedQuarantines(ctx, db, target)
+		if err != nil {
+			return fmt.Errorf("quarantine DROP TABLE targets: %w; checking whether an earlier attempt already moved them failed: %w", renameErr, err)
+		}
+		prior, found, err := findRecordedCopy(ctx, db, recorded)
+		if err != nil {
+			return fmt.Errorf("quarantine DROP TABLE targets: %w; checking whether an earlier attempt already moved them failed: %w", renameErr, err)
+		}
+		if !found {
+			e.changeLogger().Warn("quarantine RENAME found a DROP TABLE target missing and no pending drops copy this schema change recorded holds it; failing the statement",
+				"database", target.schema, "table", target.table, "recorded_copies", len(recorded))
+			return fmt.Errorf("quarantine DROP TABLE targets: %w", renameErr)
+		}
+		copies = append(copies, prior)
+	}
+	for _, prior := range copies {
+		e.logger.Info("DROP TABLE target was quarantined by an earlier attempt's RENAME while this attempt's RENAME waited; treating it as quarantined",
+			"database", prior.SchemaName,
+			"table", prior.TableName,
+			"quarantine_database", prior.QuarantineSchema,
+			"quarantine_table", prior.QuarantineTable,
+		)
+		e.emitTableLog(prior.TableName,
+			fmt.Sprintf("table `%s`.`%s` already quarantined as `%s`.`%s` earlier in this schema change; recoverable until the pending drops retention period expires",
+				prior.SchemaName, prior.TableName, prior.QuarantineSchema, prior.QuarantineTable))
 	}
 	return nil
 }

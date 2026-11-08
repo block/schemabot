@@ -567,9 +567,9 @@ func TestEngine_ResumeDropPhase_StopDuringBlockedRename(t *testing.T) {
 // The replay still sees the table, so it records a fresh destination and
 // queues behind the abandoned RENAME. Once the lock is released the abandoned
 // RENAME lands at the first destination and the replay's own RENAME finds no
-// table. The next replay must find the data at the first destination and skip
-// the table, rather than report the drop final because the newer destination
-// was never written.
+// table. The replay must find the data at the first destination and report the
+// table quarantined, rather than fail on a table that is safely in pending
+// drops, and a further replay skips it the same way.
 func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -652,8 +652,8 @@ func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
 
 	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
 	require.NoError(t, err, "release the metadata lock")
-	require.Error(t, receiveWithin(t, replay, "the replay to return"),
-		"the replay's own RENAME finds the table already moved")
+	require.NoError(t, receiveWithin(t, replay, "the replay to return"),
+		"the replay's own RENAME finds no table, and the copy at the first destination accounts for it")
 	require.Equal(t, []string{firstRecorded[0].QuarantineTable}, listQuarantinedTables(t, db),
 		"the abandoned RENAME quarantined the table at the first destination")
 
@@ -1004,4 +1004,168 @@ func TestEngine_ResumeDropPhase_SkipsTableQuarantinedAtTheReplaysDestination(t *
 		"DROP TABLE `landed_at_replay`")
 	require.NoError(t, err, "the copy at the replay's destination holds the table, so the drop is not final")
 	assert.Equal(t, []string{second.QuarantineTable}, listQuarantinedTables(t, db))
+}
+
+// quarantineOvertakenBy runs the quarantine of drop for apply-overtaken while
+// overtaking is already queued on the server ahead of its RENAME, and returns
+// the quarantine's result. A READ lock on lockedTables holds both statements
+// until each has queued, and releasing it lets overtaking land first, the way
+// a RENAME an earlier attempt abandoned lands ahead of the replay's.
+func quarantineOvertakenBy(t *testing.T, db *sql.DB, dsn, lockedTables, overtaking, drop string) error {
+	t.Helper()
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	locker, err := db.Conn(t.Context())
+	require.NoError(t, err, "open locking connection")
+	t.Cleanup(func() {
+		cleanupCtx := context.WithoutCancel(t.Context())
+		_, _ = locker.ExecContext(cleanupCtx, "UNLOCK TABLES")
+		_ = locker.Close()
+	})
+	_, err = locker.ExecContext(t.Context(), "LOCK TABLES "+lockedTables)
+	require.NoError(t, err, "lock %s", lockedTables)
+
+	waiting := func() int {
+		var count int
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			"SELECT COUNT(*) FROM information_schema.processlist WHERE state LIKE 'Waiting for %metadata lock'").Scan(&count))
+		return count
+	}
+	overtaken := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(t.Context(), overtaking)
+		overtaken <- err
+	}()
+	waitFor(t, "the overtaking statement to queue on the lock", func() bool { return waiting() >= 1 })
+
+	eng := engineForApply(t, dsn, "apply-overtaken")
+	quarantine := make(chan error, 1)
+	go func() {
+		quarantine <- eng.quarantineDroppedTables(t.Context(), host, username, password, database, drop)
+	}()
+	waitFor(t, "the quarantine to queue behind the overtaking statement", func() bool { return waiting() >= 2 })
+
+	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
+	require.NoError(t, err, "release the lock")
+	require.NoError(t, receiveWithin(t, overtaken, "the overtaking statement to finish"), "the overtaking statement")
+	return receiveWithin(t, quarantine, "the quarantine to return")
+}
+
+// recordEarlierCopy records in the target's quarantine log that an earlier
+// attempt of apply-overtaken moved `testdb`.`table` to quarantineTable.
+func recordEarlierCopy(t *testing.T, db *sql.DB, table, quarantineTable string) {
+	t.Helper()
+	require.NoError(t, pendingdrops.RecordQuarantines(t.Context(), db, "apply-overtaken", []pendingdrops.QuarantinedTable{{
+		SchemaName: "testdb", TableName: table,
+		QuarantineSchema: pendingdrops.Database, QuarantineTable: quarantineTable,
+	}}, time.Now()), "record the earlier attempt's copy of %s", table)
+}
+
+// A resume on an engine with no memory of the earlier attempt quarantines two
+// tables while the RENAME that attempt abandoned is still queued ahead of it.
+// The abandoned RENAME lands first, at the copies the quarantine log names, so
+// the resume's own RENAME finds no table. Both tables are in pending drops at
+// copies this apply recorded, so the statement succeeds and leaves the copies
+// alone.
+func TestEngine_DropPhase_SucceedsWhenOvertakenByTheEarlierAttemptsRename(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	for _, name := range []string{"overtaken_first", "overtaken_second"} {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", name))
+		require.NoError(t, err, "create %s", name)
+	}
+	const firstCopy = "20260101000000000_overtaken_first"
+	const secondCopy = "20260101000000000_overtaken_second"
+	recordEarlierCopy(t, db, "overtaken_first", firstCopy)
+	recordEarlierCopy(t, db, "overtaken_second", secondCopy)
+
+	err := quarantineOvertakenBy(t, db, dsn, "`overtaken_first` READ, `overtaken_second` READ",
+		fmt.Sprintf("RENAME TABLE `testdb`.`overtaken_first` TO `%[1]s`.`%[2]s`, `testdb`.`overtaken_second` TO `%[1]s`.`%[3]s`",
+			pendingdrops.Database, firstCopy, secondCopy),
+		"DROP TABLE `overtaken_first`, `overtaken_second`")
+	require.NoError(t, err, "both tables are at copies this apply recorded")
+	assert.Equal(t, []string{firstCopy, secondCopy, pendingdrops.LogTable}, listQuarantinedTables(t, db),
+		"each table is in pending drops exactly once, at the earlier attempt's copy")
+	assert.False(t, tableExists(t, db, "overtaken_first"), "the first table is gone from the target")
+	assert.False(t, tableExists(t, db, "overtaken_second"), "the second table is gone from the target")
+}
+
+// While the quarantine RENAME waits, something other than SchemaBot drops the
+// table outright. The RENAME finds no table and no copy this schema change
+// recorded holds it, so the statement fails with the server's error rather
+// than report a drop SchemaBot holds no copy of.
+func TestEngine_DropPhase_FailsWhenOvertakenByADropThatLeavesNoCopy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `overtaken_dropped` (id INT PRIMARY KEY)")
+	require.NoError(t, err, "create overtaken_dropped")
+
+	err = quarantineOvertakenBy(t, db, dsn, "`overtaken_dropped` READ",
+		"DROP TABLE `testdb`.`overtaken_dropped`", "DROP TABLE `overtaken_dropped`")
+	require.Error(t, err, "a table found nowhere must fail the statement")
+	assert.Contains(t, err.Error(), "Error 1146", "the server's error is returned unchanged")
+	assert.Contains(t, err.Error(), "RENAME TABLE `testdb`.`overtaken_dropped`")
+	assert.Equal(t, []string{pendingdrops.LogTable}, listQuarantinedTables(t, db), "no copy exists in pending drops")
+}
+
+// A DROP of two tables is overtaken by a RENAME that puts the first at the copy
+// an earlier attempt recorded and moves the second out of the target without a
+// copy. One table is accounted for and the other is not, so the statement
+// fails rather than report both quarantined, and the first table's copy is
+// left in place.
+func TestEngine_DropPhase_FailsWhenOvertakenRenameAccountsForOnlySomeTables(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	for _, name := range []string{"overtaken_kept", "overtaken_lost"} {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", name))
+		require.NoError(t, err, "create %s", name)
+	}
+	const earlierCopy = "20260101000000000_overtaken_kept"
+	recordEarlierCopy(t, db, "overtaken_kept", earlierCopy)
+
+	err := quarantineOvertakenBy(t, db, dsn, "`overtaken_kept` READ, `overtaken_lost` READ",
+		fmt.Sprintf("RENAME TABLE `testdb`.`overtaken_kept` TO `%s`.`%s`, `testdb`.`overtaken_lost` TO `testdb`.`overtaken_lost_elsewhere`",
+			pendingdrops.Database, earlierCopy),
+		"DROP TABLE `overtaken_kept`, `overtaken_lost`")
+	require.Error(t, err, "a table no recorded copy holds must fail the statement")
+	assert.Contains(t, err.Error(), "Error 1146", "the server's error is returned unchanged")
+	assert.Equal(t, []string{earlierCopy, pendingdrops.LogTable}, listQuarantinedTables(t, db),
+		"only the earlier attempt's copy of the first table is in pending drops")
+}
+
+// A DROP of two tables is overtaken by a RENAME that puts the first at the copy
+// an earlier attempt recorded, while the second, which an earlier attempt also
+// quarantined, has since been created again on the target. A copy of the
+// second exists, but the table is still in place and was not quarantined by
+// this statement, so the statement fails.
+func TestEngine_DropPhase_FailsWhenOvertakenRenameLeavesATableInPlace(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	for _, name := range []string{"overtaken_moved", "overtaken_recreated"} {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", name))
+		require.NoError(t, err, "create %s", name)
+	}
+	const movedCopy = "20260101000000000_overtaken_moved"
+	const recreatedCopy = "20260101000000000_overtaken_recreated"
+	recordEarlierCopy(t, db, "overtaken_moved", movedCopy)
+	recordEarlierCopy(t, db, "overtaken_recreated", recreatedCopy)
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE `%s`.`%s` (id INT PRIMARY KEY)", pendingdrops.Database, recreatedCopy))
+	require.NoError(t, err, "create the earlier copy of overtaken_recreated")
+
+	err = quarantineOvertakenBy(t, db, dsn, "`overtaken_moved` READ, `overtaken_recreated` READ",
+		fmt.Sprintf("RENAME TABLE `testdb`.`overtaken_moved` TO `%s`.`%s`", pendingdrops.Database, movedCopy),
+		"DROP TABLE `overtaken_moved`, `overtaken_recreated`")
+	require.Error(t, err, "a table still on the target must fail the statement")
+	assert.Contains(t, err.Error(), "Error 1146", "the server's error is returned unchanged")
+	assert.True(t, tableExists(t, db, "overtaken_recreated"), "the second table is still on the target")
 }

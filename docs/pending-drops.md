@@ -80,7 +80,10 @@ same process, through its own start path, it skips a missing source table only
 when this attempt recorded moving that table and any recorded copy still
 exists. The record is written before the rename is issued, so a rename the
 server completes after a stop has abandoned it is still recognized on the
-replay. The record does not outlive the process; a resume on another server
+replay. When that abandoned rename is still queued and lands ahead of the
+replay's own rename, the replay's rename finds no table; the drop succeeds only
+if every table it names is at a copy this schema change recorded, and fails
+otherwise. The record does not outlive the process; a resume on another server
 relies on the re-plan above. Any other missing table still fails unless the
 statement says `IF EXISTS`, and a recorded copy that retention has since
 removed fails too: the drop is final, and the message says so and asks for the
