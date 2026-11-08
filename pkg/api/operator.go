@@ -4213,11 +4213,17 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		}
 	}
 
-	// A projection that changes nothing the parent records is skipped. The
-	// message is one of those records: a rollout can stay paused while the
-	// operation that supplied its reason is retried and completes beside a
-	// sibling still paused, and the parent then has to name the sibling.
-	if state.IsState(apply.State, derived) && startedAt == nil && errorMessage == apply.ErrorMessage {
+	// A projection that changes nothing the parent records is skipped. A held
+	// pause is the one state whose message can change without the state
+	// changing: a rollout can stay paused while the operation that supplied its
+	// reason is retried and completes beside a sibling still paused, and the
+	// parent then has to name the sibling. A terminal verdict's message is
+	// written once, at the transition, and is left alone afterwards; a remote
+	// apply's row already carries the data plane's own failure message, and
+	// re-projecting it would replace that message with the aggregate's
+	// deployment-qualified one.
+	pauseReasonChanged := state.IsState(derived, state.Apply.FailedRetryable) && errorMessage != apply.ErrorMessage
+	if state.IsState(apply.State, derived) && startedAt == nil && !pauseReasonChanged {
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			append(apply.LogAttrs(),
 				"driver", driverID, "operation_count", len(ops))...)

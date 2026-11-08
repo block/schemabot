@@ -1318,6 +1318,38 @@ func TestUpdateApplyStateFromOperations_RefreshesPauseReasonWhilePaused(t *testi
 	}
 }
 
+// TestUpdateApplyStateFromOperations_KeepsFailedMessageWhileFailed verifies
+// that a failed verdict's message is written at the transition and left alone
+// afterwards. A remote apply's row already carries the data plane's own failure
+// message when the operator projects the aggregate, whose message qualifies the
+// same failure with its deployment. The state holds at failed, so the
+// projection must not rewrite the message the row already carries.
+func TestUpdateApplyStateFromOperations_KeepsFailedMessageWhileFailed(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	completedAt := time.Now()
+	remoteMessage := "remote schema change failed while checking target connectivity"
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "data-plane", State: state.ApplyOperation.Failed, ErrorMessage: remoteMessage},
+	}
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Failed,
+		Environment:     "staging",
+		StartedAt:       &startedAt,
+		CompletedAt:     &completedAt,
+		ErrorMessage:    remoteMessage,
+	}
+
+	result, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	assert.False(t, result.Swapped)
+	assert.Nil(t, applyStore.updated, "a failed apply whose state holds must keep the message its row already carries")
+}
+
 // TestUpdateApplyStateFromOperations_ReturnsProjectionResult verifies the
 // structured projection result the writer returns: whether the compare-and-swap
 // advanced the apply row, the previous and derived states, and whether the swap
