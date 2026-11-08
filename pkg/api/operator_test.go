@@ -1260,6 +1260,52 @@ func TestUpdateApplyStateFromOperations_PauseReasonYieldsToFailure(t *testing.T)
 	}
 }
 
+// TestUpdateApplyStateFromOperations_KeepsTaskFailureWhenLeavingPause verifies
+// that a paused parent whose message names a task failure, rather than a pause
+// reason the projection stamped, keeps that message when the rollout settles
+// to failed from an operation carrying no reason of its own: the cause the
+// apply paused for is still the cause it failed for. An operation that does
+// carry a reason still replaces it.
+func TestUpdateApplyStateFromOperations_KeepsTaskFailureWhenLeavingPause(t *testing.T) {
+	taskFailure := "table orders failed: lock wait timeout"
+	cases := []struct {
+		name        string
+		failed      *storage.ApplyOperation
+		wantMessage string
+	}{
+		{
+			name:        "failed operation without a reason",
+			failed:      &storage.ApplyOperation{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed},
+			wantMessage: taskFailure,
+		},
+		{
+			name:        "failed operation with a reason",
+			failed:      &storage.ApplyOperation{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: cutover failed"},
+			wantMessage: "deployment region-a failed: spirit: cutover failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyStore := &recordingApplyStore{swapped: true}
+			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{tc.failed}}, applyStore)
+
+			apply := &storage.Apply{
+				ID:              3,
+				ApplyIdentifier: "apply-projection",
+				State:           state.Apply.FailedRetryable,
+				Environment:     "staging",
+				ErrorMessage:    taskFailure,
+			}
+
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			require.NotNil(t, applyStore.updated)
+			assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+			assert.Equal(t, tc.wantMessage, applyStore.updated.ErrorMessage)
+		})
+	}
+}
+
 // TestUpdateApplyStateFromOperations_RefreshesPauseReasonWhilePaused verifies
 // that a rollout which stays paused still has its reason kept current. Two
 // deployments' finalizers paused; the retry of the first completed while the

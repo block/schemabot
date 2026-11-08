@@ -3851,6 +3851,22 @@ func firstOperationMessageInState(ops []*storage.ApplyOperation, opState, outcom
 	return ""
 }
 
+// Outcome words firstOperationMessageInState puts between the operation's
+// location and its own message when the projection names the parent's reason.
+const (
+	failedOperationOutcome = "failed"
+	pausedOperationOutcome = "paused for retry"
+)
+
+// isProjectedPauseReason reports whether the parent's message is one the
+// projection stamped from a paused operation. Only such a message is cleared
+// when the rollout leaves its pause; a message another path wrote to a paused
+// parent, such as the task failure that paused a parent-lease apply, is kept
+// as the fallback when no operation carries a replacement.
+func isProjectedPauseReason(message string) bool {
+	return strings.Contains(message, " "+pausedOperationOutcome+": ")
+}
+
 // persistOperationState writes the claimed operation row to reflect a derived
 // state, mapping each state to the appropriate row-write. The derived state and
 // errorMessage come from either the parent apply (markOperationFromApplyState,
@@ -4194,21 +4210,24 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// When it pauses for a retry, surface the first paused operation's reason,
 	// so the pause can be triaged from the apply without opening its operation
 	// rows. Either way the existing message is the fallback when no operation
-	// carries one, except a pause reason: it describes work the rollout was
-	// about to retry, so it is cleared when the projection takes the parent out
-	// of its pause, as a claim of a paused parent-lease apply clears it, and
-	// the operation that settles the retry supplies the next reason.
+	// carries one, except a pause reason the projection itself stamped: it
+	// describes work the rollout was about to retry, so it is cleared when the
+	// projection takes the parent out of its pause, as a claim of a paused
+	// parent-lease apply clears it, and the operation that settles the retry
+	// supplies the next reason. A message another path wrote to the paused
+	// parent is not a pause reason and stays as the fallback.
 	errorMessage := apply.ErrorMessage
-	if state.IsState(apply.State, state.Apply.FailedRetryable) && !state.IsState(derived, state.Apply.FailedRetryable) {
+	leavingPause := state.IsState(apply.State, state.Apply.FailedRetryable) && !state.IsState(derived, state.Apply.FailedRetryable)
+	if leavingPause && isProjectedPauseReason(apply.ErrorMessage) {
 		errorMessage = ""
 	}
 	switch {
 	case state.IsState(derived, state.Apply.Failed):
-		if msg := firstOperationMessageInState(ops, state.ApplyOperation.Failed, "failed"); msg != "" {
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.Failed, failedOperationOutcome); msg != "" {
 			errorMessage = msg
 		}
 	case state.IsState(derived, state.Apply.FailedRetryable):
-		if msg := firstOperationMessageInState(ops, state.ApplyOperation.FailedRetryable, "paused for retry"); msg != "" {
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.FailedRetryable, pausedOperationOutcome); msg != "" {
 			errorMessage = msg
 		}
 	}

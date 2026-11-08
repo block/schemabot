@@ -1104,6 +1104,77 @@ func TestResumeClaimedApplyCountsARefusedTaskVerdict(t *testing.T) {
 	}
 }
 
+// A drive whose finalizer paused for a retry stored the pause on the operation
+// row and returned without error, so the operator counts it as a resume of the
+// state it was claimed from and records no resume failure: a pause is the
+// rollout waiting, not the drive failing, and a dashboard must not show a
+// retrying finalizer as a resume_error rate.
+func TestResumeClaimedApplyCountsAStoredFinalizerPauseAsAResume(t *testing.T) {
+	cases := []struct {
+		name          string
+		previousState string
+	}{
+		{name: "first claim of a running rollout", previousState: state.Apply.Running},
+		{name: "retry claim of a paused rollout", previousState: state.Apply.FailedRetryable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: tc.previousState,
+			}
+
+			resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0, "")
+
+			require.NoError(t, err)
+			assert.True(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var resumedPrevious []string
+			var failureReasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					switch m.Name {
+					case "schemabot.operator.resumed_total":
+						sum, ok := m.Data.(metricdata.Sum[int64])
+						require.True(t, ok)
+						for _, dp := range sum.DataPoints {
+							previous, _ := dp.Attributes.Value(attribute.Key("previous_state"))
+							resumedPrevious = append(resumedPrevious, previous.AsString())
+							assert.Equal(t, int64(1), dp.Value)
+						}
+					case "schemabot.operator.resume_failures_total":
+						sum, ok := m.Data.(metricdata.Sum[int64])
+						require.True(t, ok)
+						for _, dp := range sum.DataPoints {
+							reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+							failureReasons = append(failureReasons, reason.AsString())
+						}
+					}
+				}
+			}
+			assert.Equal(t, []string{tc.previousState}, resumedPrevious)
+			assert.Empty(t, failureReasons)
+		})
+	}
+}
+
 // A drive that stored the apply's terminal outcome and then could not answer a
 // request owed after it is counted under its own resume failure reason, so a
 // settlement storage keeps refusing shows as a rate of post_terminal_reconcile
