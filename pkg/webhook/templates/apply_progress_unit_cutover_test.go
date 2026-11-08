@@ -29,6 +29,56 @@ func TestRenderApplyStatusComment_CutoverSummaryUnit(t *testing.T) {
 	})
 }
 
+// A table whose change has already landed is past the cutover barrier: it is
+// neither ready for cutover nor something the cutover is waiting on, so the
+// readiness summary counts only the tables still facing the cutover.
+func TestRenderApplyStatusComment_CutoverSummaryLeavesOutLandedTables(t *testing.T) {
+	table := func(name, status string) TableProgressData {
+		return TableProgressData{Namespace: "orders", TableName: name, DDL: "ALTER TABLE " + name + " ADD COLUMN c int", Status: status}
+	}
+
+	t.Run("a completed table is not waited on", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
+			table("audit_log", state.Task.Completed),
+			table("users", state.Task.WaitingForCutover),
+			table("events", state.Task.Running),
+		}))
+
+		assert.Contains(t, out, "**1/2** table(s) ready for cutover — waiting on 1\n")
+		assert.NotContains(t, out, "waiting on 2")
+	})
+
+	t.Run("a table in its revert window is not waited on", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
+			table("audit_log", state.Task.RevertWindow),
+			table("users", state.Task.WaitingForCutover),
+			table("events", state.Task.Running),
+		}))
+
+		assert.Contains(t, out, "**1/2** table(s) ready for cutover — waiting on 1\n")
+	})
+
+	t.Run("every table still facing the cutover is ready", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
+			table("audit_log", state.Task.Completed),
+			table("users", state.Task.WaitingForCutover),
+			table("events", state.Task.WaitingForCutover),
+		}))
+
+		assert.Contains(t, out, "**2/2** table(s) ready for cutover\n")
+		assert.NotContains(t, out, "waiting on")
+	})
+
+	t.Run("no table faces the cutover", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
+			table("audit_log", state.Task.Completed),
+			table("users", state.Task.Completed),
+		}))
+
+		assert.NotContains(t, out, "ready for cutover")
+	})
+}
+
 // A multi-statement namespace next to a namespace of distinct tables: both
 // collapsed headers count in the comment-wide unit, so the reader never sees
 // "3 tables" above "3 statements" for the same apply.
