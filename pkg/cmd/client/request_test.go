@@ -153,6 +153,28 @@ func TestDoGetIntoCarriesTheRetryAfterHeader(t *testing.T) {
 	assert.Zero(t, apiErr.RetryAfterHeaderUncapped)
 }
 
+// A Retry-After header past the CLI's bound reaches the caller as the bounded
+// wait alongside the delay the header asked for, so a watch can say that it
+// will poll sooner than the server requested.
+func TestDoGetIntoCarriesTheCappedRetryAfterHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`<html><body><h1>503 Service Unavailable</h1></body></html>`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var result struct{}
+	err := doGetInto(srv.URL, "/api/progress/apply/apply-abc", &result)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.Status)
+	assert.Equal(t, maxRetryAfterHeader, apiErr.RetryAfterHeader)
+	assert.Equal(t, time.Hour, apiErr.RetryAfterHeaderUncapped)
+}
+
 // RetryAfter decides whether to retry from the error code alone, and when it
 // says retry, waits the longer of the body's and the header's delay.
 func TestAPIErrorRetryAfterTakesTheLongerDelay(t *testing.T) {

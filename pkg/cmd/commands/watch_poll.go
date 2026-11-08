@@ -230,6 +230,22 @@ func cappedRetryDelay(err error, wait time.Duration) time.Duration {
 	return 0
 }
 
+// maxReportedRetryDelay is the longest capped Retry-After delay the retry
+// line states exactly. A header too far out to read, such as a count of
+// seconds that overflows or a year-9999 date, parses to a saturated duration
+// the server never named, so past this ceiling the line says only that the
+// delay was more than a day.
+const maxReportedRetryDelay = 24 * time.Hour
+
+// formatCappedRetryDelay renders the delay a capped Retry-After header asked
+// for, exactly up to maxReportedRetryDelay and as "more than 24h" beyond it.
+func formatCappedRetryDelay(d time.Duration) string {
+	if d > maxReportedRetryDelay {
+		return "more than 24h"
+	}
+	return d.String()
+}
+
 // printProgressRetry reports a transient progress failure on stderr, keeping
 // stdout to the watch's own output so a JSON stream stays machine-readable.
 // When the CLI's bound shortened the delay the server asked for, the line says
@@ -237,7 +253,7 @@ func cappedRetryDelay(err error, wait time.Duration) time.Duration {
 func printProgressRetry(r progressRetry) {
 	wait := r.wait.String()
 	if r.cappedFrom > 0 {
-		wait += fmt.Sprintf(" (server asked for %s, capped)", r.cappedFrom)
+		wait += fmt.Sprintf(" (server asked for %s, capped)", formatCappedRetryDelay(r.cappedFrom))
 	}
 	fmt.Fprintf(os.Stderr, "Progress unavailable (attempt %d/%d), retrying in %s: %v\n",
 		r.attempt, maxConsecutiveProgressFailures, wait, r.err)

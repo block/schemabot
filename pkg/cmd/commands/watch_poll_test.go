@@ -502,7 +502,10 @@ func TestProgressPoller_BoundsProxyRetryAfterHeader(t *testing.T) {
 // The retry line says when the watch cut a Retry-After header's delay down to
 // the CLI's bound, naming the delay that was asked for, so an operator is not
 // left wondering why the watch polls sooner than the server said. A header at
-// or within the bound prints the plain retry line.
+// or within the bound prints the plain retry line. A delay too far out to read
+// exactly, such as a far-future date or a count of seconds that overflows, is
+// named only as more than a day, so the line never states a figure the server
+// did not send.
 func TestProgressPoller_RetryLineNamesTheCappedRetryAfterHeader(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -512,8 +515,14 @@ func TestProgressPoller_RetryLineNamesTheCappedRetryAfterHeader(t *testing.T) {
 	}{
 		{name: "seconds past the bound", header: "3600", wait: 5 * time.Minute,
 			want: "Progress unavailable (attempt 1/10), retrying in 5m0s (server asked for 1h0m0s, capped): "},
+		{name: "seconds at a day", header: "86400", wait: 5 * time.Minute,
+			want: "Progress unavailable (attempt 1/10), retrying in 5m0s (server asked for 24h0m0s, capped): "},
+		{name: "seconds past a day", header: "86401", wait: 5 * time.Minute,
+			want: "Progress unavailable (attempt 1/10), retrying in 5m0s (server asked for more than 24h, capped): "},
+		{name: "seconds too large to read", header: "99999999999999999999", wait: 5 * time.Minute,
+			want: "Progress unavailable (attempt 1/10), retrying in 5m0s (server asked for more than 24h, capped): "},
 		{name: "HTTP date past the bound", header: "Fri, 31 Dec 9999 23:59:59 GMT", wait: 5 * time.Minute,
-			want: "Progress unavailable (attempt 1/10), retrying in 5m0s (server asked for 2562047h47m16.854775807s, capped): "},
+			want: "Progress unavailable (attempt 1/10), retrying in 5m0s (server asked for more than 24h, capped): "},
 		{name: "seconds at the bound", header: "300", wait: 5 * time.Minute,
 			want: "Progress unavailable (attempt 1/10), retrying in 5m0s: "},
 		{name: "seconds within the bound", header: "45", wait: 45 * time.Second,
@@ -538,8 +547,9 @@ func TestProgressPoller_RetryLineNamesTheCappedRetryAfterHeader(t *testing.T) {
 	}
 }
 
-// The log watch reports a capped Retry-After header as its own field, and
-// leaves the field out when the header was within the bound.
+// The log watch reports a capped Retry-After header as its own field, names a
+// delay past a day only as more than a day, and leaves the field out when the
+// header was within the bound.
 func TestProgressPoller_LogRetryNamesTheCappedRetryAfterHeader(t *testing.T) {
 	completed := `{"apply_id": "` + scriptedApplyID + `", "state": "` + state.Apply.Completed + `"}`
 	for _, tc := range []struct {
@@ -547,6 +557,7 @@ func TestProgressPoller_LogRetryNamesTheCappedRetryAfterHeader(t *testing.T) {
 		want   string
 	}{
 		{header: "3600", want: `attempt=1/10 retry_in=5m0s retry_capped_from=1h0m0s error=`},
+		{header: "99999999999999999999", want: `attempt=1/10 retry_in=5m0s retry_capped_from="more than 24h" error=`},
 		{header: "45", want: `attempt=1/10 retry_in=45s error=`},
 	} {
 		t.Run(tc.header, func(t *testing.T) {
