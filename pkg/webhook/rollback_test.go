@@ -383,7 +383,7 @@ func TestHandleRollbackConfirmBlocksUnsafeChangesWithoutAllowUnsafe(t *testing.T
 	assert.Contains(t, body, "**⛔ Rollback rejected**: 1 unsafe change detected")
 	assert.Contains(t, body, "1. `audit_log`: DROP TABLE removes all data")
 	assert.Contains(t, body, "DROP TABLE `audit_log`")
-	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging\n```")
+	assertPasteableCommand(t, body, "schemabot rollback-confirm -e staging")
 	assert.NotContains(t, body, "schemabot apply")
 	assertRollbackLockPinKept(t, locks)
 }
@@ -405,7 +405,7 @@ func TestHandleRollbackConfirmBlockKeepsDeferCutoverInTheRetry(t *testing.T) {
 	assert.False(t, retry)
 
 	body := requireComment(t, comments, "rollback unsafe-changes refusal")
-	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --defer-cutover\n```")
+	assertPasteableCommand(t, body, "schemabot rollback-confirm -e staging --defer-cutover")
 	assertRollbackLockPinKept(t, locks)
 }
 
@@ -432,7 +432,7 @@ func TestHandleRollbackConfirmBlocksShardOnlyUnsafeChange(t *testing.T) {
 	assert.Contains(t, body, "**⛔ Rollback rejected**: 1 unsafe change detected")
 	assert.Contains(t, body, "1. `orders` (shard `80-`)")
 	assert.Contains(t, body, "`legacy`")
-	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging\n```")
+	assertPasteableCommand(t, body, "schemabot rollback-confirm -e staging")
 	assertRollbackLockPinKept(t, locks)
 }
 
@@ -462,7 +462,7 @@ func TestRollbackPlanCommentData_ListsUnsafeChanges(t *testing.T) {
 	body := templates.RenderRollbackPlanComment(data)
 	assert.Contains(t, body, "**Issues**: 1 unsafe change detected")
 	assert.Contains(t, body, "1. `orders` (shard `80-`)")
-	assert.Contains(t, body, "To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change")
+	assert.Contains(t, body, "Add `--allow-unsafe` to confirm 1 unsafe change")
 
 	// A plan mixing a shard-only drop in one namespace with a drop in an
 	// unsharded namespace lists both: the shard view stands in for its own

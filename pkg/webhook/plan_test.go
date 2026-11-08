@@ -3,6 +3,7 @@ package webhook
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -246,8 +246,7 @@ func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T
 	assert.Equal(t, ddl, data.UnsafeChanges[0].DDL, "the DDL is threaded so the guidance can parse it")
 
 	rendered := templates.RenderPlanComment(data)
-	assert.Contains(t, rendered, glyph.Tip+" Before allowing a destructive drop")
-	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
+	assert.Contains(t, rendered, "1. Deploy application code that no longer reads from or writes to the dropped column.\n")
 }
 
 // The multi-environment comment renders each environment's unsafe section
@@ -281,8 +280,7 @@ func TestRenderMultiEnvPlanComment_PostgresDropGuidanceClassifiedFromDDL(t *test
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
 
-	assert.Contains(t, rendered, glyph.Tip+" Before allowing a destructive drop")
-	assert.Contains(t, rendered, "no longer reads from or writes to the dropped table.")
+	assert.Contains(t, rendered, "1. Deploy application code that no longer reads from or writes to the dropped table.\n")
 }
 
 // A shard that already matches the desired schema while siblings change is
@@ -1110,7 +1108,7 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
-	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `users`:\n```\nschemabot apply -e staging\n```\n")
+	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging\n   ```\n")
 	assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
 }
 
@@ -1242,7 +1240,7 @@ func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "## Schema Change Plan")
-	assert.Contains(t, rendered, "```\nschemabot apply -e staging\n```")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging")
 }
 
 func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) {
@@ -1264,7 +1262,7 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
-	assert.Contains(t, rendered, "```\nschemabot apply -e staging --tenant alpha\n```")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha")
 }
 
 // A plan comment's copy-paste commands name a database only where a bare
@@ -1467,4 +1465,11 @@ func TestPlanRefusedByNamespacePlacement(t *testing.T) {
 	assert.True(t, planRefusedByNamespacePlacement(check), "drops that could not be checked")
 	assert.False(t, planRefusedByNamespacePlacement(errors.New("tern unavailable")), "an unrelated plan failure")
 	assert.False(t, planRefusedByNamespacePlacement(nil), "a plan that succeeded")
+}
+
+// assertPasteableCommand asserts the comment carries cmd as a fenced block of
+// its own, at whatever list indentation the block renders.
+func assertPasteableCommand(t *testing.T, comment, cmd string) {
+	t.Helper()
+	assert.Regexp(t, "(?m)^ *```\n *"+regexp.QuoteMeta(cmd)+"\n *```$", comment)
 }

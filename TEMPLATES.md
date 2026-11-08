@@ -891,17 +891,17 @@ ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 ⚠️ **Issues**: 1 unsafe change detected
 1. `orders`: DROP COLUMN discards the column's data
 
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
 📋 **Plan**: **2** tables to alter
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
-```
-schemabot apply -e staging
-```
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
+   ```
+   schemabot apply -e staging
+   ```
 
 </details>
 
@@ -972,17 +972,17 @@ DROP TABLE `refund_backfill`;
 
 </details>
 
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
-
 📋 **Plan**: **3** tables to create, **1** table to alter, **1** table to drop
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:
-```
-schemabot apply -e staging
-```
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped table and column.
+2. Add `--allow-unsafe` to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:
+   ```
+   schemabot apply -e staging
+   ```
 
 </details>
 
@@ -1010,17 +1010,17 @@ DROP TABLE `reconcile_state`;
 
 A plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.
 
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
-
 📋 **Plan**: **1** table to alter, **1** table to drop
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
-```
-schemabot apply -e staging
-```
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped table and column.
+2. Add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
+   ```
+   schemabot apply -e staging
+   ```
 
 </details>
 
@@ -2618,12 +2618,12 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
-**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
-```
-schemabot apply -e staging
-```
+**🚨 To proceed with these destructive changes**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+   ```
+   schemabot apply -e staging
+   ```
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -2649,12 +2649,12 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
-💡 Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
-
-**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
-```
-schemabot apply -e staging
-```
+**🚨 To proceed with these destructive changes**:
+1. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+   ```
+   schemabot apply -e staging
+   ```
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -7198,16 +7198,16 @@ DROP TABLE `audit_log`;
 ⚠️ **Issues**: 1 unsafe change detected
 1. `audit_log`: DROP TABLE removes all data
 
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
-
 📋 **Plan**: **1** table to drop
 
 ---
 
-To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
-```
-schemabot rollback-confirm -e staging
-```
+To confirm this rollback:
+1. Deploy application code that no longer reads from or writes to the dropped table.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+   ```
+   schemabot rollback-confirm -e staging
+   ```
 
 To cancel, comment:
 ```
@@ -7237,12 +7237,12 @@ DROP TABLE `audit_log`;
 **⛔ Rollback rejected**: 1 unsafe change detected
 1. `audit_log`: DROP TABLE removes all data
 
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
-
-**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
-```
-schemabot rollback-confirm -e staging
-```
+**🚨 To proceed with these destructive changes**:
+1. Deploy application code that no longer reads from or writes to the dropped table.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+   ```
+   schemabot rollback-confirm -e staging
+   ```
 
 The lock still pins this rollback plan, so the command above, with `--allow-unsafe`, confirms it.
 
@@ -10109,17 +10109,17 @@ ALTER TABLE `mutes`
 ⚠️ **Issues**: 1 unsafe change detected
 1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
-💡 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
-
 📋 **Plan**: **1** table to alter
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
-```
-schemabot apply -e production
-```
+▶️ **To apply**:
+1. Deploy application code that no longer reads from or writes to the dropped column.
+2. Add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
+   ```
+   schemabot apply -e production
+   ```
 
 </details>
 

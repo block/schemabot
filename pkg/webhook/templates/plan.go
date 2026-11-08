@@ -277,6 +277,10 @@ type PlanCommentData struct {
 	// count combined across targets never reads as any one target's work. Nil
 	// when the summary is one plan's.
 	summaryRollout *DeploymentDriftData
+	// applyWithheld is set on an environment's plan whose apply a multi-env
+	// footer does not offer, because an earlier environment's apply is
+	// refused, so its unsafe warning keeps the drop steps no footer carries.
+	applyWithheld bool
 
 	// namespaceLabelsInline renders each keyspace's label as a bold line
 	// rather than a heading, for changes under a target group heading that
@@ -685,7 +689,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// they run (see disclosesUnsafeChanges). Target plans disclose them under
 	// the primary target's group, whose plan they are from.
 	if unsafeShown && !targetPlans {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL)
+		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL, !data.applyInstructionCarriesDropSteps())
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -777,10 +781,10 @@ func writeRefusedChangeReplan(sb *strings.Builder, plan, planCommand string) {
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
 func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
 	if consent, ok := planUnsafeConsent(data); ok {
-		fmt.Fprintf(sb, "▶️ **To apply**, %s:\n", consent.instruction())
-	} else {
-		sb.WriteString("▶️ **To apply**, comment:\n")
+		writeUnsafeConsentCommand(sb, "▶️ **To apply**", consent, command)
+		return
 	}
+	sb.WriteString("▶️ **To apply**, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
@@ -798,6 +802,21 @@ type unsafeConsent struct {
 	// flag also consents to whatever unsafe changes the other targets carry,
 	// which the comment has no per-target plan to count from.
 	primaryOnly bool
+	// dropSteps is what to do before the destructive drops among the changes
+	// run (see unsafeDropSteps). The instruction numbers them ahead of the
+	// consent, so everything the reader must do before applying is one list in
+	// the order to do it.
+	dropSteps []string
+}
+
+// newUnsafeConsent is the consent --allow-unsafe gives to the changes.
+func newUnsafeConsent(changes []UnsafeChangeData, databaseType string, isMySQL, primaryOnly bool) unsafeConsent {
+	return unsafeConsent{
+		findings:    countUnsafeFindings(changes),
+		tables:      unsafeChangeTables(changes, databaseType),
+		primaryOnly: primaryOnly,
+		dropSteps:   unsafeDropSteps(changes, databaseType, isMySQL),
+	}
 }
 
 // planUnsafeConsent reports what the plan's apply would confirm with
@@ -818,11 +837,47 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	if len(changes) == 0 {
 		return unsafeConsent{}, false
 	}
-	return unsafeConsent{
-		findings:    countUnsafeFindings(changes),
-		tables:      unsafeChangeTables(changes, data.DatabaseType),
-		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
-	}, true
+	return newUnsafeConsent(changes, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift)), true
+}
+
+// applyInstructionCarriesDropSteps reports whether the comment's footer offers
+// the apply with its --allow-unsafe consent, and so numbers the steps that
+// make a destructive drop safe ahead of it. The unsafe warning then leaves
+// the steps to the footer. A comment whose footer offers no such apply — one
+// paused for confirmation, refused, or queued behind a refused environment —
+// keeps them as tips beneath the warning.
+func (d PlanCommentData) applyInstructionCarriesDropSteps() bool {
+	if d.IsLocked || d.MemberApplyRefusal != "" || d.applyWithheld {
+		return false
+	}
+	_, ok := planUnsafeConsent(d)
+	return ok
+}
+
+// writeUnsafeConsentCommand writes the lead-in to a command --allow-unsafe
+// must be added to, then the command. lead is the phrase the instruction
+// continues, such as "▶️ **To apply**". With drops to make safe, the lead
+// heads a numbered list: the drop steps, then the consent, with the command
+// under it.
+func writeUnsafeConsentCommand(sb *strings.Builder, lead string, consent unsafeConsent, command string) {
+	if len(consent.dropSteps) == 0 {
+		fmt.Fprintf(sb, "%s, %s:\n", lead, consent.instruction())
+		fmt.Fprintf(sb, "```\n%s\n```\n", command)
+		return
+	}
+	writeUnsafeConsentSteps(sb, lead, consent, command)
+}
+
+// writeUnsafeConsentSteps writes the lead as the heading of a numbered list:
+// each drop step, then the consent, with the command indented under it so it
+// renders inside the step it belongs to.
+func writeUnsafeConsentSteps(sb *strings.Builder, lead string, consent unsafeConsent, command string) {
+	fmt.Fprintf(sb, "%s:\n", lead)
+	for i, step := range consent.dropSteps {
+		fmt.Fprintf(sb, "%d. %s.\n", i+1, capitalizeFirst(step))
+	}
+	fmt.Fprintf(sb, "%d. %s:\n", len(consent.dropSteps)+1, capitalizeFirst(consent.instruction()))
+	fmt.Fprintf(sb, "   ```\n   %s\n   ```\n", command)
 }
 
 // unsafeCountCoversEveryTarget reports whether the unsafe changes the comment
@@ -2367,7 +2422,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if g.Primary {
 			writePrimaryTargetDisclosures(sb, data, g)
 		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && data.disclosesUnsafeChanges() {
-			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
+			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL, !data.applyInstructionCarriesDropSteps())
 		}
 		writeTargetDiscardedCopies(sb, data, g)
 	}
@@ -2419,7 +2474,7 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 	unsafe = append(unsafe, g.unsafeBeyondPrimaryPlan()...)
 	if len(unsafe) > 0 {
 		notes, _ := unsafeAttributionNotes(data, data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && attributionStillActionable(data))
-		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL)
+		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL, !data.applyInstructionCarriesDropSteps())
 	}
 }
 
@@ -2713,15 +2768,19 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 
 // writeUnsafeWarning lists the unsafe findings. attributionNotes, keyed by
 // table, carries the attribution for tables another pull request changed, so
-// the reader learns where a change came from on the finding itself, and how
-// to make a destructive drop safe.
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
+// the reader learns where a change came from on the finding itself. When
+// dropTips is set, a tip on making each destructive drop safe follows the
+// list; it is unset where the comment's apply instruction carries those steps
+// instead, so the reader meets them once, beside the command they precede.
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, dropTips bool) {
 	drops, rest := splitDestructiveDrops(changes, databaseType)
 	fmt.Fprintf(sb, "%s **Issues**: %s\n", glyph.Attention, unsafeCountPhrase(drops, rest))
 	writeUnsafeFindingList(sb, drops, rest, attributionNotes)
 	writeUnsafeAttributionDisclosure(sb, attributionNotes)
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, drops, databaseType, isMySQL)
+	if dropTips {
+		writeUnsafeDropTips(sb, drops, databaseType, isMySQL)
+	}
 }
 
 // unsafeCountPhrase counts the unsafe findings for a header, and when they
@@ -2917,27 +2976,34 @@ func countUnsafeFindings(changes []UnsafeChangeData) int {
 	return n
 }
 
-// writeUnsafeDropGuidance writes, open beneath the drops, a tip on making each
-// kind of destructive drop safe: what to deploy first, and for an index, how
-// to prove nothing relies on it.
-func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {
-	drops := countUnsafeDrops(changes, databaseType)
-	applicationUsageTarget, hasApplicationUsageTarget := unsafeDropApplicationUsageTarget(drops)
-	indexActionTarget, indexInvisibleTarget, indexQueryTarget, hasIndexUsageTarget := unsafeDropIndexUsageTargets(drops)
-	if !hasApplicationUsageTarget && !hasIndexUsageTarget {
-		return
+// writeUnsafeDropTips writes, open beneath the drops, a tip for each step that
+// makes the plan's destructive drops safe. It is the fallback for comments
+// with no apply instruction to number the steps in.
+func writeUnsafeDropTips(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {
+	for _, step := range unsafeDropSteps(changes, databaseType, isMySQL) {
+		fmt.Fprintf(sb, "%s Before allowing a destructive drop, %s.\n\n", glyph.Tip, step)
 	}
+}
 
-	if hasApplicationUsageTarget {
-		fmt.Fprintf(sb, "%s Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", glyph.Tip, applicationUsageTarget)
+// unsafeDropSteps is what to do before a destructive drop runs, one step per
+// kind of object dropped: deploy application code that no longer uses a
+// dropped table or column, and prove nothing relies on a dropped index. Each
+// step is a lower-case clause with no closing period, so it reads both as a
+// numbered step and after "Before allowing a destructive drop,".
+func unsafeDropSteps(changes []UnsafeChangeData, databaseType string, isMySQL bool) []string {
+	drops := countUnsafeDrops(changes, databaseType)
+	var steps []string
+	if target, ok := unsafeDropApplicationUsageTarget(drops); ok {
+		steps = append(steps, fmt.Sprintf("deploy application code that no longer reads from or writes to %s", target))
 	}
-	if hasIndexUsageTarget {
+	if invisibleTarget, queryTarget, ok := unsafeDropIndexUsageTargets(drops); ok {
 		if isMySQL {
-			fmt.Fprintf(sb, "%s Before dropping %s in MySQL, first make %s invisible and verify application queries no longer rely on %s for safe performance.\n\n", glyph.Tip, indexActionTarget, indexInvisibleTarget, indexQueryTarget)
+			steps = append(steps, fmt.Sprintf("make %s invisible, then verify application queries no longer rely on %s for safe performance", invisibleTarget, queryTarget))
 		} else {
-			fmt.Fprintf(sb, "%s Before allowing a destructive drop, verify application queries no longer rely on %s for safe performance.\n\n", glyph.Tip, indexInvisibleTarget)
+			steps = append(steps, fmt.Sprintf("verify application queries no longer rely on %s for safe performance", invisibleTarget))
 		}
 	}
+	return steps
 }
 
 func unsafeDropApplicationUsageTarget(drops unsafeDropCounts) (string, bool) {
@@ -2969,14 +3035,14 @@ func unsafeDropApplicationUsageTarget(drops unsafeDropCounts) (string, bool) {
 	return "", false
 }
 
-func unsafeDropIndexUsageTargets(drops unsafeDropCounts) (actionTarget, invisibleTarget, queryTarget string, ok bool) {
+func unsafeDropIndexUsageTargets(drops unsafeDropCounts) (invisibleTarget, queryTarget string, ok bool) {
 	if drops.indexes == 1 {
-		return "an index", "the dropped index", "it", true
+		return "the dropped index", "it", true
 	}
 	if drops.indexes > 1 {
-		return "indexes", "any dropped indexes", "them", true
+		return "any dropped indexes", "them", true
 	}
-	return "", "", "", false
+	return "", "", false
 }
 
 // unsafeDropCounts is what the plan's unsafe changes drop, summed across
@@ -3436,7 +3502,9 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]], budget)
 		restore()
 	} else {
-		// Separate sections per environment
+		// Separate sections per environment. One the footer offers no apply
+		// for keeps its drop steps beside its unsafe warning.
+		behindRefused := sortMultiEnvApplies(data).behindRefused
 		for _, env := range data.Environments {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
@@ -3450,6 +3518,11 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 			if !ok || plan == nil {
 				sb.WriteString("No plan result.\n\n")
 				continue
+			}
+			if slices.Contains(behindRefused, env) {
+				withheld := *plan
+				withheld.applyWithheld = true
+				plan = &withheld
 			}
 
 			writeEnvironmentPlanSection(&sb, plan, budget)
@@ -3629,7 +3702,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// Unsafe changes warning
 	if unsafeShown && !targetPlans {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL)
+		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL, !plan.applyInstructionCarriesDropSteps())
 	}
 
 	// Lint violations.
@@ -3666,38 +3739,53 @@ func writeCollapsibleKeyspaceChanges(sb *strings.Builder, plan PlanCommentData, 
 	sb.WriteString("</details>\n\n")
 }
 
-// writeMultiEnvFooter writes the footer with apply commands and error guidance.
-func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
-	// Categorize environments
-	var envsWithChanges []string
-	var envsWithErrors []string
+// multiEnvApplies sorts a multi-env plan's environments by what the footer
+// offers each.
+type multiEnvApplies struct {
+	withChanges []string
+	withErrors  []string
 	// An environment whose apply would be refused says why in its own section,
 	// so the footer neither offers its apply nor calls the PR done. The
 	// environments after it wait on it: an apply of a later environment is
 	// refused until every earlier one has succeeded, so offering one would
 	// coach an apply the promotion order refuses.
-	var envsRefused []string
-	var envsBehindRefused []string
+	refused       []string
+	behindRefused []string
 	// An environment whose plan carries a change the engine refuses is refused
 	// too, and is offered a re-plan in place of its apply.
-	var envsFailOnRefusedChange []string
+	failOnRefusedChange []string
+}
+
+func sortMultiEnvApplies(data MultiEnvPlanCommentData) multiEnvApplies {
+	var a multiEnvApplies
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
-			envsWithErrors = append(envsWithErrors, env)
+			a.withErrors = append(a.withErrors, env)
 		} else if plan, ok := data.Plans[env]; ok && plan != nil {
 			switch {
-			case environmentHasWork(plan) && len(envsRefused) > 0:
-				envsBehindRefused = append(envsBehindRefused, env)
+			case environmentHasWork(plan) && len(a.refused) > 0:
+				a.behindRefused = append(a.behindRefused, env)
 			case environmentHasWork(plan) && plan.applyFailsOnRefusedChange():
-				envsRefused = append(envsRefused, env)
-				envsFailOnRefusedChange = append(envsFailOnRefusedChange, env)
+				a.refused = append(a.refused, env)
+				a.failOnRefusedChange = append(a.failOnRefusedChange, env)
 			case environmentHasWork(plan):
-				envsWithChanges = append(envsWithChanges, env)
+				a.withChanges = append(a.withChanges, env)
 			case plan.MemberApplyRefusal != "":
-				envsRefused = append(envsRefused, env)
+				a.refused = append(a.refused, env)
 			}
 		}
 	}
+	return a
+}
+
+// writeMultiEnvFooter writes the footer with apply commands and error guidance.
+func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
+	applies := sortMultiEnvApplies(data)
+	envsWithChanges := applies.withChanges
+	envsWithErrors := applies.withErrors
+	envsRefused := applies.refused
+	envsBehindRefused := applies.behindRefused
+	envsFailOnRefusedChange := applies.failOnRefusedChange
 
 	command := func(baseCommand, environment string) string {
 		return scopedCommand(baseCommand, environment, data.ScopedDatabase, data.Tenant)
@@ -3706,19 +3794,17 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
-		writeEnvApplyLeadIn(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]])
-		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
+		writeEnvApplyCommand(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]], command("schemabot apply", envsWithChanges[0]))
 		for i := 1; i < len(envsWithChanges); i++ {
-			writeEnvApplyLeadIn(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]])
-			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[i]))
+			writeEnvApplyCommand(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]], command("schemabot apply", envsWithChanges[i]))
 		}
 	case len(envsWithChanges) == 1:
 		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
-			fmt.Fprintf(sb, "▶️ **To apply** these changes, %s:\n", consent.instruction())
+			writeUnsafeConsentCommand(sb, "▶️ **To apply** these changes", consent, command("schemabot apply", envsWithChanges[0]))
 		} else {
 			sb.WriteString("▶️ **To apply** these changes, comment:\n")
+			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 		}
-		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
 	}
@@ -3748,15 +3834,21 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	}
 }
 
-// writeEnvApplyLeadIn writes the sentence above one environment's apply
-// command, with the environment's own unsafe consent appended when its plan
-// needs it.
-func writeEnvApplyLeadIn(sb *strings.Builder, sentence string, plan *PlanCommentData) {
-	if consent, ok := planUnsafeConsent(*plan); ok {
-		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction()))
+// writeEnvApplyCommand writes one environment's apply command under the
+// sentence that leads into it, with the environment's own unsafe consent, and
+// the steps that make its drops safe, when its plan needs them.
+func writeEnvApplyCommand(sb *strings.Builder, sentence string, plan *PlanCommentData, command string) {
+	consent, ok := planUnsafeConsent(*plan)
+	switch {
+	case ok && len(consent.dropSteps) > 0:
+		writeUnsafeConsentSteps(sb, sentence, consent, command)
 		return
+	case ok:
+		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction()))
+	default:
+		sb.WriteString(sentence + ":\n")
 	}
-	sb.WriteString(sentence + ":\n")
+	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
 // TenantCommand renders a pasteable PR command for one environment, carrying
