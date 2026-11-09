@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -207,7 +208,8 @@ func TestIsTeamMember(t *testing.T) {
 		name             string
 		membershipStatus int
 		membershipState  string
-		teamStatus       int // 0 means the team endpoint must not be called
+		rateLimited      bool // the membership read answers with an exhausted primary rate limit
+		teamStatus       int  // 0 means the team endpoint must not be called
 		wantMember       bool
 		wantErr          bool
 		wantUnreadable   bool
@@ -219,12 +221,18 @@ func TestIsTeamMember(t *testing.T) {
 		{name: "team read failing is a generic error", membershipStatus: http.StatusNotFound, teamStatus: http.StatusInternalServerError, wantErr: true},
 		{name: "forbidden membership read is unreadable", membershipStatus: http.StatusForbidden, wantErr: true, wantUnreadable: true},
 		{name: "server error is a generic error", membershipStatus: http.StatusInternalServerError, wantErr: true},
+		{name: "exhausted rate limit is a generic error, not unreadable", membershipStatus: http.StatusForbidden, rateLimited: true, wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupConfigTestGitHubServer(t)
 			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/mona", func(w http.ResponseWriter, _ *http.Request) {
+				if tt.rateLimited {
+					w.Header().Set("X-RateLimit-Limit", "5000")
+					w.Header().Set("X-RateLimit-Remaining", "0")
+					w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+				}
 				w.WriteHeader(tt.membershipStatus)
 				if tt.membershipStatus == http.StatusOK {
 					require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": tt.membershipState, "role": "member"}))
@@ -233,6 +241,11 @@ func TestIsTeamMember(t *testing.T) {
 			var teamReads atomic.Int32
 			mux.HandleFunc("GET /orgs/octocat/teams/db-operators", func(w http.ResponseWriter, _ *http.Request) {
 				teamReads.Add(1)
+				if tt.teamStatus == 0 {
+					t.Error("the team is read only after a 404 on the membership read")
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
 				w.WriteHeader(tt.teamStatus)
 				if tt.teamStatus == http.StatusOK {
 					require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1, "slug": "db-operators"}))

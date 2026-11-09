@@ -275,7 +275,7 @@ func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login
 	if err == nil {
 		return membership.GetState() == "active", nil
 	}
-	if !isGitHubNotFound(err) {
+	if !IsNotFoundError(err) {
 		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team membership", org, slug, err))
 	}
 	if _, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeam, "get team", logAttrs, func(ctx context.Context) (*gh.Team, error) {
@@ -288,12 +288,6 @@ func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login
 		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team", org, slug, err))
 	}
 	return false, nil
-}
-
-// isGitHubNotFound reports whether err is a GitHub 404 response.
-func isGitHubNotFound(err error) bool {
-	var responseErr *gh.ErrorResponse
-	return errors.As(err, &responseErr) && responseErr.Response != nil && responseErr.Response.StatusCode == http.StatusNotFound
 }
 
 func teamMembershipReadError(operation, org, slug string, err error) error {
