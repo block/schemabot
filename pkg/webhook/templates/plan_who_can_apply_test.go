@@ -124,3 +124,88 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 		assert.NotContains(t, RenderPlanComment(locked), "🔐", RenderPlanComment(locked))
 	})
 }
+
+// The handler checks the reader's authorization only when OffersApply says the
+// comment shows who can apply, so a plan with nothing to run costs no GitHub
+// request. This pins the predicate to the rendered comment: the list renders
+// exactly when OffersApply holds, for each way a comment can withhold its
+// apply.
+func TestOffersApplyMatchesWhoCanApplyRendering(t *testing.T) {
+	auth := &ApplyAuthorizationData{OperatorPrincipals: []string{"acme/orders-operators"}}
+	plan := func(env string, edit func(*PlanCommentData)) *PlanCommentData {
+		p := &PlanCommentData{
+			Database: "orders", Environment: env, DatabaseType: "mysql", IsMySQL: true,
+			Changes:            []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);"}}},
+			ApplyAuthorization: auth,
+		}
+		if edit != nil {
+			edit(p)
+		}
+		return p
+	}
+	singles := map[string]func(*PlanCommentData){
+		"changes":    nil,
+		"no changes": func(p *PlanCommentData) { p.Changes = nil },
+		"locked": func(p *PlanCommentData) {
+			p.IsLocked = true
+			p.PendingManualConfirmation = true
+		},
+		"member apply refusal": func(p *PlanCommentData) {
+			p.MemberApplyRefusal = "the target reports a different schema"
+			p.MemberApplyRefusalTarget = "orders-eu"
+		},
+		"refused change": func(p *PlanCommentData) {
+			p.BlockedChanges = []BlockedChangeData{{Table: "orders", Reason: "unsupported"}}
+		},
+	}
+	for name, edit := range singles {
+		t.Run("single environment: "+name, func(t *testing.T) {
+			data := *plan("staging", edit)
+			out := RenderPlanComment(data)
+			assert.Equal(t, data.OffersApply(), strings.Contains(out, "🔐"), out)
+		})
+	}
+
+	multis := map[string]MultiEnvPlanCommentData{
+		"changes in both": {
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": plan("staging", nil), "production": plan("production", nil)},
+		},
+		"no changes anywhere": {
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*PlanCommentData{
+				"staging":    plan("staging", singles["no changes"]),
+				"production": plan("production", singles["no changes"]),
+			},
+		},
+		"refused environment withholds the one behind it": {
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*PlanCommentData{
+				"staging":    plan("staging", singles["refused change"]),
+				"production": plan("production", nil),
+			},
+		},
+		"failed environment and no changes": {
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": plan("staging", singles["no changes"])},
+			Errors:       map[string]string{"production": "plan failed; see server logs"},
+		},
+	}
+	for name, data := range multis {
+		t.Run("multiple environments: "+name, func(t *testing.T) {
+			data.Database, data.DatabaseType, data.IsMySQL = "orders", "mysql", true
+			data.ApplyAuthorization = auth
+			out := RenderMultiEnvPlanComment(data)
+			assert.Equal(t, data.OffersApply(), strings.Contains(out, "🔐"), out)
+		})
+	}
+	assert.True(t, plan("staging", nil).OffersApply())
+	for name, edit := range singles {
+		if edit != nil {
+			assert.False(t, plan("staging", edit).OffersApply(), name)
+		}
+	}
+	assert.True(t, multis["changes in both"].OffersApply())
+	assert.False(t, multis["no changes anywhere"].OffersApply())
+	assert.False(t, multis["refused environment withholds the one behind it"].OffersApply())
+}

@@ -764,6 +764,23 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
+// OffersApply reports whether the comment offers `schemabot apply`: the plan
+// has work to run (a change on the primary target, or on another target of a
+// rollout), and nothing withholds the apply instruction (a locked apply, a
+// member apply refusal, or a change the engine refuses). Only a comment that
+// offers an apply shows who can run it, so the handler checks the reader's
+// authorization only then.
+func (d PlanCommentData) OffersApply() bool {
+	return environmentHasWork(&d) && !d.IsLocked && !d.applyFailsOnRefusedChange()
+}
+
+// OffersApply reports whether the comment offers `schemabot apply` for any
+// environment: one has work to run and no refused environment ahead of it
+// withholds its apply. Only then does the footer show who can run it.
+func (d MultiEnvPlanCommentData) OffersApply() bool {
+	return len(sortMultiEnvApplies(d).withChanges) > 0
+}
+
 // writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
 // apply cannot run every target's plan the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
@@ -3536,12 +3553,6 @@ func withoutAgentHints(plans map[string]*PlanCommentData) map[string]*PlanCommen
 		cleared[env] = &copied
 	}
 	return cleared
-}
-
-// HasChanges reports whether any environment's plan carries a change, which is
-// when the comment offers an apply.
-func (d MultiEnvPlanCommentData) HasChanges() bool {
-	return countEnvsWithChanges(d) > 0
 }
 
 // countEnvsWithChanges counts the environments whose plan carries a change.

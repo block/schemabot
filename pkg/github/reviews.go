@@ -226,7 +226,26 @@ func OwnerNames(owners []codeowners.Owner) []string {
 // ListTeamMembers returns the login names of all members of a GitHub team.
 // The owner parameter is the org slug (e.g. "octocat"), and slug is the team
 // slug (e.g. "dba-team"). Returns an error if team membership cannot be read.
+// Within a scope carrying the request-scoped cache (WithPRInfoCache), a team
+// already read is answered from the cache.
 func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug string) ([]string, error) {
+	cache := prInfoCacheFromContext(ctx)
+	if cache != nil {
+		if members, ok := cache.getTeamMembers(org, slug); ok {
+			return members, nil
+		}
+	}
+	members, err := ic.listTeamMembers(ctx, org, slug)
+	if err != nil {
+		return nil, err
+	}
+	if cache != nil {
+		cache.setTeamMembers(org, slug, members)
+	}
+	return members, nil
+}
+
+func (ic *InstallationClient) listTeamMembers(ctx context.Context, org, slug string) ([]string, error) {
 	opts := &gh.TeamListTeamMembersOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	var members []string
 

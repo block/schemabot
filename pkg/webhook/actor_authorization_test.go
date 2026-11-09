@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1066,6 +1067,42 @@ func TestApplyAuthorizationForPlanComment(t *testing.T) {
 			assert.Equal(t, tt.want, h.applyAuthorizationForPlanComment(t.Context(), installClient, "octocat/hello-world", 1, "orders", tt.reader))
 		})
 	}
+}
+
+// A commented plan checks its requester twice: once at the plan gate and once
+// for the comment's who-can-apply list. Within one delivery the second check
+// answers from the first one's team reads, so the list costs no extra GitHub
+// request.
+func TestPlanGateAndPlanCommentShareTeamReads(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	reads := map[string]int{}
+	var mu sync.Mutex
+	for _, slug := range []string{"schema-admins", "orders-operators"} {
+		members := teamMembersHandler(t, http.StatusOK, "octo-admin")
+		if slug == "orders-operators" {
+			members = teamMembersHandler(t, http.StatusOK, "mona")
+		}
+		mux.HandleFunc("GET /orgs/octocat/teams/"+slug+"/members", func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			reads[slug]++
+			mu.Unlock()
+			members(w, r)
+		})
+	}
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+		db := cfg.Databases["orders"]
+		db.OperatorTeams = []string{"octocat/orders-operators"}
+		cfg.Databases["orders"] = db
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+	delivery := ghclient.WithPRInfoCache(t.Context())
+
+	require.False(t, h.planForResolvedDatabaseBlocked(delivery, "octocat/hello-world", 1, 12345, "mona", "orders", ""))
+	assert.Nil(t, h.applyAuthorizationForPlanComment(delivery, installClient, "octocat/hello-world", 1, "orders", "mona"))
+
+	assert.Equal(t, map[string]int{"schema-admins": 1, "orders-operators": 1}, reads)
 }
 
 // A commented plan answers its requester. An auto-plan has no requester, so it

@@ -231,13 +231,16 @@ You can configure two separate checks:
   author's own approval does not count.
 
 An approval does not let anyone run a command they are not authorized for.
-So when a plan comment's reader cannot run `schemabot apply` for the database,
-the comment lists who can, right under the apply command. The reader is whoever
-commented the plan command, or the PR author on an automatic plan. Anyone
-listed can run the apply once the PR has the approval the review gate requires.
-A reader who can run the apply sees no list. The comment runs the same check
-the apply does, team membership lookups included, and shows the list if that
-check fails. It names teams and users without @-mentioning them.
+So when a plan comment offers an apply its reader cannot run, the comment
+lists who can, right under the apply command. The reader is whoever commented
+the plan command, or the PR author on an automatic plan. Anyone listed can run
+the apply once the PR has the approval the review gate requires. A reader who
+can run the apply sees no list, and a plan with nothing to apply checks nobody.
+The comment runs the same check the apply does, team membership lookups
+included, and shows the list if that check fails. Team members read once are
+reused for the rest of that webhook delivery, so the plan command's own check
+and the comment's share one read per team, and the next delivery reads the team
+again. The list names teams and users without @-mentioning them.
 
 For GitHub command permissions, `*_teams` and `*_users` refer to GitHub
 accounts. For proxy access, `*_groups` refers to groups supplied by the proxy.

@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,6 +196,64 @@ func TestGetApprovedReviewsOrdersBySubmission(t *testing.T) {
 	}
 
 	assert.Equal(t, []string{"alice", "carol", "Bob", "dave"}, users)
+}
+
+// Within one delivery, every authorization check for a team answers from one
+// read of its members. The next delivery reads the team again, so a member
+// added or removed on GitHub takes effect on the next command. A failed read is
+// not cached, so the next check in the same delivery reads the team again.
+func TestListTeamMembersCachesWithinOneDelivery(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+	client, mux := setupConfigTestGitHubServer(t)
+	var reads atomic.Int32
+	var mu sync.Mutex
+	members := []string{"hubot"}
+	status := http.StatusOK
+	mux.HandleFunc("GET /orgs/octocat/teams/db-operators/members", func(w http.ResponseWriter, _ *http.Request) {
+		reads.Add(1)
+		mu.Lock()
+		defer mu.Unlock()
+		w.WriteHeader(status)
+		if status != http.StatusOK {
+			return
+		}
+		users := make([]map[string]string, 0, len(members))
+		for _, member := range members {
+			users = append(users, map[string]string{"login": member})
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(users))
+	})
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	delivery := WithPRInfoCache(t.Context())
+	member, err := ic.IsTeamMember(delivery, "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.False(t, member)
+	member, err = ic.IsTeamMember(delivery, "OctoCat", "DB-Operators", "mona")
+	require.NoError(t, err)
+	assert.False(t, member)
+	assert.Equal(t, int32(1), reads.Load(), "a second check in the same delivery reuses the first read")
+
+	mu.Lock()
+	members = []string{"hubot", "mona"}
+	mu.Unlock()
+	member, err = ic.IsTeamMember(WithPRInfoCache(t.Context()), "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.True(t, member, "the next delivery sees mona added to the team")
+	assert.Equal(t, int32(2), reads.Load())
+
+	failing := WithPRInfoCache(t.Context())
+	mu.Lock()
+	status = http.StatusNotFound
+	mu.Unlock()
+	_, err = ic.IsTeamMember(failing, "octocat", "db-operators", "mona")
+	require.ErrorIs(t, err, ErrTeamMembershipUnreadable)
+	mu.Lock()
+	status = http.StatusOK
+	mu.Unlock()
+	member, err = ic.IsTeamMember(failing, "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.True(t, member, "a failed read is not cached")
 }
 
 func TestIsTeamMember(t *testing.T) {
