@@ -223,14 +223,28 @@ func (e *Engine) cancelRequestedWithin(key string, bound time.Duration) bool {
 	defer timer.Stop()
 	select {
 	case <-settled:
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return tracked.cancelRequested
+		return e.cancelRequestedAfterSettle(tracked)
 	case <-timer.C:
-		logger.Warn("PostgreSQL cancel attempts did not settle before the drive classified the cancelled build; reading it as the operator's cancel",
-			"task_id", key, "cancels_in_flight", inFlight, "waited", bound)
-		return true
 	}
+	// The calls can settle just as the bound passes, so the drive falls back
+	// to reading the cancel as the operator's only while they are still in
+	// flight.
+	select {
+	case <-settled:
+		return e.cancelRequestedAfterSettle(tracked)
+	default:
+	}
+	logger.Warn("PostgreSQL cancel attempts did not settle before the drive classified the cancelled build; reading it as the operator's cancel",
+		"task_id", key, "cancels_in_flight", inFlight, "waited", bound)
+	return true
+}
+
+// cancelRequestedAfterSettle reads the verdict the settled Cancel calls left
+// on the apply.
+func (e *Engine) cancelRequestedAfterSettle(tracked *trackedApply) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return tracked.cancelRequested
 }
 
 // isCancellation reports whether an executor error is a cancelled statement in

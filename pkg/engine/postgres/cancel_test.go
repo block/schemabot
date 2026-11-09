@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -439,7 +441,7 @@ func TestCancelIsNotRequestedWhenTheCallerGivesUpBeforeTheTrackerSignals(t *test
 // classifies the cancellation. When the attempt sends nothing because its
 // caller gave up, the apply fails and the next drive retries it. When the
 // attempt's signal reached the build, the apply is the operator's cancel.
-func TestProbeOutsideCancelWhileOperatorCancelWaits(t *testing.T) {
+func TestOutsideCancelWhileOperatorCancelWaits(t *testing.T) {
 	tests := []struct {
 		name string
 		// returned is what the operator's CancelBuild returns once released.
@@ -475,67 +477,60 @@ func TestProbeOutsideCancelWhileOperatorCancelWaits(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
+		// synctest.Wait returns only once every goroutine in the bubble is
+		// blocked, so the drive is parked waiting for the operator's attempt
+		// before that attempt is released.
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, giveUp := context.WithCancel(t.Context())
-			defer giveUp()
-			entered, release := make(chan struct{}), make(chan struct{})
-			tracker := &fakeBuildTracker{}
-			tracker.cancelBuild = func(ctx context.Context) error {
-				close(entered)
-				<-release
-				return tc.returned(ctx, giveUp)
-			}
-			eng, drive := runningDrive(t, tracker, true)
+			synctest.Test(t, func(t *testing.T) {
+				ctx, giveUp := context.WithCancel(t.Context())
+				defer giveUp()
+				entered, release := make(chan struct{}), make(chan struct{})
+				tracker := &fakeBuildTracker{}
+				tracker.cancelBuild = func(ctx context.Context) error {
+					close(entered)
+					<-release
+					return tc.returned(ctx, giveUp)
+				}
+				eng, drive := runningDrive(t, tracker, true)
 
-			type outcome struct {
-				result *engine.ControlResult
-				err    error
-			}
-			operator := make(chan outcome, 1)
-			go func() {
-				result, err := eng.Cancel(ctx, cancelRequest())
-				operator <- outcome{result: result, err: err}
-			}()
-			select {
-			case <-entered:
-			case <-time.After(backgroundApplyDeadline):
-				require.FailNow(t, "the operator's cancel never reached the tracker")
-			}
+				type outcome struct {
+					result *engine.ControlResult
+					err    error
+				}
+				operator := make(chan outcome, 1)
+				go func() {
+					result, err := eng.Cancel(ctx, cancelRequest())
+					operator <- outcome{result: result, err: err}
+				}()
+				<-entered
 
-			// The outside cancel ends the build while the operator's attempt
-			// is still waiting, so the drive classifies with it in flight.
-			classifying := make(chan struct{})
-			go func() {
-				close(classifying)
-				drive.settleCancelledBuild()
-			}()
-			<-classifying
-			close(release)
+				// The outside cancel ends the build while the operator's attempt
+				// is still waiting, so the drive classifies with it in flight.
+				go drive.settleCancelledBuild()
+				synctest.Wait()
+				select {
+				case <-drive.done:
+					require.FailNow(t, "the drive classified the cancel before the operator's attempt settled", "published %s", drive.publishedState())
+				default:
+				}
+				close(release)
 
-			var got outcome
-			select {
-			case got = <-operator:
-			case <-time.After(backgroundApplyDeadline):
-				require.FailNow(t, "the operator's cancel never returned")
-			}
-			select {
-			case <-drive.done:
-			case <-time.After(backgroundApplyDeadline):
-				require.FailNow(t, "the drive never settled")
-			}
-			assert.Equal(t, tc.wantState, drive.publishedState())
-			assert.False(t, drive.wasCancelled(), "the drive's context is left alone")
-			if tc.wantCancelErr != nil {
-				assert.Nil(t, got.result)
-				require.ErrorIs(t, got.err, tc.wantCancelErr)
-				assert.ErrorIs(t, got.err, context.Canceled)
-				assert.False(t, requestedCancel(t, eng))
-				return
-			}
-			require.NoError(t, got.err)
-			assert.True(t, got.result.Accepted)
-			assert.Equal(t, "Concurrent index build cancelled", got.result.Message)
-			assert.True(t, requestedCancel(t, eng))
+				got := <-operator
+				<-drive.done
+				assert.Equal(t, tc.wantState, drive.publishedState())
+				assert.False(t, drive.wasCancelled(), "the drive's context is left alone")
+				if tc.wantCancelErr != nil {
+					assert.Nil(t, got.result)
+					require.ErrorIs(t, got.err, tc.wantCancelErr)
+					assert.ErrorIs(t, got.err, context.Canceled)
+					assert.False(t, requestedCancel(t, eng))
+					return
+				}
+				require.NoError(t, got.err)
+				assert.True(t, got.result.Accepted)
+				assert.Equal(t, "Concurrent index build cancelled", got.result.Message)
+				assert.True(t, requestedCancel(t, eng))
+			})
 		})
 	}
 }
@@ -577,6 +572,34 @@ func TestCancelClassificationStopsWaitingForAnUnsettledCancel(t *testing.T) {
 	case <-time.After(backgroundApplyDeadline):
 		require.FailNow(t, "the operator's cancel never returned")
 	}
+}
+
+// A concurrent index build fails for a reason other than a cancellation, such
+// as a statement timeout, while an operator's cancel is still in flight. The
+// invalid-index cleanup does not wait for that cancel to settle, because only
+// a cancelled build can be the operator's.
+func TestNonCancellationBuildFailureDoesNotWaitForInFlightCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		defer close(release)
+		entered := make(chan struct{})
+		tracker := &fakeBuildTracker{}
+		tracker.cancelBuild = func(context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		}
+		eng, _ := runningDrive(t, tracker, true)
+		go func() { _, _ = eng.Cancel(t.Context(), cancelRequest()) }()
+		<-entered
+
+		change := nativeApply{table: "orders", cancelRequested: func() bool { return eng.cancelRequested(cancelTestKey) }}
+		buildErr := &executor.InvalidIndexError{Schema: "public", Index: "idx", Table: "orders", Build: errors.New("statement timeout")}
+
+		started := time.Now()
+		require.NoError(t, cleanupCancelledConcurrentIndex(t.Context(), nil, change, buildErr, slog.New(slog.DiscardHandler)))
+		assert.Zero(t, time.Since(started), "a failure that is not a cancellation does not wait for in-flight cancels")
+	})
 }
 
 // Two cancels for the same build overlap. The first signals the build
