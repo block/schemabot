@@ -217,7 +217,7 @@ func TestRollbackConfirmCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 	t.Run("authorization evaluation failure is retryable", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := recordComments(t, mux)
-		mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+		handleTeamMembers(t, mux, "octocat", "schema-admins", http.StatusForbidden)
 		lockStore := &rollbackConfirmTestLockStore{locks: []*storage.Lock{pinnedRollbackLock()}}
 		st := pinnedRollbackStorage(lockStore, pinnedRollbackPlan())
 		cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {

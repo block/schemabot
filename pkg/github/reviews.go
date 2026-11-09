@@ -255,18 +255,37 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 	return members, nil
 }
 
-// IsTeamMember returns true when login is a member of org/slug. It relies on
-// the same team-member listing used by CODEOWNERS review checks so the only
-// negative result is a readable team list that does not contain the actor.
+// IsTeamMember returns true when login is an active member of org/slug,
+// including through a child team. It reads the one membership instead of
+// listing the team, so its cost does not grow with the team's size.
+//
+// GitHub answers 404 both for a user with no membership and for a team the
+// App cannot see, so a 404 is a negative result only once the team itself
+// reads back. A team that cannot be read returns ErrTeamMembershipUnreadable,
+// never a negative result. A pending invitation is not a membership.
 func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
-	members, err := ic.ListTeamMembers(ctx, org, slug)
-	if err != nil {
-		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, err)
-	}
-	for _, member := range members {
-		if strings.EqualFold(member, login) {
-			return true, nil
+	logAttrs := []any{"org", org, "team_slug", slug, "login", login}
+	membership, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeamMembership, "get team membership", logAttrs, func(ctx context.Context) (*gh.Membership, error) {
+		m, _, getErr := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)
+		if getErr != nil {
+			return nil, classifyGitHubAPIError(getErr)
 		}
+		return m, nil
+	})
+	if err == nil {
+		return membership.GetState() == "active", nil
+	}
+	if !IsNotFoundError(err) {
+		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team membership", org, slug, err))
+	}
+	if _, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeam, "get team", logAttrs, func(ctx context.Context) (*gh.Team, error) {
+		team, _, getErr := ic.client.Teams.GetTeamBySlug(ctx, org, slug)
+		if getErr != nil {
+			return nil, classifyGitHubAPIError(getErr)
+		}
+		return team, nil
+	}); err != nil {
+		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team", org, slug, err))
 	}
 	return false, nil
 }
