@@ -119,8 +119,8 @@ github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 h1:GvubwsqXHanJkhBotCs
 github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6/go.mod h1:KEo73lbxXs9cFlq+x3Z35UqGg3MTxAPfjDOR/ob/iik=
 github.com/block/pg-sprite v0.4.1 h1:SD4L7oHOgJrBTkdCo5txGcgApjn8qmC7sKVEeA3iSis=
 github.com/block/pg-sprite v0.4.1/go.mod h1:SYaMJUORf/jaAp3qZX5X4wa2isu8++KVXuCJwZqPBQc=
-github.com/block/spirit v0.19.1-0.20261109122825-801bf3f7e4f8 h1:B56dZeuVfkScMmhR3K6cT96AeeiPuqv7sTmRPjQtz4Q=
-github.com/block/spirit v0.19.1-0.20261109122825-801bf3f7e4f8/go.mod h1:oVtNyIG9LY3dO+m0griEuEdK1lh7eT9nYKIMTpH1svU=
+github.com/block/spirit v0.19.1-0.20261109124914-deabf1fbf7bc h1:8ZSoir7kyiY0HHk5J5mIgtRP0GxVPmUt7bdALMHf3bg=
+github.com/block/spirit v0.19.1-0.20261109124914-deabf1fbf7bc/go.mod h1:oVtNyIG9LY3dO+m0griEuEdK1lh7eT9nYKIMTpH1svU=
 github.com/block/vitess v0.0.0-20261103173808-12cc16cbb567 h1:CxRRbs7Ug0IhxEEEiwXJDzBfSPsxkqD0Ut9YBjbtCs8=
 github.com/block/vitess v0.0.0-20261103173808-12cc16cbb567/go.mod h1:8Ms/9bU2cVbNBamvZ7H7t5ZKgSpD+mtYeK5DpKcp1so=
 github.com/bndr/gotabulate v1.1.2 h1:yC9izuZEphojb9r+KYL4W9IJKO/ceIO8HDwxMA24U4c=

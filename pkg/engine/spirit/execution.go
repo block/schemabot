@@ -292,19 +292,6 @@ func classifyDDLPhases(ddlStatements []string) (ddlPhases, error) {
 	return phases, nil
 }
 
-// noteStoppedStatement records that a stopped run's statement may still be
-// running on the server when its error says the end could not be confirmed.
-func (e *Engine) noteStoppedStatement(logger *slog.Logger, database string, err error) {
-	if !errors.Is(err, dbconn.ErrCancelledStatementMayStillRun) {
-		return
-	}
-	e.cancelledStatementMayStillRun.Store(true)
-	logger.Error("schema change stopped, but a statement it issued could not be confirmed to have ended on the server and may still take effect; inspect the target before running another schema change on it",
-		"database", database,
-		"error", err,
-	)
-}
-
 // runStatementPhase executes each statement through run, stopping the phase as
 // soon as run returns an error. A cancelled context leaves the state Stopped; a
 // genuine failure transitions to StateFailed. stopLabel names the DDL phase in

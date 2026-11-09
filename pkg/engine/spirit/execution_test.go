@@ -479,8 +479,9 @@ func TestFailedProgressReportsAHeldTarget(t *testing.T) {
 }
 
 // A stopped run reports a statement as possibly still running only when Spirit
-// could not confirm that the statement ended on the server, and the engine
-// keeps reporting it after a later stop that Spirit did confirm.
+// could not confirm that the statement ended on the server. The record names
+// the statement's session, and a later stop that Spirit did confirm leaves it
+// in place.
 func TestNoteStoppedStatementRecordsAnUnconfirmedEnd(t *testing.T) {
 	eng := New(Config{Logger: slog.Default()})
 
@@ -488,9 +489,24 @@ func TestNoteStoppedStatementRecordsAnUnconfirmedEnd(t *testing.T) {
 	assert.False(t, eng.CancelledStatementMayStillRun(), "a stop Spirit confirmed leaves nothing running")
 
 	eng.noteStoppedStatement(slog.Default(), "orders_db",
-		fmt.Errorf("run Spirit: %w", fmt.Errorf("%w: session 7: %w", dbconn.ErrCancelledStatementMayStillRun, context.Canceled)))
+		fmt.Errorf("run Spirit: %w", &dbconn.CancelledStatementError{ConnID: 7, Err: context.Canceled}))
 	assert.True(t, eng.CancelledStatementMayStillRun(), "an unconfirmed end may leave the statement running")
 
 	eng.noteStoppedStatement(slog.Default(), "orders_db", context.Canceled)
 	assert.True(t, eng.CancelledStatementMayStillRun(), "a later confirmed stop does not clear an earlier unconfirmed one")
+	assert.Equal(t, []unconfirmedStatement{{database: "orders_db", connID: 7}}, eng.unconfirmedStatements,
+		"the record names the database and the session to check")
+}
+
+// A statement recorded without its target matches every target, and one with a
+// target matches only that target's database.
+func TestUnconfirmedStatementMatches(t *testing.T) {
+	unknownHost := unconfirmedStatement{database: "orders_db", connID: 7}
+	assert.True(t, unknownHost.matches("db-1:3306", "orders_db"))
+	assert.True(t, unknownHost.matches("db-2:3306", "orders_db"))
+	assert.False(t, unknownHost.matches("db-1:3306", "payments_db"))
+
+	known := unconfirmedStatement{host: "db-1:3306", database: "orders_db", connID: 7}
+	assert.True(t, known.matches("db-1:3306", "orders_db"))
+	assert.False(t, known.matches("db-2:3306", "orders_db"))
 }

@@ -68,11 +68,6 @@ type Engine struct {
 	debugLogs           atomic.Bool
 	disablePendingDrops bool
 
-	// cancelledStatementMayStillRun is set when a stopped run issued a
-	// statement that could not be confirmed to have ended on the server. It
-	// is never cleared, so it errs toward reporting a statement as running.
-	cancelledStatementMayStillRun atomic.Bool
-
 	// Resolved Settings applied to every Spirit run; immutable after New.
 	checkpointMaxAge time.Duration
 
@@ -86,6 +81,10 @@ type Engine struct {
 	// Running schema change state
 	mu                  sync.Mutex
 	runningSchemaChange *runningSchemaChange
+	// unconfirmedStatements are statements stopped runs issued that could not
+	// be confirmed to have ended on the server. A run does not start on a
+	// database while one of them may still be running there.
+	unconfirmedStatements []unconfirmedStatement
 	// drainedOutcome retains the terminal result of the last schema change
 	// Drain released, so a progress poll that lands after the drain still
 	// observes the outcome. Apply releases it when it accepts new work.
@@ -386,16 +385,6 @@ func (e *Engine) DrainContext(ctx context.Context) error {
 	}
 	e.releaseDrained(rm, raceWindow)
 	return nil
-}
-
-// CancelledStatementMayStillRun reports whether a run of this engine was
-// stopped while a statement it issued could not be confirmed to have ended on
-// the server, so the statement may still take effect. A stopped run kills the
-// session of every statement it had in flight and waits for it to exit, so once
-// the engine has drained and this reports false, nothing the engine issued is
-// still running on the target.
-func (e *Engine) CancelledStatementMayStillRun() bool {
-	return e.cancelledStatementMayStillRun.Load()
 }
 
 // trackedForDrain returns the schema change a drain waits for, if any.
@@ -999,6 +988,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 
 	rm.goRun(func() {
 		defer cancel()
+		if !e.stoppedStatementsEnded(bgCtx, host, username, password, database) {
+			return
+		}
 		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 

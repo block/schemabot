@@ -394,6 +394,9 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 
 	rm.goRun(func() {
 		defer cancel()
+		if !e.stoppedStatementsEnded(bgCtx, host, username, password, database) {
+			return
+		}
 		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 
