@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -303,9 +304,12 @@ func TestReleaseFetch_WithholdsTokenFromAnotherOrigin(t *testing.T) {
 // client routes example.com and its subdomains to the server, so both hosts
 // are served by it and told apart by the Host header.
 func TestReleaseFetch_WithholdsTokenFromAnotherHost(t *testing.T) {
+	var mu sync.Mutex
 	authByHost := map[string]string{}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		authByHost[r.Host] = r.Header.Get("Authorization")
+		mu.Unlock()
 		if r.Host == "example.com" {
 			http.Redirect(w, r, "https://uploads.example.com"+r.URL.Path, http.StatusTemporaryRedirect)
 			return
@@ -317,6 +321,8 @@ func TestReleaseFetch_WithholdsTokenFromAnotherHost(t *testing.T) {
 	client.Transport = server.Client().Transport
 
 	require.NoError(t, fetchReleasePathWithToken(t, client, "https://example.com"))
+	mu.Lock()
+	defer mu.Unlock()
 	assert.Equal(t, map[string]string{
 		"example.com":         "Bearer " + releaseFetchToken,
 		"uploads.example.com": "",
