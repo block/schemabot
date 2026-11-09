@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -494,12 +496,9 @@ func TestEngine_ResumeDropPhase_SkipsTableAlreadyQuarantined(t *testing.T) {
 }
 
 // A stop lands while the quarantine RENAME is waiting on a metadata lock. The
-// client abandons the statement with a context error, but the server still
-// completes the RENAME once the lock is released, so the table is in pending
-// drops although the first attempt never saw the RENAME succeed. The replayed
-// DROP must recognize that copy as this attempt's own work rather than fail on
-// a table it reports it never quarantined while the retention clock runs on
-// the copy.
+// stop ends the RENAME on the server, so once the lock is released the table is
+// still in place and nothing is in pending drops. The replayed DROP then
+// quarantines the table under a fresh destination, exactly once.
 func TestEngine_ResumeDropPhase_StopDuringBlockedRename(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -542,34 +541,39 @@ func TestEngine_ResumeDropPhase_StopDuringBlockedRename(t *testing.T) {
 	waitFor(t, "the RENAME to block on the metadata lock", func() bool {
 		var waiting int
 		require.NoError(t, db.QueryRowContext(t.Context(),
-			"SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE 'RENAME TABLE%stop_mid_rename%'").Scan(&waiting))
+			"SELECT COUNT(*) FROM information_schema.processlist WHERE state LIKE 'Waiting for %metadata lock' AND info LIKE 'RENAME TABLE%stop_mid_rename%'").Scan(&waiting))
 		return waiting > 0
 	})
 	cancel()
-	require.Error(t, <-firstAttempt, "the stopped attempt must report that its RENAME did not complete")
+	err = receiveWithin(t, firstAttempt, "the stopped attempt to return")
+	require.ErrorIs(t, err, context.Canceled, "the stopped attempt must report that its RENAME did not complete")
+	require.NotErrorIs(t, err, dbconn.ErrCancelledStatementMayStillRun, "the stop must confirm that the RENAME ended")
+	var queued int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE 'RENAME TABLE%stop_mid_rename%'").Scan(&queued))
+	require.Zero(t, queued, "the stopped RENAME must not still be queued on the server")
 
 	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
 	require.NoError(t, err, "release the metadata lock")
-	waitFor(t, "the server-side RENAME to complete", func() bool {
-		exists, err := tableExistsInSchema(t.Context(), db, database, "stop_mid_rename")
-		require.NoError(t, err)
-		return !exists
-	})
-	require.Len(t, listQuarantinedTables(t, db), 1, "the stopped RENAME still quarantined the table")
+	exists, err := tableExistsInSchema(t.Context(), db, database, "stop_mid_rename")
+	require.NoError(t, err)
+	require.True(t, exists, "the stopped RENAME must not move the table once the lock is released")
+	require.Empty(t, listQuarantinedTables(t, db), "the stopped RENAME quarantined nothing")
 
 	err = eng.quarantineDroppedTables(t.Context(), host, username, password, database, "DROP TABLE `stop_mid_rename`")
-	require.NoError(t, err, "the replayed DROP must skip the table its own stopped attempt quarantined")
-	assert.Len(t, listQuarantinedTables(t, db), 1, "the replay must not quarantine the table a second time")
+	require.NoError(t, err, "the replayed DROP quarantines the table")
+	assert.Len(t, listQuarantinedTables(t, db), 1, "the table is quarantined exactly once")
 }
 
-// A stop abandons a quarantine RENAME that is waiting on a metadata lock, and
-// the engine replays the DROP while that RENAME is still queued on the server.
-// The replay still sees the table, so it records a fresh destination and
-// queues behind the abandoned RENAME. Once the lock is released the abandoned
-// RENAME lands at the first destination and the replay's own RENAME finds no
-// table. The next replay must find the data at the first destination and skip
-// the table, rather than report the drop final because the newer destination
-// was never written.
+// An earlier attempt recorded its destination and issued a quarantine RENAME
+// that is still waiting on a metadata lock when the engine replays the DROP,
+// as when the process that issued it exited before it could end it. The replay
+// still sees the table, so it records a fresh destination and queues behind
+// the abandoned RENAME. Once the lock is released the abandoned RENAME lands
+// at the first destination and the replay's own RENAME finds no table. The
+// next replay must find the data at the first destination and skip the table,
+// rather than report the drop final because the newer destination was never
+// written.
 func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -619,16 +623,23 @@ func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
 	const blockedCreateDatabase = "CREATE DATABASE IF NOT EXISTS%"
 
 	target := dropTarget{schema: database, table: "replay_races_rename"}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	firstAttempt := make(chan error, 1)
-	go func() { firstAttempt <- eng.quarantineDroppedTables(ctx, host, username, password, database, drop) }()
-	waitFor(t, "the first RENAME to block on the metadata lock", func() bool { return blockedStatements(blockedRename) >= 1 })
-	cancel()
-	require.Error(t, receiveWithin(t, firstAttempt, "the stopped attempt to return"),
-		"the stopped attempt must report that its RENAME did not complete")
+	// The earlier attempt records its destination and issues its RENAME, the
+	// order quarantineDroppedTables uses, and then never ends it.
+	firstDestinations, err := pendingdrops.Destinations([]pendingdrops.TableMove{{SchemaName: database, TableName: target.table}}, time.Now())
+	require.NoError(t, err, "compute the earlier attempt's destination")
+	eng.recordQuarantinedDrop(firstDestinations[0])
+	_, err = db.ExecContext(t.Context(), "CREATE DATABASE IF NOT EXISTS "+sqlescape.EscapeIdentifier(pendingdrops.Database))
+	require.NoError(t, err, "create the pending drops database")
+	abandoned := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(context.WithoutCancel(t.Context()), fmt.Sprintf("RENAME TABLE %s.%s TO %s.%s",
+			sqlescape.EscapeIdentifier(database), sqlescape.EscapeIdentifier(target.table),
+			sqlescape.EscapeIdentifier(firstDestinations[0].QuarantineSchema), sqlescape.EscapeIdentifier(firstDestinations[0].QuarantineTable)))
+		abandoned <- err
+	}()
+	waitFor(t, "the earlier attempt's RENAME to block on the metadata lock", func() bool { return blockedStatements(blockedRename) >= 1 })
 	firstRecorded := eng.quarantinedDrops(target)
-	require.Len(t, firstRecorded, 1, "the stopped attempt recorded its destination before its RENAME")
+	require.Len(t, firstRecorded, 1, "the earlier attempt recorded its destination before its RENAME")
 
 	// Destination names carry a millisecond timestamp, so a replay that follows
 	// quickly enough would record the same name as the stopped attempt and the
@@ -652,6 +663,7 @@ func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
 
 	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
 	require.NoError(t, err, "release the metadata lock")
+	require.NoError(t, receiveWithin(t, abandoned, "the abandoned RENAME to land"), "the abandoned RENAME lands")
 	require.Error(t, receiveWithin(t, replay, "the replay to return"),
 		"the replay's own RENAME finds the table already moved")
 	require.Equal(t, []string{firstRecorded[0].QuarantineTable}, listQuarantinedTables(t, db),

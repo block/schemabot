@@ -4,8 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
 // TableMove is one source table to quarantine.
@@ -57,8 +61,9 @@ func MoveTables(ctx context.Context, db *sql.DB, tables []TableMove, now time.Ti
 // MoveTablesTo renames each source table to the quarantine destination chosen
 // for it by Destinations, in a single atomic RENAME TABLE statement. A caller
 // that must know the destinations before the rename is issued, because the
-// rename may complete on the server after the client has given up on it,
-// computes them with Destinations, records them, and then calls this.
+// rename may complete on the server after the client has given up on it (the
+// process can exit mid-rename, or a cancel can fail to confirm that the rename
+// ended), computes them with Destinations, records them, and then calls this.
 func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) error {
 	if len(moved) == 0 {
 		return nil
@@ -72,7 +77,11 @@ func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) err
 	if err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, renameSQL); err != nil {
+	// The RENAME can wait for a metadata lock. A cancel ends it on the server
+	// before returning, so it cannot move the tables after the caller gave up;
+	// an error wrapping dbconn.ErrCancelledStatementMayStillRun means that
+	// could not be confirmed.
+	if err := dbconn.ExecKillOnCancel(ctx, db, slog.Default(), "%r", sqlescape.RawSQL(renameSQL)); err != nil {
 		return fmt.Errorf("rename tables to pending drops (query = %s): %w", renameSQL, err)
 	}
 	return nil

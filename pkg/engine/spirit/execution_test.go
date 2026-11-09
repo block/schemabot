@@ -477,3 +477,20 @@ func TestFailedProgressReportsAHeldTarget(t *testing.T) {
 		})
 	}
 }
+
+// A stopped run reports a statement as possibly still running only when Spirit
+// could not confirm that the statement ended on the server, and the engine
+// keeps reporting it after a later stop that Spirit did confirm.
+func TestNoteStoppedStatementRecordsAnUnconfirmedEnd(t *testing.T) {
+	eng := New(Config{Logger: slog.Default()})
+
+	eng.noteStoppedStatement(slog.Default(), "orders_db", fmt.Errorf("run Spirit: %w", context.Canceled))
+	assert.False(t, eng.CancelledStatementMayStillRun(), "a stop Spirit confirmed leaves nothing running")
+
+	eng.noteStoppedStatement(slog.Default(), "orders_db",
+		fmt.Errorf("run Spirit: %w", fmt.Errorf("%w: session 7: %w", dbconn.ErrCancelledStatementMayStillRun, context.Canceled)))
+	assert.True(t, eng.CancelledStatementMayStillRun(), "an unconfirmed end may leave the statement running")
+
+	eng.noteStoppedStatement(slog.Default(), "orders_db", context.Canceled)
+	assert.True(t, eng.CancelledStatementMayStillRun(), "a later confirmed stop does not clear an earlier unconfirmed one")
+}

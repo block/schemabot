@@ -800,12 +800,15 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		killLogger := logger.With("database", database, "table", ds.table)
 		if err := dbconn.ForceExec(ctx, db, tables, forceExecConfig, killLogger, "%r", sqlescape.RawSQL(ds.stmt)); err != nil {
 			if ctx.Err() != nil {
-				// A cancelled context closes the connection, but MySQL may
-				// finish the DDL server-side — the statement's outcome is
-				// indeterminate until an operator inspects the table.
+				// ForceExec ends the cancelled statement on the server before
+				// returning, unless the error says it could not confirm that.
+				// Either way the statement may have finished before the stop,
+				// so its outcome is indeterminate until an operator inspects
+				// the table.
+				e.noteStoppedStatement(logger, database, err)
 				e.setDirectStatementState(progress, directStateStopped)
 				metrics.RecordDirectExecution(ctx, database, "stopped")
-				logger.Info("schema change stopped during direct execution; the in-flight statement may still complete server-side",
+				logger.Info("schema change stopped during direct execution; the in-flight statement's outcome is unknown until the table is inspected",
 					"database", database, "table", ds.table, "reason", ctx.Err())
 				return false
 			}

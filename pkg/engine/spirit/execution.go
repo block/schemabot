@@ -292,6 +292,19 @@ func classifyDDLPhases(ddlStatements []string) (ddlPhases, error) {
 	return phases, nil
 }
 
+// noteStoppedStatement records that a stopped run's statement may still be
+// running on the server when its error says the end could not be confirmed.
+func (e *Engine) noteStoppedStatement(logger *slog.Logger, database string, err error) {
+	if !errors.Is(err, dbconn.ErrCancelledStatementMayStillRun) {
+		return
+	}
+	e.cancelledStatementMayStillRun.Store(true)
+	logger.Error("schema change stopped, but a statement it issued could not be confirmed to have ended on the server and may still take effect; inspect the target before running another schema change on it",
+		"database", database,
+		"error", err,
+	)
+}
+
 // runStatementPhase executes each statement through run, stopping the phase as
 // soon as run returns an error. A cancelled context leaves the state Stopped; a
 // genuine failure transitions to StateFailed. stopLabel names the DDL phase in
@@ -303,6 +316,7 @@ func (e *Engine) runStatementPhase(ctx context.Context, database, stopLabel, fai
 	for _, stmt := range statements {
 		if err := run(ctx, stmt); err != nil {
 			if ctx.Err() != nil {
+				e.noteStoppedStatement(logger, database, err)
 				logger.Info("schema change stopped during "+stopLabel,
 					"database", database,
 					"reason", ctx.Err(),
@@ -506,6 +520,9 @@ func classifyRunnerErrorCutover(result status.WorkflowResult) runnerErrorCutover
 func (e *Engine) settleRunnerError(ctx context.Context, runErr error, result status.WorkflowResult, database string, tables []string) error {
 	logger := e.changeLogger()
 	cancelled := ctx.Err() != nil
+	if cancelled {
+		e.noteStoppedStatement(logger, database, runErr)
+	}
 	switch classifyRunnerErrorCutover(result) {
 	case runnerErrorAfterCutover:
 		// The error is cleanup Spirit could not finish; it is logged, never
