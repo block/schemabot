@@ -69,7 +69,7 @@ func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) err
 		return nil
 	}
 
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(Database))); err != nil {
+	if err := dbconn.ExecKillOnCancel(ctx, db, slog.Default(), "CREATE DATABASE IF NOT EXISTS %n", Database); err != nil {
 		return fmt.Errorf("create %s database: %w", Database, err)
 	}
 
@@ -77,9 +77,9 @@ func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) err
 	if err != nil {
 		return err
 	}
-	// The RENAME can wait for a metadata lock. A cancel ends it on the server
-	// before returning, so it cannot move the tables after the caller gave up;
-	// an error wrapping dbconn.ErrCancelledStatementMayStillRun means that
+	// Both statements can wait for a metadata lock. A cancel ends each on the
+	// server before returning, so neither takes effect after the caller gave
+	// up; an error wrapping dbconn.ErrCancelledStatementMayStillRun means that
 	// could not be confirmed.
 	if err := dbconn.ExecKillOnCancel(ctx, db, slog.Default(), "%r", sqlescape.RawSQL(renameSQL)); err != nil {
 		return fmt.Errorf("rename tables to pending drops (query = %s): %w", renameSQL, err)
