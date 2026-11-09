@@ -4323,7 +4323,7 @@ func environmentHasWork(plan *PlanCommentData) bool {
 // hasChanges returns true if there are any schema changes.
 func hasChanges(changes []KeyspaceChangeData) bool {
 	for _, ks := range changes {
-		if len(ks.Statements) > 0 || ks.VSchemaChanged || ks.Finalize {
+		if keyspaceStatementCount(ks) > 0 || ks.VSchemaChanged || ks.Finalize {
 			return true
 		}
 	}

@@ -146,6 +146,12 @@ func TestOffersApplyMatchesWhoCanApplyRendering(t *testing.T) {
 	singles := map[string]func(*PlanCommentData){
 		"changes":    nil,
 		"no changes": func(p *PlanCommentData) { p.Changes = nil },
+		"changes only on shards": func(p *PlanCommentData) {
+			p.Changes = []KeyspaceChangeData{{Keyspace: "orders", Shards: []KeyspaceShardChange{
+				{Shard: "-80", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);"}},
+				{Shard: "80-", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);"}},
+			}}}
+		},
 		"locked": func(p *PlanCommentData) {
 			p.IsLocked = true
 			p.PendingManualConfirmation = true
@@ -170,6 +176,13 @@ func TestOffersApplyMatchesWhoCanApplyRendering(t *testing.T) {
 		"changes in both": {
 			Environments: []string{"staging", "production"},
 			Plans:        map[string]*PlanCommentData{"staging": plan("staging", nil), "production": plan("production", nil)},
+		},
+		"changes only on shards": {
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*PlanCommentData{
+				"staging":    plan("staging", singles["changes only on shards"]),
+				"production": plan("production", singles["changes only on shards"]),
+			},
 		},
 		"no changes anywhere": {
 			Environments: []string{"staging", "production"},
@@ -200,12 +213,14 @@ func TestOffersApplyMatchesWhoCanApplyRendering(t *testing.T) {
 		})
 	}
 	assert.True(t, plan("staging", nil).OffersApply())
+	assert.True(t, plan("staging", singles["changes only on shards"]).OffersApply())
 	for name, edit := range singles {
-		if edit != nil {
+		if edit != nil && name != "changes only on shards" {
 			assert.False(t, plan("staging", edit).OffersApply(), name)
 		}
 	}
 	assert.True(t, multis["changes in both"].OffersApply())
+	assert.True(t, multis["changes only on shards"].OffersApply())
 	assert.False(t, multis["no changes anywhere"].OffersApply())
 	assert.False(t, multis["refused environment withholds the one behind it"].OffersApply())
 }
