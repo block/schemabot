@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestAuthorizePRCommandActor(t *testing.T) {
@@ -1021,6 +1022,85 @@ func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
 	case body := <-comments:
 		t.Fatalf("no comment should be posted for an authorized operator, got %q", body)
 	default:
+	}
+}
+
+// The plan comment lists the same principals the apply gate admits for the
+// planned database, read from config alone, and nothing when PR command
+// authorization is off.
+func TestApplyAuthorizationForPlanComment(t *testing.T) {
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+		db := cfg.Databases["orders"]
+		db.OperatorTeams = []string{"octocat/orders-operators"}
+		db.OperatorUsers = []string{"mona"}
+		cfg.Databases["orders"] = db
+	})
+	h := actorAuthTestHandler(cfg, nil)
+
+	assert.Equal(t, &templates.ApplyAuthorizationData{
+		OperatorPrincipals: []string{"octocat/orders-operators", "mona"},
+		OtherPrincipals:    []string{"octocat/schema-admins"},
+	}, h.applyAuthorizationForPlanComment("octocat/hello-world", "orders"))
+
+	off := actorAuthTestHandler(actorAuthTestConfig(false), nil)
+	assert.Nil(t, off.applyAuthorizationForPlanComment("octocat/hello-world", "orders"))
+}
+
+// The plan comment's list and the command gate are built separately, so this
+// pins them together: for every tier that can grant a command, the principal
+// that grants it is listed, and an actor granted by nothing listed is denied.
+func TestApplyAuthorizationForPlanCommentMatchesGate(t *testing.T) {
+	tiers := []struct {
+		name      string
+		principal string
+		configure func(cfg *api.ServerConfig)
+	}{
+		{"deployment admin team", "octocat/schema-admins", func(cfg *api.ServerConfig) {
+			cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+		}},
+		{"deployment admin user", "mona", func(cfg *api.ServerConfig) {
+			cfg.PRCommandAuthorization.AdminUsers = []string{"mona"}
+		}},
+		{"repository admin team", "octocat/repo-admins", func(cfg *api.ServerConfig) {
+			cfg.Repos = map[string]api.RepoConfig{"octocat/hello-world": {AdminTeams: []string{"octocat/repo-admins"}}}
+		}},
+		{"repository admin user", "mona", func(cfg *api.ServerConfig) {
+			cfg.Repos = map[string]api.RepoConfig{"octocat/hello-world": {AdminUsers: []string{"mona"}}}
+		}},
+		{"database operator team", "octocat/orders-operators", func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorTeams = []string{"octocat/orders-operators"}
+			cfg.Databases["orders"] = db
+		}},
+		{"database operator user", "mona", func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"mona"}
+			cfg.Databases["orders"] = db
+		}},
+	}
+	for _, tier := range tiers {
+		t.Run(tier.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			for _, slug := range []string{"schema-admins", "repo-admins", "orders-operators"} {
+				handleTeamMembers(t, mux, "octocat", slug, http.StatusOK, "mona")
+			}
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			h := actorAuthTestHandler(actorAuthTestConfig(true, tier.configure), installClient)
+
+			result, err := h.authorizePRCommandActor(t.Context(), installClient, "mona", "octocat/hello-world", "orders")
+			require.NoError(t, err)
+			assert.True(t, result.Allowed, "the gate admits mona through the %s", tier.name)
+
+			auth := h.applyAuthorizationForPlanComment("octocat/hello-world", "orders")
+			require.NotNil(t, auth)
+			listed := append(append([]string{}, auth.OperatorPrincipals...), auth.OtherPrincipals...)
+			assert.Equal(t, []string{tier.principal}, listed)
+
+			denied, err := h.authorizePRCommandActor(t.Context(), installClient, "hubot", "octocat/hello-world", "orders")
+			require.NoError(t, err)
+			assert.False(t, denied.Allowed, "an actor outside the listed %s is denied", tier.principal)
+		})
 	}
 }
 

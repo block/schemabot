@@ -636,11 +636,14 @@ Rules:
 
 ### Planning and the Primary Deployment
 
-Planning fans out like the apply. At review time SchemaBot plans every deployment against its own live schema, and the plan check covers all of them: approving the pull request approves the change on every deployment, not on one of them.
+The schema files are the source of truth. At review time SchemaBot plans every member of an environment by diffing that member's own live schema against the files, and the plan check covers all of them: approving the pull request approves the change on every member, not on one of them. A member that cannot be planned at all blocks the merge, so an unreachable member never passes quietly.
 
-The deployments of a `deployments` map are expected to hold the same schema, so they are expected to plan the same changes. The first deployment in rollout order is the **primary deployment**. Its plan is the one SchemaBot stores, and every deployment runs that plan at apply time. Each other deployment's plan is compared against it, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose plan differs from the primary deployment's, and a deployment that cannot be planned at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+The first member in rollout order is the **primary**. What it does depends on how the environment lists its members:
 
-Being primary decides which plan is stored, not which deployment is reviewed. A multi-deployment environment is gated on every deployment planning the same changes, because every deployment runs the one stored plan.
+- **A `deployments` map whose entries each name one `target`.** The deployments are mirrors: they are expected to hold the same schema, so they are expected to plan the same changes. The primary deployment's plan is the reference. SchemaBot stores it, compares every other deployment's plan against it using a diff that is not persisted, and runs it on every deployment at apply time. A deployment whose plan differs from the primary's blocks the merge, because the plan under review was not written for it.
+- **A `targets` list**, at the environment level or inside any `deployments` entry. Each target holds its own schema, so no target is compared against another, the primary included. Each target runs the plan made for it. When targets plan different changes, the differences are shown for review and do not block the merge by themselves: they can be a rollout that landed on some targets and not others, or drift worth a look. [How targets are planned](#how-targets-are-planned) shows an example. An apply that spans several deployments, one of them with a `targets` list, is refused for now; [Multi-Target Environment](#multi-target-environment-preview) shows how to apply one target at a time instead.
+
+Every member's plan is reviewed, regardless of which member is primary.
 
 ### Deployment Order
 
@@ -670,6 +673,23 @@ databases:
           - payments-001
           - payments-002
 ```
+
+### How targets are planned
+
+The schema files are the source of truth for every target. SchemaBot plans each target by diffing its own live schema against the files, so each target's plan is exactly the work that target needs. No target is compared against another target.
+
+For example, a pull request adds an `email` column to `users`, and `payments-002` is also missing an index the files already declare:
+
+```
+schema files in the PR
+  │
+  ├─ diff ─► payments-001 (primary) ─► ADD COLUMN email
+  └─ diff ─► payments-002           ─► ADD COLUMN email, ADD INDEX idx_status
+```
+
+The plan comment shows each plan under the targets that run it, so both plans are reviewed together. The apply runs each target's own plan: `payments-001` gets the column, and `payments-002` gets the column and the index. A target that cannot be planned at all blocks the merge.
+
+The first target in the list is the **primary target**. Nothing is compared against it, and the plan comment does not put it first: plans with work come first, the one the most targets run leading, and targets already at the desired schema follow.
 
 An apply of the environment fans out to every listed target and follows each target's copy in one watcher. Under the default `cutover_policy: parallel`, the targets copy at once, as many as the server's [`max_drivers_per_apply`](#per-apply-driver-cap) allows (2 by default, so the rest wait as queued), and each target's cutover runs as soon as its own copy is ready. The animation runs with a cap of 4, so all four targets copy together:
 

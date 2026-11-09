@@ -259,23 +259,29 @@ func printProgressRetry(r progressRetry) {
 		r.attempt, maxConsecutiveProgressFailures, wait, r.err)
 }
 
-// terminalWatchExit is the exit a non-interactive watch reports once the apply
-// reaches a terminal state. Only a completed apply succeeds. Every other
-// terminal state (stopped, failed, cancelled, reverted, or one added later)
-// means the schema change is not on the target, so the watch fails and a
-// script gating on its exit status does not proceed. A stopped apply can be
-// resumed, so its error says how; the other outcomes are already rendered, so
-// their error is silent.
-func terminalWatchExit(result *apitypes.ProgressResponse) error {
-	switch {
-	case state.IsState(result.State, state.Apply.Completed):
+// applyEndExit is the exit every watch, interactive or not, reports once it has
+// followed an apply to where it ends. Only a completed apply succeeds. Every
+// other end (stopped, failed, cancelled, reverted, one added later, or no
+// active schema change) means the schema change is not on the target, so the
+// watch fails and a script gating on its exit status does not proceed. The
+// outcome is already on screen, so the error is silent.
+func applyEndExit(applyState string) error {
+	if state.IsState(applyState, state.Apply.Completed) {
 		return nil
-	case state.IsState(result.State, state.Apply.Stopped):
+	}
+	return ErrSilent
+}
+
+// terminalWatchExit is the exit a non-interactive watch reports once the apply
+// reaches a terminal state, which is applyEndExit's. A stopped apply can be
+// resumed and the log has no view to say how, so its error does; the other
+// outcomes are already rendered.
+func terminalWatchExit(result *apitypes.ProgressResponse) error {
+	if state.IsState(result.State, state.Apply.Stopped) {
 		return fmt.Errorf("apply %s was stopped, so the schema change is not on the target; to resume from where it stopped, run '%s'",
 			result.ApplyID, startCommand(result.ApplyID, result.Environment))
-	default:
-		return ErrSilent
 	}
+	return applyEndExit(result.State)
 }
 
 // startCommand is the command that resumes a stopped apply. start requires an

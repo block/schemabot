@@ -230,6 +230,13 @@ You can configure two separate checks:
   requires a qualifying approval before apply where it is enabled. The PR
   author's own approval does not count.
 
+An approval does not let anyone run a command they are not authorized for.
+So the plan comment lists who can run `schemabot apply` for the database,
+right under the apply command. Anyone listed can run it once the PR has the
+approval the review gate requires, so a PR author who is not listed knows to
+ask one of them. The list comes from the server configuration, so it costs no
+extra GitHub request, and it names teams and users without @-mentioning them.
+
 For GitHub command permissions, `*_teams` and `*_users` refer to GitHub
 accounts. For proxy access, `*_groups` refers to groups supplied by the proxy.
 Configure both if you use both paths. OIDC also uses the `admin_teams` list,

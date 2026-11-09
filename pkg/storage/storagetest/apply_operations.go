@@ -2110,6 +2110,29 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
 	})
 
+	// A pause for retry whose reason is past the column's width stores the
+	// reason cut to fit, so the pause lands instead of being refused.
+	t.Run("MarkFailedRetryable_StoresAnOverLongReasonCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_failed_retryable_long_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_failed_retryable_long", 913)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, overLongFailureMessage))
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, operation.State)
+		assertStoredMessage(t, overLongFailureMessageStored, operation.ErrorMessage, "the pause cuts the reason")
+	})
+
 	// ClearEngineResumeState verifies the clear removes both the context and
 	// the metadata so a later read reports the state missing, takes the same
 	// lease fence as the other operation writes, and is a no-op on a row whose
