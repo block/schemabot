@@ -1024,26 +1024,68 @@ func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
 	}
 }
 
-// The plan comment lists the same principals the apply gate admits for the
-// planned database, read from config alone, and nothing when PR command
-// authorization is off.
+// The plan comment lists who can apply only to a reader the apply gate would
+// deny. A reader the gate admits sees nothing, since applying is their happy
+// path, and so does everyone when PR command authorization is off. When the
+// reader's authorization cannot be checked, the list still renders, since it
+// stays true and names whom to ask.
 func TestApplyAuthorizationForPlanComment(t *testing.T) {
-	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
-		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
-		db := cfg.Databases["orders"]
-		db.OperatorTeams = []string{"octocat/orders-operators"}
-		db.OperatorUsers = []string{"mona"}
-		cfg.Databases["orders"] = db
-	})
-	h := actorAuthTestHandler(cfg, nil)
-
-	assert.Equal(t, &templates.ApplyAuthorizationData{
+	listed := &templates.ApplyAuthorizationData{
 		OperatorPrincipals: []string{"octocat/orders-operators", "mona"},
 		OtherPrincipals:    []string{"octocat/schema-admins"},
-	}, h.applyAuthorizationForPlanComment("octocat/hello-world", "orders"))
+	}
+	tests := []struct {
+		name       string
+		enabled    bool
+		reader     string
+		teamStatus int
+		want       *templates.ApplyAuthorizationData
+	}{
+		{name: "operator user sees nothing", enabled: true, reader: "mona", teamStatus: http.StatusOK},
+		{name: "admin team member sees nothing", enabled: true, reader: "octo-admin", teamStatus: http.StatusOK},
+		{name: "unlisted reader sees the list", enabled: true, reader: "hubot", teamStatus: http.StatusOK, want: listed},
+		{name: "reader that cannot be checked sees the list", enabled: true, reader: "hubot", teamStatus: http.StatusInternalServerError, want: listed},
+		{name: "missing reader sees the list", enabled: true, reader: "", teamStatus: http.StatusOK, want: listed},
+		{name: "authorization off shows nothing", enabled: false, reader: "hubot", teamStatus: http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, tt.teamStatus, "octo-admin"))
+			mux.HandleFunc("GET /orgs/octocat/teams/orders-operators/members", teamMembersHandler(t, tt.teamStatus))
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			cfg := actorAuthTestConfig(tt.enabled, func(cfg *api.ServerConfig) {
+				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+				db := cfg.Databases["orders"]
+				db.OperatorTeams = []string{"octocat/orders-operators"}
+				db.OperatorUsers = []string{"mona"}
+				cfg.Databases["orders"] = db
+			})
+			h := actorAuthTestHandler(cfg, installClient)
 
-	off := actorAuthTestHandler(actorAuthTestConfig(false), nil)
-	assert.Nil(t, off.applyAuthorizationForPlanComment("octocat/hello-world", "orders"))
+			assert.Equal(t, tt.want, h.applyAuthorizationForPlanComment(t.Context(), installClient, "octocat/hello-world", 1, "orders", tt.reader))
+		})
+	}
+}
+
+// A commented plan answers its requester. An auto-plan has no requester, so it
+// answers the PR author, who is the one expected to run the apply.
+func TestPlanCommentReader(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"state": "open",
+			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main"},
+			"user":  map[string]any{"login": "pr-author"},
+		}))
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := actorAuthTestHandler(actorAuthTestConfig(true), installClient)
+
+	assert.Equal(t, "mona", h.planCommentReader(t.Context(), installClient, "octocat/hello-world", 1, "mona"))
+	assert.Equal(t, "pr-author", h.planCommentReader(t.Context(), installClient, "octocat/hello-world", 1, ""))
+	assert.Empty(t, h.planCommentReader(t.Context(), installClient, "octocat/hello-world", 2, ""), "an unreadable PR leaves no reader to check")
 }
 
 // The plan comment's list and the command gate are built separately, so this
@@ -1091,14 +1133,17 @@ func TestApplyAuthorizationForPlanCommentMatchesGate(t *testing.T) {
 			require.NoError(t, err)
 			assert.True(t, result.Allowed, "the gate admits mona through the %s", tier.name)
 
-			auth := h.applyAuthorizationForPlanComment("octocat/hello-world", "orders")
-			require.NotNil(t, auth)
-			listed := append(append([]string{}, auth.OperatorPrincipals...), auth.OtherPrincipals...)
-			assert.Equal(t, []string{tier.principal}, listed)
+			assert.Nil(t, h.applyAuthorizationForPlanComment(t.Context(), installClient, "octocat/hello-world", 1, "orders", "mona"),
+				"a reader the gate admits sees no list")
 
 			denied, err := h.authorizePRCommandActor(t.Context(), installClient, "hubot", "octocat/hello-world", "orders")
 			require.NoError(t, err)
 			assert.False(t, denied.Allowed, "an actor outside the listed %s is denied", tier.principal)
+
+			auth := h.applyAuthorizationForPlanComment(t.Context(), installClient, "octocat/hello-world", 1, "orders", "hubot")
+			require.NotNil(t, auth, "a reader the gate denies sees the list")
+			listed := append(append([]string{}, auth.OperatorPrincipals...), auth.OtherPrincipals...)
+			assert.Equal(t, []string{tier.principal}, listed)
 		})
 	}
 }

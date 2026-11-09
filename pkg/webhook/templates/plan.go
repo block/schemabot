@@ -192,7 +192,7 @@ type PlanCommentData struct {
 	ExemptTables []ExemptTablesData
 
 	// ApplyAuthorization lists who may run the apply the comment offers. Nil
-	// when PR command authorization is off.
+	// when PR command authorization is off or the reader may run the apply.
 	ApplyAuthorization *ApplyAuthorizationData
 
 	// Unsafe change tracking
@@ -801,10 +801,11 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 }
 
 // ApplyAuthorizationData lists who may run `schemabot apply` for the planned
-// database when PR command authorization is on, so the plan comment tells the
-// PR author up front whether they can apply it themselves, and tells reviewers
-// that their approval does not let the author run it. Nil means PR command
-// authorization is off, and the comment says nothing about it.
+// database when PR command authorization is on and the comment's reader may
+// not run it, so the plan comment tells them up front whom to ask, and that a
+// review approval does not let them run it. Nil means PR command authorization
+// is off or the reader may run the apply, and the comment says nothing about
+// it.
 type ApplyAuthorizationData struct {
 	// OperatorPrincipals are the database's own operator teams (org/team) and
 	// users.
@@ -3471,7 +3472,7 @@ type MultiEnvPlanCommentData struct {
 	AgentHint string
 
 	// ApplyAuthorization lists who may run the applies the comment offers. Nil
-	// when PR command authorization is off.
+	// when PR command authorization is off or the reader may run the applies.
 	ApplyAuthorization *ApplyAuthorizationData
 
 	// Environments in display order (staging first, production second, etc.)
@@ -3535,6 +3536,12 @@ func withoutAgentHints(plans map[string]*PlanCommentData) map[string]*PlanCommen
 		cleared[env] = &copied
 	}
 	return cleared
+}
+
+// HasChanges reports whether any environment's plan carries a change, which is
+// when the comment offers an apply.
+func (d MultiEnvPlanCommentData) HasChanges() bool {
+	return countEnvsWithChanges(d) > 0
 }
 
 // countEnvsWithChanges counts the environments whose plan carries a change.

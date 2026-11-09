@@ -190,7 +190,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
-	commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(repo, schemaResult.Database)
+	commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
 	commentData.DeploymentDrift = driftPreview
 	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, environment)
@@ -249,7 +249,7 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
-	commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(repo, schemaResult.Database)
+	commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
 	commentData.Target = target
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
 	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
@@ -738,7 +738,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			multiEnvData.IsMySQL = db.Type == storage.DatabaseTypeMySQL
 		}
 	}
-	multiEnvData.ApplyAuthorization = h.applyAuthorizationForPlanComment(repo, multiEnvData.Database)
+	if multiEnvData.HasChanges() {
+		multiEnvData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, multiEnvData.Database, h.planCommentReader(ctx, client, repo, pr, requestedBy))
+	}
 
 	// Update aggregate check once after all environments are planned.
 	// If all environments errored, no plan stored a row and headSHA is empty;
