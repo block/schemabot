@@ -38,11 +38,12 @@ func TestGRPCApplyLogger_BindsIdentity(t *testing.T) {
 
 // A failed drive-lease heartbeat is logged through the identity-bound drive
 // logger, so the warning an operator sees when a peer can reclaim the work
-// carries the apply identity plus the current mutable state without
-// duplicated identity keys.
+// carries the apply identity plus the deployment and remote apply identifier
+// without duplicated identity keys.
 func TestDriveEndingHeartbeatFailure_LogsCarryApplyIdentity(t *testing.T) {
 	apply := driveLoggerTestApply(state.Apply.Running)
 	apply.ExternalID = "remote-apply-9"
+	apply.Deployment = "eu"
 	var records []capturedLog
 	logger := slog.New(captureHandler{records: &records}).With(apply.IdentityLogAttrs()...)
 
@@ -53,7 +54,7 @@ func TestDriveEndingHeartbeatFailure_LogsCarryApplyIdentity(t *testing.T) {
 	line := requireCapturedLog(t, records,
 		"gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state")
 	assertLogCarriesApplyIdentity(t, line)
-	assert.Equal(t, state.Apply.Running, line.attrs["state"])
+	assert.Equal(t, "eu", line.attrs["deployment"])
 	assert.Equal(t, "remote-apply-9", line.attrs["external_id"])
 	assert.Equal(t, hbErr, line.attrs["error"])
 }

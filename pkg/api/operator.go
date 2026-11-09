@@ -3457,7 +3457,9 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 // heartbeat errors are logged and retried on the next tick — until they have
 // persisted for the full storage.ApplyLeaseStaleAfter window, at which point
 // the lease is presumed lost (a peer can already have reclaimed the stale row)
-// and the run is cancelled the same way.
+// and the run is cancelled the same way. Each write runs under its own
+// deadline (storage.HeartbeatLeaseAttempt), so a write that hangs counts as a
+// failure toward that window instead of stalling the check behind it.
 //
 // Each successful heartbeat also checks the inverse hazard: a drive goroutine
 // that has wedged while its heartbeat stays fresh. The heartbeat alone would
@@ -3466,7 +3468,9 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 // cancels the run when they stop for the full stall window.
 //
 // A resumed operation is also marked running from here once its engine works
-// again, and the parent re-derived from it (advanceResumePromotion).
+// again, and the parent re-derived from it (advanceResumePromotion). Both run
+// under a deadline of their own (afterOperationHeartbeatStopsDrive), so a
+// storage call in them that hangs cannot stop the loop from heartbeating.
 //
 // Returns a stop func that is safe to call more than once. It returns only
 // once the heartbeat has exited, so no parent projection from a tick can land
@@ -3492,14 +3496,13 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				err := s.storage.ApplyOperations().Heartbeat(hbCtx, op.ID)
+				attemptStart := s.clock.Now()
+				err := storage.HeartbeatLeaseAttempt(hbCtx, attemptStart, lastSuccess, func(ctx context.Context) error {
+					return s.storage.ApplyOperations().Heartbeat(ctx, op.ID)
+				})
 				if err == nil {
-					lastSuccess = s.clock.Now()
-					if s.operationDriveStalled(hbCtx, driverID, op, &applySnapshot, driveStart) {
-						cancelRun()
-						return
-					}
-					if s.advanceResumePromotion(hbCtx, driverID, op, &applySnapshot, &resume) == resumeLeaseLost {
+					lastSuccess = attemptStart
+					if s.afterOperationHeartbeatStopsDrive(hbCtx, driverID, op, &applySnapshot, driveStart, &resume) {
 						cancelRun()
 						return
 					}
@@ -3521,6 +3524,22 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 		stop()
 		<-exited
 	}
+}
+
+// afterOperationHeartbeatStopsDrive runs the checks that follow a successful
+// operation heartbeat, the drive stall check and the resumed operation's
+// promotion, and reports whether the run must be cancelled. Their storage reads
+// and writes share one deadline of storage.LeaseHeartbeatAttemptTimeout, so a
+// call that hangs on a half-open connection is cut off and retried on the next
+// tick instead of holding the heartbeat loop away from its next write and from
+// the presumed-lost check that follows a failed one.
+func (s *Service) afterOperationHeartbeatStopsDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, driveStart time.Time, resume *resumePromotion) bool {
+	ctx, cancel := context.WithTimeout(ctx, storage.LeaseHeartbeatAttemptTimeout)
+	defer cancel()
+	if s.operationDriveStalled(ctx, driverID, op, apply, driveStart) {
+		return true
+	}
+	return s.advanceResumePromotion(ctx, driverID, op, apply, resume) == resumeLeaseLost
 }
 
 // resumePromotion is what the heartbeat still owes a resumed operation: marking
@@ -3662,7 +3681,8 @@ func tasksShowResumedWork(tasks []*storage.Task) bool {
 // reported the operation lease definitively lost, or heartbeat failures have
 // persisted since lastSuccess for the full lease staleness window, so a peer
 // driver can already have reclaimed the stale row. A transient failure inside
-// the window keeps the run going and is retried on the next tick.
+// the window, including a write that timed out, keeps the run going and is
+// retried on the next tick.
 func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, hbErr error, lastSuccess time.Time) bool {
 	logAttrs := append(append(op.LogAttrs(), apply.IdentityLogAttrs()...),
 		"driver", driverID)
@@ -3676,6 +3696,11 @@ func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, drive
 			append(logAttrs, "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, op.Deployment, apply.Environment, "lease_presumed_lost")
 		return true
+	}
+	if errors.Is(hbErr, storage.ErrLeaseHeartbeatTimedOut) {
+		s.logger.Warn("operator: apply_operation heartbeat attempt timed out; it counts as a failed heartbeat toward the lease staleness window and will be retried",
+			append(logAttrs, "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		return false
 	}
 	s.logger.Warn("operator: apply_operation heartbeat failed; will retry",
 		append(logAttrs, "error", hbErr)...)
