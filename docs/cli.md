@@ -1308,8 +1308,9 @@ reaches a final state. It exits 0 only when the apply completed, and non-zero
 when it was stopped, failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. For a stopped apply the error
 names the `start` command that resumes it. The interactive watcher follows
-the same exit rule once the apply ends, and exits 0 when you detach with Esc
-while the apply is still running. A watcher that cannot reach the server
+the same exit rule once the apply ends, and exits 130, the status a Ctrl-C
+ends a log watch with, when you detach with Esc while the apply is still
+running. A watcher that cannot reach the server
 retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
