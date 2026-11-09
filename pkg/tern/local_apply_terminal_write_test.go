@@ -1949,6 +1949,52 @@ func TestOutcomeWriteLanded_ProvesTheWriteOnlyFromTheWantedStateUnderThisLease(t
 	}
 }
 
+// Storage records a failure message too long for its column cut to fit, and
+// one that is not valid UTF-8 with the invalid bytes replaced. A failure write
+// that committed under this drive's lease, but whose acknowledgement was lost,
+// is still this drive's: the re-read compares the stored message with the
+// drive's own in the form storage records it, so the drive adopts the outcome
+// instead of exiting with the apply failed and its side effects left undone.
+func TestOutcomeWriteLanded_OverLongFailureWhoseAcknowledgementWasLost(t *testing.T) {
+	cases := []struct {
+		name    string
+		failure string
+		stored  string
+	}{
+		{
+			name:    "a failure past the column width",
+			failure: "x" + strings.Repeat("é", 40_000),
+			stored:  "x" + strings.Repeat("é", 32_765) + "…",
+		},
+		{
+			name:    "a failure that is not valid UTF-8",
+			failure: "duplicate key \xff\xfe in row",
+			stored:  "duplicate key \uFFFD in row",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := failureLogTestApply(state.Apply.Failed, 0)
+			row.ErrorMessage = tc.stored
+			row.LeaseToken = "tok-a"
+			client := &LocalClient{
+				config:  LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+				storage: &exactProgressStorage{applies: &snapshotApplyStore{stored: *row}},
+				logger:  slog.Default(),
+			}
+			lease := storage.ApplyLease{ApplyID: row.ID, Owner: "driver-a", Token: "tok-a"}
+			ctx := storage.WithApplyLease(t.Context(), lease)
+
+			landed, got := client.outcomeWriteLanded(ctx, row, state.Apply.Failed, tc.failure, errors.New("connection reset by peer"))
+
+			assert.True(t, landed, "the write committed under this drive's lease and storage holds the failure")
+			require.NotNil(t, got)
+			assert.Equal(t, state.Apply.Failed, got.State)
+			assert.True(t, tc.stored == got.ErrorMessage, "the drive continues with the message as storage holds it")
+		})
+	}
+}
+
 // storedThenRefusingApplyStore reads the apply as running until its first
 // write, which it refuses with err, and as stored from then on, modelling a
 // concurrent writer that settled the apply while this drive's write failed.
