@@ -659,6 +659,35 @@ func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 }
 
+// runningPercentText is the percent the progress summary shows beside its
+// running count, or "" when there is none to show truthfully. One running table
+// shows its own percent. Several show the rows copied over the rows to copy
+// across all of them, so the figure does not depend on the order the tables are
+// listed in. When any of them has no row total yet the rows cannot be weighed
+// against each other, so no percent is shown.
+func runningPercentText(running []TableProgressData) string {
+	if len(running) == 1 {
+		t := running[0]
+		if ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied) == 0 {
+			return ""
+		}
+		return ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal)
+	}
+
+	var copied, total int64
+	for _, t := range running {
+		if t.RowsTotal <= 0 {
+			return ""
+		}
+		copied += ui.ClampRows(t.RowsCopied, t.RowsTotal)
+		total += t.RowsTotal
+	}
+	if copied == 0 {
+		return ""
+	}
+	return ui.FormatRowCopyPercent(0, copied, total)
+}
+
 // writeProgressSummary writes a one-line progress summary before the per-table breakdown.
 // For multi-table applies, shows "X/N complete · Y running (Z%) · ..." at a glance.
 // For single-table applies, the summary is skipped — the header and progress bar
@@ -670,8 +699,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 
 	var completed, running, catchingUp, checksumming, queued, waiting, failed, retrying, stopped, recovering, cutting, cancelled, other int
-	var runningPct int
-	var runningPctText string
+	var runningTables []TableProgressData
 	var runningEstimateExceeded bool
 
 	for _, t := range tables {
@@ -687,11 +715,9 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			completed++
 		case state.Task.Running:
 			running++
+			runningTables = append(runningTables, t)
 			if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 				runningEstimateExceeded = true
-			} else {
-				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-				runningPctText = ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal)
 			}
 		case state.Task.CatchingUp, state.Task.PostChecksum:
 			// Both binlog drains (before and after the verify) read as
@@ -737,8 +763,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		}
 		if runningEstimateExceeded {
 			label += " (finalizing copy)"
-		} else if runningPct > 0 {
-			label += fmt.Sprintf(" (%s)", runningPctText)
+		} else if pct := runningPercentText(runningTables); pct != "" {
+			label += fmt.Sprintf(" (%s)", pct)
 		}
 		parts = append(parts, label)
 	}
