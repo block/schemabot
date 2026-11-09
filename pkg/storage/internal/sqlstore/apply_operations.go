@@ -100,7 +100,7 @@ func insertApplyOperation(ctx context.Context, exec queryExecer, identity identi
 			already_converged, rollout_step, started_at, completed_at, engine_resume_context, engine_resume_metadata
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, nullInt64(ad.PlanID), ad.Deployment, ad.OperationKey, operationKind, ad.Target, nullString(ad.ExternalID), nullString(ad.ExternalOperationID), stateVal, nullString(storedErrorMessage(ad.ErrorMessage)), cutoverPolicy, onFailure,
+		ad.ApplyID, nullInt64(ad.PlanID), ad.Deployment, ad.OperationKey, operationKind, ad.Target, nullString(ad.ExternalID), nullString(ad.ExternalOperationID), stateVal, nullString(storedMessage(ctx, "apply_operations.error_message", ad.ErrorMessage, ad.LogAttrs)), cutoverPolicy, onFailure,
 		ad.AlreadyConverged, ad.RolloutStep, ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -617,7 +617,7 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 			{Column: "error_message", Expr: "?"},
 			{Column: "completed_at", Expr: "COALESCE(ao.completed_at, NOW())"},
 		},
-		state.ApplyOperation.Failed, nullString(storedErrorMessage(errMsg)))
+		state.ApplyOperation.Failed, nullString(storedMessage(ctx, "apply_operations.error_message", errMsg, nil)))
 }
 
 // MarkFailedRetryable sets state=failed_retryable and error_message, leaving
@@ -634,7 +634,7 @@ func (s *applyOperationStore) MarkFailedRetryable(ctx context.Context, id int64,
 			{Column: "state", Expr: "?"},
 			{Column: "error_message", Expr: "?"},
 		},
-		state.ApplyOperation.FailedRetryable, nullString(storedErrorMessage(errMsg)))
+		state.ApplyOperation.FailedRetryable, nullString(storedMessage(ctx, "apply_operations.error_message", errMsg, nil)))
 }
 
 // MarkTerminal sets the given terminal state and stamps completed_at=NOW().
@@ -3608,7 +3608,7 @@ func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *sto
 	args := []any{parent.State}
 	if state.IsState(parent.State, state.Apply.Failed) {
 		setClause = "state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())"
-		args = []any{parent.State, nullString(storedErrorMessage(parent.ErrorMessage))}
+		args = []any{parent.State, nullString(storedMessage(ctx, "apply_operations.error_message", parent.ErrorMessage, op.LogAttrs))}
 	}
 	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_operations.apply_id", strandedParentQuiescence)
 	args = append(args, op.ID, state.ApplyOperation.Pending)

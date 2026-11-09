@@ -591,10 +591,7 @@ func TestTasks(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "task_long_failure_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_task_long_failure", 905)
-		// The leading byte puts every two-byte character at an odd offset, so
-		// the column's byte width falls inside a character.
-		long := "x" + strings.Repeat("é", 40_000)
-		want := "x" + strings.Repeat("é", 32_765) + "…"
+		long, want := overLongFailureMessage, overLongFailureMessageStored
 
 		task := newTask(apply, "task_long_failure", "orders", time.Now().UTC().Truncate(time.Second))
 		task.ErrorMessage = long
@@ -636,6 +633,98 @@ func TestTasks(t *testing.T, h Harness) {
 		assertStoredMessage(t, want, failedOp.ErrorMessage, "marking the operation failed cuts the message")
 	})
 
+	// The cut is to the column's width exactly: a message that fills the
+	// column is stored whole, and one a byte longer loses only what the
+	// marker needs.
+	t.Run("FailureMessage_AtTheColumnWidth_IsStoredWhole", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_failure_width_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_failure_width", 906)
+		cases := []struct {
+			identifier, msg, want string
+		}{
+			{"task_failure_at_width", strings.Repeat("a", 65_535), strings.Repeat("a", 65_535)},
+			{"task_failure_past_width", strings.Repeat("a", 65_536), strings.Repeat("a", 65_532) + "…"},
+		}
+		for _, tc := range cases {
+			task := newTask(apply, tc.identifier, "orders", time.Now().UTC().Truncate(time.Second))
+			task.ErrorMessage = tc.msg
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err, tc.identifier)
+			got, err := store.Tasks().Get(ctx, tc.identifier)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assertStoredMessage(t, tc.want, got.ErrorMessage, tc.identifier)
+		}
+	})
+
+	// An engine can quote a binary key value in its error, so a failure
+	// message need not be valid UTF-8. It is stored with the invalid bytes
+	// replaced rather than refused, on the apply and its task alike.
+	t.Run("FailureMessage_NotValidUTF8_IsStoredWithTheBytesReplaced", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_invalid_utf8_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_invalid_utf8", 907)
+		const msg = "duplicate key \xff\xfe in row"
+		const want = "duplicate key \uFFFD in row"
+
+		apply.State = state.Apply.Failed
+		apply.ErrorMessage = msg
+		require.NoError(t, store.Applies().Update(ctx, apply), "an apply failure that is not valid UTF-8 is stored")
+		failedApply, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, failedApply)
+		assert.Equal(t, state.Apply.Failed, failedApply.State)
+		assert.Equal(t, want, failedApply.ErrorMessage)
+
+		task := newTask(apply, "task_invalid_utf8", "orders", time.Now().UTC().Truncate(time.Second))
+		task.State = state.Task.Failed
+		task.ErrorMessage = msg
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err, "a task failure that is not valid UTF-8 is stored")
+		failedTask, err := store.Tasks().Get(ctx, "task_invalid_utf8")
+		require.NoError(t, err)
+		require.NotNil(t, failedTask)
+		assert.Equal(t, want, failedTask.ErrorMessage)
+	})
+
+	// A per-shard task row inserted through the shard progress write-through
+	// stores an over-long failure cut to fit, like any other task row.
+	t.Run("FailureMessage_PastColumnWidth_OnANewShardRow_IsCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_shard_long_failure_db", storage.DatabaseTypeVitess)
+		apply := CreateApply(t, store, lock, "apply_task_shard_long_failure", 908)
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce",
+		})
+		require.NoError(t, err)
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, opID, claimed.ID)
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+
+		shard := newTask(apply, "task_shard_long_failure", "users", time.Now().UTC().Truncate(time.Second))
+		shard.ApplyOperationID = &opID
+		shard.Engine = storage.EnginePlanetScale
+		shard.Namespace = "commerce"
+		shard.Shard = "-80"
+		shard.State = state.Task.Failed
+		shard.ErrorMessage = overLongFailureMessage
+		require.NoError(t, store.Tasks().UpsertShardProgress(ownedCtx, shard), "a new shard row with a long failure message is stored")
+
+		rows, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		assert.Equal(t, state.Task.Failed, rows[0].State)
+		assertStoredMessage(t, overLongFailureMessageStored, rows[0].ErrorMessage, "the shard insert cuts the message")
+	})
+
 	t.Run("ReapStrandedActive_RejectsNonPositiveLimit", func(t *testing.T) {
 		store := h.NewStorage(t)
 		_, err := store.Tasks().ReapStrandedActive(t.Context(), 0)
@@ -663,6 +752,17 @@ func newTask(apply *storage.Apply, identifier, table string, createdAt time.Time
 		UpdatedAt:      createdAt,
 	}
 }
+
+var (
+	// overLongFailureMessage is a failure message past the column's width. The
+	// leading byte puts every two-byte character at an odd offset, so the
+	// column's byte width falls inside a character.
+	overLongFailureMessage = "x" + strings.Repeat("é", 40_000)
+	// overLongFailureMessageStored is overLongFailureMessage as storage
+	// records it: cut at the start of the character the width falls inside,
+	// with an ellipsis marking the cut.
+	overLongFailureMessageStored = "x" + strings.Repeat("é", 32_765) + "…"
+)
 
 // assertStoredMessage compares a long stored message by its length and its
 // end, where a cut shows, before comparing it whole, so a mismatch reports

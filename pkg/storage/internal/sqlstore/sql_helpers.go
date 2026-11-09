@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"time"
 	"unicode/utf8"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // rollbackTx rolls back tx, logging a warning if the rollback fails for a
@@ -34,28 +36,27 @@ func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
-// maxStoredErrorMessageBytes is the width of the error_message column on
-// tasks, applies and apply_operations, in bytes: the most a MySQL text column
-// holds. PostgreSQL's text holds more, and is held to the same width so a
-// failure reads the same on every dialect.
-const maxStoredErrorMessageBytes = 65535
-
-// storedErrorMessage cuts a failure message to the error_message column's
-// width on a character boundary, marking the cut with an ellipsis. A failure
-// message carries engine and database error text with no bound of its own;
-// written unbounded, one would refuse every write that records it, and a
-// refused failure verdict leaves the apply active through every claim that
-// retries the same write.
-func storedErrorMessage(msg string) string {
-	if len(msg) <= maxStoredErrorMessageBytes {
+// storedMessage returns msg in the form storage.StoredMessage records it in
+// column, and logs a warning when that form differs from msg: the stored value
+// shows a cut or a replacement character but not how long the original was.
+// rowAttrs, when not nil, returns the triage attributes of the row being
+// written, and is only called when there is something to log.
+func storedMessage(ctx context.Context, column, msg string, rowAttrs func() []any) string {
+	stored := storage.StoredMessage(msg)
+	if stored == msg {
 		return msg
 	}
-	const marker = "…"
-	cut := maxStoredErrorMessageBytes - len(marker)
-	for cut > 0 && !utf8.RuneStart(msg[cut]) {
-		cut--
+	var attrs []any
+	if rowAttrs != nil {
+		attrs = rowAttrs()
 	}
-	return msg[:cut] + marker
+	slog.WarnContext(ctx, "a message is longer than its column holds or is not valid UTF-8; storing it with invalid bytes replaced and cut to the column width",
+		append(attrs,
+			"column", column,
+			"original_bytes", len(msg),
+			"stored_bytes", len(stored),
+			"valid_utf8", utf8.ValidString(msg))...)
+	return stored
 }
 
 // nullInt64 returns a sql.NullInt64 for a row reference held as an int64, where
