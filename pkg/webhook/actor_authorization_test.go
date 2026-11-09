@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestAuthorizePRCommandActor(t *testing.T) {
@@ -1021,6 +1022,28 @@ func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
 		t.Fatalf("no comment should be posted for an authorized operator, got %q", body)
 	default:
 	}
+}
+
+// The plan comment lists the same principals the apply gate admits for the
+// planned database, read from config alone, and nothing when PR command
+// authorization is off.
+func TestApplyAuthorizationForPlanComment(t *testing.T) {
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+		db := cfg.Databases["orders"]
+		db.OperatorTeams = []string{"octocat/orders-operators"}
+		db.OperatorUsers = []string{"mona"}
+		cfg.Databases["orders"] = db
+	})
+	h := actorAuthTestHandler(cfg, nil)
+
+	assert.Equal(t, &templates.ApplyAuthorizationData{
+		OperatorPrincipals: []string{"octocat/orders-operators", "mona"},
+		OtherPrincipals:    []string{"octocat/schema-admins"},
+	}, h.applyAuthorizationForPlanComment("octocat/hello-world", "orders"))
+
+	off := actorAuthTestHandler(actorAuthTestConfig(false), nil)
+	assert.Nil(t, off.applyAuthorizationForPlanComment("octocat/hello-world", "orders"))
 }
 
 // With PR command authorization disabled, plan keeps its ungated behavior.

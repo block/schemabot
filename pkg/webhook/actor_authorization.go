@@ -157,6 +157,18 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 	return false, nil
 }
 
+// applyAuthorizationForPlanComment returns who may run `schemabot apply` for
+// database via repo, for the plan comment to show next to its apply command,
+// or nil when PR command authorization is off. It reads server config only,
+// so the plan comment costs no extra GitHub request.
+func (h *Handler) applyAuthorizationForPlanComment(repo, database string) *templates.ApplyAuthorizationData {
+	if h.service == nil || !h.service.Config().PRCommandAuthorizationEnabled() {
+		return nil
+	}
+	operators, others := h.service.Config().PRCommandAuthorizedPrincipals(repo, database)
+	return &templates.ApplyAuthorizationData{OperatorPrincipals: operators, OtherPrincipals: others}
+}
+
 func (h *Handler) authorizePRCommandActor(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
