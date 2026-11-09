@@ -2583,6 +2583,25 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplySeveralRunning renders an apply comment where two tables
+// copy at once, so the summary shows the rows copied over the rows to copy
+// across both rather than one table's percent.
+func PreviewCommentApplySeveralRunning() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Running
+	tables[1].RowsCopied = 914707
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 62
+	tables[1].ETASeconds = 195
+	tables[2].Status = state.Task.Running
+	tables[2].RowsCopied = 122400
+	tables[2].RowsTotal = 612000
+	tables[2].PercentComplete = 20
+	tables[2].ETASeconds = 410
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyThrottled renders an apply comment where the active row
 // copy is paused by the engine's throttler, so the stalled bar reads as a
 // deliberate slowdown with its trigger named rather than a hang.
