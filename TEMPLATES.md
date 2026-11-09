@@ -560,7 +560,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 schemabot apply -e staging
 ```
 
-🔐 **Who can apply**: only these teams and users can run `schemabot apply` for `testapp`. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to review the PR and run the command.
+🔐 **Who can apply**: only these teams and users can run `schemabot apply` for `testapp`, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.
 - Operators: `acme/testapp-operators`
 - Admins: `acme/db-admins`, `jdoe`
 

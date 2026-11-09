@@ -826,13 +826,29 @@ func writeWhoCanApply(sb *strings.Builder, database string, auth *ApplyAuthoriza
 		fmt.Fprintf(sb, "🔐 No team or user can run `schemabot apply` for %s yet. Ask a SchemaBot admin to configure its operators.\n", inlineCode(database))
 		return
 	}
-	fmt.Fprintf(sb, "🔐 **Who can apply**: only these teams and users can run `schemabot apply` for %s. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to review the PR and run the command.\n", inlineCode(database))
+	// Running the command and approving the PR are separate checks with
+	// separate lists, so the note promises only the first: a listed principal
+	// can run the apply once the PR has any approval it needs.
+	fmt.Fprintf(sb, "🔐 **Who can apply**: only these teams and users can run `schemabot apply` for %s, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.\n", inlineCode(database))
 	if len(operators) > 0 {
-		fmt.Fprintf(sb, "- Operators: %s\n", strings.Join(inlineCodeList(operators), ", "))
+		fmt.Fprintf(sb, "- Operators: %s\n", principalList(operators))
 	}
 	if len(others) > 0 {
-		fmt.Fprintf(sb, "- Admins: %s\n", strings.Join(inlineCodeList(others), ", "))
+		fmt.Fprintf(sb, "- Admins: %s\n", principalList(others))
 	}
+}
+
+// maxListedPrincipals bounds each who-can-apply line, so a database with a
+// long allowlist cannot grow a footer the comment size budget never trims.
+const maxListedPrincipals = 10
+
+// principalList renders principals as inline code, naming at most
+// maxListedPrincipals and counting the rest.
+func principalList(principals []string) string {
+	if len(principals) <= maxListedPrincipals {
+		return strings.Join(inlineCodeList(principals), ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(inlineCodeList(principals[:maxListedPrincipals]), ", "), len(principals)-maxListedPrincipals)
 }
 
 // unsafeConsent is what an apply of one plan would confirm with
@@ -3680,6 +3696,9 @@ func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool)
 	}
 	if merged.AgentHint == "" {
 		merged.AgentHint = data.AgentHint
+	}
+	if merged.ApplyAuthorization == nil {
+		merged.ApplyAuthorization = data.ApplyAuthorization
 	}
 	return merged, true
 }
