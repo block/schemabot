@@ -1831,8 +1831,8 @@ those changes: when that comment cannot be posted, `rollback` withdraws its pin 
 `LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
 applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
 dispatch scope, a shard dispatch attaching or creating from a stored plan row re-planned against
-its own shard and stamped with that shard's verdict, and a shard dispatch this deployment could
-not re-plan (it carries no schema files) treated as unsafe
+its own shard and stamped with that shard's verdict, and a shard dispatch this deployment cannot
+re-plan (it carries no schema files) refused before any of its work is admitted
 (`verifyShardDispatchAgainstLiveSchema` and `restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
 `pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and

@@ -65,10 +65,16 @@ func TestLocalClient_ShardScopedDispatchDrivesItsTasks(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanId)
 
+	// The target database is not sharded, so the dispatch is re-planned through
+	// a stand-in for a sharded engine on which the shard still needs exactly the
+	// reviewed change; the drive below runs through the real engine.
+	realEngine := client.spiritEngine
+	client.spiritEngine = reviewedReplanEngine("-80")
 	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
 		PlanId:       planResp.PlanId,
 		Environment:  localClientTestEnvironment,
 		TargetShards: []string{"-80"},
+		SchemaFiles:  reviewedUsersSchemaFiles(),
 		DdlChanges: []*ternv1.TableChange{{
 			Namespace:  "testdb",
 			TableName:  "users",
@@ -76,6 +82,7 @@ func TestLocalClient_ShardScopedDispatchDrivesItsTasks(t *testing.T) {
 			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
 		}},
 	})
+	client.spiritEngine = realEngine
 	require.NoError(t, err)
 	require.True(t, applyResp.Accepted, "shard-scoped dispatch was not accepted: %s", applyResp.ErrorMessage)
 

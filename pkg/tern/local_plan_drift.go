@@ -279,16 +279,20 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 // are no evidence about this one.
 //
 // A dispatch that carries no schema files has no reviewed schema to re-plan
-// against, and runs against the plan row as it is: a change no re-plan has
-// judged keeps the mark that makes admission require the unsafe opt-in for it.
-// logAttrs identify the apply and operation for that warning.
+// against, so the check cannot be made and the dispatch is refused: admitting
+// it would run a change on this shard that nothing judged against the shard's
+// live schema, which is what the check exists to prevent. The control plane
+// stamps the reviewed schema files on every shard dispatch, so a dispatch
+// without them comes from a dispatcher this deployment does not agree with,
+// and a redispatch of the same request cannot clear the refusal. logAttrs
+// identify the apply and operation for that refusal's log line.
 func (c *LocalClient) verifyShardDispatchAgainstLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope, logAttrs []any) error {
 	if len(req.SchemaFiles) == 0 {
-		c.logger.Warn("shard dispatch carries no schema files to re-plan against; admitting it against the plan row, which will require the unsafe opt-in for every change it could not confirm",
+		c.logger.Warn("shard dispatch carries no schema files to re-plan against; refusing it rather than running a change on this shard that nothing judged against its live schema",
 			append(logAttrs,
 				"plan_id", req.PlanId,
 				"shard", scope.shard)...)
-		return nil
+		return engine.NewPermanentError("shard dispatch for plan %s (database %q, target %q, shard %q) carries no schema files to re-plan against; refusing it rather than running a change on this shard that nothing judged against its live schema", req.PlanId, c.config.Database, req.Target, scope.shard)
 	}
 	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
 	if err != nil {

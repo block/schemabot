@@ -3,6 +3,7 @@
 package tern
 
 import (
+	"context"
 	"database/sql"
 	"log/slog"
 	"os"
@@ -15,14 +16,42 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// reviewedUsersSchemaFiles are the reviewed schema files the control plane
+// stamps on every shard dispatch of the fixture's plan: the users table with
+// the email column the plan adds.
+func reviewedUsersSchemaFiles() map[string]*ternv1.SchemaFiles {
+	return map[string]*ternv1.SchemaFiles{
+		"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))"}},
+	}
+}
+
+// reviewedUsersChange is the change the fixture's plan holds, as a re-plan of
+// the reviewed schema files against a shard that has not drifted produces it.
+func reviewedUsersChange() engine.TableChange {
+	return engine.TableChange{
+		Table:     "users",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL",
+	}
+}
+
+// attachDispatchShards are the shards the fixture's dispatches address.
+var attachDispatchShards = []string{"-80", "80-", "c0-"}
+
 // setupAttachDispatchClient provisions the shared fixture for sibling-dispatch
 // tests: a target database with a users table, storage, a LocalClient, and a
-// stored plan whose change adds the email column.
+// stored plan whose change adds the email column. The target database is not
+// sharded, so once the plan is stored the client re-plans live schema through
+// a stand-in for a sharded engine on which every shard still needs exactly the
+// reviewed change; a test that needs a shard to read differently installs its
+// own stand-in over it.
 func setupAttachDispatchClient(t *testing.T) (storage.Storage, *LocalClient, string) {
 	t.Helper()
 
@@ -62,12 +91,34 @@ func setupAttachDispatchClient(t *testing.T) (storage.Storage, *LocalClient, str
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanId)
 
+	real := client.spiritEngine
+	t.Cleanup(func() { client.spiritEngine = real })
+	client.spiritEngine = reviewedReplanEngine(attachDispatchShards...)
+
 	return stor, client, planResp.PlanId
+}
+
+// reviewedReplanEngine stands in for a sharded engine on which each of the
+// given shards still needs exactly the reviewed users change, so a shard
+// dispatch re-planned through it reads as matching the reviewed plan.
+func reviewedReplanEngine(shards ...string) engine.Engine {
+	return fakePlanEngine{planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+		result := &engine.PlanResult{}
+		for _, shard := range shards {
+			result.Changes = append(result.Changes, engine.SchemaChange{
+				Namespace:    "testdb",
+				Shard:        engine.Shard{Name: shard},
+				TableChanges: []engine.TableChange{reviewedUsersChange()},
+			})
+		}
+		return result, nil
+	}}
 }
 
 // shardDispatchRequest is the shard-scoped dispatch the control plane's
 // per-shard fan-out sends: one shard's changes under the generation's
-// idempotency key.
+// idempotency key, carrying the reviewed schema files the shard is re-planned
+// against.
 func shardDispatchRequest(planID, key, shard string) *ternv1.ApplyRequest {
 	return &ternv1.ApplyRequest{
 		PlanId:         planID,
@@ -76,6 +127,7 @@ func shardDispatchRequest(planID, key, shard string) *ternv1.ApplyRequest {
 		Type:           "mysql",
 		IdempotencyKey: key,
 		TargetShards:   []string{shard},
+		SchemaFiles:    reviewedUsersSchemaFiles(),
 		DdlChanges: []*ternv1.TableChange{{
 			Namespace:  "testdb",
 			TableName:  "users",
