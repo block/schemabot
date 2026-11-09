@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -284,9 +285,9 @@ func TestAuthorizePRCommandActorTeams(t *testing.T) {
 			if teamMembersStatusCode == 0 {
 				teamMembersStatusCode = http.StatusOK
 			}
-			mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
-			mux.HandleFunc("GET /orgs/octocat/teams/repo-admins/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
-			mux.HandleFunc("GET /orgs/octocat/teams/orders-operators/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
+			handleTeamMembers(t, mux, "octocat", "schema-admins", teamMembersStatusCode, tt.teamMembers...)
+			handleTeamMembers(t, mux, "octocat", "repo-admins", teamMembersStatusCode, tt.teamMembers...)
+			handleTeamMembers(t, mux, "octocat", "orders-operators", teamMembersStatusCode, tt.teamMembers...)
 			installClient := ghclient.NewInstallationClient(client, testLogger())
 
 			cfg := actorAuthTestConfig(true, tt.configure)
@@ -379,7 +380,7 @@ func TestEnforcePRCommandActorAuthorizationUnconfiguredDatabaseComment(t *testin
 func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 2)
-	mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+	handleTeamMembers(t, mux, "octocat", "schema-admins", http.StatusForbidden)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
@@ -402,7 +403,7 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 func TestEnforcePRCommandActorAuthorizationDurableAttemptSuppressesErrorComment(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 2)
-	mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+	handleTeamMembers(t, mux, "octocat", "schema-admins", http.StatusForbidden)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
@@ -1100,22 +1101,37 @@ func requireComment(t *testing.T, comments <-chan string, failureContext string)
 	}
 }
 
-func teamMembersHandler(t *testing.T, statusCode int, members ...string) http.HandlerFunc {
+// handleTeamMembers serves GitHub's team membership and team reads for
+// org/slug the way GitHub answers them: with statusCode 200, a listed member
+// reads as an active membership, anyone else as a 404 on a readable team; any
+// other statusCode is what both reads return, as for a team the App cannot see.
+func handleTeamMembers(t *testing.T, mux *http.ServeMux, org, slug string, statusCode int, members ...string) {
 	t.Helper()
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(statusCode)
-		if statusCode == http.StatusOK {
-			users := make([]map[string]string, 0, len(members))
-			for _, member := range members {
-				users = append(users, map[string]string{"login": member})
-			}
-			require.NoError(t, json.NewEncoder(w).Encode(users))
-		}
-		if statusCode >= http.StatusBadRequest {
-			_, err := fmt.Fprint(w, http.StatusText(statusCode))
-			require.NoError(t, err)
-		}
+	writeStatus := func(w http.ResponseWriter, status int) {
+		w.WriteHeader(status)
+		_, err := fmt.Fprint(w, http.StatusText(status))
+		require.NoError(t, err)
 	}
+	mux.HandleFunc(fmt.Sprintf("GET /orgs/%s/teams/%s/memberships/{username}", org, slug), func(w http.ResponseWriter, r *http.Request) {
+		if statusCode != http.StatusOK {
+			writeStatus(w, statusCode)
+			return
+		}
+		for _, member := range members {
+			if strings.EqualFold(member, r.PathValue("username")) {
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": "active", "role": "member"}))
+				return
+			}
+		}
+		writeStatus(w, http.StatusNotFound)
+	})
+	mux.HandleFunc(fmt.Sprintf("GET /orgs/%s/teams/%s", org, slug), func(w http.ResponseWriter, _ *http.Request) {
+		if statusCode != http.StatusOK {
+			writeStatus(w, statusCode)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1, "slug": slug}))
+	})
 }
 
 func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database string) {
