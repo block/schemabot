@@ -122,6 +122,7 @@ const (
 	PreviewCommentPlanUnmanagedSchema          PreviewType = "comment_plan_unmanaged_schema"           // Environment-scoped plan naming schema directories it does not manage
 	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with ignored live tables disclosed
 	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
+	PreviewCommentPlanWhoCanApply              PreviewType = "comment_plan_who_can_apply"              // Plan listing who can run the apply under PR command authorization
 	PreviewCommentPlanColumnOnlyAlter          PreviewType = "comment_plan_column_only_alter"          // Plan whose alter is metadata-only, so no table-size section renders
 	PreviewCommentPlanManyTables               PreviewType = "comment_plan_many_tables"                // Plan touching more tables than the size section lists inline
 	PreviewCommentPlanCollationChanges         PreviewType = "comment_plan_collation_changes"          // Plan that moves existing columns onto another collation

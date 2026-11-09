@@ -191,6 +191,10 @@ type PlanCommentData struct {
 	// ExemptTables lists live tables excluded from a plan verdict by namespace.
 	ExemptTables []ExemptTablesData
 
+	// ApplyAuthorization lists who may run the apply the comment offers. Nil
+	// when PR command authorization is off.
+	ApplyAuthorization *ApplyAuthorizationData
+
 	// Unsafe change tracking
 	HasUnsafeChanges bool
 	AllowUnsafe      bool
@@ -754,6 +758,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
 		writeApplyInstruction(&sb, applyCmd, data)
+		writeWhoCanApply(&sb, data.Database, data.ApplyAuthorization)
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
@@ -793,6 +798,57 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 	}
 	sb.WriteString("▶️ **To apply**, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// ApplyAuthorizationData lists who may run `schemabot apply` for the planned
+// database when PR command authorization is on, so the plan comment tells the
+// PR author up front whether they can apply it themselves, and tells reviewers
+// that their approval does not let the author run it. Nil means PR command
+// authorization is off, and the comment says nothing about it.
+type ApplyAuthorizationData struct {
+	// OperatorPrincipals are the database's own operator teams (org/team) and
+	// users.
+	OperatorPrincipals []string
+	// OtherPrincipals are the deployment-wide and repository admins.
+	OtherPrincipals []string
+}
+
+// writeWhoCanApply writes who may run the apply under the apply instruction.
+// Principals render as inline code rather than @-mentions: the plan comment is
+// posted on every push, and a mention would notify every listed team each time.
+func writeWhoCanApply(sb *strings.Builder, database string, auth *ApplyAuthorizationData) {
+	if auth == nil {
+		return
+	}
+	sb.WriteString("\n")
+	operators, others := auth.OperatorPrincipals, auth.OtherPrincipals
+	if len(operators) == 0 && len(others) == 0 {
+		fmt.Fprintf(sb, "🔐 No team or user can run `schemabot apply` for %s yet. Ask a SchemaBot admin to configure its operators.\n", inlineCode(database))
+		return
+	}
+	// Running the command and approving the PR are separate checks with
+	// separate lists, so the note promises only the first: a listed principal
+	// can run the apply once the PR has any approval it needs.
+	fmt.Fprintf(sb, "🔐 **Who can apply**: only these teams and users can run `schemabot apply` for %s, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.\n", inlineCode(database))
+	if len(operators) > 0 {
+		fmt.Fprintf(sb, "- Operators: %s\n", principalList(operators))
+	}
+	if len(others) > 0 {
+		fmt.Fprintf(sb, "- Admins: %s\n", principalList(others))
+	}
+}
+
+// maxListedPrincipals bounds each who-can-apply line, so a database with a
+// long allowlist cannot grow a footer the comment size budget never trims.
+const maxListedPrincipals = 10
+
+// principalList renders principals as inline code, naming at most
+// maxListedPrincipals and counting the rest.
+func principalList(principals []string) string {
+	if len(principals) <= maxListedPrincipals {
+		return strings.Join(inlineCodeList(principals), ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(inlineCodeList(principals[:maxListedPrincipals]), ", "), len(principals)-maxListedPrincipals)
 }
 
 // unsafeConsent is what an apply of one plan would confirm with
@@ -3414,6 +3470,10 @@ type MultiEnvPlanCommentData struct {
 	// unchanged comment.
 	AgentHint string
 
+	// ApplyAuthorization lists who may run the applies the comment offers. Nil
+	// when PR command authorization is off.
+	ApplyAuthorization *ApplyAuthorizationData
+
 	// Environments in display order (staging first, production second, etc.)
 	Environments []string
 
@@ -3636,6 +3696,9 @@ func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool)
 	}
 	if merged.AgentHint == "" {
 		merged.AgentHint = data.AgentHint
+	}
+	if merged.ApplyAuthorization == nil {
+		merged.ApplyAuthorization = data.ApplyAuthorization
 	}
 	return merged, true
 }
@@ -3861,6 +3924,9 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
+	}
+	if len(envsWithChanges) > 0 {
+		writeWhoCanApply(sb, data.Database, data.ApplyAuthorization)
 	}
 
 	for _, env := range envsFailOnRefusedChange {

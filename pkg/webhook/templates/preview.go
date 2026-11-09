@@ -75,6 +75,19 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanWhoCanApply renders a sample plan on a deployment that
+// turns on PR command authorization, listing who can run the apply under the
+// apply command.
+func PreviewCommentPlanWhoCanApply() string {
+	data := previewPlanData()
+	data.LintViolations = nil
+	data.ApplyAuthorization = &ApplyAuthorizationData{
+		OperatorPrincipals: []string{"acme/testapp-operators"},
+		OtherPrincipals:    []string{"acme/db-admins", "jdoe"},
+	}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanUnmanagedSchema renders the plan comment a staging-scoped
 // deployment posts for a PR that also changes a schema directory it does not
 // manage. It posts no separate notice, since a deployment serving another
