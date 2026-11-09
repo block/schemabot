@@ -643,7 +643,7 @@ The first member in rollout order is the **primary**. What it does depends on ho
 - **A `deployments` map whose entries each name one `target`.** The deployments are mirrors: they are expected to hold the same schema, so they are expected to plan the same changes. The primary deployment's plan is the reference. SchemaBot stores it, compares every other deployment's plan against it using a diff that is not persisted, and runs it on every deployment at apply time. A deployment whose plan differs from the primary's blocks the merge, because the plan under review was not written for it.
 - **A `targets` list**, at the environment level or inside any `deployments` entry. Each target holds its own schema, so no target is compared against another, the primary included. Each target runs the plan made for it, and targets that plan different changes are expected rather than blocked. [How targets are planned](#how-targets-are-planned) shows an example.
 
-Being primary decides which plan the comment is built around, not which member is reviewed. Every member's plan is reviewed.
+Every member's plan is reviewed, regardless of which member is primary.
 
 ### Deployment Order
 
@@ -689,7 +689,7 @@ schema files in the PR
 
 The plan comment shows each plan under the targets that run it, so both plans are reviewed together. The apply runs each target's own plan: `payments-001` gets the column, and `payments-002` gets the column and the index. A target that cannot be planned at all blocks the merge.
 
-The first target in the list is the **primary target**. Nothing is compared against it. Its plan is the one the plan comment opens with, and when it already has the change, the comment shows what the other targets still need.
+The first target in the list is the **primary target**. Nothing is compared against it, and the plan comment does not put it first: plans with work come first, the one the most targets run leading, and targets already at the desired schema follow.
 
 An apply of the environment fans out to every listed target and follows each target's copy in one watcher. Under the default `cutover_policy: parallel`, the targets copy at once, as many as the server's [`max_drivers_per_apply`](#per-apply-driver-cap) allows (2 by default, so the rest wait as queued), and each target's cutover runs as soon as its own copy is ready. The animation runs with a cap of 4, so all four targets copy together:
 
