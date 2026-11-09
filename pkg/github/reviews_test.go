@@ -256,6 +256,71 @@ func TestListTeamMembersCachesWithinOneDelivery(t *testing.T) {
 	assert.True(t, member, "a failed read is not cached")
 }
 
+// HasActiveTeamMembership asks GitHub about one login in one request. Only an
+// active membership counts: a pending invitation does not, and neither does a
+// 404, which GitHub returns both for a non-member and for a team it does not
+// show. Any other refusal is an error. A team already listed in the delivery
+// answers from that list without a request.
+func TestHasActiveTeamMembership(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+	tests := []struct {
+		name    string
+		status  int
+		state   string
+		want    bool
+		wantErr error
+	}{
+		{name: "active member", status: http.StatusOK, state: "active", want: true},
+		{name: "pending invitation", status: http.StatusOK, state: "pending"},
+		{name: "not a member", status: http.StatusNotFound},
+		{name: "team hidden from the installation", status: http.StatusForbidden, wantErr: ErrTeamMembershipUnreadable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupConfigTestGitHubServer(t)
+			var reads atomic.Int32
+			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/mona", func(w http.ResponseWriter, _ *http.Request) {
+				reads.Add(1)
+				w.WriteHeader(tt.status)
+				if tt.status == http.StatusOK {
+					require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": tt.state, "role": "member"}))
+				}
+			})
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			member, err := ic.HasActiveTeamMembership(t.Context(), "octocat", "db-operators", "mona")
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.want, member)
+			assert.Equal(t, int32(1), reads.Load())
+		})
+	}
+
+	t.Run("team already listed in the delivery", func(t *testing.T) {
+		client, mux := setupConfigTestGitHubServer(t)
+		mux.HandleFunc("GET /orgs/octocat/teams/db-operators/members", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{"login": "Mona"}}))
+		})
+		mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/{username}", func(http.ResponseWriter, *http.Request) {
+			t.Error("a team already listed in the delivery must not be asked again")
+		})
+		ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		delivery := WithPRInfoCache(t.Context())
+		_, err := ic.ListTeamMembers(delivery, "octocat", "db-operators")
+		require.NoError(t, err)
+
+		member, err := ic.HasActiveTeamMembership(delivery, "octocat", "db-operators", "mona")
+		require.NoError(t, err)
+		assert.True(t, member)
+		member, err = ic.HasActiveTeamMembership(delivery, "octocat", "db-operators", "hubot")
+		require.NoError(t, err)
+		assert.False(t, member)
+	})
+}
+
 func TestIsTeamMember(t *testing.T) {
 	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 	tests := []struct {

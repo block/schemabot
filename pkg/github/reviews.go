@@ -282,12 +282,46 @@ func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login
 	if err != nil {
 		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, err)
 	}
-	for _, member := range members {
-		if strings.EqualFold(member, login) {
-			return true, nil
+	return containsLogin(members, login), nil
+}
+
+// HasActiveTeamMembership returns true when login is an active member of
+// org/slug, asking GitHub about that one login in a single request whatever the
+// team's size. Within a scope carrying the request-scoped cache, a team already
+// listed there answers from that list instead.
+//
+// GitHub answers 404 both for a non-member and for a team the installation
+// cannot see, so a 404 returns false. A caller that must tell the two apart,
+// such as an authorization gate, uses IsTeamMember.
+func (ic *InstallationClient) HasActiveTeamMembership(ctx context.Context, org, slug, login string) (bool, error) {
+	if cache := prInfoCacheFromContext(ctx); cache != nil {
+		if members, ok := cache.getTeamMembers(org, slug); ok {
+			return containsLogin(members, login), nil
 		}
 	}
-	return false, nil
+	membership, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeamMembership, "get team membership", []any{"org", org, "team_slug", slug, "login", login}, func(ctx context.Context) (*gh.Membership, error) {
+		m, resp, getErr := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)
+		if getErr != nil {
+			if resp != nil && resp.StatusCode == http.StatusNotFound {
+				return nil, nil
+			}
+			return nil, classifyGitHubAPIError(getErr)
+		}
+		return m, nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team membership", org, slug, err))
+	}
+	if membership == nil {
+		ic.logger.Debug("GitHub reports no membership of the team for this login, so it counts as a non-member",
+			"org", org, "team_slug", slug, "login", login)
+		return false, nil
+	}
+	return membership.GetState() == "active", nil
+}
+
+func containsLogin(logins []string, login string) bool {
+	return slices.ContainsFunc(logins, func(l string) bool { return strings.EqualFold(l, login) })
 }
 
 func teamMembershipReadError(operation, org, slug string, err error) error {

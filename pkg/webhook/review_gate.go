@@ -675,7 +675,7 @@ type reviewGatePolicy struct {
 
 func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.InstallationClient, reviewer string) (bool, string, error) {
 	if len(p.AdminTeams) > 0 {
-		matched, principal, err := actorInAnyTeam(ctx, client, p.AdminTeams, reviewer)
+		matched, principal, err := actorInAnyTeam(ctx, client, teamReadMemberList, p.AdminTeams, reviewer)
 		if err != nil {
 			return false, "", err
 		}
@@ -687,7 +687,7 @@ func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.Installa
 		return true, principal, nil
 	}
 	if len(p.RepoAdminTeams) > 0 {
-		matched, principal, err := actorInAnyTeam(ctx, client, p.RepoAdminTeams, reviewer)
+		matched, principal, err := actorInAnyTeam(ctx, client, teamReadMemberList, p.RepoAdminTeams, reviewer)
 		if err != nil {
 			return false, "", err
 		}
@@ -699,7 +699,7 @@ func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.Installa
 		return true, principal, nil
 	}
 	if len(p.OperatorTeams) > 0 {
-		matched, principal, err := actorInAnyTeam(ctx, client, p.OperatorTeams, reviewer)
+		matched, principal, err := actorInAnyTeam(ctx, client, teamReadMemberList, p.OperatorTeams, reviewer)
 		if err != nil {
 			return false, "", err
 		}

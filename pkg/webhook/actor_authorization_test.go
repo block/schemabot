@@ -5,8 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1052,8 +1055,8 @@ func TestApplyAuthorizationForPlanComment(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupGitHubServer(t)
-			mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, tt.teamStatus, "octo-admin"))
-			mux.HandleFunc("GET /orgs/octocat/teams/orders-operators/members", teamMembersHandler(t, tt.teamStatus))
+			serveTeam(t, mux, "schema-admins", tt.teamStatus, "octo-admin")
+			serveTeam(t, mux, "orders-operators", tt.teamStatus)
 			installClient := ghclient.NewInstallationClient(client, testLogger())
 			cfg := actorAuthTestConfig(tt.enabled, func(cfg *api.ServerConfig) {
 				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
@@ -1071,24 +1074,14 @@ func TestApplyAuthorizationForPlanComment(t *testing.T) {
 
 // A commented plan checks its requester twice: once at the plan gate and once
 // for the comment's who-can-apply list. Within one delivery the second check
-// answers from the first one's team reads, so the list costs no extra GitHub
-// request.
+// answers from the team lists the first one read, so the list costs no extra
+// GitHub request.
 func TestPlanGateAndPlanCommentShareTeamReads(t *testing.T) {
 	client, mux := setupGitHubServer(t)
-	reads := map[string]int{}
-	var mu sync.Mutex
-	for _, slug := range []string{"schema-admins", "orders-operators"} {
-		members := teamMembersHandler(t, http.StatusOK, "octo-admin")
-		if slug == "orders-operators" {
-			members = teamMembersHandler(t, http.StatusOK, "mona")
-		}
-		mux.HandleFunc("GET /orgs/octocat/teams/"+slug+"/members", func(w http.ResponseWriter, r *http.Request) {
-			mu.Lock()
-			reads[slug]++
-			mu.Unlock()
-			members(w, r)
-		})
-	}
+	reads := countTeamReads(t, mux, map[string][]string{
+		"schema-admins":    {"octo-admin"},
+		"orders-operators": {"mona"},
+	})
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
 		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
@@ -1102,7 +1095,44 @@ func TestPlanGateAndPlanCommentShareTeamReads(t *testing.T) {
 	require.False(t, h.planForResolvedDatabaseBlocked(delivery, "octocat/hello-world", 1, 12345, "mona", "orders", ""))
 	assert.Nil(t, h.applyAuthorizationForPlanComment(delivery, installClient, "octocat/hello-world", 1, "orders", "mona"))
 
-	assert.Equal(t, map[string]int{"schema-admins": 1, "orders-operators": 1}, reads)
+	assert.Equal(t, map[string]int{"schema-admins/members": 1, "orders-operators/members": 1}, reads.snapshot())
+}
+
+// An auto-plan's comment checks the PR author without a gate having read any
+// team first. It asks GitHub about the author's membership of each configured
+// team, one request per team whatever the team's size, and stops at the first
+// team that includes the author. It never lists a team's members.
+func TestPlanCommentAsksOneMembershipPerTeam(t *testing.T) {
+	tests := []struct {
+		name   string
+		reader string
+		want   map[string]int
+	}{
+		{name: "admin team member", reader: "octo-admin", want: map[string]int{"schema-admins/membership": 1}},
+		{name: "operator team member", reader: "mona", want: map[string]int{"schema-admins/membership": 1, "orders-operators/membership": 1}},
+		{name: "on no team", reader: "hubot", want: map[string]int{"schema-admins/membership": 1, "orders-operators/membership": 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			reads := countTeamReads(t, mux, map[string][]string{
+				"schema-admins":    {"octo-admin"},
+				"orders-operators": {"mona"},
+			})
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+				db := cfg.Databases["orders"]
+				db.OperatorTeams = []string{"octocat/orders-operators"}
+				cfg.Databases["orders"] = db
+			})
+			h := actorAuthTestHandler(cfg, installClient)
+
+			h.applyAuthorizationForPlanComment(ghclient.WithPRInfoCache(t.Context()), installClient, "octocat/hello-world", 1, "orders", tt.reader)
+
+			assert.Equal(t, tt.want, reads.snapshot())
+		})
+	}
 }
 
 // A commented plan answers its requester. An auto-plan has no requester, so it
@@ -1161,7 +1191,7 @@ func TestApplyAuthorizationForPlanCommentMatchesGate(t *testing.T) {
 		t.Run(tier.name, func(t *testing.T) {
 			client, mux := setupGitHubServer(t)
 			for _, slug := range []string{"schema-admins", "repo-admins", "orders-operators"} {
-				mux.HandleFunc("GET /orgs/octocat/teams/"+slug+"/members", teamMembersHandler(t, http.StatusOK, "mona"))
+				serveTeam(t, mux, slug, http.StatusOK, "mona")
 			}
 			installClient := ghclient.NewInstallationClient(client, testLogger())
 			h := actorAuthTestHandler(actorAuthTestConfig(true, tier.configure), installClient)
@@ -1278,6 +1308,75 @@ func teamMembersHandler(t *testing.T, statusCode int, members ...string) http.Ha
 			require.NoError(t, err)
 		}
 	}
+}
+
+// teamMembershipHandler answers GitHub's single-user team membership endpoint
+// as GitHub does: an active membership for a listed member, and 404 for anyone
+// else.
+func teamMembershipHandler(t *testing.T, statusCode int, members ...string) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		status := statusCode
+		if status == http.StatusOK && !slices.ContainsFunc(members, func(m string) bool { return strings.EqualFold(m, r.PathValue("username")) }) {
+			status = http.StatusNotFound
+		}
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": "active", "role": "member"}))
+			return
+		}
+		_, err := fmt.Fprint(w, http.StatusText(status))
+		require.NoError(t, err)
+	}
+}
+
+// serveTeam serves both of GitHub's team membership endpoints for
+// octocat/slug: the member list the gates read and the single-user membership
+// the plan comment asks.
+func serveTeam(t *testing.T, mux *http.ServeMux, slug string, statusCode int, members ...string) {
+	t.Helper()
+	mux.HandleFunc("GET /orgs/octocat/teams/"+slug+"/members", teamMembersHandler(t, statusCode, members...))
+	mux.HandleFunc("GET /orgs/octocat/teams/"+slug+"/memberships/{username}", teamMembershipHandler(t, statusCode, members...))
+}
+
+// teamReadCounts counts the team membership requests a test's GitHub server
+// receives, keyed "<slug>/members" for a member list and "<slug>/membership"
+// for a single-user membership.
+type teamReadCounts struct {
+	mu    sync.Mutex
+	reads map[string]int
+}
+
+func (c *teamReadCounts) count(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reads[key]++
+}
+
+func (c *teamReadCounts) snapshot() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return maps.Clone(c.reads)
+}
+
+// countTeamReads serves each octocat team in teams, with its members, on both
+// membership endpoints and counts every request.
+func countTeamReads(t *testing.T, mux *http.ServeMux, teams map[string][]string) *teamReadCounts {
+	t.Helper()
+	counts := &teamReadCounts{reads: map[string]int{}}
+	for slug, members := range teams {
+		list := teamMembersHandler(t, http.StatusOK, members...)
+		membership := teamMembershipHandler(t, http.StatusOK, members...)
+		mux.HandleFunc("GET /orgs/octocat/teams/"+slug+"/members", func(w http.ResponseWriter, r *http.Request) {
+			counts.count(slug + "/members")
+			list(w, r)
+		})
+		mux.HandleFunc("GET /orgs/octocat/teams/"+slug+"/memberships/{username}", func(w http.ResponseWriter, r *http.Request) {
+			counts.count(slug + "/membership")
+			membership(w, r)
+		})
+	}
+	return counts
 }
 
 func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database string) {
