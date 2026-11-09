@@ -593,10 +593,12 @@ match, which all read the schema paths a PR vacates as well as those it changes
 the narrowing to what a PR proposes keeping every vacated schema or config path the default branch
 still holds (`PRFilesProposedAgainstDefaultBranch` in `pkg/github/client.go`);
 required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
-`pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
-multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
+`pkg/webhook/check_prior_env.go`); an environment that could not plan, whether planned alone,
+alongside environments that also failed, or while another of the same plan did, stored as a
+failing check that replaces its earlier passing one, or, when that row cannot be stored, a
 failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
-`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
+`pkg/webhook/check_records.go`, called through `recordPlanFailuresAndFold` by
+`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
 retry preparation durably invalidating old successes before releasing aggregate blocks (`MarkPlanPending` in `pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-3: The rollup is conservative
@@ -923,7 +925,8 @@ completeness test over it (`pkg/state/metadata.go`).
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
 *Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
-resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
+resume re-plan that settles a task whose change already landed and whose stored resume state records
+no deploy request to reattach to (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
 retrying can cure instead of failing it (`driveGroupFinalizer`, same file), the conflict check,
 which pauses a stale apply for retry when its engine reports a retryable failure so the next
@@ -1085,9 +1088,12 @@ reach: how long two processes can be running the same engine work against the sa
 once. Giving up on a timer is also the one place a driver acts without proof, so it is deliberately
 the fallback; a driver that can still reach storage learns it was displaced by reading the token
 instead (OW-4). *Enforced:* one staleness constant (`ApplyLeaseStaleAfter` in
-`pkg/storage/storage.go`) read by both the heartbeat loop (`pkg/api/operator.go`) and every claim
+`pkg/storage/storage.go`) read by both the heartbeat loops (`pkg/api/operator.go`,
+`pkg/tern/local_apply_sequential.go`, `pkg/tern/grpc_client.go`) and every claim
 query, at the apply level (`pkg/storage/internal/sqlstore/applies.go`) and the operation level
-(`pkg/storage/internal/sqlstore/apply_operations.go`); the halt at drive exit in
+(`pkg/storage/internal/sqlstore/apply_operations.go`); every heartbeat write runs under a per-attempt
+deadline inside that window (`HeartbeatLeaseAttempt` in `pkg/storage/lease_heartbeat.go`), so a
+write that hangs counts as a failure like one that returns an error; the halt at drive exit in
 `pkg/tern/local_apply_sequential.go`, `pkg/tern/local_apply_grouped.go` and
 `pkg/tern/local_control_resume.go`, through the engine's `OwnedWorkHalter.HaltWorkOwnedBy`
 (`pkg/engine/engine.go`).
@@ -1402,9 +1408,12 @@ storage must never settle on a state that contradicts what the engine is still d
 database underneath. *Enforced:* the revert-phase gate on the control path
 (`pkg/tern/local_control.go`), the resolution of a revert or skip-revert through the apply the
 request names and that apply's own live task (`activeTaskForControlApply`,
-`pkg/tern/local_control.go`), and the drive loops that act on its answer
+`pkg/tern/local_control.go`), the drive loops that act on its answer
 (`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
-`pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`).
+`pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`), and the resume re-plan, which
+keeps a task whose stored resume state records a deploy request active rather than settling it
+from a schema comparison, so the resume reattaches to that request and a revert window the drive
+never recorded is still reached (`taskReattachesToAcceptedWork`, `pkg/tern/local_control_resume.go`).
 
 ### CO-6: Commands act only where they have an effect
 
@@ -1768,8 +1777,9 @@ apply operation on that table that is neither terminal nor in a revert phase —
 still run it forward. A statement the re-plan still lists that only a terminal or revert-phase
 sibling was reviewed with refuses the resume instead, since nothing will run it forward.
 *Enforced:* `verifyMaterializedPlanMatchesLiveSchema`, `stampReplannedChanges` and
-`dispatchScopeForApply` on the apply path, and `verifyAttachedShardDispatch` for a shard
-dispatch attaching to an existing apply (`pkg/tern/local_plan_drift.go`, called from
+`dispatchScopeForApply` on the apply path, and `verifyShardDispatchAgainstLiveSchema` for a
+shard dispatch attaching to an existing apply or creating one from a plan row already stored
+(`pkg/tern/local_plan_drift.go`, called from `attachDispatchOperation` and `Apply` in
 `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`, and from the re-plan before a drive starts
@@ -1827,9 +1837,10 @@ those changes: when that comment cannot be posted, `rollback` withdraws its pin 
 (`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
 `LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
 applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
-dispatch scope, an attaching shard dispatch re-planned against its own shard and stamped with that
-shard's verdict, and a shard dispatch this deployment could not re-plan (it carries no schema
-files) treated as unsafe (`verifyAttachedShardDispatch` and `restoreDispatchedUnsafeVerdicts` in
+dispatch scope, a shard dispatch attaching or creating from a stored plan row re-planned against
+its own shard and stamped with that shard's verdict, and a shard dispatch this deployment could
+not re-plan (it carries no schema files) treated as unsafe
+(`verifyShardDispatchAgainstLiveSchema` and `restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
 `pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
 mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
@@ -1852,8 +1863,9 @@ in `pkg/engine/postgres/row_security.go` that abort plan creation and the apply-
 `pkg/engine/postgres/row_security_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
-to an existing apply its re-planned scope (`storage.BlockedChangeError` in
-`attachDispatchOperation`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
+to an existing apply or creating one from a stored plan row its re-planned scope
+(`storage.BlockedChangeError` in `attachDispatchOperation` and `Apply`,
+`pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
 refusing the namespace and shard verdicts of the plan they submit (a rollout's primary plan)
 before prompting or locking (`blockedPlanError` over `PlanResponse.FirstBlockedChange`, in
 `pkg/cmd/commands/apply.go`, called there and from `pkg/cmd/commands/rollback.go`), with a materialized plan carrying

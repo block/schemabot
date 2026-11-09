@@ -568,6 +568,12 @@ func TestE2EAutoPlanSourcePolicyBlocksWithFailingAggregate(t *testing.T) {
 	for _, plan := range plans {
 		assert.NotEqual(t, dbName, plan.Database, "source-policy-blocked auto-plan should not store a plan")
 	}
+
+	checks, err := svc.Storage().Checks().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, c := range checks {
+		assert.NotEqual(t, dbName, c.DatabaseName, "source-policy-blocked auto-plan should not store a per-database check for %s", c.Environment)
+	}
 }
 
 // TestE2EAutoPlanEmptySchemaRootNamesDatabase verifies that when a PR empties

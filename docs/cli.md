@@ -1319,7 +1319,10 @@ pasting it reaches the same server. When a refused poll
 carries a `Retry-After` header, as a proxy or rate limiter in front of
 SchemaBot may send, a watcher waits at least that long before polling again,
 up to 5 minutes per poll, so a watcher held off this way takes longer to give
-up.
+up. When the header asked for more than that, the retry line says so, for
+example `retrying in 5m0s (server asked for 1h0m0s, capped)`, and the `-o log`
+retry line carries the asked-for delay as `retry_capped_from`; a delay past a
+day is given only as `more than 24h`.
 
 A single Ctrl-C or SIGTERM ends only the watch. The command prints a notice to
 stderr saying the apply continues and how to watch it again with `progress`,

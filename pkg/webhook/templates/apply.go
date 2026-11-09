@@ -642,21 +642,81 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
 }
 
+// taskSettledBeforeCutover reports whether a row is out of the cutover's way:
+// its change has already landed (completed or in its revert window), or the
+// task ended without reaching the barrier (failed, reverted, cancelled). A
+// stopped row is not settled: it still holds the barrier and resumes toward it.
+func taskSettledBeforeCutover(status string) bool {
+	return shardChangeLanded(status) || state.IsTerminalTaskState(state.NormalizeTaskStatus(status))
+}
+
+// countAwaitingCutover returns how many rows have yet to reach the cutover
+// barrier. Settled rows are neither ready for cutover nor something the
+// cutover is waiting on, so they are left out.
+func countAwaitingCutover(tables []TableProgressData) int {
+	awaiting := 0
+	for _, t := range tables {
+		if !TaskStatusReadyForCutover(t.Status) && !taskSettledBeforeCutover(t.Status) {
+			awaiting++
+		}
+	}
+	return awaiting
+}
+
 // writeCutoverSummary writes a readiness summary for cutover states, showing
-// how many rows are ready for cutover vs not yet ready, counted in the
-// comment's progressUnit.
+// how many of the rows still facing the cutover are ready for it vs not yet
+// ready, counted in the comment's progressUnit. Settled rows are left out of
+// both counts.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	ready := countReadyForCutover(tables)
-	total := len(tables)
-	if total == 0 {
+	awaiting := countAwaitingCutover(tables)
+	facingCutover := ready + awaiting
+	if facingCutover == 0 {
 		return
 	}
 	unit := progressUnit(tables)
-	if ready == total {
-		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover\n", ready, total, unit)
+	if awaiting == 0 {
+		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover\n", ready, facingCutover, unit)
 	} else {
-		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover — waiting on %d\n", ready, total, unit, total-ready)
+		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover — waiting on %d\n", ready, facingCutover, unit, awaiting)
 	}
+}
+
+// runningPercentText is the percent the progress summary shows beside its
+// running count, or "" when there is none to show truthfully. One running table
+// shows its own percent. Several show the rows copied over the rows to copy
+// across all of them, so the figure does not depend on the order the tables are
+// listed in. When any of them has no row total yet the rows cannot be weighed
+// against each other, so no percent is shown. That includes a table with no
+// rows copied and no total: it may be empty, or its estimate may not have
+// arrived, and a read cannot tell which, so leaving it out could overstate the
+// progress of the others.
+//
+// The figure covers only the tables running at this render. It moves when a
+// table joins or leaves that set, so it can fall between polls, for example
+// when a nearly finished table moves on to checksumming; it is not a
+// monotonic progress bar for the apply.
+func runningPercentText(running []TableProgressData) string {
+	if len(running) == 1 {
+		t := running[0]
+		if ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied) == 0 {
+			return ""
+		}
+		return ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal)
+	}
+
+	var copied, total int64
+	for _, t := range running {
+		if t.RowsTotal <= 0 {
+			return ""
+		}
+		copied += ui.ClampRows(t.RowsCopied, t.RowsTotal)
+		total += t.RowsTotal
+	}
+	if copied == 0 {
+		return ""
+	}
+	return ui.FormatRowCopyPercent(0, copied, total)
 }
 
 // writeProgressSummary writes a one-line progress summary before the per-table breakdown.
@@ -670,8 +730,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 
 	var completed, running, catchingUp, checksumming, queued, waiting, failed, retrying, stopped, recovering, cutting, cancelled, other int
-	var runningPct int
-	var runningPctText string
+	var runningTables []TableProgressData
 	var runningEstimateExceeded bool
 
 	for _, t := range tables {
@@ -687,11 +746,9 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			completed++
 		case state.Task.Running:
 			running++
+			runningTables = append(runningTables, t)
 			if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 				runningEstimateExceeded = true
-			} else {
-				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-				runningPctText = ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal)
 			}
 		case state.Task.CatchingUp, state.Task.PostChecksum:
 			// Both binlog drains (before and after the verify) read as
@@ -737,8 +794,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		}
 		if runningEstimateExceeded {
 			label += " (finalizing copy)"
-		} else if runningPct > 0 {
-			label += fmt.Sprintf(" (%s)", runningPctText)
+		} else if pct := runningPercentText(runningTables); pct != "" {
+			label += fmt.Sprintf(" (%s)", pct)
 		}
 		parts = append(parts, label)
 	}

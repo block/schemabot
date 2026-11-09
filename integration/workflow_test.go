@@ -121,9 +121,6 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 
 	addr := listener.Addr().String()
 
-	// Wait for HTTP server readiness
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
-
 	t.Cleanup(func() {
 		_ = server.Close()
 		_ = svc.Close()

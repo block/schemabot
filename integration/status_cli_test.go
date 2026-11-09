@@ -237,7 +237,6 @@ func startStatusOnlySchemaBot(t *testing.T) (string, *schemabotmysql.Storage) {
 	t.Cleanup(func() { utils.CloseAndLog(server) })
 
 	addr := listener.Addr().String()
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
 
 	return "http://" + addr, store
 }

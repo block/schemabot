@@ -171,6 +171,7 @@ const (
 	PreviewCommentApplyStopped                 PreviewType = "comment_apply_stopped"                   // Apply stopped (1 done, 1 stopped)
 	PreviewCommentApplyWaitingCutover          PreviewType = "comment_apply_waiting_cutover"           // Waiting for cutover (deferred, operator triggers)
 	PreviewCommentApplyWaitingCutoverAutomatic PreviewType = "comment_apply_waiting_cutover_automatic" // Waiting for cutover (non-deferred, drive triggers)
+	PreviewCommentApplyWaitingCutoverLanded    PreviewType = "comment_apply_waiting_cutover_landed"    // Waiting for cutover after one table has completed
 	PreviewCommentApplyCuttingOver             PreviewType = "comment_apply_cutting_over"              // Cutting over
 
 	// Multi-deployment apply comment previews (one apply fanned out across deployments)

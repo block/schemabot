@@ -637,7 +637,9 @@ func (f *finalizerControlFixture) redispatch(t *testing.T) context.Context {
 // ns_0's finalizer reaches the engine, which reports a transient error. The
 // VSchema is not lost: the finalizer pauses as failed_retryable with the error
 // recorded, the claim re-drives it under the parent's retry budget, and the
-// re-drive re-applies the idempotent VSchema and completes.
+// re-drive re-applies the idempotent VSchema and completes. The pause is the
+// drive's outcome, not a resume failure: the drive returns no error, and the
+// operation row alone carries the reason.
 func TestLocalClient_FinalizerRetryableEngineErrorPausesThenRedriveCompletes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -645,8 +647,8 @@ func TestLocalClient_FinalizerRetryableEngineErrorPausesThenRedriveCompletes(t *
 	f := newFinalizerControlFixture(t, state.ApplyOperation.Running)
 	f.eng.applyErrs = []error{fmt.Errorf("vschema deploy endpoint unreachable")}
 
-	err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
-	require.ErrorContains(t, err, "vschema deploy endpoint unreachable")
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID),
+		"a stored pause is the drive's outcome, not a resume failure")
 
 	paused := f.finalizerOperation(t)
 	assert.Equal(t, state.ApplyOperation.FailedRetryable, paused.State)
@@ -682,11 +684,11 @@ func TestLocalClient_FinalizerResumeStateReadErrorPausesThenRedriveCompletes(t *
 		},
 	})
 
-	err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
-	require.ErrorContains(t, err, "load engine resume state")
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
 
 	paused := f.finalizerOperation(t)
 	assert.Equal(t, state.ApplyOperation.FailedRetryable, paused.State)
+	assert.Contains(t, paused.ErrorMessage, "load engine resume state")
 	assert.Contains(t, paused.ErrorMessage, "connection lost")
 	assert.Empty(t, f.eng.applies(), "a drive that cannot read its resume state must not reach the engine")
 
@@ -719,7 +721,7 @@ func TestLocalClient_RefusedFinalizerPauseWithdrawsHandoffSoRedriveHonorsPending
 	f := newFinalizerControlFixture(t, state.ApplyOperation.Running)
 	f.eng.applyErrs = []error{fmt.Errorf("vschema deploy endpoint unreachable")}
 
-	require.ErrorContains(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID), "vschema deploy endpoint unreachable")
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
 	require.Equal(t, state.ApplyOperation.FailedRetryable, f.finalizerState(t))
 	_, err := f.stor.ApplyOperations().GetEngineResumeState(t.Context(), f.finalizerID)
 	require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound, "a refused drive leaves no handoff behind")
@@ -745,8 +747,10 @@ func TestLocalClient_UnknownOutcomeFinalizerPauseKeepsHandoffSoRedriveReobserves
 	f := newFinalizerControlFixture(t, state.ApplyOperation.Running)
 	f.eng.applyErrs = []error{engine.NewOutcomeUnknownError("deploy request may have been created")}
 
-	require.ErrorContains(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID), "deploy request may have been created")
-	require.Equal(t, state.ApplyOperation.FailedRetryable, f.finalizerState(t))
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
+	paused := f.finalizerOperation(t)
+	require.Equal(t, state.ApplyOperation.FailedRetryable, paused.State)
+	assert.Contains(t, paused.ErrorMessage, "deploy request may have been created")
 	f.requireHandoffRecorded(t)
 
 	f.requestPending(t, storage.ControlOperationStop)
@@ -783,9 +787,11 @@ func TestLocalClient_EarlierDriveHandoffSurvivesLaterRefusedFinalizerPause(t *te
 	f.requireHandoffRecorded(t)
 
 	f.eng.applyErrs = []error{fmt.Errorf("vschema deploy endpoint unreachable")}
-	require.ErrorContains(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID), "vschema deploy endpoint unreachable")
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
 	require.Len(t, f.eng.applies(), 2)
-	require.Equal(t, state.ApplyOperation.FailedRetryable, f.finalizerState(t))
+	paused := f.finalizerOperation(t)
+	require.Equal(t, state.ApplyOperation.FailedRetryable, paused.State)
+	assert.Contains(t, paused.ErrorMessage, "vschema deploy endpoint unreachable")
 	f.requireHandoffRecorded(t)
 
 	f.requestPending(t, storage.ControlOperationStop)
@@ -936,7 +942,9 @@ func TestLocalClient_FinalizerNonSuccessOutcomeFailsWithoutRetry(t *testing.T) {
 // engine drives: a retryable error pauses it on a database type whose recovery
 // resumes from a checkpoint, a retryable error on a type that could dispatch
 // duplicate work fails it unless the engine says the outcome is unknown, and a
-// permanent error fails it everywhere.
+// permanent error fails it everywhere. What the drive returns follows what it
+// recorded: a pause ends the drive without an error, a failure returns its
+// cause.
 func TestLocalClient_FinalizerEngineErrorDispositionFollowsDatabaseType(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -962,7 +970,12 @@ func TestLocalClient_FinalizerEngineErrorDispositionFollowsDatabaseType(t *testi
 			f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{databaseType: tt.databaseType})
 			f.eng.applyErrs = []error{tt.err}
 
-			require.Error(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
+			err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
+			if tt.wantState == state.ApplyOperation.FailedRetryable {
+				require.NoError(t, err, "a stored pause is the drive's outcome, not a resume failure")
+			} else {
+				require.ErrorContains(t, err, tt.err.Error())
+			}
 
 			op := f.finalizerOperation(t)
 			assert.Equal(t, tt.wantState, op.State)
@@ -974,7 +987,8 @@ func TestLocalClient_FinalizerEngineErrorDispositionFollowsDatabaseType(t *testi
 // The engine accepts ns_0's VSchema deploy, then every progress poll fails with
 // a transient error. The finalizer must not poll forever: once the poll's error
 // budget is spent it pauses as failed_retryable with the poll error recorded,
-// and the claim's re-drive reattaches to the stored deploy and completes it.
+// the drive ends without an error because the pause is its outcome, and the
+// claim's re-drive reattaches to the stored deploy and completes it.
 func TestLocalClient_FinalizerProgressOutagePausesThenRedriveCompletes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -984,8 +998,8 @@ func TestLocalClient_FinalizerProgressOutagePausesThenRedriveCompletes(t *testin
 	f.eng.applyResult = &engine.ApplyResult{Accepted: true, ResumeState: &engine.ResumeState{MigrationContext: "deploy-ns-0"}}
 	f.eng.progressErr = fmt.Errorf("get deploy request: rate limited")
 
-	err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
-	require.ErrorContains(t, err, "rate limited")
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID),
+		"a stored pause is the drive's outcome, not a resume failure")
 
 	paused := f.finalizerOperation(t)
 	assert.Equal(t, state.ApplyOperation.FailedRetryable, paused.State)
@@ -1009,7 +1023,9 @@ func TestLocalClient_FinalizerProgressOutagePausesThenRedriveCompletes(t *testin
 // A progress outage on work the engine already accepted follows the
 // accepted-work policy: a type whose recovery resumes from a checkpoint or
 // reattaches to accepted work pauses the finalizer, while a type with neither
-// fails it, because a retry there could dispatch the work again.
+// fails it, because a retry there could dispatch the work again. What the
+// drive returns follows what it recorded: a pause ends the drive without an
+// error, a failure returns the poll error.
 func TestLocalClient_FinalizerProgressOutageDispositionFollowsDatabaseType(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1031,7 +1047,12 @@ func TestLocalClient_FinalizerProgressOutageDispositionFollowsDatabaseType(t *te
 			f.eng.applyResult = &engine.ApplyResult{Accepted: true, ResumeState: &engine.ResumeState{MigrationContext: "deploy-ns-0"}}
 			f.eng.progressErr = fmt.Errorf("get deploy request: connection reset")
 
-			require.Error(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID))
+			err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
+			if tt.wantState == state.ApplyOperation.FailedRetryable {
+				require.NoError(t, err, "a stored pause is the drive's outcome, not a resume failure")
+			} else {
+				require.ErrorContains(t, err, "connection reset")
+			}
 
 			op := f.finalizerOperation(t)
 			assert.Equal(t, tt.wantState, op.State)
