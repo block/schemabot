@@ -366,6 +366,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"SECOND TABLE ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
 		{"SECOND TABLE THROTTLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThrottled()) }},
+		{"SECOND AND THIRD TABLES RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplySeveralRunning()) }},
 		{"SECOND TABLE CATCHING UP", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCatchingUp()) }},
 		{"SECOND TABLE CHECKSUMMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksumming()) }},
 		{"SECOND TABLE CHECKSUMMING: CUTOVER DEFERRED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksummingDeferredCutover()) }},

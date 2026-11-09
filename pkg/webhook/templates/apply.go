@@ -664,7 +664,15 @@ func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 // shows its own percent. Several show the rows copied over the rows to copy
 // across all of them, so the figure does not depend on the order the tables are
 // listed in. When any of them has no row total yet the rows cannot be weighed
-// against each other, so no percent is shown.
+// against each other, so no percent is shown. That includes a table with no
+// rows copied and no total: it may be empty, or its estimate may not have
+// arrived, and a read cannot tell which, so leaving it out could overstate the
+// progress of the others.
+//
+// The figure covers only the tables running at this render. It moves when a
+// table joins or leaves that set, so it can fall between polls, for example
+// when a nearly finished table moves on to checksumming; it is not a
+// monotonic progress bar for the apply.
 func runningPercentText(running []TableProgressData) string {
 	if len(running) == 1 {
 		t := running[0]

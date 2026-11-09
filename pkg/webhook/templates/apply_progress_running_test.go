@@ -72,6 +72,14 @@ func TestRenderApplyStatusComment_RunningSummaryOmitsPercentItCannotWeigh(t *tes
 		assert.Equal(t, "📊 1 running (90.00%) · 1 queued", progressSummaryLine(t, out))
 	})
 
+	t.Run("one running table that has copied no rows shows no percent", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.Running, []TableProgressData{
+			runningTable("users", 0, 10000, 0), queued,
+		}))
+
+		assert.Equal(t, "📊 1 running · 1 queued", progressSummaryLine(t, out))
+	})
+
 	t.Run("a running table with no row total yet", func(t *testing.T) {
 		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.Running, []TableProgressData{
 			runningTable("events", 0, 0, 0), runningTable("users", 9000, 10000, 90),
@@ -87,4 +95,16 @@ func TestRenderApplyStatusComment_RunningSummaryOmitsPercentItCannotWeigh(t *tes
 
 		assert.Equal(t, "📊 2 running", progressSummaryLine(t, out))
 	})
+}
+
+// A table that reports more rows copied than its total counts as fully copied,
+// so it cannot inflate the figure for the others. The summary never reaches
+// this, because such a table switches the label to "(finalizing copy)" first,
+// so it is checked on the function.
+func TestRunningPercentTextCountsAnOvershootAsFullyCopied(t *testing.T) {
+	got := runningPercentText([]TableProgressData{
+		runningTable("events", 1500, 1000, 100), runningTable("users", 0, 1000, 0),
+	})
+
+	assert.Equal(t, "50.00%", got)
 }
