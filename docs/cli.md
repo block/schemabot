@@ -908,6 +908,13 @@ The default is the newest 50 entries, printed oldest first. `-n` changes that
 window; `-f` follows new entries. Follow mode is text output and cannot be
 combined with `--json`.
 
+Following stops with a non-zero exit when the server gives an answer a retry
+cannot change, such as `apply not found` or a refused token. A server it cannot
+reach is retried with backoff, the same way the watchers retry, and following
+stops with a non-zero exit once polls have kept failing for a few minutes in a
+row. Run the same `logs` command again to pick up where it stopped. Ctrl-C ends
+following normally.
+
 In local mode, omit `--deployment`: the stored log includes engine activity.
 In gRPC mode, add it with a deployment name from the apply's progress to read
 remote engine details such as copying, throttling, or cutover. It requires an
