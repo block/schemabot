@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
@@ -567,10 +570,10 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		{name: "a failed branch delete is logged for manual cleanup",
 			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: errors.New("branch delete refused"), wantCloses: []uint64{91}, wantDelete: "failed",
 			wantLog: "failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota", wantLevel: "ERROR"},
-		{name: "a branch delete refused for permission names the missing delete_branch permission",
-			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: &ps.Error{Code: ps.ErrPermission}, wantCloses: []uint64{91}, wantDelete: "failed",
+		{name: "a branch delete refused as unauthorized says what to check on the service token",
+			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: unauthorizedBranchDelete(t), wantCloses: []uint64{91}, wantDelete: "failed",
 			wantLog: "failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota", wantLevel: "ERROR",
-			wantPermissionHint: "the service token lacks the delete_branch permission; grant it to the token on this database"},
+			wantPermissionHint: unauthorizedBranchDeleteHint},
 		{name: "a drive that ends after the deploy request leaves both for the driver that takes over",
 			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, recorded: true, wantNoReads: true,
 			wantLog: "drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply", wantLevel: "INFO"},
@@ -869,12 +872,83 @@ func TestApply_LeaseLostDuringTheDeleteOfARecordedBranchAbandonsIt(t *testing.T)
 	assert.Equal(t, created[0], record["branch"])
 }
 
+// unauthorizedBranchDeleteHint is what a branch delete PlanetScale refused as
+// unauthorized tells the operator to check.
+const unauthorizedBranchDeleteHint = "PlanetScale refused the delete as unauthorized; check that the service token is valid and has the delete_branch permission on this database"
+
+// unauthorizedBranchDeleteMessage is the response text of that refusal.
+const unauthorizedBranchDeleteMessage = "You are not authorized to perform this action"
+
+// branchDeleteErrorFromAPI returns the error the PlanetScale SDK builds from
+// a branch delete the API answered with status and body.
+func branchDeleteErrorFromAPI(t *testing.T, status int, body string) error {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := psclient.NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+	err = client.DeleteBranch(t.Context(), &ps.DeleteDatabaseBranchRequest{
+		Organization: "org", Database: "commerce", Branch: "schemabot-commerce-1a2b",
+	})
+	require.Error(t, err)
+	return err
+}
+
+// unauthorizedBranchDelete returns the SDK's error for a branch delete
+// PlanetScale refused as unauthorized.
+func unauthorizedBranchDelete(t *testing.T) error {
+	t.Helper()
+	return branchDeleteErrorFromAPI(t, http.StatusUnauthorized, `{"code":"unauthorized","message":"`+unauthorizedBranchDeleteMessage+`"}`)
+}
+
+// A failed branch delete tells the operator to check the service token only
+// when PlanetScale refused it as unauthorized, which it answers with either a
+// 401 or a 403. A delete that failed any other way, including a 403 that is
+// not an unauthorized refusal, logs its error alone, so the hint never sends
+// an operator to the token for a failure the token did not cause.
+func TestBranchDeleteFailureAttrsHintOnlyOnAnUnauthorizedRefusal(t *testing.T) {
+	unauthorized := `{"code":"unauthorized","message":"` + unauthorizedBranchDeleteMessage + `"}`
+	tests := []struct {
+		name     string
+		err      error
+		wantHint bool
+	}{
+		{name: "a 401 unauthorized refusal", err: branchDeleteErrorFromAPI(t, http.StatusUnauthorized, unauthorized), wantHint: true},
+		{name: "a 403 unauthorized refusal", err: branchDeleteErrorFromAPI(t, http.StatusForbidden, unauthorized), wantHint: true},
+		{name: "an unauthorized refusal a caller wrapped", err: fmt.Errorf("delete branch: %w", unauthorizedBranchDelete(t)), wantHint: true},
+		{name: "a 403 with another code", err: branchDeleteErrorFromAPI(t, http.StatusForbidden, `{"code":"forbidden","message":"Forbidden"}`)},
+		{name: "a 400 bad request", err: branchDeleteErrorFromAPI(t, http.StatusBadRequest, `{"code":"bad_request","message":"Bad request"}`)},
+		{name: "a 422 unprocessable", err: branchDeleteErrorFromAPI(t, http.StatusUnprocessableEntity, `{"code":"unprocessable","message":"Branch is busy"}`)},
+		{name: "a 500 internal error", err: branchDeleteErrorFromAPI(t, http.StatusInternalServerError, `{"code":"internal_server_error","message":"Internal error"}`)},
+		{name: "an SDK internal error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrInternal})},
+		{name: "an SDK invalid error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrInvalid})},
+		{name: "an SDK retry error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrRetry})},
+		{name: "an SDK malformed response error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrResponseMalformed})},
+		{name: "an error that is not from the SDK", err: errors.New("context deadline exceeded")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attrs := BranchDeleteFailureAttrs(tt.err)
+			if tt.wantHint {
+				assert.Equal(t, []any{"error", tt.err, "permission_hint", unauthorizedBranchDeleteHint}, attrs)
+				return
+			}
+			assert.Equal(t, []any{"error", tt.err}, attrs)
+		})
+	}
+}
+
 // A branch the reclaim could not delete is still against quota, so the failure
 // is logged at error level with everything an operator needs to find the apply
 // and delete the branch by hand: the apply, the organization, the PlanetScale
 // database, the branch, and the failure that ended the drive. A delete
-// PlanetScale refused for permission also names the permission the service
-// token is missing, so the operator knows what to grant.
+// PlanetScale refused as unauthorized also says what to check on the service
+// token, so the operator knows where to look.
 func TestReclaimBranchAfterFailedResume_LogsAFailedDeleteForTriage(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -886,9 +960,9 @@ func TestReclaimBranchAfterFailedResume_LogsAFailedDeleteForTriage(t *testing.T)
 	}{
 		{name: "a delete that fails for another reason names no permission",
 			deleteErr: errors.New("branch delete refused"), wantError: "branch delete refused"},
-		{name: "a delete refused for permission names the missing delete_branch permission",
-			deleteErr: &ps.Error{Code: ps.ErrPermission}, wantError: "",
-			wantPermissionHint: "the service token lacks the delete_branch permission; grant it to the token on this database"},
+		{name: "a delete refused as unauthorized says what to check on the service token",
+			deleteErr: unauthorizedBranchDelete(t), wantError: unauthorizedBranchDeleteMessage,
+			wantPermissionHint: unauthorizedBranchDeleteHint},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1553,10 +1627,10 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 			wantKeptReason: "the delete failed; delete it by hand to reclaim branch quota",
 		},
 		{
-			name: "a delete refused for permission names the missing delete_branch permission", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: &ps.Error{Code: ps.ErrPermission},
+			name: "a delete refused as unauthorized says what to check on the service token", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: unauthorizedBranchDelete(t),
 			wantAttempts: []string{ownedBranch}, wantKept: []string{"branch " + ownedBranch},
-			wantErr:        "delete branch " + ownedBranch + " of the cancelled apply on commerce: ",
-			wantKeptReason: "the service token lacks the delete_branch permission; grant it to the token on this database, then delete the branch by hand to reclaim branch quota",
+			wantErr:        "delete branch " + ownedBranch + " of the cancelled apply on commerce: " + unauthorizedBranchDeleteMessage,
+			wantKeptReason: unauthorizedBranchDeleteHint + ", then delete the branch by hand to reclaim branch quota",
 		},
 	}
 	for _, tt := range tests {

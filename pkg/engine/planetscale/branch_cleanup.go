@@ -44,7 +44,7 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 	if err != nil {
 		logger.Error("failed to delete the branch left behind by a failed apply; delete it manually to reclaim branch quota",
 			append([]any{"organization", org, "planetscale_database", database, "branch", branch,
-				"apply_error", cause}, branchDeleteFailureAttrs(err)...)...)
+				"apply_error", cause}, BranchDeleteFailureAttrs(err)...)...)
 		return
 	}
 	if alreadyGone {
@@ -77,25 +77,27 @@ func deleteBranch(ctx context.Context, client psclient.PSClient, org, database, 
 	return false, err
 }
 
-// missingDeleteBranchPermission tells the operator why PlanetScale refused a
-// branch delete for permission: the service token was not granted
-// delete_branch, which only a failure or a cancel uses, so it is the
-// permission most likely to be missing.
-const missingDeleteBranchPermission = "the service token lacks the delete_branch permission; grant it to the token on this database"
+// branchDeleteUnauthorizedHint tells the operator what to check when
+// PlanetScale refuses a branch delete as unauthorized. That answer does not
+// say whether the service token is no longer accepted or was not granted
+// delete_branch, so the hint names both. delete_branch is the permission most
+// likely to be missing, because only a failure or a cancel uses it.
+const branchDeleteUnauthorizedHint = "PlanetScale refused the delete as unauthorized; check that the service token is valid and has the delete_branch permission on this database"
 
-// branchDeleteRefusedForPermission reports whether PlanetScale refused a
-// branch delete because the service token may not delete branches.
-func branchDeleteRefusedForPermission(err error) bool {
+// branchDeleteRefusedAsUnauthorized reports whether PlanetScale refused a
+// branch delete as unauthorized: the service token is not accepted, or it may
+// not delete branches.
+func branchDeleteRefusedAsUnauthorized(err error) bool {
 	var psErr *ps.Error
 	return errors.As(err, &psErr) && psErr.Code == ps.ErrPermission
 }
 
-// branchDeleteFailureAttrs returns the log attributes for a failed branch
-// delete: the error, and the missing permission when PlanetScale refused the
-// delete for permission.
-func branchDeleteFailureAttrs(err error) []any {
-	if branchDeleteRefusedForPermission(err) {
-		return []any{"error", err, "permission_hint", missingDeleteBranchPermission}
+// BranchDeleteFailureAttrs returns the log attributes for a failed branch
+// delete: the error, and what to check on the service token when PlanetScale
+// refused the delete as unauthorized.
+func BranchDeleteFailureAttrs(err error) []any {
+	if branchDeleteRefusedAsUnauthorized(err) {
+		return []any{"error", err, "permission_hint", branchDeleteUnauthorizedHint}
 	}
 	return []any{"error", err}
 }
@@ -249,7 +251,7 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 			append(attrs, "error", err)...)
 	case err != nil:
 		logger.Error("failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota",
-			append(attrs, branchDeleteFailureAttrs(err)...)...)
+			append(attrs, BranchDeleteFailureAttrs(err)...)...)
 	case alreadyGone:
 		logger.Info("the branch of a failed apply was already gone after closing its deploy request", attrs...)
 	default:
@@ -355,8 +357,8 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 	if err != nil {
 		result.Kept = []string{branch}
 		result.KeptReason = "the delete failed; delete it by hand to reclaim branch quota"
-		if branchDeleteRefusedForPermission(err) {
-			result.KeptReason = missingDeleteBranchPermission + ", then delete the branch by hand to reclaim branch quota"
+		if branchDeleteRefusedAsUnauthorized(err) {
+			result.KeptReason = branchDeleteUnauthorizedHint + ", then delete the branch by hand to reclaim branch quota"
 		}
 		return result, fmt.Errorf("delete branch %s of the cancelled apply on %s: %w", meta.BranchName, req.Database, err)
 	}
