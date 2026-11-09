@@ -631,9 +631,11 @@ ESC detach • s stop
 
 The live view refreshes until completion or a state that needs your decision.
 It includes rows copied, ETA when available, and the reason for throttling.
-Press **Esc** to detach while copying; the apply keeps running. **s** requests
-a stop for this MySQL example. At deferred cutover, **Enter** requests the
-swap. During cutover, the watcher asks you to wait and disables Esc/stop.
+Press **Esc** to detach while copying; the apply keeps running and the
+command exits 130, the status that tells a script the watch ended without an
+outcome. **s** requests a stop for this MySQL example. At deferred cutover,
+**Enter** requests the swap. During cutover, the watcher asks you to wait and
+disables Esc/stop.
 
 For progress bar colors, phase labels, and keyboard controls, see the
 [progress display reference](#progress-display-reference).
@@ -1308,8 +1310,10 @@ reaches a final state. It exits 0 only when the apply completed, and non-zero
 when it was stopped, failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. For a stopped apply the error
 names the `start` command that resumes it. The interactive watcher follows
-the same exit rule once the apply ends, and exits 0 when you detach with Esc
-while the apply is still running. A watcher that cannot reach the server
+the same exit rule once the apply ends, and exits 130, the status a Ctrl-C
+ends a log watch with, when you leave it while the apply is still running:
+with Esc, q, or Ctrl-C, with a SIGINT or SIGTERM sent to the process, or
+before its first poll has answered. A watcher that cannot reach the server
 retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
