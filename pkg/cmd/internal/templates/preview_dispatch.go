@@ -240,6 +240,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover())
 	case PreviewCommentApplyWaitingCutoverAutomatic:
 		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic())
+	case PreviewCommentApplyWaitingCutoverLanded:
+		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverFirstLanded())
 	case PreviewCommentApplyCuttingOver:
 		fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver())
 	case PreviewCommentMultiDeployInProgress:

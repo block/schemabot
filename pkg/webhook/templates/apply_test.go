@@ -2023,6 +2023,15 @@ func TestPreviewCommentApplyWaitingForCutover(t *testing.T) {
 	assert.Contains(t, result, "schemabot cutover")
 }
 
+func TestPreviewCommentApplyWaitingForCutoverFirstLanded(t *testing.T) {
+	result := PreviewCommentApplyWaitingForCutoverFirstLanded()
+
+	assert.Contains(t, result, "Waiting for Cutover")
+	assert.Contains(t, result, "**2/2** table(s) ready for cutover\n")
+	assert.NotContains(t, result, "waiting on")
+	assert.Contains(t, result, "schemabot cutover")
+}
+
 func TestPreviewCommentApplyWaitingForCutoverAutomatic(t *testing.T) {
 	result := PreviewCommentApplyWaitingForCutoverAutomatic()
 

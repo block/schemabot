@@ -642,13 +642,21 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
 }
 
+// taskSettledBeforeCutover reports whether a row is out of the cutover's way:
+// its change has already landed (completed or in its revert window), or the
+// task ended without reaching the barrier (failed, reverted, cancelled). A
+// stopped row is not settled: it still holds the barrier and resumes toward it.
+func taskSettledBeforeCutover(status string) bool {
+	return shardChangeLanded(status) || state.IsTerminalTaskState(state.NormalizeTaskStatus(status))
+}
+
 // countAwaitingCutover returns how many rows have yet to reach the cutover
-// barrier. Rows whose change has already landed are past it, so they are
-// neither ready for cutover nor something the cutover is waiting on.
+// barrier. Settled rows are neither ready for cutover nor something the
+// cutover is waiting on, so they are left out.
 func countAwaitingCutover(tables []TableProgressData) int {
 	awaiting := 0
 	for _, t := range tables {
-		if !TaskStatusReadyForCutover(t.Status) && !shardChangeLanded(t.Status) {
+		if !TaskStatusReadyForCutover(t.Status) && !taskSettledBeforeCutover(t.Status) {
 			awaiting++
 		}
 	}
@@ -657,8 +665,8 @@ func countAwaitingCutover(tables []TableProgressData) int {
 
 // writeCutoverSummary writes a readiness summary for cutover states, showing
 // how many of the rows still facing the cutover are ready for it vs not yet
-// ready, counted in the comment's progressUnit. Rows whose change has already
-// landed are left out of both counts.
+// ready, counted in the comment's progressUnit. Settled rows are left out of
+// both counts.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	ready := countReadyForCutover(tables)
 	awaiting := countAwaitingCutover(tables)
