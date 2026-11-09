@@ -2941,6 +2941,20 @@ func PreviewCommentApplyWaitingForCutover() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyWaitingForCutoverFirstLanded renders a deferred apply
+// waiting for cutover after one table has already completed: the readiness
+// line counts only the tables still facing the cutover, so the completed
+// table is neither ready nor waited on.
+func PreviewCommentApplyWaitingForCutoverFirstLanded() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.WaitingForCutover
+	tables[2].Status = state.Task.WaitingForCutover
+	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplyWaitingForCutoverAutomatic renders a sample
 // waiting-for-cutover comment for a non-deferred apply, where the drive
 // triggers cutover automatically and the footer tells the operator no action
