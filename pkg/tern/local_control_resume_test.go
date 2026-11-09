@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -2152,6 +2155,354 @@ func TestFinalizerEngineResumeState(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, finalizerEngineResumeState(tc.stored))
+		})
+	}
+}
+
+// acceptedCutoverEngine stands in for a deploy request whose cutover the
+// provider accepted: the live schema already matches the reviewed target, so
+// every re-plan reports no remaining change. While outage is set every
+// progress poll fails, as a provider that cannot be reached does. Otherwise
+// polls walk afterOutage, the deploy request's own progress once the drive
+// reattaches to it. Apply records the resume state it is handed and accepts
+// the reattach.
+type acceptedCutoverEngine struct {
+	engine.Engine
+	mu            sync.Mutex
+	outage        bool
+	afterOutage   []*engine.ProgressResult
+	progressCalls int
+	reattached    []*engine.ResumeState
+}
+
+func (e *acceptedCutoverEngine) Name() string { return "accepted-cutover" }
+
+func (e *acceptedCutoverEngine) ProgressIsExternallyAuthoritative() bool { return true }
+
+func (e *acceptedCutoverEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	return &engine.PlanResult{NoChanges: true}, nil
+}
+
+func (e *acceptedCutoverEngine) Apply(_ context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reattached = append(e.reattached, req.ResumeState)
+	return &engine.ApplyResult{Accepted: true, ResumeState: req.ResumeState}, nil
+}
+
+func (e *acceptedCutoverEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.outage {
+		return nil, errors.New("get deploy request: rate limited")
+	}
+	i := min(e.progressCalls, len(e.afterOutage)-1)
+	e.progressCalls++
+	return e.afterOutage[i], nil
+}
+
+// deployRequestResumeMetadata is a stored resume state naming deploy request
+// 5. branchOnlyResumeMetadata names only the branch, as the engine stores it
+// before any deploy request exists.
+const (
+	deployRequestResumeMetadata = `{"branch_name":"branch-1","deploy_request_id":5}`
+	branchOnlyResumeMetadata    = `{"branch_name":"branch-1"}`
+)
+
+// acceptedCutoverFixture builds an apply of two tables, orders and payments,
+// in the given task state on a client of the given database type driving eng.
+// Both tasks belong to operation 7, whose stored resume state carries
+// metadata; an empty metadata stores none.
+func acceptedCutoverFixture(databaseType, metadata, taskState string, eng *acceptedCutoverEngine) (*LocalClient, *storage.Apply, []*storage.Task, *snapshotApplyStore) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 1, PlanID: 7, ApplyIdentifier: "apply-accepted-cutover", Database: "appdb",
+		DatabaseType: databaseType, Environment: "staging", State: state.Apply.CuttingOver,
+	}
+	var tasks []*storage.Task
+	for i, table := range []string{"orders", "payments"} {
+		tasks = append(tasks, &storage.Task{
+			ID: int64(i + 1), ApplyID: apply.ID, PlanID: 7, ApplyOperationID: &operationID,
+			TaskIdentifier: "task-" + table, Database: "appdb", DatabaseType: databaseType,
+			Namespace: "appdb", TableName: table, Environment: "staging", State: taskState,
+			DDL: "ALTER TABLE `" + table + "` ADD COLUMN `note` varchar(255)", DDLAction: "alter",
+		})
+	}
+	operations := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{
+		ID: operationID, ApplyID: apply.ID, State: state.Apply.CuttingOver,
+	}}}
+	if metadata != "" {
+		operations.data = &storage.EngineResumeState{ApplyOperationID: operationID, Metadata: metadata}
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	client := &LocalClient{
+		config: LocalConfig{Database: "appdb", Type: databaseType},
+		storage: &exactProgressStorage{
+			applies:         applies,
+			tasks:           &stateRecordingTaskStore{exactProgressTaskStore: &exactProgressTaskStore{tasks: tasks}},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: operations,
+			plans:           &scriptedPlanStore{plan: &storage.Plan{ID: 7, SchemaFiles: schema.SchemaFiles{}}},
+		},
+		logger:                   slog.Default(),
+		heartbeatInterval:        time.Hour,
+		taskPollIntervalOverride: time.Millisecond,
+	}
+	if databaseType == storage.DatabaseTypeVitess {
+		client.planetscaleEngine = eng
+	} else {
+		// A database-scoped DSN lets the re-plan diff the database as one unit
+		// without schema files.
+		client.config.TargetDSN = "root@tcp(127.0.0.1:3306)/appdb"
+		client.spiritEngine = eng
+	}
+	return client, apply, tasks, applies
+}
+
+// A Vitess apply's cutover is accepted by the provider, and then the provider
+// stops answering: the progress polls that would record the revert window
+// fail until the drive pauses the apply for retry, resting both tables
+// failed_retryable while the deploy request is in its revert window. The
+// live schema already matches the reviewed target, so a resume that settled
+// the tables from the re-plan would complete the apply and the operator would
+// never be offered the revert. Because the stored resume state names the
+// deploy request, the resume reattaches to it instead: the engine is handed
+// the stored deploy request, the tables reach the revert window, and they
+// complete only when the deploy request reports completion.
+func TestResumeReplanReattachesToAnAcceptedCutover(t *testing.T) {
+	eng := &acceptedCutoverEngine{outage: true, afterOutage: []*engine.ProgressResult{
+		{State: engine.StateRevertWindow},
+		{State: engine.StateCompleted},
+	}}
+	client, apply, tasks, applies := acceptedCutoverFixture(storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.CuttingOver, eng)
+	taskStore := client.storage.Tasks().(*stateRecordingTaskStore)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+	require.Equal(t, state.Apply.FailedRetryable, applies.stored.State, "the poll outage pauses the apply")
+	for _, task := range tasks {
+		require.Equal(t, state.Task.FailedRetryable, task.State, "the pause rests %s retryable", task.TableName)
+	}
+
+	eng.mu.Lock()
+	eng.outage = false
+	eng.mu.Unlock()
+	taskStore.states = nil
+	resumed := applies.stored
+	require.NoError(t, client.resumeApplyWithTasks(t.Context(), &resumed, nil, tasks, map[string]string{}, false, false))
+
+	require.Len(t, eng.reattached, 1, "the resume reattaches to the engine instead of settling the tables from the re-plan")
+	require.NotNil(t, eng.reattached[0])
+	assert.Equal(t, deployRequestResumeMetadata, eng.reattached[0].Metadata, "the engine is handed the stored deploy request")
+	assert.Contains(t, taskStore.states, state.Task.RevertWindow, "the reattached drive records the revert window")
+	assert.Less(t, slices.Index(taskStore.states, state.Task.RevertWindow), slices.Index(taskStore.states, state.Task.Completed),
+		"the tables complete only after the revert window, from engine progress")
+	assert.Equal(t, state.Apply.Completed, applies.stored.State)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Completed, task.State, "table %s", task.TableName)
+	}
+}
+
+// The resume re-plan keeps a task whose change landed active only when its
+// engine reattaches to accepted work and the task's stored resume state names
+// a deploy request. A failed_retryable task (an apply paused by a poll
+// outage) and a cutting_over task (a crashed drive) are both kept. Without a
+// deploy request in the resume state — nothing stored, or only the branch —
+// and on an engine that does not reattach, the task settles completed from the
+// schema match as before.
+func TestResumeReplanKeepsLandedTaskActiveOnlyForAcceptedWork(t *testing.T) {
+	cases := []struct {
+		name         string
+		databaseType string
+		metadata     string
+		taskState    string
+		wantActive   bool
+	}{
+		{"paused vitess task with a deploy request reattaches", storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.FailedRetryable, true},
+		{"crashed vitess task cutting over with a deploy request reattaches", storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.CuttingOver, true},
+		{"requeued vitess task with a deploy request reattaches", storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.Pending, true},
+		{"vitess task whose resume state names only a branch settles", storage.DatabaseTypeVitess, branchOnlyResumeMetadata, state.Task.FailedRetryable, false},
+		{"vitess task with no stored resume state settles", storage.DatabaseTypeVitess, "", state.Task.CuttingOver, false},
+		{"spirit task settles even with a deploy request in its resume state", storage.DatabaseTypeMySQL, deployRequestResumeMetadata, state.Task.CuttingOver, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, apply, tasks, _ := acceptedCutoverFixture(tc.databaseType, tc.metadata, tc.taskState, &acceptedCutoverEngine{})
+
+			rp, err := client.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{ID: 7})
+
+			require.NoError(t, err)
+			if tc.wantActive {
+				assert.Zero(t, rp.CompletedCount)
+				assert.Equal(t, tasks, rp.ActiveTasks)
+				for _, task := range tasks {
+					assert.Equal(t, tc.taskState, task.State, "table %s keeps its stored state", task.TableName)
+				}
+				return
+			}
+			assert.Equal(t, int64(2), rp.CompletedCount)
+			assert.Empty(t, rp.ActiveTasks)
+			for _, task := range tasks {
+				assert.Equal(t, state.Task.Completed, task.State, "table %s", task.TableName)
+			}
+		})
+	}
+}
+
+// A stored resume state the re-plan cannot read cannot rule out a deploy
+// request the engine accepted, so the re-plan fails instead of settling the
+// tasks from the schema match, and no task is written completed.
+func TestResumeReplanFailsOnAnUnreadableResumeState(t *testing.T) {
+	client, apply, tasks, _ := acceptedCutoverFixture(storage.DatabaseTypeVitess, `{"deploy_request_id":`, state.Task.CuttingOver, &acceptedCutoverEngine{})
+
+	_, err := client.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{ID: 7})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.Contains(t, err.Error(), "decode engine resume state before settling task task-orders")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.CuttingOver, task.State, "table %s", task.TableName)
+	}
+}
+
+// resumeStateReadsThenFail answers the first `reads` engine resume state reads
+// from the embedded store and fails every read after them, as storage that
+// goes away part-way through a resume does.
+type resumeStateReadsThenFail struct {
+	*exactProgressApplyOperationStore
+	reads int
+	err   error
+}
+
+func (s *resumeStateReadsThenFail) GetEngineResumeState(ctx context.Context, operationID int64) (*storage.EngineResumeState, error) {
+	if s.reads == 0 {
+		return nil, s.err
+	}
+	s.reads--
+	return s.exactProgressApplyOperationStore.GetEngineResumeState(ctx, operationID)
+}
+
+// A paused Vitess apply resumes with its stored resume state readable, so the
+// first re-plan keeps both tables active for the reattach. The final re-plan
+// inside the grouped launch then cannot read the state. The deploy request the
+// engine accepted is still open, so the drive exits with the read error and
+// writes no terminal state: the apply stays paused for a later claim to
+// reattach, instead of being failed with its revert window abandoned.
+func TestResumeExitsWithoutTerminalStateWhenFinalReplanCannotReadResumeState(t *testing.T) {
+	eng := &acceptedCutoverEngine{}
+	client, apply, tasks, applies := acceptedCutoverFixture(storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.FailedRetryable, eng)
+	apply.State = state.Apply.FailedRetryable
+	applies.stored = *apply
+	store := client.storage.(*exactProgressStorage)
+	// The first re-plan reads the state once per table; the final re-plan's
+	// first read fails.
+	store.applyOperations = &resumeStateReadsThenFail{
+		exactProgressApplyOperationStore: store.applyOperations.(*exactProgressApplyOperationStore),
+		reads:                            len(tasks),
+		err:                              errors.New("storage unavailable"),
+	}
+	taskStore := client.storage.Tasks().(*stateRecordingTaskStore)
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, map[string]string{}, false, false)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.Contains(t, err.Error(), "storage unavailable")
+	assert.Empty(t, eng.reattached, "the engine is not handed a resume the drive could not verify")
+	assert.Equal(t, state.Apply.FailedRetryable, applies.stored.State, "the apply row keeps the pause it was claimed in")
+	assert.NotContains(t, taskStore.states, state.Task.Failed, "no task is written failed")
+	assert.NotContains(t, taskStore.states, state.Task.Completed, "no task is written completed")
+	for _, task := range tasks {
+		assert.False(t, state.IsTerminalTaskState(task.State), "table %s stays non-terminal in %s", task.TableName, task.State)
+	}
+}
+
+// A task whose own statement is gone from a re-plan that still lists a
+// sibling's statement for the same table has landed, and the resume would
+// settle it without re-running it. Accepted engine work outranks that too:
+// with a deploy request in the stored resume state the task stays active for
+// the reattach, and without one it settles as landed.
+func TestResumeReplanKeepsLandedStatementActiveForAcceptedWork(t *testing.T) {
+	for _, tc := range []struct {
+		metadata   string
+		wantActive bool
+	}{
+		{deployRequestResumeMetadata, true},
+		{branchOnlyResumeMetadata, false},
+	} {
+		t.Run(tc.metadata, func(t *testing.T) {
+			client, apply, tasks, _ := acceptedCutoverFixture(storage.DatabaseTypeVitess, tc.metadata, state.Task.FailedRetryable, &acceptedCutoverEngine{})
+			landed := tasks[0]
+			sibling := *landed
+			sibling.ID, sibling.TaskIdentifier, sibling.State = 3, "task-orders-index", state.Task.Pending
+			sibling.DDL = "ALTER TABLE `orders` ADD INDEX `idx_note` (`note`)"
+			client.planetscaleEngine = &replanTargetEngine{plan: &engine.PlanResult{Changes: []engine.SchemaChange{{
+				Namespace:    "appdb",
+				TableChanges: []engine.TableChange{{Table: "orders", DDL: sibling.DDL}},
+			}}}}
+
+			rp, err := client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{landed, &sibling}, &storage.Plan{ID: 7})
+
+			require.NoError(t, err)
+			if tc.wantActive {
+				assert.Zero(t, rp.CompletedCount)
+				assert.Equal(t, []*storage.Task{landed, &sibling}, rp.ActiveTasks)
+				assert.Equal(t, state.Task.FailedRetryable, landed.State)
+				return
+			}
+			assert.Equal(t, int64(1), rp.CompletedCount)
+			assert.Equal(t, []*storage.Task{&sibling}, rp.ActiveTasks)
+			assert.Equal(t, state.Task.Completed, landed.State)
+		})
+	}
+}
+
+// A terminal task is never reattached to, whatever its stored resume state
+// records. A cancelled task whose change the re-plan finds landed is the one
+// terminal state that reaches the reattach decision, and it must not return to
+// the active set: a drive would otherwise reattach to a deploy request the
+// task's own verdict already closed.
+func TestResumeReplanDoesNotReattachATerminalTask(t *testing.T) {
+	client, apply, tasks, _ := acceptedCutoverFixture(storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.Cancelled, &acceptedCutoverEngine{})
+
+	reattach, err := client.taskReattachesToAcceptedWork(t.Context(), tasks[0])
+	require.NoError(t, err)
+	assert.False(t, reattach, "a terminal task is never reattached to")
+
+	rp, err := client.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{ID: 7})
+	require.NoError(t, err)
+	assert.Empty(t, rp.ActiveTasks, "a terminal task does not return to the active set")
+}
+
+// The outcome of a reattached deploy request comes from engine progress alone.
+// When the provider reports the request failed or cancelled after the live
+// schema already matched the reviewed target, the apply ends failed or
+// cancelled with its tasks in the same state; the schema match never settles
+// any task completed.
+func TestResumeReattachedDeployRequestThatFailsOrIsCancelledEndsTheApplyThere(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		result    *engine.ProgressResult
+		wantTask  string
+		wantApply string
+	}{
+		{"failed", &engine.ProgressResult{State: engine.StateFailed, ErrorMessage: "deploy request failed"}, state.Task.Failed, state.Apply.Failed},
+		{"cancelled", &engine.ProgressResult{State: engine.StateCancelled}, state.Task.Cancelled, state.Apply.Cancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := &acceptedCutoverEngine{afterOutage: []*engine.ProgressResult{tc.result}}
+			client, apply, tasks, applies := acceptedCutoverFixture(storage.DatabaseTypeVitess, deployRequestResumeMetadata, state.Task.FailedRetryable, eng)
+			apply.State = state.Apply.FailedRetryable
+			applies.stored = *apply
+			taskStore := client.storage.Tasks().(*stateRecordingTaskStore)
+
+			require.NoError(t, client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, map[string]string{}, false, false))
+
+			require.Len(t, eng.reattached, 1, "the resume reattaches to the deploy request")
+			assert.Equal(t, tc.wantApply, applies.stored.State)
+			assert.NotContains(t, taskStore.states, state.Task.Completed, "no task is written completed")
+			for _, task := range tasks {
+				assert.Equal(t, tc.wantTask, task.State, "table %s", task.TableName)
+			}
 		})
 	}
 }
