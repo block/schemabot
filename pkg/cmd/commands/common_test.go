@@ -151,6 +151,22 @@ func TestLoadCLIConfig_ParsesIgnoreNamespaces(t *testing.T) {
 	assert.Equal(t, []string{"local_fixtures"}, cfg.IgnoreNamespaces)
 }
 
+func TestLoadCLIConfig_IgnoreNamespacePatterns(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nignore_namespaces:\n  - /^mydb_[0-9]+_production$/\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/^mydb_[0-9]+_production$/"}, cfg.IgnoreNamespaces)
+
+	content = "database: mydb\ntype: mysql\nignore_namespaces:\n  - /^mydb_[0-9]+_{env}$/\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+	cfg, err = LoadCLIConfig(dir)
+	require.ErrorContains(t, err, "is a pattern and cannot use {env} or $ENV")
+	assert.Nil(t, cfg)
+}
+
 func TestLoadCLIConfig_RejectsIgnoreNamespacePaths(t *testing.T) {
 	dir := t.TempDir()
 	content := "database: mydb\ntype: vitess\nignore_namespaces:\n  - schema/local_fixtures\n"
