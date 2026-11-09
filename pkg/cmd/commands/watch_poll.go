@@ -89,6 +89,10 @@ type progressRetry struct {
 	err     error
 	attempt int
 	wait    time.Duration
+
+	// cappedFrom is the longer delay a Retry-After header asked for when the
+	// CLI's bound shortened the wait below it, and zero otherwise.
+	cappedFrom time.Duration
 }
 
 // next returns the apply's current progress. A transient failure (the server
@@ -118,7 +122,7 @@ func (p *progressPoller) next(onRetry func(progressRetry)) (*apitypes.ProgressRe
 			return nil, fmt.Errorf("%s: %w", progressGiveUpMessage(p.applyID, p.environment, failures), err)
 		}
 		wait := progressRetryWait(err, failures)
-		onRetry(progressRetry{err: err, attempt: failures, wait: wait})
+		onRetry(progressRetry{err: err, attempt: failures, wait: wait, cappedFrom: cappedRetryDelay(err, wait)})
 		if err := p.pause(wait); err != nil {
 			return nil, err
 		}
@@ -215,11 +219,44 @@ func requestedRetryDelay(err error) time.Duration {
 	return apiErr.RetryAfterHeader
 }
 
+// cappedRetryDelay is the delay a failed fetch's Retry-After header asked for
+// when the CLI's bound shortened it and the watch will poll again before that
+// delay is up. Zero when the watch waits at least as long as was asked.
+func cappedRetryDelay(err error, wait time.Duration) time.Duration {
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.RetryAfterHeaderUncapped > wait {
+		return apiErr.RetryAfterHeaderUncapped
+	}
+	return 0
+}
+
+// maxReportedRetryDelay is the longest capped Retry-After delay the retry
+// line states exactly. A header too far out to read, such as a count of
+// seconds that overflows or a year-9999 date, parses to a saturated duration
+// the server never named, so past this ceiling the line says only that the
+// delay was more than a day.
+const maxReportedRetryDelay = 24 * time.Hour
+
+// formatCappedRetryDelay renders the delay a capped Retry-After header asked
+// for, exactly up to maxReportedRetryDelay and as "more than 24h" beyond it.
+func formatCappedRetryDelay(d time.Duration) string {
+	if d > maxReportedRetryDelay {
+		return "more than 24h"
+	}
+	return d.String()
+}
+
 // printProgressRetry reports a transient progress failure on stderr, keeping
 // stdout to the watch's own output so a JSON stream stays machine-readable.
+// When the CLI's bound shortened the delay the server asked for, the line says
+// so, so the operator knows the next poll comes sooner than asked.
 func printProgressRetry(r progressRetry) {
+	wait := r.wait.String()
+	if r.cappedFrom > 0 {
+		wait += fmt.Sprintf(" (server asked for %s, capped)", formatCappedRetryDelay(r.cappedFrom))
+	}
 	fmt.Fprintf(os.Stderr, "Progress unavailable (attempt %d/%d), retrying in %s: %v\n",
-		r.attempt, maxConsecutiveProgressFailures, r.wait, r.err)
+		r.attempt, maxConsecutiveProgressFailures, wait, r.err)
 }
 
 // terminalWatchExit is the exit a non-interactive watch reports once the apply

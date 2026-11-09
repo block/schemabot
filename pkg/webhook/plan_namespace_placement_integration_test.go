@@ -60,6 +60,9 @@ type namespacePlacementHarness struct {
 	github     *planFlowResult
 	mux        *http.ServeMux
 	production *namespaceSelectingTernClient
+	// client is the handler's installation client, for a test that folds the
+	// aggregate directly.
+	client *ghclient.InstallationClient
 }
 
 func newNamespacePlacementHarness(t *testing.T, productionTargets []api.TargetEntry) *namespacePlacementHarness {
@@ -144,6 +147,7 @@ func newMultiEnvPlanHarnessWithRepo(t *testing.T, productionTargets []api.Target
 		store:   st,
 		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
 		github:  result,
+		client:  installClient,
 		mux:     mux,
 	}
 }

@@ -8,9 +8,10 @@
 // beside them (🛑), naming the member each one collapses into, so a sixth
 // level cannot enter through a glyph the vocabulary never defined.
 //
-// The vocabulary's one non-severity member, the documentation pointer 📖, is
-// flagged the same way: it shares the package so every surface renders the
-// same glyph, and a literal spelled at a rendering site would let it drift.
+// The vocabulary's non-severity members, the documentation pointer 📖 and the
+// tip 💡, are flagged the same way: they share the package so every surface
+// renders the same glyph, and a literal spelled at a rendering site would let
+// them drift.
 //
 // The analyzer inspects decoded string values, so escape-spelled glyphs
 // (e.g. "❌") are caught the same as literal ones. It matches on the
@@ -66,8 +67,10 @@ var severityGlyphs = []struct {
 var vocabularyGlyphs = []struct {
 	glyph    string
 	constant string
+	kind     string
 }{
-	{"📖", "glyph.Docs"},
+	{"📖", "glyph.Docs", "documentation"},
+	{"💡", "glyph.Tip", "tip"},
 }
 
 // Analyzer flags string literals containing a severity glyph in non-test
@@ -76,7 +79,7 @@ var vocabularyGlyphs = []struct {
 // drifts.
 var Analyzer = &analysis.Analyzer{
 	Name:     "severityglyphs",
-	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), glyphs that read as severity without being vocabulary members (🛑), and the documentation glyph (📖), in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
+	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), glyphs that read as severity without being vocabulary members (🛑), and the documentation (📖) and tip (💡) glyphs, in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
@@ -105,7 +108,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 		for _, vg := range vocabularyGlyphs {
 			if strings.Contains(val, vg.glyph) {
-				pass.Reportf(lit.Pos(), "documentation glyph %s in string literal — use %s from pkg/glyph", vg.glyph, vg.constant)
+				pass.Reportf(lit.Pos(), "%s glyph %s in string literal — use %s from pkg/glyph", vg.kind, vg.glyph, vg.constant)
 			}
 		}
 	})

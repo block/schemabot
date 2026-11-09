@@ -205,6 +205,7 @@ func previewCommentPlanAllOutput() {
 		{"POSTGRES PLAN (ENGINE-BLOCKED CHANGE, TWO CAUSES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlockedPostgres()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"MYSQL PLAN (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnsafe()) }},
+		{"MYSQL PLAN (MANY UNSAFE CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyUnsafeChanges()) }},
 		{"MYSQL PLAN (CHANGE ATTRIBUTED TO ANOTHER PR)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanAttributedChange()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED, APPLYING)", func() {

@@ -3843,26 +3843,44 @@ func firstFailedTaskError(tasks []*storage.Task) string {
 	return ""
 }
 
-// firstFailedOperationMessage returns a deployment-qualified failure reason from
-// the first failed operation row that carries one, naming the operation's
+// firstOperationMessageInState returns a deployment-qualified reason from the
+// first operation row in opState that carries one, naming the operation's
 // target as well when it has one, since a deployment addressing several
-// targets says nothing about which of them failed. It surfaces the parent
-// apply's ErrorMessage from the aggregate when the rollout settles to failed,
-// rather than leaving whatever message the last-driven (possibly successful)
-// operation wrote. The rollout's failure verdict is the first failure, so the
-// first failed row in deployment order wins. Empty when no failed operation
-// carries a message, so the caller keeps the existing apply message as fallback.
-func firstFailedOperationMessage(ops []*storage.ApplyOperation) string {
+// targets says nothing about which of them the reason belongs to. outcome is
+// the verb phrase that joins the row to its reason ("failed", "paused for
+// retry"). It surfaces the parent apply's ErrorMessage from the aggregate when
+// the rollout settles or pauses, rather than leaving whatever message the
+// last-driven (possibly successful) operation wrote. The rollout's verdict is
+// the first row to reach the state, so the first such row in deployment order
+// wins. Empty when no row in opState carries a message, so the caller keeps the
+// existing apply message as fallback.
+func firstOperationMessageInState(ops []*storage.ApplyOperation, opState, outcome string) string {
 	for _, op := range ops {
-		if !state.IsState(op.State, state.ApplyOperation.Failed) || op.ErrorMessage == "" {
+		if !state.IsState(op.State, opState) || op.ErrorMessage == "" {
 			continue
 		}
 		if op.Target != "" {
-			return fmt.Sprintf("target %s on deployment %s failed: %s", op.Target, op.Deployment, op.ErrorMessage)
+			return fmt.Sprintf("target %s on deployment %s %s: %s", op.Target, op.Deployment, outcome, op.ErrorMessage)
 		}
-		return fmt.Sprintf("deployment %s failed: %s", op.Deployment, op.ErrorMessage)
+		return fmt.Sprintf("deployment %s %s: %s", op.Deployment, outcome, op.ErrorMessage)
 	}
 	return ""
+}
+
+// Outcome words firstOperationMessageInState puts between the operation's
+// location and its own message when the projection names the parent's reason.
+const (
+	failedOperationOutcome = "failed"
+	pausedOperationOutcome = "paused for retry"
+)
+
+// isProjectedPauseReason reports whether the parent's message is one the
+// projection stamped from a paused operation. Only such a message is cleared
+// when the rollout leaves its pause; a message another path wrote to a paused
+// parent, such as the task failure that paused a parent-lease apply, is kept
+// as the fallback when no operation carries a replacement.
+func isProjectedPauseReason(message string) bool {
+	return strings.Contains(message, " "+pausedOperationOutcome+": ")
 }
 
 // persistOperationState writes the claimed operation row to reflect a derived
@@ -4200,7 +4218,47 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		startedAt = &now
 	}
 
-	if state.IsState(apply.State, derived) && startedAt == nil {
+	// The parent's message follows the aggregate the same way its state does.
+	// When the rollout settles to failed, surface the failure reason from the
+	// first failed operation rather than leaving whatever message the last-driven
+	// operation wrote — under continue the last driver may be a successful
+	// sibling, which would leave the failed verdict with no matching reason.
+	// When it pauses for a retry, surface the first paused operation's reason,
+	// so the pause can be triaged from the apply without opening its operation
+	// rows. Either way the existing message is the fallback when no operation
+	// carries one, except a pause reason the projection itself stamped: it
+	// describes work the rollout was about to retry, so it is cleared when the
+	// projection takes the parent out of its pause, as a claim of a paused
+	// parent-lease apply clears it, and the operation that settles the retry
+	// supplies the next reason. A message another path wrote to the paused
+	// parent is not a pause reason and stays as the fallback.
+	errorMessage := apply.ErrorMessage
+	leavingPause := state.IsState(apply.State, state.Apply.FailedRetryable) && !state.IsState(derived, state.Apply.FailedRetryable)
+	if leavingPause && isProjectedPauseReason(apply.ErrorMessage) {
+		errorMessage = ""
+	}
+	switch {
+	case state.IsState(derived, state.Apply.Failed):
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.Failed, failedOperationOutcome); msg != "" {
+			errorMessage = msg
+		}
+	case state.IsState(derived, state.Apply.FailedRetryable):
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.FailedRetryable, pausedOperationOutcome); msg != "" {
+			errorMessage = msg
+		}
+	}
+
+	// A projection that changes nothing the parent records is skipped. A held
+	// pause is the one state whose message can change without the state
+	// changing: a rollout can stay paused while the operation that supplied its
+	// reason is retried and completes beside a sibling still paused, and the
+	// parent then has to name the sibling. A terminal verdict's message is
+	// written once, at the transition, and is left alone afterwards; a remote
+	// apply's row already carries the data plane's own failure message, and
+	// re-projecting it would replace that message with the aggregate's
+	// deployment-qualified one.
+	pauseReasonChanged := state.IsState(derived, state.Apply.FailedRetryable) && errorMessage != apply.ErrorMessage
+	if state.IsState(apply.State, derived) && startedAt == nil && !pauseReasonChanged {
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			append(apply.LogAttrs(),
 				"driver", driverID, "operation_count", len(ops))...)
@@ -4221,18 +4279,6 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		}
 	default:
 		completedAt = nil
-	}
-
-	// When the rollout settles to failed, surface the failure reason from the
-	// aggregate (the first failed operation) rather than leaving whatever message
-	// the last-driven operation wrote — under continue the last driver may be a
-	// successful sibling, which would leave the failed verdict with no matching
-	// reason. Keep the existing message as a fallback when no operation carries one.
-	errorMessage := apply.ErrorMessage
-	if state.IsState(derived, state.Apply.Failed) {
-		if msg := firstFailedOperationMessage(ops); msg != "" {
-			errorMessage = msg
-		}
 	}
 
 	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, startedAt, completedAt)
@@ -4256,10 +4302,10 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// lease-lost settle, stop reconciliation). Record the transition in the
 	// apply's own durable log so its timeline states how it reached the derived
 	// state instead of ending at the last claim entry. A swap that only stamps
-	// started_at while the state holds is not a transition, so it writes no
-	// timeline entry.
+	// started_at or refreshes the message while the state holds is not a
+	// transition, so it writes no timeline entry.
 	if state.IsState(apply.State, derived) {
-		s.logger.Debug("operator: derived apply state swap stamped started_at only; no state transition to record",
+		s.logger.Debug("operator: derived apply state swap kept the state; no state transition to record",
 			append(apply.LogAttrs(),
 				"driver", driverID, "derived_state", derived)...)
 	} else {

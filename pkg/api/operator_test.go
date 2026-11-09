@@ -1149,6 +1149,253 @@ func TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarri
 		"with no operation-level message the existing apply reason must be preserved")
 }
 
+// TestUpdateApplyStateFromOperations_StampsPauseReason verifies that when the
+// rollout pauses for a retry the parent apply's ErrorMessage names the paused
+// operation and its reason, so the pause can be triaged from the apply alone.
+// A sharded namespace's group_finalizer pauses on a retryable deploy error
+// while its sibling shard work completed; the derived failed_retryable verdict
+// must carry that finalizer's deployment and reason, not the successful
+// sibling's empty message.
+func TestUpdateApplyStateFromOperations_StampsPauseReason(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", Target: "orders-001", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "region-a", Target: "orders-002", State: state.ApplyOperation.Completed},
+		{ID: 3, Deployment: "region-a", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.FailedRetryable, ErrorMessage: "vschema deploy endpoint unreachable"},
+	}
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+	}
+
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	require.NotNil(t, applyStore.updated, "derived failed_retryable differs from running, so the apply must be persisted")
+	assert.Equal(t, state.Apply.FailedRetryable, applyStore.updated.State)
+	assert.Equal(t, "deployment region-a paused for retry: vschema deploy endpoint unreachable", applyStore.updated.ErrorMessage,
+		"the pause reason must come from the paused operation, not the completed siblings")
+}
+
+// TestUpdateApplyStateFromOperations_ClearsPauseReasonOnRetry verifies that
+// when the retry claim moves the paused operation back to running and the
+// projection takes the parent out of failed_retryable, the pause reason is
+// cleared rather than carried onto an apply that is working again. The
+// operation row's own reason was cleared by the redispatch, so the parent's
+// stale copy would otherwise be the only place the cured error survived.
+func TestUpdateApplyStateFromOperations_ClearsPauseReasonOnRetry(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", Target: "orders-001", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "region-a", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Running},
+	}
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.FailedRetryable,
+		Environment:     "staging",
+		ErrorMessage:    "deployment region-a paused for retry: vschema deploy endpoint unreachable",
+	}
+
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	require.NotNil(t, applyStore.updated, "derived running differs from failed_retryable, so the apply must be persisted")
+	assert.Equal(t, state.Apply.Running, applyStore.updated.State)
+	assert.Empty(t, applyStore.updated.ErrorMessage,
+		"a pause reason must not outlive the pause it describes")
+}
+
+// TestUpdateApplyStateFromOperations_PauseReasonYieldsToFailure verifies that a
+// rollout leaving its pause for a failed verdict reports the failure's reason:
+// the retried finalizer completed, and a sibling that failed with a message
+// replaces the pause reason, while a sibling that failed without one leaves no
+// reason at all rather than the stale pause, since the apply did not fail for
+// the reason it paused.
+func TestUpdateApplyStateFromOperations_PauseReasonYieldsToFailure(t *testing.T) {
+	pauseReason := "deployment region-a paused for retry: vschema deploy endpoint unreachable"
+	cases := []struct {
+		name        string
+		failed      *storage.ApplyOperation
+		wantMessage string
+	}{
+		{
+			name:        "failed sibling with a reason",
+			failed:      &storage.ApplyOperation{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: cutover failed"},
+			wantMessage: "deployment region-b failed: spirit: cutover failed",
+		},
+		{
+			name:        "failed sibling without a reason",
+			failed:      &storage.ApplyOperation{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Failed},
+			wantMessage: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				{ID: 1, Deployment: "region-a", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Completed},
+				tc.failed,
+			}
+			applyStore := &recordingApplyStore{swapped: true}
+			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+			apply := &storage.Apply{
+				ID:              3,
+				ApplyIdentifier: "apply-projection",
+				State:           state.Apply.FailedRetryable,
+				Environment:     "staging",
+				ErrorMessage:    pauseReason,
+			}
+
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			require.NotNil(t, applyStore.updated)
+			assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+			assert.Equal(t, tc.wantMessage, applyStore.updated.ErrorMessage)
+		})
+	}
+}
+
+// TestUpdateApplyStateFromOperations_KeepsTaskFailureWhenLeavingPause verifies
+// that a paused parent whose message names a task failure, rather than a pause
+// reason the projection stamped, keeps that message when the rollout settles
+// to failed from an operation carrying no reason of its own: the cause the
+// apply paused for is still the cause it failed for. An operation that does
+// carry a reason still replaces it.
+func TestUpdateApplyStateFromOperations_KeepsTaskFailureWhenLeavingPause(t *testing.T) {
+	taskFailure := "table orders failed: lock wait timeout"
+	cases := []struct {
+		name        string
+		failed      *storage.ApplyOperation
+		wantMessage string
+	}{
+		{
+			name:        "failed operation without a reason",
+			failed:      &storage.ApplyOperation{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed},
+			wantMessage: taskFailure,
+		},
+		{
+			name:        "failed operation with a reason",
+			failed:      &storage.ApplyOperation{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: cutover failed"},
+			wantMessage: "deployment region-a failed: spirit: cutover failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyStore := &recordingApplyStore{swapped: true}
+			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{tc.failed}}, applyStore)
+
+			apply := &storage.Apply{
+				ID:              3,
+				ApplyIdentifier: "apply-projection",
+				State:           state.Apply.FailedRetryable,
+				Environment:     "staging",
+				ErrorMessage:    taskFailure,
+			}
+
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			require.NotNil(t, applyStore.updated)
+			assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+			assert.Equal(t, tc.wantMessage, applyStore.updated.ErrorMessage)
+		})
+	}
+}
+
+// TestUpdateApplyStateFromOperations_RefreshesPauseReasonWhilePaused verifies
+// that a rollout which stays paused still has its reason kept current. Two
+// deployments' finalizers paused; the retry of the first completed while the
+// second is still paused, so the derived state holds at failed_retryable. The
+// parent must now name the finalizer that is still paused rather than keep the
+// cured one's reason, and a projection that changes neither state nor reason
+// writes nothing.
+func TestUpdateApplyStateFromOperations_RefreshesPauseReasonWhilePaused(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	regionBReason := "deployment region-b paused for retry: vschema deploy endpoint unreachable"
+	cases := []struct {
+		name        string
+		message     string
+		wantUpdated bool
+	}{
+		{
+			name:        "reason names the cured finalizer",
+			message:     "deployment region-a paused for retry: vschema deploy endpoint unreachable",
+			wantUpdated: true,
+		},
+		{
+			name:        "reason already names the paused finalizer",
+			message:     regionBReason,
+			wantUpdated: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := []*storage.ApplyOperation{
+				{ID: 1, Deployment: "region-a", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Completed},
+				{ID: 2, Deployment: "region-b", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.FailedRetryable, ErrorMessage: "vschema deploy endpoint unreachable"},
+			}
+			applyStore := &recordingApplyStore{swapped: true}
+			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+			apply := &storage.Apply{
+				ID:              3,
+				ApplyIdentifier: "apply-projection",
+				State:           state.Apply.FailedRetryable,
+				Environment:     "staging",
+				StartedAt:       &startedAt,
+				ErrorMessage:    tc.message,
+			}
+
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			if !tc.wantUpdated {
+				assert.Nil(t, applyStore.updated, "a projection that changes neither state nor reason must not write")
+				return
+			}
+			require.NotNil(t, applyStore.updated, "the pause reason changed, so the apply must be persisted even though its state held")
+			assert.Equal(t, state.Apply.FailedRetryable, applyStore.updated.State)
+			assert.Equal(t, regionBReason, applyStore.updated.ErrorMessage,
+				"the reason must name the finalizer that is still paused, not the one whose retry completed")
+		})
+	}
+}
+
+// TestUpdateApplyStateFromOperations_KeepsFailedMessageWhileFailed verifies
+// that a failed verdict's message is written at the transition and left alone
+// afterwards. A remote apply's row already carries the data plane's own failure
+// message when the operator projects the aggregate, whose message qualifies the
+// same failure with its deployment. The state holds at failed, so the
+// projection must not rewrite the message the row already carries.
+func TestUpdateApplyStateFromOperations_KeepsFailedMessageWhileFailed(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	completedAt := time.Now()
+	remoteMessage := "remote schema change failed while checking target connectivity"
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "data-plane", State: state.ApplyOperation.Failed, ErrorMessage: remoteMessage},
+	}
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Failed,
+		Environment:     "staging",
+		StartedAt:       &startedAt,
+		CompletedAt:     &completedAt,
+		ErrorMessage:    remoteMessage,
+	}
+
+	result, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	assert.False(t, result.Swapped)
+	assert.Nil(t, applyStore.updated, "a failed apply whose state holds must keep the message its row already carries")
+}
+
 // TestUpdateApplyStateFromOperations_ReturnsProjectionResult verifies the
 // structured projection result the writer returns: whether the compare-and-swap
 // advanced the apply row, the previous and derived states, and whether the swap

@@ -593,10 +593,12 @@ match, which all read the schema paths a PR vacates as well as those it changes
 the narrowing to what a PR proposes keeping every vacated schema or config path the default branch
 still holds (`PRFilesProposedAgainstDefaultBranch` in `pkg/github/client.go`);
 required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
-`pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
-multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
+`pkg/webhook/check_prior_env.go`); an environment that could not plan, whether planned alone,
+alongside environments that also failed, or while another of the same plan did, stored as a
+failing check that replaces its earlier passing one, or, when that row cannot be stored, a
 failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
-`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
+`pkg/webhook/check_records.go`, called through `recordPlanFailuresAndFold` by
+`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
 retry preparation durably invalidating old successes before releasing aggregate blocks (`MarkPlanPending` in `pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-3: The rollup is conservative
@@ -871,10 +873,10 @@ control-owned states (`stopped`, `failed_retryable`) are never overwritten by ac
 and active states advance strictly forward through the lifecycle.
 
 The guard belongs to the drive loop, which is where stale polls come from, and nothing else
-assigns task state. That is a consequence of OW-8: every writer of a task row is a driver or an
-elected reaper, so every write either goes through this resolution or is a reaper settling a row
-no driver is touching. *Enforced:* the forward-only state resolution
-the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
+assigns task state. That is a consequence of OW-8: every writer of a task row is a driver, an
+elected reaper, or the conflict check settling a task whose lease has gone stale, so every write
+either goes through this resolution or lands on a row no driver is touching. *Enforced:* the
+forward-only state resolution the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
 outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
 `pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
@@ -926,9 +928,11 @@ starts again a task another run held the table from (`pkg/tern/local_apply_seque
 resume re-plan that settles a task whose change already landed and whose stored resume state records
 no deploy request to reattach to (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
-retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the per-operation budget in
-the redispatch claim (`FindNextApplyOperation`,
+retrying can cure instead of failing it (`driveGroupFinalizer`, same file), the conflict check,
+which pauses a stale apply for retry when its engine reports a retryable failure so the next
+recovery is charged against the budget (`pauseStaleApplyForRetry` in `pkg/tern/local_apply.go`),
+and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the
+per-operation budget in the redispatch claim (`FindNextApplyOperation`,
 `pkg/storage/internal/sqlstore/apply_operations.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
@@ -1039,10 +1043,13 @@ stale comments or overwriting newer state.
 
 The token is what a driver writes under, so a write made by something that is not driving has none
 to present and the predicate is empty. That is only safe where such a write cannot race a driver.
-The elected reaper is the sole non-driver writer (OW-8), and it earns that by writing only rows
-whose drive liveness signal has gone quiet for longer than the operator's whole recovery budget,
-re-asserted on the guarded write rather than trusted from the scan. Any new non-driver write needs
-a precondition that actually excludes a live driver. *Enforced:* a token
+Two non-driver writers exist (OW-8), and each earns it with a precondition the store re-asserts on
+the write rather than trusting from the scan. The elected reaper writes only rows whose drive
+liveness signal has gone quiet for longer than the operator's whole recovery budget. The conflict
+check settles a task only while no drive holds its operation's lease at the moment of the write,
+and pauses that task's apply and operation for retry only while each still carries the lease token
+it read and that token's heartbeat is older than the staleness window. Any new non-driver write
+needs a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
 `pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
@@ -1180,11 +1187,20 @@ work it does not own. *Enforced:* scope checks and token-guarded claim release i
 (`pkg/api/operator.go`) and operation lease checks before conflict resolution
 (`pkg/tern/local_apply.go`, `pkg/storage/internal/sqlstore/tasks.go`).
 
-### OW-8: Only drivers and elected reapers write apply and task rows
+### OW-8: Only drivers, elected reapers, and the bounded conflict check write apply and task rows
 
 Two classes of writer touch apply, apply-operation, and task rows: the driver holding that row's
-lease, and the elected reaper settling rows no driver is coming back for. Nothing else does, and a
-request goroutine serving a read never does.
+lease, and the elected reaper settling rows no driver is coming back for. One bounded writer sits
+outside both classes: the conflict check settles a task whose lease has gone stale from this
+process's own engine report and, when that settlement rests `failed_retryable`, pauses the task's
+apply and operation for retry. Its two writes carry different guards. The task settlement lands
+only while no drive holds a fresh lease on the task's operation, checked by the store at the
+write; a task that records no operation has no such lease, and its settlement rests on the apply
+lease having read stale before the engine was asked. The retry pause lands only while the apply
+and operation still carry the lease tokens the conflict check read and those tokens' heartbeats
+are older than the staleness window, the precondition a peer claim uses, so a live driver excludes
+it the same way (OW-2). The apply and operation states it writes are non-terminal ones any later
+claim undoes. Nothing else writes these rows, and a request goroutine serving a read never does.
 
 The reason is narrower than "reads and writes should not race", and survives the observation that
 a particular reader write would almost always have agreed with the driver. The guarantee OW-2
@@ -1208,8 +1224,11 @@ including when what is stored is a task that has outlived its apply's verdict (U
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
 gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
 `lockUndrivenApplies`, `pkg/storage/internal/sqlstore/apply_operations.go`,
-`pkg/storage/internal/sqlstore/applies.go`), and a read path that builds progress from
-stored rows without writing them (`pkg/api/progress_handlers.go`).
+`pkg/storage/internal/sqlstore/applies.go`), the stale-lease guards the conflict check's task
+settlement and retry pause write under (`tryResolveStaleTask`, `pauseStaleApplyForRetry`,
+`pkg/tern/local_apply.go`; `MarkStaleApplyRetryable`, `pkg/storage/internal/sqlstore/applies.go`),
+and a read path that builds progress from stored rows without writing them
+(`pkg/api/progress_handlers.go`).
 
 ### OW-9: An advisory lock is only exclusion where the session holds still
 
@@ -1755,8 +1774,9 @@ apply operation on that table that is neither terminal nor in a revert phase —
 still run it forward. A statement the re-plan still lists that only a terminal or revert-phase
 sibling was reviewed with refuses the resume instead, since nothing will run it forward.
 *Enforced:* `verifyMaterializedPlanMatchesLiveSchema`, `stampReplannedChanges` and
-`dispatchScopeForApply` on the apply path, and `verifyAttachedShardDispatch` for a shard
-dispatch attaching to an existing apply (`pkg/tern/local_plan_drift.go`, called from
+`dispatchScopeForApply` on the apply path, and `verifyShardDispatchAgainstLiveSchema` for a
+shard dispatch attaching to an existing apply or creating one from a plan row already stored
+(`pkg/tern/local_plan_drift.go`, called from `attachDispatchOperation` and `Apply` in
 `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`, and from the re-plan before a drive starts
@@ -1814,9 +1834,10 @@ those changes: when that comment cannot be posted, `rollback` withdraws its pin 
 (`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
 `LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
 applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
-dispatch scope, an attaching shard dispatch re-planned against its own shard and stamped with that
-shard's verdict, and a shard dispatch this deployment could not re-plan (it carries no schema
-files) treated as unsafe (`verifyAttachedShardDispatch` and `restoreDispatchedUnsafeVerdicts` in
+dispatch scope, a shard dispatch attaching or creating from a stored plan row re-planned against
+its own shard and stamped with that shard's verdict, and a shard dispatch this deployment could
+not re-plan (it carries no schema files) treated as unsafe
+(`verifyShardDispatchAgainstLiveSchema` and `restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
 `pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
 mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
@@ -1839,8 +1860,9 @@ in `pkg/engine/postgres/row_security.go` that abort plan creation and the apply-
 `pkg/engine/postgres/row_security_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
-to an existing apply its re-planned scope (`storage.BlockedChangeError` in
-`attachDispatchOperation`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
+to an existing apply or creating one from a stored plan row its re-planned scope
+(`storage.BlockedChangeError` in `attachDispatchOperation` and `Apply`,
+`pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
 refusing the namespace and shard verdicts of the plan they submit (a rollout's primary plan)
 before prompting or locking (`blockedPlanError` over `PlanResponse.FirstBlockedChange`, in
 `pkg/cmd/commands/apply.go`, called there and from `pkg/cmd/commands/rollback.go`), with a materialized plan carrying

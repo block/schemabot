@@ -402,7 +402,9 @@ When a dispatch's idempotency key already maps to an apply, the data plane
 resolves the dispatch by its derived operation key: a matching operation row is
 an idempotent replay (counted on `schemabot.remote_apply_dedup_total`, with
 `outcome` naming the path that resolved the key — `hit`, `conflict_race`,
-`create_race`, or `key_collision_refused`), and a missing row attaches the
+`create_race`, or `key_collision_refused`; `create_race` covers a winner found
+at the create itself and one found after this dispatch's drift check failed
+because the winner had already run the change), and a missing row attaches the
 dispatch as a new sibling
 operation, counted on `schemabot.remote_apply_attach_total`:
 
