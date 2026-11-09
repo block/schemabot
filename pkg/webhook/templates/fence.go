@@ -2,7 +2,11 @@ package templates
 
 import (
 	"math"
+	"regexp"
 	"strings"
+	"unicode"
+
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // minimumFenceLength is the shortest backtick run CommonMark accepts as a
@@ -507,4 +511,124 @@ func flattenIdentifier(name string) string {
 // row and still reads as written.
 func inlineCodeCell(name string) string {
 	return strings.ReplaceAll(inlineCode(name), "|", `\|`)
+}
+
+// mentionPattern matches what GitHub notifies as a user or team mention: an @
+// that does not follow a word character, then a login or an org/team slug. The
+// first group is the boundary character the mention follows, which stays
+// outside the span written around the second.
+var mentionPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])(@[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)?)`)
+
+// markdownReason renders a lint or unsafe change reason on one line of
+// Markdown. Identifiers the reason quotes read as code, as ui.CodeQuoteIdentifiers
+// makes them; every other character is written so it cannot start a link,
+// emphasis, an HTML tag, or a mention, because the reason carries names from
+// the PR author's schema that the quoting does not recognise. Text already in a
+// code span is left as written, which a Markdown renderer shows literally.
+func markdownReason(reason string) string {
+	return mapOutsideCodeSpans(ui.CodeQuoteIdentifiers(flattenIdentifier(reason)), escapeProse)
+}
+
+// escapeProse is escapeInlineMarkdown for text that may also name a mention: a
+// mention is written as inline code, which GitHub does not notify. An
+// underscore between two letters or digits is left alone, since it cannot
+// start emphasis there and names such as seen_at read as written.
+func escapeProse(text string) string {
+	var b strings.Builder
+	last := 0
+	for _, m := range mentionPattern.FindAllStringSubmatchIndex(text, -1) {
+		mentionStart, mentionEnd := m[4], m[5]
+		b.WriteString(escapeProseWords(text[last:mentionStart]))
+		b.WriteByte('`')
+		b.WriteString(text[mentionStart:mentionEnd])
+		b.WriteByte('`')
+		last = mentionEnd
+	}
+	b.WriteString(escapeProseWords(text[last:]))
+	return b.String()
+}
+
+// escapeProseWords is escapeInlineMarkdown without the escapes that change
+// nothing about how the text renders: an underscore inside a word, and a less
+// than sign that no HTML construct can start with, as in "<=".
+func escapeProseWords(text string) string {
+	runes := []rune(text)
+	var b strings.Builder
+	b.Grow(len(text))
+	for i, r := range runes {
+		var before, after rune
+		if i > 0 {
+			before = runes[i-1]
+		}
+		if i < len(runes)-1 {
+			after = runes[i+1]
+		}
+		switch {
+		case r == '_' && isWordRune(before) && isWordRune(after):
+			b.WriteRune(r)
+		case r == '<' && !startsHTML(after):
+			b.WriteRune(r)
+		default:
+			b.WriteString(escapeInlineMarkdown(string(r)))
+		}
+	}
+	return b.String()
+}
+
+func isWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// startsHTML reports whether r, following a less than sign, opens an HTML tag,
+// closing tag, comment, declaration or processing instruction.
+func startsHTML(r rune) bool {
+	return unicode.IsLetter(r) || r == '/' || r == '!' || r == '?'
+}
+
+// mapOutsideCodeSpans applies rewrite to the parts of text a Markdown renderer
+// reads as prose and keeps each code span as written. A span is a backtick run
+// closed by the next run of the same length; a run with no such closer is
+// prose, so its backticks reach rewrite.
+func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
+	var b strings.Builder
+	proseStart := 0
+	for i := 0; i < len(text); {
+		if text[i] != '`' {
+			i++
+			continue
+		}
+		spanStart := i
+		for i < len(text) && text[i] == '`' {
+			i++
+		}
+		spanEnd := endOfCodeSpan(text, i, i-spanStart)
+		if spanEnd < 0 {
+			continue
+		}
+		b.WriteString(rewrite(text[proseStart:spanStart]))
+		b.WriteString(text[spanStart:spanEnd])
+		proseStart = spanEnd
+		i = spanEnd
+	}
+	b.WriteString(rewrite(text[proseStart:]))
+	return b.String()
+}
+
+// endOfCodeSpan returns the index just past the first run of exactly delimiter
+// backticks at or after from, or -1 when the text has none.
+func endOfCodeSpan(text string, from, delimiter int) int {
+	for i := from; i < len(text); {
+		if text[i] != '`' {
+			i++
+			continue
+		}
+		runStart := i
+		for i < len(text) && text[i] == '`' {
+			i++
+		}
+		if i-runStart == delimiter {
+			return i
+		}
+	}
+	return -1
 }

@@ -332,7 +332,9 @@ content, DDL fences drawing on a budget shared across the comment, and the code 
 an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —
 table, namespace, keyspace, shard, schema path, database, check name — flattened to one line and
 delimited past any backtick run inside it (`pkg/webhook/templates/fence.go`, exercised across
-its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`); the Check Run
+its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`), and the escaping of
+a lint or unsafe change reason that quotes such names outside any code span (`markdownReason` in
+the same file); the Check Run
 summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
 clamp (`pkg/webhook/plan_drift.go`); the log-text sanitizer applied to every line, level, and
 group heading in the failed-summary log fold (`pkg/webhook/templates/failure_logs.go`); the

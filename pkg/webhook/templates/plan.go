@@ -2989,7 +2989,8 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 // reason: the table, the finding, and the change's attribution note, which a
 // change that creates its table never carries. A change with no parseable reason
 // still gets a line, carrying the engine's change type when one is known so
-// the finding explains itself.
+// the finding explains itself. The table is already Markdown, as
+// unsafeChangeLabel renders it; each reason is rendered here by markdownReason.
 func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) []string {
 	table := unsafeChangeLabel(c)
 	suffix := ""
@@ -3005,7 +3006,7 @@ func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) 
 	}
 	lines := make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		lines = append(lines, fmt.Sprintf("%s: %s%s", table, ui.CodeQuoteIdentifiers(r), suffix))
+		lines = append(lines, fmt.Sprintf("%s: %s%s", table, markdownReason(r), suffix))
 	}
 	return lines
 }
@@ -3238,7 +3239,7 @@ type lintWarningGroup struct {
 // too many to name inline read as coverage on the line, with their names
 // collapsed beneath it.
 func writeLintLine(sb *strings.Builder, table string, w LintViolationData) {
-	message := ui.CodeQuoteIdentifiers(w.Message)
+	message := markdownReason(w.Message)
 	if label := lintLabel(table, w); label != "" {
 		fmt.Fprintf(sb, "- %s: %s\n", label, message)
 	} else {

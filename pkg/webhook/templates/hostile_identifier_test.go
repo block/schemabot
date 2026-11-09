@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // hostileIdentifier is a name a PR author controls — a table, shard, database,
@@ -43,6 +44,12 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 	configNotAuthorized := SchemaErrorData{DatabaseName: hostileIdentifier, SchemaPath: hostileIdentifier}
 	var shardTable strings.Builder
 	writeShardStatusTable(&shardTable, []ShardStatus{{Shard: hostileIdentifier, State: state.Apply.Running}})
+	hostileItem := SchemaChangeReconciliationItem{Database: hostileIdentifier, Environment: hostileIdentifier, ApplyID: hostileIdentifier, State: hostileIdentifier}
+	reconcileOne := func(inProgress bool) string {
+		item := hostileItem
+		item.InProgress = inProgress
+		return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{Items: []SchemaChangeReconciliationItem{item}})
+	}
 
 	surfaces := map[string]string{
 		"plan comment":                                 RenderPlanComment(plan),
@@ -63,6 +70,13 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 		"repository truncated for a hostile -d":        RenderRepositoryTreeTruncated(SchemaErrorData{DatabaseName: hostileIdentifier}),
 		"database rejects the repo for a hostile -d":   RenderDatabaseRepoNotAllowed(SchemaErrorData{DatabaseName: hostileIdentifier}),
 		"no config for a hostile -d":                   RenderNoConfig(SchemaErrorData{DatabaseName: hostileIdentifier}),
+
+		"no managed schema changes for a hostile -e":      RenderNoManagedSchemaChanges(SchemaErrorData{Environment: hostileIdentifier}),
+		"reconciliation of one completed apply":           reconcileOne(false),
+		"reconciliation of one in-progress apply":         reconcileOne(true),
+		"reconciliation table of several applies":         RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{Items: []SchemaChangeReconciliationItem{hostileItem, hostileItem}}),
+		"reconciliation table row without an environment": RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{Items: []SchemaChangeReconciliationItem{{Database: hostileIdentifier}, {Database: hostileIdentifier}}}),
+		"reconciliation of several in-progress applies":   RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{Items: []SchemaChangeReconciliationItem{{Database: hostileIdentifier, InProgress: true}, hostileItem}}),
 	}
 
 	for name, rendered := range surfaces {
@@ -77,6 +91,115 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 				assert.False(t, strings.HasPrefix(line, "```"), "the identifier's fence never opens a line: %q", line)
 				assert.Contains(t, line, "x` ``` # injected", "the identifier is flattened onto the line that names it: %q", line)
 			}
+		})
+	}
+}
+
+// A pipe in a database, environment or apply ID the PR author chose stays in
+// its table cell, so the row keeps its four columns.
+func TestReconciliationTableKeepsAPipeInsideItsCell(t *testing.T) {
+	rendered := RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{Items: []SchemaChangeReconciliationItem{
+		{Database: "orders|x", Environment: "staging", ApplyID: "apply-1", State: "running"},
+		{Database: "users", Environment: "stag|ing", ApplyID: "ap|ply-2", State: "completed"},
+	}})
+
+	assert.Contains(t, rendered, "| `orders\\|x` | `staging` | `apply-1` | `running` |\n")
+	assert.Contains(t, rendered, "| `users` | `stag\\|ing` | `ap\\|ply-2` | `completed` |\n")
+}
+
+// A lint message or unsafe change reason is written by a linter or an engine
+// from names in the PR author's schema, so it can carry anything a schema name
+// can. Wherever it lands in the comment it reads as the text it is: no link,
+// image, HTML tag, emphasis, heading, fence or mention that the author could
+// use to speak in the comment, and no line break to start one on.
+func TestHostileReasonStaysPlainTextInPlanComment(t *testing.T) {
+	tests := []struct {
+		name    string
+		reason  string
+		written string
+	}{
+		{"link", `see [the docs](https://evil.example/x) first`, `see \[the docs\](https://evil.example/x) first`},
+		{"image", `![x](https://evil.example/p.png)`, `!\[x\](https://evil.example/p.png)`},
+		{"HTML tag", `<img src=x onerror=alert(1)>`, `\<img src=x onerror=alert(1)>`},
+		{"emphasis", `*all clear* and __trusted__`, `\*all clear\* and \_\_trusted\_\_`},
+		{"user mention", `ask @octocat to approve`, "ask `@octocat` to approve"},
+		{"team mention", `ask @acme/db-admins to approve`, "ask `@acme/db-admins` to approve"},
+		{"table separator", `a | b`, `a \| b`},
+		{"line breaks", "x\n# injected\n```\nsql\n```", "x # injected ``` sql ```"},
+		{"unbalanced backtick", "ends a span ` early", "ends a span \\` early"},
+		{"backslash before a backtick", "\\` @octocat `", "\\\\` @octocat `"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := PlanCommentData{
+				Database: "testapp", Environment: "staging", IsMySQL: true,
+				Changes:          []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE t ADD c int"}}},
+				HasUnsafeChanges: true,
+				UnsafeChanges:    []UnsafeChangeData{{Table: "orders", Reason: tt.reason, ChangeType: "DROP COLUMN"}},
+				LintViolations:   []LintViolationData{{Table: "orders", Message: tt.reason}},
+			}
+
+			for name, rendered := range map[string]string{
+				"plan comment":             RenderPlanComment(plan),
+				"unsafe changes rejection": RenderUnsafeChangesBlocked(plan),
+			} {
+				assert.Contains(t, rendered, "1. `orders`: "+tt.written+"\n", name)
+			}
+			assert.Contains(t, RenderPlanComment(plan), "- `orders`: "+tt.written+"\n", "the lint line")
+		})
+	}
+}
+
+// A reason that quotes identifiers renders them as code exactly as
+// ui.CodeQuoteIdentifiers does, and a reason with nothing to escape comes out
+// as that function leaves it, so existing comments do not change.
+func TestMarkdownReasonKeepsWhatCodeQuoteIdentifiersWrites(t *testing.T) {
+	for _, reason := range []string{
+		`Index "idx_status" should be made invisible before dropping`,
+		`Column "created_at" of type "DATETIME" should not be the leftmost index column`,
+		`Using "mediumint(9)" as primary key is discouraged`,
+		`Column "status" in table "orders" has type "enum('active','archived')"`,
+		`Table "app.users" has no primary key`,
+		`The statement "DROP COLUMN ` + "`legacy`" + `" cannot be undone`,
+		"has_timestamp: column seen_at uses TIMESTAMP",
+		"range predicates (>, >=, <, <=, BETWEEN) stop the optimizer using later columns",
+		"drops column nickname (data loss) and index idx_nick",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			assert.Equal(t, ui.CodeQuoteIdentifiers(reason), markdownReason(reason))
+		})
+	}
+
+	assert.Equal(t, "Index `idx_status` should be made invisible before dropping",
+		markdownReason(`Index "idx_status" should be made invisible before dropping`))
+	assert.Equal(t, `The index `+"`idx_a`"+` is marked "do not drop"`,
+		markdownReason(`The index "idx_a" is marked "do not drop"`),
+		"quoted prose is not an identifier and keeps its quotes")
+}
+
+// Text a reason has inside a code span is left as written, and what surrounds
+// the span is escaped, so a hostile name that code quoting recognises cannot be
+// escaped twice and a hostile one it does not recognise cannot slip out.
+func TestMarkdownReasonEscapesOnlyOutsideCodeSpans(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{"quoted name beside link", `Column "a_b" see [x](y)`, "Column `a_b` see \\[x\\](y)"},
+		{"mention in a span is not wrapped again", "ask `@octocat` and @hubot", "ask `@octocat` and `@hubot`"},
+		{"span with a longer delimiter", "see ``a ` b`` then <b>", "see ``a ` b`` then \\<b>"},
+		{"intraword underscore stays", "col_a and _lead and trail_ and a__b", "col_a and \\_lead and trail\\_ and a\\_\\_b"},
+		{"less than sign that starts no HTML", "a < b, a <= b, 1<2, <", "a < b, a <= b, 1<2, <"},
+		{"less than sign that starts HTML", "<b>x</b> <!-- y --> <?z", "\\<b>x\\</b> \\<!-- y --> \\<?z"},
+		{"email address is not a mention", "mail dba@example.com", "mail dba@example.com"},
+		{"mention after punctuation", "(@octocat)", "(`@octocat`)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, markdownReason(tt.reason))
 		})
 	}
 }
