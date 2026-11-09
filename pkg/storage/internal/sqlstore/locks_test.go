@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -504,6 +505,143 @@ func testLockAcquireInsertRaceReleasedBeforeReread(t *testing.T, newStore func(t
 		assert.Zero(t, lock.ID)
 		current, err := store.Get(ctx, "testdb", "vitess")
 		require.NoError(t, err)
+		assert.Nil(t, current, "the acquire created no lock row")
+	})
+}
+
+// insertRetryBinder makes another owner win the acquire's first INSERT and
+// release the key before the re-read, so the acquire retries the INSERT, and
+// then decides the retried INSERT's fate: retryWinner claims the key just
+// before it runs and keeps it, or, when failRetry is set, the statement is
+// rewritten to target a table that does not exist so it fails outright.
+type insertRetryBinder struct {
+	t           *testing.T
+	next        binder
+	rival       *lockStore
+	retryWinner *storage.Lock
+	failRetry   bool
+	inserts     int
+	releaseNext bool
+}
+
+func (b *insertRetryBinder) Rebind(query string) string {
+	switch {
+	case strings.Contains(query, "INSERT INTO locks"):
+		b.inserts++
+		switch b.inserts {
+		case 1:
+			require.NoError(b.t, b.rival.Acquire(b.t.Context(), &storage.Lock{
+				DatabaseName: "testdb", DatabaseType: "vitess", Repository: "org/other", PullRequest: 9, Owner: "org/other#9",
+			}))
+			b.releaseNext = true
+		case 2:
+			if b.failRetry {
+				query = strings.Replace(query, "INSERT INTO locks", "INSERT INTO locks_missing", 1)
+			}
+			if b.retryWinner != nil {
+				require.NoError(b.t, b.rival.Acquire(b.t.Context(), b.retryWinner))
+			}
+		}
+	case b.releaseNext && strings.Contains(query, "FROM locks"):
+		b.releaseNext = false
+		require.NoError(b.t, b.rival.ForceRelease(b.t.Context(), "testdb", "vitess"))
+	}
+	return b.next.Rebind(query)
+}
+
+// TestLockStore_Acquire_InsertRetryOutcomes runs the retried-insert scenarios
+// against MySQL; TestPostgresStorageParity runs the same scenarios against
+// PostgreSQL.
+func TestLockStore_Acquire_InsertRetryOutcomes(t *testing.T) {
+	testLockAcquireInsertRetryOutcomes(t, func(t *testing.T, b func(binder) binder) *lockStore {
+		t.Helper()
+		return &lockStore{db: newRebindDB(testDB, b(MySQLDialect{})), dialect: MySQLDialect{}, identity: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
+	}, clearTables)
+}
+
+// The acquire's first INSERT loses to another owner who releases the key
+// before the re-read, so the acquire inserts once more. That retried INSERT
+// can lose again to a rival that keeps the key: another owner means the lock
+// is held and the acquire creates nothing, while the same owner means the
+// acquire holds the lock through the rival's row and records its intent on
+// it. A retried INSERT that fails for any reason other than a duplicate key
+// surfaces that failure instead of reporting the lock held or acquired.
+func testLockAcquireInsertRetryOutcomes(t *testing.T, newStore func(t *testing.T, wrap func(binder) binder) *lockStore, clear func(t *testing.T)) {
+	newLock := func() *storage.Lock {
+		return &storage.Lock{
+			DatabaseName: "testdb", DatabaseType: "vitess", Repository: "org/repo", PullRequest: 123, Owner: "org/repo#123",
+			PendingPlanID: "plan-1",
+		}
+	}
+	setup := func(t *testing.T, configure func(b *insertRetryBinder)) (*lockStore, *insertRetryBinder) {
+		t.Helper()
+		clear(t)
+		rival := newStore(t, func(b binder) binder { return b })
+		var race *insertRetryBinder
+		store := newStore(t, func(b binder) binder {
+			race = &insertRetryBinder{t: t, next: b, rival: rival}
+			configure(race)
+			return race
+		})
+		return store, race
+	}
+
+	// An acquire that carries no intent has nothing to write onto the winner's
+	// row, so the owner comparison alone decides it; one that carries an
+	// intent is also decided by the owner-scoped refresh finding no row.
+	for _, pendingPlanID := range []string{"", "plan-1"} {
+		t.Run("retried insert loses to another owner who keeps the key, intent "+strconv.Quote(pendingPlanID), func(t *testing.T) {
+			ctx := t.Context()
+			store, race := setup(t, func(b *insertRetryBinder) {
+				b.retryWinner = &storage.Lock{DatabaseName: "testdb", DatabaseType: "vitess", Repository: "org/third", PullRequest: 7, Owner: "org/third#7"}
+			})
+			lock := newLock()
+			lock.PendingPlanID = pendingPlanID
+
+			require.ErrorIs(t, store.Acquire(ctx, lock), storage.ErrLockHeld)
+
+			assert.Equal(t, 2, race.inserts, "the acquire gave up after one retried insert")
+			assert.Zero(t, lock.ID, "the acquire created no lock row")
+			current, err := store.Get(ctx, "testdb", "vitess")
+			require.NoError(t, err)
+			require.NotNil(t, current, "the rival's row survives the acquire")
+			assert.Equal(t, "org/third#7", current.Owner)
+			assert.Empty(t, current.PendingPlanID, "the acquire wrote nothing onto another owner's row")
+		})
+	}
+
+	t.Run("retried insert loses to the same owner who keeps the key", func(t *testing.T) {
+		ctx := t.Context()
+		store, race := setup(t, func(b *insertRetryBinder) {
+			b.retryWinner = &storage.Lock{DatabaseName: "testdb", DatabaseType: "vitess", Repository: "org/repo", PullRequest: 123, Owner: "org/repo#123"}
+		})
+		lock := newLock()
+
+		require.NoError(t, store.Acquire(ctx, lock))
+
+		assert.Equal(t, 2, race.inserts, "the acquire found its own row after one retried insert")
+		assert.Zero(t, lock.ID, "the acquire created no row of its own")
+		current, err := store.Get(ctx, "testdb", "vitess")
+		require.NoError(t, err)
+		require.NotNil(t, current)
+		assert.Equal(t, "org/repo#123", current.Owner)
+		assert.Equal(t, "plan-1", current.PendingPlanID, "the acquire recorded its intent on the same owner's row")
+	})
+
+	t.Run("retried insert failure is returned", func(t *testing.T) {
+		ctx := t.Context()
+		store, race := setup(t, func(b *insertRetryBinder) { b.failRetry = true })
+		lock := newLock()
+
+		err := store.Acquire(ctx, lock)
+
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, storage.ErrLockHeld, "a failed insert is not a held lock")
+		assert.ErrorContains(t, err, "insert lock for testdb/vitess owner=org/repo#123")
+		assert.Equal(t, 2, race.inserts, "the acquire stopped at the failed retried insert")
+		assert.Zero(t, lock.ID, "a failed insert never records a row id")
+		current, getErr := store.Get(ctx, "testdb", "vitess")
+		require.NoError(t, getErr)
 		assert.Nil(t, current, "the acquire created no lock row")
 	})
 }

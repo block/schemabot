@@ -127,8 +127,10 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 	if winner == nil {
 		// The winner released the lock between the duplicate-key error and the
 		// read. This caller observed no pin, so a free key is the state it asked
-		// for: claim it once more. Only once, so a key that keeps changing hands
-		// reports ErrLockHeld below instead of racing without bound.
+		// for: claim it once more. Only once per attempt (withLockRetry restarts
+		// the attempt from the Get on a retryable conflict), so a key that keeps
+		// changing hands reports ErrLockHeld below instead of racing without
+		// bound.
 		inserted, err = s.insertLock(ctx, lock, acquirer)
 		if err != nil {
 			return err
@@ -142,8 +144,9 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 		}
 	}
 	if winner == nil {
-		slog.Warn("lock changed hands twice during acquire; reporting it held",
-			"database", lock.DatabaseName, "database_type", lock.DatabaseType, "owner", lock.Owner)
+		slog.Warn("lock key was released twice during acquire; returning lock held although no row exists",
+			"database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"repository", lock.Repository, "pull_request", lock.PullRequest, "owner", lock.Owner)
 		return storage.ErrLockHeld
 	}
 	if winner.Owner != lock.Owner {

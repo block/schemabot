@@ -67,6 +67,12 @@ func TestPostgresStorageParity(t *testing.T) {
 			return &lockStore{db: newRebindDB(h.db, b(PostgresDialect{})), dialect: PostgresDialect{}, identity: PostgresDialect{}, classifier: NewPostgresErrorClassifier()}
 		}, func(t *testing.T) { clearPostgresTables(t, h.db) })
 	})
+	t.Run("LockAcquireInsertRetryOutcomes", func(t *testing.T) {
+		testLockAcquireInsertRetryOutcomes(t, func(t *testing.T, b func(binder) binder) *lockStore {
+			t.Helper()
+			return &lockStore{db: newRebindDB(h.db, b(PostgresDialect{})), dialect: PostgresDialect{}, identity: PostgresDialect{}, classifier: NewPostgresErrorClassifier()}
+		}, func(t *testing.T) { clearPostgresTables(t, h.db) })
+	})
 	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
 	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
