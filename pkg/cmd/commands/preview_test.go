@@ -36,3 +36,12 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 		})
 	}
 }
+
+// A live TUI preview replays a scenario that never ends, so pressing Esc is
+// how the preview finishes. That is a success for the preview, not an operator
+// leaving an apply behind, so it exits 0; any other watch result is kept.
+func TestPreviewTUI_LeavingTheLivePreviewSucceeds(t *testing.T) {
+	assert.NoError(t, previewWatchExit(detachedFromWatch()))
+	assert.NoError(t, previewWatchExit(nil))
+	assert.Equal(t, 1, ExitCodeFor(previewWatchExit(ErrSilent)), "a watch that could not follow the scenario still fails")
+}

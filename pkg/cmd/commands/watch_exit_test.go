@@ -125,12 +125,53 @@ func TestWatchExit_LeavingTheWatchExitsAsInterrupted(t *testing.T) {
 	}
 }
 
+// An operator leaves the interactive watch before its first poll has answered,
+// so the watch knows nothing about the apply yet. That is a detach like any
+// other, not the apply having failed: the exit is 130, whether the first poll
+// is still in flight or has failed and is being retried.
+func TestWatchExit_LeavingBeforeTheFirstPollExitsAsInterrupted(t *testing.T) {
+	fresh := func() WatchModel {
+		m := NewWatchModel("http://localhost:8080", "", "staging", false)
+		m.applyID = exitTestApplyID
+		return m
+	}
+
+	t.Run("before the first poll answers", func(t *testing.T) {
+		left := press(t, fresh(), tea.KeyMsg{Type: tea.KeyEsc})
+
+		err := left.exitError()
+		require.ErrorIs(t, err, ErrSilent)
+		assert.Equal(t, ExitInterrupted, ExitCodeFor(err))
+	})
+
+	t.Run("while the first polls fail and are retried", func(t *testing.T) {
+		updated, quit := fresh().Update(progressMsg{failed: true, retryable: true, errorMsg: "connection refused"})
+		require.Nil(t, quit, "a failed first poll is retried, not fatal")
+		left := press(t, updated.(WatchModel), tea.KeyMsg{Type: tea.KeyEsc})
+
+		err := left.exitError()
+		require.ErrorIs(t, err, ErrSilent)
+		assert.Equal(t, ExitInterrupted, ExitCodeFor(err))
+	})
+
+	// An interrupt signal reaches the program as a signal rather than a
+	// keystroke when stdin is not a terminal, and ends the run with an error
+	// instead of a final model. It is still the operator leaving.
+	t.Run("SIGINT delivered as a signal", func(t *testing.T) {
+		m := watchAt(t, state.Apply.Running)
+
+		err := watchExit(m, m, tea.ErrInterrupted)
+		require.ErrorIs(t, err, ErrSilent)
+		assert.Equal(t, ExitInterrupted, ExitCodeFor(err))
+	})
+}
+
 // A watch that cannot follow the apply fails with status 1: the server refused
 // the apply permanently, or polls kept failing until the watch gave up. Neither
 // is the operator leaving, and neither says anything about how the apply ended.
 func TestWatchExit_FailingToFollowTheApplyExitsOne(t *testing.T) {
 	t.Run("permanent error", func(t *testing.T) {
-		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+		m := watchAt(t, state.Apply.Running)
 		updated, cmd := m.Update(progressMsg{failed: true, errorMsg: "apply not found"})
 
 		require.NotNil(t, cmd)

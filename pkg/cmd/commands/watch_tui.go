@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -357,12 +358,28 @@ func runWatchModel(model WatchModel) (err error) {
 	// Don't use alt-screen - render inline for seamless experience
 	p := tea.NewProgram(model)
 	finalModel, err := p.Run()
-	if err != nil {
-		printExitContext(model.applyID, "", model.environment)
-		return err
-	}
+	return watchExit(model, finalModel, err)
+}
 
-	m := finalModel.(WatchModel)
+// watchExit is the result of a watch whose program has returned. An interrupt
+// signal reaches the program as a signal rather than a keystroke when stdin is
+// not a terminal, and ends it with tea.ErrInterrupted; that is the operator
+// leaving, the same as a Ctrl-C keystroke, so it exits as a detach rather than
+// as an error. Any other run error is reported as it is. Otherwise the final
+// model decides, as exitError says.
+func watchExit(started WatchModel, finalModel tea.Model, runErr error) error {
+	m, ok := finalModel.(WatchModel)
+	if !ok {
+		m = started
+	}
+	if errors.Is(runErr, tea.ErrInterrupted) {
+		printExitContext(m.applyID, m.deployRequestURL, m.environment)
+		return detachedFromWatch()
+	}
+	if runErr != nil {
+		printExitContext(started.applyID, "", started.environment)
+		return runErr
+	}
 
 	// Completed applies render their apply ID in the success line. Other exits
 	// need explicit context so operators can resume monitoring or investigate.
@@ -374,19 +391,21 @@ func runWatchModel(model WatchModel) (err error) {
 }
 
 // exitError is the watch's exit status for its final model, the same rule the
-// non-interactive watch follows. A watch that followed the apply to its end
-// exits as applyEndExit says: only a completed apply succeeds, and the view
-// already shows the outcome, including the start command for a stopped apply.
-// A watch that could not follow the apply fails. Anything else is the operator
-// leaving while the apply carries on (Esc, Ctrl-C, q, or SIGTERM): that is not
-// an outcome, so it exits ExitInterrupted, the status a Ctrl-C ends a log watch
-// with, rather than 0, which a script reads as the schema change being done.
+// non-interactive watch follows. A watch that could not follow the apply fails.
+// A watch that followed the apply to its end exits as applyEndExit says: only a
+// completed apply succeeds, and the view already shows the outcome, including
+// the start command for a stopped apply. Anything else is the operator leaving
+// while the apply carries on (Esc, Ctrl-C, q, or SIGTERM), including leaving
+// before the first poll has answered: that is not an outcome, so it exits
+// ExitInterrupted, the status a Ctrl-C ends a log watch with, rather than 0,
+// which a script reads as the schema change being done, or 1, which it reads
+// as the apply having failed.
 func (m WatchModel) exitError() error {
 	switch {
-	case m.watchHasEnded():
-		return applyEndExit(m.state)
 	case m.followFailed:
 		return ErrSilent
+	case m.initialized && m.watchHasEnded():
+		return applyEndExit(m.state)
 	default:
 		return detachedFromWatch()
 	}
