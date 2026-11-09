@@ -164,11 +164,10 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 // comment answers: whoever commented the plan command, or the PR author on an
 // auto-plan.
 //
-// It runs the apply gate's check, except that it asks GitHub about reader's
-// membership of each configured team, one request per team at any team size,
-// until one includes reader. A team the plan command's own gate already listed
-// answers from that list. When the check cannot be evaluated, the list renders:
-// it is still true, and it names whom to ask.
+// It runs the same check the apply gate does, so on top of the config read it
+// lists the members of each configured team until one includes reader, once
+// per plan comment. When that check cannot be evaluated, the list renders: it
+// is still true, and it names whom to ask.
 func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, reader string) *templates.ApplyAuthorizationData {
 	if h.service == nil || !h.service.Config().PRCommandAuthorizationEnabled() {
 		return nil
@@ -180,7 +179,7 @@ func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *
 			"repo", repo, "pr", pr, "database", database)
 		return auth
 	}
-	result, err := h.authorizeDatabaseActor(ctx, client, teamReadActorMembership, reader, repo, database)
+	result, err := h.authorizePRCommandActor(ctx, client, reader, repo, database)
 	if err != nil {
 		h.logger.Warn("plan comment lists who can apply because the reader's apply authorization could not be checked",
 			"repo", repo, "pr", pr, "database", database, "reader", reader,
@@ -235,28 +234,12 @@ func (h *Handler) authorizePRCommandActor(
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingActor}, nil
 	}
 
-	return h.authorizeDatabaseActor(ctx, client, teamReadMemberList, actor, repo, database)
+	return h.authorizeConfiguredDatabaseActor(ctx, client, actor, repo, database)
 }
 
-// teamMembershipRead is how an authorization check asks GitHub whether an
-// actor is on a configured team.
-type teamMembershipRead int
-
-const (
-	// teamReadMemberList reads each team's member list. A team GitHub cannot
-	// show is an error rather than a non-member, so the gates read this way.
-	teamReadMemberList teamMembershipRead = iota
-	// teamReadActorMembership asks about the one actor, one request per team at
-	// any team size. A team GitHub cannot show reads as a non-member, so only a
-	// check that blocks nothing and fails toward listing who can apply reads
-	// this way.
-	teamReadActorMembership
-)
-
-func (h *Handler) authorizeDatabaseActor(
+func (h *Handler) authorizeConfiguredDatabaseActor(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
-	teamRead teamMembershipRead,
 	actor string,
 	repo string,
 	database string,
@@ -295,7 +278,7 @@ func (h *Handler) authorizeDatabaseActor(
 		if client == nil {
 			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
 		}
-		matched, principal, err := actorInAnyTeam(ctx, client, teamRead, authConfig.AdminTeams, actor)
+		matched, principal, err := actorInAnyTeam(ctx, client, authConfig.AdminTeams, actor)
 		if err != nil {
 			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
 		}
@@ -324,7 +307,7 @@ func (h *Handler) authorizeDatabaseActor(
 		if client == nil {
 			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
 		}
-		matched, principal, err := actorInAnyTeam(ctx, client, teamRead, repoAdminTeams, actor)
+		matched, principal, err := actorInAnyTeam(ctx, client, repoAdminTeams, actor)
 		if err != nil {
 			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
 		}
@@ -353,7 +336,7 @@ func (h *Handler) authorizeDatabaseActor(
 		if client == nil {
 			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
 		}
-		matched, principal, err := actorInAnyTeam(ctx, client, teamRead, dbConfig.OperatorTeams, actor)
+		matched, principal, err := actorInAnyTeam(ctx, client, dbConfig.OperatorTeams, actor)
 		if err != nil {
 			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
 		}
@@ -380,13 +363,13 @@ func (h *Handler) authorizeDatabaseActor(
 	return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNotAuthorized}, nil
 }
 
-func actorInAnyTeam(ctx context.Context, client *ghclient.InstallationClient, teamRead teamMembershipRead, teams []string, actor string) (bool, string, error) {
+func actorInAnyTeam(ctx context.Context, client *ghclient.InstallationClient, teams []string, actor string) (bool, string, error) {
 	for _, team := range teams {
 		org, slug, err := api.ParseGitHubTeamPrincipal(team)
 		if err != nil {
 			return false, "", fmt.Errorf("invalid configured GitHub team %q: %w", team, err)
 		}
-		member, err := isTeamMember(ctx, client, teamRead, org, slug, actor)
+		member, err := client.IsTeamMember(ctx, org, slug, actor)
 		if err != nil {
 			return false, "", err
 		}
@@ -395,13 +378,6 @@ func actorInAnyTeam(ctx context.Context, client *ghclient.InstallationClient, te
 		}
 	}
 	return false, "", nil
-}
-
-func isTeamMember(ctx context.Context, client *ghclient.InstallationClient, teamRead teamMembershipRead, org, slug, actor string) (bool, error) {
-	if teamRead == teamReadActorMembership {
-		return client.HasActiveTeamMembership(ctx, org, slug, actor)
-	}
-	return client.IsTeamMember(ctx, org, slug, actor)
 }
 
 func matchedUserPrincipal(allowedUsers []string, actor string) (bool, string) {

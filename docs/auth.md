@@ -244,7 +244,7 @@ The comment checks the reader against the same admins, repository admins, and
 operators the apply does. For each configured team, until one includes the
 reader, it asks GitHub about the reader's membership in one request whatever
 the team's size. An automatic plan makes those requests for each database it
-plans. A commented plan reuses the team lists its own authorization check just
+plans. A commented plan reuses the memberships its own authorization check just
 read, so it makes no extra request. If GitHub cannot answer, the comment shows
 the list. Membership is read again on the next webhook delivery, so a team
 change on GitHub shows on the next plan. The list names teams and users without

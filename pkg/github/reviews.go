@@ -226,26 +226,7 @@ func OwnerNames(owners []codeowners.Owner) []string {
 // ListTeamMembers returns the login names of all members of a GitHub team.
 // The owner parameter is the org slug (e.g. "octocat"), and slug is the team
 // slug (e.g. "dba-team"). Returns an error if team membership cannot be read.
-// Within a scope carrying the request-scoped cache (WithPRInfoCache), a team
-// already read is answered from the cache.
 func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug string) ([]string, error) {
-	cache := prInfoCacheFromContext(ctx)
-	if cache != nil {
-		if members, ok := cache.getTeamMembers(org, slug); ok {
-			return members, nil
-		}
-	}
-	members, err := ic.listTeamMembers(ctx, org, slug)
-	if err != nil {
-		return nil, err
-	}
-	if cache != nil {
-		cache.setTeamMembers(org, slug, members)
-	}
-	return members, nil
-}
-
-func (ic *InstallationClient) listTeamMembers(ctx context.Context, org, slug string) ([]string, error) {
 	opts := &gh.TeamListTeamMembersOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	var members []string
 
@@ -274,54 +255,59 @@ func (ic *InstallationClient) listTeamMembers(ctx context.Context, org, slug str
 	return members, nil
 }
 
-// IsTeamMember returns true when login is a member of org/slug. It relies on
-// the same team-member listing used by CODEOWNERS review checks so the only
-// negative result is a readable team list that does not contain the actor.
-func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
-	members, err := ic.ListTeamMembers(ctx, org, slug)
-	if err != nil {
-		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, err)
-	}
-	return containsLogin(members, login), nil
-}
-
-// HasActiveTeamMembership returns true when login is an active member of
-// org/slug, asking GitHub about that one login in a single request whatever the
-// team's size. Within a scope carrying the request-scoped cache, a team already
-// listed there answers from that list instead.
+// IsTeamMember returns true when login is an active member of org/slug,
+// including through a child team. It reads the one membership instead of
+// listing the team, so its cost does not grow with the team's size.
 //
-// GitHub answers 404 both for a non-member and for a team the installation
-// cannot see, so a 404 returns false. A caller that must tell the two apart,
-// such as an authorization gate, uses IsTeamMember.
-func (ic *InstallationClient) HasActiveTeamMembership(ctx context.Context, org, slug, login string) (bool, error) {
-	if cache := prInfoCacheFromContext(ctx); cache != nil {
-		if members, ok := cache.getTeamMembers(org, slug); ok {
-			return containsLogin(members, login), nil
+// GitHub answers 404 both for a user with no membership and for a team the
+// App cannot see, so a 404 is a negative result only once the team itself
+// reads back. A team that cannot be read returns ErrTeamMembershipUnreadable,
+// never a negative result. A pending invitation is not a membership.
+//
+// Within a scope carrying the request-scoped cache (WithPRInfoCache), a
+// membership already read is answered from the cache.
+func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
+	cache := prInfoCacheFromContext(ctx)
+	if cache != nil {
+		if member, ok := cache.getMembership(org, slug, login); ok {
+			return member, nil
 		}
 	}
-	membership, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeamMembership, "get team membership", []any{"org", org, "team_slug", slug, "login", login}, func(ctx context.Context) (*gh.Membership, error) {
-		m, resp, getErr := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)
+	member, err := ic.isTeamMember(ctx, org, slug, login)
+	if err != nil {
+		return false, err
+	}
+	if cache != nil {
+		cache.setMembership(org, slug, login, member)
+	}
+	return member, nil
+}
+
+func (ic *InstallationClient) isTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
+	logAttrs := []any{"org", org, "team_slug", slug, "login", login}
+	membership, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeamMembership, "get team membership", logAttrs, func(ctx context.Context) (*gh.Membership, error) {
+		m, _, getErr := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)
 		if getErr != nil {
-			if resp != nil && resp.StatusCode == http.StatusNotFound {
-				return nil, nil
-			}
 			return nil, classifyGitHubAPIError(getErr)
 		}
 		return m, nil
 	})
-	if err != nil {
+	if err == nil {
+		return membership.GetState() == "active", nil
+	}
+	if !IsNotFoundError(err) {
 		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team membership", org, slug, err))
 	}
-	if membership == nil {
-		ic.logger.Debug("GitHub reports no membership of the team for this login, so it counts as a non-member",
-			"org", org, "team_slug", slug, "login", login)
-		return false, nil
+	if _, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeam, "get team", logAttrs, func(ctx context.Context) (*gh.Team, error) {
+		team, _, getErr := ic.client.Teams.GetTeamBySlug(ctx, org, slug)
+		if getErr != nil {
+			return nil, classifyGitHubAPIError(getErr)
+		}
+		return team, nil
+	}); err != nil {
+		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team", org, slug, err))
 	}
-	return membership.GetState() == "active", nil
-}
-
-func containsLogin(logins []string, login string) bool {
-	return slices.ContainsFunc(logins, func(l string) bool { return strings.EqualFold(l, login) })
+	return false, nil
 }
 
 func teamMembershipReadError(operation, org, slug string, err error) error {

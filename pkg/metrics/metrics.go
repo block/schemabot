@@ -1589,6 +1589,7 @@ const (
 	GitHubOperationGetBranchRules                 = "get_branch_rules"
 	GitHubOperationGetCombinedStatus              = "get_combined_status"
 	GitHubOperationGetPullRequestReviewProtection = "get_pull_request_review_protection"
+	GitHubOperationGetTeam                        = "get_team"
 	GitHubOperationGetTeamMembership              = "get_team_membership"
 	GitHubOperationGraphQLMinimizeComment         = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup       = "graphql_status_check_rollup"
@@ -1794,6 +1795,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationGetBranchRules,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetPullRequestReviewProtection,
+		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,

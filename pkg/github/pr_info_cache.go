@@ -9,7 +9,7 @@ import (
 )
 
 // requestPRInfoCache memoises FetchPullRequest, FetchPRFiles, and
-// ListTeamMembers results for the lifetime of a single webhook delivery (or
+// IsTeamMember results for the lifetime of a single webhook delivery (or
 // any other ctx-bounded operation it is attached to). A fresh cache is constructed at every entry
 // point via WithPRInfoCache, so the cached value cannot outlive the scope it
 // was created for — eliminating the staleness risk that a TTL'd
@@ -22,15 +22,15 @@ import (
 // call each. Concurrent callers from spawned goroutines that share the ctx
 // see the populated entry once the first fetch completes.
 //
-// Team members are cached so the authorization checks one delivery makes for
-// the same team, such as the plan command's gate and the plan comment's
-// who-can-apply check, answer from one read. Only successful reads are cached,
-// so a failed read is retried by the next check rather than replayed.
+// Team memberships are cached so the authorization checks one delivery makes
+// for the same login and team, such as the plan command's gate and the plan
+// comment's who-can-apply check, answer from one read. Only successful reads are
+// cached, so a failed read is retried by the next check rather than replayed.
 type requestPRInfoCache struct {
 	mu          sync.Mutex
 	m           map[string]*PullRequestInfo
 	files       map[string][]PRFile
-	teamMembers map[string][]string
+	memberships map[string]bool
 }
 
 type prInfoCacheCtxKey struct{}
@@ -45,7 +45,7 @@ func WithPRInfoCache(ctx context.Context) context.Context {
 	return context.WithValue(ctx, prInfoCacheCtxKey{}, &requestPRInfoCache{
 		m:           make(map[string]*PullRequestInfo),
 		files:       make(map[string][]PRFile),
-		teamMembers: make(map[string][]string),
+		memberships: make(map[string]bool),
 	})
 }
 
@@ -111,26 +111,25 @@ func (c *requestPRInfoCache) setFiles(repo string, pr int, files []PRFile) {
 	c.files[cacheKey(repo, pr)] = slices.Clone(files)
 }
 
-// getTeamMembers returns the cached member logins of org/slug if present.
-func (c *requestPRInfoCache) getTeamMembers(org, slug string) ([]string, bool) {
+// getMembership returns whether login is a member of org/slug, if cached.
+func (c *requestPRInfoCache) getMembership(org, slug, login string) (member, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	members, ok := c.teamMembers[teamCacheKey(org, slug)]
-	return slices.Clone(members), ok
+	member, ok = c.memberships[membershipCacheKey(org, slug, login)]
+	return member, ok
 }
 
-// setTeamMembers stores the member logins of org/slug. A copy is stored so
-// callers mutating the returned slice cannot affect the cached value.
-func (c *requestPRInfoCache) setTeamMembers(org, slug string, members []string) {
+// setMembership stores whether login is a member of org/slug.
+func (c *requestPRInfoCache) setMembership(org, slug, login string, member bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.teamMembers[teamCacheKey(org, slug)] = slices.Clone(members)
+	c.memberships[membershipCacheKey(org, slug, login)] = member
 }
 
-// teamCacheKey lowercases the team, since GitHub org and team slugs match
-// case-insensitively.
-func teamCacheKey(org, slug string) string {
-	return strings.ToLower(org + "/" + slug)
+// membershipCacheKey lowercases the key, since GitHub org slugs, team slugs,
+// and logins all match case-insensitively.
+func membershipCacheKey(org, slug, login string) string {
+	return strings.ToLower(org + "/" + slug + "/" + login)
 }
 
 func cacheKey(repo string, pr int) string {
