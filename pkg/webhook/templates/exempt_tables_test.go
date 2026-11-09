@@ -238,7 +238,7 @@ func TestRenderPlanComment_ExemptTablesAtLimitStayInline(t *testing.T) {
 	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: exemptTableNames(exemptTablesInlineLimit), Reason: "ignore_tables"}}
 	out := RenderPlanComment(data)
 
-	assert.Contains(t, out, "ℹ️ Ignored tables in namespace `app` (ignore\\_tables): `events_2026_01`")
+	assert.Contains(t, out, "ℹ️ Ignored tables in namespace `app` (ignore_tables): `events_2026_01`")
 	assert.NotContains(t, out, "ignored tables in namespace (ignore_tables)</summary>")
 }
 

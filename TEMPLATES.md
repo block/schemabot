@@ -549,7 +549,7 @@ schemabot apply -e staging
 
 ✅ **No schema changes detected**
 
-ℹ️ Ignored tables in namespace `testapp` (ignore\_tables): `flyway_schema_history`
+ℹ️ Ignored tables in namespace `testapp` (ignore_tables): `flyway_schema_history`
 
 
 </details>
@@ -857,7 +857,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
-- `users`: the table has ~1,240 rows
+- `users`: the table has \~1,240 rows
 
 Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.
 

@@ -513,11 +513,33 @@ func inlineCodeCell(name string) string {
 	return strings.ReplaceAll(inlineCode(name), "|", `\|`)
 }
 
-// mentionPattern matches what GitHub notifies as a user or team mention: an @
-// that does not follow a word character, then a login or an org/team slug. The
-// first group is the boundary character the mention follows, which stays
-// outside the span written around the second.
-var mentionPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])(@[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)?)`)
+// mentionPattern matches the body of what GitHub notifies as a user or team
+// mention: an @ then a login or an org/team slug. Whether a match is a mention
+// also depends on what precedes it, which mentionSpans decides.
+var mentionPattern = regexp.MustCompile(`@[A-Za-z0-9][A-Za-z0-9_-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)?`)
+
+// mentionSpans returns the byte ranges of text that read as mentions, with
+// mentions that touch merged into one range. A match is a mention when it
+// starts the text, follows a character that is not part of a word, or follows
+// another mention: an address such as dba@example.com names nobody, while
+// @octocat@hubot names two people.
+func mentionSpans(text string) [][2]int {
+	var spans [][2]int
+	for _, m := range mentionPattern.FindAllStringIndex(text, -1) {
+		start, end := m[0], m[1]
+		switch {
+		case len(spans) > 0 && spans[len(spans)-1][1] == start:
+			spans[len(spans)-1][1] = end
+		case start == 0 || !isWordByte(text[start-1]):
+			spans = append(spans, [2]int{start, end})
+		}
+	}
+	return spans
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
 
 // markdownReason renders a lint or unsafe change reason on one line of
 // Markdown. Identifiers the reason quotes read as code, as ui.CodeQuoteIdentifiers
@@ -530,19 +552,19 @@ func markdownReason(reason string) string {
 }
 
 // escapeProse is escapeInlineMarkdown for text that may also name a mention: a
-// mention is written as inline code, which GitHub does not notify. An
+// mention is written as inline code, which GitHub does not notify, and
+// mentions that touch share one span so no backtick lands between them. An
 // underscore between two letters or digits is left alone, since it cannot
 // start emphasis there and names such as seen_at read as written.
 func escapeProse(text string) string {
 	var b strings.Builder
 	last := 0
-	for _, m := range mentionPattern.FindAllStringSubmatchIndex(text, -1) {
-		mentionStart, mentionEnd := m[4], m[5]
-		b.WriteString(escapeProseWords(text[last:mentionStart]))
+	for _, span := range mentionSpans(text) {
+		b.WriteString(escapeProseWords(text[last:span[0]]))
 		b.WriteByte('`')
-		b.WriteString(text[mentionStart:mentionEnd])
+		b.WriteString(text[span[0]:span[1]])
 		b.WriteByte('`')
-		last = mentionEnd
+		last = span[1]
 	}
 	b.WriteString(escapeProseWords(text[last:]))
 	return b.String()
@@ -550,7 +572,9 @@ func escapeProse(text string) string {
 
 // escapeProseWords is escapeInlineMarkdown without the escapes that change
 // nothing about how the text renders: an underscore inside a word, and a less
-// than sign that no HTML construct can start with, as in "<=".
+// than sign that no HTML construct can start with, as in "<=". An ampersand is
+// escaped like any other delimiter, since a character reference such as &#64;
+// renders as the @ it names and GitHub notifies that mention.
 func escapeProseWords(text string) string {
 	runes := []rune(text)
 	var b strings.Builder
@@ -588,10 +612,23 @@ func startsHTML(r rune) bool {
 // mapOutsideCodeSpans applies rewrite to the parts of text a Markdown renderer
 // reads as prose and keeps each code span as written. A span is a backtick run
 // closed by the next run of the same length; a run with no such closer is
-// prose, so its backticks reach rewrite.
+// prose, so its backticks reach rewrite. A kept span begins and ends a maximal
+// backtick run, so the prose beside it never does; when rewrite writes a code
+// span of its own at that edge, a space keeps its delimiter apart from the
+// kept span's, since joined they would be one longer run that closes neither.
 func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
 	var b strings.Builder
 	proseStart := 0
+	writeProse := func(prose string, spanFollows bool) {
+		rewritten := rewrite(prose)
+		if proseStart > 0 && strings.HasPrefix(rewritten, "`") {
+			b.WriteByte(' ')
+		}
+		b.WriteString(rewritten)
+		if spanFollows && strings.HasSuffix(rewritten, "`") {
+			b.WriteByte(' ')
+		}
+	}
 	for i := 0; i < len(text); {
 		if text[i] != '`' {
 			i++
@@ -605,12 +642,12 @@ func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
 		if spanEnd < 0 {
 			continue
 		}
-		b.WriteString(rewrite(text[proseStart:spanStart]))
+		writeProse(text[proseStart:spanStart], true)
 		b.WriteString(text[spanStart:spanEnd])
 		proseStart = spanEnd
 		i = spanEnd
 	}
-	b.WriteString(rewrite(text[proseStart:]))
+	writeProse(text[proseStart:], false)
 	return b.String()
 }
 

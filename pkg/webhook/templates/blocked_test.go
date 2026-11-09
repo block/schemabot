@@ -31,6 +31,12 @@ func TestWriteEngineReasonItem(t *testing.T) {
 	sb.Reset()
 	writeEngineReasonItem(&sb, "`users`", engine.JoinBlockedCauses([]string{single, "\u200b"}))
 	assert.Equal(t, "- `users`: "+single+"\n", sb.String())
+
+	// A cause reads as the text it is: a mention in it is written as code, so
+	// GitHub notifies nobody, and a character reference cannot spell one.
+	sb.Reset()
+	writeEngineReasonItem(&sb, "`users`", engine.JoinBlockedCauses([]string{"ask @octocat@hubot first", "or &#64;hubot"}))
+	assert.Equal(t, "- `users`: ask `@octocat@hubot` first\n  - or \\&#64;hubot\n", sb.String())
 }
 
 // A statement the engine refuses is disclosed in its own ⛔ section, naming the
@@ -73,7 +79,7 @@ func TestRenderPlanComment_BlockedEscapesReasonMarkdown(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "table user\\_events\\_v2 \\| column \\*event\\_id\\* is unsupported")
+	assert.Contains(t, out, "table user_events_v2 \\| column \\*event_id\\* is unsupported")
 }
 
 func TestRenderPlanComment_BlockedSanitizesReason(t *testing.T) {

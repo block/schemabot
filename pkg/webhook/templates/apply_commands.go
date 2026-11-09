@@ -165,7 +165,7 @@ func RenderPRCommandDatabaseNotConfigured(data ActorAuthorizationCommentData) st
 	sb.WriteString("## SchemaBot Command Not Authorized\n\n")
 	writeDBEnvLine(&sb, data.Database, data.Environment)
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database `%s` is not configured on this SchemaBot instance.\n\n", data.CommandName, data.Database)
+	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database %s is not configured on this SchemaBot instance.\n\n", data.CommandName, inlineCode(data.Database))
 	sb.WriteString("Verify the database name, or run the command against the SchemaBot instance that manages this database.\n")
 
 	return offerSupportChannel(sb.String())

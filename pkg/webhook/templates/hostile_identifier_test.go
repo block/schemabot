@@ -72,6 +72,7 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 		"no config for a hostile -d":                   RenderNoConfig(SchemaErrorData{DatabaseName: hostileIdentifier}),
 
 		"no managed schema changes for a hostile -e":      RenderNoManagedSchemaChanges(SchemaErrorData{Environment: hostileIdentifier}),
+		"command for a database that is not configured":   RenderPRCommandDatabaseNotConfigured(ActorAuthorizationCommentData{CommandName: "apply", Database: hostileIdentifier, Environment: hostileIdentifier}),
 		"reconciliation of one completed apply":           reconcileOne(false),
 		"reconciliation of one in-progress apply":         reconcileOne(true),
 		"reconciliation table of several applies":         RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{Items: []SchemaChangeReconciliationItem{hostileItem, hostileItem}}),
@@ -195,11 +196,40 @@ func TestMarkdownReasonEscapesOnlyOutsideCodeSpans(t *testing.T) {
 		{"less than sign that starts HTML", "<b>x</b> <!-- y --> <?z", "\\<b>x\\</b> \\<!-- y --> \\<?z"},
 		{"email address is not a mention", "mail dba@example.com", "mail dba@example.com"},
 		{"mention after punctuation", "(@octocat)", "(`@octocat`)"},
+		{"mentions that touch share one span", "@octocat@hubot and @acme/db-admins@hubot", "`@octocat@hubot` and `@acme/db-admins@hubot`"},
+		{"character references cannot spell an @", "&#64;octocat &commat;octocat &#x40;octocat", "\\&#64;octocat \\&commat;octocat \\&#x40;octocat"},
+		{"mention before a span", "@octocat``a ` b`` @hubot`c`", "`@octocat` ``a ` b`` `@hubot` `c`"},
+		{"mention after a span", "``a ` b``@octocat `c`@hubot", "``a ` b`` `@octocat` `c` `@hubot`"},
+		{"strikethrough", "~~all clear~~", "\\~\\~all clear\\~\\~"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, markdownReason(tt.reason))
+		})
+	}
+}
+
+// A mention never reaches the comment as prose, whatever sits beside it: not
+// next to another mention, not next to a code span the reason already has, and
+// not spelled as a character reference.
+func TestMarkdownReasonDefusesEveryMention(t *testing.T) {
+	for _, reason := range []string{
+		"@octocat@hubot",
+		"@acme/db-admins@hubot",
+		"ask &#64;octocat to approve",
+		"ask &commat;octocat to approve",
+		"ask &#x40;octocat to approve",
+		"@octocat``a ` b``",
+		"``a ` b``@octocat",
+		"`a`@octocat`b`@hubot",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			mapOutsideCodeSpans(markdownReason(reason), func(prose string) string {
+				assert.NotContains(t, prose, "@", "an @ outside a code span can notify")
+				assert.NotContains(t, strings.ReplaceAll(prose, `\&`, ""), "&", "an ampersand outside a code span can start a character reference that spells an @")
+				return prose
+			})
 		})
 	}
 }
