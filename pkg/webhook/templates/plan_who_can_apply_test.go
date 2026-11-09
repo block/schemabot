@@ -25,7 +25,7 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 			ApplyAuthorization: auth,
 		}
 	}
-	whoCanApply := "🔐 **Who can apply**: only these teams and users can run `schemabot apply` for `orders`, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.\n" +
+	whoCanApply := "🔐 Only these teams and this user can run `schemabot apply` for `orders`. Ask one of them to run it:\n" +
 		"- Operators: `acme/orders-operators`, `lee`\n" +
 		"- Admins: `acme/db-admins`\n"
 
@@ -42,7 +42,7 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 			Plans:              map[string]*PlanCommentData{"staging": plan("staging"), "production": plan("production")},
 			ApplyAuthorization: auth,
 		})
-		assert.Equal(t, 1, strings.Count(out, "**Who can apply**"), out)
+		assert.Equal(t, 1, strings.Count(out, "🔐"), out)
 		assert.Contains(t, out, whoCanApply, out)
 	})
 
@@ -95,7 +95,7 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 		data := *plan("staging")
 		data.ApplyAuthorization = &ApplyAuthorizationData{OtherPrincipals: []string{"acme/db-admins"}}
 		out := RenderPlanComment(data)
-		assert.Contains(t, out, "ask one of them to run it.\n- Admins: `acme/db-admins`\n", out)
+		assert.Contains(t, out, "🔐 Only this team can run `schemabot apply` for `orders`. Ask a member to run it:\n- Admins: `acme/db-admins`\n", out)
 		assert.NotContains(t, out, "- Operators:", out)
 	})
 
@@ -208,4 +208,26 @@ func TestOffersApplyMatchesWhoCanApplyRendering(t *testing.T) {
 	assert.True(t, multis["changes in both"].OffersApply())
 	assert.False(t, multis["no changes anywhere"].OffersApply())
 	assert.False(t, multis["refused environment withholds the one behind it"].OffersApply())
+}
+
+// The sentence above the list is worded for what the list holds, so it never
+// calls a lone user "these teams and users" or asks a team to run a command.
+func TestWhoCanApplySentence(t *testing.T) {
+	tests := []struct {
+		name       string
+		principals []string
+		want       string
+	}{
+		{"one team", []string{"acme/orders-operators"}, "Only this team can run `schemabot apply` for `orders`. Ask a member to run it:"},
+		{"several teams", []string{"acme/orders-operators", "acme/db-admins"}, "Only these teams can run `schemabot apply` for `orders`. Ask a member of one of them to run it:"},
+		{"one user", []string{"lee"}, "Only this user can run `schemabot apply` for `orders`. Ask them to run it:"},
+		{"several users", []string{"lee", "jdoe"}, "Only these users can run `schemabot apply` for `orders`. Ask one of them to run it:"},
+		{"one team and one user", []string{"acme/orders-operators", "lee"}, "Only this team and this user can run `schemabot apply` for `orders`. Ask one of them to run it:"},
+		{"teams and users", []string{"acme/orders-operators", "acme/db-admins", "lee", "jdoe"}, "Only these teams and these users can run `schemabot apply` for `orders`. Ask one of them to run it:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, whoCanApplySentence("orders", tt.principals))
+		})
+	}
 }

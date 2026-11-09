@@ -844,16 +844,47 @@ func writeWhoCanApply(sb *strings.Builder, database string, auth *ApplyAuthoriza
 		fmt.Fprintf(sb, "🔐 No team or user can run `schemabot apply` for %s yet. Ask a SchemaBot admin to configure its operators.\n", inlineCode(database))
 		return
 	}
-	// Running the command and approving the PR are separate checks with
-	// separate lists, so the note promises only the first: a listed principal
-	// can run the apply once the PR has any approval it needs.
-	fmt.Fprintf(sb, "🔐 **Who can apply**: only these teams and users can run `schemabot apply` for %s, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.\n", inlineCode(database))
+	fmt.Fprintf(sb, "🔐 %s\n", whoCanApplySentence(database, append(append([]string{}, operators...), others...)))
 	if len(operators) > 0 {
 		fmt.Fprintf(sb, "- Operators: %s\n", principalList(operators))
 	}
 	if len(others) > 0 {
 		fmt.Fprintf(sb, "- Admins: %s\n", principalList(others))
 	}
+}
+
+// whoCanApplySentence says who can run the apply and whom to ask, worded for
+// what principals holds: teams, users, or both, one or several. A principal in
+// org/team form is a team; GitHub logins cannot contain a slash, so anything
+// else is a user.
+func whoCanApplySentence(database string, principals []string) string {
+	teams, users := 0, 0
+	for _, principal := range principals {
+		if strings.Contains(principal, "/") {
+			teams++
+		} else {
+			users++
+		}
+	}
+	noun := func(count int, one, many string) string {
+		if count == 1 {
+			return one
+		}
+		return many
+	}
+	var who, ask string
+	switch {
+	case teams > 0 && users > 0:
+		who = noun(teams, "this team", "these teams") + " and " + noun(users, "this user", "these users")
+		ask = "Ask one of them to run it:"
+	case teams > 0:
+		who = noun(teams, "this team", "these teams")
+		ask = noun(teams, "Ask a member to run it:", "Ask a member of one of them to run it:")
+	default:
+		who = noun(users, "this user", "these users")
+		ask = noun(users, "Ask them to run it:", "Ask one of them to run it:")
+	}
+	return fmt.Sprintf("Only %s can run `schemabot apply` for %s. %s", who, inlineCode(database), ask)
 }
 
 // maxListedPrincipals bounds each who-can-apply line, so a database with a
