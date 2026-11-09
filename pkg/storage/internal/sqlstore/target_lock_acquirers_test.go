@@ -1,10 +1,12 @@
 package sqlstore
 
 import (
+	"context"
 	"go/ast"
 	"go/types"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +30,10 @@ var applyTargetLockAcquirers = []string{
 	"applyStore.WithTargetHeld",
 }
 
+// packageLoadDeadline bounds the go/packages load, so a stalled go list
+// subprocess fails this test instead of waiting for the suite timeout.
+const packageLoadDeadline = 30 * time.Second
+
 // TestApplyTargetLockAcquirersAreListed walks this package's call graph and
 // checks that the exported entry points reaching acquireApplyTargetLockConn
 // are exactly applyTargetLockAcquirers. A new path to the target lock fails
@@ -36,9 +42,12 @@ var applyTargetLockAcquirers = []string{
 // Calls made through an interface are not followed; every current path
 // reaches the lock through concrete calls.
 func TestApplyTargetLockAcquirersAreListed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), packageLoadDeadline)
+	defer cancel()
 	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
-		Dir:  ".",
+		Context: ctx,
+		Mode:    packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
+		Dir:     ".",
 	}
 	pkgs, err := packages.Load(cfg, ".")
 	require.NoError(t, err)

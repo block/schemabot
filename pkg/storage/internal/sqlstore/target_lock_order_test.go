@@ -24,6 +24,11 @@ import (
 
 // applyRowLockReader lists the locks any open transaction holds on applies
 // rows in the store's database, read from a session of its own.
+// lockOrderCheckDeadline bounds each lock-order case and the probe, so a
+// stalled pool wait, row lock or catalog read fails the case instead of
+// waiting for the suite timeout.
+const lockOrderCheckDeadline = 30 * time.Second
+
 type applyRowLockReader func(ctx context.Context) ([]string, error)
 
 // mysqlApplyRowLocks reads InnoDB's lock table. A transaction that has locked
@@ -140,9 +145,10 @@ func TestApplyTargetLockPrecedesApplyRowLocks(t *testing.T) {
 func testApplyTargetLockPrecedesApplyRowLocks(t *testing.T, newStore func(t *testing.T, locker namedlock.Locker) *Storage, baseLocker namedlock.Locker, heldApplyRowLocks applyRowLockReader) {
 	locker := &lockOrderCheckingLocker{Locker: baseLocker, heldApplyRowLocks: heldApplyRowLocks}
 	store := newStore(t, locker)
-	ctx := t.Context()
 
 	t.Run("the check sees a held apply row", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), lockOrderCheckDeadline)
+		defer cancel()
 		lock := storagetest.CreateLock(t, store, "lock_order_probe_db", storage.DatabaseTypeMySQL)
 		apply := storagetest.CreateApplyWithStateEnvDeployment(t, store, lock, "apply_lock_order_probe", 9700, state.Apply.Failed, "staging", "default")
 		tx, err := store.db.BeginTx(ctx, nil)
@@ -158,24 +164,24 @@ func testApplyTargetLockPrecedesApplyRowLocks(t *testing.T, newStore func(t *tes
 		require.ErrorContains(t, err, "requested while apply row locks are held", "the check refuses the target lock while an apply row is held")
 	})
 
-	cases := map[string]func(t *testing.T, lock *storage.Lock){
-		"applyStore.Create": func(t *testing.T, lock *storage.Lock) {
+	cases := map[string]func(ctx context.Context, t *testing.T, lock *storage.Lock){
+		"applyStore.Create": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			_, err := store.Applies().Create(ctx, lockOrderApply(lock, "apply_lock_order_create"))
 			require.NoError(t, err)
 		},
-		"applyStore.CreateWithTasks": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.CreateWithTasks": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := lockOrderApply(lock, "apply_lock_order_create_tasks")
 			_, err := store.Applies().CreateWithTasks(ctx, apply, []*storage.Task{lockOrderTask(apply, "task_lock_order_create_tasks", "")})
 			require.NoError(t, err)
 		},
-		"applyStore.CreateWithTasksAndOperations": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.CreateWithTasksAndOperations": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := lockOrderApply(lock, "apply_lock_order_create_ops")
 			_, err := store.Applies().CreateWithTasksAndOperations(ctx, apply,
 				[]*storage.Task{lockOrderTask(apply, "task_lock_order_create_ops", "")},
 				[]*storage.ApplyOperation{{Deployment: "default", OperationKey: "default", State: state.ApplyOperation.Pending}})
 			require.NoError(t, err)
 		},
-		"applyStore.CreateWithGroupedOperations": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.CreateWithGroupedOperations": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := lockOrderApply(lock, "apply_lock_order_create_grouped")
 			_, err := store.Applies().CreateWithGroupedOperations(ctx, apply, []*storage.ApplyOperationWithTasks{{
 				Operation: &storage.ApplyOperation{Deployment: "default", Target: lock.DatabaseName, State: state.ApplyOperation.Pending},
@@ -183,7 +189,7 @@ func testApplyTargetLockPrecedesApplyRowLocks(t *testing.T, newStore func(t *tes
 			}})
 			require.NoError(t, err)
 		},
-		"applyStore.AttachOperationWithTasks": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.AttachOperationWithTasks": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := lockOrderApply(lock, "apply_lock_order_attach")
 			id, err := store.Applies().CreateWithTasksAndOperations(ctx, apply,
 				[]*storage.Task{lockOrderTask(apply, "task_lock_order_attach_first", "-80")},
@@ -195,14 +201,14 @@ func testApplyTargetLockPrecedesApplyRowLocks(t *testing.T, newStore func(t *tes
 			sibling := &storage.ApplyOperation{Deployment: "default", OperationKey: lock.DatabaseName + "/80-/users", Target: lock.DatabaseName, State: state.ApplyOperation.Pending}
 			require.NoError(t, store.Applies().AttachOperationWithTasks(ctx, apply, sibling, []*storage.Task{lockOrderTask(apply, "task_lock_order_attach_sibling", "80-")}))
 		},
-		"applyStore.Update": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.Update": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := storagetest.CreateApplyWithStateEnvDeployment(t, store, lock, "apply_lock_order_update", 9701, state.Apply.Pending, "staging", "default")
 			locker.takeAcquired()
 
 			apply.State = state.Apply.Running
 			require.NoError(t, store.Applies().Update(ctx, apply))
 		},
-		"applyStore.ClaimApplyByID": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.ClaimApplyByID": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := storagetest.CreateApplyWithStateEnvDeployment(t, store, lock, "apply_lock_order_claim", 9702, state.Apply.Stopped, "staging", "default")
 			_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 				ApplyID:   apply.ID,
@@ -218,13 +224,13 @@ func testApplyTargetLockPrecedesApplyRowLocks(t *testing.T, newStore func(t *tes
 			require.NoError(t, err)
 			require.NotNil(t, claimed, "the stopped apply with a pending start is claimed under the target lock")
 		},
-		"applyStore.WithExclusiveTarget": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.WithExclusiveTarget": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := storagetest.CreateApplyWithStateEnvDeployment(t, store, lock, "apply_lock_order_exclusive", 9703, state.Apply.Pending, "staging", "default")
 			locker.takeAcquired()
 
 			require.NoError(t, store.Applies().WithExclusiveTarget(ctx, apply, func(context.Context) error { return nil }))
 		},
-		"applyStore.WithTargetHeld": func(t *testing.T, lock *storage.Lock) {
+		"applyStore.WithTargetHeld": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			require.NoError(t, store.Applies().WithTargetHeld(ctx, lock.DatabaseName, lock.DatabaseType, "staging", func(context.Context) error { return nil }))
 		},
 	}
@@ -241,8 +247,10 @@ func testApplyTargetLockPrecedesApplyRowLocks(t *testing.T, newStore func(t *tes
 		t.Run(name, func(t *testing.T) {
 			lock := storagetest.CreateLock(t, store, fmt.Sprintf("lock_order_db_%d", i), storage.DatabaseTypeMySQL)
 			locker.takeAcquired()
+			ctx, cancel := context.WithTimeout(t.Context(), lockOrderCheckDeadline)
+			defer cancel()
 
-			cases[name](t, lock)
+			cases[name](ctx, t, lock)
 
 			assert.Contains(t, locker.takeAcquired(), applyTargetLockName(lock.DatabaseName, lock.DatabaseType, "staging"),
 				"%s must take the apply target lock on the path this case drives", name)
