@@ -868,7 +868,7 @@ func TestEngine_ResumeDropPhase_FailsOnMissingTableItNeverQuarantined(t *testing
 	// did not make.
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `resume_vanished_first` (id INT PRIMARY KEY AUTO_INCREMENT)")
 	require.NoError(t, err, "create resume_vanished_first")
-	foreign, err := pendingdrops.MoveTable(t.Context(), db, "testdb", "resume_vanished_first", time.Now())
+	foreign, err := pendingdrops.MoveTable(t.Context(), db, slog.Default(), "testdb", "resume_vanished_first", time.Now())
 	require.NoError(t, err, "quarantine resume_vanished_first outside the schema change")
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))

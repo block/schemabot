@@ -5,6 +5,7 @@ package spirit
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -119,35 +120,59 @@ func (e *Engine) stoppedStatementsEnded(ctx context.Context, host, username, pas
 	}
 
 	running := pending[len(ended)]
-	logger.Warn("a statement from a stopped schema change is still running on the server; the schema change will start once its session is gone",
+	held := heldByStoppedStatement(running, username, database)
+	logger.Warn("a statement from a stopped schema change still holds the database; the schema change will not start",
 		"database", database,
 		"session", running.connID,
+		"error", held,
 	)
-	e.setSchemaChangeFailed(fmt.Errorf("%w: %w", engine.ErrTargetHeld, engine.OperatorErrorf(
-		fmt.Errorf("session %d", running.connID),
-		"a statement from a stopped schema change on database %s is still running on the server; wait for it to finish or kill its session", database)))
+	e.setSchemaChangeFailed(fmt.Errorf("%w: %w", engine.ErrTargetHeld, held))
 	return false
+}
+
+// heldByStoppedStatement explains why stmt still holds database and names the
+// step that releases it. A statement this run can look up is released once its
+// session leaves the server. One it cannot look up, because its session is
+// unknown or belongs to another database user, stays recorded until the engine
+// restarts.
+func heldByStoppedStatement(stmt unconfirmedStatement, username, database string) error {
+	session := fmt.Errorf("session %d", stmt.connID)
+	switch {
+	case stmt.connID == 0:
+		return engine.OperatorErrorf(errors.New("session unknown"),
+			"a statement from a stopped schema change on database %s may still be running, and its session is unknown; once it has ended, restart the server running this schema change", database)
+	case stmt.username != username:
+		return engine.OperatorErrorf(session,
+			"a statement from a stopped schema change on database %s ran as a different database user, so session %d cannot be checked; once it has ended, restart the server running this schema change", database, stmt.connID)
+	default:
+		return engine.OperatorErrorf(session,
+			"a statement from a stopped schema change on database %s is still running on the server; wait for it to finish or kill session %d", database, stmt.connID)
+	}
 }
 
 // endedStatements returns the leading statements of pending whose sessions are
 // gone from the server, stopping at the first one that may still be running.
 func (e *Engine) endedStatements(ctx context.Context, host, username, password, database string, pending []unconfirmedStatement) ([]unconfirmedStatement, error) {
-	db, err := mysqlconn.Open(targetDSN(host, username, password, database))
-	if err != nil {
-		return nil, fmt.Errorf("open database %s: %w", database, err)
-	}
-	defer utils.CloseAndLog(db)
-	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping database %s: %w", database, err)
-	}
-
 	var ended []unconfirmedStatement
+	var db *sql.DB
+	defer func() {
+		if db != nil {
+			utils.CloseAndLog(db)
+		}
+	}()
 	for _, stmt := range pending {
-		// A user always sees its own sessions in the processlist, but not
-		// another user's without the PROCESS privilege, so an absent session
-		// proves nothing when this run connects as someone else.
-		if stmt.connID == 0 || stmt.username != username {
+		if !stmt.checkableAs(username) {
 			return ended, nil
+		}
+		if db == nil {
+			opened, err := mysqlconn.Open(targetDSN(host, username, password, database))
+			if err != nil {
+				return ended, fmt.Errorf("open database %s: %w", database, err)
+			}
+			db = opened
+			if err := db.PingContext(ctx); err != nil {
+				return ended, fmt.Errorf("ping database %s: %w", database, err)
+			}
 		}
 		var sessions int
 		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.processlist WHERE id = ?", stmt.connID).Scan(&sessions); err != nil {
@@ -159,6 +184,14 @@ func (e *Engine) endedStatements(ctx context.Context, host, username, password, 
 		ended = append(ended, stmt)
 	}
 	return ended, nil
+}
+
+// checkableAs reports whether a run connected as username can tell that the
+// statement's session has left the server. A user always sees its own sessions
+// in the processlist, but not another user's without the PROCESS privilege, so
+// an absent session proves nothing when the run connects as someone else.
+func (s unconfirmedStatement) checkableAs(username string) bool {
+	return s.connID != 0 && s.username == username
 }
 
 // forgetStatements drops statements confirmed to have left the server.

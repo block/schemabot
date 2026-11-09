@@ -52,7 +52,7 @@ const createLogTableSQL = "CREATE TABLE IF NOT EXISTS `" + Database + "`.`" + Lo
 // failure converges on one record per copy. A destination already recorded for
 // another apply or another source is refused: two moves must not claim one
 // copy.
-func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, moved []QuarantinedTable, now time.Time) error {
+func RecordQuarantines(ctx context.Context, db *sql.DB, logger *slog.Logger, applyIdentifier string, moved []QuarantinedTable, now time.Time) error {
 	if applyIdentifier == "" {
 		return errors.New("record quarantines: apply identifier is required")
 	}
@@ -61,10 +61,10 @@ func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, 
 	}
 	// Each statement runs through ExecKillOnCancel, so a stopped schema change
 	// leaves none of them queued on the server to take effect after it exits.
-	if err := dbconn.ExecKillOnCancel(ctx, db, slog.Default(), "CREATE DATABASE IF NOT EXISTS %n", Database); err != nil {
+	if err := dbconn.ExecKillOnCancel(ctx, db, logger, "CREATE DATABASE IF NOT EXISTS %n", Database); err != nil {
 		return fmt.Errorf("create %s database: %w", Database, err)
 	}
-	if err := dbconn.ExecKillOnCancel(ctx, db, slog.Default(), "%r", sqlescape.RawSQL(createLogTableSQL)); err != nil {
+	if err := dbconn.ExecKillOnCancel(ctx, db, logger, "%r", sqlescape.RawSQL(createLogTableSQL)); err != nil {
 		return fmt.Errorf("create %s.%s: %w", Database, LogTable, err)
 	}
 	insert := "INSERT INTO %n.%n (quarantine_table, source_schema, source_table, apply_identifier, quarantined_at) VALUES (%?, %?, %?, %?, %?)"
@@ -76,7 +76,7 @@ func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, 
 		if recorded {
 			continue
 		}
-		if err := dbconn.ExecKillOnCancel(ctx, db, slog.Default(), insert,
+		if err := dbconn.ExecKillOnCancel(ctx, db, logger, insert,
 			Database, LogTable, table.QuarantineTable, table.SchemaName, table.TableName, applyIdentifier, now.UTC()); err != nil {
 			return fmt.Errorf("record quarantine of %s.%s as %s for apply %s: %w",
 				table.SchemaName, table.TableName, table.QuarantineTable, applyIdentifier, err)

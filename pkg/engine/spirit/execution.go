@@ -725,7 +725,7 @@ func (e *Engine) dropCutoverOriginalsLeftByCancel(ctx context.Context, dsn, data
 			"database", database,
 			"tables", present,
 		)
-		discarded, err := discardArtifacts(ctx, db, database, present)
+		discarded, err := discardArtifacts(ctx, db, logger, database, present)
 		return present[len(discarded):], err
 	}()
 	if err != nil {

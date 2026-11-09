@@ -42,3 +42,50 @@ func TestStartFailsWhenAStoppedRunsStatementCannotBeChecked(t *testing.T) {
 	assert.False(t, progress.TargetHeld, "a failed check is not a held target")
 	assert.Equal(t, []unconfirmedStatement{recorded}, eng.unconfirmedStatements, "the statement stays recorded for the next start")
 }
+
+// A start that arrives while a stop is still waiting for its run to exit waits
+// for that run. The run records a statement it could not confirm had ended only
+// as it exits, so the start checks that statement rather than starting before
+// it is recorded.
+func TestStartWaitsForAStoppingRunToRecordItsStatement(t *testing.T) {
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	// The statement ran as another user, so the check holds the target
+	// without reaching the server.
+	recorded := unconfirmedStatement{host: "127.0.0.1:1", username: "schemabot_old", database: "orders_db", connID: 4242}
+	rm := &runningSchemaChange{state: engine.StateStopped, host: recorded.host, username: "schemabot", database: recorded.database}
+	eng.runningSchemaChange = rm
+	release := make(chan struct{})
+	rm.goRun(func() {
+		<-release
+		eng.mu.Lock()
+		eng.unconfirmedStatements = append(eng.unconfirmedStatements, recorded)
+		eng.mu.Unlock()
+	})
+
+	started := make(chan error, 1)
+	go func() {
+		_, err := eng.Start(t.Context(), &engine.ControlRequest{})
+		started <- err
+	}()
+	select {
+	case <-started:
+		require.FailNow(t, "Start returned while the stopped run was still exiting")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-started:
+		require.NoError(t, err, "Start()")
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "Start did not return")
+	}
+
+	var progress *engine.ProgressResult
+	require.Eventually(t, func() bool {
+		progress = pollProgress(t, eng)
+		return progress.State.IsTerminal()
+	}, 10*time.Second, 10*time.Millisecond, "the start did not settle")
+	assert.Equal(t, engine.StateFailed, progress.State, "the schema change does not start")
+	assert.True(t, progress.TargetHeld, "the start checked the statement the stopped run recorded")
+	assert.Equal(t, []unconfirmedStatement{recorded}, eng.unconfirmedStatements, "the statement stays recorded for the next start")
+}

@@ -62,7 +62,8 @@ func TestEngine_StartWaitsForAStoppedRunsStatementToLeaveTheServer(t *testing.T)
 // A statement recorded under a different user than the one a later start
 // connects as cannot be checked: a user does not see another user's sessions
 // without the PROCESS privilege, so a missing session proves nothing. The
-// start is refused as a held target even though no such session is running.
+// start is refused as a held target even though no such session is running,
+// and the refusal says that only a restart releases the database.
 func TestEngine_StartWaitsWhenAStoppedRunsStatementWasIssuedByAnotherUser(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -78,6 +79,8 @@ func TestEngine_StartWaitsWhenAStoppedRunsStatementWasIssuedByAnotherUser(t *tes
 	applyTableChange(t, eng, dsn, "other_user_orders", "CREATE TABLE other_user_orders (id BIGINT UNSIGNED NOT NULL PRIMARY KEY)")
 	refused := waitForTerminalOutcome(t, eng, engine.StateFailed)
 	assert.True(t, refused.TargetHeld, "a statement that cannot be checked holds the target")
+	assert.Contains(t, refused.ErrorMessage, "ran as a different database user", "the refusal names why the session cannot be checked")
+	assert.Contains(t, refused.ErrorMessage, "restart the server running this schema change", "the refusal names the step that releases the database")
 	assert.False(t, tableExists(t, db, "other_user_orders"), "the schema change did not start")
 	assert.True(t, eng.CancelledStatementMayStillRun(), "the statement stays recorded")
 }

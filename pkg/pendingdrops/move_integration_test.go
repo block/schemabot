@@ -5,6 +5,7 @@ package pendingdrops
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -59,7 +60,7 @@ func TestMoveTablesQuarantinesEveryTableUnderItsOwnName(t *testing.T) {
 			moves = append(moves, TableMove{SchemaName: "testdb", TableName: name})
 		}
 
-		moved, err := MoveTables(t.Context(), db, moves, time.Now())
+		moved, err := MoveTables(t.Context(), db, slog.Default(), moves, time.Now())
 		require.NoError(t, err)
 
 		require.Len(t, moved, 2)
@@ -76,7 +77,7 @@ func TestMoveTablesQuarantinesEveryTableUnderItsOwnName(t *testing.T) {
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `testdb_2`")
 		})
 
-		moved, err := MoveTables(t.Context(), db, []TableMove{
+		moved, err := MoveTables(t.Context(), db, slog.Default(), []TableMove{
 			{SchemaName: "testdb", TableName: "users"},
 			{SchemaName: "testdb_2", TableName: "users"},
 		}, time.Now())
@@ -96,7 +97,7 @@ func TestMoveTablesQuarantinesEveryTableUnderItsOwnName(t *testing.T) {
 		name := strings.Repeat("é", 40)
 		createSourceTable(t, db, "testdb", name, 3)
 
-		moved, err := MoveTables(t.Context(), db, []TableMove{{SchemaName: "testdb", TableName: name}}, time.Now())
+		moved, err := MoveTables(t.Context(), db, slog.Default(), []TableMove{{SchemaName: "testdb", TableName: name}}, time.Now())
 		require.NoError(t, err)
 
 		require.Len(t, moved, 1)

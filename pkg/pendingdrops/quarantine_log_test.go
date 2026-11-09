@@ -1,6 +1,7 @@
 package pendingdrops
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 // that made it, so it is refused before the target is touched.
 func TestRecordQuarantinesRequiresAnApplyIdentifier(t *testing.T) {
 	moved := []QuarantinedTable{{SchemaName: "app", TableName: "orders", QuarantineSchema: Database, QuarantineTable: TableName("app", "orders", time.Now())}}
-	err := RecordQuarantines(t.Context(), nil, "", moved, time.Now())
+	err := RecordQuarantines(t.Context(), nil, slog.Default(), "", moved, time.Now())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "apply identifier is required")
 }

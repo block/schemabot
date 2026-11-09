@@ -95,7 +95,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 	// the table does not run, so no copy lands in pending drops that a later
 	// attempt cannot recognize as its own.
 	if applyIdentifier := e.runningApplyIdentifier(); applyIdentifier != "" {
-		if err := pendingdrops.RecordQuarantines(ctx, db, applyIdentifier, moved, time.Now()); err != nil {
+		if err := pendingdrops.RecordQuarantines(ctx, db, e.changeLogger(), applyIdentifier, moved, time.Now()); err != nil {
 			return fmt.Errorf("record which apply quarantines the DROP TABLE targets before moving them: %w", err)
 		}
 	} else {
@@ -104,7 +104,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			"tables", quarantinedSourceTables(moved),
 		)
 	}
-	if err := pendingdrops.MoveTablesTo(ctx, db, moved); err != nil {
+	if err := pendingdrops.MoveTablesTo(ctx, db, e.changeLogger(), moved); err != nil {
 		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
 	}
 	for _, table := range moved {
