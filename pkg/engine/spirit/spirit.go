@@ -81,9 +81,10 @@ type Engine struct {
 	// Running schema change state
 	mu                  sync.Mutex
 	runningSchemaChange *runningSchemaChange
-	// unconfirmedStatements are statements stopped runs issued that could not
-	// be confirmed to have ended on the server. A run does not start on a
-	// database while one of them may still be running there.
+	// unconfirmedStatements are statements stopped runs of this engine issued
+	// that could not be confirmed to have ended on the server. A run does not
+	// start on a database while one of them may still be running there. The
+	// record lives only in memory, so a new Engine starts without it.
 	unconfirmedStatements []unconfirmedStatement
 	// drainedOutcome retains the terminal result of the last schema change
 	// Drain released, so a progress poll that lands after the drain still

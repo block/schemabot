@@ -59,6 +59,29 @@ func TestEngine_StartWaitsForAStoppedRunsStatementToLeaveTheServer(t *testing.T)
 	assert.False(t, eng.CancelledStatementMayStillRun(), "a confirmed end clears the record")
 }
 
+// A statement recorded under a different user than the one a later start
+// connects as cannot be checked: a user does not see another user's sessions
+// without the PROCESS privilege, so a missing session proves nothing. The
+// start is refused as a held target even though no such session is running.
+func TestEngine_StartWaitsWhenAStoppedRunsStatementWasIssuedByAnotherUser(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	host, _, _, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+	var connID int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT MAX(id) + 1000 FROM information_schema.processlist").Scan(&connID), "pick an unused session id")
+
+	eng := New(Config{Logger: slog.Default()})
+	eng.unconfirmedStatements = []unconfirmedStatement{{host: host, username: "some_other_user", database: database, connID: connID}}
+
+	applyTableChange(t, eng, dsn, "other_user_orders", "CREATE TABLE other_user_orders (id BIGINT UNSIGNED NOT NULL PRIMARY KEY)")
+	refused := waitForTerminalOutcome(t, eng, engine.StateFailed)
+	assert.True(t, refused.TargetHeld, "a statement that cannot be checked holds the target")
+	assert.False(t, tableExists(t, db, "other_user_orders"), "the schema change did not start")
+	assert.True(t, eng.CancelledStatementMayStillRun(), "the statement stays recorded")
+}
+
 // waitForSessionGone polls until connID leaves the processlist.
 func waitForSessionGone(t *testing.T, db *sql.DB, connID int) {
 	t.Helper()

@@ -251,6 +251,25 @@ func TestSettleRunnerError(t *testing.T) {
 	}
 }
 
+// A stop that lands while Spirit drops a leftover table after the change has
+// applied, and cannot confirm that the DROP ended on the server, still settles
+// the change as finished. The engine records the DROP's session, so the next
+// start on the database waits for it to leave the server.
+func TestSettleRunnerErrorRecordsACleanupDropThatMayStillRun(t *testing.T) {
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	eng.runningSchemaChange = &runningSchemaChange{database: "app", state: engine.StateStopped, host: "db-1:3306", username: "schemabot"}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	runErr := fmt.Errorf("run Spirit: %w", &dbconn.CancelledStatementError{ConnID: 4242, Err: context.Canceled})
+
+	err := eng.settleRunnerError(ctx, runErr, status.WorkflowResult{DurableMutation: true}, "app", []string{"orders"})
+
+	require.NoError(t, err, "the applied change settles as finished")
+	assert.True(t, eng.CancelledStatementMayStillRun())
+	assert.Equal(t, []unconfirmedStatement{{host: "db-1:3306", username: "schemabot", database: "app", connID: 4242}}, eng.unconfirmedStatements,
+		"the record names the target and the DROP's session")
+}
+
 // A row the copy cannot write into the new table definition fails every
 // attempt the same way, because every attempt copies the same rows into the
 // same definition. Those failures are permanent; what a retry can clear — a

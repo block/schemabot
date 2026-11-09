@@ -66,9 +66,12 @@ func (e *Engine) noteStoppedStatement(logger *slog.Logger, database string, err 
 // stopped while a statement it issued could not be confirmed to have ended on
 // the server, and no later start on that database has since confirmed the
 // statement's session is gone. A stopped run kills the session of every
-// statement it had in flight and waits for it to exit, so once the engine has
-// drained and this reports false, nothing the engine issued is still running on
-// the target.
+// statement it had in flight and waits for it to exit, so once this engine has
+// drained and this reports false, nothing this engine issued is still running
+// on the target.
+//
+// The record is held in memory by this Engine. It does not cover statements
+// issued by another Engine, including one in an earlier process.
 func (e *Engine) CancelledStatementMayStillRun() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
