@@ -350,6 +350,24 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		e.mu.Unlock()
 		return nil, fmt.Errorf("no schema change to resume - use Apply to start a new one")
 	}
+	stopping := rm.state == engine.StateStopped
+	stoppedDatabase := rm.database
+	e.mu.Unlock()
+
+	// A stop marks the change stopped before its run has exited, and the run
+	// records a statement it could not confirm had ended only as it exits.
+	// Waiting for that run lets the check below see the record.
+	if stopping {
+		if err := waitForRunExit(ctx, rm); err != nil {
+			return nil, fmt.Errorf("wait for the stopped run on database %s to exit before resuming: %w", stoppedDatabase, err)
+		}
+	}
+
+	e.mu.Lock()
+	if e.runningSchemaChange != rm {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("the stopped schema change on database %s stopped being tracked while its run exited; resume it again", stoppedDatabase)
+	}
 	state := rm.state
 	host := rm.host
 	username := rm.username
@@ -394,6 +412,9 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 
 	rm.goRun(func() {
 		defer cancel()
+		if !e.stoppedStatementsEnded(bgCtx, host, username, password, database) {
+			return
+		}
 		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 

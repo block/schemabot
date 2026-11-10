@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ func recordQuarantine(t *testing.T, db *sql.DB, applyIdentifier, table string, q
 	t.Helper()
 	moved, err := Destinations([]TableMove{{SchemaName: "testdb", TableName: table}}, quarantinedAt)
 	require.NoError(t, err)
-	require.NoError(t, RecordQuarantines(t.Context(), db, applyIdentifier, moved, quarantinedAt))
+	require.NoError(t, RecordQuarantines(t.Context(), db, slog.Default(), applyIdentifier, moved, quarantinedAt))
 	return moved[0].QuarantineTable
 }
 
@@ -72,19 +73,19 @@ func TestQuarantineLogAcceptsARepeatAndRefusesAnotherOwner(t *testing.T) {
 	}, now)
 	require.NoError(t, err)
 
-	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", moved, now))
-	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", moved, now))
+	require.NoError(t, RecordQuarantines(t.Context(), db, slog.Default(), "apply-a", moved, now))
+	require.NoError(t, RecordQuarantines(t.Context(), db, slog.Default(), "apply-a", moved, now))
 	assert.Equal(t, []string{moved[0].QuarantineTable}, recordedNames(t, db, "apply-a", "orders"))
 	assert.Equal(t, []string{moved[1].QuarantineTable}, recordedNames(t, db, "apply-a", "customers"))
 
-	err = RecordQuarantines(t.Context(), db, "apply-b", moved, now)
+	err = RecordQuarantines(t.Context(), db, slog.Default(), "apply-b", moved, now)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), moved[0].QuarantineTable)
 	assert.Contains(t, err.Error(), "apply-a")
 	assert.Empty(t, recordedNames(t, db, "apply-b", "orders"))
 
 	otherSource := []QuarantinedTable{{SchemaName: "testdb", TableName: "invoices", QuarantineSchema: Database, QuarantineTable: moved[0].QuarantineTable}}
-	err = RecordQuarantines(t.Context(), db, "apply-a", otherSource, now)
+	err = RecordQuarantines(t.Context(), db, slog.Default(), "apply-a", otherSource, now)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "testdb.orders")
 	assert.Empty(t, recordedNames(t, db, "apply-a", "invoices"))
@@ -105,7 +106,7 @@ func TestQuarantineLogTellsDestinationsApartAsMySQLDoes(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, moved[0].QuarantineTable, moved[1].QuarantineTable)
 
-	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", moved, now))
+	require.NoError(t, RecordQuarantines(t.Context(), db, slog.Default(), "apply-a", moved, now))
 	assert.Equal(t, []string{moved[0].QuarantineTable}, recordedNames(t, db, "apply-a", "cafe"))
 	assert.Equal(t, []string{moved[1].QuarantineTable}, recordedNames(t, db, "apply-a", "café"))
 
@@ -120,12 +121,12 @@ func TestQuarantineLogTellsDestinationsApartAsMySQLDoes(t *testing.T) {
 		_, err := db.ExecContext(context.WithoutCancel(t.Context()), "DROP TABLE IF EXISTS `testdb`.`cafe`, `testdb`.`café`")
 		assert.NoError(t, err, "drop accent tables")
 	})
-	require.NoError(t, MoveTablesTo(t.Context(), db, moved))
+	require.NoError(t, MoveTablesTo(t.Context(), db, slog.Default(), moved))
 	assert.Contains(t, quarantinedTables(t, db), moved[0].QuarantineTable)
 	assert.Contains(t, quarantinedTables(t, db), moved[1].QuarantineTable)
 
 	folded := []QuarantinedTable{{SchemaName: "testdb", TableName: "cafe", QuarantineSchema: Database, QuarantineTable: strings.ToUpper(moved[0].QuarantineTable)}}
-	err = RecordQuarantines(t.Context(), db, "apply-b", folded, now)
+	err = RecordQuarantines(t.Context(), db, slog.Default(), "apply-b", folded, now)
 	require.Error(t, err, "a destination differing only by case is the recorded copy")
 	assert.Contains(t, err.Error(), "apply-a")
 }
@@ -227,7 +228,7 @@ func TestCleaner_KeepsTheQuarantineLogInStepWithTheCopies(t *testing.T) {
 			"expired, no copy":   recordQuarantine(t, db, "apply-a", "never_moved", old),
 			"fresh, no copy yet": recordQuarantine(t, db, "apply-a", "moving", now),
 		}
-		require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", []QuarantinedTable{
+		require.NoError(t, RecordQuarantines(t.Context(), db, slog.Default(), "apply-a", []QuarantinedTable{
 			{SchemaName: "testdb", TableName: "old_orders", QuarantineSchema: Database, QuarantineTable: names["expired copy"]},
 			{SchemaName: "testdb", TableName: "new_orders", QuarantineSchema: Database, QuarantineTable: names["fresh copy"]},
 		}, now))

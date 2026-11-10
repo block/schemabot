@@ -28,7 +28,8 @@ const pendingDropReplayDeadline = 30 * time.Second
 // pendingDropReplayTables are the tables the scenario's plan drops, named so
 // the plan orders their DROP statements the way the scenario needs: the first
 // is quarantined before the stop, the second is the one whose RENAME the stop
-// abandons, and the third is never reached before the stop.
+// ends while it waits on a lock, and the third is never reached before the
+// stop.
 var pendingDropReplayTables = []string{"replay_a_users", "replay_b_sessions", "replay_c_tokens"}
 
 // pendingDropReplayRows is how many rows each table carries, so a quarantined
@@ -154,9 +155,9 @@ type pendingDropReplay struct {
 // drops quarantine enabled. The first table is renamed into pending drops and
 // its task completes. A lock held on another connection stands in for a long
 // transaction on the second table, so its RENAME waits on a metadata lock, and
-// the operator stops the apply while it waits: the drive abandons the RENAME
-// and stands down, but the statement stays queued on the server until the lock
-// is released. The third table is never reached.
+// the operator stops the apply while it waits: the drive ends the RENAME on the
+// server and stands down, leaving the second table in place. The third table
+// is never reached.
 func stopPendingDropReplayMidQuarantine(t *testing.T) *pendingDropReplay {
 	t.Helper()
 	_, dsn := setupMySQLContainer(t)
@@ -258,7 +259,42 @@ func stopPendingDropReplayMidQuarantine(t *testing.T) *pendingDropReplay {
 		"the first drive must stand down cleanly on the stop")
 	requireApplyState(t, stor, s.apply.ID, state.Apply.Stopped)
 	requireControlRequestStatus(t, stor, s.apply.ID, storage.ControlOperationStop, storage.ControlRequestCompleted)
+	assert.Zero(t, renamesWaitingOnLock(t, db, "replay_b_sessions"),
+		"the stop must end the second table's RENAME on the server before the drive stands down")
+	assert.True(t, targetTableExists(t, dsn, "replay_b_sessions"), "the stop must leave the second table in place")
 	return s
+}
+
+// queueAbandonedRename issues, on a session of its own, the RENAME of table to
+// the destination the stopped attempt recorded in the quarantine log, and
+// waits until it is queued on the lock the scenario holds. It stands in for a
+// RENAME the first attempt left on the server. The returned channel carries
+// the RENAME's result once it lands.
+func queueAbandonedRename(t *testing.T, s *pendingDropReplay, table string) <-chan error {
+	t.Helper()
+	ctx := t.Context()
+	var schemaName string
+	require.NoError(t, s.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&schemaName))
+	recorded, err := pendingdrops.RecordedQuarantines(ctx, s.db, s.apply.ApplyIdentifier, schemaName, table)
+	require.NoError(t, err)
+	require.Len(t, recorded, 1, "the stopped attempt must have recorded one destination for %s", table)
+	destination := recorded[0]
+
+	// The RENAME must outlive the test's context the way an abandoned one
+	// outlives its drive; the lock's cleanup lets it finish if the test fails
+	// first, and the scenario's cleanup removes the copy it writes.
+	abandoned := make(chan error, 1)
+	renameCtx := context.WithoutCancel(ctx)
+	go func() {
+		_, err := s.db.ExecContext(renameCtx, fmt.Sprintf("RENAME TABLE `%s`.`%s` TO `%s`.`%s`",
+			schemaName, table, destination.QuarantineSchema, destination.QuarantineTable))
+		abandoned <- err
+	}()
+	waitutil.Poll(t, pendingDropReplayDeadline, 20*time.Millisecond,
+		func() bool { return renamesWaitingOnLock(t, s.db, table) > 0 },
+		func() string { return "the abandoned RENAME of " + table + " never queued on its lock" },
+	)
+	return abandoned
 }
 
 // claimAndDrive claims the apply for the client the way an operator driver
@@ -360,18 +396,17 @@ func (s *pendingDropReplay) requirePendingDropReplayConverged(t *testing.T, clie
 }
 
 // The operator stops an apply while the second of its three DROPs waits on a
-// metadata lock, the long transaction ends after the stop so the abandoned
-// RENAME lands on the server, and only then does a driver on another server,
-// whose engine has no memory of the first attempt, take the operator's start
-// and resume the apply.
+// metadata lock, the long transaction ends after the stop, and only then does
+// a driver on another server, whose engine has no memory of the first attempt,
+// take the operator's start and resume the apply.
 //
-// The resume plans again against the live schema before it runs anything, so
-// the second table has already left the diff and its task settles as
-// completed without its DROP being handed to the engine, which would fail on
-// a table it never quarantined. Only the third table's DROP runs. Every table
-// ends up quarantined exactly once with all of its rows, none is dropped
-// outright or brought back, the apply completes, and planning again finds
-// nothing left to drop.
+// The stop ended the second table's RENAME on the server, so releasing the
+// lock changes nothing and the second table is still on the target when the
+// resume plans again. The resume hands the engine the second and third DROPs,
+// and the second is quarantined under a new destination since the one the
+// first attempt recorded holds no copy. Every table ends up quarantined
+// exactly once with all of its rows, none is dropped outright or brought
+// back, the apply completes, and planning again finds nothing left to drop.
 func TestLocalClient_ResumeAfterStopMidQuarantineQuarantinesEachTableOnce(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -379,22 +414,19 @@ func TestLocalClient_ResumeAfterStopMidQuarantineQuarantinesEachTableOnce(t *tes
 	s := stopPendingDropReplayMidQuarantine(t)
 	ctx := t.Context()
 
-	// The transaction ends. The RENAME the stop abandoned is still queued on
-	// the server and lands now.
+	// The transaction ends. Nothing from the stopped drive is left queued
+	// behind it, so the second table stays where it is.
 	_, err := s.locker.ExecContext(ctx, "UNLOCK TABLES")
 	require.NoError(t, err)
-	waitutil.Poll(t, pendingDropReplayDeadline, 20*time.Millisecond,
-		func() bool { return !targetTableExists(t, s.dsn, "replay_b_sessions") },
-		func() string { return "the abandoned RENAME of the second table never completed on the server" },
-	)
-	requireQuarantinedOnce(t, s.dsn, "replay_b_sessions", pendingDropReplayRows)
+	assert.True(t, targetTableExists(t, s.dsn, "replay_b_sessions"), "releasing the lock must leave the second table in place")
+	assert.Empty(t, quarantinedCopies(t, s.dsn, "replay_b_sessions"), "the stopped RENAME must not have quarantined the second table")
 	assert.True(t, targetTableExists(t, s.dsn, "replay_c_tokens"), "the stop must leave the third table in place")
 
 	second, resume := s.startPendingDropReplayResume(t)
 	require.NoError(t, awaitPendingDropReplayDrive(t, resume, "the resume did not return"),
 		"the resume must complete the apply")
 	taskByTable := s.requirePendingDropReplayConverged(t, second)
-	firstTask, abandonedTask, thirdTask := taskByTable["replay_a_users"], taskByTable["replay_b_sessions"], taskByTable["replay_c_tokens"]
+	firstTask, stoppedTask, thirdTask := taskByTable["replay_a_users"], taskByTable["replay_b_sessions"], taskByTable["replay_c_tokens"]
 
 	logs, err := s.stor.ApplyLogs().GetByApply(ctx, s.apply.ID)
 	require.NoError(t, err)
@@ -405,36 +437,40 @@ func TestLocalClient_ResumeAfterStopMidQuarantineQuarantinesEachTableOnce(t *tes
 		fmt.Sprintf("Task %s already completed", firstTask.TaskIdentifier)),
 		"the resume must leave the first table's completed task alone rather than settle it again")
 	assert.Equal(t, 1, countLogMessagesContaining(logs,
-		fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", abandonedTask.TaskIdentifier)),
-		"the resume must settle the abandoned RENAME's task from the live schema")
+		fmt.Sprintf("Task %s finished: engine_state=completed", stoppedTask.TaskIdentifier)),
+		"the second table's DROP must run on resume")
 	assert.Equal(t, 1, countLogMessagesContaining(logs,
 		fmt.Sprintf("Task %s finished: engine_state=completed", thirdTask.TaskIdentifier)),
 		"the third table's DROP must run on resume")
-	// The first drive starts its tasks fresh and never logs a resume, so one
-	// resumed task across the whole apply means the resume handed the engine
-	// exactly one DROP, and the task count below says which.
-	assert.Equal(t, 1, countLogMessagesContaining(logs, "Resuming task "),
-		"the resume hands the engine exactly one DROP")
+	// The first drive starts its tasks fresh and never logs a resume, so the
+	// resumed tasks across the whole apply are the DROPs the resume handed the
+	// engine.
+	assert.Equal(t, 2, countLogMessagesContaining(logs, "Resuming task "),
+		"the resume hands the engine the second and third DROPs")
+	assert.Equal(t, 1, countLogMessagesContaining(logs, fmt.Sprintf("Resuming task %s ", stoppedTask.TaskIdentifier)),
+		"the resume hands the engine the second table's DROP")
 	assert.Equal(t, 1, countLogMessagesContaining(logs, fmt.Sprintf("Resuming task %s ", thirdTask.TaskIdentifier)),
-		"the one DROP the resume hands the engine is the third table's")
+		"the resume hands the engine the third table's DROP")
 }
 
-// The same opening, but the operator resumes while the long transaction still
-// holds the second table, so the RENAME the stop abandoned is still queued on
-// the server when the resume plans again. The second table is still on the
-// target, so the resume hands its DROP to the engine, whose quarantine of it
-// queues on the server behind the abandoned RENAME. When the transaction ends
-// the abandoned RENAME lands first and the resume's attempt fails on a table
-// that is already in pending drops: the apply pauses as retryable without
-// touching the quarantined copy, and the next drive settles the task from the
-// live schema and finishes the apply. Every table ends up quarantined exactly
-// once and none is dropped outright.
+// The same opening, but the first attempt's RENAME of the second table is
+// still queued on the server when the operator resumes, the way it is left
+// when the process that issued it exits or a stop cannot confirm it ended.
+// The second table is still on the target, so the resume hands its DROP to
+// the engine, whose quarantine of it queues on the server behind the
+// abandoned RENAME. When the transaction ends the abandoned RENAME lands
+// first, at the destination the first attempt recorded, and the resume's
+// attempt fails on a table that is already in pending drops: the apply pauses
+// as retryable without touching the quarantined copy, and the next drive
+// settles the task from the live schema and finishes the apply. Every table
+// ends up quarantined exactly once and none is dropped outright.
 func TestLocalClient_ResumeWhileAbandonedRenameQueuedQuarantinesEachTableOnce(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 	s := stopPendingDropReplayMidQuarantine(t)
 	ctx := t.Context()
+	abandoned := queueAbandonedRename(t, s, "replay_b_sessions")
 
 	second, resume := s.startPendingDropReplayResume(t)
 	waitutil.Poll(t, pendingDropReplayDeadline, 20*time.Millisecond,
@@ -448,6 +484,8 @@ func TestLocalClient_ResumeWhileAbandonedRenameQueuedQuarantinesEachTableOnce(t 
 	// quarantine wait on it.
 	_, err := s.locker.ExecContext(ctx, "UNLOCK TABLES")
 	require.NoError(t, err)
+	require.NoError(t, awaitPendingDropReplayDrive(t, abandoned, "the abandoned RENAME did not land once the lock was released"),
+		"the abandoned RENAME must land once the lock is released")
 	if err := awaitPendingDropReplayDrive(t, resume, "the resume did not return once the lock was released"); err != nil {
 		t.Logf("resume drive returned: %v", err)
 	}

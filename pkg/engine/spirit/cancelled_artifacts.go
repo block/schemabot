@@ -17,11 +17,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -86,6 +87,7 @@ func (e *Engine) ReleaseCancelledArtifacts(ctx context.Context, req *engine.Rele
 // still alive.
 func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database string, tables []string) (*engine.ReleaseArtifactsResult, error) {
 	result := &engine.ReleaseArtifactsResult{}
+	logger := e.changeLogger()
 
 	data, err := existingTables(ctx, db, database, dataBearingArtifacts(tables))
 	if err != nil {
@@ -112,13 +114,13 @@ func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database stri
 		// off would move it into a database nothing ever sweeps rather than
 		// keep it recoverable. Discard it instead, matching what the deployment
 		// already chose for the tables an operator asked to delete.
-		discarded, err := discardArtifacts(ctx, db, database, data)
+		discarded, err := discardArtifacts(ctx, db, logger, database, data)
 		result.Discarded = append(result.Discarded, discarded...)
 		if err != nil {
 			return result, err
 		}
 	} else {
-		preserved, err := preserveArtifacts(ctx, db, database, data)
+		preserved, err := preserveArtifacts(ctx, db, logger, database, data)
 		if err != nil {
 			return result, err
 		}
@@ -129,7 +131,7 @@ func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database stri
 	// from here on returns the result alongside the error: reporting it as
 	// nothing reclaimed would send an operator looking for a copy that has
 	// moved.
-	discarded, err := discardArtifacts(ctx, db, database, metadata)
+	discarded, err := discardArtifacts(ctx, db, logger, database, metadata)
 	result.Discarded = append(result.Discarded, discarded...)
 	if err != nil {
 		return result, err
@@ -234,7 +236,7 @@ func isReleasableArtifactName(name string) bool {
 
 // preserveArtifacts renames the given tables into the pending drops quarantine
 // so the rows they hold stay recoverable until retention expires.
-func preserveArtifacts(ctx context.Context, db *sql.DB, database string, names []string) ([]engine.PreservedArtifact, error) {
+func preserveArtifacts(ctx context.Context, db *sql.DB, logger *slog.Logger, database string, names []string) ([]engine.PreservedArtifact, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -249,7 +251,7 @@ func preserveArtifacts(ctx context.Context, db *sql.DB, database string, names [
 	// One atomic RENAME covers every table, so a name that no longer exists
 	// would fail the whole move — which is why only tables just confirmed
 	// present are passed.
-	moved, err := pendingdrops.MoveTables(ctx, db, moves, time.Now())
+	moved, err := pendingdrops.MoveTables(ctx, db, logger, moves, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("preserve cancelled schema change data from database %s: %w", database, err)
 	}
@@ -268,15 +270,16 @@ func preserveArtifacts(ctx context.Context, db *sql.DB, database string, names [
 // schema.table name so a release reads the same way whichever half disposed of
 // a given artifact. A failure part-way returns the tables already dropped
 // alongside the error, because they are gone either way.
-func discardArtifacts(ctx context.Context, db *sql.DB, database string, names []string) ([]string, error) {
+func discardArtifacts(ctx context.Context, db *sql.DB, logger *slog.Logger, database string, names []string) ([]string, error) {
 	if err := verifyReleasableArtifacts(database, names); err != nil {
 		return nil, err
 	}
 
 	discarded := make([]string, 0, len(names))
 	for _, name := range names {
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s",
-			sqlescape.EscapeIdentifier(database), sqlescape.EscapeIdentifier(name))); err != nil {
+		// The DROP can wait for a metadata lock; a cancel ends it on the
+		// server rather than leave it to take effect later.
+		if err := dbconn.ExecKillOnCancel(ctx, db, logger, "DROP TABLE IF EXISTS %n.%n", database, name); err != nil {
 			return discarded, fmt.Errorf("discard cancelled schema change artifact %s.%s: %w", database, name, err)
 		}
 		discarded = append(discarded, database+"."+name)

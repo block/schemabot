@@ -81,6 +81,11 @@ type Engine struct {
 	// Running schema change state
 	mu                  sync.Mutex
 	runningSchemaChange *runningSchemaChange
+	// unconfirmedStatements are statements stopped runs of this engine issued
+	// that could not be confirmed to have ended on the server. A run does not
+	// start on a database while one of them may still be running there. The
+	// record lives only in memory, so a new Engine starts without it.
+	unconfirmedStatements []unconfirmedStatement
 	// drainedOutcome retains the terminal result of the last schema change
 	// Drain released, so a progress poll that lands after the drain still
 	// observes the outcome. Apply releases it when it accepts new work.
@@ -984,6 +989,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 
 	rm.goRun(func() {
 		defer cancel()
+		if !e.stoppedStatementsEnded(bgCtx, host, username, password, database) {
+			return
+		}
 		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 

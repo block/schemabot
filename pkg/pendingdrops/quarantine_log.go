@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/mysqlerr"
@@ -49,21 +52,22 @@ const createLogTableSQL = "CREATE TABLE IF NOT EXISTS `" + Database + "`.`" + Lo
 // failure converges on one record per copy. A destination already recorded for
 // another apply or another source is refused: two moves must not claim one
 // copy.
-func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, moved []QuarantinedTable, now time.Time) error {
+func RecordQuarantines(ctx context.Context, db *sql.DB, logger *slog.Logger, applyIdentifier string, moved []QuarantinedTable, now time.Time) error {
 	if applyIdentifier == "" {
 		return errors.New("record quarantines: apply identifier is required")
 	}
 	if len(moved) == 0 {
 		return nil
 	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(Database))); err != nil {
+	// Each statement runs through ExecKillOnCancel, so a stopped schema change
+	// leaves none of them queued on the server to take effect after it exits.
+	if err := dbconn.ExecKillOnCancel(ctx, db, logger, "CREATE DATABASE IF NOT EXISTS %n", Database); err != nil {
 		return fmt.Errorf("create %s database: %w", Database, err)
 	}
-	if _, err := db.ExecContext(ctx, createLogTableSQL); err != nil {
+	if err := dbconn.ExecKillOnCancel(ctx, db, logger, "%r", sqlescape.RawSQL(createLogTableSQL)); err != nil {
 		return fmt.Errorf("create %s.%s: %w", Database, LogTable, err)
 	}
-	insert := "INSERT INTO `" + Database + "`.`" + LogTable + "` " +
-		"(quarantine_table, source_schema, source_table, apply_identifier, quarantined_at) VALUES (?, ?, ?, ?, ?)"
+	insert := "INSERT INTO %n.%n (quarantine_table, source_schema, source_table, apply_identifier, quarantined_at) VALUES (%?, %?, %?, %?, %?)"
 	for _, table := range moved {
 		recorded, err := recordMatchesMove(ctx, db, table, applyIdentifier)
 		if err != nil {
@@ -72,7 +76,8 @@ func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, 
 		if recorded {
 			continue
 		}
-		if _, err := db.ExecContext(ctx, insert, table.QuarantineTable, table.SchemaName, table.TableName, applyIdentifier, now.UTC()); err != nil {
+		if err := dbconn.ExecKillOnCancel(ctx, db, logger, insert,
+			Database, LogTable, table.QuarantineTable, table.SchemaName, table.TableName, applyIdentifier, now.UTC()); err != nil {
 			return fmt.Errorf("record quarantine of %s.%s as %s for apply %s: %w",
 				table.SchemaName, table.TableName, table.QuarantineTable, applyIdentifier, err)
 		}
