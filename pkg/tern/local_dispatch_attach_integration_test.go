@@ -210,7 +210,7 @@ func attachFixture(t *testing.T, stor storage.Storage, client *LocalClient, plan
 	require.NotNil(t, apply)
 
 	siblingReq := shardDispatchRequest(planID, key, "80-")
-	plan, err := client.planForApplyRequest(ctx, siblingReq)
+	plan, _, err := client.planForApplyRequest(ctx, siblingReq)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	scope, err := deriveDispatchScope(plan, siblingReq)

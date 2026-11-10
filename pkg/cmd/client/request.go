@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -252,6 +253,12 @@ type APIError struct {
 	// server can send it with no error code, so the caller decides from the
 	// status whether the request is worth repeating.
 	RetryAfterHeader time.Duration
+
+	// RetryAfterHeaderUncapped is the delay the Retry-After header asked for
+	// when it was longer than the CLI's bound, so RetryAfterHeader holds the
+	// bound instead. Zero when the header asked for no more than the bound, so
+	// a caller can tell an operator the wait was shortened.
+	RetryAfterHeaderUncapped time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -464,10 +471,12 @@ func stripHTMLTags(s string) string {
 // Retry-After header, which a proxy or rate limiter in front of SchemaBot may
 // send with a body that carries neither.
 func parseAPIError(resp *http.Response, body []byte) *APIError {
+	retryAfter, uncapped := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
 	apiErr := &APIError{
-		Status:           resp.StatusCode,
-		Message:          FormatAPIError(resp.StatusCode, body),
-		RetryAfterHeader: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
+		Status:                   resp.StatusCode,
+		Message:                  FormatAPIError(resp.StatusCode, body),
+		RetryAfterHeader:         retryAfter,
+		RetryAfterHeaderUncapped: uncapped,
 	}
 	var errResp apitypes.ErrorResponse
 	if json.Unmarshal(body, &errResp) == nil {
@@ -490,24 +499,31 @@ const maxRetryAfterHeader = 5 * time.Minute
 // by maxRetryAfterHeader. An absent, malformed, or negative value, or a date
 // already past, yields zero, so a header nobody can act on never delays a
 // retry. A count of seconds too large to read is still a request to wait long,
-// so it yields the bound.
-func parseRetryAfterHeader(value string, now time.Time) time.Duration {
+// so it yields the bound. When the bound cuts the delay short, uncapped is the
+// delay the header asked for, saturating at the longest time.Duration, and
+// zero otherwise.
+func parseRetryAfterHeader(value string, now time.Time) (after, uncapped time.Duration) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return 0
+		return 0, 0
 	}
 	if isDigits(value) {
 		seconds, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || seconds > int64(maxRetryAfterHeader/time.Second) {
-			return maxRetryAfterHeader
+		if err != nil || seconds > int64(math.MaxInt64/time.Second) {
+			return maxRetryAfterHeader, time.Duration(math.MaxInt64)
 		}
-		return time.Duration(seconds) * time.Second
+		after = time.Duration(seconds) * time.Second
+	} else {
+		at, err := http.ParseTime(value)
+		if err != nil {
+			return 0, 0
+		}
+		after = max(at.Sub(now), 0)
 	}
-	at, err := http.ParseTime(value)
-	if err != nil {
-		return 0
+	if after > maxRetryAfterHeader {
+		return maxRetryAfterHeader, after
 	}
-	return min(max(at.Sub(now), 0), maxRetryAfterHeader)
+	return after, 0
 }
 
 func isDigits(s string) bool {

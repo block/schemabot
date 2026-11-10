@@ -3,6 +3,7 @@ package storagetest
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +50,33 @@ func TestApplyLogs(t *testing.T, h Harness) {
 		none, err := store.ApplyLogs().GetByApply(ctx, apply.ID+1000)
 		require.NoError(t, err)
 		assert.Empty(t, none)
+	})
+
+	// An apply log line quotes the failure it reports, which has no bound of
+	// its own. A line past the column's width is stored cut to fit, so the
+	// apply log still carries the failure an operator reads it for.
+	t.Run("Append_PastColumnWidth_IsCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "long_log_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_long_log", 601, state.Apply.Running, "staging")
+
+		require.NoError(t, store.ApplyLogs().Append(ctx, &storage.ApplyLog{
+			ApplyID:   apply.ID,
+			Level:     storage.LogLevelError,
+			EventType: storage.LogEventError,
+			Source:    storage.LogSourceSchemaBot,
+			Message:   "Apply failed: " + overLongFailureMessage,
+		}), "an apply log line past the column's width is stored")
+
+		logs, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		require.Len(t, logs, 1)
+		// The prefix keeps every two-byte character at an odd offset, so the
+		// cut still falls inside one and backs off to its start.
+		want := "Apply failed: x" + strings.Repeat("é", 32_758) + "…"
+		assertStoredMessage(t, want, logs[0].Message, "the apply log line is cut")
 	})
 
 	// GetRecentByApply verifies the bounded tail read used by the

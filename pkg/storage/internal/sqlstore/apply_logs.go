@@ -49,10 +49,13 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	if source == "" {
 		source = storage.LogSourceSchemaBot
 	}
+	message := storedMessage(ctx, "apply_logs.message", log.Message, func() []any {
+		return []any{"level", log.Level, "event_type", log.EventType, "source", source}
+	})
 
 	if hasLease {
 		id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, applyLogLeasedAppendStatement(s.dialect),
-			log.ApplyID, nullInt64Ptr(log.TaskID), nullInt64Ptr(log.ApplyOperationID), log.Level, log.EventType, source, log.Message,
+			log.ApplyID, nullInt64Ptr(log.TaskID), nullInt64Ptr(log.ApplyOperationID), log.Level, log.EventType, source, message,
 			nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
 			lease.ApplyID, lease.Token,
 		)
@@ -75,7 +78,7 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 			old_state, new_state, metadata
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		log.ApplyID, nullInt64Ptr(log.TaskID), nullInt64Ptr(log.ApplyOperationID), log.Level, log.EventType, source, log.Message,
+		log.ApplyID, nullInt64Ptr(log.TaskID), nullInt64Ptr(log.ApplyOperationID), log.Level, log.EventType, source, message,
 		nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
 	)
 	if err != nil {

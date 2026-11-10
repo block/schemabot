@@ -929,9 +929,6 @@ func startSchemaBotLocal(t *testing.T) string {
 
 	addr := listener.Addr().String()
 
-	// Wait for server to be ready
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
-
 	return addr
 }
 
@@ -1013,9 +1010,6 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 
 	addr := listener.Addr().String()
 
-	// Wait for server to be ready
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
-
 	return addr
 }
 
@@ -1080,9 +1074,6 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 
 	addr := listener.Addr().String()
 
-	// Wait for server to be ready
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
-
 	return addr
 }
 
@@ -1131,7 +1122,6 @@ func parseApplyID(t *testing.T, output string) string {
 	return match[1]
 }
 
-// waitForHTTP waits for an HTTP endpoint to be available.
 // clearStorageDB deletes all rows from every table in the SchemaBot storage
 // database. Called before each test to prevent stale plans/tasks/applies/locks
 // from prior tests from interfering with state polling.
@@ -1151,23 +1141,6 @@ func clearStorageDB(t *testing.T, db *sql.DB) {
 		_, err := db.ExecContext(t.Context(), "DELETE FROM `"+table+"`")
 		require.NoErrorf(t, err, "clearStorageDB: DELETE FROM %s", table)
 	}
-}
-
-func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
-	t.Helper()
-	testutil.Poll(t, timeout, 50*time.Millisecond,
-		func() bool {
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
-			require.NoError(t, err, "create request")
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return false
-			}
-			_ = resp.Body.Close()
-			return resp.StatusCode == http.StatusOK
-		},
-		func() string { return "timeout waiting for " + url },
-	)
 }
 
 // TestCLI_Rollback tests the rollback command validation.

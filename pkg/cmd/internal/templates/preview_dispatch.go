@@ -136,6 +136,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlan())
 	case PreviewCommentPlanIgnoredNamespaces:
 		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces())
+	case PreviewCommentPlanWhoCanApply:
+		fmt.Print(webhooktemplates.PreviewCommentPlanWhoCanApply())
 	case PreviewCommentPlanUnmanagedSchema:
 		fmt.Print(webhooktemplates.PreviewCommentPlanUnmanagedSchema())
 	case PreviewCommentPlanExemptTables:
@@ -240,6 +242,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover())
 	case PreviewCommentApplyWaitingCutoverAutomatic:
 		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic())
+	case PreviewCommentApplyWaitingCutoverLanded:
+		fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverFirstLanded())
 	case PreviewCommentApplyCuttingOver:
 		fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver())
 	case PreviewCommentMultiDeployInProgress:

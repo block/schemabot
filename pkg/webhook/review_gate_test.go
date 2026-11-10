@@ -2050,7 +2050,7 @@ func TestCheckReviewGate_RepoAdminTeamApproval(t *testing.T) {
 			SubmittedAt: &gh.Timestamp{Time: time.Now()},
 		},
 	})
-	mux.HandleFunc("GET /orgs/octocat/teams/repo-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
+	handleTeamMembers(t, mux, "octocat", "repo-admins", http.StatusOK, "bob", "carol")
 
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
@@ -2079,7 +2079,7 @@ func TestCheckReviewGate_RepoAdminTeamNonMemberBlocked(t *testing.T) {
 			SubmittedAt: &gh.Timestamp{Time: time.Now()},
 		},
 	})
-	mux.HandleFunc("GET /orgs/octocat/teams/repo-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
+	handleTeamMembers(t, mux, "octocat", "repo-admins", http.StatusOK, "bob", "carol")
 
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
@@ -2249,7 +2249,7 @@ func TestCheckReviewGate_OperatorTeamApproval(t *testing.T) {
 			SubmittedAt: &gh.Timestamp{Time: time.Now()},
 		},
 	})
-	mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
+	handleTeamMembers(t, mux, "octocat", "db-admins", http.StatusOK, "bob", "carol")
 
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
@@ -2276,7 +2276,7 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 			CommitID:    new(reviewGateTestHeadSHA),
 		},
 	})
-	mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
+	handleTeamMembers(t, mux, "octocat", "db-admins", http.StatusOK, "bob", "carol")
 
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
@@ -2776,7 +2776,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 			{User: &gh.User{Login: new("dave")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}},
 		})
-		mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
+		handleTeamMembers(t, mux, "octocat", "db-admins", http.StatusOK, "bob", "carol")
 		comments := registerCommentsCapture(mux)
 
 		client, err := h.clientForRepo("octocat/hello-world", 12345)

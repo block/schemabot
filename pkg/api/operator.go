@@ -3457,7 +3457,9 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 // heartbeat errors are logged and retried on the next tick — until they have
 // persisted for the full storage.ApplyLeaseStaleAfter window, at which point
 // the lease is presumed lost (a peer can already have reclaimed the stale row)
-// and the run is cancelled the same way.
+// and the run is cancelled the same way. Each write runs under its own
+// deadline (storage.HeartbeatLeaseAttempt), so a write that hangs counts as a
+// failure toward that window instead of stalling the check behind it.
 //
 // Each successful heartbeat also checks the inverse hazard: a drive goroutine
 // that has wedged while its heartbeat stays fresh. The heartbeat alone would
@@ -3466,7 +3468,9 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 // cancels the run when they stop for the full stall window.
 //
 // A resumed operation is also marked running from here once its engine works
-// again, and the parent re-derived from it (advanceResumePromotion).
+// again, and the parent re-derived from it (advanceResumePromotion). Both run
+// under a deadline of their own (afterOperationHeartbeatStopsDrive), so a
+// storage call in them that hangs cannot stop the loop from heartbeating.
 //
 // Returns a stop func that is safe to call more than once. It returns only
 // once the heartbeat has exited, so no parent projection from a tick can land
@@ -3492,14 +3496,13 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				err := s.storage.ApplyOperations().Heartbeat(hbCtx, op.ID)
+				attemptStart := s.clock.Now()
+				err := storage.HeartbeatLeaseAttempt(hbCtx, attemptStart, lastSuccess, func(ctx context.Context) error {
+					return s.storage.ApplyOperations().Heartbeat(ctx, op.ID)
+				})
 				if err == nil {
-					lastSuccess = s.clock.Now()
-					if s.operationDriveStalled(hbCtx, driverID, op, &applySnapshot, driveStart) {
-						cancelRun()
-						return
-					}
-					if s.advanceResumePromotion(hbCtx, driverID, op, &applySnapshot, &resume) == resumeLeaseLost {
+					lastSuccess = attemptStart
+					if s.afterOperationHeartbeatStopsDrive(hbCtx, driverID, op, &applySnapshot, driveStart, &resume) {
 						cancelRun()
 						return
 					}
@@ -3521,6 +3524,22 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 		stop()
 		<-exited
 	}
+}
+
+// afterOperationHeartbeatStopsDrive runs the checks that follow a successful
+// operation heartbeat, the drive stall check and the resumed operation's
+// promotion, and reports whether the run must be cancelled. Their storage reads
+// and writes share one deadline of storage.LeaseHeartbeatAttemptTimeout, so a
+// call that hangs on a half-open connection is cut off and retried on the next
+// tick instead of holding the heartbeat loop away from its next write and from
+// the presumed-lost check that follows a failed one.
+func (s *Service) afterOperationHeartbeatStopsDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, driveStart time.Time, resume *resumePromotion) bool {
+	ctx, cancel := context.WithTimeout(ctx, storage.LeaseHeartbeatAttemptTimeout)
+	defer cancel()
+	if s.operationDriveStalled(ctx, driverID, op, apply, driveStart) {
+		return true
+	}
+	return s.advanceResumePromotion(ctx, driverID, op, apply, resume) == resumeLeaseLost
 }
 
 // resumePromotion is what the heartbeat still owes a resumed operation: marking
@@ -3662,7 +3681,8 @@ func tasksShowResumedWork(tasks []*storage.Task) bool {
 // reported the operation lease definitively lost, or heartbeat failures have
 // persisted since lastSuccess for the full lease staleness window, so a peer
 // driver can already have reclaimed the stale row. A transient failure inside
-// the window keeps the run going and is retried on the next tick.
+// the window, including a write that timed out, keeps the run going and is
+// retried on the next tick.
 func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, hbErr error, lastSuccess time.Time) bool {
 	logAttrs := append(append(op.LogAttrs(), apply.IdentityLogAttrs()...),
 		"driver", driverID)
@@ -3676,6 +3696,11 @@ func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, drive
 			append(logAttrs, "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, op.Deployment, apply.Environment, "lease_presumed_lost")
 		return true
+	}
+	if errors.Is(hbErr, storage.ErrLeaseHeartbeatTimedOut) {
+		s.logger.Warn("operator: apply_operation heartbeat attempt timed out; it counts as a failed heartbeat toward the lease staleness window and will be retried",
+			append(logAttrs, "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		return false
 	}
 	s.logger.Warn("operator: apply_operation heartbeat failed; will retry",
 		append(logAttrs, "error", hbErr)...)
@@ -3843,26 +3868,44 @@ func firstFailedTaskError(tasks []*storage.Task) string {
 	return ""
 }
 
-// firstFailedOperationMessage returns a deployment-qualified failure reason from
-// the first failed operation row that carries one, naming the operation's
+// firstOperationMessageInState returns a deployment-qualified reason from the
+// first operation row in opState that carries one, naming the operation's
 // target as well when it has one, since a deployment addressing several
-// targets says nothing about which of them failed. It surfaces the parent
-// apply's ErrorMessage from the aggregate when the rollout settles to failed,
-// rather than leaving whatever message the last-driven (possibly successful)
-// operation wrote. The rollout's failure verdict is the first failure, so the
-// first failed row in deployment order wins. Empty when no failed operation
-// carries a message, so the caller keeps the existing apply message as fallback.
-func firstFailedOperationMessage(ops []*storage.ApplyOperation) string {
+// targets says nothing about which of them the reason belongs to. outcome is
+// the verb phrase that joins the row to its reason ("failed", "paused for
+// retry"). It surfaces the parent apply's ErrorMessage from the aggregate when
+// the rollout settles or pauses, rather than leaving whatever message the
+// last-driven (possibly successful) operation wrote. The rollout's verdict is
+// the first row to reach the state, so the first such row in deployment order
+// wins. Empty when no row in opState carries a message, so the caller keeps the
+// existing apply message as fallback.
+func firstOperationMessageInState(ops []*storage.ApplyOperation, opState, outcome string) string {
 	for _, op := range ops {
-		if !state.IsState(op.State, state.ApplyOperation.Failed) || op.ErrorMessage == "" {
+		if !state.IsState(op.State, opState) || op.ErrorMessage == "" {
 			continue
 		}
 		if op.Target != "" {
-			return fmt.Sprintf("target %s on deployment %s failed: %s", op.Target, op.Deployment, op.ErrorMessage)
+			return fmt.Sprintf("target %s on deployment %s %s: %s", op.Target, op.Deployment, outcome, op.ErrorMessage)
 		}
-		return fmt.Sprintf("deployment %s failed: %s", op.Deployment, op.ErrorMessage)
+		return fmt.Sprintf("deployment %s %s: %s", op.Deployment, outcome, op.ErrorMessage)
 	}
 	return ""
+}
+
+// Outcome words firstOperationMessageInState puts between the operation's
+// location and its own message when the projection names the parent's reason.
+const (
+	failedOperationOutcome = "failed"
+	pausedOperationOutcome = "paused for retry"
+)
+
+// isProjectedPauseReason reports whether the parent's message is one the
+// projection stamped from a paused operation. Only such a message is cleared
+// when the rollout leaves its pause; a message another path wrote to a paused
+// parent, such as the task failure that paused a parent-lease apply, is kept
+// as the fallback when no operation carries a replacement.
+func isProjectedPauseReason(message string) bool {
+	return strings.Contains(message, " "+pausedOperationOutcome+": ")
 }
 
 // persistOperationState writes the claimed operation row to reflect a derived
@@ -4200,7 +4243,47 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		startedAt = &now
 	}
 
-	if state.IsState(apply.State, derived) && startedAt == nil {
+	// The parent's message follows the aggregate the same way its state does.
+	// When the rollout settles to failed, surface the failure reason from the
+	// first failed operation rather than leaving whatever message the last-driven
+	// operation wrote — under continue the last driver may be a successful
+	// sibling, which would leave the failed verdict with no matching reason.
+	// When it pauses for a retry, surface the first paused operation's reason,
+	// so the pause can be triaged from the apply without opening its operation
+	// rows. Either way the existing message is the fallback when no operation
+	// carries one, except a pause reason the projection itself stamped: it
+	// describes work the rollout was about to retry, so it is cleared when the
+	// projection takes the parent out of its pause, as a claim of a paused
+	// parent-lease apply clears it, and the operation that settles the retry
+	// supplies the next reason. A message another path wrote to the paused
+	// parent is not a pause reason and stays as the fallback.
+	errorMessage := apply.ErrorMessage
+	leavingPause := state.IsState(apply.State, state.Apply.FailedRetryable) && !state.IsState(derived, state.Apply.FailedRetryable)
+	if leavingPause && isProjectedPauseReason(apply.ErrorMessage) {
+		errorMessage = ""
+	}
+	switch {
+	case state.IsState(derived, state.Apply.Failed):
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.Failed, failedOperationOutcome); msg != "" {
+			errorMessage = msg
+		}
+	case state.IsState(derived, state.Apply.FailedRetryable):
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.FailedRetryable, pausedOperationOutcome); msg != "" {
+			errorMessage = msg
+		}
+	}
+
+	// A projection that changes nothing the parent records is skipped. A held
+	// pause is the one state whose message can change without the state
+	// changing: a rollout can stay paused while the operation that supplied its
+	// reason is retried and completes beside a sibling still paused, and the
+	// parent then has to name the sibling. A terminal verdict's message is
+	// written once, at the transition, and is left alone afterwards; a remote
+	// apply's row already carries the data plane's own failure message, and
+	// re-projecting it would replace that message with the aggregate's
+	// deployment-qualified one.
+	pauseReasonChanged := state.IsState(derived, state.Apply.FailedRetryable) && errorMessage != apply.ErrorMessage
+	if state.IsState(apply.State, derived) && startedAt == nil && !pauseReasonChanged {
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			append(apply.LogAttrs(),
 				"driver", driverID, "operation_count", len(ops))...)
@@ -4221,18 +4304,6 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		}
 	default:
 		completedAt = nil
-	}
-
-	// When the rollout settles to failed, surface the failure reason from the
-	// aggregate (the first failed operation) rather than leaving whatever message
-	// the last-driven operation wrote — under continue the last driver may be a
-	// successful sibling, which would leave the failed verdict with no matching
-	// reason. Keep the existing message as a fallback when no operation carries one.
-	errorMessage := apply.ErrorMessage
-	if state.IsState(derived, state.Apply.Failed) {
-		if msg := firstFailedOperationMessage(ops); msg != "" {
-			errorMessage = msg
-		}
 	}
 
 	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, startedAt, completedAt)
@@ -4256,10 +4327,10 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// lease-lost settle, stop reconciliation). Record the transition in the
 	// apply's own durable log so its timeline states how it reached the derived
 	// state instead of ending at the last claim entry. A swap that only stamps
-	// started_at while the state holds is not a transition, so it writes no
-	// timeline entry.
+	// started_at or refreshes the message while the state holds is not a
+	// transition, so it writes no timeline entry.
 	if state.IsState(apply.State, derived) {
-		s.logger.Debug("operator: derived apply state swap stamped started_at only; no state transition to record",
+		s.logger.Debug("operator: derived apply state swap kept the state; no state transition to record",
 			append(apply.LogAttrs(),
 				"driver", driverID, "derived_state", derived)...)
 	} else {
