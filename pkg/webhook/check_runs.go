@@ -188,6 +188,21 @@ var planFailedUnrecordedBlock = checkBlockReason{
 	message:        planFailedUnstoredSummary,
 }
 
+// sourcePolicyRefusedBlock is carried by the failing aggregate posted when the
+// database's source policy refused a plan. No check row is stored on behalf of
+// a refused source, so stored check state holds nothing of the refusal, and a
+// fold from it, on a later plan of another environment, could pass on the
+// refused environment's earlier passing row. The block keeps every such fold
+// off the aggregate until auto-plan re-verifies the PR and durably invalidates
+// prior successful results. A re-plan the policy refuses again posts the block
+// again; one it authorizes stores replacement results that can pass the
+// aggregate. message is appended to the refusal, so the Check Run names the
+// step that lifts the block once the policy is fixed.
+var sourcePolicyRefusedBlock = checkBlockReason{
+	blockingReason: checkstate.BlockPlanRefusedBySourcePolicy,
+	message:        "Once the source policy authorizes this pull request, re-run this check or push a commit to re-plan every environment.",
+}
+
 // noAllowedConfiguredEnvironmentsBlock holds the gate when a changed database
 // has no configured environments. A known database registered only in another
 // publisher's environments instead has verified no local work.
@@ -218,5 +233,6 @@ var allCheckBlockReasons = []checkBlockReason{
 	noAllowedConfiguredEnvironmentsBlock,
 	narrowedApplyBlock,
 	planFailedUnrecordedBlock,
+	sourcePolicyRefusedBlock,
 	{blockingReason: participantUnresolvedBlockingReason},
 }
