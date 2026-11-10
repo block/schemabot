@@ -165,9 +165,10 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 // auto-plan.
 //
 // It runs the same check the apply gate does, so on top of the config read it
-// lists the members of each configured team until one includes reader, once
-// per plan comment. When that check cannot be evaluated, the list renders: it
-// is still true, and it names whom to ask.
+// asks GitHub for reader's membership in each configured team until one
+// includes reader, reusing any membership this delivery has already read. When
+// that check cannot be evaluated, the list renders: it is still true, and it
+// names whom to ask.
 func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, reader string) *templates.ApplyAuthorizationData {
 	if h.service == nil || !h.service.Config().PRCommandAuthorizationEnabled() {
 		return nil
