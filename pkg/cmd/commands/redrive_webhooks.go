@@ -2,7 +2,6 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -65,7 +64,7 @@ func (cmd *RedriveWebhooksCmd) Run(ctx context.Context, g *Globals) error {
 		updateProgress(redriveProgressLine(r, windowStart, windowEnd, cmd.DryRun))
 	})
 	stopProgress()
-	if errors.Is(err, context.Canceled) {
+	if endedByInterrupt(ctx, err) {
 		return reportWebhookRedriveCanceled(ctx, merged, cmd.DryRun)
 	}
 	if err != nil {

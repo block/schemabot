@@ -249,6 +249,37 @@ func redriveWindowCmd() *RedriveWebhooksCmd {
 // the cancel, and exits with the interrupt status, so a script can tell an
 // interrupted redrive from one that failed.
 func TestRedriveWebhooksCancelExitsInterrupted(t *testing.T) {
+	stderr, runErr := cancelRedriveDuringSecondChunk(t, redriveWindowCmd())
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	require.ErrorIs(t, runErr, context.Canceled)
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.Contains(t, stderr, "redrive canceled\napp=production redelivered=3 failed=0 (before cancel)\n")
+}
+
+// An operator presses Ctrl-C part-way through a --dry-run redrive. A dry run
+// redelivers nothing, so the command says the redrive was canceled without
+// printing redelivery counts that would read as work done, and exits with the
+// interrupt status.
+func TestRedriveWebhooksDryRunCancelPrintsNoRedeliveryCounts(t *testing.T) {
+	cmd := redriveWindowCmd()
+	cmd.DryRun = true
+
+	stderr, runErr := cancelRedriveDuringSecondChunk(t, cmd)
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	require.ErrorIs(t, runErr, context.Canceled)
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.Contains(t, stderr, "redrive canceled\n")
+	assert.NotContains(t, stderr, "(before cancel)")
+}
+
+// cancelRedriveDuringSecondChunk runs cmd against a server that answers the
+// first chunk with three redeliveries and more work pending, presses the
+// operator's Ctrl-C while the second chunk is waiting on the server, and
+// returns the command's stderr and the error it ended with.
+func cancelRedriveDuringSecondChunk(t *testing.T, cmd *RedriveWebhooksCmd) (stderr string, runErr error) {
+	t.Helper()
 	hold := newHoldingHandler(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/api/webhooks/redrive", r.URL.Path)
@@ -272,21 +303,15 @@ func TestRedriveWebhooksCancelExitsInterrupted(t *testing.T) {
 	t.Cleanup(server.Close)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	cmd := redriveWindowCmd()
 
 	done := make(chan error, 1)
-	var runErr error
-	stderr := captureStderr(t, func() {
+	stderr = captureStderr(t, func() {
 		go func() { done <- cmd.Run(ctx, &Globals{Endpoint: server.URL}) }()
 		awaitSignal(t, hold.inFlight, "the second redrive chunk to reach the server")
 		cancel()
 		runErr = awaitSignal(t, done, "the canceled redrive to end")
 	})
-
-	require.ErrorIs(t, runErr, ErrSilent)
-	require.ErrorIs(t, runErr, context.Canceled)
-	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
-	assert.Contains(t, stderr, "redrive canceled\napp=production redelivered=3 failed=0 (before cancel)\n")
+	return stderr, runErr
 }
 
 // A redrive the server refuses is a failure, not an interrupt, and exits 1.

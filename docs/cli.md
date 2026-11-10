@@ -1073,11 +1073,25 @@ This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
 A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
-are. Each says on stderr that it was canceled and reports any work it had
-already finished, then exits 130, the status a shell reports for an
-interrupted process, so a script can tell an interrupted run from one that
-failed or left findings. Checks already recreated and deliveries already
-redelivered are not undone.
+are. Each says on stderr that it was canceled and exits 130, the status a
+shell reports for an interrupted process, so a script can tell an interrupted
+run from one that failed or left findings. Exit 130 is the only mark of a
+report that was cut short; the JSON output has no field for it.
+
+What an interrupted run reports depends on where it stopped:
+
+- `checks backfill` interrupted during its scan, with or without `--dry-run`,
+  prints no report. What the scan had found so far is discarded.
+- `checks backfill` interrupted while recreating checks prints its report with
+  the outcomes it received. A PR with no outcome was either not reached or was
+  in the batch the interrupt cut off.
+- `webhooks redrive` prints the redelivery counts from the chunks that
+  completed, and prints none under `--dry-run`.
+
+Treat those outcomes and counts as a lower bound: the server may have finished
+part of the request that was in flight. Checks already recreated and
+deliveries already redelivered are not undone. Run `checks backfill` again to
+finish the sweep; it only acts on PRs whose Check Runs are still missing.
 
 An `--all-repos` sweep skips a declared repository the server's GitHub App is
 not installed on, names it, and keeps scanning the rest. The skip still makes

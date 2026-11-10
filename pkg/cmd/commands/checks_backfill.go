@@ -2,7 +2,6 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -478,7 +477,7 @@ func checksScanProgressLine(repoIndex, repoCount int, repo string, repoScanned, 
 // canceled" error line. It returns nil for any other error (including none)
 // so the caller handles it normally.
 func backfillCanceledError(ctx context.Context, err error, stopProgress func()) error {
-	if !errors.Is(err, context.Canceled) {
+	if !endedByInterrupt(ctx, err) {
 		return nil
 	}
 	stopProgress()
