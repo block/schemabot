@@ -1112,12 +1112,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		} else if pending != nil && c.skipRevertAllowed(ctx, logger, apply, ps) {
 			logger.Info("skip-revert requested by user; closing revert window", "requested_by", controlRequestCaller(pending))
 			skipResult, err := eng.SkipRevert(ctx, controlReq)
+			refusal, refused := controlResultRefusal("skip-revert", skipResult)
 			switch {
 			case err != nil:
 				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationSkipRevert, storage.LogEventSkipRevertTriggered, pending, err)
-			case skipResult == nil || !skipResult.Accepted:
+			case refused:
 				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationSkipRevert,
-					storage.LogEventSkipRevertTriggered, pending, errors.New("engine rejected skip-revert request"))
+					storage.LogEventSkipRevertTriggered, pending, engine.NewSettledOutcomeError("%s", refusal))
 			default:
 				c.markRevertSkipped(ctx, apply)
 				ps.revertSkipped = true
@@ -1141,12 +1142,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		} else if pending != nil {
 			logger.Info("revert requested by user; reverting schema change", "requested_by", controlRequestCaller(pending))
 			revertResult, err := eng.Revert(ctx, controlReq)
+			refusal, refused := controlResultRefusal("revert", revertResult)
 			switch {
 			case err != nil:
 				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending, err)
-			case revertResult == nil || !revertResult.Accepted:
+			case refused:
 				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert,
-					storage.LogEventRevertTriggered, pending, errors.New("engine rejected revert request"))
+					storage.LogEventRevertTriggered, pending, engine.NewSettledOutcomeError("%s", refusal))
 			default:
 				revertedByControlRequest = true
 				ps.revertTriggered = true
@@ -1643,12 +1645,18 @@ type autoSkipRevertTrigger struct {
 // autoSkipRevert closes the revert window without an operator command, either
 // because the apply was started with --skip-revert or because the window
 // expired. The trigger lands on the timeline once, however many ticks the skip
-// takes. Only an accepted skip marks the window skipped; a failed or rejected
-// one is retried on the next progress tick, at Warn while the failure is
-// recent and escalating to Error logging plus a one-time timeline event once
-// it has outlived autoSkipRevertEscalationAfter, so a window the engine will
-// not close pages instead of filling the logs at every tick.
+// takes. Only an accepted skip marks the window skipped. A failed one is
+// retried on the next progress tick, at Warn while the failure is recent and
+// escalating to Error logging plus a one-time timeline event once it has
+// outlived autoSkipRevertEscalationAfter, so a window the engine will not close
+// pages instead of filling the logs at every tick. A refused one is not sent
+// again by this drive (see resolveOrRetryAutoSkipRevert).
 func (c *LocalClient) autoSkipRevert(ctx context.Context, logger *slog.Logger, eng engine.Engine, apply *storage.Apply, controlReq *engine.ControlRequest, ps *atomicPollState, now time.Time, trigger autoSkipRevertTrigger) {
+	if ps.autoSkipRevertRefused {
+		logger.Debug("the engine refused the automatic skip-revert earlier in this drive; it is not sent again, and the revert window waits for an operator's revert or skip-revert",
+			append(apply.MutableLogAttrs(), "reason", trigger.reason)...)
+		return
+	}
 	if !c.skipRevertAllowed(ctx, logger, apply, ps) {
 		return
 	}
@@ -1659,11 +1667,12 @@ func (c *LocalClient) autoSkipRevert(ctx context.Context, logger *slog.Logger, e
 		ps.autoSkipRevertLogged = true
 	}
 	skipResult, err := eng.SkipRevert(ctx, controlReq)
+	refusal, refused := controlResultRefusal("skip-revert", skipResult)
 	switch {
 	case err != nil:
-		c.reportAutoSkipRevertFailure(ctx, logger, apply, ps, now, err)
-	case skipResult == nil || !skipResult.Accepted:
-		c.reportAutoSkipRevertFailure(ctx, logger, apply, ps, now, errors.New("engine rejected skip-revert request"))
+		c.resolveOrRetryAutoSkipRevert(ctx, logger, apply, ps, now, trigger, err)
+	case refused:
+		c.resolveOrRetryAutoSkipRevert(ctx, logger, apply, ps, now, trigger, engine.NewSettledOutcomeError("%s", refusal))
 	default:
 		logger.Info("skip-revert triggered", "reason", trigger.reason)
 		c.markRevertSkipped(ctx, apply)
@@ -1671,6 +1680,28 @@ func (c *LocalClient) autoSkipRevert(ctx context.Context, logger *slog.Logger, e
 			trigger.skippedEvent, state.Apply.RevertWindow, state.Apply.SkippingRevert)
 		ps.revertSkipped = true
 	}
+}
+
+// resolveOrRetryAutoSkipRevert disposes of an automatic skip-revert the engine
+// did not carry out. There is no operator request to resolve, so a refusal for
+// this schema change (a typed settled-outcome refusal, which is also how a
+// result the engine did not accept arrives) is answered by not asking again for
+// the rest of this drive and recording the engine's reason on the apply
+// timeline. The window stays open and the apply keeps showing it, so the
+// operator can still close it with a skip-revert or undo it with a revert,
+// both of which this drive carries out. Any other failure, a not-ready engine
+// included, is retried at the next progress tick.
+func (c *LocalClient) resolveOrRetryAutoSkipRevert(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState, now time.Time, trigger autoSkipRevertTrigger, skipErr error) {
+	refusal, ok := engine.AsSettledOutcome(skipErr)
+	if !ok {
+		c.reportAutoSkipRevertFailure(ctx, logger, apply, ps, now, skipErr)
+		return
+	}
+	ps.autoSkipRevertRefused = true
+	logger.Error("the engine refused the automatic skip-revert; it is not sent again, and the revert window stays open until an operator reverts or skips it",
+		append(apply.MutableLogAttrs(), "reason", trigger.reason, "error", skipErr)...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+		fmt.Sprintf("The engine refused to close the revert window: %s. SchemaBot will not ask it again; run skip-revert to keep the changes or revert to undo them", refusal.Error()), "", "")
 }
 
 // reportAutoSkipRevertFailure logs a failed automatic skip-revert that the
@@ -1696,13 +1727,28 @@ func (c *LocalClient) reportAutoSkipRevertFailure(ctx context.Context, logger *s
 }
 
 // resolveOrRetryRevertPhaseRequest disposes of a revert-phase control operation
-// the engine refused. A refusal the engine issues for its whole database type is
-// issued identically on every later claim, so the request is resolved with the
-// engine's reason; any other failure leaves it pending for the next drive tick
-// to retry. Neither outcome advances the revert window: a refusal declines the
-// operator's command rather than carrying it out, so the window runs to its own
-// deadline either way.
+// the engine refused. A refusal for this schema change (a typed settled-outcome
+// refusal, which is also how the drive carries a result the engine did not
+// accept) and a decline for the engine's whole database type are both issued
+// identically on every later claim, so the request is resolved with the
+// engine's reason; any other failure, a not-ready engine included, leaves it
+// pending for the next drive tick to retry. Neither outcome advances the
+// revert window: a refusal declines the operator's command rather than
+// carrying it out, so the window runs to its own deadline either way.
 func (c *LocalClient) resolveOrRetryRevertPhaseRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) {
+	settled, settleErr := c.failPendingRequestForSettledOutcome(ctx, logger, apply, operation, eventType, controlReq, opErr)
+	if settleErr != nil {
+		logger.Error("could not resolve an engine-refused control request; it stays pending and the next drive claim collects the same refusal",
+			"operation", string(operation),
+			"requested_by", controlRequestCaller(controlReq),
+			"error", settleErr)
+		return
+	}
+	if settled {
+		// failPendingRequestForSettledOutcome logs the refusal and records it
+		// on the apply's timeline for the operator who asked.
+		return
+	}
 	declined, declineErr := c.failPendingRequestForUnsupportedOperation(ctx, logger, apply, operation, eventType, controlReq, opErr)
 	if declineErr != nil {
 		logger.Error("could not resolve an engine-declined control request; it stays pending and the next drive claim collects the same decline",

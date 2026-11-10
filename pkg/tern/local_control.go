@@ -1517,7 +1517,9 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 // settled=false when the error is not a settled-outcome refusal, so the caller
 // applies its normal error handling. When settled=true the operation did not
 // take effect, so a stop or cancel caller must keep its drive going, or the
-// drive loop would record the operator's command over the engine's outcome.
+// drive loop would record the operator's command over the engine's outcome. A
+// revert-window control the engine answered without accepting reaches here as
+// the same typed refusal, and resolves the same way.
 func (c *LocalClient) failPendingRequestForSettledOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	refusal, ok := engine.AsSettledOutcome(opErr)
 	if !ok {
@@ -1525,7 +1527,7 @@ func (c *LocalClient) failPendingRequestForSettledOutcome(ctx context.Context, l
 	}
 	message := refusal.Error()
 	caller := controlRequestCaller(controlReq)
-	logger.Warn("rejecting pending control request: the schema change already settled on its own outcome; the drive keeps going and records that outcome",
+	logger.Warn("rejecting pending control request: the engine refused it for this schema change; the drive keeps going and records the outcome the engine reports",
 		"operation", string(operation),
 		"requested_by", caller,
 		"state", apply.State,
@@ -3025,20 +3027,34 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 // reported as accepted. The engine's own message is the reason when it gave
 // one, so the caller and the durable control request resolve on it.
 func (c *LocalClient) engineControlRefusal(task *storage.Task, operation string, result *engine.ControlResult) (string, bool) {
-	if result == nil {
-		reason := fmt.Sprintf("the engine returned no result for the %s", operation)
+	reason, refused := controlResultRefusal(operation, result)
+	switch {
+	case !refused:
+		return "", false
+	case result == nil:
 		c.logger.Warn("the engine returned no result for the control operation; it is reported as refused",
 			append(task.LogAttrs(), "operation", operation)...)
-		return reason, true
-	}
-	if !result.Accepted {
-		reason := fmt.Sprintf("the engine did not accept the %s", operation)
-		if result.Message != "" {
-			reason = result.Message
-		}
+	default:
 		c.logger.Warn("the engine refused the control operation; it is reported as refused",
 			append(task.LogAttrs(), "operation", operation, "error_message", reason)...)
-		return reason, true
+	}
+	return reason, true
+}
+
+// controlResultRefusal returns the refusal reason when an engine's answer to a
+// revert-window control is not an acceptance: a missing result, or one the
+// engine did not accept, carrying the engine's own message when it gave one.
+// Every path that sends the control resolves the same answer on the same
+// reason, whether the API sent it or the drive did.
+func controlResultRefusal(operation string, result *engine.ControlResult) (string, bool) {
+	if result == nil {
+		return fmt.Sprintf("the engine returned no result for the %s", operation), true
+	}
+	if !result.Accepted {
+		if result.Message != "" {
+			return result.Message, true
+		}
+		return fmt.Sprintf("the engine did not accept the %s", operation), true
 	}
 	return "", false
 }
