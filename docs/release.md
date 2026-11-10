@@ -105,7 +105,7 @@ gh workflow run bump-formula.yaml --repo block/homebrew-tap \
 
 Replace `vX.Y.Z` with the tag just released. Merge the generated formula PR after its checks
 pass. Users then receive that release with `brew upgrade block/tap/schemabot`; Homebrew
-maintains the `schemabot` command on PATH. No wizard-created alias or symlink is needed.
+maintains the `schemabot` command on PATH.
 
 The formula supports Apple Silicon macOS and Linux arm64/amd64, matching the published
 archives. Verify `schemabot init` from a fresh application directory before advertising a
