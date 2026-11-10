@@ -158,15 +158,58 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 }
 
 // applyAuthorizationForPlanComment returns who may run `schemabot apply` for
-// database via repo, for the plan comment to show next to its apply command,
-// or nil when PR command authorization is off. It reads server config only,
-// so the plan comment costs no extra GitHub request.
-func (h *Handler) applyAuthorizationForPlanComment(repo, database string) *templates.ApplyAuthorizationData {
+// database via repo, for the plan comment to show next to its apply command.
+// It returns nil when the comment has nothing to say: PR command authorization
+// is off, or reader may already run the apply. reader is the person the
+// comment answers: whoever commented the plan command, or the PR author on an
+// auto-plan.
+//
+// It runs the same check the apply gate does, so on top of the config read it
+// asks GitHub for reader's membership in each configured team until one
+// includes reader, reusing any membership this delivery has already read. When
+// that check cannot be evaluated, the list renders: it is still true, and it
+// names whom to ask.
+func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, reader string) *templates.ApplyAuthorizationData {
 	if h.service == nil || !h.service.Config().PRCommandAuthorizationEnabled() {
 		return nil
 	}
 	operators, others := h.service.Config().PRCommandAuthorizedPrincipals(repo, database)
-	return &templates.ApplyAuthorizationData{OperatorPrincipals: operators, OtherPrincipals: others}
+	auth := &templates.ApplyAuthorizationData{OperatorPrincipals: operators, OtherPrincipals: others}
+	if strings.TrimSpace(reader) == "" {
+		h.logger.Debug("plan comment lists who can apply because it has no reader to check",
+			"repo", repo, "pr", pr, "database", database)
+		return auth
+	}
+	result, err := h.authorizePRCommandActor(ctx, client, reader, repo, database)
+	if err != nil {
+		h.logger.Warn("plan comment lists who can apply because the reader's apply authorization could not be checked",
+			"repo", repo, "pr", pr, "database", database, "reader", reader,
+			"reason", result.Reason, "error", err)
+		return auth
+	}
+	if result.Allowed {
+		h.logger.Debug("plan comment omits who can apply because the reader may run the apply",
+			"repo", repo, "pr", pr, "database", database, "reader", reader,
+			"matched_principal", result.MatchedPrincipal)
+		return nil
+	}
+	return auth
+}
+
+// planCommentReader returns whom a plan comment answers: the requester of a
+// commented plan, or the PR author on an auto-plan, which has no requester.
+// It returns "" when the PR author cannot be read.
+func (h *Handler) planCommentReader(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, requestedBy string) string {
+	if requestedBy != "" {
+		return requestedBy
+	}
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Warn("plan comment cannot read the PR author, so it lists who can apply",
+			"repo", repo, "pr", pr, "error", err)
+		return ""
+	}
+	return prInfo.User
 }
 
 func (h *Handler) authorizePRCommandActor(

@@ -192,7 +192,7 @@ type PlanCommentData struct {
 	ExemptTables []ExemptTablesData
 
 	// ApplyAuthorization lists who may run the apply the comment offers. Nil
-	// when PR command authorization is off.
+	// when PR command authorization is off or the reader may run the apply.
 	ApplyAuthorization *ApplyAuthorizationData
 
 	// Unsafe change tracking
@@ -764,6 +764,23 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
+// OffersApply reports whether the comment offers `schemabot apply`: the plan
+// has work to run (a change on the primary target, or on another target of a
+// rollout), and nothing withholds the apply instruction (a locked apply, a
+// member apply refusal, or a change the engine refuses). Only a comment that
+// offers an apply shows who can run it, so the handler checks the reader's
+// authorization only then.
+func (d PlanCommentData) OffersApply() bool {
+	return environmentHasWork(&d) && !d.IsLocked && !d.applyFailsOnRefusedChange()
+}
+
+// OffersApply reports whether the comment offers `schemabot apply` for any
+// environment: one has work to run and no refused environment ahead of it
+// withholds its apply. Only then does the footer show who can run it.
+func (d MultiEnvPlanCommentData) OffersApply() bool {
+	return len(sortMultiEnvApplies(d).withChanges) > 0
+}
+
 // writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
 // apply cannot run every target's plan the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
@@ -801,10 +818,11 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 }
 
 // ApplyAuthorizationData lists who may run `schemabot apply` for the planned
-// database when PR command authorization is on, so the plan comment tells the
-// PR author up front whether they can apply it themselves, and tells reviewers
-// that their approval does not let the author run it. Nil means PR command
-// authorization is off, and the comment says nothing about it.
+// database when PR command authorization is on and the comment's reader may
+// not run it, so the plan comment tells them up front whom to ask, and that a
+// review approval does not let them run it. Nil means PR command authorization
+// is off or the reader may run the apply, and the comment says nothing about
+// it.
 type ApplyAuthorizationData struct {
 	// OperatorPrincipals are the database's own operator teams (org/team) and
 	// users.
@@ -826,16 +844,47 @@ func writeWhoCanApply(sb *strings.Builder, database string, auth *ApplyAuthoriza
 		fmt.Fprintf(sb, "🔐 No team or user can run `schemabot apply` for %s yet. Ask a SchemaBot admin to configure its operators.\n", inlineCode(database))
 		return
 	}
-	// Running the command and approving the PR are separate checks with
-	// separate lists, so the note promises only the first: a listed principal
-	// can run the apply once the PR has any approval it needs.
-	fmt.Fprintf(sb, "🔐 **Who can apply**: only these teams and users can run `schemabot apply` for %s, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.\n", inlineCode(database))
+	fmt.Fprintf(sb, "🔐 %s\n", whoCanApplySentence(database, append(append([]string{}, operators...), others...)))
 	if len(operators) > 0 {
 		fmt.Fprintf(sb, "- Operators: %s\n", principalList(operators))
 	}
 	if len(others) > 0 {
 		fmt.Fprintf(sb, "- Admins: %s\n", principalList(others))
 	}
+}
+
+// whoCanApplySentence says who can run the apply and whom to ask, worded for
+// what principals holds: teams, users, or both, one or several. A principal in
+// org/team form is a team; GitHub logins cannot contain a slash, so anything
+// else is a user.
+func whoCanApplySentence(database string, principals []string) string {
+	teams, users := 0, 0
+	for _, principal := range principals {
+		if strings.Contains(principal, "/") {
+			teams++
+		} else {
+			users++
+		}
+	}
+	noun := func(count int, one, many string) string {
+		if count == 1 {
+			return one
+		}
+		return many
+	}
+	var who, ask string
+	switch {
+	case teams > 0 && users > 0:
+		who = noun(teams, "this team", "these teams") + " and " + noun(users, "this user", "these users")
+		ask = "Ask one of them to run it:"
+	case teams > 0:
+		who = noun(teams, "this team", "these teams")
+		ask = noun(teams, "Ask a member to run it:", "Ask a member of one of them to run it:")
+	default:
+		who = noun(users, "this user", "these users")
+		ask = noun(users, "Ask them to run it:", "Ask one of them to run it:")
+	}
+	return fmt.Sprintf("Only %s can run `schemabot apply` for %s. %s", who, inlineCode(database), ask)
 }
 
 // maxListedPrincipals bounds each who-can-apply line, so a database with a
@@ -3471,7 +3520,7 @@ type MultiEnvPlanCommentData struct {
 	AgentHint string
 
 	// ApplyAuthorization lists who may run the applies the comment offers. Nil
-	// when PR command authorization is off.
+	// when PR command authorization is off or the reader may run the applies.
 	ApplyAuthorization *ApplyAuthorizationData
 
 	// Environments in display order (staging first, production second, etc.)
@@ -4274,7 +4323,7 @@ func environmentHasWork(plan *PlanCommentData) bool {
 // hasChanges returns true if there are any schema changes.
 func hasChanges(changes []KeyspaceChangeData) bool {
 	for _, ks := range changes {
-		if len(ks.Statements) > 0 || ks.VSchemaChanged || ks.Finalize {
+		if keyspaceStatementCount(ks) > 0 || ks.VSchemaChanged || ks.Finalize {
 			return true
 		}
 	}

@@ -516,7 +516,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
-*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Started at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -560,7 +560,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 schemabot apply -e staging
 ```
 
-🔐 **Who can apply**: only these teams and users can run `schemabot apply` for `testapp`, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.
+🔐 Only these teams and this user can run `schemabot apply` for `testapp`. Ask one of them to run it:
 - Operators: `acme/testapp-operators`
 - Admins: `acme/db-admins`, `jdoe`
 
@@ -10310,6 +10310,52 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ---
 
 ▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="multienv-plan-changes-only-on-shards"></a><strong>Multi-env Plan: Changes Only On Shards</strong></summary>
+
+
+## Schema Change Plan
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### Staging
+
+#### Keyspace: `cdb_resolute_sharded`
+**shards `-80`, `80-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: **1** table to alter
+
+### Production
+
+#### Keyspace: `cdb_resolute_sharded`
+**shards `-40`, `40-80`, `80-c0`, `c0-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: **1** table to alter
+
+---
+
+▶️ **To apply** these changes, start with the first environment:
+```
+schemabot apply -e staging
+```
+
+After verifying staging, apply to production:
 ```
 schemabot apply -e production
 ```

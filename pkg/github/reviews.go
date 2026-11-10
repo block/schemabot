@@ -263,7 +263,27 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 // App cannot see, so a 404 is a negative result only once the team itself
 // reads back. A team that cannot be read returns ErrTeamMembershipUnreadable,
 // never a negative result. A pending invitation is not a membership.
+//
+// Within a scope carrying the request-scoped cache (WithPRInfoCache), a
+// membership already read is answered from the cache.
 func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
+	cache := prInfoCacheFromContext(ctx)
+	if cache != nil {
+		if member, ok := cache.getMembership(org, slug, login); ok {
+			return member, nil
+		}
+	}
+	member, err := ic.isTeamMember(ctx, org, slug, login)
+	if err != nil {
+		return false, err
+	}
+	if cache != nil {
+		cache.setMembership(org, slug, login, member)
+	}
+	return member, nil
+}
+
+func (ic *InstallationClient) isTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
 	logAttrs := []any{"org", org, "team_slug", slug, "login", login}
 	membership, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeamMembership, "get team membership", logAttrs, func(ctx context.Context) (*gh.Membership, error) {
 		m, _, getErr := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)

@@ -25,7 +25,7 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 			ApplyAuthorization: auth,
 		}
 	}
-	whoCanApply := "🔐 **Who can apply**: only these teams and users can run `schemabot apply` for `orders`, once the PR has any approval it needs. Approving the PR does not let anyone else run it, so if you are not listed, ask one of them to run it.\n" +
+	whoCanApply := "🔐 Only these teams and this user can run `schemabot apply` for `orders`. Ask one of them to run it:\n" +
 		"- Operators: `acme/orders-operators`, `lee`\n" +
 		"- Admins: `acme/db-admins`\n"
 
@@ -42,7 +42,7 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 			Plans:              map[string]*PlanCommentData{"staging": plan("staging"), "production": plan("production")},
 			ApplyAuthorization: auth,
 		})
-		assert.Equal(t, 1, strings.Count(out, "**Who can apply**"), out)
+		assert.Equal(t, 1, strings.Count(out, "🔐"), out)
 		assert.Contains(t, out, whoCanApply, out)
 	})
 
@@ -95,7 +95,7 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 		data := *plan("staging")
 		data.ApplyAuthorization = &ApplyAuthorizationData{OtherPrincipals: []string{"acme/db-admins"}}
 		out := RenderPlanComment(data)
-		assert.Contains(t, out, "ask one of them to run it.\n- Admins: `acme/db-admins`\n", out)
+		assert.Contains(t, out, "🔐 Only this team can run `schemabot apply` for `orders`. Ask a member to run it:\n- Admins: `acme/db-admins`\n", out)
 		assert.NotContains(t, out, "- Operators:", out)
 	})
 
@@ -123,4 +123,126 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 		locked.PendingManualConfirmation = true
 		assert.NotContains(t, RenderPlanComment(locked), "🔐", RenderPlanComment(locked))
 	})
+}
+
+// The handler checks the reader's authorization only when OffersApply says the
+// comment shows who can apply, so a plan with nothing to run costs no GitHub
+// request. This pins the predicate to the rendered comment: the list renders
+// exactly when OffersApply holds, for each way a comment can withhold its
+// apply.
+func TestOffersApplyMatchesWhoCanApplyRendering(t *testing.T) {
+	auth := &ApplyAuthorizationData{OperatorPrincipals: []string{"acme/orders-operators"}}
+	plan := func(env string, edit func(*PlanCommentData)) *PlanCommentData {
+		p := &PlanCommentData{
+			Database: "orders", Environment: env, DatabaseType: "mysql", IsMySQL: true,
+			Changes:            []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);"}}},
+			ApplyAuthorization: auth,
+		}
+		if edit != nil {
+			edit(p)
+		}
+		return p
+	}
+	singles := map[string]func(*PlanCommentData){
+		"changes":    nil,
+		"no changes": func(p *PlanCommentData) { p.Changes = nil },
+		"changes only on shards": func(p *PlanCommentData) {
+			p.Changes = []KeyspaceChangeData{{Keyspace: "orders", Shards: []KeyspaceShardChange{
+				{Shard: "-80", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);"}},
+				{Shard: "80-", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);"}},
+			}}}
+		},
+		"locked": func(p *PlanCommentData) {
+			p.IsLocked = true
+			p.PendingManualConfirmation = true
+		},
+		"member apply refusal": func(p *PlanCommentData) {
+			p.MemberApplyRefusal = "the target reports a different schema"
+			p.MemberApplyRefusalTarget = "orders-eu"
+		},
+		"refused change": func(p *PlanCommentData) {
+			p.BlockedChanges = []BlockedChangeData{{Table: "orders", Reason: "unsupported"}}
+		},
+	}
+	for name, edit := range singles {
+		t.Run("single environment: "+name, func(t *testing.T) {
+			data := *plan("staging", edit)
+			out := RenderPlanComment(data)
+			assert.Equal(t, data.OffersApply(), strings.Contains(out, "🔐"), out)
+		})
+	}
+
+	multis := map[string]MultiEnvPlanCommentData{
+		"changes in both": {
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": plan("staging", nil), "production": plan("production", nil)},
+		},
+		"changes only on shards": {
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*PlanCommentData{
+				"staging":    plan("staging", singles["changes only on shards"]),
+				"production": plan("production", singles["changes only on shards"]),
+			},
+		},
+		"no changes anywhere": {
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*PlanCommentData{
+				"staging":    plan("staging", singles["no changes"]),
+				"production": plan("production", singles["no changes"]),
+			},
+		},
+		"refused environment withholds the one behind it": {
+			Environments: []string{"staging", "production"},
+			Plans: map[string]*PlanCommentData{
+				"staging":    plan("staging", singles["refused change"]),
+				"production": plan("production", nil),
+			},
+		},
+		"failed environment and no changes": {
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": plan("staging", singles["no changes"])},
+			Errors:       map[string]string{"production": "plan failed; see server logs"},
+		},
+	}
+	for name, data := range multis {
+		t.Run("multiple environments: "+name, func(t *testing.T) {
+			data.Database, data.DatabaseType, data.IsMySQL = "orders", "mysql", true
+			data.ApplyAuthorization = auth
+			out := RenderMultiEnvPlanComment(data)
+			assert.Equal(t, data.OffersApply(), strings.Contains(out, "🔐"), out)
+		})
+	}
+	assert.True(t, plan("staging", nil).OffersApply())
+	assert.True(t, plan("staging", singles["changes only on shards"]).OffersApply())
+	for name, edit := range singles {
+		if edit != nil && name != "changes only on shards" {
+			assert.False(t, plan("staging", edit).OffersApply(), name)
+		}
+	}
+	assert.True(t, multis["changes in both"].OffersApply())
+	assert.True(t, multis["changes only on shards"].OffersApply())
+	assert.False(t, multis["no changes anywhere"].OffersApply())
+	assert.False(t, multis["refused environment withholds the one behind it"].OffersApply())
+}
+
+// The sentence above the list is worded for what the list holds, so it never
+// calls a lone user "these teams and users" or asks a team to run a command.
+func TestWhoCanApplySentence(t *testing.T) {
+	tests := []struct {
+		name       string
+		principals []string
+		want       string
+	}{
+		{"one team", []string{"acme/orders-operators"}, "Only this team can run `schemabot apply` for `orders`. Ask a member to run it:"},
+		{"several teams", []string{"acme/orders-operators", "acme/db-admins"}, "Only these teams can run `schemabot apply` for `orders`. Ask a member of one of them to run it:"},
+		{"one user", []string{"lee"}, "Only this user can run `schemabot apply` for `orders`. Ask them to run it:"},
+		{"several users", []string{"lee", "jdoe"}, "Only these users can run `schemabot apply` for `orders`. Ask one of them to run it:"},
+		{"one team and one user", []string{"acme/orders-operators", "lee"}, "Only this team and this user can run `schemabot apply` for `orders`. Ask one of them to run it:"},
+		{"teams and users", []string{"acme/orders-operators", "acme/db-admins", "lee", "jdoe"}, "Only these teams and these users can run `schemabot apply` for `orders`. Ask one of them to run it:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, whoCanApplySentence("orders", tt.principals))
+		})
+	}
 }

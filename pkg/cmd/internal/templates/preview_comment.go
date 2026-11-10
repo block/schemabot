@@ -461,6 +461,7 @@ func previewCommentShardedAllOutput() {
 	}{
 		{"PLAN: DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanDivergent()) }},
 		{"PLAN: MANY SHARDS (32)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanManyShards()) }},
+		{"MULTI-ENV PLAN: CHANGES ONLY ON SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanMultiEnvShardOnly()) }},
 		{"PLAN: PARTIALLY APPLIED SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanPartiallyApplied()) }},
 		{"PLAN: UNSAFE CHANGE ON ONE SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanUnsafe()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyInProgress()) }},

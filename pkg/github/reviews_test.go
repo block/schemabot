@@ -202,6 +202,52 @@ func TestGetApprovedReviewsOrdersBySubmission(t *testing.T) {
 // 404 counts as "not a member" only when the team itself reads back: GitHub
 // returns 404 for a team the App cannot see too, and that must stay an
 // unreadable error, never a denial dressed as an answer.
+// Within one delivery, every authorization check for the same login and team
+// answers from one read. The next delivery reads again, so a member added or
+// removed on GitHub takes effect on the next command. A failed read is not
+// cached, so the next check in the same delivery reads again.
+func TestIsTeamMemberCachesWithinOneDelivery(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+	client, mux := setupConfigTestGitHubServer(t)
+	var reads atomic.Int32
+	var state, status atomic.Value
+	state.Store("pending")
+	status.Store(http.StatusOK)
+	mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/mona", func(w http.ResponseWriter, _ *http.Request) {
+		reads.Add(1)
+		code := status.Load().(int)
+		w.WriteHeader(code)
+		if code == http.StatusOK {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": state.Load().(string), "role": "member"}))
+		}
+	})
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	delivery := WithPRInfoCache(t.Context())
+	member, err := ic.IsTeamMember(delivery, "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.False(t, member)
+	member, err = ic.IsTeamMember(delivery, "OctoCat", "DB-Operators", "Mona")
+	require.NoError(t, err)
+	assert.False(t, member)
+	assert.Equal(t, int32(1), reads.Load(), "a second check in the same delivery reuses the first read")
+
+	state.Store("active")
+	member, err = ic.IsTeamMember(WithPRInfoCache(t.Context()), "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.True(t, member, "the next delivery sees mona join the team")
+	assert.Equal(t, int32(2), reads.Load())
+
+	failing := WithPRInfoCache(t.Context())
+	status.Store(http.StatusForbidden)
+	_, err = ic.IsTeamMember(failing, "octocat", "db-operators", "mona")
+	require.ErrorIs(t, err, ErrTeamMembershipUnreadable)
+	status.Store(http.StatusOK)
+	member, err = ic.IsTeamMember(failing, "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.True(t, member, "a failed read is not cached")
+}
+
 func TestIsTeamMember(t *testing.T) {
 	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 	tests := []struct {
