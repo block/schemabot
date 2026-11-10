@@ -53,6 +53,7 @@ func previewCommentAllOutput() {
 		{"PLAN COMMENT (COLLATION CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCollationChanges()) }},
 		{"PLAN COMMENT (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"PLAN COMMENT (UNMANAGED SCHEMA ALONGSIDE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnmanagedSchema()) }},
+		{"PLAN COMMENT (WHO CAN APPLY)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanWhoCanApply()) }},
 		{"PLAN COMMENT (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"PLAN COMMENT (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
@@ -142,6 +143,7 @@ func previewCommentAllOutput() {
 		{"APPLY STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
 		{"APPLY WAITING FOR CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover()) }},
 		{"APPLY WAITING FOR CUTOVER (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic()) }},
+		{"APPLY WAITING FOR CUTOVER: FIRST TABLE LANDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverFirstLanded()) }},
 		{"APPLY CUTTING OVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
@@ -195,6 +197,7 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN (PARTITIONED TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanPartitionedTables()) }},
 		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"MYSQL PLAN (UNMANAGED SCHEMA ALONGSIDE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnmanagedSchema()) }},
+		{"MYSQL PLAN (WHO CAN APPLY)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanWhoCanApply()) }},
 		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"MYSQL PLAN (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
 		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
@@ -366,6 +369,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyProgress()) }},
 		{"SECOND TABLE ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
 		{"SECOND TABLE THROTTLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThrottled()) }},
+		{"SECOND AND THIRD TABLES RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplySeveralRunning()) }},
 		{"SECOND TABLE CATCHING UP", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCatchingUp()) }},
 		{"SECOND TABLE CHECKSUMMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksumming()) }},
 		{"SECOND TABLE CHECKSUMMING: CUTOVER DEFERRED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksummingDeferredCutover()) }},
@@ -391,6 +395,7 @@ func previewCommentApplyFlowAllOutput() {
 		// Cutover states
 		{"WAITING FOR CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover()) }},
 		{"WAITING FOR CUTOVER (AUTOMATIC)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverAutomatic()) }},
+		{"WAITING FOR CUTOVER: FIRST TABLE LANDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutoverFirstLanded()) }},
 		{"CUTTING OVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver()) }},
 		// Revert-window states (PlanetScale): deployed-but-revertable, then finalizing.
 		{"REVERT WINDOW", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRevertWindow()) }},
@@ -456,6 +461,7 @@ func previewCommentShardedAllOutput() {
 	}{
 		{"PLAN: DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanDivergent()) }},
 		{"PLAN: MANY SHARDS (32)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanManyShards()) }},
+		{"MULTI-ENV PLAN: CHANGES ONLY ON SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanMultiEnvShardOnly()) }},
 		{"PLAN: PARTIALLY APPLIED SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanPartiallyApplied()) }},
 		{"PLAN: UNSAFE CHANGE ON ONE SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanUnsafe()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyInProgress()) }},

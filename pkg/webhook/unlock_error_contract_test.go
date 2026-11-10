@@ -232,7 +232,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 	t.Run("authorization evaluation failure is retryable", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := recordComments(t, mux)
-		mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+		handleTeamMembers(t, mux, "octocat", "schema-admins", http.StatusForbidden)
 		lockStore := &unlockTestLockStore{locks: []*storage.Lock{prOwnedOrdersLock()}}
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {

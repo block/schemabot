@@ -584,6 +584,9 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 }
 
 func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, operation storage.ControlOperation, errorMessage string) error {
+	errorMessage = storedMessage(ctx, "apply_control_requests.error_message", errorMessage, func() []any {
+		return []any{"operation", operation}
+	})
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {
 		return err
@@ -629,6 +632,9 @@ func (s *controlRequestStore) SettlePendingRevision(ctx context.Context, req *st
 	if status != storage.ControlRequestFailed {
 		errorMessage = ""
 	}
+	errorMessage = storedMessage(ctx, "apply_control_requests.error_message", errorMessage, func() []any {
+		return []any{"operation", req.Operation}
+	})
 	target := fmt.Sprintf("apply %d operation %s request %d revision %d", req.ApplyID, req.Operation, req.ID, req.Revision)
 	lease, hasLease, err := applyLeaseFromContext(ctx, req.ApplyID)
 	if err != nil {
@@ -750,20 +756,26 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 	// the operation, so an unchanged row means the failure is already recorded.
 	// The requester is part of that identity: a second operator whose re-issued
 	// command fails for the same reason is a distinct rejection, and the notice
-	// names who issued the command that did not take effect.
+	// names who issued the command that did not take effect. The row holds the
+	// message in its stored form, so the report is compared in that form too:
+	// a report too long for the column still matches the row that recorded it.
 	if existing != nil && existing.Status == storage.ControlRequestFailed &&
-		existing.ErrorMessage == req.ErrorMessage && existing.RequestedBy == requestedBy {
+		storage.StoredMessage(existing.ErrorMessage) == storage.StoredMessage(req.ErrorMessage) &&
+		existing.RequestedBy == requestedBy {
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("commit unchanged remote failure read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 		}
 		return false, nil
 	}
+	errorMessage := storedMessage(ctx, "apply_control_requests.error_message", req.ErrorMessage, func() []any {
+		return []any{"operation", req.Operation}
+	})
 	if existing != nil {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE apply_control_requests
 			SET status = ?, requested_by = ?, error_message = ?, completed_at = NOW(), updated_at = NOW()
 			WHERE id = ?
-		`, storage.ControlRequestFailed, requestedBy, nullString(req.ErrorMessage), existing.ID); err != nil {
+		`, storage.ControlRequestFailed, requestedBy, nullString(errorMessage), existing.ID); err != nil {
 			return false, fmt.Errorf("record remote failure on control request %d for apply %d operation %s: %w", existing.ID, req.ApplyID, req.Operation, err)
 		}
 	} else if _, err := s.identity.InsertID(ctx, tx, `
@@ -772,7 +784,7 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 		) VALUES (?, ?, ?, ?, ?, ?, NOW())
 	`,
 		req.ApplyID, req.Operation, storage.ControlRequestFailed,
-		req.RequestedBy, nullString(req.ErrorMessage), nullJSON(storage.MirroredControlRequestMetadata()),
+		req.RequestedBy, nullString(errorMessage), nullJSON(storage.MirroredControlRequestMetadata()),
 	); err != nil {
 		return false, fmt.Errorf("create failed control request for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 	}

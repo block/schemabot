@@ -23,6 +23,7 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 		// The reason is engine prose, so it is escaped like any other. An
 		// underscore inside a word cannot start emphasis, so it is left as written.
 		{templates.PreviewCommentPlanIgnoreTables, "(ignore_tables): `flyway_schema_history`"},
+		{templates.PreviewCommentPlanWhoCanApply, "- Operators: `acme/testapp-operators`"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.previewType), func(t *testing.T) {
@@ -35,4 +36,13 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 			assert.Contains(t, out, tt.want)
 		})
 	}
+}
+
+// A live TUI preview replays a scenario that never ends, so pressing Esc is
+// how the preview finishes. That is a success for the preview, not an operator
+// leaving an apply behind, so it exits 0; any other watch result is kept.
+func TestPreviewTUI_LeavingTheLivePreviewSucceeds(t *testing.T) {
+	assert.NoError(t, previewWatchExit(detachedFromWatch()))
+	assert.NoError(t, previewWatchExit(nil))
+	assert.Equal(t, 1, ExitCodeFor(previewWatchExit(ErrSilent)), "a watch that could not follow the scenario still fails")
 }

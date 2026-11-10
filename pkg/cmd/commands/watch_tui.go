@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -37,7 +38,14 @@ type WatchModel struct {
 	sharded bool
 	// deferCutover is whether the apply waits for an operator at each cutover.
 	deferCutover bool
-	errorMsg     string
+	// errorMsg is the error the view shows. It is display text only: a failed
+	// poll the watch is still retrying or a refused control request leaves it
+	// set while the watch carries on, so it does not decide the exit status.
+	errorMsg string
+	// followFailed is whether the watch ended because it could not follow the
+	// apply: the server answered with a permanent error, or polls kept failing
+	// until the watch gave up.
+	followFailed bool
 
 	// Engine metadata
 	engine           string // "Spirit", "PlanetScale", etc.
@@ -170,6 +178,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
 				m.errorMsg = progressGiveUpMessage(m.applyID, m.environment, m.consecutiveErrors) + ": " + msg.errorMsg
 				m.initialized = true
+				m.followFailed = true
 				return m, tea.Quit
 			}
 			return m, nil
@@ -178,6 +187,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Permanent error (not_found, invalid_request, deployment_not_found).
 			m.errorMsg = msg.errorMsg
 			m.initialized = true
+			m.followFailed = true
 			return m, tea.Quit
 		}
 
@@ -348,12 +358,28 @@ func runWatchModel(model WatchModel) (err error) {
 	// Don't use alt-screen - render inline for seamless experience
 	p := tea.NewProgram(model)
 	finalModel, err := p.Run()
-	if err != nil {
-		printExitContext(model.applyID, "", model.environment)
-		return err
-	}
+	return watchExit(model, finalModel, err)
+}
 
-	m := finalModel.(WatchModel)
+// watchExit is the result of a watch whose program has returned. An interrupt
+// signal reaches the program as a signal rather than a keystroke when stdin is
+// not a terminal, and ends it with tea.ErrInterrupted; that is the operator
+// leaving, the same as a Ctrl-C keystroke, so it exits as a detach rather than
+// as an error. Any other run error is reported as it is. Otherwise the final
+// model decides, as exitError says.
+func watchExit(started WatchModel, finalModel tea.Model, runErr error) error {
+	m, ok := finalModel.(WatchModel)
+	if !ok {
+		m = started
+	}
+	if errors.Is(runErr, tea.ErrInterrupted) {
+		printExitContext(m.applyID, m.deployRequestURL, m.environment)
+		return detachedFromWatch()
+	}
+	if runErr != nil {
+		printExitContext(started.applyID, "", started.environment)
+		return runErr
+	}
 
 	// Completed applies render their apply ID in the success line. Other exits
 	// need explicit context so operators can resume monitoring or investigate.
@@ -364,22 +390,25 @@ func runWatchModel(model WatchModel) (err error) {
 	return m.exitError()
 }
 
-// exitError is the watch's exit status for its final model, the same rule
-// terminalWatchExit and noActiveChangeError give the non-interactive watch:
-// only a completed apply succeeds. Any other end (stopped, failed,
-// cancelled, reverted, no active schema change) or an error means the
-// schema change is not on the target. The view already shows the outcome,
-// including the start command for a stopped apply, so the failure is
-// ErrSilent. Detaching while the apply still runs is not an outcome, so it
-// exits 0.
+// exitError is the watch's exit status for its final model, the same rule the
+// non-interactive watch follows. A watch that could not follow the apply fails.
+// A watch that followed the apply to its end exits as applyEndExit says: only a
+// completed apply succeeds, and the view already shows the outcome, including
+// the start command for a stopped apply. Anything else is the operator leaving
+// while the apply carries on (Esc, Ctrl-C, q, or SIGTERM), including leaving
+// before the first poll has answered: that is not an outcome, so it exits
+// ExitInterrupted, the status a Ctrl-C ends a log watch with, rather than 0,
+// which a script reads as the schema change being done, or 1, which it reads
+// as the apply having failed.
 func (m WatchModel) exitError() error {
-	if state.IsState(m.state, state.Apply.Completed) {
-		return nil
-	}
-	if m.errorMsg != "" || m.watchHasEnded() {
+	switch {
+	case m.followFailed:
 		return ErrSilent
+	case m.initialized && m.watchHasEnded():
+		return applyEndExit(m.state)
+	default:
+		return detachedFromWatch()
 	}
-	return nil
 }
 
 // printExitContext prints apply context on any TUI exit so operators

@@ -39,7 +39,7 @@ func TestDriftGuard_MatchMaterializes(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 5}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_ok",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
@@ -98,7 +98,7 @@ func TestDriftGuard_WithheldTablesTravelToTheReplan(t *testing.T) {
 	var shown []string
 	c := newBookkeepingTableDriftClient(store, &shown)
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:       "plan_withheld",
 		IgnoreTables: []string{bookkeepingTable},
 		DdlChanges: []*ternv1.TableChange{
@@ -122,7 +122,7 @@ func TestDriftGuard_MaterializedPlanRecordsIgnoreTables(t *testing.T) {
 	var shown []string
 	c := newBookkeepingTableDriftClient(store, &shown)
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:       "plan_withheld",
 		IgnoreTables: []string{bookkeepingTable},
 		DdlChanges: []*ternv1.TableChange{
@@ -144,7 +144,7 @@ func TestDriftGuard_NoWithheldRecordStillSeesTheWholeSchema(t *testing.T) {
 	var shown []string
 	c := newBookkeepingTableDriftClient(store, &shown)
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_exposed",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
@@ -172,7 +172,7 @@ func TestDriftGuard_CanonicalizationTolerant(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 6}
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_canon",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
@@ -188,7 +188,7 @@ func TestDriftGuard_MissingReviewedChangeFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{}) // recomputes no changes
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_drift",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
@@ -208,7 +208,7 @@ func TestDriftGuard_UnexpectedLocalChangeFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_extra",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "orders", Ddl: "CREATE TABLE `orders` (`id` bigint)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE, Namespace: "testapp"},
@@ -226,7 +226,7 @@ func TestDriftGuard_DifferentDDLSameTableFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_diff_ddl",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
@@ -245,7 +245,7 @@ func TestDriftGuard_ShardScopedMatchMaterializes(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 8}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("-80"))
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:       "plan_shard_ok",
 		TargetShards: []string{"-80"},
 		DdlChanges: []*ternv1.TableChange{
@@ -265,7 +265,7 @@ func TestDriftGuard_ShardScopedWrongShardFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("80-"))
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:       "plan_shard_drift",
 		TargetShards: []string{"-80"},
 		DdlChanges: []*ternv1.TableChange{
@@ -312,7 +312,7 @@ func TestDriftGuard_ShardScopedIgnoresOtherTablesOnTheShard(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 8}
 	c := newPlanMaterializeClientWithPlan(store, twoTableShardPlan("-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"))
 
-	got, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_two_tables"))
+	got, _, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_two_tables"))
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
@@ -326,7 +326,7 @@ func TestDriftGuard_ShardScopedDispatchedTableDriftFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, twoTableShardPlan("-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(100)"))
 
-	_, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_two_tables_drift"))
+	_, _, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_two_tables_drift"))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
@@ -344,7 +344,7 @@ func TestDriftGuard_ShardScopedDispatchedTableAbsentFromReplanFailsClosed(t *tes
 	result.Changes[0].TableChanges = result.Changes[0].TableChanges[1:]
 	c := newPlanMaterializeClientWithPlan(store, result)
 
-	_, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_users_absent"))
+	_, _, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_users_absent"))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
@@ -359,7 +359,7 @@ func TestDriftGuard_MultipleTargetShardsFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("-80"))
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:       "plan_shard_multi",
 		TargetShards: []string{"-80", "80-"},
 		DdlChanges: []*ternv1.TableChange{
@@ -378,7 +378,7 @@ func TestDriftGuard_VSchemaParityFailsClosed(t *testing.T) {
 	// Recomputed plan has the table change but no vschema change.
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_vschema",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
@@ -399,7 +399,7 @@ func TestDriftGuard_VSchemaParityMatches(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 9}
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_vschema_ok",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "VSchema: testapp", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "testapp"},
@@ -424,7 +424,7 @@ func TestDriftGuard_RecomputeErrorFailsClosed(t *testing.T) {
 		},
 	}
 
-	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	_, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId: "plan_engine_err",
 		DdlChanges: []*ternv1.TableChange{
 			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
