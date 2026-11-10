@@ -162,7 +162,7 @@ func (c *LocalClient) ReconcileOrphanedBranches(ctx context.Context, opts Branch
 		case branchDeleteFailed:
 			result.Orphaned++
 			logger.Error("failed to delete orphaned SchemaBot branch; it is retried on the next pass, or delete it manually to reclaim branch quota",
-				append(attrs, "error", err)...)
+				append(attrs, planetscale.BranchDeleteFailureAttrs(err)...)...)
 		case branchDeleted:
 			result.Orphaned++
 			result.Deleted++
