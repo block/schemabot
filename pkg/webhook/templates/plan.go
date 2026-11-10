@@ -785,7 +785,7 @@ func (d MultiEnvPlanCommentData) OffersApply() bool {
 // apply cannot run every target's plan the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
 func writeMemberApplyRefusal(sb *strings.Builder, target, reason string) {
-	reason = escapeInlineMarkdown(strings.Join(strings.Fields(reason), " "))
+	reason = escapeProse(strings.Join(strings.Fields(reason), " "))
 	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: target %s: %s.\n\n", inlineCode(target), reason)
 	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
 }
@@ -1114,7 +1114,7 @@ func appendTargetFlag(command, target string) string {
 // writePlanMetadata writes the metadata line for plan comments.
 // Schema name (the schema directory) is shown for MySQL. Vitess uses keyspace headers instead.
 func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
-	parts := []string{fmt.Sprintf("**Database**: `%s`", data.Database)}
+	parts := []string{fmt.Sprintf("**Database**: %s", inlineCode(data.Database))}
 	parts = append(parts, fmt.Sprintf("**Type**: `%s`", schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)))
 	if data.IsMySQL && data.SchemaName != "" {
 		parts = append(parts, fmt.Sprintf("**Schema Name**: %s", inlineCode(data.SchemaName)))
@@ -1123,7 +1123,7 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 		parts = append(parts, fmt.Sprintf("**Target**: %s", inlineCode(data.Target)))
 	}
 	if data.Tenant != "" {
-		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))
+		parts = append(parts, fmt.Sprintf("**Tenant**: %s", inlineCode(data.Tenant)))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 }
@@ -1357,7 +1357,7 @@ func hasExemptTables(groups []ExemptTablesData) bool {
 }
 
 func exemptReason(reason string) string {
-	return escapeInlineMarkdown(SanitizeInlineError(reason))
+	return escapeProse(SanitizeInlineError(reason))
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -2926,9 +2926,9 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 		fmt.Fprintf(sb, "- %s\n", table)
 		return
 	}
-	fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(causes[0]))
+	fmt.Fprintf(sb, "- %s: %s\n", table, escapeProse(causes[0]))
 	for _, cause := range causes[1:] {
-		fmt.Fprintf(sb, "  - %s\n", escapeInlineMarkdown(cause))
+		fmt.Fprintf(sb, "  - %s\n", escapeProse(cause))
 	}
 }
 
@@ -3094,7 +3094,8 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 // reason: the table, the finding, and the change's attribution note, which a
 // change that creates its table never carries. A change with no parseable reason
 // still gets a line, carrying the engine's change type when one is known so
-// the finding explains itself.
+// the finding explains itself. The table is already Markdown, as
+// unsafeChangeLabel renders it; each reason is rendered here by markdownReason.
 func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) []string {
 	table := unsafeChangeLabel(c)
 	suffix := ""
@@ -3110,7 +3111,7 @@ func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) 
 	}
 	lines := make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		lines = append(lines, fmt.Sprintf("%s: %s%s", table, ui.CodeQuoteIdentifiers(r), suffix))
+		lines = append(lines, fmt.Sprintf("%s: %s%s", table, markdownReason(r), suffix))
 	}
 	return lines
 }
@@ -3343,7 +3344,7 @@ type lintWarningGroup struct {
 // too many to name inline read as coverage on the line, with their names
 // collapsed beneath it.
 func writeLintLine(sb *strings.Builder, table string, w LintViolationData) {
-	message := ui.CodeQuoteIdentifiers(w.Message)
+	message := markdownReason(w.Message)
 	if label := lintLabel(table, w); label != "" {
 		fmt.Fprintf(sb, "- %s: %s\n", label, message)
 	} else {
