@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -20,6 +21,21 @@ func TestExitCodeFor(t *testing.T) {
 		ExitCodeFor(fmt.Errorf("wrapped: %w", exitStorageSchemaOutstanding())),
 		"a wrapped request for a status is still honored")
 	assert.Equal(t, 1, ExitCodeFor(&ExitCodeError{Err: errors.New("no status asked for")}))
+}
+
+// A command treats a cancellation as the operator's interrupt only once its
+// own context is done. A cancellation error that surfaces while that context
+// is still live came from something else, so it stays a failure and exits 1
+// instead of being reported as an interrupt.
+func TestEndedByInterruptNeedsTheCommandContextToBeDone(t *testing.T) {
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	requestCanceled := fmt.Errorf("scan octo/repo: %w", context.Canceled)
+
+	assert.True(t, endedByInterrupt(canceled, requestCanceled))
+	assert.False(t, endedByInterrupt(t.Context(), requestCanceled), "the command's context is still live")
+	assert.False(t, endedByInterrupt(canceled, errors.New("502 Bad Gateway")), "the request failed for another reason")
+	assert.False(t, endedByInterrupt(canceled, nil))
 }
 
 // A status request prints nothing further: the report is already on the screen,

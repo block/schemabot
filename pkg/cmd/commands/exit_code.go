@@ -22,8 +22,9 @@ const (
 
 	// ExitInterrupted says the operator ended the command before it reached its
 	// usual outcome: a watch was stopped by Ctrl-C, SIGTERM, or the interactive
-	// watcher's detach key while its apply carries on, or a schema change was
-	// never submitted. It is the status a shell reports for a process the
+	// watcher's detach key while its apply carries on, a schema change was
+	// never submitted, or a checks backfill or webhook redrive stopped part-way
+	// through its sweep. It is the status a shell reports for a process the
 	// interrupt signal ended, and the one the CLI exits with on a second signal,
 	// so a script sees one status for an interrupt however the command took it,
 	// and never mistakes it for the apply having failed or for it having
@@ -37,6 +38,14 @@ const (
 // match on it.
 func interrupted(ctx context.Context) error {
 	return &ExitCodeError{Code: ExitInterrupted, Err: fmt.Errorf("%w: %w", ErrSilent, ctx.Err())}
+}
+
+// endedByInterrupt reports whether err is the operator's signal ending the
+// command: a cancellation that arrived once the command's own context was
+// done. A cancellation error under a context that is still live came from
+// something other than the operator, so it stays an ordinary failure.
+func endedByInterrupt(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && errors.Is(err, context.Canceled)
 }
 
 // detachedFromWatch is the error the interactive watcher returns once the
