@@ -522,15 +522,17 @@ repository it serves, so routine edits in one large repository use it up and req
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
 configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
 (`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
-symlinks from one diff of the change, or from directory listings batched across those paths when
-GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
-the server's configuration names every directory the repository's configs can sit in, and reads a
-symlink's target only when a config file sits above it; and
+symlinks from one diff of the change, and reads the paths the diff gives no mode for with at most
+one request per side: one directory listing when they fit in one batch, otherwise one listing of
+the whole tree. It asks only about paths inside the configured schema directories when the
+server's configuration names every directory the repository's configs can sit in, lists those
+directories in batches when GitHub truncates the tree, and otherwise treats the unread paths as
+not symlinks. It reads a symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
 (`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
-one-line edits outside its schema directory and requires the same GitHub requests. It covers an
-auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
-repository whose tree GitHub truncates.
+one-line edits outside its schema directory and requires the same GitHub requests, with the diff
+served, refused as too large, and naming pure renames. It covers an auto-plan when the PR opens and
+when a push lands, a plan command, and a plan command in a repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
