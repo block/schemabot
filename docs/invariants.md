@@ -1144,10 +1144,12 @@ active parents and over terminal parents with an operation in progress
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`). The order
 of that lock before any apply row is checked by `TestApplyTargetLockPrecedesApplyRowLocks`
 (`pkg/storage/internal/sqlstore/target_lock_order_test.go`, on both dialects), which drives every
-entry point that takes the lock and refuses the lock while any transaction holds an apply row, and
-`TestApplyTargetLockAcquirersAreListed` (`pkg/storage/internal/sqlstore/target_lock_acquirers_test.go`),
-which walks the package's call graph so a new path to the lock fails until the first test drives
-it. The admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` and
+entry point that takes the lock and refuses the lock while any transaction holds an apply row, on
+the branches its cases drive, and `TestApplyTargetLockAcquirersAreListed`
+(`pkg/storage/internal/sqlstore/target_lock_acquirers_test.go`), which walks the package's call
+graph, following interface calls to the package's own implementations, so a new exported entry
+point that reaches the lock fails until the first test drives it. The admission past a settled
+manifest hold is `checkNoActiveApplyForNewGeneration` and
 `settledManifestHold`, which record the handoff in the create's transaction (`markAdmittedPast`);
 `activeApplyHoldersForTargets` stops counting the held apply once it carries the handoff, and
 `AttachOperationWithTasks` refuses an attach to it, all in the same file. The same create

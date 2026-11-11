@@ -22,13 +22,13 @@ import (
 	"github.com/block/schemabot/pkg/storage/storagetest"
 )
 
-// applyRowLockReader lists the locks any open transaction holds on applies
-// rows in the store's database, read from a session of its own.
 // lockOrderCheckDeadline bounds each lock-order case and the probe, so a
 // stalled pool wait, row lock or catalog read fails the case instead of
 // waiting for the suite timeout.
 const lockOrderCheckDeadline = 30 * time.Second
 
+// applyRowLockReader lists the locks any open transaction holds on applies
+// rows in the store's database, read from a session of its own.
 type applyRowLockReader func(ctx context.Context) ([]string, error)
 
 // mysqlApplyRowLocks reads InnoDB's lock table. A transaction that has locked
@@ -207,6 +207,13 @@ func testApplyTargetLockPrecedesApplyRowLocks(t *testing.T, newStore func(t *tes
 
 			apply.State = state.Apply.Running
 			require.NoError(t, store.Applies().Update(ctx, apply))
+			assert.Contains(t, locker.takeAcquired(), applyTargetLockName(lock.DatabaseName, lock.DatabaseType, "staging"),
+				"Update must take the apply target lock for the target the caller names")
+
+			// An update that names no target reads it from the stored row before
+			// it takes the lock, so the lock it takes can only come from that read.
+			byID := &storage.Apply{ID: apply.ID, ApplyIdentifier: apply.ApplyIdentifier, State: state.Apply.WaitingForCutover}
+			require.NoError(t, store.Applies().Update(ctx, byID))
 		},
 		"applyStore.ClaimApplyByID": func(ctx context.Context, t *testing.T, lock *storage.Lock) {
 			apply := storagetest.CreateApplyWithStateEnvDeployment(t, store, lock, "apply_lock_order_claim", 9702, state.Apply.Stopped, "staging", "default")
