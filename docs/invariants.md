@@ -582,6 +582,11 @@ automatic apply, which dispatches only after its pending changes are stored
 fold observes; concurrent publication can leave stale success over a later blocker
 ([publication concurrency](check-runs.md#publication-concurrency)).
 
+The one exception is a changed path whose file mode cannot be read within AV-15's request budget.
+It is treated as a regular file, so a PR whose only schema change is a symlink among such paths
+gets a passing "no schema files changed". The case is logged as a warning and counted
+(`symlinksAtRef` in `pkg/github/symlink_modes.go`); a request GitHub fails is still an error.
+
 ### MG-2: Absence never passes
 
 The aggregate check is created on every PR head commit. A PR that touches no managed schema files
