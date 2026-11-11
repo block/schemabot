@@ -1016,6 +1016,180 @@ func TestE2ELeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranchAcqui
 	}
 }
 
+// The same rename as above, on a leader that publishes one aggregate per
+// environment. tenant-b publishes "SchemaBot Tenant B (staging)" and
+// "SchemaBot Tenant B (production)" on the head, and the default branch then
+// acquires the rename, so the PR proposes nothing for tenant-b. Each
+// environment's aggregate keeps folding tenant-b's run for that environment
+// while it is in progress or failed, a failed staging run keeps production
+// blocked as its prerequisite, and with no run on the head both aggregates
+// pass. A tenant-b run the leader cannot read leaves it unable to tell which
+// case it is in, so it publishes nothing and re-folds later.
+func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranchAcquiresTheRename(t *testing.T) {
+	stagingName := aggregateCheckNameForEnv("SchemaBot", "staging")
+	productionName := aggregateCheckNameForEnv("SchemaBot", "production")
+	tests := []struct {
+		name string
+		// runs maps an environment to tenant-b's Check Run for it on the head;
+		// an environment missing from it has no run.
+		runs map[string]map[string]any
+		// readFails makes every tenant-b Check Run read fail.
+		readFails    bool
+		wantFollowUp aggregateFoldFollowUp
+		wantError    bool
+		// want maps each aggregate Check Run name to its status and conclusion.
+		want map[string][2]string
+	}{
+		{
+			name: "in_progress runs keep both aggregates in progress",
+			runs: map[string]map[string]any{
+				"staging":    {"status": "in_progress"},
+				"production": {"status": "in_progress"},
+			},
+			wantFollowUp: aggregateFoldScheduleParticipantRefold,
+			want: map[string][2]string{
+				stagingName:    {checkStatusInProgress, ""},
+				productionName: {checkStatusInProgress, ""},
+			},
+		},
+		{
+			name: "failed runs keep both aggregates failing",
+			runs: map[string]map[string]any{
+				"staging":    {"status": "completed", "conclusion": "failure"},
+				"production": {"status": "completed", "conclusion": "failure"},
+			},
+			wantFollowUp: aggregateFoldClearParticipantRefoldBudget,
+			want: map[string][2]string{
+				stagingName:    {checkStatusCompleted, checkConclusionFailure},
+				productionName: {checkStatusCompleted, checkConclusionFailure},
+			},
+		},
+		{
+			name: "a failed staging run keeps production blocked as its prerequisite",
+			runs: map[string]map[string]any{
+				"staging": {"status": "completed", "conclusion": "failure"},
+			},
+			wantFollowUp: aggregateFoldClearParticipantRefoldBudget,
+			want: map[string][2]string{
+				stagingName:    {checkStatusCompleted, checkConclusionFailure},
+				productionName: {checkStatusCompleted, checkConclusionFailure},
+			},
+		},
+		{
+			name:         "no run lets both aggregates pass",
+			wantFollowUp: aggregateFoldClearParticipantRefoldBudget,
+			want: map[string][2]string{
+				stagingName:    {checkStatusCompleted, checkConclusionSuccess},
+				productionName: {checkStatusCompleted, checkConclusionSuccess},
+			},
+		},
+		{
+			name:         "unreadable run publishes nothing and re-folds",
+			readFails:    true,
+			wantFollowUp: aggregateFoldScheduleParticipantRefold,
+			wantError:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			const repo, headSHA = "octocat/hello-world", "abc123"
+			previous, current := tenantBSchemaDir+"/users.sql", "archive/users.sql"
+			files := []*gh.CommitFile{{Filename: new(current), PreviousFilename: new(previous), Status: new("renamed")}}
+			headEntries := []*gh.TreeEntry{{Path: new(current), Type: new("blob"), SHA: new("renamed-file")}}
+			mockLeaderPRHead(mux, headSHA)
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(files)
+			})
+			var defaultHoldsRename atomic.Bool
+			registerRepositoryTrees(t, mux, repositoryTreeFixture{
+				headSHA:     headSHA,
+				headEntries: headEntries,
+				baseEntries: func() []*gh.TreeEntry {
+					if defaultHoldsRename.Load() {
+						return []*gh.TreeEntry{{Path: new(current), Type: new("blob"), SHA: new("renamed-file")}}
+					}
+					return []*gh.TreeEntry{{Path: new(previous), Type: new("blob"), SHA: new("old-file")}}
+				},
+				defaultTip: func() string {
+					if defaultHoldsRename.Load() {
+						return "main-with-rename"
+					}
+					return "def456"
+				},
+			})
+			if tt.readFails {
+				mux.HandleFunc("GET /repos/octocat/hello-world/commits/", func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, "boom", http.StatusInternalServerError)
+				})
+			} else {
+				runs := map[string]map[string]any{}
+				for env, state := range tt.runs {
+					name := aggregateCheckNameForEnv(tenantBCheckName, env)
+					run := map[string]any{"id": 4001, "name": name, "app": map[string]any{"slug": trustedTenantAppSlug}}
+					maps.Copy(run, state)
+					runs[name] = run
+				}
+				mockParticipantCheckRuns(mux, runs)
+			}
+			checkRuns := captureLeaderCheckRuns(mux)
+
+			h := newLeaderHandler(t, svc, client)
+			installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
+			_, err := h.updateAggregateCheckOnce(t.Context(), installClient, repo, 1, headSHA)
+			require.NoError(t, err)
+			for _, name := range []string{stagingName, productionName} {
+				first := collectAggregate(t, checkRuns, name)
+				require.NotEqual(t, checkConclusionSuccess, first.Conclusion, "while the PR proposes the rename, tenant-b gates %s", name)
+			}
+			storedBefore := map[string]*storage.Check{}
+			for _, env := range []string{"staging", "production"} {
+				stored, err := svc.Storage().Checks().Get(t.Context(), repo, 1, env, aggregateSentinel, aggregateSentinel)
+				require.NoError(t, err)
+				require.NotNil(t, stored)
+				storedBefore[env] = stored
+			}
+
+			defaultHoldsRename.Store(true)
+			followUp, err := h.updateAggregateCheckOnce(t.Context(), installClient, repo, 1, headSHA)
+			assert.Equal(t, tt.wantFollowUp, followUp)
+			if tt.wantError {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "resolve participants for scoped aggregate leader")
+				assert.Empty(t, checkRuns, "no Check Run is published while tenant-b's run on the head is unreadable")
+				for env, stored := range storedBefore {
+					after, err := svc.Storage().Checks().Get(t.Context(), repo, 1, env, aggregateSentinel, aggregateSentinel)
+					require.NoError(t, err)
+					require.NotNil(t, after)
+					assert.Equal(t, stored.Status, after.Status, env)
+					assert.Equal(t, stored.Conclusion, after.Conclusion, env)
+				}
+				return
+			}
+			require.NoError(t, err)
+			got := map[string]checkRunCapture{}
+			for len(got) < len(tt.want) {
+				select {
+				case cr := <-checkRuns:
+					got[cr.Name] = cr
+				case <-time.After(webhookIntegrationCheckRunDeadline):
+					t.Fatalf("timed out waiting for both aggregates, got %v", got)
+				}
+			}
+			for name, want := range tt.want {
+				assert.Equal(t, want[0], got[name].Status, name)
+				assert.Equal(t, want[1], got[name].Conclusion, name)
+			}
+		})
+	}
+}
+
 // While the participant's Check Run is still in progress, the leader's
 // aggregate must stay in_progress (no conclusion), which blocks merge until the
 // participant reaches a terminal state.
