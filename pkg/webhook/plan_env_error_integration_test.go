@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -390,6 +391,91 @@ func TestE2ESourcePolicyRefusalHoldsAggregateOverOldSuccess(t *testing.T) {
 	aggregate := p.lastAggregate()
 	require.NotNil(t, aggregate, "the re-plan publishes the aggregate check run")
 	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion)
+}
+
+// A pull request's staging and production checks both passed on an earlier
+// plan. The database's source policy then stops authorizing the repository,
+// and a plan of production narrowed to one of its targets is refused. A
+// narrowed plan that fails for its own target leaves the environment's check
+// alone, but the source policy refuses the whole source, not the one target,
+// so the failing aggregate is posted with its block just as it is for a plan
+// of every target.
+func TestE2ESourcePolicyRefusalOfNarrowedPlanHoldsAggregate(t *testing.T) {
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	}, &planFailingTernClient{}, nil)
+	p.seedPassingChecks(t, "staging", "production")
+	dbConfig := p.handler.service.Config().Databases[p.dbName]
+	dbConfig.AllowedRepos = []string{"octocat/orders"}
+	p.handler.service.Config().Databases[p.dbName] = dbConfig
+
+	assert.Contains(t, p.comment(t, "schemabot plan -e production --target orders-001"), `repo "octocat/hello-world" is not authorized`)
+
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionSuccess, byEnv["production"].Conclusion, "no row is stored on behalf of the refused source")
+	aggregates := p.publishedAggregates()
+	require.NotEmpty(t, aggregates, "the failing aggregate check run is published")
+	assertNoPassingAggregate(t, aggregates, "the narrowed plan's source policy refusal")
+	p.assertAggregateBlocked(t, checkstate.BlockPlanRefusedBySourcePolicy)
+}
+
+// A deployment publishes one aggregate per allowed environment, and a pull
+// request's staging and production checks both passed on an earlier plan. The
+// only database serving production then stops authorizing the repository, so
+// production is no longer among the environments the deployment covers for
+// it. A plan of production is refused, and production's aggregate still fails
+// with the source policy block instead of keeping its earlier state. Once the
+// policy authorizes the repository again, a re-run of the check re-plans every
+// environment and passes production's aggregate.
+func TestE2ESourcePolicyRefusalBlocksEnvironmentAggregateTheRepoNoLongerCovers(t *testing.T) {
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	}, &planFailingTernClient{}, nil)
+	p.handler.service.Config().AllowedEnvironments = []string{"staging", "production"}
+	p.seedPassingChecks(t, "staging", "production")
+	setAllowedRepos := func(repos []string) {
+		dbConfig := p.handler.service.Config().Databases[p.dbName]
+		dbConfig.AllowedRepos = repos
+		p.handler.service.Config().Databases[p.dbName] = dbConfig
+	}
+
+	setAllowedRepos([]string{"octocat/orders"})
+	assert.Contains(t, p.comment(t, "schemabot plan -e production"), `repo "octocat/hello-world" is not authorized`)
+	p.assertEnvAggregate(t, "production", checkConclusionFailure, checkstate.BlockPlanRefusedBySourcePolicy)
+
+	setAllowedRepos(nil)
+	_, err := p.handler.runAutoPlanForPR(t.Context(), p.client, "octocat/hello-world", 1, "abc123", 0,
+		"check_run.rerequested", "check_run.rerequested", "", "")
+	require.NoError(t, err)
+	drainCtx, cancel := context.WithTimeout(t.Context(), webhookIntegrationPollDeadline)
+	defer cancel()
+	p.handler.DrainInProcessWebhookWork(drainCtx)
+	require.NoError(t, drainCtx.Err(), "the re-plan finishes")
+	p.assertEnvAggregate(t, "production", checkConclusionSuccess, "")
+	p.assertEnvAggregate(t, "staging", checkConclusionSuccess, "")
+}
+
+// A source policy refusal can carry a long schema directory, and a Check Run
+// summary is clamped to a fixed length. The step that lifts the block comes
+// first in the summary, so it stays readable however long the refusal is.
+func TestE2ESourcePolicyRefusalSummaryKeepsTheRecoveryStep(t *testing.T) {
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	}, &planFailingTernClient{}, nil)
+	refusal := `schema path "` + strings.Repeat("deeply/nested/", 60) + `orders" is not authorized for database "orders"`
+
+	p.handler.postSourcePolicyRefusal(t.Context(), p.client, "octocat/hello-world", 1, "abc123", map[string]string{"production": refusal})
+
+	aggregate := p.lastAggregate()
+	require.NotNil(t, aggregate, "the failing aggregate check run is published")
+	require.NotNil(t, aggregate.Output)
+	assert.Contains(t, aggregate.Output.Summary, "re-run this check or push a commit to re-plan every environment")
+	assert.Contains(t, aggregate.Output.Summary, `schema path "deeply/nested/`)
+	p.assertAggregateBlocked(t, checkstate.BlockPlanRefusedBySourcePolicy)
 }
 
 // A pull request's staging and production checks both passed on an earlier

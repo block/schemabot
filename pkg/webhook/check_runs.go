@@ -196,8 +196,8 @@ var planFailedUnrecordedBlock = checkBlockReason{
 // off the aggregate until auto-plan re-verifies the PR and durably invalidates
 // prior successful results. A re-plan the policy refuses again posts the block
 // again; one it authorizes stores replacement results that can pass the
-// aggregate. message is appended to the refusal, so the Check Run names the
-// step that lifts the block once the policy is fixed.
+// aggregate. message opens the Check Run summary, ahead of the refusal, so the
+// summary names the step that lifts the block once the policy is fixed.
 var sourcePolicyRefusedBlock = checkBlockReason{
 	blockingReason: checkstate.BlockPlanRefusedBySourcePolicy,
 	message:        "Once the source policy authorizes this pull request, re-run this check or push a commit to re-plan every environment.",
