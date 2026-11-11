@@ -85,12 +85,16 @@ written before the rename is issued, so a rename the server completes after a
 stop has abandoned it is still recognized on the replay. When that abandoned
 rename is still queued and lands ahead of the replay's own rename, the replay's
 rename finds no table; the drop succeeds only if every table it names is at a
-recorded copy that was not yet in `_pending_drops` when the replay checked the
-table, and fails otherwise. A copy that was already there holds an older table
-of the same name, not the one that just went missing. Any other missing table
-still fails unless the statement says `IF EXISTS`, and a recorded copy that
-retention has since removed fails too: the drop is final, and the message says
-so and asks for the schema change to be planned again against the live schema.
+recorded copy that arrived in `_pending_drops` after the replay saw the table on
+the target and then noted the copies already there, and fails otherwise. A copy
+that was already there holds an older table of the same name, not the one that
+just went missing. The copies are read after the table is seen, so a copy that
+arrives between the two reads is treated as already there: the drop fails, and
+the next replay finds the table gone and its copy recorded and skips it. Any
+other missing table still fails unless the statement says `IF EXISTS`, and a
+recorded copy that retention has since removed fails too: the drop is final,
+and the message says so and asks for the schema change to be planned again
+against the live schema.
 
 **Cancelling a schema change quarantines its copy too.** A cancelled change
 leaves a shadow table holding every row copied so far, and — if its cutover had already

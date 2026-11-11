@@ -458,4 +458,18 @@ func TestLocalClient_ResumeWhileAbandonedRenameQueuedQuarantinesEachTableOnce(t 
 		"the resume overtaken by the abandoned RENAME must find the table in pending drops and complete, got %s (error: %s)",
 		resumed.State, resumed.ErrorMessage)
 	s.requirePendingDropReplayConverged(t, second)
+
+	// The apply log is where an operator learns, in the same drive, which
+	// pending drops table holds the rows of the table the abandoned RENAME
+	// moved.
+	var abandonedCopy string
+	for name := range quarantinedCopies(t, s.dsn, "replay_b_sessions") {
+		abandonedCopy = name
+	}
+	logs, err := s.stor.ApplyLogs().GetByApply(ctx, s.apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs, fmt.Sprintf(
+		"[replay_b_sessions] table `testdb`.`replay_b_sessions` already quarantined as `%s`.`%s` earlier in this schema change; recoverable until the pending drops retention period expires",
+		pendingdrops.Database, abandonedCopy)),
+		"the apply log must name the pending drops copy of replay_b_sessions exactly once")
 }

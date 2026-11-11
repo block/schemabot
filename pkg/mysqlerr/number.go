@@ -7,6 +7,10 @@ import (
 	"github.com/block/mysql"
 )
 
+// NoSuchTable is ER_NO_SUCH_TABLE, the code the server returns for a statement
+// that names a table that does not exist.
+const NoSuchTable uint16 = 1146
+
 // Number reports the MySQL server error code carried by err.
 //
 // It exists so no call site asserts a driver's error type directly. SchemaBot
