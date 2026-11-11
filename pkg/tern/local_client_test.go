@@ -719,6 +719,10 @@ type fakeControlEngine struct {
 	skipRevertResult        *engine.ControlResult
 	skipRevertNoResult      bool
 	externallyAuthoritative bool
+	// duringRevertWindowControl runs while the engine is answering a revert or
+	// skip-revert, standing in for whatever else happens to the apply's
+	// storage before the answer comes back.
+	duringRevertWindowControl func()
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
@@ -787,6 +791,9 @@ func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*e
 
 func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.revertCount++
+	if e.duringRevertWindowControl != nil {
+		e.duringRevertWindowControl()
+	}
 	if e.revertErr != nil {
 		return nil, e.revertErr
 	}
@@ -801,6 +808,9 @@ func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*en
 
 func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.skipRevertCount++
+	if e.duringRevertWindowControl != nil {
+		e.duringRevertWindowControl()
+	}
 	if e.skipRevertErr != nil {
 		return nil, e.skipRevertErr
 	}
@@ -5246,6 +5256,71 @@ func TestHandleAtomicProgressTickFailsRefusedQueuedRevert(t *testing.T) {
 			assert.False(t, f.tick(t))
 			assert.Equal(t, 1, f.eng.revertCount, "a failed request is not sent again")
 			assert.False(t, f.ps.revertTriggered)
+		})
+	}
+}
+
+// An engine's refusal answers the one command it was sent. While the engine is
+// still answering an operator's queued revert or skip-revert, the API fails
+// that command on its own attempt and the operator sends it again, which
+// re-arms the same request row for the newer command. The refusal that then
+// comes back belongs to the older command: the newer one stays pending with no
+// reason recorded against it, no rejection lands on the timeline, and the next
+// tick sends it to the engine, which carries it out.
+func TestHandleAtomicProgressTickLeavesNewerRevertWindowCommandPending(t *testing.T) {
+	const refusal = "deploy request #7 is locked by another operation"
+	for _, tc := range []struct {
+		name      string
+		operation storage.ControlOperation
+		refuse    func(eng *fakeControlEngine)
+		accept    func(eng *fakeControlEngine)
+		sent      func(eng *fakeControlEngine) int
+	}{
+		{
+			name:      "revert",
+			operation: storage.ControlOperationRevert,
+			refuse:    func(eng *fakeControlEngine) { eng.revertResult = &engine.ControlResult{Message: refusal} },
+			accept:    func(eng *fakeControlEngine) { eng.revertResult = nil },
+			sent:      func(eng *fakeControlEngine) int { return eng.revertCount },
+		},
+		{
+			name:      "skip-revert",
+			operation: storage.ControlOperationSkipRevert,
+			refuse:    func(eng *fakeControlEngine) { eng.skipRevertResult = &engine.ControlResult{Message: refusal} },
+			accept:    func(eng *fakeControlEngine) { eng.skipRevertResult = nil },
+			sent:      func(eng *fakeControlEngine) int { return eng.skipRevertCount },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(storage.ApplyOptions{})
+			f.ps.stateEnteredAt = time.Now() // the window is still open, so only the queued request acts on it
+			f.recordControlRequest(tc.operation, storage.ControlRequestPending)
+			f.controlRequests.requests[0].ID = 41
+			tc.refuse(f.eng)
+			f.eng.duringRevertWindowControl = func() {
+				f.eng.duringRevertWindowControl = nil
+				require.NoError(t, f.controlRequests.FailPending(t.Context(), f.apply.ID, tc.operation, "the engine refused the API's own attempt"))
+				_, alreadyPending, err := f.controlRequests.RequestPending(t.Context(), &storage.ApplyControlRequest{
+					ApplyID:     f.apply.ID,
+					Operation:   tc.operation,
+					RequestedBy: "second-operator",
+				})
+				require.NoError(t, err)
+				require.False(t, alreadyPending, "the second command re-arms the settled row")
+			}
+
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 1, tc.sent(f.eng))
+			req := f.controlRequest(t, tc.operation)
+			assert.Equal(t, storage.ControlRequestPending, req.Status, "the refusal answers the command the engine was sent, not the one recorded after it")
+			assert.Empty(t, req.ErrorMessage)
+			assert.Equal(t, "second-operator", req.RequestedBy)
+			assert.False(t, hasLogMessageContaining(f.logs.logs, "request rejected"), "no rejection is recorded against a command the engine never saw")
+
+			tc.accept(f.eng)
+			f.tick(t)
+			assert.Equal(t, 2, tc.sent(f.eng), "the next tick sends the newer command")
+			assert.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, tc.operation))
 		})
 	}
 }

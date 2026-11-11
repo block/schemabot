@@ -1482,22 +1482,21 @@ func (c *LocalClient) stopStandsDownUnlessStartPending(ctx context.Context, logg
 // the caller applies its normal error handling. When declined=true the
 // operation did not take effect: a stop or cancel caller must keep its drive
 // going, or the drive loop would mark the still-running apply stopped.
+//
+// The decline answers controlReq, the command the engine was sent, and no
+// other: see failEngineAnsweredControlRequest.
 func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	unsupported, ok := engine.AsUnsupportedOperation(opErr)
 	if !ok {
 		return false, nil
 	}
-	message := unsupported.Error()
-	caller := controlRequestCaller(controlReq)
-	logger.Warn("rejecting pending control request: the engine does not support the operation; the schema change continues and settles on its own",
-		"operation", string(operation),
-		"requested_by", caller,
-		"state", apply.State,
-		"error", opErr)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
-	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
-		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	answered, err := c.failEngineAnsweredControlRequest(ctx, logger, apply, operation, eventType, controlReq, unsupported.Error(), opErr,
+		"rejecting pending control request: the engine does not support the operation; the schema change continues and settles on its own")
+	if err != nil {
+		return true, err
+	}
+	if !answered {
+		return true, nil
 	}
 	engineName := "unknown"
 	if eng := c.getEngine(); eng != nil {
@@ -1520,23 +1519,49 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 // drive loop would record the operator's command over the engine's outcome. A
 // revert-window control the engine answered without accepting reaches here as
 // the same typed refusal, and resolves the same way.
+//
+// The refusal answers controlReq, the command the engine was sent, and no
+// other: see failEngineAnsweredControlRequest.
 func (c *LocalClient) failPendingRequestForSettledOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	refusal, ok := engine.AsSettledOutcome(opErr)
 	if !ok {
 		return false, nil
 	}
-	message := refusal.Error()
+	_, err := c.failEngineAnsweredControlRequest(ctx, logger, apply, operation, eventType, controlReq, refusal.Error(), opErr,
+		"rejecting pending control request: the engine refused it for this schema change; the drive keeps going and records the outcome the engine reports")
+	return true, err
+}
+
+// failEngineAnsweredControlRequest fails controlReq with the reason the engine
+// gave for refusing it, and records the rejection on the apply's timeline.
+//
+// The engine's answer belongs to the one command it was sent. The API settles
+// a request on its own immediate attempt, and the row is re-armed in place for
+// the operator's next command of the same operation, so by the time the engine
+// answers, the row can carry a newer command the engine never saw. The request
+// is therefore failed only while its row still carries the command this drive
+// sent, and the rejection is logged and put on the timeline only when it was:
+// a newer command stays pending for the next drive tick to send, with no
+// rejection recorded against it. answered reports whether controlReq was the
+// command failed here.
+func (c *LocalClient) failEngineAnsweredControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, message string, opErr error, rejection string) (answered bool, err error) {
+	answered, err = settleControlRequestRevisionIfCurrent(ctx, c.storage, logger, apply, controlReq, storage.ControlRequestFailed, message)
+	if err != nil {
+		return false, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	}
+	if !answered {
+		// settleControlRequestRevisionIfCurrent logged that the row had already
+		// been settled or re-armed.
+		return false, nil
+	}
 	caller := controlRequestCaller(controlReq)
-	logger.Warn("rejecting pending control request: the engine refused it for this schema change; the drive keeps going and records the outcome the engine reports",
+	logger.Warn(rejection,
 		"operation", string(operation),
 		"requested_by", caller,
 		"state", apply.State,
 		"error", opErr)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
-	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
-		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
-	}
 	return true, nil
 }
 
