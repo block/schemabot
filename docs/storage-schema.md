@@ -383,6 +383,7 @@ not, so a maintenance script keyed on the status gets them right:
 | a destructive statement was not permitted, so nothing ran | non-zero |
 | a change needs manual remediation, so nothing ran | non-zero |
 | the target could not be read, or the DDL failed | non-zero |
+| ended by Ctrl-C or SIGTERM during the convergence | `130` |
 
 Both non-zero refusals mean the same thing: nothing converged, and a person has
 to decide something before anything does. A script keyed on the status can
