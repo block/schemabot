@@ -908,8 +908,10 @@ func (c *LocalClient) heartbeatDriveLease(ctx context.Context, apply *storage.Ap
 // the next tick — until they have persisted for the full
 // storage.ApplyLeaseStaleAfter window, at which point the lease is presumed
 // lost (a peer operator can already have reclaimed the stale row) and the drive
-// is cancelled the same way. Returns a cancel function that stops the
-// heartbeat. Must be deferred by the caller.
+// is cancelled the same way. Each write runs under its own deadline
+// (storage.HeartbeatLeaseAttempt), so a write that hangs counts as a failure
+// toward that window instead of stalling the check behind it. Returns a cancel
+// function that stops the heartbeat. Must be deferred by the caller.
 func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply, cancelApply ...context.CancelFunc) context.CancelFunc {
 	hbCtx, cancel := context.WithCancel(ctx)
 	stopDrive := func() {
@@ -930,9 +932,12 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				err := c.heartbeatDriveLease(hbCtx, apply)
+				attemptStart := time.Now()
+				err := storage.HeartbeatLeaseAttempt(hbCtx, attemptStart, lastSuccess, func(ctx context.Context) error {
+					return c.heartbeatDriveLease(ctx, apply)
+				})
 				if err == nil {
-					lastSuccess = time.Now()
+					lastSuccess = attemptStart
 					continue
 				}
 				if hbCtx.Err() != nil {
@@ -954,10 +959,11 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 // reports whether the driver must stop driving: either storage reported the
 // lease definitively lost, or heartbeat failures have persisted since
 // lastSuccess for the full lease staleness window, so a peer operator can
-// already have reclaimed the stale row. A transient failure inside the window
-// keeps the drive running and is retried on the next tick. operationScoped
-// names which claim went stale in the logs — the two are reclaimed by different
-// paths, so an operator triaging a displaced drive needs to know which.
+// already have reclaimed the stale row. A transient failure inside the window,
+// including a write that timed out, keeps the drive running and is retried on
+// the next tick. operationScoped names which claim went stale in the logs — the
+// two are reclaimed by different paths, so an operator triaging a displaced
+// drive needs to know which.
 func (c *LocalClient) applyHeartbeatFailureStopsDrive(ctx context.Context, apply *storage.Apply, hbErr error, lastSuccess time.Time, operationScoped bool) bool {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	logger = logger.With("heartbeat_scope", heartbeatScopeName(operationScoped))
@@ -972,6 +978,11 @@ func (c *LocalClient) applyHeartbeatFailureStopsDrive(ctx context.Context, apply
 			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_presumed_lost")
 		return true
+	}
+	if errors.Is(hbErr, storage.ErrLeaseHeartbeatTimedOut) {
+		logger.Warn("heartbeat attempt timed out; it counts as a failed heartbeat toward the lease staleness window and will be retried",
+			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		return false
 	}
 	logger.Warn("heartbeat failed; will retry", append(apply.MutableLogAttrs(), "error", hbErr)...)
 	return false

@@ -631,9 +631,11 @@ ESC detach • s stop
 
 The live view refreshes until completion or a state that needs your decision.
 It includes rows copied, ETA when available, and the reason for throttling.
-Press **Esc** to detach while copying; the apply keeps running. **s** requests
-a stop for this MySQL example. At deferred cutover, **Enter** requests the
-swap. During cutover, the watcher asks you to wait and disables Esc/stop.
+Press **Esc** to detach while copying; the apply keeps running and the
+command exits 130, the status that tells a script the watch ended without an
+outcome. **s** requests a stop for this MySQL example. At deferred cutover,
+**Enter** requests the swap. During cutover, the watcher asks you to wait and
+disables Esc/stop.
 
 For progress bar colors, phase labels, and keyboard controls, see the
 [progress display reference](#progress-display-reference).
@@ -1329,8 +1331,10 @@ reaches a final state. It exits 0 only when the apply completed, and non-zero
 when it was stopped, failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. For a stopped apply the error
 names the `start` command that resumes it. The interactive watcher follows
-the same exit rule once the apply ends, and exits 0 when you detach with Esc
-while the apply is still running. A watcher that cannot reach the server
+the same exit rule once the apply ends, and exits 130, the status a Ctrl-C
+ends a log watch with, when you leave it while the apply is still running:
+with Esc, q, or Ctrl-C, with a SIGINT or SIGTERM sent to the process, or
+before its first poll has answered. A watcher that cannot reach the server
 retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
@@ -1340,7 +1344,10 @@ pasting it reaches the same server. When a refused poll
 carries a `Retry-After` header, as a proxy or rate limiter in front of
 SchemaBot may send, a watcher waits at least that long before polling again,
 up to 5 minutes per poll, so a watcher held off this way takes longer to give
-up.
+up. When the header asked for more than that, the retry line says so, for
+example `retrying in 5m0s (server asked for 1h0m0s, capped)`, and the `-o log`
+retry line carries the asked-for delay as `retry_capped_from`; a delay past a
+day is given only as `more than 24h`.
 
 A single Ctrl-C or SIGTERM ends only the watch. The command prints a notice to
 stderr saying the apply continues and how to watch it again with `progress`,

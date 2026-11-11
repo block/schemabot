@@ -871,7 +871,10 @@ type replanResult struct {
 // whose own statement already landed, are marked completed. Remaining tasks get
 // their DDL updated from the re-plan result. A task a previous drive failed
 // permanently is neither settled nor re-planned: it stays active as stored for
-// the drive to read as the apply's verdict. Used by the resume paths that pick
+// the drive to read as the apply's verdict. A task whose change landed but
+// whose engine accepted work the resume must reattach to
+// (taskReattachesToAcceptedWork) is not settled either: it stays active as
+// stored, and engine progress decides its outcome. Used by the resume paths that pick
 // up an apply whose tables may have completed before a stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
 	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
@@ -947,6 +950,15 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 		}
 		replanned := replanDDL[replanKey]
 		if verdict == replanChangeLanded {
+			reattach, err := c.taskReattachesToAcceptedWork(ctx, task)
+			if err != nil {
+				return nil, err
+			}
+			if reattach {
+				c.keepAcceptedWorkTaskActive(task)
+				activeTasks = append(activeTasks, task)
+				continue
+			}
 			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
 			// this shard's live schema. A table dropping out of that diff means
 			// live already matches the reviewed target, so there is no remaining
@@ -990,6 +1002,15 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 				continue
 			}
 			if landed {
+				reattach, err := c.taskReattachesToAcceptedWork(ctx, task)
+				if err != nil {
+					return nil, err
+				}
+				if reattach {
+					c.keepAcceptedWorkTaskActive(task)
+					activeTasks = append(activeTasks, task)
+					continue
+				}
 				// The table is still in the diff, but only for the reviewed
 				// DDL of siblings that will still run it: this task's own
 				// statement executed before its outcome was recorded. Settle
@@ -1033,6 +1054,67 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 // revert already landed.
 func taskInRevertPhase(task *storage.Task) bool {
 	return state.IsState(task.State, state.Task.RevertWindow, state.Task.Reverting)
+}
+
+// taskReattachesToAcceptedWork reports whether a resume must reattach to
+// engine work the task's stored resume state names, instead of settling the
+// task from a schema comparison. It holds for a non-terminal task on an engine
+// whose recovery reattaches to accepted work (recoveryReattachesToAcceptedWork)
+// when the task's operation has persisted resume state recording a deploy
+// request: the engine handed the work to the provider, and it keeps running
+// there whatever this drive concludes.
+//
+// The signal is the recorded deploy request, not a cutover. The engine records
+// the request's ID before the provider has finished computing its diff, so the
+// row also names a request that was never deployed. That is safe to reattach
+// to: the engine's resume reads the provider's own state for the request and
+// handles each one it can be in, so the engine-reported state decides the
+// task's outcome, never the stored row.
+//
+// After an accepted cutover the live schema matches the reviewed target, so a
+// schema match cannot tell a finished change from one whose revert window is
+// open. The task states that would say so are not reliable here: the polls
+// that record the revert window can fail and pause the apply, which rewrites
+// the tasks as failed_retryable, and a crashed drive leaves them cutting_over.
+// Settling such a task completed would finish the apply with its revert
+// window never offered. Keeping it active lets the resume reattach to the
+// deploy request, and engine progress decides the task's terminal state.
+//
+// The deploy request is read from the PlanetScale resume blob through
+// psMetadataForStorage, the projection tern already reads that blob through
+// for display and revert deadlines; only the Vitess database type reaches the
+// read. A storage read failure and an undecodable blob are errors marked
+// errGroupedResumeStateUnavailable, so the resume fails rather than settles a
+// task whose engine work it cannot rule out, and the drive exits without
+// recording a terminal state: the re-plan runs again inside the grouped
+// launch, where an unmarked error would fail the apply permanently and
+// abandon the accepted deploy request.
+func (c *LocalClient) taskReattachesToAcceptedWork(ctx context.Context, task *storage.Task) (bool, error) {
+	if !recoveryReattachesToAcceptedWork(c.config.Type) {
+		return false, nil
+	}
+	if state.IsTerminalTaskState(task.State) {
+		return false, nil
+	}
+	stored, err := c.loadStoredEngineResumeState(ctx, task, "resume re-plan settlement")
+	if err != nil {
+		return false, fmt.Errorf("%w: load engine resume state before settling task %s from the resume re-plan: %w", errGroupedResumeStateUnavailable, task.TaskIdentifier, err)
+	}
+	if stored == nil {
+		return false, nil
+	}
+	meta, err := decodePSMetadataForStorage(stored.Metadata)
+	if err != nil {
+		return false, fmt.Errorf("%w: decode engine resume state before settling task %s from the resume re-plan: %w", errGroupedResumeStateUnavailable, task.TaskIdentifier, err)
+	}
+	return meta != nil && meta.DeployRequestID != 0, nil
+}
+
+// keepAcceptedWorkTaskActive logs why a task the resume re-plan would have
+// settled stays active instead: taskReattachesToAcceptedWork holds for it.
+func (c *LocalClient) keepAcceptedWorkTaskActive(task *storage.Task) {
+	c.logger.Info("keeping task active through resume re-plan although the re-plan finds its change landed: its stored resume state records a deploy request, so the resume reattaches to it and engine progress decides its terminal state",
+		task.LogAttrs()...)
 }
 
 // applyInRevertPhase reports whether the apply dwells in an engine-monitored
@@ -2095,13 +2177,17 @@ func finalizerNamespaceFromKey(operationKey, target string, targetQualified bool
 //
 // A failure ends the operation one of two ways. A permanent engine error, a
 // rejected apply, a permanent progress poll failure, or a non-success terminal
-// state fails it for good. An error retrying can cure, whether a storage read
-// or a retryable engine error, pauses it as failed_retryable with the error
-// recorded: the claim re-drives it under the parent apply's retry budget, and
-// the re-drive is safe because the VSchema apply is idempotent and a stored
-// handoff makes it reattach to work already in flight. When the engine refused
-// the work outright, the drive withdraws the handoff it wrote, so the re-drive
-// starts fresh and honors a cancel or stop the operator issued in between.
+// state fails it for good, and the drive returns that cause. An error retrying
+// can cure, whether a storage read or a retryable engine error, pauses it as
+// failed_retryable with the error recorded: the claim re-drives it under the
+// parent apply's retry budget, and the re-drive is safe because the VSchema
+// apply is idempotent and a stored handoff makes it reattach to work already
+// in flight. A stored pause ends the drive without an error, the way a work
+// operation's pause does: the operation row carries the reason and the parent
+// projection surfaces it, so the operator records the drive as resumed rather
+// than as a resume failure. When the engine refused the work outright, the
+// drive withdraws the handoff it wrote, so the re-drive starts fresh and honors
+// a cancel or stop the operator issued in between.
 func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation) error {
 	planID, err := storage.PlanIDForOperation(apply, op)
 	if err != nil {
@@ -2146,6 +2232,13 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	// that was cancelled records neither: its error describes the driver, not
 	// the VSchema work, and the driver that reclaims the row decides its outcome.
 	//
+	// What the drive returns follows what was recorded, not what went wrong. A
+	// stored pause returns nil: the pause is the drive's outcome, the row carries
+	// the cause, and the operator reads the drive as resumed, as it does a work
+	// operation that paused its tasks. A permanent failure returns its cause,
+	// and so does a pause storage refused, since the row then still reads active
+	// and only the error says why the drive ended.
+	//
 	// withdrawHandoff withdraws this drive's own handoff record alongside the
 	// pause, for a cause that proves the engine refused the work: nothing is
 	// live, so the re-drive must read the row as never handed to the engine and
@@ -2174,7 +2267,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 			}
 			c.logger.Warn("group_finalizer paused for retry; the parent apply's retry budget bounds the re-claims",
 				append(append(op.LogAttrs(), apply.IdentityLogAttrs()...), "error", cause)...)
-			return cause
+			return nil
 		}
 		if markErr := c.storage.ApplyOperations().MarkFailed(ctx, op.ID, cause.Error()); markErr != nil {
 			c.logger.Error("group_finalizer: failed to mark operation failed",

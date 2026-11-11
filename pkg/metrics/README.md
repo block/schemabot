@@ -179,7 +179,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_branch_rules`, `get_combined_status`, `get_pull_request_review_protection`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_branch_rules`, `get_combined_status`, `get_pull_request_review_protection`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
@@ -402,7 +402,9 @@ When a dispatch's idempotency key already maps to an apply, the data plane
 resolves the dispatch by its derived operation key: a matching operation row is
 an idempotent replay (counted on `schemabot.remote_apply_dedup_total`, with
 `outcome` naming the path that resolved the key — `hit`, `conflict_race`,
-`create_race`, or `key_collision_refused`), and a missing row attaches the
+`create_race`, or `key_collision_refused`; `create_race` covers a winner found
+at the create itself and one found after this dispatch's drift check failed
+because the winner had already run the change), and a missing row attaches the
 dispatch as a new sibling
 operation, counted on `schemabot.remote_apply_attach_total`:
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -466,8 +467,13 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 	data.Tables[0].Throttled = true
 	data.Tables[0].ThrottleReason = "signal_a 1_000ms >= `500ms` [gradual]"
 	escaped := RenderApplyStatusComment(data)
-	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal\\_a 1\\_000ms >= \\`500ms\\` \\[gradual\\]_",
-		"markdown delimiters in an unrecognized reason are escaped and render with no tip")
+	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal_a 1_000ms >= \\`500ms\\` \\[gradual\\]_",
+		"markdown delimiters in an unrecognized reason are escaped and render with no tip; an underscore inside a word cannot end the italic span, so it is left as written")
+
+	data.Tables[0].ThrottleReason = "lag_ held by @octocat and &#64;hubot"
+	mention := RenderApplyStatusComment(data)
+	assert.Contains(t, mention, "- ℹ️ _Throttled: lag\\_ held by `@octocat` and \\&#64;hubot_",
+		"a mention in the reason reads as code and a character reference as text, so neither notifies anyone; an underscore that ends a word is escaped so it cannot close the italic span")
 }
 
 // A throttled checksum verify carries the same header annotation and tooltip
@@ -498,7 +504,6 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		name                string
 		databaseType        string
 		changes             []UnsafeChangeData
-		wantActionTarget    string
 		wantInvisibleTarget string
 		wantQueryTarget     string
 		wantOK              bool
@@ -508,7 +513,6 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
-			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
 			wantQueryTarget:     "it",
 			wantOK:              true,
@@ -519,7 +523,6 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: `statement removes live structure from table "customers"`, DDL: `DROP INDEX "idx_customers_email"`},
 			},
-			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
 			wantQueryTarget:     "it",
 			wantOK:              true,
@@ -529,7 +532,6 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_phone`\""},
 			},
-			wantActionTarget:    "indexes",
 			wantInvisibleTarget: "any dropped indexes",
 			wantQueryTarget:     "them",
 			wantOK:              true,
@@ -539,7 +541,6 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
-			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
 			wantQueryTarget:     "it",
 			wantOK:              true,
@@ -559,10 +560,9 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 			if databaseType == "" {
 				databaseType = "mysql"
 			}
-			gotActionTarget, gotInvisibleTarget, gotQueryTarget, ok := unsafeDropIndexUsageTargets(countUnsafeDrops(tt.changes, databaseType))
+			gotInvisibleTarget, gotQueryTarget, ok := unsafeDropIndexUsageTargets(countUnsafeDrops(tt.changes, databaseType))
 
 			assert.Equal(t, tt.wantOK, ok)
-			assert.Equal(t, tt.wantActionTarget, gotActionTarget)
 			assert.Equal(t, tt.wantInvisibleTarget, gotInvisibleTarget)
 			assert.Equal(t, tt.wantQueryTarget, gotQueryTarget)
 		})
@@ -589,8 +589,12 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, rendered, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.")
-	assert.Contains(t, rendered, "Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.")
+	assert.Contains(t, rendered, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n"+
+		"1. Deploy application code that no longer reads from or writes to the dropped column.\n"+
+		"2. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.\n"+
+		"3. Add `--allow-unsafe` to confirm 2 unsafe changes on `customers`:\n"+
+		"   ```\n   schemabot apply -e staging\n   ```\n")
+	assert.NotContains(t, rendered, glyph.Tip+" Before allowing", "the steps lead into the command, not a tip of their own")
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
 }
 
@@ -648,7 +652,7 @@ func TestRenderUnsafeChangesBlockedClassifiesPostgresDropsFromDDL(t *testing.T) 
 		},
 	})
 
-	assert.Contains(t, rendered, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to any dropped columns.")
+	assert.Contains(t, rendered, "1. Deploy application code that no longer reads from or writes to any dropped columns.\n")
 	assert.NotContains(t, rendered, "the dropped column.")
 }
 
@@ -672,8 +676,7 @@ func TestRenderUnsafeChangesBlockedUsesPluralMySQLDropIndexGuidance(t *testing.T
 		},
 	})
 
-	assert.Contains(t, rendered, "Before dropping indexes in MySQL, first make any dropped indexes invisible and verify application queries no longer rely on them for safe performance.")
-	assert.NotContains(t, rendered, "Before dropping an index in MySQL, first make any dropped indexes invisible")
+	assert.Contains(t, rendered, "1. Make any dropped indexes invisible, then verify application queries no longer rely on them for safe performance.\n")
 }
 
 func TestRenderUnsafeChangesBlockedDoesNotMentionInvisibleIndexesForVitess(t *testing.T) {
@@ -695,7 +698,7 @@ func TestRenderUnsafeChangesBlockedDoesNotMentionInvisibleIndexesForVitess(t *te
 		},
 	})
 
-	assert.Contains(t, rendered, "Before allowing a destructive drop, verify application queries no longer rely on the dropped index for safe performance.")
+	assert.Contains(t, rendered, "1. Verify application queries no longer rely on the dropped index for safe performance.\n")
 	assert.NotContains(t, rendered, "invisible")
 }
 
@@ -2022,6 +2025,15 @@ func TestPreviewCommentApplyWaitingForCutover(t *testing.T) {
 	result := PreviewCommentApplyWaitingForCutover()
 
 	assert.Contains(t, result, "Waiting for Cutover")
+	assert.Contains(t, result, "schemabot cutover")
+}
+
+func TestPreviewCommentApplyWaitingForCutoverFirstLanded(t *testing.T) {
+	result := PreviewCommentApplyWaitingForCutoverFirstLanded()
+
+	assert.Contains(t, result, "Waiting for Cutover")
+	assert.Contains(t, result, "**2/2** table(s) ready for cutover\n")
+	assert.NotContains(t, result, "waiting on")
 	assert.Contains(t, result, "schemabot cutover")
 }
 

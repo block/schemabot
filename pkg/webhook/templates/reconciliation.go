@@ -35,7 +35,7 @@ func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 	var sb strings.Builder
 	sb.WriteString("## " + glyph.Info + " No Schema Files Changed\n\n")
 	if data.Environment != "" {
-		fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", data.Environment)
+		fmt.Fprintf(&sb, "**Environment**: %s\n\n", inlineCode(data.Environment))
 	}
 	writeRequestedLine(&sb, data.RequestedBy, data.Timestamp)
 	sb.WriteString("\nSchemaBot found no changes to managed schema files in this PR and no apply-owned state that requires live database reconciliation.\n")
@@ -102,12 +102,12 @@ func RenderSchemaChangeReconciliationRequired(data SchemaChangeReconciliationDat
 func writeReconciliationMetadata(sb *strings.Builder, items []SchemaChangeReconciliationItem) {
 	if len(items) == 1 {
 		item := items[0]
-		parts := []string{fmt.Sprintf("**Database**: `%s`", item.Database)}
+		parts := []string{"**Database**: " + inlineCode(item.Database)}
 		if item.Environment != "" {
-			parts = append(parts, fmt.Sprintf("**Environment**: `%s`", item.Environment))
+			parts = append(parts, "**Environment**: "+inlineCode(item.Environment))
 		}
 		if item.ApplyID != "" {
-			parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", item.ApplyID))
+			parts = append(parts, "**Apply ID**: "+inlineCode(item.ApplyID))
 		}
 		fmt.Fprintf(sb, "%s\n\n", strings.Join(parts, " | "))
 		return
@@ -124,7 +124,7 @@ func writeReconciliationMetadata(sb *strings.Builder, items []SchemaChangeReconc
 		if state == "" {
 			state = "unknown"
 		}
-		fmt.Fprintf(sb, "| `%s` | `%s` | `%s` | `%s` |\n", item.Database, item.Environment, applyID, state)
+		fmt.Fprintf(sb, "| %s | %s | %s | %s |\n", inlineCodeCell(item.Database), inlineCodeCell(item.Environment), inlineCodeCell(applyID), inlineCodeCell(state))
 	}
 	sb.WriteString("\n")
 }
@@ -189,9 +189,9 @@ func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	if !ok {
 		return appendTenantFlag("schemabot plan -e <environment> -d <database>", tenant)
 	}
-	cmd := fmt.Sprintf("schemabot plan -e %s", item.Environment)
+	cmd := fmt.Sprintf("schemabot plan -e %s", flattenIdentifier(item.Environment))
 	if item.Database != "" {
-		cmd += fmt.Sprintf(" -d %s", item.Database)
+		cmd += fmt.Sprintf(" -d %s", flattenIdentifier(item.Database))
 	}
 	return appendTenantFlag(cmd, tenant)
 }
@@ -201,7 +201,7 @@ func stopCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	if !ok || item.ApplyID == "" {
 		return appendTenantFlag("schemabot stop <apply-id> -e <environment>", tenant)
 	}
-	return appendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", item.ApplyID, item.Environment), tenant)
+	return appendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", flattenIdentifier(item.ApplyID), flattenIdentifier(item.Environment)), tenant)
 }
 
 func rollbackCommand(tenant string, items []SchemaChangeReconciliationItem) string {
@@ -209,7 +209,7 @@ func rollbackCommand(tenant string, items []SchemaChangeReconciliationItem) stri
 	if !ok || item.ApplyID == "" {
 		return appendTenantFlag("schemabot rollback <apply-id> -e <environment>", tenant)
 	}
-	return appendTenantFlag(fmt.Sprintf("schemabot rollback %s -e %s", item.ApplyID, item.Environment), tenant)
+	return appendTenantFlag(fmt.Sprintf("schemabot rollback %s -e %s", flattenIdentifier(item.ApplyID), flattenIdentifier(item.Environment)), tenant)
 }
 
 func singleCommandItem(items []SchemaChangeReconciliationItem) (SchemaChangeReconciliationItem, bool) {

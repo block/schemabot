@@ -165,7 +165,7 @@ func RenderPRCommandDatabaseNotConfigured(data ActorAuthorizationCommentData) st
 	sb.WriteString("## SchemaBot Command Not Authorized\n\n")
 	writeDBEnvLine(&sb, data.Database, data.Environment)
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database `%s` is not configured on this SchemaBot instance.\n\n", data.CommandName, data.Database)
+	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database %s is not configured on this SchemaBot instance.\n\n", data.CommandName, inlineCode(data.Database))
 	sb.WriteString("Verify the database name, or run the command against the SchemaBot instance that manages this database.\n")
 
 	return offerSupportChannel(sb.String())
@@ -263,20 +263,16 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 
 // writeUnsafeChangesRejection writes the refusal for a command that would run
 // unsafe changes without `--allow-unsafe`: the heading names what was
-// rejected, each unsafe change is listed, and the comment ends in the command
-// to re-run. Like the plan's apply instruction, the consent requirement leads
+// rejected, each unsafe change is listed, and the comment ends in the steps
+// that make any destructive drop safe and the command to re-run. Like the plan's apply instruction, the consent requirement leads
 // into the command and the flag stays out of the pasteable command, so
 // consenting to destroy data takes typing it.
 func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
 	sb.WriteString("---\n\n")
-	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
-	fmt.Fprintf(sb, "**"+glyph.Refused+" %s**: %d unsafe %s detected\n", rejected, unsafeCount, pluralize("change", unsafeCount))
-	item := 0
-	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, "")
-	}
+	drops, rest := splitDestructiveDrops(data.UnsafeChanges, data.DatabaseType)
+	fmt.Fprintf(sb, "**%s %s**: %s\n", glyph.Refused, rejected, unsafeCountPhrase(drops, rest))
+	writeUnsafeFindingList(sb, drops, rest, nil)
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
 
 	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
 	// is consent to destroy the data, and whether the change is this pull
@@ -285,13 +281,8 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 		writeAttributedChanges(sb, data.AttributedChanges)
 	}
 
-	consent := unsafeConsent{
-		findings:    unsafeCount,
-		tables:      unsafeChangeTables(data.UnsafeChanges),
-		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
-	}
-	fmt.Fprintf(sb, "**%s To proceed with these destructive changes**, %s:\n", glyph.Escalation, consent.instruction())
-	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+	consent := newUnsafeConsent(data.UnsafeChanges, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift))
+	writeUnsafeConsentCommand(sb, fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation), consent, command)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an

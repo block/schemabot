@@ -75,6 +75,20 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanWhoCanApply renders a sample auto-plan on a deployment
+// that turns on PR command authorization, for a PR whose author may not run
+// the apply, so it lists who can under the apply command.
+func PreviewCommentPlanWhoCanApply() string {
+	data := previewPlanData()
+	data.RequestedBy = ""
+	data.LintViolations = nil
+	data.ApplyAuthorization = &ApplyAuthorizationData{
+		OperatorPrincipals: []string{"acme/testapp-operators"},
+		OtherPrincipals:    []string{"acme/db-admins", "jdoe"},
+	}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanUnmanagedSchema renders the plan comment a staging-scoped
 // deployment posts for a PR that also changes a schema directory it does not
 // manage. It posts no separate notice, since a deployment serving another
@@ -415,6 +429,49 @@ func PreviewCommentPlanUnsafe() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
 		},
+	})
+}
+
+// PreviewCommentPlanManyUnsafeChanges renders a sample plan whose unsafe list
+// is long and mixes destructive drops of a table, a column and an index with
+// findings that destroy nothing: the drops lead the list, the rest fold past
+// the first findings, and the apply instruction numbers each drop's safety
+// step ahead of the consent.
+func PreviewCommentPlanManyUnsafeChanges() string {
+	timestamp := func(column string) string {
+		return "Column `" + column + "` uses `TIMESTAMP` which overflows on 2038-01-19."
+	}
+	var statements []string
+	var unsafe []UnsafeChangeData
+	for _, table := range []string{"loans", "refunds", "ledger"} {
+		statements = append(statements, "CREATE TABLE `"+table+"` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;")
+		unsafe = append(unsafe,
+			UnsafeChangeData{Table: table, Reason: timestamp("created_at"), ChangeType: "create"},
+			UnsafeChangeData{Table: table, Reason: timestamp("updated_at"), ChangeType: "create"},
+		)
+	}
+	statements = append(statements,
+		"ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;",
+		"ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;",
+		"DROP TABLE `refund_backfill`;",
+	)
+	unsafe = append(unsafe,
+		UnsafeChangeData{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data", ChangeType: "alter", DDL: "ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;"},
+		UnsafeChangeData{Table: "payouts", Reason: "DROP INDEX removes the index", ChangeType: "alter", DDL: "ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;"},
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`;"},
+	)
+	return RenderPlanComment(PlanCommentData{
+		Database:         "testapp",
+		SchemaName:       "testapp",
+		Environment:      "staging",
+		HeadSHA:          previewHeadSHA,
+		Repository:       previewRepository,
+		RequestedBy:      previewRequestedBy,
+		IsMySQL:          true,
+		DatabaseType:     "mysql",
+		Changes:          []KeyspaceChangeData{{Keyspace: "testapp", Statements: statements}},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    unsafe,
 	})
 }
 
@@ -2540,6 +2597,25 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplySeveralRunning renders an apply comment where two tables
+// copy at once, so the summary shows the rows copied over the rows to copy
+// across both rather than one table's percent.
+func PreviewCommentApplySeveralRunning() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Running
+	tables[1].RowsCopied = 914707
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 62
+	tables[1].ETASeconds = 195
+	tables[2].Status = state.Task.Running
+	tables[2].RowsCopied = 122400
+	tables[2].RowsTotal = 612000
+	tables[2].PercentComplete = 20
+	tables[2].ETASeconds = 410
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyThrottled renders an apply comment where the active row
 // copy is paused by the engine's throttler, so the stalled bar reads as a
 // deliberate slowdown with its trigger named rather than a hang.
@@ -2893,6 +2969,20 @@ func PreviewCommentApplyWaitingForCutover() string {
 	for i := range tables {
 		tables[i].Status = state.Task.WaitingForCutover
 	}
+	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyWaitingForCutoverFirstLanded renders a deferred apply
+// waiting for cutover after one table has already completed: the readiness
+// line counts only the tables still facing the cutover, so the completed
+// table is neither ready nor waited on.
+func PreviewCommentApplyWaitingForCutoverFirstLanded() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.WaitingForCutover
+	tables[2].Status = state.Task.WaitingForCutover
 	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
 	data.DeferCutover = true
 	return RenderApplyStatusComment(data)

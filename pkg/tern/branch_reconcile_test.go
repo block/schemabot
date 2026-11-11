@@ -394,6 +394,45 @@ func TestReconcileOrphanedBranchesKeepsBranchesItCannotJudge(t *testing.T) {
 	})
 }
 
+// The pass logs each orphan it could not delete. When PlanetScale refused the
+// delete as unauthorized, that log also says what to check on the service
+// token, so an orphan that every pass fails to delete is explained by the log
+// the operator is already reading. Any other failure carries the error alone.
+func TestReconcileOrphanedBranchesLogsWhatToCheckWhenADeleteIsRefusedAsUnauthorized(t *testing.T) {
+	const failedDeleteLog = "failed to delete orphaned SchemaBot branch; it is retried on the next pass, or delete it manually to reclaim branch quota"
+	const unauthorizedHint = "PlanetScale refused the delete as unauthorized; check that the service token is valid and has the delete_branch permission on this database"
+	orphan := &ps.DatabaseBranch{Name: "schemabot-orders-aaaa0001", CreatedAt: branchReconcileNow.Add(-48 * time.Hour)}
+
+	reconcile := func(t *testing.T, deleteErr error) capturedLog {
+		t.Helper()
+		client := &branchReconcileClient{branches: []*ps.DatabaseBranch{orphan}, deleteErr: deleteErr}
+		lc := newBranchReconcileClient(&branchReconcileStorage{applies: &branchReconcileApplyStore{}, operations: &branchReconcileOperationStore{}}, client, nil)
+		var records []capturedLog
+		lc.logger = slog.New(captureHandler{records: &records})
+
+		_, err := lc.ReconcileOrphanedBranches(t.Context(), deletingBranchReconcileOptions())
+
+		require.ErrorIs(t, err, deleteErr)
+		rec := requireCapturedLog(t, records, failedDeleteLog)
+		assert.Equal(t, slog.LevelError, rec.level)
+		assert.Equal(t, orphan.Name, rec.attrs["branch"])
+		require.ErrorIs(t, rec.attrs["error"].(error), deleteErr)
+		return rec
+	}
+
+	t.Run("refused as unauthorized", func(t *testing.T) {
+		rec := reconcile(t, &ps.Error{Code: ps.ErrPermission})
+
+		assert.Equal(t, unauthorizedHint, rec.attrs["permission_hint"])
+	})
+
+	t.Run("failed for another reason", func(t *testing.T) {
+		rec := reconcile(t, errors.New("branch is busy"))
+
+		assert.NotContains(t, rec.attrs, "permission_hint")
+	})
+}
+
 // An apply re-run for the same plan reuses the branch of that name. When it
 // starts after the pass first read the applies, the read under the held
 // target sees it, by its plan before it has recorded a branch, and the branch

@@ -1005,3 +1005,34 @@ func TestEngine_ResumeDropPhase_SkipsTableQuarantinedAtTheReplaysDestination(t *
 	require.NoError(t, err, "the copy at the replay's destination holds the table, so the drop is not final")
 	assert.Equal(t, []string{second.QuarantineTable}, listQuarantinedTables(t, db))
 }
+
+// A replay looks for the pending drops copy it recorded and cannot tell
+// whether it is there, because the existence check fails. The failure is
+// returned rather than read as "the copy is missing": a missing copy reports
+// the drop final and its data unrecoverable, while here the copy is in fact
+// in pending drops.
+func TestFindRecordedCopy_ReturnsTheExistenceCheckFailure(t *testing.T) {
+	_, db := setupTestMySQL(t)
+	cleanupPendingDropsDB(t, db)
+
+	recorded := pendingdrops.QuarantinedTable{
+		SchemaName:       "testdb",
+		TableName:        "unchecked_copy",
+		QuarantineSchema: pendingdrops.Database,
+		QuarantineTable:  "20260101000000000_unchecked_copy",
+	}
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", pendingdrops.Database))
+	require.NoError(t, err, "create pending drops database")
+	_, err = db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE `%s`.`%s` (id INT PRIMARY KEY)", pendingdrops.Database, recorded.QuarantineTable))
+	require.NoError(t, err, "create the recorded copy")
+
+	// A cancelled context fails the existence check before it reaches MySQL.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, found, err := findRecordedCopy(ctx, db, []pendingdrops.QuarantinedTable{recorded})
+	require.ErrorIs(t, err, context.Canceled, "the existence check's failure is returned, not read as a missing copy")
+	assert.Contains(t, err.Error(), "check recorded pending drops table `20260101000000000_unchecked_copy` exists")
+	assert.False(t, found)
+}

@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -11,22 +12,85 @@ func TestRenderApplyStatusComment_CutoverSummaryUnit(t *testing.T) {
 	t.Run("one statement per table", func(t *testing.T) {
 		data := multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
 			{Namespace: "public", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a int", Status: state.Task.WaitingForCutover},
-			{Namespace: "public", TableName: "sessions", DDL: "ALTER TABLE sessions ADD COLUMN b int", Status: state.Task.Running},
+			{Namespace: "public", TableName: "sessions", DDL: "ALTER TABLE sessions ADD COLUMN b int", Status: state.Task.Completed},
 		})
 		out := RenderApplyStatusComment(data)
 
-		assert.Contains(t, out, "**1/2** table(s) ready for cutover")
+		assert.Contains(t, out, "**1/1** table(s) ready for cutover")
 	})
 
 	t.Run("several statements on one table", func(t *testing.T) {
 		data := multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
 			{Namespace: "public", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a int", Status: state.Task.WaitingForCutover},
-			{Namespace: "public", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN b int", Status: state.Task.Running},
+			{Namespace: "public", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN b int", Status: state.Task.Completed},
 		})
 		out := RenderApplyStatusComment(data)
 
-		assert.Contains(t, out, "**1/2** statement(s) ready for cutover")
+		assert.Contains(t, out, "**1/1** statement(s) ready for cutover")
 	})
+}
+
+// A table that has settled is out of the cutover's way: it is neither ready
+// for cutover nor something the cutover is waiting on, so the readiness summary
+// counts only the tables still facing the cutover. The apply reads
+// waiting_for_cutover with a completed sibling once that table's change has
+// landed, and with a cancelled sibling while a cancel is still reaching the
+// tables parked at the barrier.
+func TestRenderApplyStatusComment_CutoverSummaryLeavesOutSettledTables(t *testing.T) {
+	table := func(name, status string) TableProgressData {
+		return TableProgressData{Namespace: "orders", TableName: name, DDL: "ALTER TABLE " + name + " ADD COLUMN c int", Status: status}
+	}
+
+	t.Run("a completed table is not waited on", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
+			table("audit_log", state.Task.Completed),
+			table("users", state.Task.WaitingForCutover),
+		}))
+
+		assert.Contains(t, out, "**1/1** table(s) ready for cutover\n")
+		assert.NotContains(t, out, "waiting on")
+	})
+
+	t.Run("a cancelled table is not waited on", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
+			table("audit_log", state.Task.Cancelled),
+			table("users", state.Task.WaitingForCutover),
+			table("events", state.Task.WaitingForCutover),
+		}))
+
+		assert.Contains(t, out, "**2/2** table(s) ready for cutover\n")
+		assert.NotContains(t, out, "waiting on")
+	})
+
+	t.Run("no table faces the cutover", func(t *testing.T) {
+		out := RenderApplyStatusComment(multiStatementApplyData(state.Apply.WaitingForCutover, []TableProgressData{
+			table("audit_log", state.Task.Completed),
+			table("users", state.Task.Completed),
+		}))
+
+		assert.NotContains(t, out, "ready for cutover")
+	})
+}
+
+// The readiness line's counting rule, checked row by row: a row whose change
+// has landed or whose task has ended is left out of both counts, while a
+// stopped row still holds the barrier and stays counted as waited on.
+func TestWriteCutoverSummary_CountsOnlyRowsStillFacingCutover(t *testing.T) {
+	summary := func(statuses ...string) string {
+		tables := make([]TableProgressData, 0, len(statuses))
+		for i, status := range statuses {
+			tables = append(tables, TableProgressData{Namespace: "orders", TableName: "t" + string(rune('a'+i)), Status: status})
+		}
+		var sb strings.Builder
+		writeCutoverSummary(&sb, tables)
+		return sb.String()
+	}
+
+	assert.Equal(t, "\n**1/1** table(s) ready for cutover\n", summary(state.Task.RevertWindow, state.Task.WaitingForCutover))
+	assert.Equal(t, "\n**1/1** table(s) ready for cutover\n", summary(state.Task.Failed, state.Task.WaitingForCutover))
+	assert.Equal(t, "\n**1/1** table(s) ready for cutover\n", summary(state.Task.Reverted, state.Task.WaitingForCutover))
+	assert.Equal(t, "\n**1/2** table(s) ready for cutover — waiting on 1\n", summary(state.Task.Stopped, state.Task.WaitingForCutover))
+	assert.Equal(t, "\n**1/2** table(s) ready for cutover — waiting on 1\n", summary(state.Task.Running, state.Task.WaitingForCutover))
 }
 
 // A multi-statement namespace next to a namespace of distinct tables: both

@@ -281,6 +281,11 @@ var githubRoutePatterns = []githubRoutePattern{
 	},
 	{
 		method:    http.MethodGet,
+		path:      "/orgs/{org}/teams/{team_slug}",
+		operation: metrics.GitHubOperationGetTeam,
+	},
+	{
+		method:    http.MethodGet,
 		path:      "/orgs/{org}/teams/{team_slug}/members",
 		operation: metrics.GitHubOperationListTeamMembers,
 	},
@@ -434,6 +439,7 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationGetBranchRules,
 		metrics.GitHubOperationGetCombinedStatus,
 		metrics.GitHubOperationGetPullRequestReviewProtection,
+		metrics.GitHubOperationGetTeam,
 		metrics.GitHubOperationGetTeamMembership,
 		metrics.GitHubOperationGraphQLStatusCheckRollup,
 		metrics.GitHubOperationGraphQLTreeEntries,

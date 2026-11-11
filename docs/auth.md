@@ -230,6 +230,26 @@ You can configure two separate checks:
   requires a qualifying approval before apply where it is enabled. The PR
   author's own approval does not count.
 
+An approval does not let anyone run a command they are not authorized for.
+So when a plan comment offers an apply its reader cannot run, the comment
+lists who can, right under the apply command. The reader is whoever commented
+the plan command, or the PR author on an automatic plan. Anyone listed can run
+the apply once the PR has the approval the review gate requires. A reader who
+can run the apply sees no list, and a plan with nothing to apply checks nobody.
+The plan command requires the same authorization as apply, so the list shows on
+automatic plans: a plan an operator comments answers the operator and shows
+none.
+
+The comment checks the reader against the same admins, repository admins, and
+operators the apply does. For each configured team, until one includes the
+reader, it asks GitHub about the reader's membership in one request whatever
+the team's size. An automatic plan makes those requests for each database it
+plans. A commented plan reuses the memberships its own authorization check just
+read, so it makes no extra request. If GitHub cannot answer, the comment shows
+the list. Membership is read again on the next webhook delivery, so a team
+change on GitHub shows on the next plan. The list names teams and users without
+@-mentioning them.
+
 For GitHub command permissions, `*_teams` and `*_users` refer to GitHub
 accounts. For proxy access, `*_groups` refers to groups supplied by the proxy.
 Configure both if you use both paths. OIDC also uses the `admin_teams` list,

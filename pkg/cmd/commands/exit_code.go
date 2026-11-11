@@ -20,14 +20,15 @@ const (
 	// proceed with a deploy.
 	ExitStorageSchemaOutstanding = 2
 
-	// ExitInterrupted says the operator's Ctrl-C or SIGTERM ended the command
-	// before it reached its usual outcome: a watch was stopped while its apply
-	// carries on, a schema change was never submitted, or a checks backfill or
-	// webhook redrive stopped part-way through its sweep. It is the status a
-	// shell reports for a process the interrupt signal ended, and the one the
-	// CLI exits with on a second signal, so a script sees one status for an
-	// interrupt however the command took it, and never mistakes it for the
-	// apply having failed.
+	// ExitInterrupted says the operator ended the command before it reached its
+	// usual outcome: a watch was stopped by Ctrl-C, SIGTERM, or the interactive
+	// watcher's detach key while its apply carries on, a schema change was
+	// never submitted, or a checks backfill or webhook redrive stopped part-way
+	// through its sweep. It is the status a shell reports for a process the
+	// interrupt signal ended, and the one the CLI exits with on a second signal,
+	// so a script sees one status for an interrupt however the command took it,
+	// and never mistakes it for the apply having failed or for it having
+	// completed.
 	ExitInterrupted = 130
 )
 
@@ -45,6 +46,13 @@ func interrupted(ctx context.Context) error {
 // something other than the operator, so it stays an ordinary failure.
 func endedByInterrupt(ctx context.Context, err error) bool {
 	return ctx.Err() != nil && errors.Is(err, context.Canceled)
+}
+
+// detachedFromWatch is the error the interactive watcher returns once the
+// operator has left it while the apply carries on. Its view has already said
+// how to reattach, so the status is all that is left to report.
+func detachedFromWatch() error {
+	return &ExitCodeError{Code: ExitInterrupted, Err: ErrSilent}
 }
 
 // ExitCodeError carries the process exit status a command wants, alongside its

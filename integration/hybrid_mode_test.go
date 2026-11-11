@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -19,8 +18,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/block/schemabot/e2e/testutil"
 	schemabotapi "github.com/block/schemabot/pkg/api"
@@ -148,9 +145,6 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	t.Cleanup(func() { utils.CloseAndLog(server) })
 
 	addr := listener.Addr().String()
-
-	// Wait for server readiness
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
 
 	// =========================================================================
 	// Test 1: Plan for local-mode database (uses LocalClient)
@@ -422,26 +416,13 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("listen grpc: %w", err)
 	}
+	// The listener is bound before Serve starts, so the address is usable as
+	// soon as this returns: a dial waits in the listen backlog until Serve
+	// accepts it, and an RPC waits while its connection is still connecting,
+	// until gRPC's connect timeout or the caller's deadline, whichever is
+	// first.
 	go func() { _ = grpcSrv.Serve(grpcListener) }()
 	t.Cleanup(func() { grpcSrv.GracefulStop() })
 
-	grpcAddress := grpcListener.Addr().String()
-
-	// Wait for server ready
-	conn, err := grpc.NewClient(grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return "", fmt.Errorf("create grpc client: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	readyCtx, readyCancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer readyCancel()
-	conn.Connect()
-	for conn.GetState() != connectivity.Ready {
-		if !conn.WaitForStateChange(readyCtx, conn.GetState()) {
-			return "", fmt.Errorf("gRPC server not ready: context expired")
-		}
-	}
-
-	return grpcAddress, nil
+	return grpcListener.Addr().String(), nil
 }

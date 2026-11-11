@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -5741,6 +5742,36 @@ func TestApplyOperationStore_ReapStranded_RespectsLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, settled, 1, "the next sweep drains the remainder")
 	assert.Equal(t, third.ID, settled[0].Operation.ID)
+}
+
+// The reaper mirrors a failed parent's explanation onto the operation it
+// settles. An explanation past the column's width is stored cut to fit, so the
+// settle lands instead of being refused on every sweep. The parent row stored
+// its own message cut already, so the long message is given in the parent the
+// sweep read rather than written to the parent row.
+func TestApplyOperationStore_ReapStranded_CutsAnOverLongParentFailureToFit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "stranded_long_failure_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_long_failure", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	op := insertPendingOperation(t, store, parent.ID, "region-a")
+	stranded, err := store.ApplyOperations().Get(ctx, op.ID)
+	require.NoError(t, err)
+	parent.ErrorMessage = "x" + strings.Repeat("é", 40_000)
+
+	settledRow, err := store.applyOperations.reapStrandedOperation(ctx, stranded, parent)
+	require.NoError(t, err, "settling under a parent with a long failure message is stored")
+	assert.True(t, settledRow)
+	reloaded, err := store.ApplyOperations().Get(ctx, op.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	assert.Equal(t, state.ApplyOperation.Failed, reloaded.State)
+	want := "x" + strings.Repeat("é", 32_765) + "…"
+	assert.Equal(t, len(want), len(reloaded.ErrorMessage), "stored length in bytes")
+	assert.True(t, want == reloaded.ErrorMessage, "the parent's failure is cut on a character boundary")
 }
 
 // Selection and the write are separate statements, so a driver can claim and

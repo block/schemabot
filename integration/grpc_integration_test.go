@@ -140,23 +140,7 @@ func startSchemaBot(t *testing.T, ternGRPCAddr string) string {
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { utils.CloseAndLog(server) })
 
-	// Wait for server to be ready by polling health endpoint
 	addr := listener.Addr().String()
-	healthCtx, healthCancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer healthCancel()
-	for {
-		require.NoError(t, healthCtx.Err(), "schemabot server did not become healthy in time")
-		req, err := http.NewRequestWithContext(healthCtx, http.MethodGet, "http://"+addr+"/health", nil)
-		require.NoError(t, err, "create health request")
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 
 	return addr
 }
@@ -397,21 +381,6 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	defer utils.CloseAndLog(server)
 	schemabotAddr := listener.Addr().String()
 
-	// Wait for HTTP server readiness
-	testutil.Poll(t, 5*time.Second, 10*time.Millisecond,
-		func() bool {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+schemabotAddr+"/health", nil)
-			require.NoError(t, err)
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return false
-			}
-			_ = resp.Body.Close()
-			return resp.StatusCode == http.StatusOK
-		},
-		func() string { return "schemabot HTTP server did not become healthy" },
-	)
-
 	// Step 1: Plan — create a new table
 	schemaSQL := `CREATE TABLE task_state_test (
 		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -582,21 +551,6 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	go func() { _ = server.Serve(listener) }()
 	defer utils.CloseAndLog(server)
 	schemabotAddr := listener.Addr().String()
-
-	// Wait for HTTP server readiness
-	testutil.Poll(t, 5*time.Second, 10*time.Millisecond,
-		func() bool {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+schemabotAddr+"/health", nil)
-			require.NoError(t, err)
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return false
-			}
-			_ = resp.Body.Close()
-			return resp.StatusCode == http.StatusOK
-		},
-		func() string { return "schemabot HTTP server did not become healthy" },
-	)
 
 	// Step 1: Plan — add a unique index the seeded duplicate rows cannot satisfy,
 	// alongside a second table whose change is unaffected by that failure.

@@ -101,13 +101,15 @@ type trackedApply struct {
 	cancelRequested bool
 	// cancelsInFlight counts the Cancel calls that have committed to acting
 	// on this apply but have not yet learned whether their signal was sent.
-	// The drive reads the apply as cancelled by the operator while any is in
-	// flight, because a signal can land before the call that sent it hears
-	// back. The cost runs the other way too: while a call is in flight, a
-	// backend cancellation SchemaBot did not send is also read as the
-	// operator's.
+	// A signal can land before the call that sent it hears back, so a drive
+	// that sees a cancellation while any is in flight waits for them to
+	// settle before it classifies: a backend cancellation SchemaBot did not
+	// send is the operator's only if one of those calls may have acted.
 	cancelsInFlight int
-	done            chan struct{}
+	// cancelsSettled is closed when cancelsInFlight returns to zero. Cancel
+	// replaces it each time the count leaves zero.
+	cancelsSettled chan struct{}
+	done           chan struct{}
 	// owner is the drive the apply was started for (engine.WithWorkOwner).
 	owner string
 }

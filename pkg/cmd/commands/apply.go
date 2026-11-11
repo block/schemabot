@@ -916,10 +916,13 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 	var lastRevertHeartbeat time.Time
 	pollInterval := 500 * time.Millisecond
 	logRetry := func(r progressRetry) {
-		log.emit("msg", "Progress unavailable, retrying",
+		kvs := []string{"msg", "Progress unavailable, retrying",
 			"attempt", fmt.Sprintf("%d/%d", r.attempt, maxConsecutiveProgressFailures),
-			"retry_in", r.wait.String(),
-			"error", r.err.Error())
+			"retry_in", r.wait.String()}
+		if r.cappedFrom > 0 {
+			kvs = append(kvs, "retry_capped_from", formatCappedRetryDelay(r.cappedFrom))
+		}
+		log.emit(append(kvs, "error", r.err.Error())...)
 	}
 
 	for {

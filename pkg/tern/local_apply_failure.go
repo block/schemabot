@@ -268,7 +268,7 @@ func (c *LocalClient) outcomeWriteLanded(ctx context.Context, apply *storage.App
 		c.logger.Warn("storage holds the outcome, but not provably by this drive's write; treating the outcome as not recorded and leaving it to the drive that owns it",
 			append(stored.LogAttrs(),
 				"want_state", wantState,
-				"message_matched", stored.ErrorMessage == errMsg,
+				"message_matched", storedMessageMatches(stored, errMsg),
 				"lease_token_matched", stored.LeaseToken == lease.Token)...)
 		return false, nil
 	}
@@ -278,8 +278,15 @@ func (c *LocalClient) outcomeWriteLanded(ctx context.Context, apply *storage.App
 // storedUnderLeaseWithMessage reports whether the stored apply carries errMsg
 // and still carries the lease token the drive wrote under.
 func storedUnderLeaseWithMessage(stored *storage.Apply, errMsg string, lease storage.ApplyLease) bool {
-	return stored.ErrorMessage == errMsg &&
+	return storedMessageMatches(stored, errMsg) &&
 		stored.LeaseToken == lease.Token
+}
+
+// storedMessageMatches reports whether the stored apply carries errMsg in the
+// form storage records it. A message too long for its column, or not valid
+// UTF-8, is stored changed, so the drive's own copy is compared in that form.
+func storedMessageMatches(stored *storage.Apply, errMsg string) bool {
+	return stored.ErrorMessage == storage.StoredMessage(errMsg)
 }
 
 // failApplyAndNotify fails the apply and, once storage holds a terminal state
