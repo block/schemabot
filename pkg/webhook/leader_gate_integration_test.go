@@ -11,6 +11,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -720,6 +722,127 @@ func TestE2EParticipantPlanCommandStaysSilentForADeletionTheDefaultBranchHolds(t
 	require.True(t, handled)
 	assert.Empty(t, checkRuns, "a participant the PR proposes nothing for publishes no Check Run")
 	assert.Zero(t, comments.Load(), "a participant the PR proposes nothing for posts no comment")
+}
+
+// A PR deletes tenant-b's config and the default branch has already absorbed
+// the deletion, so the PR proposes nothing for tenant-b and tenant-b has no
+// Check Run on the head. Both the pull_request event and
+// `schemabot plan` reach the leader's "no managed schema" path.
+//
+// An unscoped leader reads tenant-b's run under its unscoped name to decide
+// whether tenant-b still gates the head, finds none, and publishes passing
+// checks. An environment-scoped leader never reads that name, because tenant-b
+// publishes only "SchemaBot Tenant B (<env>)" runs there: both callers publish
+// through the leader's fold, which passes each environment's aggregate, and the
+// plan command says the check waits for the tenant deployments rather than
+// claiming it was refreshed as passing before the fold has run.
+func TestE2ELeaderNoManagedSchemaPathReadsUnscopedParticipantRunOnlyWhenUnscoped(t *testing.T) {
+	tests := []struct {
+		name        string
+		scoped      bool
+		planCommand bool
+	}{
+		{name: "scoped leader on pull_request", scoped: true},
+		{name: "scoped leader on plan command", scoped: true, planCommand: true},
+		{name: "unscoped leader on pull_request"},
+		{name: "unscoped leader on plan command", planCommand: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := leaderRepoConfig()
+			wantAggregates := []string{aggregateCheckNameForEnv("SchemaBot", "staging"), aggregateCheckNameForEnv("SchemaBot", "production")}
+			if !tt.scoped {
+				config.AllowedEnvironments = nil
+				wantAggregates = []string{"SchemaBot"}
+			}
+			svc := setupE2EServiceWithConfig(t, config)
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			const headSHA = "abc123"
+			mockLeaderPRHead(mux, headSHA)
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+					{Filename: new(tenantBSchemaDir + "/schemabot.yaml"), Status: new("removed")},
+				})
+			})
+			other := []*gh.TreeEntry{{Path: new("README.md"), Type: new("blob"), SHA: new("readme")}}
+			registerRepositoryTrees(t, mux, repositoryTreeFixture{
+				headSHA:     headSHA,
+				headEntries: other,
+				baseEntries: func() []*gh.TreeEntry { return other },
+			})
+			var readsMu sync.Mutex
+			var reads []string
+			mux.HandleFunc("GET /repos/octocat/hello-world/commits/", func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/check-runs") {
+					http.NotFound(w, r)
+					return
+				}
+				readsMu.Lock()
+				reads = append(reads, r.URL.Query().Get("check_name"))
+				readsMu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "check_runs": []any{}})
+			})
+			comments := make(chan string, 4)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Body string `json:"body"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				comments <- body.Body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			})
+			checkRuns := captureLeaderCheckRuns(mux)
+
+			h := newLeaderHandler(t, svc, client)
+			if tt.planCommand {
+				installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
+				handled, err := h.handleNoManagedSchemaChangesForCommand(t.Context(), installClient, "octocat/hello-world", 1, 0, action.Plan, "", "", "testuser")
+				require.NoError(t, err)
+				require.True(t, handled)
+				select {
+				case body := <-comments:
+					if tt.scoped {
+						assert.Contains(t, body, "touches schema paths owned by tenant deployments")
+						assert.NotContains(t, body, "were refreshed as passing")
+					} else {
+						assert.Contains(t, body, "were refreshed as passing")
+						assert.NotContains(t, body, "tenant deployments")
+					}
+				case <-time.After(webhookIntegrationCheckRunDeadline):
+					t.Fatal("timed out waiting for the checks-refreshed comment")
+				}
+			} else {
+				req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: headSHA, headRef: "feature-branch"}, nil)
+				rr := httptest.NewRecorder()
+				h.ServeHTTP(rr, req)
+				require.Equal(t, http.StatusOK, rr.Code)
+			}
+
+			for _, name := range wantAggregates {
+				cr := collectAggregate(t, checkRuns, name)
+				assert.Equal(t, headSHA, cr.HeadSHA)
+				assert.Equal(t, checkStatusCompleted, cr.Status, "aggregate %s", name)
+				assert.Equal(t, checkConclusionSuccess, cr.Conclusion, "aggregate %s", name)
+			}
+			drainCtx, cancel := context.WithTimeout(t.Context(), webhookIntegrationCheckRunDeadline)
+			defer cancel()
+			h.DrainInProcessWebhookWork(drainCtx)
+			require.NoError(t, drainCtx.Err(), "the delivery's background work finishes before its reads are counted")
+			readsMu.Lock()
+			defer readsMu.Unlock()
+			if tt.scoped {
+				assert.NotContains(t, reads, tenantBCheckName, "a scoped leader never reads a participant run under the unscoped name")
+			} else {
+				assert.Contains(t, reads, tenantBCheckName, "an unscoped leader reads whether tenant-b still gates the head")
+			}
+		})
+	}
 }
 
 // mockPlanCommandComparisonFailure serves a PR whose only change deletes
