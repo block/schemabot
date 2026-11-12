@@ -107,6 +107,11 @@ func TestApplyLogs(t *testing.T, h Harness) {
 		assert.Equal(t, "entry 4", recent[1].Message)
 		assert.Equal(t, "entry 5", recent[2].Message)
 
+		newest, err := store.ApplyLogs().GetRecentByApply(ctx, apply.ID, 1)
+		require.NoError(t, err)
+		require.Len(t, newest, 1)
+		assert.Equal(t, "entry 5", newest[0].Message)
+
 		all, err := store.ApplyLogs().GetRecentByApply(ctx, apply.ID, seeded*2)
 		require.NoError(t, err)
 		require.Len(t, all, seeded)
