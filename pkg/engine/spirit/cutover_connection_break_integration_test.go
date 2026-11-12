@@ -33,6 +33,12 @@ const cutoverCallTimeout = 30 * time.Second
 // before its reply arrived, leaving the sentinel gone. Both look the same to the
 // caller and both are reported as unknown. With no break, the same cutover is
 // accepted and the sentinel is gone.
+//
+// Cutover sees the two breaks identically: its write of the drop succeeds and
+// its read of the reply fails. They exercise one path through Cutover, not
+// two; what differs is whether the server ran the drop, which the final
+// sentinel check reads from the database to confirm the proxy broke the
+// connection where each case says it did.
 func TestEngine_CutoverReportsAnUnknownOutcomeWhenTheConnectionBreaksDuringTheSentinelDrop(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -49,15 +55,8 @@ func TestEngine_CutoverReportsAnUnknownOutcomeWhenTheConnectionBreaksDuringTheSe
 			dsn, db := setupTestMySQL(t)
 			cleanupTables(t, db)
 
-			_, err := db.ExecContext(t.Context(), "CREATE TABLE `_spirit_sentinel` (id int NOT NULL PRIMARY KEY)")
-			require.NoError(t, err, "create sentinel")
-			t.Cleanup(func() {
-				// t.Context() is already cancelled when cleanup runs.
-				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
-				defer cancel()
-				_, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS `_spirit_sentinel`")
-				assert.NoError(t, err, "drop sentinel")
-			})
+			dropTablesOnCleanup(t, db, deferredCutoverSentinelTable)
+			seedArtifact(t, db, deferredCutoverSentinelTable, 1)
 
 			proxy := startSentinelDropProxy(t, dsn, tt.fault)
 
@@ -71,7 +70,7 @@ func TestEngine_CutoverReportsAnUnknownOutcomeWhenTheConnectionBreaksDuringTheSe
 			select {
 			case <-proxy.sawDrop:
 			default:
-				t.Fatal("the sentinel drop never passed through the proxy, so the test did not exercise it")
+				t.Fatalf("the sentinel drop never passed through the proxy, so the test did not exercise it; Cutover() returned result %+v and error: %v", result, err)
 			}
 
 			if tt.wantUnknownError {
@@ -191,7 +190,8 @@ func (p *sentinelDropProxy) serve(t *testing.T, client net.Conn) {
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
-			// The peer may have closed either side already.
+			// The test's cleanup closes every proxied connection too, and may
+			// get to either side first.
 			_ = client.Close()
 			_ = server.Close()
 		})
