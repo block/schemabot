@@ -202,7 +202,63 @@ func fastFollowPacing() followPacing {
 	return followPacing{
 		interval:  time.Millisecond,
 		retryWait: func(error, int) time.Duration { return time.Millisecond },
+		sleep:     sleepUnlessDone,
 	}
+}
+
+// A tail waits the poll interval after every poll that answered and the
+// backoff for its place in the run after every poll that failed. Once a poll
+// answers again the tail is back on the interval, so a server that recovered
+// is not polled at the pace of the last backoff, and a server that is failing
+// is not polled at the pace of a healthy one.
+func TestRunFollowLoopWaitsTheBackoffOnlyAfterAFailedPoll(t *testing.T) {
+	const interval = 5 * time.Second
+	fetch, limits := scriptedFetch([]followFetchResult{
+		{logs: []*client.LogEntry{followLogEntry(1)}},
+		{err: transientFollowError()},
+		{err: transientFollowError()},
+		{logs: []*client.LogEntry{followLogEntry(2)}},
+		{logs: []*client.LogEntry{followLogEntry(3)}},
+		{err: followAPIError(http.StatusNotFound, "apply not found")},
+	})
+	var waits []time.Duration
+	pacing := followPacing{
+		interval:  interval,
+		retryWait: func(_ error, failures int) time.Duration { return time.Duration(failures) * time.Minute },
+		sleep:     func(_ context.Context, d time.Duration) { waits = append(waits, d) },
+	}
+
+	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, pacing)
+
+	require.ErrorContains(t, err, "apply not found")
+	assert.Len(t, limits(), 6, "every scripted poll ran")
+	assert.Equal(t, []time.Duration{interval, time.Minute, 2 * time.Minute, interval, interval}, waits,
+		"one wait before each poll after the first: the interval, the backoff after each of two failures, then the interval again")
+}
+
+// A tail polls every five seconds and, after a failed poll, backs off on the
+// schedule the progress watches use, including a longer delay the server asked
+// for, so a tail and a watch ride out the same outage for the same time.
+func TestDefaultFollowPacingMatchesTheWatches(t *testing.T) {
+	assert.Equal(t, 5*time.Second, defaultFollowPacing.interval)
+
+	unreachable := transientFollowError()
+	for failures := 1; failures < maxConsecutiveProgressFailures; failures++ {
+		assert.Equal(t, progressRetryWait(unreachable, failures), defaultFollowPacing.retryWait(unreachable, failures), "failure %d", failures)
+	}
+	assert.Equal(t, 4*time.Second, defaultFollowPacing.retryWait(unreachable, 1), "the first backoff")
+	assert.Equal(t, 30*time.Second, defaultFollowPacing.retryWait(unreachable, maxConsecutiveProgressFailures-1), "the backoff is capped")
+
+	// The default wait is a real one that an interrupt cuts short.
+	started := time.Now()
+	defaultFollowPacing.sleep(t.Context(), 50*time.Millisecond)
+	assert.GreaterOrEqual(t, time.Since(started), 50*time.Millisecond, "the wait lasts its full duration")
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	started = time.Now()
+	defaultFollowPacing.sleep(cancelled, followTestDeadline)
+	assert.Less(t, time.Since(started), followTestDeadline, "a cancelled tail does not wait out the interval")
 }
 
 // transientFollowError is a failure the watches judge worth retrying: the

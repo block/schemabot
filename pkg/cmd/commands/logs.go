@@ -393,16 +393,18 @@ func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse)
 
 // followPacing sets how long a tail waits before its next poll: interval after
 // a poll that succeeded, and retryWait after one that failed transiently, given
-// that failure and how many polls in a row have failed.
+// that failure and how many polls in a row have failed. sleep performs the
+// wait and returns early once the tail is cancelled.
 type followPacing struct {
 	interval  time.Duration
 	retryWait func(err error, consecutiveFailures int) time.Duration
+	sleep     func(ctx context.Context, d time.Duration)
 }
 
 // defaultFollowPacing polls at followInterval, and backs off after a transient
 // failure on the same schedule the progress watches use, so a tail rides out a
 // server restart for as long as a watch does.
-var defaultFollowPacing = followPacing{interval: followInterval, retryWait: progressRetryWait}
+var defaultFollowPacing = followPacing{interval: followInterval, retryWait: progressRetryWait, sleep: sleepUnlessDone}
 
 // runFollowLoop fetches the newest initialLimit entries and hands them to
 // emit, then polls fetch after each pacing wait until ctx is cancelled. emit
@@ -428,7 +430,7 @@ func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error),
 	wait := pacing.interval
 	failures := 0
 	for {
-		sleepUnlessDone(ctx, wait)
+		pacing.sleep(ctx, wait)
 		if ctx.Err() != nil {
 			// Interrupting a tail is its normal exit, not a failure.
 			return nil

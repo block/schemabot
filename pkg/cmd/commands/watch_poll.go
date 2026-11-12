@@ -167,9 +167,15 @@ func isRetryableFetchError(err error) bool {
 		}
 		return isRetryableStatusWithoutCode(apiErr.Status)
 	}
-	// A response body that failed partway through, such as a connection reset
-	// or a read timeout after the headers arrived. Failures to send the request
+	// A response body that failed partway through: a connection reset, a read
+	// timeout after the headers arrived, or an HTTP/2 stream reset from a
+	// server shutting down mid-response. The client marks it by type, since
+	// the cause depends on the protocol in use. Failures to send the request
 	// arrive as a ConnectionError above.
+	var readErr *client.ResponseReadError
+	if errors.As(err, &readErr) {
+		return true
+	}
 	var netErr net.Error
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr)
 }
