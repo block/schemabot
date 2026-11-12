@@ -277,8 +277,8 @@ func TestSecondStopDuringFirstStopWaitDoesNotReportAlreadyStopped(t *testing.T) 
 // hold the control call past its caller's context. The call fails with a
 // retryable error, never a permanent or settled one, so the durable request
 // stays pending. The schema change stays tracked with the state the operator
-// asked for and its runner alive, so the target stays held and a cancel
-// releases no artifacts. Once the runner returns, the same operation succeeds.
+// asked for and its runner alive, and a cancel releases no artifacts. Once the
+// runner returns, the same operation succeeds.
 func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
 	controls := map[string]struct {
 		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
@@ -342,14 +342,137 @@ func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
 				require.NoError(t, err)
 				assert.True(t, result.Accepted)
 				assert.Equal(t, "Already stopped", result.Message)
-			} else if err != nil {
-				// The cancel goes on to release artifacts against a target this
-				// fixture does not run, so only that it got past the wait matters.
+			} else {
+				// The cancel gets past the wait and goes on to release the
+				// artifacts, which fails at the connection because this fixture
+				// runs no target. The change stays tracked for the next cancel.
+				require.Error(t, err)
+				assert.Nil(t, result)
+				assert.Contains(t, err.Error(), "connect to database testdb to clean up cancelled schema change artifacts")
 				assert.NotContains(t, err.Error(), "the runner has not returned")
+				assert.Same(t, rm, eng.runningSchemaChange, "a cancel that could not release the artifacts stays tracked")
 			}
 			assert.Equal(t, control.wantState, rm.state)
 		})
 	}
+}
+
+// assertStartRefusedWhileRunnerAlive sends a start for a stopped change whose
+// runner has not returned and checks that it is refused with an error the
+// caller retries, leaving the change stopped and no second run started.
+func assertStartRefusedWhileRunnerAlive(t *testing.T, eng *Engine, rm *runningSchemaChange) {
+	t.Helper()
+	result, err := eng.Start(t.Context(), &engine.ControlRequest{})
+	require.Error(t, err, "a second run must not start while the first has not returned")
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "the stopped runner has not returned")
+	assert.Contains(t, err.Error(), "testdb")
+	assert.True(t, engine.IsRetryable(err), "the start succeeds once the runner has returned, so it must stay retryable")
+	eng.mu.Lock()
+	state := rm.state
+	eng.mu.Unlock()
+	assert.Equal(t, engine.StateStopped, state, "a refused start leaves the change stopped")
+	assert.EqualValues(t, 1, rm.active.Load(), "no second run was started")
+}
+
+// A stop whose wait expired leaves the change stopped with its runner still
+// alive. A start must not resume it yet: the resumed run would work the same
+// tables beside the runner that has not returned. The start is refused with an
+// error the caller retries.
+func TestStartIsRefusedAfterAStopWhoseWaitExpired(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.cancelFunc = func() {}
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	rm.goRun(func() { <-stuck })
+
+	stopCtx, cancelStop := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelStop()
+	_, err := eng.Stop(stopCtx, &engine.ControlRequest{})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, engine.StateStopped, rm.state)
+	require.EqualValues(t, 1, rm.active.Load(), "the stopped runner is still alive")
+
+	assertStartRefusedWhileRunnerAlive(t, eng, rm)
+}
+
+// A start that arrives while a stop is still waiting for the runner finds the
+// change marked stopped with its runner alive, and is refused the same way.
+// Once the runner has returned and the stop has answered, the start is
+// accepted and resumes the change.
+func TestStartIsAcceptedOnceTheStoppedRunnerHasReturned(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.cancelFunc = func() {}
+	stuck := make(chan struct{})
+	var releaseRunner sync.Once
+	release := func() { releaseRunner.Do(func() { close(stuck) }) }
+	t.Cleanup(release)
+	rm.goRun(func() { <-stuck })
+
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), controlDuringConnectDeadline)
+	defer cancelWait()
+	stopped := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(waitCtx, &engine.ControlRequest{})
+		stopped <- err
+	}()
+	require.Eventually(t, func() bool {
+		eng.mu.Lock()
+		defer eng.mu.Unlock()
+		return rm.state == engine.StateStopped
+	}, controlDuringConnectDeadline, 5*time.Millisecond, "the stop marks the change stopped before waiting for the runner")
+
+	assertStartRefusedWhileRunnerAlive(t, eng, rm)
+
+	release()
+	require.NoError(t, <-stopped, "the stop answers once the runner has returned")
+
+	result, err := eng.Start(t.Context(), &engine.ControlRequest{})
+	require.NoError(t, err, "a start is accepted once the stopped runner has returned")
+	require.NotNil(t, result)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "Resumed from checkpoint", result.Message)
+	// The resumed run fails at the connection because this fixture runs no
+	// target; wait it out so it does not outlive the test.
+	require.NoError(t, waitForRunExit(waitCtx, rm), "the resumed run returns")
+}
+
+// A stop or cancel whose caller has already given up, on a change with no
+// runner alive, has no runner to wait out. It must not report a runner that
+// has not returned: the stop answers that the change is already stopped, and
+// the cancel goes on to release the artifacts.
+func TestControlWithAnEndedCallerAndNoRunnerDoesNotReportAStuckRunner(t *testing.T) {
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	t.Run("stop of a stopped change", func(t *testing.T) {
+		eng := New(Config{})
+		rm := registerRunningSchemaChange(eng)
+		rm.state = engine.StateStopped
+
+		result, err := eng.Stop(ended, &engine.ControlRequest{})
+		require.NoError(t, err)
+		assert.True(t, result.Accepted)
+		assert.Equal(t, "Already stopped", result.Message)
+		assert.Equal(t, engine.StateStopped, rm.state)
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		eng := New(Config{})
+		rm := registerRunningSchemaChange(eng)
+		rm.cancelFunc = func() {}
+
+		// The cancel gets past the wait and fails releasing the artifacts,
+		// because this fixture runs no target.
+		result, err := eng.Cancel(ended, &engine.ControlRequest{})
+		require.Error(t, err)
+		assert.Nil(t, result)
+		assert.Contains(t, err.Error(), "connect to database testdb to clean up cancelled schema change artifacts")
+		assert.NotContains(t, err.Error(), "the runner has not returned")
+		assert.Equal(t, engine.StateCancelled, rm.state)
+	})
 }
 
 // A stop that finds the change stopped with no runner alive answers at once:
