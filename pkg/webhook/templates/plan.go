@@ -191,6 +191,10 @@ type PlanCommentData struct {
 	// ExemptTables lists live tables excluded from a plan verdict by namespace.
 	ExemptTables []ExemptTablesData
 
+	// ApplyAuthorization lists who may run the apply the comment offers. Nil
+	// when PR command authorization is off or the reader may run the apply.
+	ApplyAuthorization *ApplyAuthorizationData
+
 	// Unsafe change tracking
 	HasUnsafeChanges bool
 	AllowUnsafe      bool
@@ -754,16 +758,34 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
 		writeApplyInstruction(&sb, applyCmd, data)
+		writeWhoCanApply(&sb, data.Database, data.ApplyAuthorization)
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
+}
+
+// OffersApply reports whether the comment offers `schemabot apply`: the plan
+// has work to run (a change on the primary target, or on another target of a
+// rollout), and nothing withholds the apply instruction (a locked apply, a
+// member apply refusal, or a change the engine refuses). Only a comment that
+// offers an apply shows who can run it, so the handler checks the reader's
+// authorization only then.
+func (d PlanCommentData) OffersApply() bool {
+	return environmentHasWork(&d) && !d.IsLocked && !d.applyFailsOnRefusedChange()
+}
+
+// OffersApply reports whether the comment offers `schemabot apply` for any
+// environment: one has work to run and no refused environment ahead of it
+// withholds its apply. Only then does the footer show who can run it.
+func (d MultiEnvPlanCommentData) OffersApply() bool {
+	return len(sortMultiEnvApplies(d).withChanges) > 0
 }
 
 // writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
 // apply cannot run every target's plan the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
 func writeMemberApplyRefusal(sb *strings.Builder, target, reason string) {
-	reason = escapeInlineMarkdown(strings.Join(strings.Fields(reason), " "))
+	reason = escapeProse(strings.Join(strings.Fields(reason), " "))
 	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: target %s: %s.\n\n", inlineCode(target), reason)
 	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
 }
@@ -793,6 +815,89 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 	}
 	sb.WriteString("▶️ **To apply**, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// ApplyAuthorizationData lists who may run `schemabot apply` for the planned
+// database when PR command authorization is on and the comment's reader may
+// not run it, so the plan comment tells them up front whom to ask, and that a
+// review approval does not let them run it. Nil means PR command authorization
+// is off or the reader may run the apply, and the comment says nothing about
+// it.
+type ApplyAuthorizationData struct {
+	// OperatorPrincipals are the database's own operator teams (org/team) and
+	// users.
+	OperatorPrincipals []string
+	// OtherPrincipals are the deployment-wide and repository admins.
+	OtherPrincipals []string
+}
+
+// writeWhoCanApply writes who may run the apply under the apply instruction.
+// Principals render as inline code rather than @-mentions: the plan comment is
+// posted on every push, and a mention would notify every listed team each time.
+func writeWhoCanApply(sb *strings.Builder, database string, auth *ApplyAuthorizationData) {
+	if auth == nil {
+		return
+	}
+	sb.WriteString("\n")
+	operators, others := auth.OperatorPrincipals, auth.OtherPrincipals
+	if len(operators) == 0 && len(others) == 0 {
+		fmt.Fprintf(sb, "🔐 No team or user can run `schemabot apply` for %s yet. Ask a SchemaBot admin to configure its operators.\n", inlineCode(database))
+		return
+	}
+	fmt.Fprintf(sb, "🔐 %s\n", whoCanApplySentence(database, append(append([]string{}, operators...), others...)))
+	if len(operators) > 0 {
+		fmt.Fprintf(sb, "- Operators: %s\n", principalList(operators))
+	}
+	if len(others) > 0 {
+		fmt.Fprintf(sb, "- Admins: %s\n", principalList(others))
+	}
+}
+
+// whoCanApplySentence says who can run the apply and whom to ask, worded for
+// what principals holds: teams, users, or both, one or several. A principal in
+// org/team form is a team; GitHub logins cannot contain a slash, so anything
+// else is a user.
+func whoCanApplySentence(database string, principals []string) string {
+	teams, users := 0, 0
+	for _, principal := range principals {
+		if strings.Contains(principal, "/") {
+			teams++
+		} else {
+			users++
+		}
+	}
+	noun := func(count int, one, many string) string {
+		if count == 1 {
+			return one
+		}
+		return many
+	}
+	var who, ask string
+	switch {
+	case teams > 0 && users > 0:
+		who = noun(teams, "this team", "these teams") + " and " + noun(users, "this user", "these users")
+		ask = "Ask one of them to run it:"
+	case teams > 0:
+		who = noun(teams, "this team", "these teams")
+		ask = noun(teams, "Ask a member to run it:", "Ask a member of one of them to run it:")
+	default:
+		who = noun(users, "this user", "these users")
+		ask = noun(users, "Ask them to run it:", "Ask one of them to run it:")
+	}
+	return fmt.Sprintf("Only %s can run `schemabot apply` for %s. %s", who, inlineCode(database), ask)
+}
+
+// maxListedPrincipals bounds each who-can-apply line, so a database with a
+// long allowlist cannot grow a footer the comment size budget never trims.
+const maxListedPrincipals = 10
+
+// principalList renders principals as inline code, naming at most
+// maxListedPrincipals and counting the rest.
+func principalList(principals []string) string {
+	if len(principals) <= maxListedPrincipals {
+		return strings.Join(inlineCodeList(principals), ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(inlineCodeList(principals[:maxListedPrincipals]), ", "), len(principals)-maxListedPrincipals)
 }
 
 // unsafeConsent is what an apply of one plan would confirm with
@@ -1009,7 +1114,7 @@ func appendTargetFlag(command, target string) string {
 // writePlanMetadata writes the metadata line for plan comments.
 // Schema name (the schema directory) is shown for MySQL. Vitess uses keyspace headers instead.
 func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
-	parts := []string{fmt.Sprintf("**Database**: `%s`", data.Database)}
+	parts := []string{fmt.Sprintf("**Database**: %s", inlineCode(data.Database))}
 	parts = append(parts, fmt.Sprintf("**Type**: `%s`", schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)))
 	if data.IsMySQL && data.SchemaName != "" {
 		parts = append(parts, fmt.Sprintf("**Schema Name**: %s", inlineCode(data.SchemaName)))
@@ -1018,7 +1123,7 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 		parts = append(parts, fmt.Sprintf("**Target**: %s", inlineCode(data.Target)))
 	}
 	if data.Tenant != "" {
-		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))
+		parts = append(parts, fmt.Sprintf("**Tenant**: %s", inlineCode(data.Tenant)))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 }
@@ -1252,7 +1357,7 @@ func hasExemptTables(groups []ExemptTablesData) bool {
 }
 
 func exemptReason(reason string) string {
-	return escapeInlineMarkdown(SanitizeInlineError(reason))
+	return escapeProse(SanitizeInlineError(reason))
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -2821,9 +2926,9 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 		fmt.Fprintf(sb, "- %s\n", table)
 		return
 	}
-	fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(causes[0]))
+	fmt.Fprintf(sb, "- %s: %s\n", table, escapeProse(causes[0]))
 	for _, cause := range causes[1:] {
-		fmt.Fprintf(sb, "  - %s\n", escapeInlineMarkdown(cause))
+		fmt.Fprintf(sb, "  - %s\n", escapeProse(cause))
 	}
 }
 
@@ -2989,7 +3094,8 @@ func pullRequestRef(commentRepo, repo string, pr int) string {
 // reason: the table, the finding, and the change's attribution note, which a
 // change that creates its table never carries. A change with no parseable reason
 // still gets a line, carrying the engine's change type when one is known so
-// the finding explains itself.
+// the finding explains itself. The table is already Markdown, as
+// unsafeChangeLabel renders it; each reason is rendered here by markdownReason.
 func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) []string {
 	table := unsafeChangeLabel(c)
 	suffix := ""
@@ -3005,7 +3111,7 @@ func unsafeFindingLines(c UnsafeChangeData, attributionNotes map[string]string) 
 	}
 	lines := make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		lines = append(lines, fmt.Sprintf("%s: %s%s", table, ui.CodeQuoteIdentifiers(r), suffix))
+		lines = append(lines, fmt.Sprintf("%s: %s%s", table, markdownReason(r), suffix))
 	}
 	return lines
 }
@@ -3238,7 +3344,7 @@ type lintWarningGroup struct {
 // too many to name inline read as coverage on the line, with their names
 // collapsed beneath it.
 func writeLintLine(sb *strings.Builder, table string, w LintViolationData) {
-	message := ui.CodeQuoteIdentifiers(w.Message)
+	message := markdownReason(w.Message)
 	if label := lintLabel(table, w); label != "" {
 		fmt.Fprintf(sb, "- %s: %s\n", label, message)
 	} else {
@@ -3413,6 +3519,10 @@ type MultiEnvPlanCommentData struct {
 	// the plan. Empty on deployments that configure none, which render an
 	// unchanged comment.
 	AgentHint string
+
+	// ApplyAuthorization lists who may run the applies the comment offers. Nil
+	// when PR command authorization is off or the reader may run the applies.
+	ApplyAuthorization *ApplyAuthorizationData
 
 	// Environments in display order (staging first, production second, etc.)
 	Environments []string
@@ -3636,6 +3746,9 @@ func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool)
 	}
 	if merged.AgentHint == "" {
 		merged.AgentHint = data.AgentHint
+	}
+	if merged.ApplyAuthorization == nil {
+		merged.ApplyAuthorization = data.ApplyAuthorization
 	}
 	return merged, true
 }
@@ -3861,6 +3974,9 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
+	}
+	if len(envsWithChanges) > 0 {
+		writeWhoCanApply(sb, data.Database, data.ApplyAuthorization)
 	}
 
 	for _, env := range envsFailOnRefusedChange {
@@ -4208,7 +4324,7 @@ func environmentHasWork(plan *PlanCommentData) bool {
 // hasChanges returns true if there are any schema changes.
 func hasChanges(changes []KeyspaceChangeData) bool {
 	for _, ks := range changes {
-		if len(ks.Statements) > 0 || ks.VSchemaChanged || ks.Finalize {
+		if keyspaceStatementCount(ks) > 0 || ks.VSchemaChanged || ks.Finalize {
 			return true
 		}
 	}

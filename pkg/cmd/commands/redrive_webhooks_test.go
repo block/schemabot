@@ -2,6 +2,10 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -226,4 +230,105 @@ func TestRunChunkedWebhookRedriveReturnsPartialOnCancel(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	require.Len(t, merged.Results, 1)
 	assert.Equal(t, 3, merged.Results[0].Redelivered, "work completed before cancel is preserved")
+}
+
+// redriveWindowCmd redrives a fixed window for one App, so a test controls
+// every request the command makes.
+func redriveWindowCmd() *RedriveWebhooksCmd {
+	return &RedriveWebhooksCmd{
+		WindowStart: "2026-07-07T19:40:00Z",
+		WindowEnd:   "2026-07-07T19:50:00Z",
+		App:         "production",
+		MaxPages:    10,
+	}
+}
+
+// An operator presses Ctrl-C after the first chunk of a redrive has
+// redelivered deliveries and while the next chunk is waiting on the server.
+// The command says the redrive was canceled, names what it redelivered before
+// the cancel, and exits with the interrupt status, so a script can tell an
+// interrupted redrive from one that failed.
+func TestRedriveWebhooksCancelExitsInterrupted(t *testing.T) {
+	stderr, runErr := cancelRedriveDuringSecondChunk(t, redriveWindowCmd())
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	require.ErrorIs(t, runErr, context.Canceled)
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.Contains(t, stderr, "redrive canceled\napp=production redelivered=3 failed=0 (before cancel)\n")
+}
+
+// An operator presses Ctrl-C part-way through a --dry-run redrive. A dry run
+// redelivers nothing, so the command says the redrive was canceled without
+// printing redelivery counts that would read as work done, and exits with the
+// interrupt status.
+func TestRedriveWebhooksDryRunCancelPrintsNoRedeliveryCounts(t *testing.T) {
+	cmd := redriveWindowCmd()
+	cmd.DryRun = true
+
+	stderr, runErr := cancelRedriveDuringSecondChunk(t, cmd)
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	require.ErrorIs(t, runErr, context.Canceled)
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.Contains(t, stderr, "redrive canceled\n")
+	assert.NotContains(t, stderr, "(before cancel)")
+}
+
+// cancelRedriveDuringSecondChunk runs cmd against a server that answers the
+// first chunk with three redeliveries and more work pending, presses the
+// operator's Ctrl-C while the second chunk is waiting on the server, and
+// returns the command's stderr and the error it ended with.
+func cancelRedriveDuringSecondChunk(t *testing.T, cmd *RedriveWebhooksCmd) (stderr string, runErr error) {
+	t.Helper()
+	hold := newHoldingHandler(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/webhooks/redrive", r.URL.Path)
+		// The server notices the client hanging up only once the body is read.
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		var req apitypes.WebhookRedriveRequest
+		assert.NoError(t, json.Unmarshal(body, &req))
+		if req.Cursor != "" {
+			hold.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(apitypes.WebhookRedriveResponse{Results: []apitypes.WebhookRedriveResult{{
+			AppName:     "production",
+			Pages:       1,
+			Redelivered: 3,
+			NextCursor:  "page-2",
+		}}}))
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	stderr = captureStderr(t, func() {
+		go func() { done <- cmd.Run(ctx, &Globals{Endpoint: server.URL}) }()
+		awaitSignal(t, hold.inFlight, "the second redrive chunk to reach the server")
+		cancel()
+		runErr = awaitSignal(t, done, "the canceled redrive to end")
+	})
+	return stderr, runErr
+}
+
+// A redrive the server refuses is a failure, not an interrupt, and exits 1.
+func TestRedriveWebhooksServerErrorExitsOne(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/webhooks/redrive", r.URL.Path)
+		http.Error(w, "list deliveries failed", http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+
+	var runErr error
+	captureStderr(t, func() {
+		runErr = redriveWindowCmd().Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.Error(t, runErr)
+	assert.NotErrorIs(t, runErr, ErrSilent)
+	assert.Contains(t, runErr.Error(), "list deliveries failed")
+	assert.Equal(t, 1, ExitCodeFor(runErr))
 }

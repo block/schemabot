@@ -193,6 +193,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	commentData.DeploymentDrift = driftPreview
 	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, environment)
+	if commentData.OffersApply() {
+		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
+	}
 
 	// Store per-database check record and update aggregate
 	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, drift)
@@ -250,6 +253,9 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 	commentData.ScopedDatabase = databaseName
 	commentData.Target = target
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
+	if commentData.OffersApply() {
+		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
+	}
 	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
 		Database:         schemaResult.Database,
 		DatabaseType:     schemaResult.Type,
@@ -736,7 +742,6 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			multiEnvData.IsMySQL = db.Type == storage.DatabaseTypeMySQL
 		}
 	}
-
 	// Update aggregate check once after all environments are planned.
 	// If all environments errored, no plan stored a row and headSHA is empty;
 	// the PR's head stands in, so the failures still reach the gate instead of
@@ -872,6 +877,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		h.logger.Info("auto-plan: no changes, errors, or drift detected; posting the no-changes plan comment to supersede the plan comment from a prior head",
 			"repo", repo, "pr", pr, "database", slot.Database,
 			"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA)
+	}
+
+	// Who can apply is read only once the comment is certain to post, so a
+	// refresh that keeps the visible comment makes no team lookups.
+	if multiEnvData.OffersApply() {
+		multiEnvData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, multiEnvData.Database, h.planCommentReader(ctx, client, repo, pr, requestedBy))
 	}
 
 	// Post a single combined comment

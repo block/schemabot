@@ -61,6 +61,18 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("MarkDeletedPreservesStamp", func(t *testing.T) { testPostgresMarkDeletedPreservesStamp(t, h) })
 	t.Run("LockUpdatedAtAdvances", func(t *testing.T) { testPostgresLockUpdatedAtAdvances(t, h) })
 	t.Run("LockAcquireSameOwnerConcurrent", func(t *testing.T) { testPostgresLockAcquireSameOwnerConcurrent(t, h) })
+	t.Run("LockAcquireInsertRaceReleasedBeforeReread", func(t *testing.T) {
+		testLockAcquireInsertRaceReleasedBeforeReread(t, func(t *testing.T, b func(binder) binder) *lockStore {
+			t.Helper()
+			return &lockStore{db: newRebindDB(h.db, b(PostgresDialect{})), dialect: PostgresDialect{}, identity: PostgresDialect{}, classifier: NewPostgresErrorClassifier()}
+		}, func(t *testing.T) { clearPostgresTables(t, h.db) })
+	})
+	t.Run("LockAcquireInsertRetryOutcomes", func(t *testing.T) {
+		testLockAcquireInsertRetryOutcomes(t, func(t *testing.T, b func(binder) binder) *lockStore {
+			t.Helper()
+			return &lockStore{db: newRebindDB(h.db, b(PostgresDialect{})), dialect: PostgresDialect{}, identity: PostgresDialect{}, classifier: NewPostgresErrorClassifier()}
+		}, func(t *testing.T) { clearPostgresTables(t, h.db) })
+	})
 	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
 	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
@@ -80,6 +92,17 @@ func TestPostgresStorageParity(t *testing.T) {
 			clearPostgresTables(t, h.db)
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db), postgresAdvisoryLockWaiter(h.db))
+	})
+	t.Run("ApplyTargetLockPrecedesApplyRowLocks", func(t *testing.T) {
+		testApplyTargetLockPrecedesApplyRowLocks(t, func(t *testing.T, locker namedlock.Locker) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			dialect := PostgresDialect{}
+			return NewWithDependencies(Dependencies{
+				DB: h.db, Binder: dialect, Dialect: dialect, Identity: dialect,
+				Locker: locker, Classifier: NewPostgresErrorClassifier(),
+			})
+		}, namedlock.Postgres{}, postgresApplyRowLocks(h.db))
 	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
 	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })

@@ -553,6 +553,83 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, 1, charged.Attempt, "the redispatch charges the parent's retry budget")
 	})
 
+	// Marking a stale apply retryable records why. An over-long reason is
+	// stored cut to fit, on the apply and on its operation alike, so the move
+	// lands instead of being refused.
+	t.Run("MarkStaleApplyRetryable_StoresAnOverLongReasonCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_long_db", storage.DatabaseTypeMySQL)
+		apply, op := createStaleRunningApplyWithOperation(t, store, lock, "apply_stale_retryable_long", 9425)
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID:      apply.ID,
+			OperationID:  op.ID,
+			ErrorMessage: overLongFailureMessage,
+		})
+		require.NoError(t, err)
+		require.True(t, moved, "a stale apply marked retryable with a long reason moves")
+
+		marked, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, marked)
+		assert.Equal(t, state.Apply.FailedRetryable, marked.State)
+		assertStoredMessage(t, overLongFailureMessageStored, marked.ErrorMessage, "the apply's reason is cut")
+		markedOp, err := store.ApplyOperations().Get(ctx, op.ID)
+		require.NoError(t, err)
+		require.NotNil(t, markedOp)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, markedOp.State)
+		assertStoredMessage(t, overLongFailureMessageStored, markedOp.ErrorMessage, "the operation's reason is cut")
+	})
+
+	// An apply created already carrying a failure, and the projection that
+	// derives the parent's state from its operations, store an over-long
+	// failure cut to fit rather than refusing the row.
+	t.Run("FailureMessage_PastColumnWidth_OnCreateAndDerivedState_IsCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_long_failure_create_db", storage.DatabaseTypeMySQL)
+		newFailedApply := func(identifier string, planID int64) *storage.Apply {
+			return &storage.Apply{
+				ApplyIdentifier: identifier,
+				LockID:          lock.ID,
+				PlanID:          planID,
+				Database:        lock.DatabaseName,
+				DatabaseType:    lock.DatabaseType,
+				Environment:     "staging",
+				Engine:          storage.EngineForType(lock.DatabaseType),
+				State:           state.Apply.Failed,
+				ErrorMessage:    overLongFailureMessage,
+			}
+		}
+
+		created := newFailedApply("apply_long_failure_create", 9430)
+		createdID, err := store.Applies().Create(ctx, created)
+		require.NoError(t, err, "an apply created with a long failure message is stored")
+		got, err := store.Applies().Get(ctx, createdID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assertStoredMessage(t, overLongFailureMessageStored, got.ErrorMessage, "the create cuts the message")
+
+		withTasks := newFailedApply("apply_long_failure_create_tasks", 9431)
+		withTasksID, err := store.Applies().CreateWithTasks(ctx, withTasks, []*storage.Task{newTask(withTasks, "task_long_failure_create_tasks", "users", time.Now())})
+		require.NoError(t, err, "an apply created with its tasks and a long failure message is stored")
+		got, err = store.Applies().Get(ctx, withTasksID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assertStoredMessage(t, overLongFailureMessageStored, got.ErrorMessage, "the create with tasks cuts the message")
+
+		derived := CreateApplyWithStateAndEnv(t, store, lock, "apply_long_failure_derived", 9432, state.Apply.Running, "staging")
+		swapped, err := store.Applies().UpdateDerivedState(ctx, derived.ID, derived.State, state.Apply.Failed, overLongFailureMessage, nil, nil)
+		require.NoError(t, err, "a derived failure with a long message is stored")
+		require.True(t, swapped)
+		got, err = store.Applies().Get(ctx, derived.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, state.Apply.Failed, got.State)
+		assertStoredMessage(t, overLongFailureMessageStored, got.ErrorMessage, "the derived state cuts the message")
+	})
+
 	t.Run("MarkStaleApplyRetryable_LeavesBothRowsWhenTheOperationTokenMoved", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

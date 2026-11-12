@@ -631,9 +631,11 @@ ESC detach • s stop
 
 The live view refreshes until completion or a state that needs your decision.
 It includes rows copied, ETA when available, and the reason for throttling.
-Press **Esc** to detach while copying; the apply keeps running. **s** requests
-a stop for this MySQL example. At deferred cutover, **Enter** requests the
-swap. During cutover, the watcher asks you to wait and disables Esc/stop.
+Press **Esc** to detach while copying; the apply keeps running and the
+command exits 130, the status that tells a script the watch ended without an
+outcome. **s** requests a stop for this MySQL example. At deferred cutover,
+**Enter** requests the swap. During cutover, the watcher asks you to wait and
+disables Esc/stop.
 
 For progress bar colors, phase labels, and keyboard controls, see the
 [progress display reference](#progress-display-reference).
@@ -1072,6 +1074,27 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
+are. Each says on stderr that it was canceled and exits 130, the status a
+shell reports for an interrupted process, so a script can tell an interrupted
+run from one that failed or left findings. Exit 130 is the only mark of a
+report that was cut short; the JSON output has no field for it.
+
+What an interrupted run reports depends on where it stopped:
+
+- `checks backfill` interrupted during its scan, with or without `--dry-run`,
+  prints no report. What the scan had found so far is discarded.
+- `checks backfill` interrupted while recreating checks prints its report with
+  the outcomes it received. A PR with no outcome was either not reached or was
+  in the batch the interrupt cut off.
+- `webhooks redrive` prints the redelivery counts from the chunks that
+  completed, and prints none under `--dry-run`.
+
+Treat those outcomes and counts as a lower bound: the server may have finished
+part of the request that was in flight. Checks already recreated and
+deliveries already redelivered are not undone. Run `checks backfill` again to
+finish the sweep; it only acts on PRs whose Check Runs are still missing.
+
 An `--all-repos` sweep skips a declared repository the server's GitHub App is
 not installed on, names it, and keeps scanning the rest. The skip still makes
 the run exit nonzero, because that repository was never read. Any other scan
@@ -1308,8 +1331,10 @@ reaches a final state. It exits 0 only when the apply completed, and non-zero
 when it was stopped, failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. For a stopped apply the error
 names the `start` command that resumes it. The interactive watcher follows
-the same exit rule once the apply ends, and exits 0 when you detach with Esc
-while the apply is still running. A watcher that cannot reach the server
+the same exit rule once the apply ends, and exits 130, the status a Ctrl-C
+ends a log watch with, when you leave it while the apply is still running:
+with Esc, q, or Ctrl-C, with a SIGINT or SIGTERM sent to the process, or
+before its first poll has answered. A watcher that cannot reach the server
 retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to

@@ -332,7 +332,12 @@ content, DDL fences drawing on a budget shared across the comment, and the code 
 an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —
 table, namespace, keyspace, shard, schema path, database, check name — flattened to one line and
 delimited past any backtick run inside it (`pkg/webhook/templates/fence.go`, exercised across
-its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`); the Check Run
+its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`), and the prose
+escaper that writes a mention as code and a character reference as text (`escapeProse` in
+`pkg/webhook/templates/fence.go`), applied to a lint or unsafe change reason that quotes such
+names outside any code span (`markdownReason`, also there) and to engine reasons, exempt-table
+reasons, per-deployment apply refusals, and throttle reasons
+(`pkg/webhook/templates/plan.go`, `pkg/webhook/templates/apply.go`); the Check Run
 summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
 clamp (`pkg/webhook/plan_drift.go`); the log-text sanitizer applied to every line, level, and
 group heading in the failed-summary log fold (`pkg/webhook/templates/failure_logs.go`); the
@@ -1147,8 +1152,15 @@ admitted after that result and before the correction lands is recorded active be
 rollout. *Enforced:* the exclusivity check in the storage apply create and activate paths, over
 active parents and over terminal parents with an operation in progress
 (`checkNoActiveApplyForTargets`, `checkNoInProgressRolloutForTargets`), under the apply target lock
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`). The
-admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` and
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`). The order
+of that lock before any apply row is checked by `TestApplyTargetLockPrecedesApplyRowLocks`
+(`pkg/storage/internal/sqlstore/target_lock_order_test.go`, on both dialects), which drives every
+entry point that takes the lock and refuses the lock while any transaction holds an apply row, on
+the branches its cases drive, and `TestApplyTargetLockAcquirersAreListed`
+(`pkg/storage/internal/sqlstore/target_lock_acquirers_test.go`), which walks the package's call
+graph, following interface calls to the package's own implementations, so a new exported entry
+point that reaches the lock fails until the first test drives it. The admission past a settled
+manifest hold is `checkNoActiveApplyForNewGeneration` and
 `settledManifestHold`, which record the handoff in the create's transaction (`markAdmittedPast`);
 `activeApplyHoldersForTargets` stops counting the held apply once it carries the handoff, and
 `AttachOperationWithTasks` refuses an attach to it, all in the same file. The same create

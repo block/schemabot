@@ -96,6 +96,12 @@ type Engine struct {
 	// that window deterministically.
 	stopCheckpointWindow func()
 
+	// dropTargetSeenWindow is a test seam invoked between the quarantine
+	// seeing a DROP TABLE target on the target database and noting which
+	// recorded copies of it are already in pending drops, so tests can change
+	// either one in that window deterministically.
+	dropTargetSeenWindow func()
+
 	// sizeProbeFault is a test seam invoked with the plan-time size probe's
 	// context when the probe starts. A non-nil error fails the probe, so tests
 	// can prove a failed or slow probe never fails or stalls a plan.

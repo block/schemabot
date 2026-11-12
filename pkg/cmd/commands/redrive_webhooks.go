@@ -2,7 +2,6 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -65,8 +64,8 @@ func (cmd *RedriveWebhooksCmd) Run(ctx context.Context, g *Globals) error {
 		updateProgress(redriveProgressLine(r, windowStart, windowEnd, cmd.DryRun))
 	})
 	stopProgress()
-	if errors.Is(err, context.Canceled) {
-		return reportWebhookRedriveCanceled(merged, cmd.DryRun)
+	if endedByInterrupt(ctx, err) {
+		return reportWebhookRedriveCanceled(ctx, merged, cmd.DryRun)
 	}
 	if err != nil {
 		return err
@@ -75,16 +74,16 @@ func (cmd *RedriveWebhooksCmd) Run(ctx context.Context, g *Globals) error {
 }
 
 // reportWebhookRedriveCanceled prints what the redrive completed before the
-// operator interrupted it, then returns ErrSilent so the CLI exits non-zero
-// without a raw "context canceled" error line.
-func reportWebhookRedriveCanceled(partial *apitypes.WebhookRedriveResponse, dryRun bool) error {
+// operator interrupted it, then returns a silent error so the CLI exits with
+// the interrupt status without a raw "context canceled" error line.
+func reportWebhookRedriveCanceled(ctx context.Context, partial *apitypes.WebhookRedriveResponse, dryRun bool) error {
 	fmt.Fprintln(os.Stderr, "redrive canceled")
 	if partial != nil && !dryRun {
 		for _, result := range partial.Results {
 			fmt.Fprintf(os.Stderr, "app=%s redelivered=%d failed=%d (before cancel)\n", result.AppName, result.Redelivered, result.Failed)
 		}
 	}
-	return ErrSilent
+	return interrupted(ctx)
 }
 
 // redriveProgressLine summarizes one app's crawl so far: how far back through

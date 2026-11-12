@@ -151,8 +151,9 @@ func escapeMarkdownLinkText(text string) string {
 }
 
 // escapeInlineMarkdown backslash-escapes the characters that can change how
-// engine-influenced text renders inside an inline markdown span: emphasis and
-// code delimiters, link brackets, HTML tag openers, and table separators. A
+// engine-influenced text renders inside an inline markdown span: emphasis,
+// strikethrough and code delimiters, link brackets, HTML tag openers, the
+// ampersand that starts a character reference, and table separators. A
 // backslash-escaped pipe renders as a literal pipe in GFM both inside and
 // outside tables, while sites that replace pipes with slashes predate this
 // escape. Use it when untrusted text is interpolated into styled inline
@@ -163,7 +164,7 @@ func escapeInlineMarkdown(text string) string {
 	b.Grow(len(text))
 	for _, r := range text {
 		switch r {
-		case '\\', '`', '*', '_', '[', ']', '<', '|':
+		case '\\', '`', '*', '_', '~', '[', ']', '<', '&', '|':
 			b.WriteByte('\\')
 		}
 		b.WriteRune(r)
@@ -484,9 +485,9 @@ func escapeRelativeTimeDatetime(timestamp string) string {
 // writeDBEnvLine writes the **Database** | **Environment** metadata line.
 func writeDBEnvLine(sb *strings.Builder, database, environment string) {
 	if environment != "" {
-		fmt.Fprintf(sb, "**Database**: `%s` | **Environment**: `%s`\n", database, environment)
+		fmt.Fprintf(sb, "**Database**: %s | **Environment**: %s\n", inlineCode(database), inlineCode(environment))
 	} else {
-		fmt.Fprintf(sb, "**Database**: `%s`\n", database)
+		fmt.Fprintf(sb, "**Database**: %s\n", inlineCode(database))
 	}
 }
 
@@ -494,5 +495,5 @@ func writeDBLine(sb *strings.Builder, database string) {
 	if database == "" {
 		return
 	}
-	fmt.Fprintf(sb, "**Database**: `%s`\n", database)
+	fmt.Fprintf(sb, "**Database**: %s\n", inlineCode(database))
 }

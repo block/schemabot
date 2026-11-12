@@ -509,6 +509,64 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-who-can-apply"></a><strong>MySQL Plan (Who Can Apply)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Started at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+🔐 Only these teams and this user can run `schemabot apply` for `testapp`. Ask one of them to run it:
+- Operators: `acme/testapp-operators`
+- Admins: `acme/db-admins`, `jdoe`
+
+</details>
+
+<details>
 <summary><a name="postgres-plan-exempt-tables"></a><strong>Postgres Plan (Exempt Tables)</strong></summary>
 
 
@@ -549,7 +607,7 @@ schemabot apply -e staging
 
 ✅ **No schema changes detected**
 
-ℹ️ Ignored tables in namespace `testapp` (ignore\_tables): `flyway_schema_history`
+ℹ️ Ignored tables in namespace `testapp` (ignore_tables): `flyway_schema_history`
 
 
 </details>
@@ -857,7 +915,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
-- `users`: the table has ~1,240 rows
+- `users`: the table has \~1,240 rows
 
 Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.
 
@@ -10252,6 +10310,52 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ---
 
 ▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="multienv-plan-changes-only-on-shards"></a><strong>Multi-env Plan: Changes Only On Shards</strong></summary>
+
+
+## Schema Change Plan
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### Staging
+
+#### Keyspace: `cdb_resolute_sharded`
+**shards `-80`, `80-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: **1** table to alter
+
+### Production
+
+#### Keyspace: `cdb_resolute_sharded`
+**shards `-40`, `40-80`, `80-c0`, `c0-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: **1** table to alter
+
+---
+
+▶️ **To apply** these changes, start with the first environment:
+```
+schemabot apply -e staging
+```
+
+After verifying staging, apply to production:
 ```
 schemabot apply -e production
 ```

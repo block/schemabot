@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
@@ -523,6 +526,9 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		wantNoReads bool
 		wantLog     string
 		wantLevel   string
+		// wantPermissionHint is the permission_hint the outcome log carries;
+		// "" asserts it carries none.
+		wantPermissionHint string
 	}{
 		{name: "a deploy request PlanetScale refused is closed and its branch deleted",
 			createdDR: refused, reread: refused, wantCloses: []uint64{91}, wantDelete: "deleted",
@@ -564,6 +570,10 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		{name: "a failed branch delete is logged for manual cleanup",
 			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: errors.New("branch delete refused"), wantCloses: []uint64{91}, wantDelete: "failed",
 			wantLog: "failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota", wantLevel: "ERROR"},
+		{name: "a branch delete refused as unauthorized says what to check on the service token",
+			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: unauthorizedBranchDelete(t), wantCloses: []uint64{91}, wantDelete: "failed",
+			wantLog: "failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota", wantLevel: "ERROR",
+			wantPermissionHint: unauthorizedBranchDeleteHint},
 		{name: "a drive that ends after the deploy request leaves both for the driver that takes over",
 			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, recorded: true, wantNoReads: true,
 			wantLog: "drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply", wantLevel: "INFO"},
@@ -650,6 +660,11 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 			assert.Equal(t, tt.wantLevel, record["level"])
 			assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
 			assert.Equal(t, float64(91), record["deploy_request"])
+			if tt.wantPermissionHint != "" {
+				assert.Equal(t, tt.wantPermissionHint, record["permission_hint"])
+			} else {
+				assert.NotContains(t, record, "permission_hint")
+			}
 		})
 	}
 }
@@ -857,28 +872,125 @@ func TestApply_LeaseLostDuringTheDeleteOfARecordedBranchAbandonsIt(t *testing.T)
 	assert.Equal(t, created[0], record["branch"])
 }
 
+// unauthorizedBranchDeleteHint is what a branch delete PlanetScale refused as
+// unauthorized tells the operator to check.
+const unauthorizedBranchDeleteHint = "PlanetScale refused the delete as unauthorized; check that the service token is valid and has the delete_branch permission on this database"
+
+// unauthorizedBranchDeleteMessage is the response text of that refusal.
+const unauthorizedBranchDeleteMessage = "You are not authorized to perform this action"
+
+// branchDeleteErrorFromAPI returns the error the PlanetScale SDK builds from
+// a branch delete the API answered with status and body.
+func branchDeleteErrorFromAPI(t *testing.T, status int, body string) error {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := psclient.NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+	err = client.DeleteBranch(t.Context(), &ps.DeleteDatabaseBranchRequest{
+		Organization: "org", Database: "commerce", Branch: "schemabot-commerce-1a2b",
+	})
+	require.Error(t, err)
+	return err
+}
+
+// unauthorizedBranchDelete returns the SDK's error for a branch delete
+// PlanetScale refused as unauthorized.
+func unauthorizedBranchDelete(t *testing.T) error {
+	t.Helper()
+	return branchDeleteErrorFromAPI(t, http.StatusUnauthorized, `{"code":"unauthorized","message":"`+unauthorizedBranchDeleteMessage+`"}`)
+}
+
+// A failed branch delete tells the operator to check the service token only
+// when PlanetScale refused it as unauthorized, which it answers with either a
+// 401 or a 403. A delete that failed any other way, including a 403 that is
+// not an unauthorized refusal, logs its error alone, so the hint never sends
+// an operator to the token for a failure the token did not cause.
+func TestBranchDeleteFailureAttrsHintOnlyOnAnUnauthorizedRefusal(t *testing.T) {
+	unauthorized := `{"code":"unauthorized","message":"` + unauthorizedBranchDeleteMessage + `"}`
+	tests := []struct {
+		name     string
+		err      error
+		wantHint bool
+	}{
+		{name: "a 401 unauthorized refusal", err: branchDeleteErrorFromAPI(t, http.StatusUnauthorized, unauthorized), wantHint: true},
+		{name: "a 403 unauthorized refusal", err: branchDeleteErrorFromAPI(t, http.StatusForbidden, unauthorized), wantHint: true},
+		{name: "an unauthorized refusal a caller wrapped", err: fmt.Errorf("delete branch: %w", unauthorizedBranchDelete(t)), wantHint: true},
+		{name: "a 403 with another code", err: branchDeleteErrorFromAPI(t, http.StatusForbidden, `{"code":"forbidden","message":"Forbidden"}`)},
+		{name: "a 400 bad request", err: branchDeleteErrorFromAPI(t, http.StatusBadRequest, `{"code":"bad_request","message":"Bad request"}`)},
+		{name: "a 422 unprocessable", err: branchDeleteErrorFromAPI(t, http.StatusUnprocessableEntity, `{"code":"unprocessable","message":"Branch is busy"}`)},
+		{name: "a 500 internal error", err: branchDeleteErrorFromAPI(t, http.StatusInternalServerError, `{"code":"internal_server_error","message":"Internal error"}`)},
+		{name: "an SDK internal error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrInternal})},
+		{name: "an SDK invalid error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrInvalid})},
+		{name: "an SDK retry error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrRetry})},
+		{name: "an SDK malformed response error", err: fmt.Errorf("delete branch: %w", &ps.Error{Code: ps.ErrResponseMalformed})},
+		{name: "an error that is not from the SDK", err: errors.New("context deadline exceeded")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attrs := BranchDeleteFailureAttrs(tt.err)
+			if tt.wantHint {
+				assert.Equal(t, []any{"error", tt.err, "permission_hint", unauthorizedBranchDeleteHint}, attrs)
+				return
+			}
+			assert.Equal(t, []any{"error", tt.err}, attrs)
+		})
+	}
+}
+
 // A branch the reclaim could not delete is still against quota, so the failure
 // is logged at error level with everything an operator needs to find the apply
 // and delete the branch by hand: the apply, the organization, the PlanetScale
-// database, the branch, and the failure that ended the drive.
+// database, the branch, and the failure that ended the drive. A delete
+// PlanetScale refused as unauthorized also says what to check on the service
+// token, so the operator knows where to look.
 func TestReclaimBranchAfterFailedResume_LogsAFailedDeleteForTriage(t *testing.T) {
-	var logs bytes.Buffer
-	client := &resumeReclaimClient{deleteErr: errors.New("branch delete refused")}
-	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-commerce-1a2b"}, "apply-1a2b3c4d5e6f7890")
-	req.Logger = slog.New(slog.NewJSONHandler(&logs, nil)).With("apply_id", "apply-1a2b3c4d5e6f7890")
-	cause := engine.NewPermanentError("apply keyspace commerce: vschema rejected")
+	tests := []struct {
+		name      string
+		deleteErr error
+		wantError string
+		// wantPermissionHint is the permission_hint the log carries; ""
+		// asserts it carries none.
+		wantPermissionHint string
+	}{
+		{name: "a delete that fails for another reason names no permission",
+			deleteErr: errors.New("branch delete refused"), wantError: "branch delete refused"},
+		{name: "a delete refused as unauthorized says what to check on the service token",
+			deleteErr: unauthorizedBranchDelete(t), wantError: unauthorizedBranchDeleteMessage,
+			wantPermissionHint: unauthorizedBranchDeleteHint},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			client := &resumeReclaimClient{deleteErr: tt.deleteErr}
+			req := resumeRequest(t, &psMetadata{BranchName: "schemabot-commerce-1a2b"}, "apply-1a2b3c4d5e6f7890")
+			req.Logger = slog.New(slog.NewJSONHandler(&logs, nil)).With("apply_id", "apply-1a2b3c4d5e6f7890")
+			cause := engine.NewPermanentError("apply keyspace commerce: vschema rejected")
 
-	conformanceEngine(client).reclaimBranchAfterFailedResume(t.Context(), client, "org", req, "schemabot-commerce-1a2b", cause)
+			conformanceEngine(client).reclaimBranchAfterFailedResume(t.Context(), client, "org", req, "schemabot-commerce-1a2b", cause)
 
-	var record map[string]any
-	require.NoError(t, json.Unmarshal(logs.Bytes(), &record), "exactly one log line: %s", logs.String())
-	assert.Equal(t, "ERROR", record["level"])
-	assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
-	assert.Equal(t, "org", record["organization"])
-	assert.Equal(t, "testdb", record["planetscale_database"])
-	assert.Equal(t, "schemabot-commerce-1a2b", record["branch"])
-	assert.Equal(t, "apply keyspace commerce: vschema rejected", record["apply_error"])
-	assert.Equal(t, "branch delete refused", record["error"])
+			var record map[string]any
+			require.NoError(t, json.Unmarshal(logs.Bytes(), &record), "exactly one log line: %s", logs.String())
+			assert.Equal(t, "ERROR", record["level"])
+			assert.Equal(t, "failed to delete the branch left behind by a failed apply; delete it manually to reclaim branch quota", record["msg"])
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
+			assert.Equal(t, "org", record["organization"])
+			assert.Equal(t, "testdb", record["planetscale_database"])
+			assert.Equal(t, "schemabot-commerce-1a2b", record["branch"])
+			assert.Equal(t, "apply keyspace commerce: vschema rejected", record["apply_error"])
+			assert.Equal(t, tt.wantError, record["error"])
+			if tt.wantPermissionHint != "" {
+				assert.Equal(t, tt.wantPermissionHint, record["permission_hint"])
+			} else {
+				assert.NotContains(t, record, "permission_hint")
+			}
+		})
+	}
 }
 
 // A Vitess drive fails the apply for good on any engine error, classified or
@@ -1493,6 +1605,8 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 		wantReclaimed []string
 		wantKept      []string
 		wantErr       string
+		// wantKeptReason, when set, is the exact reason a kept branch carries.
+		wantKeptReason string
 	}{
 		{
 			name: "a branch with no deploy request is deleted", meta: &psMetadata{BranchName: ownedBranch},
@@ -1509,7 +1623,14 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 		{
 			name: "a delete that fails reports the branch as left in place", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: errors.New("planetscale unavailable"),
 			wantAttempts: []string{ownedBranch}, wantKept: []string{"branch " + ownedBranch},
-			wantErr: "delete branch " + ownedBranch + " of the cancelled apply on commerce: planetscale unavailable",
+			wantErr:        "delete branch " + ownedBranch + " of the cancelled apply on commerce: planetscale unavailable",
+			wantKeptReason: "the delete failed; delete it by hand to reclaim branch quota",
+		},
+		{
+			name: "a delete refused as unauthorized says what to check on the service token", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: unauthorizedBranchDelete(t),
+			wantAttempts: []string{ownedBranch}, wantKept: []string{"branch " + ownedBranch},
+			wantErr:        "delete branch " + ownedBranch + " of the cancelled apply on commerce: " + unauthorizedBranchDeleteMessage,
+			wantKeptReason: unauthorizedBranchDeleteHint + ", then delete the branch by hand to reclaim branch quota",
 		},
 	}
 	for _, tt := range tests {
@@ -1535,6 +1656,9 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 			assert.Equal(t, tt.wantReclaimed, result.Reclaimed)
 			assert.Equal(t, tt.wantKept, result.Kept)
 			assert.Equal(t, len(tt.wantKept) > 0, result.KeptReason != "", "a kept branch carries its reason")
+			if tt.wantKeptReason != "" {
+				assert.Equal(t, tt.wantKeptReason, result.KeptReason)
+			}
 		})
 	}
 
