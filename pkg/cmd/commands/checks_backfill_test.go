@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -785,18 +786,22 @@ func TestChecksBackfillCancelWhileListingReposExitsInterrupted(t *testing.T) {
 	assert.Empty(t, output)
 }
 
-// An operator presses Ctrl-C while a backfill is recreating Check Runs: the
-// first batch of PRs has its outcomes and the second batch is waiting on the
-// server. The command says the backfill was canceled and still prints the
-// report, with the outcome of every PR it heard back about and none for the PR
-// the interrupt cut off, then exits with the interrupt status.
-func TestChecksBackfillCancelWhileRecreatingChecksPrintsPartialReport(t *testing.T) {
-	hold := newHoldingHandler(t)
-	const prCount = checksSynthesizeBatchSize + 1
+// checksBackfillRecreateServer scans prCount missing-check PRs in one page and
+// answers every synthesize batch with "created 1 Check Run", except that a
+// batch for which holdBatch returns true is held open on hold. It records the
+// first PR of every synthesize batch it received.
+func checksBackfillRecreateServer(t *testing.T, prCount int, hold *holdingHandler, holdBatch func(prs []int) bool) (*httptest.Server, func() []int) {
+	t.Helper()
 	missing := make([]apitypes.MissingCheckPR, 0, prCount)
 	for pr := 1; pr <= prCount; pr++ {
-		missing = append(missing, apitypes.MissingCheckPR{Number: pr, MissingNames: []string{"SchemaBot (production)"}})
+		missing = append(missing, apitypes.MissingCheckPR{
+			Number:       pr,
+			URL:          "https://github.com/octo/repo/pull/" + strconv.Itoa(pr),
+			MissingNames: []string{"SchemaBot (production)"},
+		})
 	}
+	var mu sync.Mutex
+	var batchStarts []int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The server notices the client hanging up only once the body is read.
 		body, err := io.ReadAll(r.Body)
@@ -813,7 +818,10 @@ func TestChecksBackfillCancelWhileRecreatingChecksPrintsPartialReport(t *testing
 		case "/api/checks/synthesize":
 			var req apitypes.ChecksSynthesizeRequest
 			assert.NoError(t, json.Unmarshal(body, &req))
-			if len(req.PRs) < checksSynthesizeBatchSize {
+			mu.Lock()
+			batchStarts = append(batchStarts, req.PRs[0])
+			mu.Unlock()
+			if holdBatch(req.PRs) {
 				hold.ServeHTTP(w, r)
 				return
 			}
@@ -828,6 +836,139 @@ func TestChecksBackfillCancelWhileRecreatingChecksPrintsPartialReport(t *testing
 		}
 	}))
 	t.Cleanup(server.Close)
+	return server, func() []int {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(batchStarts)
+	}
+}
+
+// An operator presses Ctrl-C while a backfill is recreating Check Runs: the
+// first batch of PRs has its outcomes, the second batch is waiting on the
+// server, and the third was never sent. The command says the backfill was
+// canceled and still prints the report, marked as interrupted. Every PR it
+// heard back about keeps its outcome; the PR the interrupt cut off and every
+// PR after it read "not confirmed", since the server may have acted on the
+// batch in flight. It then exits with the interrupt status.
+func TestChecksBackfillCancelWhileRecreatingChecksPrintsPartialReport(t *testing.T) {
+	hold := newHoldingHandler(t)
+	const prCount = 2*checksSynthesizeBatchSize + 1
+	server, batchStarts := checksBackfillRecreateServer(t, prCount, hold, func(prs []int) bool { return prs[0] != 1 })
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h", JSON: true}
+
+	output, stderr, runErr := cancelBackfillOnceHeld(t, cmd, server, hold.inFlight)
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	require.ErrorIs(t, runErr, context.Canceled)
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.Equal(t, "checks backfill canceled\n", stderr)
+	assert.Equal(t, []int{1, checksSynthesizeBatchSize + 1}, batchStarts(), "the third batch is never sent")
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report))
+	assert.True(t, report.Interrupted)
+	require.Len(t, report.Actions, prCount)
+	for _, action := range report.Actions[:checksSynthesizeBatchSize] {
+		assert.Equal(t, "created 1 Check Run", action.Outcome, "PR %d was recreated before the interrupt", action.PR)
+	}
+	for _, action := range report.Actions[checksSynthesizeBatchSize:] {
+		assert.Equal(t, checksBackfillUnconfirmedStatus, action.Outcome, "PR %d was never answered", action.PR)
+		assert.Empty(t, action.Error)
+	}
+}
+
+// The same interrupt in the text report: the PRs the server answered show
+// their outcome, every other PR reads "not confirmed", and a line under the
+// headline says the run was interrupted and how to finish it.
+func TestChecksBackfillCancelWhileRecreatingChecksMarksTheTextReport(t *testing.T) {
+	hold := newHoldingHandler(t)
+	const prCount = checksSynthesizeBatchSize + 1
+	server, _ := checksBackfillRecreateServer(t, prCount, hold, func(prs []int) bool { return prs[0] != 1 })
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h"}
+
+	output, stderr, runErr := cancelBackfillOnceHeld(t, cmd, server, hold.inFlight)
+
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.True(t, strings.HasSuffix(stderr, "checks backfill canceled\n"), stderr)
+	lines := strings.Split(output, "\n")
+	require.GreaterOrEqual(t, len(lines), 2)
+	assert.Equal(t, "Scanned 11 open PRs in octo/repo for SchemaBot (production).", lines[0])
+	assert.Equal(t, checksBackfillInterruptedRecreateNote, lines[1])
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/1", "SchemaBot (production)", "created 1 Check Run"},
+		renderedCells(lineContaining(t, output, "/pull/1 ")))
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/11", "SchemaBot (production)", checksBackfillUnconfirmedStatus},
+		renderedCells(lineContaining(t, output, "/pull/11 ")))
+}
+
+// A run nobody interrupts reports interrupted as false, always present so a
+// consumer can rely on the key, and every PR keeps the outcome the server sent.
+func TestChecksBackfillUninterruptedRunReportsNotInterrupted(t *testing.T) {
+	const prCount = checksSynthesizeBatchSize + 1
+	server, _ := checksBackfillRecreateServer(t, prCount, newHoldingHandler(t), func([]int) bool { return false })
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h", JSON: true}
+
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.NoError(t, runErr)
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(output), &raw))
+	assert.JSONEq(t, "false", string(raw["interrupted"]))
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report))
+	require.Len(t, report.Actions, prCount)
+	for _, action := range report.Actions {
+		assert.Equal(t, "created 1 Check Run", action.Outcome, "PR %d", action.PR)
+	}
+}
+
+// checksBackfillTwoPageScanServer answers the first scan page with one
+// missing-check PR and one stuck Check Run, and holds the second page open on
+// hold. A synthesize request fails the test: an interrupted scan sends none.
+func checksBackfillTwoPageScanServer(t *testing.T, hold *holdingHandler) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The server notices the client hanging up only once the body is read.
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		if r.URL.Path != "/api/checks/scan" {
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req apitypes.ChecksScanRequest
+		assert.NoError(t, json.Unmarshal(body, &req))
+		if req.Page > 1 {
+			hold.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{
+			Repo:       "octo/repo",
+			CheckNames: []string{"SchemaBot (production)"},
+			Scanned:    100,
+			NextPage:   2,
+			Missing: []apitypes.MissingCheckPR{
+				{Number: 7, URL: "https://github.com/octo/repo/pull/7", MissingNames: []string{"SchemaBot (production)"}},
+			},
+			Stuck: []apitypes.StuckCheckPR{{
+				Number: 9, URL: "https://github.com/octo/repo/pull/9",
+				Checks: []apitypes.IncompleteCheckRun{{Name: "SchemaBot (production)", CheckRunID: 90, Status: "queued"}},
+			}},
+		}))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// An operator presses Ctrl-C while the scan waits on its second page. The
+// first page's findings are kept: the command prints them, marked as
+// interrupted, and recreates nothing, since the scan never finished. It then
+// exits with the interrupt status.
+func TestChecksBackfillCancelDuringScanPrintsPartialFindings(t *testing.T) {
+	hold := newHoldingHandler(t)
+	server := checksBackfillTwoPageScanServer(t, hold)
 	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h", JSON: true}
 
 	output, stderr, runErr := cancelBackfillOnceHeld(t, cmd, server, hold.inFlight)
@@ -837,15 +978,80 @@ func TestChecksBackfillCancelWhileRecreatingChecksPrintsPartialReport(t *testing
 	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
 	assert.Equal(t, "checks backfill canceled\n", stderr)
 	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report), "the partial findings are printed")
+	assert.True(t, report.Interrupted)
+	assert.Equal(t, []string{"octo/repo"}, report.Repos)
+	assert.Equal(t, 100, report.Scanned)
+	require.Len(t, report.Actions, 1)
+	assert.Equal(t, 7, report.Actions[0].PR)
+	assert.Empty(t, report.Actions[0].Outcome, "nothing was sent for recreation")
+	require.Len(t, report.Stuck, 1)
+	assert.Equal(t, 9, report.Stuck[0].PR)
+}
+
+// The same interrupted scan in the text report: a line under the headline says
+// the findings are partial and nothing was recreated, and the table lists what
+// the backfill would do rather than an outcome.
+func TestChecksBackfillCancelDuringScanMarksTheTextReport(t *testing.T) {
+	hold := newHoldingHandler(t)
+	server := checksBackfillTwoPageScanServer(t, hold)
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h"}
+
+	output, stderr, runErr := cancelBackfillOnceHeld(t, cmd, server, hold.inFlight)
+
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.True(t, strings.HasSuffix(stderr, "checks backfill canceled\n"), stderr)
+	lines := strings.Split(output, "\n")
+	require.GreaterOrEqual(t, len(lines), 2)
+	assert.Equal(t, "Scanned 100 open PRs in octo/repo for SchemaBot (production).", lines[0])
+	assert.Equal(t, checksBackfillInterruptedScanNote, lines[1])
+	assert.Contains(t, output, "https://github.com/octo/repo/pull/9")
+	assert.Equal(t, []string{"PR", "MISSING CHECKS", "ACTION"}, renderedCells(lineContaining(t, output, "MISSING CHECKS")))
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/7", "SchemaBot (production)", "synthesize via auto-plan"},
+		renderedCells(lineContaining(t, output, "/pull/7 ")))
+}
+
+// An operator presses Ctrl-C while an --all-repos sweep waits on the scan of
+// its last repository. The report keeps the first repository's findings and
+// the skip of the second, and names only the repository it read as scanned:
+// the one the interrupt cut off was never read.
+func TestChecksBackfillCancelDuringFleetScanReportsOnlyTheReposRead(t *testing.T) {
+	hold := newHoldingHandler(t)
+	declared, scans := fleetScansWithOneUninstalledRepo()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The server notices the client hanging up only once the body is read.
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/checks/repos":
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksReposResponse{Repos: declared}))
+		case "/api/checks/scan":
+			var req apitypes.ChecksScanRequest
+			assert.NoError(t, json.Unmarshal(body, &req))
+			if req.Repo == "octo/zeta" {
+				hold.ServeHTTP(w, r)
+				return
+			}
+			assert.NoError(t, json.NewEncoder(w).Encode(scans[req.Repo]))
+		default:
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	cmd := &ChecksBackfillCmd{AllRepos: true, StuckAfter: "1h", JSON: true}
+
+	output, _, runErr := cancelBackfillOnceHeld(t, cmd, server, hold.inFlight)
+
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	var report checksBackfillReport
 	require.NoError(t, json.Unmarshal([]byte(output), &report))
-	require.Len(t, report.Actions, prCount)
-	for _, action := range report.Actions[:checksSynthesizeBatchSize] {
-		assert.Equal(t, "created 1 Check Run", action.Outcome, "PR %d was recreated before the interrupt", action.PR)
-	}
-	cutOff := report.Actions[checksSynthesizeBatchSize]
-	assert.Equal(t, prCount, cutOff.PR)
-	assert.Empty(t, cutOff.Outcome, "the batch the interrupt cut off has no outcome")
-	assert.Empty(t, cutOff.Error)
+	assert.True(t, report.Interrupted)
+	assert.Equal(t, []string{"octo/alpha"}, report.Repos)
+	assert.Equal(t, []string{"octo/onboarding"}, report.SkippedAppNotInstalled)
+	require.Len(t, report.Actions, 1)
+	assert.Equal(t, 3, report.Actions[0].PR)
 }
 
 // Naming one repository the server's GitHub App is not installed on is the
