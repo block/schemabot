@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -37,13 +39,19 @@ func (e *finalizerPollEngine) Progress(context.Context, *engine.ProgressRequest)
 	return step.result, step.err
 }
 
+// finalizerPollClient returns a client that can only poll an engine: it has no
+// storage, logs to logger, and waits pollInterval between polls.
+func finalizerPollClient(logger *slog.Logger, pollInterval time.Duration) *LocalClient {
+	return &LocalClient{
+		config:                   LocalConfig{Database: "appdb", Type: storage.DatabaseTypeVitess},
+		logger:                   logger,
+		taskPollIntervalOverride: pollInterval,
+	}
+}
+
 func driveFinalizerPoll(t *testing.T, eng engine.Engine, persist func(*engine.ResumeState)) (engine.State, error) {
 	t.Helper()
-	client := &LocalClient{
-		config:                   LocalConfig{Database: "appdb", Type: storage.DatabaseTypeVitess},
-		logger:                   slog.Default(),
-		taskPollIntervalOverride: time.Millisecond,
-	}
+	client := finalizerPollClient(slog.Default(), time.Millisecond)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	apply := &storage.Apply{ApplyIdentifier: "apply-finalizer-poll", Database: "appdb"}
@@ -67,6 +75,58 @@ func TestDriveFinalizerToTerminal_TransientErrorsSpendABudgetAndReturnRetryable(
 	assert.ErrorContains(t, err, fmt.Sprintf("failed after %d consecutive errors", maxConsecutiveProgressPollErrors))
 	assert.True(t, engine.IsRetryable(err), "a spent budget must not read as a permanent failure")
 	assert.NotErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// The drive waits the client's poll interval between polls, the cadence the
+// task drives share, instead of a cadence of its own. The first poll does not
+// wait, so a run of failures that spends the budget takes one interval less
+// than the budget.
+func TestDriveFinalizerToTerminal_WaitsTheClientsPollIntervalBetweenPolls(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const pollInterval = 7 * time.Second
+		eng := &finalizerPollEngine{steps: []finalizerPollStep{{err: errors.New("get deploy request: rate limited")}}}
+		client := finalizerPollClient(discardLogger(), pollInterval)
+		apply := &storage.Apply{ApplyIdentifier: "apply-finalizer-poll", Database: "appdb"}
+
+		start := time.Now()
+		_, err := client.driveFinalizerToTerminal(t.Context(), eng, apply, nil, &engine.ResumeState{MigrationContext: "deploy-1"}, func(*engine.ResumeState) {})
+
+		require.Error(t, err)
+		require.Equal(t, maxConsecutiveProgressPollErrors, eng.calls)
+		assert.Equal(t, time.Duration(maxConsecutiveProgressPollErrors-1)*pollInterval, time.Since(start))
+	})
+}
+
+// Each failed poll warns with the apply's identity, the poll error, and how
+// many polls in a row have failed, so the run that ends in a pause can be
+// followed from the logs alone.
+func TestDriveFinalizerToTerminal_FailedPollWarningsCarryApplyIdentityAndErrorCount(t *testing.T) {
+	pollErr := errors.New("get deploy request: rate limited")
+	eng := &finalizerPollEngine{steps: []finalizerPollStep{{err: pollErr}}}
+	var records []capturedLog
+	client := finalizerPollClient(slog.New(captureHandler{records: &records}), time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	_, err := client.driveFinalizerToTerminal(ctx, eng, driveLoggerTestApply(state.Apply.Running), nil, &engine.ResumeState{MigrationContext: "deploy-1"}, func(*engine.ResumeState) {})
+	require.Error(t, err)
+
+	var warnings []capturedLog
+	for _, rec := range records {
+		if rec.msg == "group_finalizer: transient progress error" {
+			warnings = append(warnings, rec)
+		}
+	}
+	require.Len(t, warnings, maxConsecutiveProgressPollErrors, "every failed poll warns, including the one that spends the budget")
+	for i, line := range warnings {
+		assert.Equal(t, slog.LevelWarn, line.level)
+		assertLogCarriesApplyIdentity(t, line)
+		assert.Equal(t, state.Apply.Running, line.attrs["state"])
+		assert.Equal(t, int64(i+1), line.attrs["consecutive_errors"])
+		loggedErr, ok := line.attrs["error"].(error)
+		require.True(t, ok, "the warning carries the poll error")
+		assert.ErrorIs(t, loggedErr, pollErr)
+	}
 }
 
 // A poll that answers resets the run of failures, so a deploy whose progress
