@@ -845,6 +845,14 @@ type StorageConfig struct {
 	// and password references. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
 
+	// SchemaDSN is the connection string used only to converge the storage
+	// schema at startup and by the storage CLI. Optional: when unset the
+	// schema is converged over DSN. Set it to keep DDL privileges off the
+	// long-lived pool, so DSN can name a user that only reads and writes
+	// rows. It must name the same server and database as DSN. Accepts the
+	// same env:/file: references as DSN; Database applies to it too.
+	SchemaDSN string `yaml:"schema_dsn,omitempty"`
+
 	// Dialect selects the database family of SchemaBot's internal storage
 	// database: "mysql" (the default when unset) or "postgres". It routes
 	// schema bootstrapping, connection handling, and the storage
@@ -4005,6 +4013,19 @@ func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
 // every storage dialect as the legacy fallback name.
 func (c *ServerConfig) StorageDSN() (string, error) {
 	dsn, err := c.resolveStorageDSN()
+	if err != nil || c.Storage.Database == "" {
+		return dsn, err
+	}
+	return storageDatabaseDSN(c.Storage.Dialect, dsn, c.Storage.Database)
+}
+
+// StorageSchemaDSN returns the DSN that converges the storage schema:
+// storage.schema_dsn when configured, otherwise StorageDSN.
+func (c *ServerConfig) StorageSchemaDSN() (string, error) {
+	if c.Storage.SchemaDSN == "" {
+		return c.StorageDSN()
+	}
+	dsn, err := secrets.Resolve(c.Storage.SchemaDSN, "")
 	if err != nil || c.Storage.Database == "" {
 		return dsn, err
 	}

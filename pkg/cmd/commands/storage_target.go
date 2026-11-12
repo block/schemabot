@@ -164,7 +164,8 @@ func resolveStorageConfig(configFlag string) (*storageConfig, error) {
 // target fetches the configured DSN and returns the storage database it names,
 // under the policy the config states for it.
 func (c *storageConfig) target() (*storageTarget, error) {
-	dsn, err := c.cfg.StorageDSN()
+	// Storage commands manage the schema, so they connect as the schema user.
+	dsn, err := c.cfg.StorageSchemaDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage DSN from %s: %w", c.source, err)
 	}

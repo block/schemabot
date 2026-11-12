@@ -1525,6 +1525,26 @@ duration must be positive, and `max_idle_conns` must not exceed a positive
 `max_open_conns`; SchemaBot rejects violations at config load rather than
 silently reverting to a default.
 
+### Separate schema user
+
+By default SchemaBot converges its storage schema at startup over the same
+connection its pool uses, so the storage user needs DDL privileges for the life
+of the process. Set `storage.schema_dsn` to converge the schema as a different
+user, and let `storage.dsn` name a user that only reads and writes rows:
+
+```yaml
+storage:
+  dsn: "env:SCHEMABOT_DSN"               # SELECT, INSERT, UPDATE, DELETE
+  schema_dsn: "env:SCHEMABOT_SCHEMA_DSN" # DDL on the storage database
+```
+
+`schema_dsn` is used only to read and converge the storage schema: at startup,
+through the storage schema API, and by the `schemabot storage` commands. The
+pool never dials it. It accepts the same `env:` and `file:` references as
+`dsn`, and `storage.database` applies to it too. Both must name the same server
+and database: SchemaBot refuses to start when they differ, rather than serve
+storage whose schema it did not converge.
+
 ## Spirit Run Settings
 
 For MySQL databases this server drives directly, the Spirit engine runs every

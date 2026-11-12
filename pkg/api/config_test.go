@@ -3659,6 +3659,39 @@ func TestServerConfig_StorageDSNEnvFallback(t *testing.T) {
 	})
 }
 
+// The schema DSN falls back to the storage DSN, so existing configs converge
+// exactly as before; when set, it resolves its own reference and still lands
+// on the configured storage database.
+func TestServerConfig_StorageSchemaDSN(t *testing.T) {
+	t.Run("falls back to the storage DSN", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(storage:3306)/schemabot"}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "rw:pw@tcp(storage:3306)/schemabot", dsn)
+	})
+
+	t.Run("resolves its own reference and applies the storage database", func(t *testing.T) {
+		t.Setenv("SCHEMA_DSN_UNDER_TEST", "ddl:pw@tcp(storage:3306)/")
+		cfg := ServerConfig{Storage: StorageConfig{
+			DSN:       "rw:pw@tcp(storage:3306)/schemabot",
+			SchemaDSN: "env:SCHEMA_DSN_UNDER_TEST",
+			Database:  "schemabot_tenant",
+		}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		parsed, err := gomysql.ParseDSN(dsn)
+		require.NoError(t, err)
+		assert.Equal(t, "ddl", parsed.User)
+		assert.Equal(t, "schemabot_tenant", parsed.DBName)
+
+		poolDSN, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		parsed, err = gomysql.ParseDSN(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, "rw", parsed.User, "the pool keeps the storage DSN's user")
+	})
+}
+
 func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
 	dir := t.TempDir()
 	databaseConfigPath := filepath.Join(dir, "storage.yaml")
