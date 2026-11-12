@@ -79,6 +79,13 @@ const (
 	checksBackfillInterruptedRecreateNote = `Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet. Run the command again to finish; it recreates only the Check Runs still missing.`
 )
 
+// What stderr says about how far an interrupted run got when its report could
+// not be written to stdout, one per phase the interrupt can land in.
+const (
+	checksBackfillUnwrittenScanReportNote     = "No Check Run was recreated. Run the command again for a full sweep."
+	checksBackfillUnwrittenRecreateReportNote = "Some Check Runs may already be recreated. Run the command again to finish; it recreates only the Check Runs still missing."
+)
+
 // checksBackfillAction is one PR's classification and (after acting) outcome.
 type checksBackfillAction struct {
 	Repo         string   `json:"repo"`
@@ -382,7 +389,7 @@ scanning:
 		if reached > 0 || len(skippedByServer) > 0 {
 			report.Interrupted = true
 			report.interruptedScan = true
-			_ = cmd.write(report)
+			cmd.writeInterrupted(report)
 		}
 		return scanCanceled
 	}
@@ -397,7 +404,7 @@ scanning:
 			stopProgress()
 			report.Interrupted = true
 			report.markUnconfirmed()
-			_ = cmd.write(report)
+			cmd.writeInterrupted(report)
 			return canceled
 		}
 		if err != nil {
@@ -736,6 +743,22 @@ func (cmd *ChecksBackfillCmd) write(report *checksBackfillReport) error {
 		return writeJSON(report)
 	}
 	return writeChecksBackfillReport(os.Stdout, report)
+}
+
+// writeInterrupted prints the report of a run the operator's interrupt cut
+// short. The run ends with the interrupt status whether or not stdout took
+// the report, so a report that was not written is named on stderr, along with
+// what its note would have said about how far the run got.
+func (cmd *ChecksBackfillCmd) writeInterrupted(report *checksBackfillReport) {
+	err := cmd.write(report)
+	if err == nil {
+		return
+	}
+	note := checksBackfillUnwrittenRecreateReportNote
+	if report.interruptedScan {
+		note = checksBackfillUnwrittenScanReportNote
+	}
+	fmt.Fprintf(os.Stderr, "The report could not be written to stdout, so it is missing or incomplete: %v. %s\n", err, note)
 }
 
 func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error {

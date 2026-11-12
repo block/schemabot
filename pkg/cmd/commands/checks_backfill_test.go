@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -747,18 +749,91 @@ func TestChecksBackfillCancelExitsInterrupted(t *testing.T) {
 // the command printed and the error it ended with.
 func cancelBackfillOnceHeld(t *testing.T, cmd *ChecksBackfillCmd, server *httptest.Server, held <-chan struct{}) (stdout, stderr string, runErr error) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan error, 1)
 	stderr = captureStderr(t, func() {
 		stdout = captureStdout(func() {
-			go func() { done <- cmd.Run(ctx, &Globals{Endpoint: server.URL}) }()
-			awaitSignal(t, held, "a backfill request to reach the server")
-			cancel()
-			runErr = awaitSignal(t, done, "the canceled backfill to end")
+			runErr = runBackfillUntilCanceled(t, cmd, server, held)
 		})
 	})
 	return stdout, stderr, runErr
+}
+
+// runBackfillUntilCanceled runs cmd against server, presses the operator's
+// Ctrl-C once held reports a request waiting on the server, and returns the
+// error the command ended with.
+func runBackfillUntilCanceled(t *testing.T, cmd *ChecksBackfillCmd, server *httptest.Server, held <-chan struct{}) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Run(ctx, &Globals{Endpoint: server.URL}) }()
+	awaitSignal(t, held, "a backfill request to reach the server")
+	cancel()
+	return awaitSignal(t, done, "the canceled backfill to end")
+}
+
+// cancelBackfillWithUnwritableStdout is cancelBackfillOnceHeld with a stdout
+// that rejects every write. It returns what the command printed on stderr, the
+// error it ended with, and the error stdout gives a writer.
+func cancelBackfillWithUnwritableStdout(t *testing.T, cmd *ChecksBackfillCmd, server *httptest.Server, held <-chan struct{}) (stderr string, runErr, writeErr error) {
+	t.Helper()
+	// A file opened for reading only refuses writes.
+	unwritable, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(unwritable)
+	_, writeErr = unwritable.WriteString("report")
+	require.Error(t, writeErr, "stdout must reject writes for this test to mean anything")
+
+	old := os.Stdout
+	defer func() { os.Stdout = old }()
+	os.Stdout = unwritable
+	stderr = captureStderr(t, func() {
+		runErr = runBackfillUntilCanceled(t, cmd, server, held)
+	})
+	return stderr, runErr, writeErr
+}
+
+// An operator presses Ctrl-C on a backfill whose stdout cannot take the
+// report, such as a redirect to a full disk. The command still exits with the
+// interrupt status, and stderr says, after the cancel line, that the report
+// was not written, whether any Check Run was recreated, and what to run next.
+func TestChecksBackfillCancelWithUnwritableStdoutSaysTheReportWasNotWritten(t *testing.T) {
+	tests := []struct {
+		name     string
+		server   func(t *testing.T, hold *holdingHandler) *httptest.Server
+		cmd      *ChecksBackfillCmd
+		wantNote string
+	}{
+		{
+			name:     "interrupted during the scan",
+			server:   checksBackfillTwoPageScanServer,
+			cmd:      &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h", JSON: true},
+			wantNote: "No Check Run was recreated. Run the command again for a full sweep.",
+		},
+		{
+			name: "interrupted while recreating Check Runs",
+			server: func(t *testing.T, hold *holdingHandler) *httptest.Server {
+				server, _ := checksBackfillRecreateServer(t, checksSynthesizeBatchSize+1, hold, func(prs []int) bool { return prs[0] != 1 })
+				return server
+			},
+			cmd:      &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h", JSON: true},
+			wantNote: "Some Check Runs may already be recreated. Run the command again to finish; it recreates only the Check Runs still missing.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hold := newHoldingHandler(t)
+
+			stderr, runErr, writeErr := cancelBackfillWithUnwritableStdout(t, tt.cmd, tt.server(t, hold), hold.inFlight)
+
+			require.ErrorIs(t, runErr, ErrSilent)
+			require.ErrorIs(t, runErr, context.Canceled)
+			assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+			assert.Equal(t,
+				"checks backfill canceled\n"+
+					"The report could not be written to stdout, so it is missing or incomplete: "+writeErr.Error()+". "+tt.wantNote+"\n",
+				stderr)
+		})
+	}
 }
 
 // An operator presses Ctrl-C while an --all-repos sweep is still asking the

@@ -1134,6 +1134,10 @@ of the chunk that was in flight. Checks already recreated and deliveries
 already redelivered are not undone. Run `checks backfill` again to finish the
 sweep; it only acts on PRs whose Check Runs are still missing.
 
+If `checks backfill` cannot write its interrupted report to stdout, for
+example because the disk behind a redirect is full, it says so on stderr,
+along with whether any Check Run was recreated, and still exits 130.
+
 An `--all-repos` sweep skips a declared repository the server's GitHub App is
 not installed on, names it, and keeps scanning the rest. The skip still makes
 the run exit nonzero, because that repository was never read. Any other scan
