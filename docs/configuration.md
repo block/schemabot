@@ -1542,8 +1542,13 @@ storage:
 through the storage schema API, and by the `schemabot storage` commands. The
 pool never dials it. It accepts the same `env:` and `file:` references as
 `dsn`, and `storage.database` applies to it too. Both must name the same server
-and database: SchemaBot refuses to start when they differ, rather than serve
-storage whose schema it did not converge.
+and database: SchemaBot refuses to start, and the storage commands and API
+refuse to run, when they differ, rather than converge storage the pool does not
+serve.
+
+`schema_dsn` is supported for MySQL storage only. On PostgreSQL the same server
+and database can still resolve to a different schema per user, so SchemaBot
+rejects the setting at config load.
 
 ## Spirit Run Settings
 

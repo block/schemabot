@@ -4021,15 +4021,51 @@ func (c *ServerConfig) StorageDSN() (string, error) {
 
 // StorageSchemaDSN returns the DSN that converges the storage schema:
 // storage.schema_dsn when configured, otherwise StorageDSN.
+//
+// A configured schema DSN must name the same server and database as the pool's
+// DSN, and every caller (startup, the storage schema API, and the storage CLI)
+// gets that check here: otherwise the schema user would converge a database
+// the pool never serves, under this config's destructive policy.
 func (c *ServerConfig) StorageSchemaDSN() (string, error) {
 	if c.Storage.SchemaDSN == "" {
 		return c.StorageDSN()
 	}
-	dsn, err := secrets.Resolve(c.Storage.SchemaDSN, "")
-	if err != nil || c.Storage.Database == "" {
-		return dsn, err
+	schemaDSN, err := secrets.Resolve(c.Storage.SchemaDSN, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve storage schema_dsn: %w", err)
 	}
-	return storageDatabaseDSN(c.Storage.Dialect, dsn, c.Storage.Database)
+	if c.Storage.Database != "" {
+		if schemaDSN, err = storageDatabaseDSN(c.Storage.Dialect, schemaDSN, c.Storage.Database); err != nil {
+			return "", fmt.Errorf("storage schema_dsn: %w", err)
+		}
+	}
+	poolDSN, err := c.StorageDSN()
+	if err != nil {
+		return "", fmt.Errorf("resolve storage dsn to check schema_dsn against: %w", err)
+	}
+	schemaTarget, err := mysqlStorageTarget(schemaDSN)
+	if err != nil {
+		return "", fmt.Errorf("storage schema_dsn: %w", err)
+	}
+	poolTarget, err := mysqlStorageTarget(poolDSN)
+	if err != nil {
+		return "", fmt.Errorf("storage dsn: %w", err)
+	}
+	if schemaTarget != poolTarget {
+		return "", fmt.Errorf("storage.schema_dsn names %s but storage.dsn names %s; both must name the same storage database", schemaTarget, poolTarget)
+	}
+	return schemaDSN, nil
+}
+
+// mysqlStorageTarget names the server and database a MySQL DSN connects to,
+// without its credentials. Hostnames compare case-insensitively; database
+// names do not, because MySQL database names can be case sensitive.
+func mysqlStorageTarget(dsn string) (string, error) {
+	cfg, err := gomysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("invalid MySQL storage connection")
+	}
+	return strings.ToLower(cfg.Addr) + "/" + cfg.DBName, nil
 }
 
 func (c *ServerConfig) resolveStorageDSN() (string, error) {
@@ -4062,6 +4098,13 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 	// the first connection attempt.
 	if dialect != schema.DialectMySQL && c.DSNFrom != nil {
 		return fmt.Errorf("%s dsn_from builds a MySQL DSN and is not supported with dialect %q; use dsn", context, dialect)
+	}
+	// On PostgreSQL the same host and database can still resolve to another
+	// schema (search_path, role defaults), and the pool's session affinity is
+	// only proven for the bootstrap connection, so a separate schema user is
+	// MySQL-only until both are checked.
+	if dialect != schema.DialectMySQL && c.SchemaDSN != "" {
+		return fmt.Errorf("%s schema_dsn is only supported with dialect %q, not %q", context, schema.DialectMySQL, dialect)
 	}
 	return c.Pool.Validate(context)
 }

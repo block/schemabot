@@ -837,25 +837,11 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
+	// StorageSchemaDSN refuses a schema DSN that names a different database
+	// from dsn, so the pool only serves storage this server converged.
 	schemaDSN, err := cfg.StorageSchemaDSN()
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve storage schema DSN: %w", err)
-	}
-	// The schema user converges the database the pool then serves, so the two
-	// must name the same one: otherwise the pool would run against storage
-	// whose schema this server never converged.
-	if schemaDSN != dsn {
-		poolTarget, err := storageTargetFor(dialect, dsn)
-		if err != nil {
-			return nil, "", fmt.Errorf("read storage target: %w", err)
-		}
-		schemaTarget, err := storageTargetFor(dialect, schemaDSN)
-		if err != nil {
-			return nil, "", fmt.Errorf("read storage schema target: %w", err)
-		}
-		if poolTarget != schemaTarget {
-			return nil, "", fmt.Errorf("storage.schema_dsn names %s but storage.dsn names %s; both must name the same storage database", schemaTarget, poolTarget)
-		}
 	}
 	if err := api.EnsureSchema(schemaDSN, logger,
 		api.WithStopSignal(ctx.Done()),
