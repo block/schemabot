@@ -294,6 +294,9 @@ func TestIsRetryableFetchError_TransportAndUnstructuredServerErrors(t *testing.T
 		{name: "response body interrupted", err: fmt.Errorf("read response: %w", io.ErrUnexpectedEOF)},
 		{name: "response body read timed out", err: fmt.Errorf("read response: %w", &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded})},
 		{name: "response body connection reset", err: fmt.Errorf("read response: %w", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET})},
+		// An HTTP/2 stream reset is neither an EOF nor a net.Error, so the
+		// client's body-read error type is what marks it transient.
+		{name: "response body cut by an HTTP/2 stream reset", err: &client.ResponseReadError{Err: errors.New("stream error: stream ID 1; INTERNAL_ERROR; received from peer")}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -311,7 +314,7 @@ func TestIsRetryableFetchError_ClientSideFailuresArePermanent(t *testing.T) {
 		err  error
 	}{
 		{name: "operator cancelled", err: context.Canceled},
-		{name: "operator cancelled while reading the body", err: fmt.Errorf("read response: %w", &net.OpError{Op: "read", Net: "tcp", Err: context.Canceled})},
+		{name: "operator cancelled while reading the body", err: &client.ResponseReadError{Err: &net.OpError{Op: "read", Net: "tcp", Err: context.Canceled}}},
 		{name: "token refused over plaintext", err: &url.Error{Op: "Get", URL: "http://schemabot.example.test/api/progress/apply/x", Err: client.ErrInsecureTokenTransport}},
 		{name: "client error without API code", err: &client.APIError{Status: http.StatusForbidden, Message: "forbidden"}},
 	}
