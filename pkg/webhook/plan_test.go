@@ -1467,6 +1467,28 @@ func TestPlanRefusedByNamespacePlacement(t *testing.T) {
 	assert.False(t, planRefusedByNamespacePlacement(nil), "a plan that succeeded")
 }
 
+// When the source policy refuses any environment of a plan that failed in
+// every environment, each environment's aggregate is held by the refusal. A
+// refused environment shows its own refusal, and an environment that failed
+// some other way shows the refusal of the first refused environment in plan
+// order, never its own failure.
+func TestSourcePolicyRefusalHoldingEachFailure(t *testing.T) {
+	failures := map[string]string{
+		"sandbox":    "no schema files found",
+		"staging":    `schema path "schema/staging" is not authorized for database "orders"`,
+		"production": `schema path "schema/production" is not authorized for database "orders"`,
+	}
+	refused := map[string]bool{"staging": true, "production": true}
+
+	got := sourcePolicyRefusalHoldingEachFailure([]string{"sandbox", "staging", "production"}, failures, refused)
+
+	assert.Equal(t, map[string]string{
+		"sandbox":    `schema path "schema/staging" is not authorized for database "orders"`,
+		"staging":    `schema path "schema/staging" is not authorized for database "orders"`,
+		"production": `schema path "schema/production" is not authorized for database "orders"`,
+	}, got)
+}
+
 // assertPasteableCommand asserts the comment carries cmd as a fenced block of
 // its own, at whatever list indentation the block renders.
 func assertPasteableCommand(t *testing.T, comment, cmd string) {
