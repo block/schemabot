@@ -5001,6 +5001,16 @@ func newRevertWindowTickFixture(opts storage.ApplyOptions) *revertWindowTickFixt
 	return f
 }
 
+// claimAgain gives the fixture the poll state a later drive claim starts with:
+// the same revert window, and nothing the earlier claim remembered.
+func (f *revertWindowTickFixture) claimAgain() {
+	f.ps = &atomicPollState{
+		lastProgressLog: time.Now(),
+		lastTaskState:   f.ps.lastTaskState,
+		stateEnteredAt:  f.ps.stateEnteredAt,
+	}
+}
+
 func (f *revertWindowTickFixture) tick(t *testing.T) bool {
 	t.Helper()
 	return f.client.handleAtomicProgressTick(t.Context(), f.eng, f.apply, f.tasks, &engine.Credentials{}, nil, f.ps, f.apply.GetOptions().Map(), false)
@@ -5148,6 +5158,40 @@ func revertWindowRefusals(operation string) []struct {
 	}
 }
 
+// autoSkipRevertRefusedEvent is the apply timeline's record of an automatic
+// skip-revert the engine refused for the given reason.
+func autoSkipRevertRefusedEvent(reason string) string {
+	return fmt.Sprintf("The engine refused to close the revert window: %s. SchemaBot will not retry the automatic skip unless this apply is picked up again, such as after a restart. Run skip-revert to keep the changes or revert to undo them", reason)
+}
+
+// A drive that holds an apply remembers that the engine refused the automatic
+// skip of its revert window, and does not ask again. A drive that claims the
+// apply later starts with no such memory, so it asks the engine once more: a
+// refusal is recorded on the timeline again and silences that drive in turn,
+// which is what the timeline's refusal event tells the operator to expect.
+func TestHandleAtomicProgressTickAsksAgainOnALaterDriveClaimAfterRefusedAutoSkipRevert(t *testing.T) {
+	const reason = "deploy request #7 is locked by another operation"
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.eng.skipRevertResult = &engine.ControlResult{Message: reason}
+	refusalEvent := autoSkipRevertRefusedEvent(reason)
+
+	assert.False(t, f.tick(t))
+	assert.False(t, f.tick(t))
+	require.Equal(t, 1, f.eng.skipRevertCount, "the drive that was refused does not ask again")
+	require.Equal(t, 1, f.eventCount(storage.LogEventError, refusalEvent))
+
+	f.claimAgain()
+	assert.False(t, f.tick(t), "a refused skip keeps the later drive polling the revert window")
+	assert.Equal(t, 2, f.eng.skipRevertCount, "a later drive claim asks the engine once more")
+	assert.Equal(t, 2, f.eventCount(storage.LogEventError, refusalEvent), "the later drive records the engine's answer")
+	assert.Equal(t, state.Apply.RevertWindow, f.apply.State, "the window is still open")
+	assert.Nil(t, f.applies.stored.RevertSkippedAt, "a refused skip must not persist the skip-revert signal")
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.eng.skipRevertCount, "the later drive does not ask again either")
+	assert.Equal(t, 2, f.eventCount(storage.LogEventError, refusalEvent))
+}
+
 // The drive closes a revert window on its own when the window expires or when
 // the apply was started with --skip-revert. An engine that refuses that skip
 // without an error has answered for good, so the drive does not ask again for
@@ -5168,7 +5212,7 @@ func TestHandleAtomicProgressTickStopsAskingAfterRefusedAutoSkipRevert(t *testin
 				f := newRevertWindowTickFixture(trigger.options)
 				f.eng.skipRevertResult = refusal.result
 				f.eng.skipRevertNoResult = refusal.noResult
-				refusalEvent := fmt.Sprintf("The engine refused to close the revert window: %s. SchemaBot will not ask it again; run skip-revert to keep the changes or revert to undo them", refusal.reason)
+				refusalEvent := autoSkipRevertRefusedEvent(refusal.reason)
 
 				assert.False(t, f.tick(t), "a refused skip keeps the drive polling the revert window")
 				assert.Equal(t, 1, f.eng.skipRevertCount)

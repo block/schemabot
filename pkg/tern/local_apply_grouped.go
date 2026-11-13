@@ -1698,10 +1698,13 @@ func (c *LocalClient) resolveOrRetryAutoSkipRevert(ctx context.Context, logger *
 		return
 	}
 	ps.autoSkipRevertRefused = true
-	logger.Error("the engine refused the automatic skip-revert; it is not sent again, and the revert window stays open until an operator reverts or skips it",
+	logger.Error("the engine refused the automatic skip-revert; this drive does not send it again, a later drive claim asks once more, and the revert window stays open until an operator reverts or skips it",
 		append(apply.MutableLogAttrs(), "reason", trigger.reason, "error", skipErr)...)
+	// The drive remembers the refusal only for as long as it holds the apply,
+	// so the timeline promises no more than that: a drive that claims the
+	// apply later asks the engine again and records its answer.
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-		fmt.Sprintf("The engine refused to close the revert window: %s. SchemaBot will not ask it again; run skip-revert to keep the changes or revert to undo them", refusal.Error()), "", "")
+		fmt.Sprintf("The engine refused to close the revert window: %s. SchemaBot will not retry the automatic skip unless this apply is picked up again, such as after a restart. Run skip-revert to keep the changes or revert to undo them", refusal.Error()), "", "")
 }
 
 // reportAutoSkipRevertFailure logs a failed automatic skip-revert that the
