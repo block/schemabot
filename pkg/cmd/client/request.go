@@ -321,7 +321,7 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return &ResponseReadError{Err: err}
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -332,6 +332,24 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 		return checkNonJSONResponse(resp, respBody, err)
 	}
 	return nil
+}
+
+// ResponseReadError means the server started answering a read request and the
+// response body then failed before it was complete: the connection was reset,
+// an HTTP/2 stream was reset, or the read timed out. The server was reached,
+// so this is not a ConnectionError, and no complete answer arrived, so it is
+// not an APIError. The cause varies with the protocol in use, which is why
+// callers that poll match this type instead of the cause.
+type ResponseReadError struct {
+	Err error
+}
+
+func (e *ResponseReadError) Error() string {
+	return "read response: " + e.Err.Error()
+}
+
+func (e *ResponseReadError) Unwrap() error {
+	return e.Err
 }
 
 // doSendBody sends a request with a JSON body and checks for success.

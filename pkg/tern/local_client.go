@@ -4102,12 +4102,18 @@ func (c *LocalClient) progressFromReads(ctx context.Context, reads *progressRead
 		}
 
 		// During branch setup phases, include the latest event message so the
-		// CLI can show what's happening instead of a static spinner.
+		// CLI can show what's happening instead of a static spinner. The detail is
+		// a display hint, so a failed read answers without it instead of failing
+		// the whole progress read.
 		if state.IsState(overallState, state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
-			if logs, err := c.storage.ApplyLogs().GetByApply(ctx, apply.ID); err == nil && len(logs) > 0 {
-				latest := logs[len(logs)-1]
+			latestLogs, err := c.storage.ApplyLogs().GetRecentByApply(ctx, apply.ID, 1)
+			switch {
+			case err != nil:
+				c.logger.Warn("progress: serving a branch setup phase without its latest event message; the CLI shows the phase's default label until a later poll reads it",
+					append(apply.LogAttrs(), "error", err)...)
+			case len(latestLogs) > 0:
 				resp.Metadata = ensureMetadata(resp.Metadata)
-				resp.Metadata["status_detail"] = latest.Message
+				resp.Metadata["status_detail"] = latestLogs[0].Message
 			}
 		}
 	}

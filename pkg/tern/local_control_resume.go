@@ -2178,7 +2178,8 @@ func finalizerNamespaceFromKey(operationKey, target string, targetQualified bool
 // A failure ends the operation one of two ways. A permanent engine error, a
 // rejected apply, a permanent progress poll failure, or a non-success terminal
 // state fails it for good, and the drive returns that cause. An error retrying
-// can cure, whether a storage read or a retryable engine error, pauses it as
+// can cure, whether a storage read or a retryable engine error, including
+// progress polls that kept failing for a full budget, pauses it as
 // failed_retryable with the error recorded: the claim re-drives it under the
 // parent apply's retry budget, and the re-drive is safe because the VSchema
 // apply is idempotent and a stored handoff makes it reattach to work already
@@ -2406,11 +2407,14 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	if result.ResumeState != nil {
 		persistResume(result.ResumeState)
 		// The await retries transient progress errors itself, so what it returns
-		// is a permanent poll failure or a cancelled drive: the first fails the
-		// row for good and the second records nothing, as settleFailure decides.
+		// is a permanent poll failure, a run of transient errors that spent its
+		// budget, or a cancelled drive. The engine already accepted this work, so
+		// a retryable error pauses the row under the accepted-work policy and a
+		// permanent one fails it for good; a cancelled drive records nothing, as
+		// settleFailure decides.
 		finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, result.ResumeState, persistResume)
 		if err != nil {
-			return failClosed(fmt.Errorf("await group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
+			return settleFailure(fmt.Errorf("await group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err), c.shouldRetryAcceptedWorkError(err), false)
 		}
 		if !finalizerVSchemaApplied(finalState) {
 			return failClosed(fmt.Errorf("group_finalizer %s for apply %s ended in non-success state %q", work, apply.ApplyIdentifier, finalState))
@@ -2631,11 +2635,16 @@ func finalizerVSchemaApplied(s engine.State) bool {
 // terminal (or revert-window) state, persisting resume state on each poll so a
 // reclaim reattaches. An instance-local engine reports terminal on the first
 // poll; an externally-authoritative engine is tracked to deploy completion. A
-// permanent progress error fails the drive; transient errors are retried while
-// the operation lease is heartbeated by the operator.
+// permanent progress error fails the drive. A transient error is retried until
+// maxConsecutiveProgressPollErrors polls in a row have failed, then the drive
+// returns the last one, which is not a permanent error: the caller pauses the
+// finalizer for a retry instead of polling an engine that does not answer.
+// The operator does not watch a finalizer for a stalled drive, since it has no
+// task rows to mirror, so this budget is what bounds the drive.
 func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.Engine, apply *storage.Apply, creds *engine.Credentials, resumeState *engine.ResumeState, persistResume func(*engine.ResumeState)) (engine.State, error) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(c.taskPollInterval())
 	defer ticker.Stop()
+	consecutiveErrors := 0
 	for {
 		res, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 			Database:    apply.Database,
@@ -2647,9 +2656,14 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 			if errors.As(err, &permanent) {
 				return "", fmt.Errorf("group_finalizer progress poll failed permanently: %w", err)
 			}
-			c.logger.Warn("group_finalizer: transient progress error; will retry",
-				"apply_id", apply.ApplyIdentifier, "error", err)
+			consecutiveErrors++
+			c.logger.Warn("group_finalizer: transient progress error",
+				append(apply.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors)...)
+			if consecutiveErrors >= maxConsecutiveProgressPollErrors {
+				return "", fmt.Errorf("group_finalizer progress poll failed after %d consecutive errors: %w", consecutiveErrors, err)
+			}
 		} else {
+			consecutiveErrors = 0
 			if res.ResumeState != nil {
 				persistResume(res.ResumeState)
 				resumeState = res.ResumeState
