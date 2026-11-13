@@ -331,6 +331,34 @@ func narrowedPlanFailureLeavesEnvironmentCheck(err error, target string) bool {
 	return !planRefusedBySourcePolicy(err)
 }
 
+// sourcePolicyRefusalHoldingEachFailure returns the source policy refusal the
+// aggregate of each failed environment shows, keyed by environment. failures
+// holds what the plan comment shows for each one, and refused names those the
+// policy refused. A refused environment shows its own refusal. An environment
+// that failed some other way is held by the same block without being refused,
+// so it shows the refusal of the first refused environment in plan order, and
+// its own failure stays on the plan comment. A deployment that publishes one
+// aggregate for every environment then names a refusal whichever environment
+// it reads, and never a failure the source policy did not cause.
+func sourcePolicyRefusalHoldingEachFailure(planOrder []string, failures map[string]string, refused map[string]bool) map[string]string {
+	holding := ""
+	for _, env := range planOrder {
+		if refused[env] {
+			holding = failures[env]
+			break
+		}
+	}
+	refusals := make(map[string]string, len(failures))
+	for env, failure := range failures {
+		if refused[env] {
+			refusals[env] = failure
+		} else {
+			refusals[env] = holding
+		}
+	}
+	return refusals
+}
+
 // postSourcePolicyRefusal posts the failing aggregate for environments whose
 // plan the database's source policy refused, keyed by environment with the
 // refusal the plan comment shows. With no row stored for the refused source, a
@@ -876,13 +904,15 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			// of a source the policy refused, and a namespace placement
 			// refusal whose row could not be stored. It is posted after the
 			// fold so the fold cannot replace it. A source policy refusal
-			// carries its block, so no later fold replaces it either.
+			// carries its block, so no later fold replaces it either, and
+			// every aggregate it holds names the refusal.
 			unrecorded := maps.Clone(multiEnvData.Errors)
 			for _, env := range recordable {
 				delete(unrecorded, env)
 			}
 			if len(unrecorded) > 0 && len(sourcePolicyRefused) > 0 {
-				h.postSourcePolicyRefusal(ctx, client, repo, pr, prInfo.HeadSHA, unrecorded)
+				h.postSourcePolicyRefusal(ctx, client, repo, pr, prInfo.HeadSHA,
+					sourcePolicyRefusalHoldingEachFailure(environments, unrecorded, sourcePolicyRefused))
 			} else if len(unrecorded) > 0 {
 				h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA, unrecorded)
 			}

@@ -332,6 +332,82 @@ func TestE2EAllEnvPlanFailureWithSourcePolicyRefusalStoresNoRow(t *testing.T) {
 
 // A pull request's staging and production checks both passed on an earlier
 // plan. The database's source policy then stops authorizing the repository,
+// and the repository's config ignores the only namespace production would
+// plan. A plan of both environments fails in each: the source policy refuses
+// staging, and production has no schema files to plan. Neither failure stores
+// a row, so both stored rows are still the old successes, and the failing
+// aggregate posted for the refusal carries a block. A fold from stored check
+// state would pass on those rows and leaves the aggregate blocked instead. The
+// policy then authorizes the repository again, and a plan of staging alone
+// still leaves the aggregate blocked, since no plan command releases an
+// aggregate block. A re-run of the check re-plans every environment, which
+// clears the block: staging passes, and the aggregate now fails on the row
+// production's own failed plan stored.
+func TestE2EAllEnvSourcePolicyRefusalHoldsAggregateOverOldSuccess(t *testing.T) {
+	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	p := newMultiEnvPlanHarnessWithRepo(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_production"}},
+	}, &namespaceSelectingTernClient{}, nil, map[string]string{
+		"ns_{env}/orders.sql": table,
+	}, "ignore_namespaces:\n  - ns_production\n")
+	p.seedPassingChecks(t, "staging", "production")
+	setAllowedRepos := func(repos []string) {
+		dbConfig := p.handler.service.Config().Databases[p.dbName]
+		dbConfig.AllowedRepos = repos
+		p.handler.service.Config().Databases[p.dbName] = dbConfig
+	}
+
+	setAllowedRepos([]string{"octocat/orders"})
+	body := p.comment(t, "schemabot plan")
+	assert.Contains(t, body, `repo "octocat/hello-world" is not authorized`, "staging's plan is refused by source policy")
+	assert.Contains(t, body, "no schema files found", "production fails before its source is checked")
+	byEnv := p.checksByEnv(t)
+	for _, env := range []string{"staging", "production"} {
+		require.Contains(t, byEnv, env)
+		assert.Equal(t, checkConclusionSuccess, byEnv[env].Conclusion, "no row is stored for %s on behalf of the refused source", env)
+	}
+	aggregates := p.publishedAggregates()
+	require.NotEmpty(t, aggregates, "the failing aggregate check run is published")
+	assertNoPassingAggregate(t, aggregates, "the source policy refusal of a plan of both environments")
+	last := aggregates[len(aggregates)-1]
+	require.NotNil(t, last.Output)
+	assert.Contains(t, last.Output.Summary, `repo "octocat/hello-world" is not authorized`, "the aggregate names the refusal that holds it")
+	assert.NotContains(t, last.Output.Summary, "no schema files found", "production's own failure stays on the plan comment")
+	assert.Contains(t, last.Output.Summary, "re-run this check or push a commit")
+	p.assertAggregateBlocked(t, checkstate.BlockPlanRefusedBySourcePolicy)
+
+	p.handler.updateAggregateCheck(t.Context(), p.client, "octocat/hello-world", 1, "abc123")
+	assertNoPassingAggregate(t, p.publishedAggregates(), "a fold of the old success rows")
+	p.assertAggregateBlocked(t, checkstate.BlockPlanRefusedBySourcePolicy)
+
+	setAllowedRepos(nil)
+	assert.NotContains(t, p.comment(t, "schemabot plan -e staging"), "is not authorized", "staging plans once its source is authorized")
+	assertNoPassingAggregate(t, p.publishedAggregates(), "staging's plan over the source policy refusal")
+	p.assertAggregateBlocked(t, checkstate.BlockPlanRefusedBySourcePolicy)
+
+	// A re-run of the check runs auto-plan, which re-plans in the background.
+	_, err := p.handler.runAutoPlanForPR(t.Context(), p.client, "octocat/hello-world", 1, "abc123", 0,
+		"check_run.rerequested", "check_run.rerequested", "", "")
+	require.NoError(t, err)
+	drainCtx, cancel := context.WithTimeout(t.Context(), webhookIntegrationPollDeadline)
+	defer cancel()
+	p.handler.DrainInProcessWebhookWork(drainCtx)
+	require.NoError(t, drainCtx.Err(), "the re-plan finishes")
+	stored, err := p.store.Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Empty(t, stored.BlockingReason, "the re-run of the check clears the block")
+	assert.Equal(t, checkConclusionFailure, stored.Conclusion, "production's failed plan still fails the aggregate")
+	byEnv = p.checksByEnv(t)
+	require.Contains(t, byEnv, "staging")
+	assert.Equal(t, checkConclusionSuccess, byEnv["staging"].Conclusion, "staging plans once its source is authorized")
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion, "production's failed plan replaces its old success row")
+	assert.Equal(t, planFailedCheckSummary, byEnv["production"].ChangeSummary)
+}
+
+// A pull request's staging and production checks both passed on an earlier
+// plan. The database's source policy then stops authorizing the repository,
 // and a plan of production alone is refused. No row is stored on behalf of the
 // refused source, so production's stored row is still the old success, and the
 // failing aggregate posted for the refusal carries a block. The policy then
