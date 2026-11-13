@@ -1124,6 +1124,13 @@ func (h *Handler) failClosedPostContext(ctx context.Context, repo string, pr int
 // and stored. A caller about to fold the aggregate from stored check state
 // reads false as "the fold may not see this failure" and must not fold.
 func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) bool {
+	return h.postFailingAggregateTargetsWithBlock(ctx, client, repo, pr, headSHA, h.aggregateCheckTargetsForRepo(repo), errors, block)
+}
+
+// postFailingAggregateTargetsWithBlock is postFailingAggregatesWithBlock over
+// the aggregates the caller names. With allowed environments configured, it
+// posts the targets whose environment has an error.
+func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, targets []aggregateCheckTarget, errors map[string]string, block checkBlockReason) bool {
 	ctx, cancel := h.failClosedPostContext(ctx, repo, pr, headSHA)
 	defer cancel()
 
@@ -1145,7 +1152,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 
 	var checks []envCheck
 	if len(config.AllowedEnvironments) > 0 {
-		for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+		for _, target := range targets {
 			env := target.environment
 			if _, hasError := errors[env]; hasError {
 				checks = append(checks, envCheck{

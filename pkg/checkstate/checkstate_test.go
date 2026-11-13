@@ -225,7 +225,7 @@ func TestDiagnoseReadsDurableBlockingReasonsFirst(t *testing.T) {
 func TestDiagnoseTellsARollupGuardBlockToReverifyThePullRequest(t *testing.T) {
 	t.Parallel()
 
-	for _, reason := range []string{BlockPlanFailedUnrecorded, BlockNamespacePlacementRefused, BlockConfigDiscoveryFailed} {
+	for _, reason := range []string{BlockPlanFailedUnrecorded, BlockPlanRefusedBySourcePolicy, BlockNamespacePlacementRefused, BlockConfigDiscoveryFailed} {
 		t.Run(reason, func(t *testing.T) {
 			t.Parallel()
 			got := Diagnose(&storage.Check{

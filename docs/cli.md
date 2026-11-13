@@ -910,6 +910,19 @@ The default is the newest 50 entries, printed oldest first. `-n` changes that
 window; `-f` follows new entries. Follow mode is text output and cannot be
 combined with `--json`.
 
+The first read is not retried: if it fails, the command fails at once. After
+that, following stops with a non-zero exit when the server gives an answer a
+retry cannot change, such as `apply not found` or a refused token. A server it
+cannot reach is retried with backoff, the same way the watchers retry, and
+following stops with a non-zero exit once polls have kept failing for a few
+minutes in a row. Run the same `logs` command again to keep following: it
+prints the newest entries again and does not resume from the last line shown.
+Ctrl-C ends following normally.
+
+With `--deployment`, a source whose logs could not be read is reported as a
+warning while the other sources keep printing. That warning does not end
+following, even when every poll fails the same way.
+
 In local mode, omit `--deployment`: the stored log includes engine activity.
 In gRPC mode, add it with a deployment name from the apply's progress to read
 remote engine details such as copying, throttling, or cutover. It requires an
@@ -1073,6 +1086,27 @@ A long-running apply can legitimately own one. The command returns nonzero
 when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
+
+A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
+are. Each says on stderr that it was canceled and exits 130, the status a
+shell reports for an interrupted process, so a script can tell an interrupted
+run from one that failed or left findings. Exit 130 is the only mark of a
+report that was cut short; the JSON output has no field for it.
+
+What an interrupted run reports depends on where it stopped:
+
+- `checks backfill` interrupted during its scan, with or without `--dry-run`,
+  prints no report. What the scan had found so far is discarded.
+- `checks backfill` interrupted while recreating checks prints its report with
+  the outcomes it received. A PR with no outcome was either not reached or was
+  in the batch the interrupt cut off.
+- `webhooks redrive` prints the redelivery counts from the chunks that
+  completed, and prints none under `--dry-run`.
+
+Treat those outcomes and counts as a lower bound: the server may have finished
+part of the request that was in flight. Checks already recreated and
+deliveries already redelivered are not undone. Run `checks backfill` again to
+finish the sweep; it only acts on PRs whose Check Runs are still missing.
 
 An `--all-repos` sweep skips a declared repository the server's GitHub App is
 not installed on, names it, and keeps scanning the rest. The skip still makes

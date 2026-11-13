@@ -147,7 +147,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan refused by namespace placement"})
 		return
 	}
-	if err != nil && target != "" {
+	if narrowedPlanFailureLeavesEnvironmentCheck(err, target) {
 		// A plan narrowed to one target speaks for that target only, so its
 		// failure (an unknown target included) answers on the comment and leaves
 		// the environment's check as its last plan of every target recorded it.
@@ -161,12 +161,14 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	if err != nil {
 		h.logger.Error("plan execution failed",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
-			"deployment", deployment, "environment", environment, "error", err)
+			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		userError := userFacingError(err)
 		if planRefusedBySourcePolicy(err) {
 			// A source the policy refused stores no check state, so its
-			// refusal fails only the aggregate.
-			h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
+			// refusal fails only the aggregate. The policy refuses the source
+			// for the database, so a plan narrowed to one target fails the
+			// aggregate the same way.
+			h.postSourcePolicyRefusal(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
 				environment: userError,
 			})
 		} else {
@@ -310,10 +312,121 @@ func (h *Handler) failClosedOnNamespacePlacement(ctx context.Context, client *gh
 // the plan because the pull request's repository or schema directory is not
 // authorized for the database. Such a refusal stores no check state: a row
 // written for it would record state for the database on behalf of a source
-// the policy refused, so the failing aggregate alone answers for it.
+// the policy refused, so the failing aggregate alone answers for it, carrying
+// a block no fold replaces (postSourcePolicyRefusal).
 func planRefusedBySourcePolicy(err error) bool {
 	_, ok := errors.AsType[*api.SourcePolicyError](err)
 	return ok
+}
+
+// narrowedPlanFailureLeavesEnvironmentCheck reports whether a failed plan was
+// narrowed to one target and failed for that target alone, so the
+// environment's check stays as its last plan of every target recorded it. A
+// source policy refusal is not such a failure: the policy refuses the pull
+// request's source for the database, whichever target the plan named.
+func narrowedPlanFailureLeavesEnvironmentCheck(err error, target string) bool {
+	if err == nil || target == "" {
+		return false
+	}
+	return !planRefusedBySourcePolicy(err)
+}
+
+// sourcePolicyRefusalHoldingEachFailure returns the source policy refusal the
+// aggregate of each failed environment shows, keyed by environment. failures
+// holds what the plan comment shows for each one, and refused names those the
+// policy refused. A refused environment shows its own refusal. An environment
+// that failed some other way is held by the same block without being refused,
+// so it shows the refusal of the first refused environment in plan order, and
+// its own failure stays on the plan comment. A deployment that publishes one
+// aggregate for every environment then names a refusal whichever environment
+// it reads, and never a failure the source policy did not cause.
+func sourcePolicyRefusalHoldingEachFailure(planOrder []string, failures map[string]string, refused map[string]bool) map[string]string {
+	holding := ""
+	for _, env := range planOrder {
+		if refused[env] {
+			holding = failures[env]
+			break
+		}
+	}
+	refusals := make(map[string]string, len(failures))
+	for env, failure := range failures {
+		if refused[env] {
+			refusals[env] = failure
+		} else {
+			refusals[env] = holding
+		}
+	}
+	return refusals
+}
+
+// postSourcePolicyRefusal posts the failing aggregate for environments whose
+// plan the database's source policy refused, keyed by environment with the
+// refusal the plan comment shows. With no row stored for the refused source, a
+// fold from stored check state would read the environment's earlier row, which
+// can be a success on this same head. So the aggregate carries
+// sourcePolicyRefusedBlock, which no fold replaces: it lifts only when a re-run
+// of the check or a new commit re-verifies the PR and re-plans every
+// environment. The summary names that step ahead of the refusal: a Check Run
+// summary is clamped to a fixed length, and the refusal's length follows the
+// schema directory it names.
+func (h *Handler) postSourcePolicyRefusal(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, refusals map[string]string) {
+	summaries := make(map[string]string, len(refusals))
+	for env, refusal := range refusals {
+		summaries[env] = sourcePolicyRefusedBlock.message + " Refusal: " + refusal
+	}
+	targets, unpublished := h.sourcePolicyRefusalAggregateTargets(repo, refusals)
+	if len(unpublished) > 0 {
+		h.logger.Warn("source policy refused a plan of environments this deployment publishes no aggregate for; no aggregate is posted for them",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "environments", unpublished)
+	}
+	if len(unpublished) == len(refusals) {
+		return
+	}
+	if !h.postFailingAggregateTargetsWithBlock(ctx, client, repo, pr, headSHA, targets, summaries, sourcePolicyRefusedBlock) {
+		h.logger.Warn("source policy refusal block is not in place on every aggregate; each such aggregate keeps the state it last stored, and a later fold reads the refused environment's earlier stored row",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "environments", slices.Sorted(maps.Keys(refusals)))
+		return
+	}
+	h.logger.Info("failing aggregate posted with the source policy refusal block; no fold replaces it until a re-run of the check or a new commit re-plans every environment",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "environments", slices.Sorted(maps.Keys(refusals)))
+}
+
+// sourcePolicyRefusalAggregateTargets returns the aggregates a source policy
+// refusal fails: the repository's own aggregates, and the aggregate of every
+// refused environment this deployment publishes that those leave out. A
+// database that stops authorizing the repository can take its environment out
+// of the repository's aggregates while that environment's aggregate from an
+// earlier plan still stands on the head, so the refusal fails it by name. The
+// block on it lifts like any other once the policy authorizes the repository
+// again and the environment is back among its aggregates.
+//
+// unpublished lists the refused environments that get no aggregate because
+// they are outside this deployment's allowed environments.
+func (h *Handler) sourcePolicyRefusalAggregateTargets(repo string, refusals map[string]string) (targets []aggregateCheckTarget, unpublished []string) {
+	targets = h.aggregateCheckTargetsForRepo(repo)
+	config, ok := h.serverConfig()
+	if !ok || len(config.AllowedEnvironments) == 0 {
+		return targets, nil
+	}
+	covered := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		covered[target.environment] = true
+	}
+	base := h.aggregateCheckNameForRepo(repo)
+	for _, env := range slices.Sorted(maps.Keys(refusals)) {
+		switch {
+		case covered[env]:
+			// Already one of the repository's own aggregates.
+		case config.IsEnvironmentAllowed(env):
+			targets = append(targets, aggregateCheckTarget{
+				name:        aggregateCheckNameForEnv(base, env),
+				environment: env,
+			})
+		default:
+			unpublished = append(unpublished, env)
+		}
+	}
+	return targets, unpublished
 }
 
 // recordPlanFailuresAndFold stores a failing check row for each environment
@@ -790,12 +903,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			// refused any of them, since no check state is stored on behalf
 			// of a source the policy refused, and a namespace placement
 			// refusal whose row could not be stored. It is posted after the
-			// fold so the fold cannot replace it.
+			// fold so the fold cannot replace it. A source policy refusal
+			// carries its block, so no later fold replaces it either, and
+			// every aggregate it holds names the refusal.
 			unrecorded := maps.Clone(multiEnvData.Errors)
 			for _, env := range recordable {
 				delete(unrecorded, env)
 			}
-			if len(unrecorded) > 0 {
+			if len(unrecorded) > 0 && len(sourcePolicyRefused) > 0 {
+				h.postSourcePolicyRefusal(ctx, client, repo, pr, prInfo.HeadSHA,
+					sourcePolicyRefusalHoldingEachFailure(environments, unrecorded, sourcePolicyRefused))
+			} else if len(unrecorded) > 0 {
 				h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA, unrecorded)
 			}
 		}
