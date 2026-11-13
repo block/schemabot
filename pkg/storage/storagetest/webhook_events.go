@@ -1077,6 +1077,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 			require.True(t, ok, "state %q must be present even when empty", state)
 			assert.Equal(t, int64(0), count, "state %q", state)
 		}
+		assert.Zero(t, empty.ClaimableDepth)
 		assert.Zero(t, empty.OldestClaimableAge)
 		assert.Equal(t, int64(0), empty.StuckProcessing)
 
@@ -1088,6 +1089,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 		stats, err := store.WebhookEvents().InboxStats(ctx)
 		require.NoError(t, err)
+		assert.Equal(t, int64(2), stats.ClaimableDepth)
 		assert.Equal(t, int64(2), stats.CountsByState[storage.WebhookEventPending])
 		assert.GreaterOrEqual(t, stats.OldestClaimableAge, time.Minute, "the oldest pending row drives the backlog age")
 		assert.Less(t, stats.OldestClaimableAge, 10*time.Minute)
@@ -1097,6 +1099,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		claimed := claimExpecting(t, store, "pending-old")
 		stats, err = store.WebhookEvents().InboxStats(ctx)
 		require.NoError(t, err)
+		assert.Equal(t, int64(1), stats.ClaimableDepth)
 		assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventPending])
 		assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventProcessing])
 		assert.Less(t, stats.OldestClaimableAge, time.Minute)
@@ -1117,7 +1120,106 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Equal(t, int64(2), stats.CountsByState[storage.WebhookEventPending])
 		assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventCompleted])
+		assert.Equal(t, int64(1), stats.ClaimableDepth, "deferred and completed rows are excluded")
 		assert.Less(t, stats.OldestClaimableAge, time.Minute, "a deferred pending row is not claimable backlog")
+	})
+
+	t.Run("InboxStats_ScheduledBecomesClaimable", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		event := newEvent("scheduled-becomes-due")
+		due := time.Now().UTC().Add(2 * time.Second)
+		event.RetryAfter = &due
+		createEvent(t, store, event)
+		stats, err := store.WebhookEvents().InboxStats(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, stats.ClaimableDepth)
+		require.EventuallyWithT(t, func(collect *assert.CollectT) {
+			stats, err := store.WebhookEvents().InboxStats(ctx)
+			if assert.NoError(collect, err) {
+				assert.Equal(collect, int64(1), stats.ClaimableDepth)
+			}
+		}, pollDeadline, pollInterval)
+		row, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, event.DeliveryID)
+		require.NoError(t, err)
+		require.NotNil(t, row)
+		assert.Equal(t, storage.WebhookEventPending, row.State, "eligibility changes without a state write")
+	})
+
+	// Count the same population FindNext can claim on both storage dialects.
+	t.Run("InboxStats_ClaimableDepthLifecycle", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			state    string
+			attempts int
+			future   bool
+			expired  bool
+			want     int64
+		}{
+			{name: "pending", want: 1},
+			{name: "scheduled", future: true},
+			{name: "retry_due", state: storage.WebhookEventFailedRetryable, want: 1},
+			{name: "retry_future", state: storage.WebhookEventFailedRetryable, future: true},
+			{name: "retry_exhausted", state: storage.WebhookEventFailedRetryable, attempts: storage.MaxWebhookEventAttempts - 1},
+			{name: "processing_live", state: storage.WebhookEventProcessing},
+			{name: "processing_expired", state: storage.WebhookEventProcessing, expired: true, want: 1},
+			{name: "processing_exhausted", state: storage.WebhookEventProcessing, expired: true, attempts: storage.MaxWebhookEventAttempts - 1},
+			{name: "completed", state: storage.WebhookEventCompleted},
+			{name: "failed", state: storage.WebhookEventFailed},
+			{name: "dead_letter", state: storage.WebhookEventFailedPermanent},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				event := newEvent(tc.name)
+				event.Attempts = tc.attempts
+				future := time.Now().UTC().Add(time.Hour)
+				if tc.state == "" && tc.future {
+					event.RetryAfter = &future
+				}
+				createEvent(t, store, event)
+				if tc.state != "" {
+					lease := time.Minute
+					if tc.expired {
+						lease = time.Millisecond
+					}
+					claimed, err := store.WebhookEvents().FindNext(ctx, "driver", lease)
+					require.NoError(t, err)
+					require.NotNil(t, claimed)
+					switch tc.state {
+					case storage.WebhookEventFailedRetryable:
+						due := time.Now().UTC().Add(-time.Minute)
+						if tc.future {
+							due = future
+						}
+						require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "retry", &due))
+					case storage.WebhookEventCompleted:
+						require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
+					case storage.WebhookEventFailed:
+						require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "failed", nil))
+					case storage.WebhookEventFailedPermanent:
+						require.NoError(t, store.WebhookEvents().MarkFailedPermanent(ctx, claimed.ID, claimed.LeaseToken, "permanent"))
+					}
+					if tc.expired {
+						require.EventuallyWithT(t, func(collect *assert.CollectT) {
+							row, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, tc.name)
+							if assert.NoError(collect, err) && assert.NotNil(collect, row) && assert.NotNil(collect, row.LeaseExpiresAt) {
+								assert.True(collect, time.Now().UTC().After(*row.LeaseExpiresAt))
+							}
+						}, pollDeadline, pollInterval)
+					}
+				}
+				stats, err := store.WebhookEvents().InboxStats(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, stats.ClaimableDepth)
+				if tc.want == 0 {
+					assert.Zero(t, stats.OldestClaimableAge)
+				}
+				claimed, err := store.WebhookEvents().FindNext(ctx, "next-driver", time.Minute)
+				require.NoError(t, err)
+				assert.Equal(t, tc.want == 1, claimed != nil, "count and worker eligibility must agree")
+			})
+		}
 	})
 
 	// A row that spent time deferred measures its backlog age and dispatch-lag
@@ -1138,6 +1240,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 		stats, err := store.WebhookEvents().InboxStats(ctx)
 		require.NoError(t, err)
+		assert.Equal(t, int64(1), stats.ClaimableDepth)
 		assert.Greater(t, stats.OldestClaimableAge, 5*time.Second, "age must count the time spent claimable")
 		assert.Less(t, stats.OldestClaimableAge, 40*time.Second, "age must not count the deferral's grace period since receipt")
 
