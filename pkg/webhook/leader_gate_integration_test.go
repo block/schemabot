@@ -1024,8 +1024,13 @@ func TestE2ELeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranchAcqui
 // while it is in progress or failed, a failed staging run keeps production
 // blocked as its prerequisite, and with no run on the head both aggregates
 // pass. A tenant-b run the leader cannot read leaves it unable to tell which
-// case it is in, so it publishes nothing and re-folds later.
+// case it is in, so it publishes nothing and re-folds later. When the leader's
+// environment_order omits an environment tenant-b publishes, the leader cannot
+// tell which run must pass before which, so both aggregates fail, as they do
+// while the PR still proposes the rename.
 func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranchAcquiresTheRename(t *testing.T) {
+	const unreadableRunError = "resolve participants for scoped aggregate leader"
+	const omittedEnvironmentError = "missing from the effective environment_order"
 	stagingName := aggregateCheckNameForEnv("SchemaBot", "staging")
 	productionName := aggregateCheckNameForEnv("SchemaBot", "production")
 	tests := []struct {
@@ -1034,9 +1039,13 @@ func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranc
 		// an environment missing from it has no run.
 		runs map[string]map[string]any
 		// readFails makes every tenant-b Check Run read fail.
-		readFails    bool
-		wantFollowUp aggregateFoldFollowUp
-		wantError    bool
+		readFails bool
+		// environmentOrder replaces the leader's global environment_order.
+		environmentOrder []string
+		wantFollowUp     aggregateFoldFollowUp
+		// wantError is text the fold's error contains once the default branch
+		// holds the rename; empty means the fold succeeds.
+		wantError string
 		// want maps each aggregate Check Run name to its status and conclusion.
 		want map[string][2]string
 	}{
@@ -1087,12 +1096,29 @@ func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranc
 			name:         "unreadable run publishes nothing and re-folds",
 			readFails:    true,
 			wantFollowUp: aggregateFoldScheduleParticipantRefold,
-			wantError:    true,
+			wantError:    unreadableRunError,
+		},
+		{
+			name: "a failed staging run the environment order omits fails both aggregates",
+			runs: map[string]map[string]any{
+				"staging": {"status": "completed", "conclusion": "failure"},
+			},
+			environmentOrder: []string{"production"},
+			wantFollowUp:     aggregateFoldScheduleParticipantRefold,
+			wantError:        omittedEnvironmentError,
+			want: map[string][2]string{
+				stagingName:    {checkStatusCompleted, checkConclusionFailure},
+				productionName: {checkStatusCompleted, checkConclusionFailure},
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+			cfg := leaderRepoConfig()
+			if tt.environmentOrder != nil {
+				cfg.EnvironmentOrder = tt.environmentOrder
+			}
+			svc := setupE2EServiceWithConfig(t, cfg)
 			mux := http.NewServeMux()
 			server := httptest.NewServer(mux)
 			t.Cleanup(server.Close)
@@ -1143,7 +1169,11 @@ func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranc
 			h := newLeaderHandler(t, svc, client)
 			installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
 			_, err := h.updateAggregateCheckOnce(t.Context(), installClient, repo, 1, headSHA)
-			require.NoError(t, err)
+			if tt.environmentOrder != nil {
+				require.ErrorContains(t, err, omittedEnvironmentError, "while the PR proposes the rename")
+			} else {
+				require.NoError(t, err)
+			}
 			for _, name := range []string{stagingName, productionName} {
 				first := collectAggregate(t, checkRuns, name)
 				require.NotEqual(t, checkConclusionSuccess, first.Conclusion, "while the PR proposes the rename, tenant-b gates %s", name)
@@ -1159,9 +1189,8 @@ func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranc
 			defaultHoldsRename.Store(true)
 			followUp, err := h.updateAggregateCheckOnce(t.Context(), installClient, repo, 1, headSHA)
 			assert.Equal(t, tt.wantFollowUp, followUp)
-			if tt.wantError {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), "resolve participants for scoped aggregate leader")
+			if tt.readFails {
+				require.ErrorContains(t, err, tt.wantError)
 				assert.Empty(t, checkRuns, "no Check Run is published while tenant-b's run on the head is unreadable")
 				for env, stored := range storedBefore {
 					after, err := svc.Storage().Checks().Get(t.Context(), repo, 1, env, aggregateSentinel, aggregateSentinel)
@@ -1172,7 +1201,11 @@ func TestE2EScopedLeaderKeepsFoldingAParticipantRunOnTheHeadAfterTheDefaultBranc
 				}
 				return
 			}
-			require.NoError(t, err)
+			if tt.wantError != "" {
+				require.ErrorContains(t, err, tt.wantError)
+			} else {
+				require.NoError(t, err)
+			}
 			got := map[string]checkRunCapture{}
 			for len(got) < len(tt.want) {
 				select {

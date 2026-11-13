@@ -283,14 +283,7 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 			return aggregateFoldScheduleRefold, nil
 		}
 		if scopeErr != nil {
-			h.logger.Error("aggregate scope could not be verified; no no-work success will be published",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "error", scopeErr)
-			errorsByEnvironment := map[string]string{}
-			for _, target := range h.aggregateCheckTargetsForRepo(repo) {
-				errorsByEnvironment[target.environment] = "Environment coverage could not be verified. Retry planning this PR."
-			}
-			h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errorsByEnvironment, checkBlockReason{})
-			return aggregateFoldScheduleParticipantRefold, scopeErr
+			return h.failAggregatesForUnverifiedScope(ctx, client, repo, pr, headSHA, scopeErr)
 		}
 		// Each environment's aggregate folds the participants it expects for
 		// that environment. A participant only the listed files select keeps
@@ -307,6 +300,12 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 			h.logger.Error("scoped aggregate leader cannot read a participant the PR no longer proposes work for, not publishing aggregate",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
 			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("resolve participants for scoped aggregate leader %s#%d: %w", repo, pr, err)
+		}
+		// Unlike a failed read, an environment the order omits is a known
+		// coverage gap, so every aggregate fails as it does when discovery
+		// finds the same gap in a participant the PR proposes work for.
+		if err := scope.validateExpectedParticipantOrder(config, expectedByEnvironment); err != nil {
+			return h.failAggregatesForUnverifiedScope(ctx, client, repo, pr, headSHA, err)
 		}
 		if h.isAggregateParticipant(repo) && !scope.participantSelected && !hasBlockingCheckForEnvironment(dbChecks, aggregateSentinel) {
 			h.logger.Debug("aggregate participant has no selected paths; staying silent", "repo", repo, "pr", pr, "head_sha", headSHA)
@@ -433,6 +432,28 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
 	}
 	return aggregateFoldClearParticipantRefoldBudget, nil
+}
+
+// failAggregatesForUnverifiedScope fails every aggregate the repository
+// publishes when the fold cannot establish which environments the PR's
+// participants and databases cover. It returns scopeErr with the follow-up that
+// arms the bounded re-fold.
+func (h *Handler) failAggregatesForUnverifiedScope(
+	ctx context.Context,
+	client *ghclient.InstallationClient,
+	repo string,
+	pr int,
+	headSHA string,
+	scopeErr error,
+) (aggregateFoldFollowUp, error) {
+	h.logger.Error("aggregate scope could not be verified; no no-work success will be published",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "error", scopeErr)
+	errorsByEnvironment := map[string]string{}
+	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+		errorsByEnvironment[target.environment] = "Environment coverage could not be verified. Retry planning this PR."
+	}
+	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errorsByEnvironment, checkBlockReason{})
+	return aggregateFoldScheduleParticipantRefold, scopeErr
 }
 
 // settleLeaderAggregateWithNoProposedWork handles an unscoped leader fold that
