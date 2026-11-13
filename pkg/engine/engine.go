@@ -1312,7 +1312,14 @@ type ControlResumeValidator interface {
 
 // ControlResult is the response from control operations.
 type ControlResult struct {
-	Accepted    bool
+	// Accepted reports whether the engine took the operation on. False is a
+	// terminal refusal of this request, with Message as the reason: callers
+	// resolve the request as refused and do not send it again. An engine that
+	// cannot act yet but expects to once its backend catches up must return a
+	// NotReadyError instead, which callers send again on a later tick.
+	Accepted bool
+	// Message is the engine's explanation of its answer. When Accepted is
+	// false it is the reason shown to the operator.
 	Message     string
 	ResumeState *ResumeState
 }

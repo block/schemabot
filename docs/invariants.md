@@ -1345,7 +1345,10 @@ not replace (CO-3), which is typed apart from a decline for the database type.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
 `pkg/tern/control_requests.go`), the terminal resolution of a typed settled-outcome refusal on the
-stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_control.go`), the
+stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_control.go`) and on
+the revert and skip-revert paths, which carry an engine answer that is not an acceptance as that
+refusal (`resolveOrRetryRevertPhaseRequest` and `resolveOrRetryAutoSkipRevert`,
+`pkg/tern/local_apply_grouped.go`), the
 terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
