@@ -149,3 +149,44 @@ func TestPlanCheckRecordStalenessReadsTheCurrentHead(t *testing.T) {
 	assert.Equal(t, pushedHeadSHA, row.HeadSHA)
 	assert.Equal(t, pushedHeadSummary, row.ChangeSummary)
 }
+
+// A plan finishes while SchemaBot cannot read the PR from GitHub. The plan's
+// result is stored only against the head GitHub reports now, and the
+// delivery's cached PR snapshot cannot stand in for that answer, so the write
+// is refused with the read failure and the stored check state for the
+// environment stays exactly as the last answered plan left it.
+func TestPlanCheckRecordIsNotStoredWhenTheCurrentHeadCannotBeRead(t *testing.T) {
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+	}, &namespaceSelectingTernClient{}, nil)
+	schema := &ghclient.SchemaRequestResult{HeadSHA: planStartHeadSHA, Database: p.dbName, Type: storage.DatabaseTypeMySQL}
+
+	ctx := ghclient.WithPRInfoCache(t.Context())
+	cached, err := p.client.FetchPullRequest(ctx, "octocat/hello-world", 1)
+	require.NoError(t, err)
+	require.Equal(t, planStartHeadSHA, cached.HeadSHA)
+
+	const storedSummary = "1 altered"
+	require.NoError(t, p.store.Checks().Upsert(t.Context(), &storage.Check{
+		Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: planStartHeadSHA,
+		Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: p.dbName,
+		CheckRunID: 1, Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired,
+		HasChanges: true, ChangeSummary: storedSummary,
+	}), "seed production's stored check state")
+
+	p.github.FailPRReadsAfterFirstFetch.Store(true)
+	cached, err = p.client.FetchPullRequest(ctx, "octocat/hello-world", 1)
+	require.NoError(t, err, "the delivery's cached snapshot still answers")
+	require.Equal(t, planStartHeadSHA, cached.HeadSHA)
+
+	headSHA, err := p.handler.storePlanCheckRecord(ctx, p.client, "octocat/hello-world", 1, schema, &apitypes.PlanResponse{}, "production", reviewDriftOutcome{})
+	require.ErrorContains(t, err, "fetch PR for stored check state")
+	assert.Empty(t, headSHA, "a write that could not confirm the head names no head")
+
+	row := p.checksByEnv(t)["production"]
+	require.NotNil(t, row, "production's stored check state is still there")
+	assert.Equal(t, planStartHeadSHA, row.HeadSHA)
+	assert.Equal(t, checkConclusionActionRequired, row.Conclusion, "an empty plan must not turn the stored check state passing")
+	assert.True(t, row.HasChanges)
+	assert.Equal(t, storedSummary, row.ChangeSummary)
+}
