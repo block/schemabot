@@ -1611,6 +1611,10 @@ func PreviewCommentReviewRequiredUnauthorizedApprover() string {
 		OtherReviewers:        []string{"acme/schema-reviewers"},
 		PRAuthor:              previewRequestedBy,
 		UnauthorizedApprovers: []string{"jdoe"},
+		OperatorTeamHelp: "**To add a reviewer:**\n" +
+			"1. Open [Access Directory](https://example.com/groups) and find an operator team's owner group.\n" +
+			"2. Ask a group admin to grant membership to someone other than the PR author.\n" +
+			"3. Wait until the reviewer appears in the GitHub team. Do not edit membership directly in GitHub.",
 	})
 }
 

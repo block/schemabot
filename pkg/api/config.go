@@ -1367,7 +1367,14 @@ type ReviewPolicyConfig struct {
 	// those rules, it compares as if true. A database's own
 	// review_policy.require_reapproval overrides it.
 	RequireReapproval *bool `yaml:"require_reapproval,omitempty"`
+
+	// OperatorTeamHelp is optional Markdown explaining how to join a database's
+	// operator team. Review gate comments show it below the operator list only
+	// when that list includes a team. It does not grant approval authority.
+	OperatorTeamHelp string `yaml:"operator_team_help,omitempty"`
 }
+
+const maxOperatorTeamHelpBytes = 1000
 
 // EnvironmentConfig holds per-environment database configuration.
 type EnvironmentConfig struct {
@@ -2418,6 +2425,9 @@ func (c *ServerConfig) Validate() error {
 	}
 	if err := validateReviewPolicy(c.ReviewPolicy); err != nil {
 		return err
+	}
+	if len(c.ReviewPolicy.OperatorTeamHelp) > maxOperatorTeamHelpBytes {
+		return fmt.Errorf("review_policy.operator_team_help must be at most %d bytes (got %d)", maxOperatorTeamHelpBytes, len(c.ReviewPolicy.OperatorTeamHelp))
 	}
 	if err := validateSupportChannel(c.SupportChannel); err != nil {
 		return err

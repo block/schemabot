@@ -19,6 +19,9 @@ type ReviewGateData struct {
 	// OperatorReviewers are the database's own operator principals — the
 	// reviewers the author should ping first, shown in their own section.
 	OperatorReviewers []string
+	// OperatorTeamHelp is server-configured Markdown explaining how to join
+	// an operator team. It is shown only when OperatorReviewers includes a team.
+	OperatorTeamHelp string
 	// OtherReviewers are the broader principals whose approval also satisfies
 	// the gate: admins, repo admins, and codeowners.
 	OtherReviewers []string
@@ -251,6 +254,9 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 	if hasOperators {
 		fmt.Fprintf(sb, "\n**Operators of `%s`**:\n", data.Database)
 		writeMentionList(sb, data.OperatorReviewers)
+		if help := strings.TrimSpace(data.OperatorTeamHelp); help != "" && len(teamsIn(data.OperatorReviewers)) > 0 {
+			fmt.Fprintf(sb, "\n%s\n", help)
+		}
 		if hasOthers {
 			sb.WriteString("\n**Other authorized reviewers**:\n")
 			writeMentionList(sb, data.OtherReviewers)

@@ -2105,6 +2105,23 @@ Repo admins sit between the global admin policy and per-database operators: they
 
 The PR author's own approval never counts, even if they match one of the configured principals. An approval from someone who is not one of these principals does not count either; the Review Required comment names that reviewer and, when the database's operators include a team, offers adding them to it. It never offers an admin or CODEOWNERS team, since joining one grants approval beyond this database. Team membership is checked on every apply, so once they join, running the apply again counts the approval they already gave. When re-approval is required (see below), that approval must still cover the PR's schema change, so a reviewer who approved an earlier commit is also asked to approve the latest one, which always counts once they join. If the GitHub API fails while checking reviews or team membership, SchemaBot blocks the apply and posts an error comment.
 
+To explain how reviewers join an externally managed operator team, set `review_policy.operator_team_help` in the server config:
+
+```yaml
+review_policy:
+  operator_team_help: |
+    **To add a reviewer:**
+    1. Open [Access Directory](https://example.com/groups) and find an operator team's owner group.
+    2. Ask a group admin to grant membership to someone other than the PR author.
+    3. Wait until the reviewer appears in the GitHub team. Do not edit membership directly in GitHub.
+```
+
+This optional Markdown appears below the database's operators in Review Required and Review Gate Error comments. SchemaBot shows it only when the operator list includes a team. It does not appear for admin or CODEOWNERS teams alone.
+
+The field accepts at most 1,000 bytes and defaults to empty. Use a directory link that PR readers can access. See the [rendered example](../TEMPLATES.md#apply-blocked-review-required-approver-not-authorized).
+
+> **Authorization:** This field adds instructions only. It grants no access and changes no review requirements. SchemaBot still reads team membership from GitHub on every apply.
+
 CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review policy is server-controlled. When `include_codeowners` is true, SchemaBot looks for CODEOWNERS in the standard GitHub locations on the base branch:
 
 1. `.github/CODEOWNERS`
