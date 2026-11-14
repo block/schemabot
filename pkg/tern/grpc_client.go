@@ -163,6 +163,10 @@ type GRPCClient struct {
 	// selects defaultObserverHandoffGrace.
 	observerHandoffGrace time.Duration
 
+	// pendingControlReads lets the drives of one apply share their reads of
+	// its pending control requests. Nil reads storage on every check.
+	pendingControlReads *SharedPendingControlReads
+
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
 	controlSendGate remoteControlSendGate
@@ -204,6 +208,12 @@ type Config struct {
 	// MaxRecvMsgBytes bounds a single response message. Zero or negative
 	// selects DefaultMaxRecvMsgBytes.
 	MaxRecvMsgBytes int
+
+	// PendingControlReads is shared with the other clients that drive the same
+	// applies against the same storage, so drives of one apply on different
+	// clients share their reads of its pending control requests. Nil gives the
+	// client a set of its own.
+	PendingControlReads *SharedPendingControlReads
 }
 
 // DefaultMaxRecvMsgBytes bounds a single response from a Tern deployment.
@@ -374,11 +384,12 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 	}
 
 	return &GRPCClient{
-		conn:    conn,
-		client:  ternv1.NewTernClient(conn),
-		address: config.Address,
-		storage: config.Storage,
-		logger:  config.Logger,
+		conn:                conn,
+		client:              ternv1.NewTernClient(conn),
+		address:             config.Address,
+		storage:             config.Storage,
+		logger:              config.Logger,
+		pendingControlReads: pendingControlReadsOrNew(config.PendingControlReads),
 	}, nil
 }
 
@@ -5564,15 +5575,16 @@ func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.App
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
 	parked := newParkedPoll()
+	pendingReads := c.pendingControlReads.forDrive(grpcProgressPollInterval / 2)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
+			if !parked.runFullPoll(ctx, pendingReads, c.storage, apply, time.Now(), logger) {
 				continue
 			}
-			if standDown, err := c.processPendingControlRequestsAtPoll(ctx, apply, scope, &parked); err != nil {
+			if standDown, err := c.processPendingControlRequestsAtPoll(ctx, apply, scope, pendingReads, &parked); err != nil {
 				return err
 			} else if standDown {
 				return nil
@@ -5753,12 +5765,14 @@ func (c *GRPCClient) pollRemoteUntilDone(ctx context.Context, apply *storage.App
 // only the processors for operations found pending run, each loading its own
 // request again before acting on it. standDown reports that a cancel or stop
 // is settling the apply and the drive should exit. An error means the drive
-// exits for the operator to retry, leaving the request pending. parked, when
-// set, is told what the read found, so a drive held at a deferred cutover
-// stays at full cadence behind a request it consumes here.
-func (c *GRPCClient) processPendingControlRequestsAtPoll(ctx context.Context, apply *storage.Apply, scope applyTaskScope, parked *parkedPoll) (standDown bool, err error) {
+// exits for the operator to retry, leaving the request pending. reads is the
+// drive's handle on the reads it shares with the apply's other drives; nil
+// reads storage directly. parked, when set, is told what the read found, so a
+// drive held at a deferred cutover stays at full cadence behind a request it
+// consumes here.
+func (c *GRPCClient) processPendingControlRequestsAtPoll(ctx context.Context, apply *storage.Apply, scope applyTaskScope, reads *drivePendingControlReads, parked *parkedPoll) (standDown bool, err error) {
 	logger := c.applyLogger(apply)
-	pending, err := loadPendingControlOperations(ctx, c.storage, apply)
+	pending, err := reads.load(ctx, c.storage, apply, logger)
 	if err != nil {
 		logger.WarnContext(ctx, "pending gRPC control request read failed; current apply owner will exit for operator retry",
 			append(apply.MutableLogAttrs(), "error", err)...)

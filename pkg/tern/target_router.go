@@ -62,6 +62,11 @@ type TargetRouter struct {
 	factory  LocalClientFactory
 	now      func() time.Time
 
+	// pendingControlReads is handed to every client the router builds, so
+	// the drives of one apply on different targets share their reads of its
+	// pending control requests.
+	pendingControlReads *SharedPendingControlReads
+
 	mu sync.Mutex
 	// authRetryBlockedUntil holds, per route, the end of the cooldown armed
 	// when a self-heal retry proved that re-resolution does not fix the
@@ -214,6 +219,7 @@ func NewTargetRouter(config TargetRouterConfig) (*TargetRouter, error) {
 		sweepAt:               minimumSweepThreshold,
 		activeObservers:       make(map[int64]ProgressObserver),
 		pendingObservers:      make(map[targetClientKey]ProgressObserver),
+		pendingControlReads:   &SharedPendingControlReads{},
 	}, nil
 }
 
@@ -1075,6 +1081,8 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		Metadata:        maps.Clone(resolved.Metadata),
 		SchemaOverrides: maps.Clone(resolved.SchemaOverrides),
 		TableOwner:      resolved.TableOwner,
+
+		PendingControlReads: r.pendingControlReads,
 	}, r.storage, r.logger)
 	if err != nil {
 		publish.done()

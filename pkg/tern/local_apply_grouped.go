@@ -726,6 +726,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		revertSkipped:   apply.RevertSkippedAt != nil,
 		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
 		parked:          newParkedPoll(),
+		pendingReads:    c.pendingControlReads.forDrive(c.taskPollInterval() / 2),
 	}
 
 	// Every exit but the cutover barrier's leaves no engine work running behind
@@ -744,7 +745,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 				apply.IdentityLogAttrs()...)
 			return nil
 		case <-ticker.C:
-			if !ps.parked.runFullPoll(ctx, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...)) {
+			if !ps.parked.runFullPoll(ctx, ps.pendingReads, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...)) {
 				continue
 			}
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
@@ -790,7 +791,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if c.driveCancelled(ctx, apply, "before a progress tick") {
 		return true
 	}
-	pendingBeforeProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
+	pendingBeforeProgress, err := ps.pendingReads.load(ctx, c.storage, apply, logger)
 	if err != nil {
 		logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
 			"error", err)
@@ -1005,7 +1006,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	} else {
 		ps.progressWriteFailures = 0
 	}
-	pendingAfterProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
+	// This check must see a stop recorded while the progress sync ran, before
+	// the cutover below can start, so no earlier read answers it.
+	pendingAfterProgress, err := ps.pendingReads.loadFresh(ctx, c.storage, apply, logger)
 	if err != nil {
 		logger.Warn("pending control request read failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
