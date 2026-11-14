@@ -33,8 +33,13 @@ var applyTargetLockAcquirers = []string{
 }
 
 // packageLoadDeadline bounds the go/packages load, so a stalled go list
-// subprocess fails this test instead of waiting for the suite timeout.
-const packageLoadDeadline = 30 * time.Second
+// subprocess fails this test instead of waiting for the suite timeout (go
+// test's 10-minute default). The load needs export data for every dependency,
+// and go list compiles any that are not in the build cache. After a dependency
+// bump that is a cold compile of the changed module, Vitess included, while
+// the rest of the suite runs in parallel. That takes over 30 seconds on a CI
+// runner, so the bound sits well above it but below the suite timeout.
+const packageLoadDeadline = 5 * time.Minute
 
 // TestApplyTargetLockAcquirersAreListed walks this package's call graph and
 // checks that the exported entry points reaching acquireApplyTargetLockConn

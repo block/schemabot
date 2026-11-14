@@ -2,7 +2,9 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -104,13 +106,13 @@ func scriptedFetch(script []followFetchResult) (fetch func(limit int) ([]*client
 
 // TestRunFollowLoop verifies the follow loop end to end: the initial poll
 // prints the newest-N window, later polls print only entries newer than the
-// last printed id, a transient fetch failure is retried on the next tick
+// last printed id, a transient fetch failure is retried after its backoff
 // without killing the tail, and cancellation exits cleanly.
 func TestRunFollowLoop(t *testing.T) {
 	script := []followFetchResult{
 		{logs: []*client.LogEntry{followLogEntry(1), followLogEntry(2), followLogEntry(3)}},
 		{logs: []*client.LogEntry{followLogEntry(2), followLogEntry(3)}},
-		{err: fmt.Errorf("transient poll failure")},
+		{err: transientFollowError()},
 		{logs: []*client.LogEntry{followLogEntry(3), followLogEntry(4), followLogEntry(5)}},
 	}
 	fetch, limits := scriptedFetch(script)
@@ -134,7 +136,7 @@ func TestRunFollowLoop(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- runFollowLoop(ctx, fetch, emit, 3, time.Millisecond)
+		done <- runFollowLoop(ctx, fetch, emit, 3, fastFollowPacing())
 	}()
 
 	var got []*client.LogEntry
@@ -189,9 +191,201 @@ func TestRunFollowLoop(t *testing.T) {
 // command immediately rather than tailing nothing.
 func TestRunFollowLoopInitialFetchFails(t *testing.T) {
 	fetch, _ := scriptedFetch([]followFetchResult{{err: fmt.Errorf("endpoint unreachable")}})
-	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, time.Millisecond)
+	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
 	require.ErrorContains(t, err, "fetch initial log window")
 	require.ErrorContains(t, err, "endpoint unreachable")
+}
+
+// fastFollowPacing polls and retries without real waiting, so a test drives the
+// loop through many polls in moments.
+func fastFollowPacing() followPacing {
+	return followPacing{
+		interval:  time.Millisecond,
+		retryWait: func(error, int) time.Duration { return time.Millisecond },
+		sleep:     sleepUnlessDone,
+	}
+}
+
+// A tail waits the poll interval after every poll that answered and the
+// backoff for its place in the run after every poll that failed. Once a poll
+// answers again the tail is back on the interval, so a server that recovered
+// is not polled at the pace of the last backoff, and a server that is failing
+// is not polled at the pace of a healthy one.
+func TestRunFollowLoopWaitsTheBackoffOnlyAfterAFailedPoll(t *testing.T) {
+	const interval = 5 * time.Second
+	fetch, limits := scriptedFetch([]followFetchResult{
+		{logs: []*client.LogEntry{followLogEntry(1)}},
+		{err: transientFollowError()},
+		{err: transientFollowError()},
+		{logs: []*client.LogEntry{followLogEntry(2)}},
+		{logs: []*client.LogEntry{followLogEntry(3)}},
+		{err: followAPIError(http.StatusNotFound, "apply not found")},
+	})
+	var waits []time.Duration
+	pacing := followPacing{
+		interval:  interval,
+		retryWait: func(_ error, failures int) time.Duration { return time.Duration(failures) * time.Minute },
+		sleep:     func(_ context.Context, d time.Duration) { waits = append(waits, d) },
+	}
+
+	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, pacing)
+
+	require.ErrorContains(t, err, "apply not found")
+	assert.Len(t, limits(), 6, "every scripted poll ran")
+	assert.Equal(t, []time.Duration{interval, time.Minute, 2 * time.Minute, interval, interval}, waits,
+		"one wait before each poll after the first: the interval, the backoff after each of two failures, then the interval again")
+}
+
+// A tail polls every five seconds and, after a failed poll, backs off on the
+// schedule the progress watches use, including a longer delay the server asked
+// for, so a tail and a watch ride out the same outage for the same time.
+func TestDefaultFollowPacingMatchesTheWatches(t *testing.T) {
+	assert.Equal(t, 5*time.Second, defaultFollowPacing.interval)
+
+	unreachable := transientFollowError()
+	for failures := 1; failures < maxConsecutiveProgressFailures; failures++ {
+		assert.Equal(t, progressRetryWait(unreachable, failures), defaultFollowPacing.retryWait(unreachable, failures), "failure %d", failures)
+	}
+	assert.Equal(t, 4*time.Second, defaultFollowPacing.retryWait(unreachable, 1), "the first backoff")
+	assert.Equal(t, 30*time.Second, defaultFollowPacing.retryWait(unreachable, maxConsecutiveProgressFailures-1), "the backoff is capped")
+
+	// The default wait is a real one that an interrupt cuts short.
+	started := time.Now()
+	defaultFollowPacing.sleep(t.Context(), 50*time.Millisecond)
+	assert.GreaterOrEqual(t, time.Since(started), 50*time.Millisecond, "the wait lasts its full duration")
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	started = time.Now()
+	defaultFollowPacing.sleep(cancelled, followTestDeadline)
+	assert.Less(t, time.Since(started), followTestDeadline, "a cancelled tail does not wait out the interval")
+}
+
+// transientFollowError is a failure the watches judge worth retrying: the
+// server could not be reached.
+func transientFollowError() error {
+	return &client.ConnectionError{Endpoint: "http://schemabot.example", Err: errors.New("connection refused")}
+}
+
+func followAPIError(status int, message string) error {
+	return &client.APIError{Status: status, Message: message}
+}
+
+// A tail that the server answers with a permanent refusal ends with an error
+// and a non-zero exit instead of polling forever: the apply having disappeared
+// or the credentials being refused will not change on the next poll, and a tail
+// that prints nothing reads as an apply with nothing to say.
+func TestRunFollowLoopStopsOnPermanentFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "apply not found", err: followAPIError(http.StatusNotFound, "apply not found"), want: "apply not found"},
+		{name: "credentials refused", err: followAPIError(http.StatusUnauthorized, "invalid token"), want: "invalid token"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fetch, limits := scriptedFetch([]followFetchResult{
+				{logs: []*client.LogEntry{followLogEntry(1)}},
+				{err: tc.err},
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), followTestDeadline)
+			defer cancel()
+
+			err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
+
+			require.Error(t, err)
+			require.NoError(t, ctx.Err(), "the loop must end on the failure, not on the test deadline")
+			assert.ErrorContains(t, err, "stopped following logs")
+			assert.ErrorContains(t, err, tc.want)
+			var apiErr *client.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Len(t, limits(), 2, "one initial poll and the one that failed, with no retry of a permanent failure")
+		})
+	}
+}
+
+// A tail that cannot reach the server retries with backoff and gives up with an
+// error after the same number of polls in a row that the progress watches
+// tolerate, so a script following an apply's logs does not hang on a server
+// that never comes back.
+func TestRunFollowLoopGivesUpAfterConsecutiveTransientFailures(t *testing.T) {
+	fetch, limits := scriptedFetch([]followFetchResult{
+		{logs: []*client.LogEntry{followLogEntry(1)}},
+		{err: transientFollowError()},
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), followTestDeadline)
+	defer cancel()
+
+	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
+
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "the loop must give up on its own, not on the test deadline")
+	assert.ErrorContains(t, err, "stopped following logs after 10 consecutive failed polls")
+	assert.ErrorContains(t, err, "does not affect the apply")
+	var connErr *client.ConnectionError
+	require.ErrorAs(t, err, &connErr)
+	assert.Len(t, limits(), 1+maxConsecutiveProgressFailures, "the initial poll, then every failed poll up to the bound")
+}
+
+// A poll that succeeds clears the run of failures, and each failed poll waits
+// the backoff for its place in the run, so intermittent trouble never ends a
+// tail that keeps recovering.
+func TestRunFollowLoopSuccessResetsTheFailureRun(t *testing.T) {
+	script := []followFetchResult{{logs: []*client.LogEntry{followLogEntry(1)}}}
+	for range maxConsecutiveProgressFailures - 1 {
+		script = append(script, followFetchResult{err: followAPIError(http.StatusServiceUnavailable, "unavailable")})
+	}
+	script = append(script, followFetchResult{logs: []*client.LogEntry{followLogEntry(2)}})
+	for range maxConsecutiveProgressFailures - 1 {
+		script = append(script, followFetchResult{err: transientFollowError()})
+	}
+	script = append(script, followFetchResult{err: followAPIError(http.StatusNotFound, "apply not found")})
+	fetch, limits := scriptedFetch(script)
+
+	var waits []int
+	pacing := fastFollowPacing()
+	pacing.retryWait = func(_ error, failures int) time.Duration {
+		waits = append(waits, failures)
+		return time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), followTestDeadline)
+	defer cancel()
+
+	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, pacing)
+
+	require.ErrorContains(t, err, "apply not found")
+	require.NoError(t, ctx.Err())
+	assert.Len(t, limits(), len(script), "every scripted poll ran, so no failure run reached the bound")
+	var want []int
+	for range 2 {
+		for failures := 1; failures < maxConsecutiveProgressFailures; failures++ {
+			want = append(want, failures)
+		}
+	}
+	assert.Equal(t, want, waits, "the failure count restarts after a successful poll")
+}
+
+// An operator who presses Ctrl-C while a poll is in flight ends the tail
+// normally, even if that poll comes back with an error.
+func TestRunFollowLoopInterruptDuringFailedPollIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	polls := 0
+	fetch := func(int) ([]*client.LogEntry, error) {
+		polls++
+		if polls == 1 {
+			return []*client.LogEntry{followLogEntry(1)}, nil
+		}
+		cancel()
+		return nil, followAPIError(http.StatusNotFound, "apply not found")
+	}
+
+	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, polls)
 }
 
 func deploymentFollowSource(target, externalID string, ids ...int64) *apitypes.DeploymentLogSource {

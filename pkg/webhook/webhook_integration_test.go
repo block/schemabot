@@ -367,6 +367,11 @@ type planFlowResult struct {
 	HeadSHAs    []string
 	headSHACall atomic.Int64
 
+	// MovedHeadSHA, once set, is the head SHA every later /pulls/1 read
+	// serves, ahead of HeadSHAs. Tests set it partway through a flow to model
+	// a push landing at a moment they choose rather than at a call count.
+	MovedHeadSHA atomic.Pointer[string]
+
 	// PRState overrides the lifecycle state served by /pulls/1. Empty (the
 	// default) serves "open"; tests exercising the closed-PR command gate set
 	// "closed" before issuing the webhook request.
@@ -452,6 +457,9 @@ type planFlowResult struct {
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
+	if moved := p.MovedHeadSHA.Load(); moved != nil {
+		return *moved
+	}
 	if len(p.HeadSHAs) == 0 {
 		return "abc123"
 	}
