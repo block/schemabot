@@ -3659,6 +3659,73 @@ func TestServerConfig_StorageDSNEnvFallback(t *testing.T) {
 	})
 }
 
+// The schema DSN falls back to the storage DSN, so existing configs converge
+// exactly as before; when set, it resolves its own reference and still lands
+// on the configured storage database.
+func TestServerConfig_StorageSchemaDSN(t *testing.T) {
+	t.Run("falls back to the storage DSN", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(storage:3306)/schemabot"}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "rw:pw@tcp(storage:3306)/schemabot", dsn)
+	})
+
+	t.Run("resolves its own reference and applies the storage database", func(t *testing.T) {
+		t.Setenv("SCHEMA_DSN_UNDER_TEST", "ddl:pw@tcp(storage:3306)/")
+		cfg := ServerConfig{Storage: StorageConfig{
+			DSN:       "rw:pw@tcp(storage:3306)/schemabot",
+			SchemaDSN: "env:SCHEMA_DSN_UNDER_TEST",
+			Database:  "schemabot_tenant",
+		}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		parsed, err := gomysql.ParseDSN(dsn)
+		require.NoError(t, err)
+		assert.Equal(t, "ddl", parsed.User)
+		assert.Equal(t, "schemabot_tenant", parsed.DBName)
+
+		poolDSN, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		parsed, err = gomysql.ParseDSN(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, "rw", parsed.User, "the pool keeps the storage DSN's user")
+	})
+
+	t.Run("refuses a schema DSN naming another server or database", func(t *testing.T) {
+		for name, schemaDSN := range map[string]string{
+			"other database": "ddl:pw@tcp(storage:3306)/other",
+			"other host":     "ddl:pw@tcp(replica:3306)/schemabot",
+			"other port":     "ddl:pw@tcp(storage:3307)/schemabot",
+			"database case":  "ddl:pw@tcp(storage:3306)/SchemaBot",
+		} {
+			t.Run(name, func(t *testing.T) {
+				cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(storage:3306)/schemabot", SchemaDSN: schemaDSN}}
+				_, err := cfg.StorageSchemaDSN()
+				require.ErrorContains(t, err, "both must name the same storage database")
+				assert.NotContains(t, err.Error(), "pw", "the refusal must not echo credentials")
+			})
+		}
+	})
+
+	t.Run("accepts the same server spelled in another case", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(Storage.Example.com:3306)/schemabot", SchemaDSN: "ddl:pw@tcp(storage.example.com)/schemabot"}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "ddl:pw@tcp(storage.example.com)/schemabot", dsn)
+	})
+
+	t.Run("is rejected for PostgreSQL storage", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{
+			Dialect:   "postgres",
+			DSN:       "postgres://rw:pw@storage:5432/schemabot",
+			SchemaDSN: "postgres://ddl:pw@storage:5432/schemabot",
+		}, Databases: map[string]DatabaseConfig{
+			"appdb": {Type: "mysql", Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/appdb"}}},
+		}}
+		require.ErrorContains(t, cfg.Validate(), `schema_dsn is only supported with dialect "mysql", not "postgres"`)
+	})
+}
+
 func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
 	dir := t.TempDir()
 	databaseConfigPath := filepath.Join(dir, "storage.yaml")

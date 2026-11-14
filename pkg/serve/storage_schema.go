@@ -37,9 +37,9 @@ import (
 // bootstrap permits: the destructive refusal and the manual-remediation gate
 // decide on supplied files the same way they decide on embedded ones (AV-9).
 type storageSchemaAdapter struct {
-	// resolveDSN re-resolves the storage DSN per call rather than capturing a
-	// string, so a credential rotated since startup is picked up the same way
-	// the storage pool picks it up.
+	// resolveDSN re-resolves the storage schema DSN per call rather than
+	// capturing a string, so a credential rotated since startup is picked up
+	// the same way the storage pool picks it up.
 	resolveDSN func() (string, error)
 	// bootTarget is the database this instance booted against, parsed out of
 	// the DSN its storage pool was opened with. Every re-resolved DSN is
@@ -78,7 +78,7 @@ func (s *Server) newStorageSchemaService() (*storageSchemaAdapter, error) {
 		return nil, fmt.Errorf("read the storage target this instance booted against: %w", err)
 	}
 	return &storageSchemaAdapter{
-		resolveDSN:               s.cfg.StorageDSN,
+		resolveDSN:               s.cfg.StorageSchemaDSN,
 		bootTarget:               bootTarget,
 		dialect:                  s.dialect,
 		version:                  attributableVersion(s.version),

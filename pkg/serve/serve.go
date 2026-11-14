@@ -837,7 +837,13 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
-	if err := api.EnsureSchema(dsn, logger,
+	// StorageSchemaDSN refuses a schema DSN that names a different database
+	// from dsn, so the pool only serves storage this server converged.
+	schemaDSN, err := cfg.StorageSchemaDSN()
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve storage schema DSN: %w", err)
+	}
+	if err := api.EnsureSchema(schemaDSN, logger,
 		api.WithStopSignal(ctx.Done()),
 		api.WithDestructiveSchemaChangePolicy(api.ConfiguredDestructivePolicy(cfg.Storage.AllowDestructiveSchemaChanges), false),
 		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
