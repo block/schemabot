@@ -2007,8 +2007,8 @@ var knownWebhookInboxStates = func() map[string]bool {
 //
 // One caveat on pending: a row created with a not-before time sits in pending
 // by design until it becomes due, so steady nonzero pending depth alone does
-// not imply dispatch lag — cross-check the oldest-claimable-age gauge, which
-// counts only dispatchable rows.
+// not imply dispatch lag — use claimable depth and oldest claimable age,
+// which count only dispatchable rows.
 func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 	if !knownWebhookInboxStates[state] {
 		state = "unknown"
@@ -2017,6 +2017,17 @@ func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 		"Number of durable webhook inbox rows by state", "{row}",
 		EnvironmentAttribute(""),
 		attribute.String("state", state),
+	)
+}
+
+// RecordWebhookInboxClaimableDepth records rows ready for a worker now, excluding
+// scheduled work, active leases and exhausted retries. A sustained rise means
+// workers are not keeping up; inspect worker health and claim/storage errors.
+// Replicas observe the same inbox, so aggregate with max rather than sum.
+func RecordWebhookInboxClaimableDepth(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.webhook.inbox_claimable_depth", count,
+		"Number of durable webhook inbox rows ready to claim", "{row}",
+		EnvironmentAttribute(""),
 	)
 }
 

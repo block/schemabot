@@ -161,7 +161,7 @@ func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliv
 // pending row whose not-before time (retry_after) is unset or has passed, a
 // retryable row whose retry window has elapsed and is under the attempt cap,
 // or a processing row whose lease has expired and is under the attempt cap.
-// FindNext and the InboxStats backlog-age query derive from this single source
+// FindNext and the InboxStats claimable aggregate derive from this single source
 // so the "ready to claim" definition cannot drift between what a driver picks
 // up and what the backlog gauge measures. Bind its placeholders with
 // webhookClaimableArgs.
@@ -651,8 +651,7 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 
 // InboxStats returns a read-only snapshot of the inbox for observability. It
 // runs three cheap aggregates rather than one query: heterogeneous aggregates
-// (grouped counts, a MIN age over a filtered subset, and a filtered count) do
-// not combine into a single index-friendly statement, and each is served by an
+// (grouped counts, claimable count/age, and stuck-processing count) do not combine into a single index-friendly statement, and each is served by an
 // existing index.
 func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInboxStats, error) {
 	stats := &storage.WebhookInboxStats{CountsByState: make(map[string]int64, len(storage.WebhookEventStatesAll))}
@@ -677,7 +676,7 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 		return nil, fmt.Errorf("iterate webhook inbox state counts: %w", err)
 	}
 
-	// Oldest ready-to-claim row, using the exact predicate a driver claims by
+	// Count and oldest age share the exact predicate a driver claims by
 	// (webhookClaimablePredicate) so the backlog gauge and dispatch agree on
 	// what is claimable: a cap-exhausted retryable row is not counted (a driver
 	// won't take it, so it isn't backlog), and an expired-lease processing row a
@@ -691,12 +690,12 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 	// zero age.
 	var oldestClaimableAt, databaseNow sql.NullTime
 	err = s.db.QueryRowContext(ctx, `
-		SELECT MIN(GREATEST(received_at, COALESCE(retry_after, received_at))), `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`
+		SELECT COUNT(*), MIN(GREATEST(received_at, COALESCE(retry_after, received_at))), `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`
 		FROM webhook_events
 		WHERE `+s.webhookClaimablePredicate()+`
-	`, webhookClaimableArgs()...).Scan(&oldestClaimableAt, &databaseNow)
+	`, webhookClaimableArgs()...).Scan(&stats.ClaimableDepth, &oldestClaimableAt, &databaseNow)
 	if err != nil {
-		return nil, fmt.Errorf("measure oldest claimable webhook inbox row: %w", err)
+		return nil, fmt.Errorf("measure claimable webhook inbox rows: %w", err)
 	}
 	if oldestClaimableAt.Valid && databaseNow.Valid && databaseNow.Time.After(oldestClaimableAt.Time) {
 		stats.OldestClaimableAge = databaseNow.Time.Sub(oldestClaimableAt.Time)

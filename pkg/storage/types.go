@@ -2955,9 +2955,13 @@ type WebhookInboxStats struct {
 	// state momentarily empties.
 	CountsByState map[string]int64
 
+	// ClaimableDepth counts rows ready for FindNext now: due pending/retryable
+	// deliveries and expired processing leases with attempts remaining.
+	ClaimableDepth int64
+
 	// OldestClaimableAge is how long the oldest ready-to-claim-but-unclaimed row
-	// (pending with no future not-before time, or retryable with an elapsed
-	// retry window) has been claimable. Age is measured from when the row
+	// (due pending/retryable work or an expired processing lease under the
+	// attempt cap) has been claimable. Age is measured from when the row
 	// became claimable — the later of receipt and its retry_after — not from
 	// receipt, so a row that spent time deliberately deferred does not report
 	// its grace period as backlog. It is the inbox's backlog latency; zero
