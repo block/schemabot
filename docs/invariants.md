@@ -522,15 +522,18 @@ repository it serves, so routine edits in one large repository use it up and req
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
 configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
 (`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
-symlinks from one diff of the change, or from directory listings batched across those paths when
-GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
-the server's configuration names every directory the repository's configs can sit in, and reads a
-symlink's target only when a config file sits above it; and
+symlinks from one diff of the change, and reads the paths the diff gives no mode for with at most
+one request per side: one directory listing when they fit in one batch, otherwise one listing of
+the whole tree. It asks only about paths inside the configured schema directories when the
+server's configuration names every directory the repository's configs can sit in. When GitHub
+truncates the tree, the paths the listing still names keep its modes; the rest are listed by
+directory in batches when they are inside those schema directories, and are otherwise treated as
+not symlinks. It reads a symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
 (`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
-one-line edits outside its schema directory and requires the same GitHub requests. It covers an
-auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
-repository whose tree GitHub truncates.
+one-line edits outside its schema directory and requires the same GitHub requests, with the diff
+served, refused as too large, and naming pure renames. It covers an auto-plan when the PR opens and
+when a push lands, a plan command, and a plan command in a repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
@@ -579,6 +582,11 @@ automatic apply, which dispatches only after its pending changes are stored
 (`applyCommandCore` in `pkg/webhook/apply_handlers.go`). These guards apply to the state a
 fold observes; concurrent publication can leave stale success over a later blocker
 ([publication concurrency](check-runs.md#publication-concurrency)).
+
+The one exception is a changed path whose file mode cannot be read within AV-15's request budget.
+It is treated as a regular file, so a PR whose only schema change is a symlink among such paths
+gets a passing "no schema files changed". The case is logged as a warning and counted
+(`symlinksAtRef` in `pkg/github/symlink_modes.go`); a request GitHub fails is still an error.
 
 ### MG-2: Absence never passes
 

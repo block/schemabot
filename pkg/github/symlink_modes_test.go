@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -183,18 +184,24 @@ func TestParseDiffModesReadsTheFilesAfterAnOverlongLine(t *testing.T) {
 }
 
 // symlinkModesServer fakes the GitHub endpoints SymlinkModes uses and counts
-// every request, failing the test on any other endpoint, such as a tree read.
-// A ref is resolvable when at least one tree is registered under it.
+// every request, failing the test on any other endpoint, such as a
+// level-by-level tree read. A ref is resolvable when at least one tree is
+// registered under it.
 type symlinkModesServer struct {
 	ic    *InstallationClient
 	diff  func(w http.ResponseWriter)
 	trees map[string][]graphQLTreeEntry // "<ref>:<dir>" → entries; absent → null
 	// graphQL, when set, answers a GraphQL query itself and returns true, or
 	// returns false to let the fake answer it from trees.
-	graphQL  func(w http.ResponseWriter, ref string, dirs []string) bool
-	mu       sync.Mutex
-	compares int
-	queries  [][]string // the directories of each GraphQL query, in order
+	graphQL func(w http.ResponseWriter, ref string, dirs []string) bool
+	// recursiveTree, when set, answers a recursive tree read itself and
+	// returns true, or returns false to let the fake list every entry of
+	// trees registered under the ref.
+	recursiveTree func(w http.ResponseWriter, ref string) bool
+	mu            sync.Mutex
+	compares      int
+	queries       [][]string // the directories of each GraphQL query, in order
+	treeReads     []string   // the ref of each recursive tree read, in order
 }
 
 func newSymlinkModesServer(t *testing.T) *symlinkModesServer {
@@ -258,6 +265,34 @@ func newSymlinkModesServer(t *testing.T) *symlinkModesServer {
 		}
 		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": repository}}))
 	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		ref := r.PathValue("ref")
+		if !assert.Equal(t, "1", r.URL.Query().Get("recursive"), "the tree is read whole, never level by level") {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		s.treeReads = append(s.treeReads, ref)
+		s.mu.Unlock()
+		if s.recursiveTree != nil && s.recursiveTree(w, ref) {
+			return
+		}
+		var entries []*gh.TreeEntry
+		for key, dirEntries := range s.trees {
+			dir, under := strings.CutPrefix(key, ref+":")
+			if !under {
+				continue
+			}
+			for _, entry := range dirEntries {
+				entries = append(entries, &gh.TreeEntry{
+					Path: new(path.Join(dir, entry.Name)),
+					Mode: new(strconv.FormatInt(int64(entry.Mode), 8)),
+					Type: new("blob"),
+				})
+			}
+		}
+		assert.NoError(t, json.NewEncoder(w).Encode(gh.Tree{SHA: new(ref), Entries: entries, Truncated: new(false)}))
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected GitHub request %s %s", r.Method, r.URL.Path)
 		w.WriteHeader(http.StatusNotFound)
@@ -276,6 +311,13 @@ func (s *symlinkModesServer) graphQLQueries() [][]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([][]string(nil), s.queries...)
+}
+
+// treeReadRefs returns the ref of each recursive tree read, in order.
+func (s *symlinkModesServer) treeReadRefs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.treeReads...)
 }
 
 // graphQLBatchSizes returns how many directories each GraphQL query listed,
@@ -323,7 +365,7 @@ func TestSymlinkModesReadsEveryModeFromOneDiff(t *testing.T) {
 	probes = append(probes, SymlinkProbe{Path: "orders/schema/staging", AtHead: true, AtBase: true})
 	s.diff = func(w http.ResponseWriter) { _, _ = io.WriteString(w, diff.String()) }
 
-	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes)
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, s.compareCount(), "one diff request covers every changed file")
@@ -333,10 +375,12 @@ func TestSymlinkModesReadsEveryModeFromOneDiff(t *testing.T) {
 	assert.Len(t, modes, 51)
 }
 
-// When GitHub refuses the diff as too large, the modes come from batched
-// GraphQL directory listings, one query per side for up to a hundred
-// directories, and never from a level-by-level tree walk.
-func TestSymlinkModesFallsBackToBatchedGraphQLWhenDiffTooLarge(t *testing.T) {
+// When GitHub refuses the diff as too large, each side's modes come from one
+// request. The head side's paths sit in more directories than one GraphQL
+// query lists, so they come from one recursive listing of the tree; the base
+// side's two directories fit in one GraphQL query. Nothing is read level by
+// level.
+func TestSymlinkModesReadsEachSideWithOneRequestWhenDiffTooLarge(t *testing.T) {
 	s := newSymlinkModesServer(t)
 	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
 	var probes []SymlinkProbe
@@ -353,14 +397,207 @@ func TestSymlinkModesFallsBackToBatchedGraphQLWhenDiffTooLarge(t *testing.T) {
 	s.trees["base1:orders/schema"] = []graphQLTreeEntry{{Name: "staging", Mode: 0o100644}}
 	// gone/ is absent at base, so its listing comes back null.
 
-	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes)
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, s.compareCount())
-	assert.Equal(t, []int{100, 51, 2}, s.graphQLBatchSizes(), "151 head directories in two batches, 2 base directories in one")
-	assert.Equal(t, SymlinkMode{Head: true, Base: false}, modes["orders/schema/staging"])
+	assert.Equal(t, []string{"head1"}, s.treeReadRefs(), "151 head directories are read from one tree listing")
+	assert.Equal(t, [][]string{{"orders/schema", "gone"}}, s.graphQLQueries(), "2 base directories are read in one GraphQL query")
+	assert.Equal(t, SymlinkMode{Head: true, Base: false}, modes["orders/schema/staging"], "the symlink is found in the tree listing")
 	assert.Equal(t, SymlinkMode{}, modes["gone/link"])
 	assert.Equal(t, SymlinkMode{}, modes["svc/pkg149/Main.java"])
+}
+
+// However many directories the unknown paths sit in, past one GraphQL batch
+// each side costs exactly one recursive tree read: 150 directories and 1,500
+// cost the same. Pure renames, which the diff gives no mode for, are read the
+// same way as paths of a refused diff.
+func TestSymlinkModesReadCostDoesNotGrowWithDirectories(t *testing.T) {
+	for _, dirs := range []int{symlinkModeGraphQLBatch + 1, 1500} {
+		t.Run(fmt.Sprintf("%d directories", dirs), func(t *testing.T) {
+			s := newSymlinkModesServer(t)
+			var diff strings.Builder
+			var probes []SymlinkProbe
+			for i := range dirs {
+				from, to := fmt.Sprintf("old/pkg%04d/Main.java", i), fmt.Sprintf("new/pkg%04d/Main.java", i)
+				fmt.Fprintf(&diff, "diff --git a/%s b/%s\nsimilarity index 100%%\nrename from %s\nrename to %s\n", from, to, from, to)
+				probes = append(probes, SymlinkProbe{Path: to, AtHead: true}, SymlinkProbe{Path: from, AtBase: true})
+				s.trees["head1:"+path.Dir(to)] = []graphQLTreeEntry{{Name: "Main.java", Mode: 0o100644}}
+				s.trees["base1:"+path.Dir(from)] = []graphQLTreeEntry{{Name: "Main.java", Mode: 0o100644}}
+			}
+			s.trees["head1:new/pkg0007"][0].Mode = 40960
+			s.diff = func(w http.ResponseWriter) { _, _ = io.WriteString(w, diff.String()) }
+
+			modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
+			require.NoError(t, err)
+
+			assert.Equal(t, 1, s.compareCount())
+			assert.Equal(t, []string{"head1", "base1"}, s.treeReadRefs(), "one tree listing per side")
+			assert.Empty(t, s.graphQLQueries())
+			assert.Equal(t, SymlinkMode{Head: true}, modes["new/pkg0007/Main.java"])
+			assert.Equal(t, SymlinkMode{}, modes["old/pkg0007/Main.java"])
+			assert.Len(t, modes, 2*dirs)
+		})
+	}
+}
+
+// writeTruncatedTree answers a recursive tree read the way GitHub answers one
+// for a repository too large to list: truncated, naming only entries, the
+// part of the tree that fit.
+func writeTruncatedTree(t *testing.T, w http.ResponseWriter, ref string, entries ...*gh.TreeEntry) {
+	t.Helper()
+	if entries == nil {
+		entries = []*gh.TreeEntry{}
+	}
+	assert.NoError(t, json.NewEncoder(w).Encode(gh.Tree{SHA: new(ref), Entries: entries, Truncated: new(true)}))
+}
+
+// mainJavaEntries returns the recursive tree entries of Main.java in the
+// first dirs directories manyDirectoryProbes registered at head1, with the
+// modes registered there.
+func mainJavaEntries(s *symlinkModesServer, dirs int) []*gh.TreeEntry {
+	entries := make([]*gh.TreeEntry, 0, dirs)
+	for i := range dirs {
+		dir := fmt.Sprintf("schema/pkg%03d", i)
+		entry := s.trees["head1:"+dir][0]
+		entries = append(entries, &gh.TreeEntry{
+			Path: new(path.Join(dir, entry.Name)),
+			Mode: new(strconv.FormatInt(int64(entry.Mode), 8)),
+			Type: new("blob"),
+		})
+	}
+	return entries
+}
+
+// manyDirectoryProbes returns head probes for Main.java in dirs directories,
+// registered as regular files at head1, with the one in pkg042 a symlink.
+func manyDirectoryProbes(s *symlinkModesServer, dirs int) []SymlinkProbe {
+	var probes []SymlinkProbe
+	for i := range dirs {
+		dir := fmt.Sprintf("schema/pkg%03d", i)
+		probes = append(probes, SymlinkProbe{Path: dir + "/Main.java", AtHead: true})
+		s.trees["head1:"+dir] = []graphQLTreeEntry{{Name: "Main.java", Mode: 0o100644}}
+	}
+	s.trees["head1:schema/pkg042"][0].Mode = 40960
+	return probes
+}
+
+// When GitHub truncates the tree listing and the caller probed only paths
+// inside the configured schema directories, the paths are read with batched
+// GraphQL queries: their count is bounded by the schema directories the PR
+// touches, not by the rest of the PR.
+func TestSymlinkModesReadsScopedPathsWithGraphQLWhenTheTreeIsTruncated(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+	s.recursiveTree = func(w http.ResponseWriter, ref string) bool {
+		writeTruncatedTree(t, w, ref)
+		return true
+	}
+	probes := manyDirectoryProbes(s, 151)
+
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"head1"}, s.treeReadRefs())
+	assert.Equal(t, []int{100, 51}, s.graphQLBatchSizes())
+	assert.Equal(t, SymlinkMode{Head: true}, modes["schema/pkg042/Main.java"])
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg150/Main.java"])
+}
+
+// When GitHub truncates the tree listing and no configured schema directories
+// bound the probed paths, reading them directory by directory would cost
+// requests in proportion to the PR's other files. They are not read: every
+// one is reported as not a symlink, without an error, so the PR is still
+// planned.
+func TestSymlinkModesLeavesUnscopedPathsUnreadWhenTheTreeIsTruncated(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+	s.recursiveTree = func(w http.ResponseWriter, ref string) bool {
+		writeTruncatedTree(t, w, ref)
+		return true
+	}
+	probes := manyDirectoryProbes(s, 151)
+
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"head1"}, s.treeReadRefs())
+	assert.Empty(t, s.graphQLQueries(), "no directory is listed")
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg042/Main.java"], "an unread path is reported as not a symlink")
+	assert.Len(t, modes, 151)
+}
+
+// A truncated tree listing still gives the mode of every path it names. With
+// no configured schema directories bounding the probed paths, a symlink the
+// listing names is reported as one, and only the paths it leaves out are
+// reported as not symlinks, without a directory listing.
+func TestSymlinkModesKeepsTheModesATruncatedTreeNamesForUnscopedPaths(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+	probes := manyDirectoryProbes(s, 151)
+	s.trees["head1:schema/pkg120"][0].Mode = 40960
+	s.recursiveTree = func(w http.ResponseWriter, ref string) bool {
+		writeTruncatedTree(t, w, ref, mainJavaEntries(s, 100)...)
+		return true
+	}
+
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, s.compareCount())
+	assert.Equal(t, []string{"head1"}, s.treeReadRefs())
+	assert.Empty(t, s.graphQLQueries(), "no directory is listed")
+	assert.Equal(t, SymlinkMode{Head: true}, modes["schema/pkg042/Main.java"], "a symlink the truncated listing names")
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg000/Main.java"], "a regular file the truncated listing names")
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg120/Main.java"], "a symlink the truncated listing leaves out is unread")
+	assert.Len(t, modes, 151)
+}
+
+// When the probed paths are inside the configured schema directories, only
+// the paths a truncated tree listing leaves out are read with GraphQL: the
+// paths it names keep the modes it gives.
+func TestSymlinkModesReadsOnlyThePathsATruncatedTreeLeavesOutWithGraphQL(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+	probes := manyDirectoryProbes(s, 151)
+	s.trees["head1:schema/pkg120"][0].Mode = 40960
+	s.recursiveTree = func(w http.ResponseWriter, ref string) bool {
+		writeTruncatedTree(t, w, ref, mainJavaEntries(s, 100)...)
+		return true
+	}
+
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"head1"}, s.treeReadRefs())
+	queries := s.graphQLQueries()
+	require.Len(t, queries, 1, "the paths the listing leaves out fit in one query")
+	assert.Len(t, queries[0], 51)
+	assert.Equal(t, "schema/pkg100", queries[0][0])
+	assert.Equal(t, "schema/pkg150", queries[0][50])
+	assert.Equal(t, SymlinkMode{Head: true}, modes["schema/pkg042/Main.java"], "a symlink the truncated listing names")
+	assert.Equal(t, SymlinkMode{Head: true}, modes["schema/pkg120/Main.java"], "a symlink read with GraphQL")
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg000/Main.java"])
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg150/Main.java"])
+	assert.Len(t, modes, 151)
+}
+
+// A tree listing GitHub fails to serve is an error, never "not a symlink".
+func TestSymlinkModesReturnsTreeError(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+	s.recursiveTree = func(w http.ResponseWriter, _ string) bool {
+		w.WriteHeader(http.StatusForbidden)
+		return true
+	}
+	probes := manyDirectoryProbes(s, 151)
+
+	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list the tree at head1")
+	assert.Contains(t, err.Error(), "403")
+	assert.Empty(t, s.graphQLQueries())
 }
 
 // GitHub answers a diff that takes too long to generate with 422 rather than
@@ -374,7 +611,7 @@ func TestSymlinkModesFallsBackToGraphQLWhenTheDiffIsSlow(t *testing.T) {
 
 	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{
 		{Path: "orders/schema/staging", AtHead: true, AtBase: true},
-	})
+	}, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, s.compareCount())
@@ -397,7 +634,7 @@ func TestSymlinkModesReadsOnlyModelessPathsThroughGraphQL(t *testing.T) {
 		{Path: "a/README.md", AtHead: true, AtBase: true},
 		{Path: "new/link", AtHead: true},
 		{Path: "old/link", AtBase: true},
-	})
+	}, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, [][]string{{"new"}, {"old"}}, s.graphQLQueries(), "one query per side, each for the renamed path's directory only")
@@ -413,7 +650,7 @@ func TestSymlinkModesReadsRootDirectoryThroughGraphQL(t *testing.T) {
 	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
 	s.trees["head1:"] = []graphQLTreeEntry{{Name: "staging", Mode: 40960}}
 
-	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "staging", AtHead: true}})
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "staging", AtHead: true}}, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, SymlinkMode{Head: true}, modes["staging"])
@@ -423,7 +660,7 @@ func TestSymlinkModesReadsRootDirectoryThroughGraphQL(t *testing.T) {
 func TestSymlinkModesWithoutProbesSendsNoRequest(t *testing.T) {
 	s := newSymlinkModesServer(t)
 
-	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, nil)
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, nil, false)
 	require.NoError(t, err)
 
 	assert.Empty(t, modes)
@@ -436,7 +673,7 @@ func TestSymlinkModesReturnsDiffError(t *testing.T) {
 	s := newSymlinkModesServer(t)
 	s.diff = func(w http.ResponseWriter) { w.WriteHeader(http.StatusInternalServerError) }
 
-	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true}})
+	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true}}, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read the diff of octocat/hello-world")
 	assert.Empty(t, s.graphQLQueries())
@@ -457,7 +694,7 @@ func TestSymlinkModesReturnsGraphQLError(t *testing.T) {
 		return true
 	}
 
-	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true}})
+	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true}}, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Something went wrong")
 	assert.Equal(t, []int{1}, s.graphQLBatchSizes(), "a GraphQL errors payload is not retried")
@@ -477,7 +714,7 @@ func TestSymlinkModesReturnsGraphQLErrorAtBase(t *testing.T) {
 		return true
 	}
 
-	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true, AtBase: true}})
+	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true, AtBase: true}}, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "at base base1")
 	assert.Contains(t, err.Error(), "Something went wrong at base")
@@ -491,7 +728,7 @@ func TestSymlinkModesRejectsAnUnresolvableRef(t *testing.T) {
 	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
 	// No tree is registered for head1, as when the commit does not exist.
 
-	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "orders/schema/staging", AtHead: true}})
+	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "orders/schema/staging", AtHead: true}}, false)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "head1 does not resolve in octocat/hello-world")
@@ -507,7 +744,7 @@ func TestSymlinkModesRejectsANullRepository(t *testing.T) {
 		return true
 	}
 
-	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true}})
+	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, []SymlinkProbe{{Path: "x/link", AtHead: true}}, false)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "repository octocat/hello-world not returned")
@@ -542,10 +779,11 @@ func TestSymlinkModesSplitsAGraphQLBatchGitHubGivesUpOn(t *testing.T) {
 		return true
 	}
 
-	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes)
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, []int{100, 50, 25, 25, 50, 25, 25}, s.graphQLBatchSizes(), "each failed batch is halved until GitHub answers")
+	assert.Empty(t, s.treeReadRefs(), "paths in one batch of directories are read with GraphQL, not from the tree")
 	assert.Equal(t, SymlinkMode{Head: true}, modes["gen/pkg042/Gen0.java"])
 	assert.Equal(t, SymlinkMode{}, modes["gen/pkg099/Gen0.java"])
 	assert.Len(t, modes, dirs)
@@ -562,7 +800,7 @@ func TestSymlinkModesDoesNotSplitAGraphQLBatchOnAClientError(t *testing.T) {
 	}
 	probes := []SymlinkProbe{{Path: "a/one", AtHead: true}, {Path: "b/two", AtHead: true}}
 
-	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes)
+	_, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "403 Forbidden")
