@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
@@ -25,7 +27,9 @@ func TestCollectWebhookInboxClaimableDepthExport(t *testing.T) {
 	otel.SetMeterProvider(provider)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(previous)
-		require.NoError(t, provider.Shutdown(t.Context()))
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+		defer cancel()
+		require.NoError(t, provider.Shutdown(ctx))
 	})
 
 	store := &fakeWebhookEventStore{stats: &storage.WebhookInboxStats{ClaimableDepth: 11}}
