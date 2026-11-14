@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	cmdclient "github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -817,6 +818,17 @@ func dialectOfTarget(ctx context.Context, g *Globals, flags *storageSchemaTarget
 	}
 }
 
+// The notices a convergence the operator stopped prints before it exits with
+// the interrupt status. Each says what the stop left behind on its path, since
+// the two paths leave different things: a direct convergence releases what it
+// was doing, while the server carries on with one it had started, because a
+// client hanging up is not a decision about its storage (AV-13). The %s is
+// the CLI's own name, filled in when the notice is printed.
+const (
+	storageApplyInterruptedDirect     = "Storage apply interrupted. Any statement in flight was cancelled, and statements that had finished stay applied. Run `%s storage plan` with the same target flags to see what is left."
+	storageApplyInterruptedThroughAPI = "Storage apply interrupted. A convergence the server had already started carries on, holding the storage bootstrap lock, until it finishes or its budget runs out. Run `%s storage plan` with the same target flags to see what is left."
+)
+
 // converge runs the convergence over whichever path the flags selected, against
 // the schema already resolved for the plan the operator approved.
 func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *storageSchemaTargetFlags, desired *api.StorageSchemaSource) (planned, remaining *apitypes.StorageSchemaReport, err error) {
@@ -846,6 +858,10 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *sto
 			append(target.ensureSchemaOptions(cmd.AllowUnsafe),
 				api.WithConvergenceTimeout(budget),
 				api.WithConvergenceProgress(progress.observe))...)
+		if endedByInterrupt(ctx, err) {
+			fmt.Fprintf(os.Stderr, storageApplyInterruptedDirect+"\n", cliname.Name())
+			return nil, nil, interrupted(ctx)
+		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("converge storage schema on the database from %s: %w", target.source, err)
 		}
@@ -871,6 +887,10 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *sto
 		request.SchemaSource = desired.Description
 	}
 	response, err := cmdclient.StorageSchemaApply(ctx, endpoint, request)
+	if endedByInterrupt(ctx, err) {
+		fmt.Fprintf(os.Stderr, storageApplyInterruptedThroughAPI+"\n", cliname.Name())
+		return nil, nil, interrupted(ctx)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("converge storage schema%s: %w", storageSchemaTargetSuffix(flags.Deployment, flags.Environment), err)
 	}

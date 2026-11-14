@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 
 	"github.com/stretchr/testify/require"
 )
@@ -207,19 +209,52 @@ func TestInitReuseRejectsInvalidRootBeforeRegistration(t *testing.T) {
 	}
 }
 
-func TestInitCancellationPreservesCauseAndRecovery(t *testing.T) {
-	err := retainedInitError(fmt.Errorf("import live schema: %w", context.Canceled))
-	require.ErrorIs(t, err, context.Canceled)
-	require.ErrorContains(t, err, "setup cancelled")
-	require.ErrorContains(t, err, "retained for retry")
-	require.NotContains(t, err.Error(), "connection")
-	err = retainedInitError(errors.New("schema files changed"))
-	require.ErrorContains(t, err, "schema files changed")
-	require.NotContains(t, err.Error(), "cancelled")
+// An operator presses Ctrl-C after init registered its runtime. The command
+// says setup was cancelled and that the registration is kept for a retry, and
+// exits with the interrupt status rather than reporting a failed setup.
+func TestInitInterruptAfterRegistrationExitsInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := retainedInitError(ctx, fmt.Errorf("import live schema: %w", context.Canceled))
+
+	var status error
+	stderr := captureStderr(t, func() { status = initStopped(err) })
+
+	require.ErrorIs(t, status, ErrSilent)
+	require.ErrorIs(t, status, context.Canceled)
+	require.Equal(t, ExitInterrupted, ExitCodeFor(status))
+	require.Equal(t, fmt.Sprintf("Setup cancelled; runtime registration is retained for retry. Run `%s init` again with the same flags to finish it.\n", cliname.Name()), stderr)
+}
+
+// A setup that fails after registering its runtime exits 1 with its error and
+// the retry hint. That holds for a deadline, and for a cancellation that came
+// from somewhere other than the operator while the command was still running.
+func TestInitFailureAfterRegistrationExitsOne(t *testing.T) {
+	expired, cancel := context.WithDeadline(t.Context(), time.Now())
+	defer cancel()
+	tests := []struct {
+		name  string
+		ctx   context.Context
+		cause error
+	}{
+		{name: "failure", ctx: t.Context(), cause: errors.New("schema files changed")},
+		{name: "cancellation while still running", ctx: t.Context(), cause: fmt.Errorf("import live schema: %w", context.Canceled)},
+		{name: "deadline", ctx: expired, cause: fmt.Errorf("start SchemaBot: %w", context.DeadlineExceeded)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := retainedInitError(tc.ctx, tc.cause)
+			require.ErrorIs(t, err, tc.cause)
+			require.ErrorContains(t, err, "initialization incomplete; runtime registration is retained for retry")
+			require.NotErrorIs(t, err, ErrSilent)
+			require.Equal(t, 1, ExitCodeFor(err))
+			require.Nil(t, initStopped(err))
+		})
+	}
 }
 
 func TestSchemaDriftDoesNotSuggestRetry(t *testing.T) {
 	drift := &initSchemaDriftError{message: "review your edits with plan"}
-	require.Same(t, drift, retainedInitError(drift))
-	require.ErrorContains(t, retainedInitError(errors.New("connection failed")), "retained for retry")
+	require.Same(t, drift, retainedInitError(t.Context(), drift))
+	require.ErrorContains(t, retainedInitError(t.Context(), errors.New("connection failed")), "retained for retry")
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -128,9 +129,37 @@ func TestInitWizardContextCancellationLeavesInputsUntouched(t *testing.T) {
 	go func() { done <- cmd.promptInputs(ctx, input, output, &Globals{}) }()
 	<-output.started
 	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
+	err := <-done
+	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, original.Database, cmd.Database)
 	require.Empty(t, cmd.Type)
+
+	// The operator's signal ended the wizard, so the command says nothing was
+	// changed and exits with the interrupt status.
+	var status error
+	stderr := captureStderr(t, func() { status = initStopped(err) })
+	require.ErrorIs(t, status, ErrSilent)
+	require.Equal(t, ExitInterrupted, ExitCodeFor(status))
+	require.Equal(t, "Setup cancelled; nothing was changed.\n", stderr)
+}
+
+// A wizard whose context ran out of time was not stopped by the operator, so
+// it is a failure that exits 1 with its error and no interrupt notice.
+func TestInitWizardDeadlineExitsOne(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	input, writer := io.Pipe()
+	t.Cleanup(func() { require.NoError(t, input.Close()); require.NoError(t, writer.Close()) })
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now())
+	defer cancel()
+	cmd := InitCmd{Database: "shop"}
+
+	err := cmd.promptInputs(ctx, input, io.Discard, &Globals{})
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "setup cancelled")
+	require.NotErrorIs(t, err, ErrSilent)
+	require.Equal(t, 1, ExitCodeFor(err))
+	require.Nil(t, initStopped(err))
 }
 
 type initSignalWriter struct{ started chan struct{} }

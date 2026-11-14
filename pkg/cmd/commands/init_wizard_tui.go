@@ -438,6 +438,11 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	m := newInitWizard(cmd, initProfileName(cfg, g.Profile, cmd.Runtime), output)
 	m.ctx = ctx
 	_, err = tea.NewProgram(m, tea.WithInput(input), tea.WithOutput(output), tea.WithContext(ctx)).Run()
+	// The program reports how it ended in its own terms, so the context's own
+	// error is the one that says whether the operator's signal ended it.
+	if endedByInterrupt(ctx, ctx.Err()) {
+		return initInterrupted(ctx, "Setup cancelled; nothing was changed.")
+	}
 	if ctx.Err() != nil {
 		return fmt.Errorf("setup cancelled: %w", ctx.Err())
 	}
