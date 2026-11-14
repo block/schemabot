@@ -38,6 +38,16 @@ var httpClient = &http.Client{Timeout: 30 * time.Second, Transport: authTranspor
 // database. Matches the server's own budget for these routes.
 var operatorHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: authTransport}
 
+// pullHTTPClient serves POST /api/pull, whose live-schema read of a large
+// database outlasts the default client timeout. Its timeout is the server's
+// pull budget plus room for the round trip, so the client never abandons a
+// pull the server is still going to answer.
+var pullHTTPClient = &http.Client{Timeout: apitypes.PullSchemaBudget + pullResponseMargin, Transport: authTransport}
+
+// pullResponseMargin is the room a pull needs beyond the server's budget for
+// the round trip and the response body.
+const pullResponseMargin = 30 * time.Second
+
 // clientForBudget builds a client for one request whose server-side work is
 // bounded by a budget the caller named, rather than by a fixed one this package
 // can know in advance.

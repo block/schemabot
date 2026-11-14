@@ -31,6 +31,40 @@ import (
 // number of concurrent connections across regions.
 const pullMemberConcurrency = 4
 
+// memberPullError is a failed live-schema read of one target and namespace. It
+// carries where the read went so the pull handler, which logs every pull
+// failure exactly once, can name the target an operator has to look at.
+//
+// Error is the underlying failure's text alone: the message reaches the HTTP
+// response body, so the data-plane endpoint stays out of it and is only logged.
+type memberPullError struct {
+	Deployment string
+	Target     string
+	Namespace  string
+	Endpoint   string
+	Remote     bool
+	Err        error
+}
+
+func (e *memberPullError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *memberPullError) Unwrap() error {
+	return e.Err
+}
+
+// logAttrs are the identifiers of the failed read, for the handler's log line.
+func (e *memberPullError) logAttrs() []any {
+	return []any{
+		"deployment", e.Deployment,
+		"target", e.Target,
+		"namespace", e.Namespace,
+		"endpoint", e.Endpoint,
+		"is_remote", e.Remote,
+	}
+}
+
 // pullTargetSchema fetches one execution target's live schema, one call per
 // namespace, and merges the results into a single response.
 //
@@ -96,23 +130,21 @@ func (s *Service) pullTargetSchema(
 		if pullErr != nil {
 			span.RecordError(pullErr, trace.WithAttributes(attribute.String("namespace", namespace)))
 			span.SetStatus(otelcodes.Error, "pull schema failed")
-			s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
-				"database", req.Database,
-				"type", target.DatabaseType,
-				"deployment", target.Deployment,
-				"target", target.Target,
-				"environment", req.Environment,
-				"namespace", namespace,
-				"endpoint", client.Endpoint(),
-				"is_remote", isRemoteTarget,
-				"error", pullErr,
-			)
+			failure := &memberPullError{
+				Deployment: target.Deployment,
+				Target:     target.Target,
+				Namespace:  namespace,
+				Endpoint:   client.Endpoint(),
+				Remote:     isRemoteTarget,
+				Err:        pullErr,
+			}
 			if isRemoteTarget && grpcstatus.Code(pullErr) == grpccodes.Unavailable {
-				return nil, &RemoteDeploymentUnavailableError{
+				failure.Err = &RemoteDeploymentUnavailableError{
 					Deployment: target.Deployment,
 					Target:     target.Target,
 					Err:        pullErr,
 				}
+				return nil, failure
 			}
 			// Whether pull is supported is the data plane's answer — it depends
 			// on which engine backs the deployment — so the 501 is derived from
@@ -125,7 +157,7 @@ func (s *Service) pullTargetSchema(
 			if errors.Is(pullErr, tern.ErrPullSchemaUnsupportedType) {
 				return nil, &unsupportedPullSchemaError{DatabaseType: target.DatabaseType}
 			}
-			return nil, pullErr
+			return nil, failure
 		}
 		if err := mergePullSchemaResponse(merged, resp, namespace); err != nil {
 			span.RecordError(err, trace.WithAttributes(attribute.String("namespace", namespace)))
