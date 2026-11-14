@@ -75,12 +75,13 @@ type SymlinkMode struct {
 //   - Paths in at most symlinkModeGraphQLBatch distinct directories are read
 //     from those directories in one GraphQL query.
 //   - More are read from one recursive listing of the whole tree.
-//   - When GitHub truncates that listing, the paths are read with batched
-//     GraphQL queries only if scopedToSchemaDirs says the caller probed only
-//     paths inside the configured schema directories, so the queries grow
-//     with the schema directories the PR touches rather than with the rest of
-//     the PR. Otherwise they are not read: they are reported as not symlinks,
-//     with a warning and a count in schemabot.github.symlink_modes_unread_total.
+//   - When GitHub truncates that listing, the paths it still names keep the
+//     modes it gives. The paths it leaves out are read with batched GraphQL
+//     queries only if scopedToSchemaDirs says the caller probed only paths
+//     inside the configured schema directories, so the queries grow with the
+//     schema directories the PR touches rather than with the rest of the PR.
+//     Otherwise they are not read: they are reported as not symlinks, with a
+//     warning and a count in schemabot.github.symlink_modes_unread_total.
 //
 // The tree is never walked level by level, and a request GitHub fails is an
 // error, never "not a symlink".
@@ -159,33 +160,53 @@ func (ic *InstallationClient) symlinksAtRef(ctx context.Context, repo string, ch
 	if err != nil {
 		return nil, fmt.Errorf("list the tree at %s to read the modes of %d paths in %d directories: %w", ref, len(paths), len(dirs), err)
 	}
+	listedSymlink := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		listedSymlink[entry.Path] = entry.Mode == gitSymlinkModeOctal
+	}
+	symlinks := make(map[string]bool, len(paths))
+	var unlisted []string
+	for _, p := range paths {
+		symlink, listed := listedSymlink[path.Clean(p)]
+		symlinks[p] = symlink
+		if !listed {
+			unlisted = append(unlisted, p)
+		}
+	}
 	if !truncated {
-		symlinkEntries := make(map[string]bool)
-		for _, entry := range entries {
-			if entry.Mode == gitSymlinkModeOctal {
-				symlinkEntries[entry.Path] = true
-			}
-		}
-		symlinks := make(map[string]bool, len(paths))
-		for _, p := range paths {
-			symlinks[p] = symlinkEntries[path.Clean(p)]
-		}
+		// A whole listing names every path at ref, so a path it leaves out is
+		// absent there, and an absent path is not a symlink.
 		return symlinks, nil
 	}
 
+	// A truncated listing still gives the mode of every path it names. Only
+	// the paths it leaves out are unknown: each is either absent at ref or was
+	// cut from the listing.
+	if len(unlisted) == 0 {
+		ic.logger.Debug("GitHub truncated the tree listing but it names every changed path whose mode was unknown, so no further read is needed",
+			"repo", repo, "pr", change.PR, "ref", ref, "paths", len(paths))
+		return symlinks, nil
+	}
+	unlistedDirs := parentDirs(unlisted)
+
 	if scopedToSchemaDirs {
-		ic.logger.Info("GitHub truncated the tree listing, so the modes of changed paths inside the configured schema directories are read from their directories with GraphQL",
-			"repo", repo, "pr", change.PR, "ref", ref, "paths", len(paths), "directories", len(dirs))
-		return ic.graphQLSymlinks(ctx, repo, ref, paths)
+		ic.logger.Info("GitHub truncated the tree listing, so the modes of the changed paths inside the configured schema directories that it left out are read from their directories with GraphQL",
+			"repo", repo, "pr", change.PR, "ref", ref, "paths", len(unlisted), "directories", len(unlistedDirs))
+		read, err := ic.graphQLSymlinks(ctx, repo, ref, unlisted)
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(symlinks, read)
+		return symlinks, nil
 	}
 
 	// Without configured schema directories bounding the paths, reading them
 	// directory by directory would cost requests in proportion to the PR's
 	// other files, so they are left unread and reported as not symlinks.
-	ic.logger.Warn("GitHub truncated the tree listing and no configured schema directories bound the changed paths, so these paths are treated as not symlinks: a symlink among them that names a schema root or namespace is not planned; set allowed_dirs on every database the repository serves so only paths inside them are read",
-		"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "ref", ref, "paths", len(paths), "directories", len(dirs))
-	metrics.RecordSymlinkModesUnread(ctx, repo, len(paths))
-	return make(map[string]bool, len(paths)), nil
+	ic.logger.Warn("GitHub truncated the tree listing and no configured schema directories bound the changed paths, so the paths it left out are treated as not symlinks: a symlink among them that names a schema root or namespace is not planned; set allowed_dirs on every database the repository serves so only paths inside them are read",
+		"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "ref", ref, "paths", len(unlisted), "directories", len(unlistedDirs))
+	metrics.RecordSymlinkModesUnread(ctx, repo, len(unlisted))
+	return symlinks, nil
 }
 
 // parentDirs returns the distinct parent directories of paths, in first-seen

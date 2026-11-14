@@ -442,11 +442,31 @@ func TestSymlinkModesReadCostDoesNotGrowWithDirectories(t *testing.T) {
 }
 
 // writeTruncatedTree answers a recursive tree read the way GitHub answers one
-// for a repository too large to list: truncated, with entries a caller must
-// not trust.
-func writeTruncatedTree(t *testing.T, w http.ResponseWriter, ref string) {
+// for a repository too large to list: truncated, naming only entries, the
+// part of the tree that fit.
+func writeTruncatedTree(t *testing.T, w http.ResponseWriter, ref string, entries ...*gh.TreeEntry) {
 	t.Helper()
-	assert.NoError(t, json.NewEncoder(w).Encode(gh.Tree{SHA: new(ref), Entries: []*gh.TreeEntry{}, Truncated: new(true)}))
+	if entries == nil {
+		entries = []*gh.TreeEntry{}
+	}
+	assert.NoError(t, json.NewEncoder(w).Encode(gh.Tree{SHA: new(ref), Entries: entries, Truncated: new(true)}))
+}
+
+// mainJavaEntries returns the recursive tree entries of Main.java in the
+// first dirs directories manyDirectoryProbes registered at head1, with the
+// modes registered there.
+func mainJavaEntries(s *symlinkModesServer, dirs int) []*gh.TreeEntry {
+	entries := make([]*gh.TreeEntry, 0, dirs)
+	for i := range dirs {
+		dir := fmt.Sprintf("schema/pkg%03d", i)
+		entry := s.trees["head1:"+dir][0]
+		entries = append(entries, &gh.TreeEntry{
+			Path: new(path.Join(dir, entry.Name)),
+			Mode: new(strconv.FormatInt(int64(entry.Mode), 8)),
+			Type: new("blob"),
+		})
+	}
+	return entries
 }
 
 // manyDirectoryProbes returns head probes for Main.java in dirs directories,
@@ -504,6 +524,61 @@ func TestSymlinkModesLeavesUnscopedPathsUnreadWhenTheTreeIsTruncated(t *testing.
 	assert.Equal(t, []string{"head1"}, s.treeReadRefs())
 	assert.Empty(t, s.graphQLQueries(), "no directory is listed")
 	assert.Equal(t, SymlinkMode{}, modes["schema/pkg042/Main.java"], "an unread path is reported as not a symlink")
+	assert.Len(t, modes, 151)
+}
+
+// A truncated tree listing still gives the mode of every path it names. With
+// no configured schema directories bounding the probed paths, a symlink the
+// listing names is reported as one, and only the paths it leaves out are
+// reported as not symlinks, without a directory listing.
+func TestSymlinkModesKeepsTheModesATruncatedTreeNamesForUnscopedPaths(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+	probes := manyDirectoryProbes(s, 151)
+	s.trees["head1:schema/pkg120"][0].Mode = 40960
+	s.recursiveTree = func(w http.ResponseWriter, ref string) bool {
+		writeTruncatedTree(t, w, ref, mainJavaEntries(s, 100)...)
+		return true
+	}
+
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, s.compareCount())
+	assert.Equal(t, []string{"head1"}, s.treeReadRefs())
+	assert.Empty(t, s.graphQLQueries(), "no directory is listed")
+	assert.Equal(t, SymlinkMode{Head: true}, modes["schema/pkg042/Main.java"], "a symlink the truncated listing names")
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg000/Main.java"], "a regular file the truncated listing names")
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg120/Main.java"], "a symlink the truncated listing leaves out is unread")
+	assert.Len(t, modes, 151)
+}
+
+// When the probed paths are inside the configured schema directories, only
+// the paths a truncated tree listing leaves out are read with GraphQL: the
+// paths it names keep the modes it gives.
+func TestSymlinkModesReadsOnlyThePathsATruncatedTreeLeavesOutWithGraphQL(t *testing.T) {
+	s := newSymlinkModesServer(t)
+	s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+	probes := manyDirectoryProbes(s, 151)
+	s.trees["head1:schema/pkg120"][0].Mode = 40960
+	s.recursiveTree = func(w http.ResponseWriter, ref string) bool {
+		writeTruncatedTree(t, w, ref, mainJavaEntries(s, 100)...)
+		return true
+	}
+
+	modes, err := s.ic.SymlinkModes(t.Context(), "octocat/hello-world", ChangeRange{PR: 7, Base: "base1", Head: "head1"}, probes, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"head1"}, s.treeReadRefs())
+	queries := s.graphQLQueries()
+	require.Len(t, queries, 1, "the paths the listing leaves out fit in one query")
+	assert.Len(t, queries[0], 51)
+	assert.Equal(t, "schema/pkg100", queries[0][0])
+	assert.Equal(t, "schema/pkg150", queries[0][50])
+	assert.Equal(t, SymlinkMode{Head: true}, modes["schema/pkg042/Main.java"], "a symlink the truncated listing names")
+	assert.Equal(t, SymlinkMode{Head: true}, modes["schema/pkg120/Main.java"], "a symlink read with GraphQL")
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg000/Main.java"])
+	assert.Equal(t, SymlinkMode{}, modes["schema/pkg150/Main.java"])
 	assert.Len(t, modes, 151)
 }
 

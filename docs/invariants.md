@@ -525,8 +525,9 @@ configs, probing each directory once (`pkg/github/config.go`); the changed-file 
 symlinks from one diff of the change, and reads the paths the diff gives no mode for with at most
 one request per side: one directory listing when they fit in one batch, otherwise one listing of
 the whole tree. It asks only about paths inside the configured schema directories when the
-server's configuration names every directory the repository's configs can sit in, lists those
-directories in batches when GitHub truncates the tree, and otherwise treats the unread paths as
+server's configuration names every directory the repository's configs can sit in. When GitHub
+truncates the tree, the paths the listing still names keep its modes; the rest are listed by
+directory in batches when they are inside those schema directories, and are otherwise treated as
 not symlinks. It reads a symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
 (`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
