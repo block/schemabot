@@ -66,6 +66,26 @@ const checksSynthesizeBatchSize = 10
 // head — so the PR never even reaches the server, and the operator sees why.
 const checksBackfillHeldStatus = "held: an uncompleted Check Run sits on this head (a started apply may own it); investigate before backfilling"
 
+// checksBackfillUnconfirmedStatus is the outcome of a PR an interrupted run
+// sent, or would have sent, for recreation but never heard back about. The
+// request may have reached the server, so it claims neither way whether the
+// Check Run was recreated.
+const checksBackfillUnconfirmedStatus = "not confirmed: interrupted before the server answered"
+
+// The notes under the headline of an interrupted report, one per phase the
+// interrupt can land in.
+const (
+	checksBackfillInterruptedScanNote     = "Interrupted during the scan: only the PRs scanned so far are listed, and no Check Run was recreated. Run the command again for a full sweep."
+	checksBackfillInterruptedRecreateNote = `Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet. Run the command again to finish; it recreates only the Check Runs still missing.`
+)
+
+// What stderr says about how far an interrupted run got when its report could
+// not be written to stdout, one per phase the interrupt can land in.
+const (
+	checksBackfillUnwrittenScanReportNote     = "No Check Run was recreated. Run the command again for a full sweep."
+	checksBackfillUnwrittenRecreateReportNote = "Some Check Runs may already be recreated. Run the command again to finish; it recreates only the Check Runs still missing."
+)
+
 // checksBackfillAction is one PR's classification and (after acting) outcome.
 type checksBackfillAction struct {
 	Repo         string   `json:"repo"`
@@ -86,6 +106,9 @@ type checksBackfillAction struct {
 	Held    bool   `json:"held,omitempty"`
 	Outcome string `json:"outcome,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// answered records that the server sent this PR's result, so an
+	// interrupted run can tell the PRs it heard back about from the rest.
+	answered bool
 }
 
 // checksStuckCheck is one existing-but-uncompleted Check Run on an open PR,
@@ -137,11 +160,32 @@ type checksBackfillReport struct {
 	Scanned                int      `json:"scanned"`
 	// Last echoes the --last window bounding the sweep; empty means every
 	// open PR was scanned.
-	Last       string                 `json:"last,omitempty"`
-	DryRun     bool                   `json:"dry_run"`
-	StuckAfter string                 `json:"stuck_after"`
-	Actions    []checksBackfillAction `json:"actions"`
-	Stuck      []checksStuckCheck     `json:"stuck,omitempty"`
+	Last   string `json:"last,omitempty"`
+	DryRun bool   `json:"dry_run"`
+	// Interrupted says an operator's Ctrl-C or SIGTERM cut the run short, so
+	// the report holds only what the run learned before it. It is always
+	// present, false on a run that finished.
+	Interrupted bool                   `json:"interrupted"`
+	StuckAfter  string                 `json:"stuck_after"`
+	Actions     []checksBackfillAction `json:"actions"`
+	Stuck       []checksStuckCheck     `json:"stuck,omitempty"`
+	// interruptedScan says the interrupt landed before the scan finished, so
+	// nothing was sent for recreation and the table shows what the backfill
+	// would do rather than an outcome.
+	interruptedScan bool
+}
+
+// markUnconfirmed sets the unconfirmed outcome on every PR an interrupted act
+// phase sent, or would have sent, for recreation without hearing back. Held
+// PRs never reach the server and keep the reason they were held.
+func (r *checksBackfillReport) markUnconfirmed() {
+	for i := range r.Actions {
+		action := &r.Actions[i]
+		if action.Held || action.answered {
+			continue
+		}
+		action.Outcome = checksBackfillUnconfirmedStatus
+	}
 }
 
 func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
@@ -212,6 +256,10 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	checkNamesSeen := map[string]bool{}
 	skippedByServer := map[string]bool{}
 	held := 0
+	// reached counts the leading repositories at least one scan page came back
+	// for, so an interrupted scan reports only the repositories it read.
+	reached := 0
+	var scanCanceled error
 scanning:
 	for i, repo := range repos {
 		page := 1
@@ -235,7 +283,8 @@ scanning:
 				ReportAppNotInstalled: true,
 			})
 			if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
-				return canceled
+				scanCanceled = canceled
+				break scanning
 			}
 			if err != nil {
 				return fmt.Errorf("scan %s open PRs for missing or stuck Check Runs: %w", repo, err)
@@ -266,6 +315,7 @@ scanning:
 				report.SkippedAppNotInstalled = append(report.SkippedAppNotInstalled, repo)
 				continue scanning
 			}
+			reached = i + 1
 			for _, name := range chunk.CheckNames {
 				if !checkNamesSeen[name] {
 					checkNamesSeen[name] = true
@@ -310,7 +360,8 @@ scanning:
 			}
 			if err := pauseForRateLimit(ctx, chunk.RateLimit, cmd.RateLimitFloor, updateProgress); err != nil {
 				if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
-					return canceled
+					scanCanceled = canceled
+					break scanning
 				}
 				return err
 			}
@@ -318,11 +369,29 @@ scanning:
 		}
 	}
 	sort.Strings(report.CheckNames)
+	if scanCanceled != nil {
+		// The repositories after the one the interrupt cut off were never
+		// read, so they are not part of the report.
+		report.Repos = report.Repos[:reached]
+	}
 
 	// The report's scanned-repo list and its skip lists stay disjoint: a repo
 	// the server skipped was never scanned, so it belongs only in a skip list.
 	if len(skippedByServer) > 0 {
 		report.Repos = slices.DeleteFunc(report.Repos, func(r string) bool { return skippedByServer[r] })
+	}
+
+	if scanCanceled != nil {
+		// Every finding came from a scan page the server answered in full, so
+		// each listed PR was fully inspected; the list is partial, and the
+		// report says so. Nothing was sent for recreation. A scan that read
+		// nothing has nothing to report.
+		if reached > 0 || len(skippedByServer) > 0 {
+			report.Interrupted = true
+			report.interruptedScan = true
+			cmd.writeInterrupted(report)
+		}
+		return scanCanceled
 	}
 
 	if !cmd.DryRun {
@@ -333,7 +402,9 @@ scanning:
 			// Print what completed before the interrupt, then exit with the
 			// interrupt status.
 			stopProgress()
-			_ = cmd.write(report)
+			report.Interrupted = true
+			report.markUnconfirmed()
+			cmd.writeInterrupted(report)
 			return canceled
 		}
 		if err != nil {
@@ -656,6 +727,7 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 				if action, ok := actionByPR[repoPR{repo: repo, pr: result.PR}]; ok {
 					action.Outcome = result.Outcome
 					action.Error = result.Error
+					action.answered = true
 				}
 			}
 			if err := pauseForRateLimit(ctx, resp.RateLimit, cmd.RateLimitFloor, updateProgress); err != nil {
@@ -673,9 +745,30 @@ func (cmd *ChecksBackfillCmd) write(report *checksBackfillReport) error {
 	return writeChecksBackfillReport(os.Stdout, report)
 }
 
+// writeInterrupted prints the report of a run the operator's interrupt cut
+// short. The run ends with the interrupt status whether or not stdout took
+// the report, so a report that was not written is named on stderr, along with
+// what its note would have said about how far the run got.
+func (cmd *ChecksBackfillCmd) writeInterrupted(report *checksBackfillReport) {
+	err := cmd.write(report)
+	if err == nil {
+		return
+	}
+	note := checksBackfillUnwrittenRecreateReportNote
+	if report.interruptedScan {
+		note = checksBackfillUnwrittenScanReportNote
+	}
+	fmt.Fprintf(os.Stderr, "The report could not be written to stdout, so it is missing or incomplete: %v. %s\n", err, note)
+}
+
 func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error {
-	if len(report.Repos) == 0 && len(report.SkippedAppNotInstalled) > 0 {
+	// An interrupted scan that read no repository still names the ones it
+	// skipped, rather than reading as a sweep with nothing to scan.
+	if len(report.Repos) == 0 && (len(report.SkippedAppNotInstalled) > 0 || report.Interrupted) {
 		if _, err := fmt.Fprintln(w, "No repositories scanned."); err != nil {
+			return err
+		}
+		if err := writeChecksInterruptedNote(w, report); err != nil {
 			return err
 		}
 		return writeChecksSkippedRepos(w, report)
@@ -703,6 +796,9 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s in %s%s.\n", report.Scanned, window, repoScope, checkScope); err != nil {
 		return err
 	}
+	if err := writeChecksInterruptedNote(w, report); err != nil {
+		return err
+	}
 	if err := writeChecksSkippedRepos(w, report); err != nil {
 		return err
 	}
@@ -714,9 +810,12 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		return err
 	}
 
+	// An interrupted scan sent nothing for recreation, so like a dry run it
+	// lists what the backfill would do.
+	acted := !report.DryRun && !report.interruptedScan
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	header := "PR\tMISSING CHECKS\tACTION"
-	if !report.DryRun {
+	if acted {
 		header = "PR\tMISSING CHECKS\tOUTCOME"
 	}
 	if _, err := fmt.Fprintln(tw, header); err != nil {
@@ -728,7 +827,7 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		if action.Held {
 			status = checksBackfillHeldStatus
 		}
-		if !report.DryRun {
+		if acted {
 			status = action.Outcome
 			if action.Error != "" {
 				status = "failed: " + action.Error
@@ -755,6 +854,20 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		return fmt.Errorf("%d Check Run backfills failed; see the outcomes above", failed)
 	}
 	return nil
+}
+
+// writeChecksInterruptedNote says, under the headline, that an interrupt cut
+// the run short and what the report therefore leaves out.
+func writeChecksInterruptedNote(w io.Writer, report *checksBackfillReport) error {
+	if !report.Interrupted {
+		return nil
+	}
+	note := checksBackfillInterruptedRecreateNote
+	if report.interruptedScan {
+		note = checksBackfillInterruptedScanNote
+	}
+	_, err := fmt.Fprintln(w, note)
+	return err
 }
 
 // writeChecksSkippedRepos names the repositories the sweep did not scan, one

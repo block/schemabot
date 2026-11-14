@@ -1090,23 +1090,66 @@ workflow and automatic recovery behavior.
 A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
 are. Each says on stderr that it was canceled and exits 130, the status a
 shell reports for an interrupted process, so a script can tell an interrupted
-run from one that failed or left findings. Exit 130 is the only mark of a
-report that was cut short; the JSON output has no field for it.
+run from one that failed or left findings.
 
 What an interrupted run reports depends on where it stopped:
 
 - `checks backfill` interrupted during its scan, with or without `--dry-run`,
-  prints no report. What the scan had found so far is discarded.
+  prints what the scan found so far and recreates nothing. A line under the
+  headline says the list is partial. Every PR listed was fully inspected; the
+  PRs and repositories the scan had not reached are left out. A scan
+  interrupted before its first page came back prints no report.
 - `checks backfill` interrupted while recreating checks prints its report with
-  the outcomes it received. A PR with no outcome was either not reached or was
-  in the batch the interrupt cut off.
+  a line under the headline saying it was interrupted. Every PR the server
+  answered keeps its outcome. The PR the interrupt cut off and every PR after
+  it read `not confirmed: interrupted before the server answered`, because the
+  server may have acted on the request in flight.
 - `webhooks redrive` prints the redelivery counts from the chunks that
   completed, and prints none under `--dry-run`.
 
-Treat those outcomes and counts as a lower bound: the server may have finished
-part of the request that was in flight. Checks already recreated and
-deliveries already redelivered are not undone. Run `checks backfill` again to
-finish the sweep; it only acts on PRs whose Check Runs are still missing.
+```console
+$ schemabot checks backfill acme/store -e production
+^C
+checks backfill canceled
+Scanned 12 open PRs in acme/store for SchemaBot (production).
+Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet. Run the command again to finish; it recreates only the Check Runs still missing.
+PR                                     MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/1   SchemaBot (production)  created 1 Check Run
+...
+https://github.com/acme/store/pull/10  SchemaBot (production)  created 1 Check Run
+https://github.com/acme/store/pull/11  SchemaBot (production)  not confirmed: interrupted before the server answered
+https://github.com/acme/store/pull/12  SchemaBot (production)  not confirmed: interrupted before the server answered
+```
+
+With `--json`, the report carries a top-level `interrupted` field, `false` on
+a run that finished and `true` on one an interrupt cut short. A PR the server
+never answered has the same `not confirmed` value in its `outcome`. A PR in an
+interrupted scan has no `outcome`, since nothing was sent for it. The same
+interrupted run, cut down to two of its PRs:
+
+```json
+{
+  "repos": ["acme/store"],
+  "check_names": ["SchemaBot (production)"],
+  "scanned": 12,
+  "dry_run": false,
+  "interrupted": true,
+  "stuck_after": "1h",
+  "actions": [
+    {"repo": "acme/store", "pr": 10, "url": "https://github.com/acme/store/pull/10", "title": "add index", "head_sha": "4c1e9a07", "missing_names": ["SchemaBot (production)"], "outcome": "created 1 Check Run"},
+    {"repo": "acme/store", "pr": 11, "url": "https://github.com/acme/store/pull/11", "title": "drop legacy column", "head_sha": "9b2d5f31", "missing_names": ["SchemaBot (production)"], "outcome": "not confirmed: interrupted before the server answered"}
+  ]
+}
+```
+
+Treat the redrive counts as a lower bound: the server may have finished part
+of the chunk that was in flight. Checks already recreated and deliveries
+already redelivered are not undone. Run `checks backfill` again to finish the
+sweep; it only acts on PRs whose Check Runs are still missing.
+
+If `checks backfill` cannot write its interrupted report to stdout, for
+example because the disk behind a redirect is full, it says so on stderr,
+along with whether any Check Run was recreated, and still exits 130.
 
 An `--all-repos` sweep skips a declared repository the server's GitHub App is
 not installed on, names it, and keeps scanning the rest. The skip still makes
