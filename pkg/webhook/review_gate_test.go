@@ -2771,6 +2771,7 @@ func TestEnforceReviewGate(t *testing.T) {
 			db := cfg.Databases["orders"]
 			db.OperatorTeams = []string{"octocat/db-admins"}
 			cfg.Databases["orders"] = db
+			cfg.ReviewPolicy.OperatorTeamHelp = "Ask a group admin to add @dave in [Access Directory](https://example.com/groups). Wait for membership to sync to GitHub."
 		}))
 		registerPREndpoint(mux, "alice")
 		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
@@ -2790,6 +2791,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "## Review Required")
 			assert.Contains(t, body, "\n@dave approved, but isn't an authorized reviewer for `orders`, so that approval doesn't count.\n")
+			assert.Contains(t, body, "\nAsk a group admin to add @dave in [Access Directory](https://example.com/groups). Wait for membership to sync to GitHub.\n")
 			assert.Contains(t, body, "1. Request a review from anyone listed above, or add @dave to @octocat/db-admins\n2. Then run `schemabot apply -e production` again\n")
 			assert.Contains(t, body, "- @octocat/db-admins\n")
 		case <-time.After(2 * time.Second):

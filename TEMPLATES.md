@@ -4734,6 +4734,11 @@ Schema changes require approval from an authorized reviewer before applying.
 **Operators of `testapp`**:
 - @acme/testapp-operators
 
+**To add a reviewer:**
+1. Open [Access Directory](https://example.com/groups) and find an operator team's owner group.
+2. Ask a group admin to grant membership to someone other than the PR author.
+3. Wait until the reviewer appears in the GitHub team. Do not edit membership directly in GitHub.
+
 **Other authorized reviewers**:
 - @acme/schema-reviewers
 

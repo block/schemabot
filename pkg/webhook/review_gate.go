@@ -110,6 +110,7 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			Environment:                  environment,
 			RequestedBy:                  requestedBy,
 			OperatorReviewers:            gateResult.OperatorReviewers,
+			OperatorTeamHelp:             h.service.Config().ReviewPolicy.OperatorTeamHelp,
 			OtherReviewers:               gateResult.OtherReviewers,
 			PRAuthor:                     gateResult.PRAuthor,
 			ChangedApprovers:             gateResult.ChangedApprovers,

@@ -4390,6 +4390,9 @@ review_policy:
     - mona
   include_database_operators: false
   include_codeowners: true
+  operator_team_help: |
+    Ask a group admin to add the reviewer in [Access Directory](https://example.com/groups).
+    Wait for membership to sync to GitHub.
 `
 		err := os.WriteFile(configPath, []byte(content), 0644)
 		require.NoError(t, err)
@@ -4402,7 +4405,44 @@ review_policy:
 		assert.Equal(t, []string{"mona"}, cfg.ReviewPolicy.AdminUsers)
 		assert.False(t, cfg.ReviewPolicyIncludesDatabaseOperators())
 		assert.True(t, cfg.ReviewPolicy.IncludeCodeowners)
+		assert.Equal(t, "Ask a group admin to add the reviewer in [Access Directory](https://example.com/groups).\nWait for membership to sync to GitHub.\n", cfg.ReviewPolicy.OperatorTeamHelp)
 	})
+}
+
+// Operator team help stays bounded so it leaves room for the rest of the PR
+// comment. It is display text and cannot enable the review gate on its own.
+func TestServerConfig_OperatorTeamHelp(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		help    string
+		wantErr bool
+	}{
+		{"unset", "", false},
+		{"at the limit", strings.Repeat("a", maxOperatorTeamHelpBytes), false},
+		{"past the limit", strings.Repeat("a", maxOperatorTeamHelpBytes+1), true},
+		{"multi-byte text past the limit", strings.Repeat("é", maxOperatorTeamHelpBytes), true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"payments": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"production": {DSN: "root@tcp(localhost:3306)/payments"},
+						},
+					},
+				},
+				ReviewPolicy: ReviewPolicyConfig{OperatorTeamHelp: tt.help},
+			}
+			if tt.wantErr {
+				require.ErrorContains(t, cfg.Validate(), "review_policy.operator_team_help must be at most 1000 bytes")
+			} else {
+				require.NoError(t, cfg.Validate())
+			}
+			assert.False(t, cfg.ReviewPolicyEnabled())
+			assert.False(t, cfg.PRCommandAuthorization.Enabled)
+		})
+	}
 }
 
 // An instance with the review gate off can turn it on for one database. The

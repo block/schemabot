@@ -60,6 +60,84 @@ func TestRenderReviewRequired_UnauthorizedApprover(t *testing.T) {
 		"the explanation precedes the reviewer lists")
 }
 
+// Deployments can explain how to join a database's operator team. Both review
+// gate comments keep that help with the operator list, never with admin teams.
+func TestReviewGateOperatorTeamHelp(t *testing.T) {
+	const help = "**To add a reviewer:**\n" +
+		"1. Open [Access Directory](https://example.com/groups).\n" +
+		"2. Ask a group admin to grant the reviewer membership.\n" +
+		"3. Wait for membership to sync to GitHub.\n" +
+		"4. Ask the reviewer to approve the latest commit."
+	renderers := []struct {
+		name   string
+		render func(ReviewGateData) string
+	}{
+		{"review required", RenderReviewRequired},
+		{"review gate error", RenderReviewGateError},
+	}
+	for _, renderer := range renderers {
+		t.Run(renderer.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name      string
+				operators []string
+				help      string
+				wantHelp  bool
+			}{
+				{"operator team", []string{"org/payments-operators"}, help, true},
+				{"operator teams and user", []string{"bob", "org/payments-operators", "org/payments-oncall"}, help, true},
+				{"operator user only", []string{"bob"}, help, false},
+				{"no operators", nil, help, false},
+				{"no help configured", []string{"org/payments-operators"}, "", false},
+				{"blank help", []string{"org/payments-operators"}, " \n\t", false},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					result := renderer.render(ReviewGateData{
+						Database:          "payments",
+						Environment:       "production",
+						OperatorReviewers: tt.operators,
+						OperatorTeamHelp:  tt.help,
+						OtherReviewers:    []string{"org/dba-team"},
+					})
+
+					if tt.wantHelp {
+						assert.Contains(t, result, "\n"+help+"\n")
+						assertBefore(t, result, "- @org/payments-operators", help, "help follows the operator list")
+						assertBefore(t, result, help, "**Other authorized reviewers**", "help belongs to operators, not admins")
+					} else {
+						assert.NotContains(t, result, help)
+					}
+					assert.Contains(t, result, "2. Once approved, run `schemabot apply -e production` again")
+				})
+			}
+		})
+	}
+}
+
+// Long DDL gives up space to the operator help, so the membership instructions
+// and retry command remain visible within GitHub's comment limit.
+func TestReviewGateOperatorTeamHelpWithLongDDL(t *testing.T) {
+	data := ReviewGateData{
+		Database:          "payments",
+		Environment:       "production",
+		OperatorReviewers: []string{"org/payments-operators"},
+		OperatorTeamHelp:  "Read [Access Directory](https://example.com/groups). " + strings.Repeat("h", 900),
+		ChangedApprovers:  []string{"bob"},
+		ChangedStatements: []ChangedStatements{{
+			Path:     "schema/payments/schema.sql",
+			Dialect:  schema.DialectMySQL,
+			Approved: greenfieldStatements("events", 100),
+			Head:     greenfieldStatements("records", 100),
+		}},
+	}
+	for _, render := range []func(ReviewGateData) string{RenderReviewRequired, RenderReviewGateError} {
+		result := render(data)
+		assert.LessOrEqual(t, len(result), commentBodyLimit)
+		assert.Contains(t, result, ddlTruncatedMarker)
+		assert.Contains(t, result, data.OperatorTeamHelp)
+		assert.Contains(t, result, "2. Once approved, run `schemabot apply -e production` again")
+	}
+}
+
 // Several unauthorized reviewers approved, and every listed reviewer is a
 // user. A user cannot be added to another user, so the comment only asks for
 // a review from someone listed.
