@@ -456,8 +456,11 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.logger.Error("failed to create Tern client", append(apply.LogAttrs(), "error", err)...)
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.logger.Error("failed to create Tern client",
+			append(apply.LogAttrs(),
+				"operation", operation, "error", err)...)
+		status, message := controlTernClientFailure(err)
+		s.writeError(w, status, message)
 		return nil, nil, "", false
 	}
 
@@ -504,9 +507,25 @@ func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier,
 		s.logger.Error("failed to create Tern client",
 			append(apply.LogAttrs(),
 				"operation", operation, "error", err)...)
-		return nil, apply, "", controlHTTPErrorf(http.StatusNotFound, "%s", err.Error())
+		status, message := controlTernClientFailure(err)
+		return nil, apply, "", controlHTTPErrorf(status, "%s", message)
 	}
 	return client, apply, ternApplyIDForStoredApply(apply), nil
+}
+
+// controlTernClientFailure maps a failure to obtain a deployment's Tern client
+// to the HTTP status and message a control request answers with. A deployment
+// that is not in the server configuration is a 404, which the requester cannot
+// repair by retrying. Any other failure means the client could not be built,
+// for example because a DSN or token did not resolve or the gRPC client did not
+// start. That is a 503 so durable callers retry, and its message is fixed
+// because the raw error can carry DSN or host fragments; the caller logs it.
+func controlTernClientFailure(err error) (int, string) {
+	if errors.Is(err, errTernDeploymentNotConfigured) {
+		return http.StatusNotFound, err.Error()
+	}
+	return http.StatusServiceUnavailable,
+		"SchemaBot could not connect to the schema change engine for this deployment. Retry shortly."
 }
 
 // ternApplyIDForStoredApply returns the identifier that a Tern RPC expects for
