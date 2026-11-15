@@ -1405,11 +1405,15 @@ func TestEngine_DropPhase_ReturnsARenameFailureThatIsNotAMissingTableUnchanged(t
 	assert.NotContains(t, err.Error(), "checking whether an earlier attempt already moved them",
 		"a RENAME that did not report a missing table is not checked against earlier copies")
 
-	// The server still runs the RENAME the client gave up on once the lock is
-	// released, so the test waits for it rather than leave it queued.
+	// The cancelled RENAME is ended on the server before the quarantine
+	// returns, so releasing the lock leaves the table where it was.
+	var stillQueued int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE 'RENAME TABLE%cancelled_mid_rename%'").Scan(&stillQueued))
+	assert.Zero(t, stillQueued, "the cancelled RENAME is no longer on the server")
 	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
 	require.NoError(t, err, "release the metadata lock")
-	waitFor(t, "the server-side RENAME to complete", func() bool { return !tableExists(t, db, "cancelled_mid_rename") })
+	assert.True(t, tableExists(t, db, "cancelled_mid_rename"), "the cancelled RENAME never moves the table")
 }
 
 // A replay looks for the pending drops copy it recorded and cannot tell
