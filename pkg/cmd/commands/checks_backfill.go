@@ -761,6 +761,9 @@ func (cmd *ChecksBackfillCmd) writeInterrupted(report *checksBackfillReport) {
 	fmt.Fprintf(os.Stderr, "The report could not be written to stdout, so it is missing or incomplete: %v. %s\n", err, note)
 }
 
+// writeChecksBackfillReport prints the text report. Its error means w refused
+// a write. A recreation that failed is a row of the report, and
+// attentionExitError turns it into the exit status.
 func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error {
 	// An interrupted scan that read no repository still names the ones it
 	// skipped, rather than reading as a sweep with nothing to scan.
@@ -821,7 +824,6 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if _, err := fmt.Fprintln(tw, header); err != nil {
 		return err
 	}
-	failed := 0
 	for _, action := range report.Actions {
 		status := "synthesize via auto-plan"
 		if action.Held {
@@ -831,7 +833,6 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 			status = action.Outcome
 			if action.Error != "" {
 				status = "failed: " + action.Error
-				failed++
 			}
 		}
 		// The status (server outcome/error) is a tab-separated cell: strip
@@ -849,9 +850,6 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 				return err
 			}
 		}
-	}
-	if failed > 0 {
-		return fmt.Errorf("%d Check Run backfills failed; see the outcomes above", failed)
 	}
 	return nil
 }

@@ -863,9 +863,10 @@ func TestChecksBackfillCancelWhileListingReposExitsInterrupted(t *testing.T) {
 
 // checksBackfillRecreateServer scans prCount missing-check PRs in one page and
 // answers every synthesize batch with "created 1 Check Run", except that a
-// batch for which holdBatch returns true is held open on hold. It records the
-// first PR of every synthesize batch it received.
-func checksBackfillRecreateServer(t *testing.T, prCount int, hold *holdingHandler, holdBatch func(prs []int) bool) (*httptest.Server, func() []int) {
+// batch for which holdBatch returns true is held open on hold, and a PR in
+// failingPRs is answered with the error "boom". It records the first PR of
+// every synthesize batch it received.
+func checksBackfillRecreateServer(t *testing.T, prCount int, hold *holdingHandler, holdBatch func(prs []int) bool, failingPRs ...int) (*httptest.Server, func() []int) {
 	t.Helper()
 	missing := make([]apitypes.MissingCheckPR, 0, prCount)
 	for pr := 1; pr <= prCount; pr++ {
@@ -902,6 +903,10 @@ func checksBackfillRecreateServer(t *testing.T, prCount int, hold *holdingHandle
 			}
 			response := apitypes.ChecksSynthesizeResponse{Repo: req.Repo}
 			for _, pr := range req.PRs {
+				if slices.Contains(failingPRs, pr) {
+					response.Results = append(response.Results, apitypes.ChecksSynthesizeResult{PR: pr, Error: "boom"})
+					continue
+				}
 				response.Results = append(response.Results, apitypes.ChecksSynthesizeResult{PR: pr, Outcome: "created 1 Check Run"})
 			}
 			assert.NoError(t, json.NewEncoder(w).Encode(response))
@@ -972,6 +977,60 @@ func TestChecksBackfillCancelWhileRecreatingChecksMarksTheTextReport(t *testing.
 		renderedCells(lineContaining(t, output, "/pull/1 ")))
 	assert.Equal(t, []string{"https://github.com/octo/repo/pull/11", "SchemaBot (production)", checksBackfillUnconfirmedStatus},
 		renderedCells(lineContaining(t, output, "/pull/11 ")))
+}
+
+// An operator presses Ctrl-C after the server has answered one batch in which
+// a recreation failed. Stdout takes the whole text report, with the failed PR
+// showing its error, so stderr carries the cancel line alone and does not say
+// the report is missing. The command exits with the interrupt status.
+func TestChecksBackfillCancelAfterAFailedRecreationPrintsTheTextReport(t *testing.T) {
+	hold := newHoldingHandler(t)
+	const prCount = checksSynthesizeBatchSize + 1
+	server, _ := checksBackfillRecreateServer(t, prCount, hold, func(prs []int) bool { return prs[0] != 1 }, 2)
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h"}
+
+	output, stderr, runErr := cancelBackfillOnceHeld(t, cmd, server, hold.inFlight)
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
+	assert.True(t, strings.HasSuffix(stderr, "checks backfill canceled\n"), stderr)
+	assert.NotContains(t, stderr, "could not be written")
+	assert.Equal(t, checksBackfillInterruptedRecreateNote, strings.Split(output, "\n")[1])
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/1", "SchemaBot (production)", "created 1 Check Run"},
+		renderedCells(lineContaining(t, output, "/pull/1 ")))
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/2", "SchemaBot (production)", "failed: boom"},
+		renderedCells(lineContaining(t, output, "/pull/2 ")))
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/11", "SchemaBot (production)", checksBackfillUnconfirmedStatus},
+		renderedCells(lineContaining(t, output, "/pull/11 ")))
+}
+
+// A backfill nobody interrupts has one recreation fail. The text report and
+// the JSON report both show the failure, and both runs exit with the same
+// error naming the failed recreation.
+func TestChecksBackfillFailedRecreationExitsWithTheSameErrorInTextAndJSON(t *testing.T) {
+	for name, jsonOutput := range map[string]bool{"text report": false, "JSON report": true} {
+		t.Run(name, func(t *testing.T) {
+			server, _ := checksBackfillRecreateServer(t, 2, newHoldingHandler(t), func([]int) bool { return false }, 2)
+			cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h", JSON: jsonOutput}
+
+			var runErr error
+			output := captureStdout(func() {
+				runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+			})
+
+			require.EqualError(t, runErr, "checks backfill left 1 failed Check Run recreation needing attention")
+			assert.Equal(t, 1, ExitCodeFor(runErr))
+			if jsonOutput {
+				var report checksBackfillReport
+				require.NoError(t, json.Unmarshal([]byte(output), &report))
+				require.Len(t, report.Actions, 2)
+				assert.Equal(t, "boom", report.Actions[1].Error)
+				return
+			}
+			assert.Equal(t, []string{"https://github.com/octo/repo/pull/2", "SchemaBot (production)", "failed: boom"},
+				renderedCells(lineContaining(t, output, "/pull/2 ")))
+		})
+	}
 }
 
 // A run nobody interrupts reports interrupted as false, always present so a
