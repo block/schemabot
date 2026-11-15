@@ -183,6 +183,19 @@ func webhookClaimableArgs() []any {
 	}
 }
 
+// failedOrganicRowInCoolOff matches a failed row that still covers its head:
+// an organic delivery (not the SynthesizedWebhookDeliveryIDPrefix GUID form)
+// that failed less than WebhookEventFailedCoverageCoolOff ago. The cutoff is
+// measured on the database clock, the same clock that stamped completed_at.
+// Every terminal failure write stamps completed_at; updated_at, which every
+// write stamps, stands in if it is ever unset. Bind one placeholder: the
+// synthesized-GUID LIKE pattern.
+func (s *webhookEventStore) failedOrganicRowInCoolOff() string {
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.WebhookEventFailedCoverageCoolOff.Microseconds())), IntervalMicrosecond)
+	return `(delivery_id NOT LIKE ? AND COALESCE(completed_at, updated_at) > ` + cutoff + `)`
+}
+
 func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
 	repository = storage.CanonicalKey(repository)
 	if provider == "" {
@@ -195,23 +208,26 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 	// only auto-plannable pull_request rows count. Other event types can carry
 	// the same PR + head SHA without planning it — a pull_request.closed row
 	// from before a reopen, or a check_run row — and matching them would mask
-	// the very loss the reconciler exists to recover. A terminally failed
-	// organic row still covers its head: its GitHub Redeliver lever is the
-	// operator's remediation, and synthesizing over it would loop a
-	// deterministically failing head through a fresh claim budget every
-	// pass. Only a plain failed synthesized row (the
-	// SynthesizedWebhookDeliveryIDPrefix GUID form) fails to cover — there
-	// is no Redeliver lever for a synthesized GUID, so the reconciler must
-	// be able to synthesize a fresh recovery delivery, which lands in
-	// Create's duplicate-GUID branch and reopens the failed row. A
-	// permanently failed (dead-lettered) row covers its head in either GUID
-	// form: the driver proved no retry can plan that head, so resurrecting
-	// it would replay the same deterministic failure on every reconcile
-	// pass. A superseded row never covers: its work was discarded on the
-	// promise that a covering successor performs it, so it cannot itself
-	// attest coverage — when the successor's coverage lapses (e.g. it
-	// targeted a different head and the PR reopened on this one), the
-	// reconciler must be free to synthesize.
+	// the very loss the reconciler exists to recover. A plain failed row
+	// exhausted its transient retries, so a later attempt can still plan the
+	// head. An organic one covers its head only for
+	// WebhookEventFailedCoverageCoolOff after it failed: the window leaves
+	// room for the operator's GitHub Redeliver, and once it passes the
+	// reconciler synthesizes a recovery delivery so the PR is planned even
+	// when nobody noticed the failure. A failed synthesized row (the
+	// SynthesizedWebhookDeliveryIDPrefix GUID form) never covers — there is
+	// no Redeliver lever for a synthesized GUID, so the reconciler must be
+	// able to synthesize a fresh recovery delivery, which lands in Create's
+	// duplicate-GUID branch and reopens the failed row. Either way the
+	// reconciler's pass interval paces the retries. A permanently failed
+	// (dead-lettered) row covers its head in either GUID form: the driver
+	// proved no retry can plan that head, so resurrecting it would replay
+	// the same deterministic failure on every reconcile pass. A superseded
+	// row never covers: its work was discarded on the promise that a
+	// covering successor performs it, so it cannot itself attest coverage —
+	// when the successor's coverage lapses (e.g. it targeted a different
+	// head and the PR reopened on this one), the reconciler must be free to
+	// synthesize.
 	args := []any{provider, repository, pullRequest, headSHA}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
 	args = append(args, storage.WebhookEventSuperseded, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
@@ -222,7 +238,7 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
 			AND event = 'pull_request' AND action IN (`+placeholders(len(storage.AutoPlanPullRequestActions))+`)
 			AND state <> ?
-			AND (state <> ? OR delivery_id NOT LIKE ?)
+			AND (state <> ? OR `+s.failedOrganicRowInCoolOff()+`)
 		LIMIT 1
 	`, args...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {

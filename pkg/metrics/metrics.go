@@ -2174,11 +2174,13 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 
 // RecordWebhookReconcileMissingEvent counts open PR heads the webhook
 // reconciler found without a live inbox delivery — no row at all, or only
-// rows that cannot attest coverage (plain-failed synthesized rows, or
-// superseded rows whose work was discarded by claim-time coalescing). A
-// dead-lettered row or a plain-failed organic row covers its head, so neither
-// counts as missing (the dead-letter is deliberately terminal; the organic
-// failure has GitHub Redeliver as its lever). A nonzero rate usually means
+// rows that cannot attest coverage (plain-failed synthesized rows, organic
+// rows that failed longer ago than storage.WebhookEventFailedCoverageCoolOff,
+// or superseded rows whose work was discarded by claim-time coalescing). A
+// dead-lettered row covers its head, as does a plain-failed organic row
+// within the cool-off, so neither counts as missing (the dead-letter is
+// deliberately terminal; the organic failure has GitHub Redeliver as its
+// lever until the cool-off passes). A nonzero rate usually means
 // deliveries are being lost upstream of the inbox (edge auth, GitHub send
 // failures), but a head covered only by superseded rows is a
 // coalescing-created miss with no upstream loss — check the superseded
@@ -2194,11 +2196,13 @@ func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 
 // RecordWebhookReconcileSynthesizedEvent counts inbox deliveries the webhook
 // reconciler synthesized for open PR heads whose organic delivery never
-// reached the inbox. Each synthesized delivery re-plans the PR through the
-// durable dispatch path. The outcome attribute separates recovery from
-// thrash: "first" is the healthy case — a genuinely lost delivery recovered
-// once, so investigate the upstream loss (edge auth, GitHub send failures)
-// rather than the recovery — while "resynthesis" means a previously
+// reached the inbox, or failed and stayed failed past
+// storage.WebhookEventFailedCoverageCoolOff. Each synthesized delivery
+// re-plans the PR through the durable dispatch path. The outcome attribute
+// separates recovery from thrash: "first" is the healthy case — a head
+// recovered once, so investigate the upstream loss (edge auth, GitHub send
+// failures) or the organic row's last_error rather than the recovery —
+// while "resynthesis" means a previously
 // synthesized row terminally failed or was superseded and was reopened, so a
 // sustained resynthesis rate is the same head repeatedly failing or being
 // discarded after recovery — investigate that head's processing, not

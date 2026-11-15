@@ -582,13 +582,61 @@ func TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead(t *testing.T) {
 	require.Equal(t, 1, row.Attempts)
 }
 
-// TestWebhookReconcilerFailedOrganicRowCoversHead pins the organic side of
-// the terminal-failure contract: a terminally failed organic delivery still
-// covers its head, because the operator's remediation for it is GitHub
-// Redeliver — the reconciler synthesizing over it would put a
-// deterministically failing head through a fresh claim budget on every pass.
-func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
+// TestWebhookReconcilerFailedOrganicRowCoversHeadDuringCoolOff pins the
+// organic side of the terminal-failure contract: an organic delivery that
+// exhausted its retries minutes ago still covers its head, so the operator
+// has a window to use GitHub Redeliver before the reconciler steps in.
+func TestWebhookReconcilerFailedOrganicRowCoversHeadDuringCoolOff(t *testing.T) {
 	store := newRecordingWebhookEventStore()
+	seedFailedOrganicDelivery(t, store, time.Now().Add(-5*time.Minute))
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 0, missing, "a failed organic row must cover its head during the cool-off")
+	require.Equal(t, 0, synthesized)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	require.NoError(t, err)
+	require.Nil(t, row, "no recovery row may be synthesized during the cool-off")
+}
+
+// TestWebhookReconcilerReplansFailedOrganicRowAfterCoolOff covers a PR whose
+// plan delivery exhausted its transient retries and that nobody redelivered:
+// once the cool-off passes, the reconciler synthesizes a recovery delivery so
+// the PR is planned and its check unblocked without a push or a comment. The
+// organic row stays failed for forensics.
+func TestWebhookReconcilerReplansFailedOrganicRowAfterCoolOff(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	seedFailedOrganicDelivery(t, store, time.Now().Add(-storage.WebhookEventFailedCoverageCoolOff-time.Minute))
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 1, missing, "a failed organic row past the cool-off must not cover its head")
+	require.Equal(t, 1, synthesized)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, storage.WebhookEventPending, row.State)
+	require.Equal(t, webhookReconcileSynthesizedAction, row.Action)
+	organic, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "organic-github-guid")
+	require.NoError(t, err)
+	require.NotNil(t, organic)
+	require.Equal(t, storage.WebhookEventFailed, organic.State, "the organic row must stay failed")
+}
+
+// seedFailedOrganicDelivery records an organic plan delivery for
+// octocat/hello-world#7@head-sha that exhausted its retries at failedAt.
+func seedFailedOrganicDelivery(t *testing.T, store *recordingWebhookEventStore, failedAt time.Time) {
+	t.Helper()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  "organic-github-guid",
@@ -599,22 +647,10 @@ func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
 		HeadSHA:     "head-sha",
 		State:       storage.WebhookEventFailed,
 		Attempts:    storage.MaxWebhookEventAttempts,
+		CompletedAt: &failedAt,
 		Payload:     []byte(`{}`),
 	})
 	require.NoError(t, err)
-	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
-	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
-		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
-	})
-
-	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
-
-	require.Equal(t, 1, scanned)
-	require.Equal(t, 0, missing, "a terminally failed organic row must cover its head")
-	require.Equal(t, 0, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
-	require.NoError(t, err)
-	require.Nil(t, row, "no recovery row may be synthesized over a failed organic delivery")
 }
 
 // TestWebhookReconcilerNonPlanRowDoesNotCoverHead exercises the

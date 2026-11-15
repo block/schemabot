@@ -2885,9 +2885,11 @@ const (
 //   - WebhookEventFailed: the delivery exhausted its retry budget (or a
 //     reconciler sweep terminalized a wedged row), but a later attempt could
 //     still succeed — the cause was transient or unproven. GitHub Redeliver
-//     reopens it, and when the row is synthesized
-//     (SynthesizedWebhookDeliveryIDPrefix) the reconciler re-synthesizes its
-//     head instead, since no Redeliver lever exists for a synthesized GUID.
+//     reopens it. A synthesized row (SynthesizedWebhookDeliveryIDPrefix) has
+//     no Redeliver lever, so the reconciler re-synthesizes its head at once;
+//     an organic row stops covering its head after
+//     WebhookEventFailedCoverageCoolOff, so the reconciler re-plans it even
+//     when nobody redelivers it.
 //   - WebhookEventFailedPermanent: the driver proved the delivery can never
 //     succeed for its head (a deterministic failure such as GitHub's per-PR
 //     file-listing cap), so it is dead-lettered. It counts as head coverage in
@@ -2912,10 +2914,22 @@ const (
 // webhook reconciler for synthesized recovery rows, distinguishing them from
 // organic GitHub delivery GUIDs. The distinction is behavioral, not
 // cosmetic: a terminally failed organic row has a GitHub Redeliver lever, so
-// it still covers its head, while a terminally failed synthesized row has no
-// such lever and must not — the inbox coverage query (HasEventForHead) keys
-// its failed-row exclusion off this prefix.
+// it covers its head for WebhookEventFailedCoverageCoolOff, while a terminally
+// failed synthesized row has no such lever and covers nothing — the inbox
+// coverage query (HasEventForHead) keys its failed-row exclusion off this
+// prefix.
 const SynthesizedWebhookDeliveryIDPrefix = "recon:"
+
+// WebhookEventFailedCoverageCoolOff is how long a failed organic auto-plan
+// delivery keeps covering its head after it failed. Within the window an
+// operator can still use GitHub Redeliver, and the reconciler leaves the head
+// alone. Once the window passes, HasEventForHead stops counting the row, so
+// the reconciler (or a check_suite recovery) enqueues a synthesized recovery
+// delivery and the PR is planned without anyone having to notice the failure.
+// The failure was transient or unproven, so a later attempt can succeed; a
+// failure the driver proved deterministic is dead-lettered as
+// WebhookEventFailedPermanent instead and covers its head for good.
+const WebhookEventFailedCoverageCoolOff = 30 * time.Minute
 
 // AutoPlanPullRequestActions are the pull_request actions that trigger
 // auto-plan for a PR head. This is the single source for every layer that

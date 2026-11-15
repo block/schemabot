@@ -141,12 +141,25 @@ func (s *recordingWebhookEventStore) HasEventForHead(_ context.Context, provider
 			event.PullRequest == pullRequest && event.HeadSHA == headSHA &&
 			event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) &&
 			event.State != storage.WebhookEventSuperseded &&
-			(event.State != storage.WebhookEventFailed ||
-				!strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix)) {
+			(event.State != storage.WebhookEventFailed || failedOrganicRowInCoolOff(event)) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// failedOrganicRowInCoolOff mirrors the real store's rule for a failed row:
+// only an organic delivery that failed less than
+// storage.WebhookEventFailedCoverageCoolOff ago still covers its head. A row
+// seeded without a completion time counts as just failed.
+func failedOrganicRowInCoolOff(event *storage.WebhookEvent) bool {
+	if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
+		return false
+	}
+	if event.CompletedAt == nil {
+		return true
+	}
+	return time.Since(*event.CompletedAt) < storage.WebhookEventFailedCoverageCoolOff
 }
 
 func (s *recordingWebhookEventStore) FindNext(context.Context, string, time.Duration) (*storage.WebhookEvent, error) {

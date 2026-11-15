@@ -22,7 +22,10 @@
 //     dispatcher plans through the ordinary auto-plan flow; otherwise the scan
 //     is report-only. A dead-lettered head (failed_permanent) is not a miss —
 //     HasEventForHead reports it covered — so synthesis cannot resurrect a
-//     delivery the driver proved can never succeed for that head.
+//     delivery the driver proved can never succeed for that head. An organic
+//     delivery that exhausted its transient retries (failed) covers its head
+//     only for storage.WebhookEventFailedCoverageCoolOff, so a PR whose plan
+//     delivery kept failing is re-planned without anyone redelivering it.
 //
 // The missing-delivery scan pages each repository's updated-descending open
 // PR listing under a per-pass page budget, in two phases. A fresh-window walk
