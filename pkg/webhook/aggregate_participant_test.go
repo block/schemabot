@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -152,6 +153,82 @@ func TestLeaderParticipantsForPRKeepsADroppedParticipantTheFoldWouldBlockOn(t *t
 			}
 			require.Len(t, expected, 1)
 			assert.Equal(t, tt.wantTenant, expected[0].Tenant)
+		})
+	}
+}
+
+// A leader that publishes one aggregate per environment resolves a participant
+// the PR no longer proposes work for separately for each environment. The
+// participant is dropped from an environment where its run on the head passed,
+// and it is neither read nor expected for an environment it publishes no check
+// for, even when a failed run exists under that environment's name.
+func TestScopedLeaderResolvesADroppedParticipantForEachEnvironment(t *testing.T) {
+	const repo = "octocat/shared-repo"
+	stagingRun := aggregateCheckNameForEnv("SchemaBot Tenant B", "staging")
+	productionRun := aggregateCheckNameForEnv("SchemaBot Tenant B", "production")
+	passed := &ghclient.CheckRunResult{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess}
+	failed := &ghclient.CheckRunResult{Status: checkStatusCompleted, Conclusion: checkConclusionFailure}
+
+	tests := []struct {
+		name string
+		// environments is the participant's configured coverage; nil covers
+		// every environment.
+		environments []string
+		results      map[string]*ghclient.CheckRunResult
+		wantReads    []string
+		// wantExpected lists the environments the participant stays expected for.
+		wantExpected []string
+	}{
+		{
+			name:      "passing runs drop the participant from both environments",
+			results:   map[string]*ghclient.CheckRunResult{stagingRun: passed, productionRun: passed},
+			wantReads: []string{stagingRun, productionRun},
+		},
+		{
+			name:         "a passing staging run drops only staging",
+			results:      map[string]*ghclient.CheckRunResult{stagingRun: passed, productionRun: failed},
+			wantReads:    []string{stagingRun, productionRun},
+			wantExpected: []string{"production"},
+		},
+		{
+			name:         "an environment the participant does not publish is not read",
+			environments: []string{"production"},
+			results:      map[string]*ghclient.CheckRunResult{stagingRun: failed, productionRun: failed},
+			wantReads:    []string{productionRun},
+			wantExpected: []string{"production"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &api.ServerConfig{
+				AllowedEnvironments: []string{"staging", "production"},
+				Repos: map[string]api.RepoConfig{
+					repo: {Aggregate: &api.AggregateConfig{
+						Role: api.AggregateRoleLeader,
+						ExpectedTenants: []api.ExpectedTenant{{
+							Tenant:       "tenant-b",
+							Paths:        []string{"tenant-b/schema"},
+							CheckName:    "SchemaBot Tenant B",
+							Environments: tt.environments,
+						}},
+					}},
+				},
+			}
+			h := &Handler{service: api.New(nil, cfg, nil, testLogger()), logger: testLogger()}
+			finder := &fakeCheckRunFinder{results: tt.results}
+			scope := &aggregatePRScope{listed: []ghclient.PRFile{{Filename: "tenant-b/schema/schemabot.yaml", Status: "removed"}}}
+
+			byEnvironment, err := h.expectedParticipantsByEnvironment(t.Context(), finder, repo, 1, "abc123", scope)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantReads, finder.calls)
+			for _, env := range cfg.AllowedEnvironments {
+				if !slices.Contains(tt.wantExpected, env) {
+					assert.Empty(t, byEnvironment[env], env)
+					continue
+				}
+				require.Len(t, byEnvironment[env], 1, env)
+				assert.Equal(t, "tenant-b", byEnvironment[env][0].Tenant, env)
+			}
 		})
 	}
 }

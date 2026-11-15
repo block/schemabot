@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -17,7 +18,10 @@ var errAggregateHeadMoved = errors.New("PR head moved during aggregate discovery
 // than an inference from stored rows. Missing results for its local targets
 // remain blocking even before a planner has stored its first row.
 type aggregatePRScope struct {
+	// files is what the PR proposes against the default branch, and listed is
+	// the PR's raw changed-file listing before that narrowing.
 	files               []ghclient.PRFile
+	listed              []ghclient.PRFile
 	configs             []ghclient.DiscoveredConfig
 	local               []*storage.Check
 	participantSelected bool
@@ -33,6 +37,7 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 	if err != nil {
 		return nil, fmt.Errorf("list files for aggregate scope %s#%d: %w", repo, pr, err)
 	}
+	listed := files
 	files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
 	if err != nil {
 		return nil, fmt.Errorf("scope aggregate files to proposed changes %s#%d: %w", repo, pr, err)
@@ -48,24 +53,15 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 	if err != nil {
 		return nil, err
 	}
-	scope := &aggregatePRScope{files: files, configs: configs, environments: environments}
+	scope := &aggregatePRScope{files: files, listed: listed, configs: configs, environments: environments}
 	config := h.service.Config()
 	// Participants use their configured managed paths for the same conservative
 	// selection as leaders. A touched README within those paths still needs a
 	// no-work report; a PR outside them stays silent.
 	scope.participantSelected = h.participantPathsTouched(repo, files)
 	for _, tenant := range config.ExpectedParticipantChecksForPR(repo, prFilePaths(files)) {
-		// A leader cannot infer per-database overrides in another deployment.
-		// Only the selected participant's coverage uses the global order;
-		// local databases are validated against their own effective orders.
-		var covered []string
-		for _, env := range environments {
-			if tenant.PublishesEnvironment(env) {
-				covered = append(covered, env)
-			}
-		}
-		if err := config.ValidateCheckEnvironmentOrder("", covered); err != nil {
-			return nil, fmt.Errorf("validate environment order for participant %q: %w", tenant.Tenant, err)
+		if err := validateParticipantEnvironmentOrder(config, environments, tenant); err != nil {
+			return nil, err
 		}
 	}
 
@@ -115,6 +111,72 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 		return nil, fmt.Errorf("PR %s#%d aggregate discovery got unknown input move %d", repo, pr, moved)
 	}
 	return scope, nil
+}
+
+// expectedParticipantsByEnvironment returns, for every allowed environment, the
+// participants an environment-scoped leader folds into that environment's
+// aggregate on headSHA. It asks the unscoped leader's question once per
+// environment (participantsExpectedOnHead), because each environment's
+// aggregate folds the participant's run for that environment: a participant
+// only the listed files select stays expected for an environment while its run
+// for it on the head is not passing. Only those participants are read, so a PR
+// that narrowing drops nothing from makes no request here. Every environment is
+// resolved before anything is published, so a failed read publishes nothing.
+func (h *Handler) expectedParticipantsByEnvironment(
+	ctx context.Context, client checkRunFinder,
+	repo string, pr int, headSHA string, scope *aggregatePRScope,
+) (map[string][]api.ExpectedTenant, error) {
+	config := h.service.Config()
+	listed := config.ExpectedParticipantChecksForPR(repo, prFilePaths(scope.listed))
+	proposed := config.ExpectedParticipantChecksForPR(repo, prFilePaths(scope.files))
+	byEnvironment := make(map[string][]api.ExpectedTenant, len(config.AllowedEnvironments))
+	for _, env := range config.AllowedEnvironments {
+		expected, err := h.participantsExpectedOnHead(ctx, client, repo, pr, env, headSHA, listed, proposed)
+		if err != nil {
+			return nil, fmt.Errorf("resolve participants for %s aggregate: %w", env, err)
+		}
+		byEnvironment[env] = expected
+	}
+	return byEnvironment, nil
+}
+
+// validateParticipantEnvironmentOrder refuses a participant that publishes a
+// check for one of environments the global environment_order omits: the leader
+// could not tell which of the participant's runs must pass before which. A
+// leader cannot infer per-database overrides in another deployment, so only a
+// participant's coverage uses the global order; local databases are validated
+// against their own effective orders.
+func validateParticipantEnvironmentOrder(config *api.ServerConfig, environments []string, tenant api.ExpectedTenant) error {
+	var covered []string
+	for _, env := range environments {
+		if tenant.PublishesEnvironment(env) {
+			covered = append(covered, env)
+		}
+	}
+	if err := config.ValidateCheckEnvironmentOrder("", covered); err != nil {
+		return fmt.Errorf("validate environment order for participant %q: %w", tenant.Tenant, err)
+	}
+	return nil
+}
+
+// validateExpectedParticipantOrder applies the environment order check to
+// every participant an environment's aggregate folds. Discovery already ran it
+// on the participants the proposed files select; this reaches the ones only
+// the listed files select that stay expected because their run on the head is
+// not passing. A failed run in an environment the order omits is no
+// prerequisite of a later environment, so the later environment's aggregate
+// cannot be trusted to block on it (MG-1, MG-6). Each participant is checked
+// over all the environments it covers, as discovery does, not only the ones it
+// stays expected for.
+func (s *aggregatePRScope) validateExpectedParticipantOrder(config *api.ServerConfig, expectedByEnvironment map[string][]api.ExpectedTenant) error {
+	for _, env := range config.AllowedEnvironments {
+		for _, tenant := range expectedByEnvironment[env] {
+			if err := validateParticipantEnvironmentOrder(config, s.environments, tenant); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *aggregatePRScope) withPendingChecks(checks []*storage.Check, repo string, pr int, headSHA string) []*storage.Check {
