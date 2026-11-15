@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -20,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -412,14 +414,21 @@ func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
 	// Storage refusing the apply on the merits is not a storage failure: an
 	// active apply on the target keeps its conflict answer and its message.
 	t.Run("an active apply on the target stays a conflict", func(t *testing.T) {
-		applies := &capturingApplyStore{err: fmt.Errorf("apply apply-7 (state running) holds its targets: %w", storage.ErrActiveApplyExists)}
+		applies := &capturingApplyStore{err: &storage.ActiveApplyError{
+			HolderApplyID: "apply-7",
+			HolderState:   state.Apply.Running,
+			Database:      "orders",
+			Environment:   "staging",
+			Detail:        "active apply apply-7 (state running) exists for orders/mysql/staging deployments [region-a]",
+		}}
 		svc, _ := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
 
 		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
 
 		assert.Equal(t, http.StatusConflict, status)
 		assert.Equal(t, apitypes.ErrCodeActiveApplyExists, resp.ErrorCode)
-		assert.Equal(t, "apply blocked by active apply: store apply and tasks: apply apply-7 (state running) holds its targets: active apply already exists", resp.Error)
+		assert.Equal(t, "apply blocked: apply-7 is still in progress on orders in staging. Wait for it to finish, then apply again.", resp.Error)
+		assert.NotContains(t, resp.Error, "region-a", "the deployments the store names stay in the server log")
 
 		_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
 		require.ErrorIs(t, err, storage.ErrActiveApplyExists)
@@ -452,4 +461,88 @@ func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
 		assert.NotEqual(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
 		assert.Equal(t, `apply failed: database "testdb" (staging): unknown deployment "unrouted": tern deployment not configured`, resp.Error)
 	})
+}
+
+// An apply refused because another apply holds the target names the holder and
+// the one step that clears it, chosen by the state that keeps it on the target.
+func TestActiveApplyConflictMessage(t *testing.T) {
+	holder := func(holderState string) error {
+		return fmt.Errorf("store apply and tasks: %w", &storage.ActiveApplyError{
+			HolderApplyID: "apply-7",
+			HolderState:   holderState,
+			Database:      "orders",
+			Environment:   "production",
+			Detail:        "active apply apply-7 exists for orders/mysql/production deployments [region-a]",
+		})
+	}
+	tests := map[string]struct {
+		err  error
+		want string
+	}{
+		"running": {
+			err:  holder(state.Apply.Running),
+			want: "apply blocked: apply-7 is still in progress on orders in production. Wait for it to finish, then apply again.",
+		},
+		"stopped": {
+			err:  holder(state.Apply.Stopped),
+			want: "apply blocked: apply-7 is stopped on orders in production. Start or cancel it, then apply again.",
+		},
+		"waiting for cutover": {
+			err:  holder(state.Apply.WaitingForCutover),
+			want: "apply blocked: apply-7 is waiting for its cutover on orders in production. Run its cutover or cancel it, then apply again.",
+		},
+		"paused": {
+			err:  holder(state.Apply.Paused),
+			want: "apply blocked: apply-7 is paused on orders in production. Release or cancel it, then apply again.",
+		},
+		"waiting for deploy": {
+			err:  holder(state.Apply.WaitingForDeploy),
+			want: "apply blocked: apply-7 is waiting for its deploy on orders in production. Start or cancel it, then apply again.",
+		},
+		"in its revert window": {
+			err:  holder(state.Apply.RevertWindow),
+			want: "apply blocked: apply-7 is in its revert window on orders in production. Skip-revert or revert it, then apply again.",
+		},
+		"retrying after an error": {
+			err:  holder(state.Apply.FailedRetryable),
+			want: "apply blocked: apply-7 is retrying after an error on orders in production. Wait for it to finish or cancel it, then apply again.",
+		},
+		"ended with an operation still in progress": {
+			err:  holder(state.Apply.Failed),
+			want: "apply blocked: apply-7 has ended, but part of its work is still in progress on orders in production. Wait for that to finish, then apply again.",
+		},
+		"no holder details": {
+			err:  fmt.Errorf("create apply: %w", storage.ErrActiveApplyExists),
+			want: "apply blocked: another apply is still in progress on this database. Wait for it to finish, then apply again.",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, activeApplyConflictMessage(tc.err))
+		})
+	}
+}
+
+// TestActiveApplyConflictMessageNamesTheDecisionEveryRestingStateOwes walks
+// every apply state the registry says holds the database until someone acts on
+// it. A refused apply must name that action, never tell the operator to wait for
+// a holder that will not finish on its own.
+func TestActiveApplyConflictMessageNamesTheDecisionEveryRestingStateOwes(t *testing.T) {
+	v := reflect.ValueOf(state.Apply)
+	for _, field := range v.Fields() {
+		holderState := field.String()
+		if !strings.HasPrefix(state.Hold(holderState), "it holds the database until") {
+			continue
+		}
+		t.Run(holderState, func(t *testing.T) {
+			msg := activeApplyConflictMessage(&storage.ActiveApplyError{
+				HolderApplyID: "apply-7",
+				HolderState:   holderState,
+				Database:      "orders",
+				Environment:   "production",
+			})
+			assert.NotContains(t, msg, "is still in progress")
+			assert.NotContains(t, msg, "has ended")
+		})
+	}
 }

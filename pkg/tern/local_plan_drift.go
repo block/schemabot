@@ -2,7 +2,9 @@ package tern
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -94,9 +96,16 @@ func (r replannedChange) stampOnto(tc *storage.TableChange) {
 // judged by this target's engine against this target's schema. The
 // dispatched changes carry none of them, so the re-plan is the only place
 // they exist.
+//
+// vschemaMetadata holds, per namespace, the VSchema change-metadata of each of
+// the re-plan's changes for that namespace. It is recorded only for a
+// whole-deployment dispatch, the one the VSchema parity check covers: whether
+// a VSchema change removes or mutates routing is judged by this target's
+// engine against this target's live VSchema, just as the unsafe flag is.
 type replannedChanges struct {
-	targetShard string
-	byChange    map[driftChangeKey]replannedChange
+	targetShard     string
+	byChange        map[driftChangeKey]replannedChange
+	vschemaMetadata map[string][]map[string]string
 }
 
 // record keeps the re-planned change for a key. A key can repeat when the
@@ -215,6 +224,7 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		if err := compareFinalizeParity(finalizeNamespacesFromPlanResult(c, result), finalizeNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
 			return replannedChanges{}, engine.NewPermanentError("local keyspace finalization has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 		}
+		replanned.vschemaMetadata = vschemaMetadataFromPlanResult(c, result)
 	}
 	return replanned, nil
 }
@@ -249,31 +259,34 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 	return result, nil
 }
 
-// verifyAttachedShardDispatch checks a shard-scoped dispatch that attaches to
-// an existing apply against its own shard: the reviewed change it carries must
-// be what this deployment would plan for that shard and table against its own
-// live schema, or the attach fails closed. The plan row the attach runs from
-// was checked against the creating dispatch's shard at most — only when that
-// dispatch materialized it; a plan row already stored on the deployment is
-// taken as it is — so without this a sibling shard that drifted would run the
-// reviewed DDL unchecked. On a match the scope's changes take this
+// verifyShardDispatchAgainstLiveSchema checks a shard-scoped dispatch against
+// its own shard when the dispatch runs from a plan row it did not materialize:
+// the reviewed change it carries must be what this deployment would plan for that
+// shard and table against its own live schema, or the dispatch fails closed.
+// That is every dispatch attaching to an existing apply, and a dispatch
+// creating an apply from a plan row already stored on this deployment. A plan
+// row is checked against a shard only when a dispatch for that shard
+// materializes it; a stored row is taken as it is. So without this check a
+// shard that drifted would run the reviewed DDL unchecked, and when the
+// creating dispatch ran unchecked while a later sibling was refused, the
+// shards would end up divergent. On a match the scope's changes take this
 // shard's re-planned statement, execution-mode verdict and unsafe flag, as a
 // materialized plan's do.
 //
 // The comparison is restricted to the tables the dispatch names. A dispatch
 // carries one table's changes for one shard, and the shard's other tables are
-// other operations' work — some already run, some not yet attached — so they
+// other operations' work — some already run, some not yet dispatched — so they
 // are no evidence about this one.
 //
 // A dispatch that carries no schema files has no reviewed schema to re-plan
-// against, and attaches against the plan row as it is: a change no re-plan has
+// against, and runs against the plan row as it is: a change no re-plan has
 // judged keeps the mark that makes admission require the unsafe opt-in for it.
-func (c *LocalClient) verifyAttachedShardDispatch(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, scope *dispatchScope) error {
+// logAttrs identify the apply and operation for that warning.
+func (c *LocalClient) verifyShardDispatchAgainstLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope, logAttrs []any) error {
 	if len(req.SchemaFiles) == 0 {
-		c.logger.Warn("shard dispatch carries no schema files to re-plan against; attaching against the plan row, which will require the unsafe opt-in for every change it could not confirm",
-			append(apply.LogAttrs(),
+		c.logger.Warn("shard dispatch carries no schema files to re-plan against; admitting it against the plan row, which will require the unsafe opt-in for every change it could not confirm",
+			append(logAttrs,
 				"plan_id", req.PlanId,
-				"operation_key", operationKey,
 				"shard", scope.shard)...)
 		return nil
 	}
@@ -422,6 +435,10 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 // flag, and an operation the statement classifies as an alter can still drop
 // data (a dropped column), so without the re-plan's judgement the
 // unsafe-change admission gate would admit it without the opt-in.
+//
+// Each namespace's VSchema change is tightened the same way: the deletions and
+// mutations this target's re-plan recorded are added to the ones the dispatch
+// carried (see stampReplannedVSchema).
 func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.NamespacePlanData, replanned replannedChanges) error {
 	parser, err := c.statementParser()
 	if err != nil {
@@ -432,7 +449,134 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 			return err
 		}
 	}
+	return stampReplannedVSchema(namespaces, replanned.vschemaMetadata)
+}
+
+// vschemaUnsafeRecordKeys are the VSchema change-metadata keys whose records
+// make a VSchema change require the unsafe opt-in (see
+// storage.Plan.UnsafeVSchemaChanges).
+var vschemaUnsafeRecordKeys = []string{storage.PlanMetadataVSchemaDeletions, storage.PlanMetadataVSchemaMutations}
+
+// stampReplannedVSchema adds the VSchema deletions and mutations this target's
+// re-plan recorded to each namespace's materialized VSchema change, so the
+// unsafe VSchema admission gate judges the change as this target would apply
+// it. The dispatch carries the primary's records, judged against the
+// primary's live VSchema; this target's live VSchema can differ, so its own
+// re-plan can find a removal or routing change the primary's did not.
+//
+// The records are only ever added to, never replaced: a record the dispatch
+// carried stays, so the gate keeps requiring the opt-in the reviewed plan
+// asked for. The VSchema-changed flag is not stamped, so a dispatch that
+// records no VSchema change-metadata keeps failing closed at the gate.
+//
+// Every re-planned namespace has a materialized VSchema change, because the
+// VSchema parity check already required the two sets of namespaces to match;
+// one that does not is refused rather than skipped.
+func stampReplannedVSchema(namespaces map[string]*storage.NamespacePlanData, replanned map[string][]map[string]string) error {
+	for ns, changes := range replanned {
+		nsData := namespaces[ns]
+		if !nsData.ChangesVSchema() {
+			return fmt.Errorf("namespace %q: no materialized VSchema change for one the VSchema parity check matched", ns)
+		}
+		for _, meta := range changes {
+			for _, key := range vschemaUnsafeRecordKeys {
+				merged, err := mergeVSchemaUnsafeRecords(nsData.Metadata[key], meta[key])
+				if err != nil {
+					return fmt.Errorf("namespace %q: %s: %w", ns, key, err)
+				}
+				if merged == "" {
+					continue
+				}
+				if nsData.Metadata == nil {
+					nsData.Metadata = map[string]string{}
+				}
+				nsData.Metadata[key] = merged
+			}
+		}
+	}
 	return nil
+}
+
+// vschemaUnsafeRecordIdentity is the part of a VSchema deletion or mutation
+// record that identifies it: the fields plan change-metadata encodes today.
+// Two records with the same identity are the same record, whatever other
+// fields they carry.
+type vschemaUnsafeRecordIdentity struct {
+	Kind   string `json:"kind"`
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+}
+
+// vschemaUnsafeRecord is one VSchema deletion or mutation record: its identity,
+// used to tell it apart from other records, and the bytes the engine encoded
+// it as, which are what the merged value carries. Keeping the bytes means a
+// field the engine records that this package does not know survives the
+// merge.
+type vschemaUnsafeRecord struct {
+	identity vschemaUnsafeRecordIdentity
+	raw      json.RawMessage
+}
+
+// mergeVSchemaUnsafeRecords returns the dispatched records followed by each
+// re-planned record the dispatch does not already hold, encoded as plan
+// change-metadata. Each record keeps the bytes its side encoded it as. A
+// dispatched value that cannot be decoded is kept as it is: the gate already
+// fails closed on it, and rewriting it could only lose what it holds. A
+// re-planned value that cannot be decoded is an error, since this target's
+// judgement would otherwise be dropped, even when the dispatch carries the
+// same bytes.
+func mergeVSchemaUnsafeRecords(dispatched, replanned string) (string, error) {
+	if replanned == "" {
+		return dispatched, nil
+	}
+	replannedRecords, err := decodeVSchemaUnsafeRecords(replanned)
+	if err != nil {
+		return "", fmt.Errorf("decode re-planned records: %w", err)
+	}
+	if dispatched == "" || replanned == dispatched {
+		return replanned, nil
+	}
+	merged, err := decodeVSchemaUnsafeRecords(dispatched)
+	if err != nil {
+		return dispatched, nil
+	}
+	added := false
+	for _, r := range replannedRecords {
+		if !slices.ContainsFunc(merged, func(m vschemaUnsafeRecord) bool { return m.identity == r.identity }) {
+			merged = append(merged, r)
+			added = true
+		}
+	}
+	if !added {
+		return dispatched, nil
+	}
+	elements := make([]json.RawMessage, 0, len(merged))
+	for _, m := range merged {
+		elements = append(elements, m.raw)
+	}
+	encoded, err := json.Marshal(elements)
+	if err != nil {
+		return "", fmt.Errorf("encode merged records: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// decodeVSchemaUnsafeRecords decodes a VSchema deletion or mutation record
+// value into its records, each keeping the bytes it was encoded as.
+func decodeVSchemaUnsafeRecords(raw string) ([]vschemaUnsafeRecord, error) {
+	var elements []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &elements); err != nil {
+		return nil, err
+	}
+	records := make([]vschemaUnsafeRecord, 0, len(elements))
+	for _, element := range elements {
+		var identity vschemaUnsafeRecordIdentity
+		if err := json.Unmarshal(element, &identity); err != nil {
+			return nil, err
+		}
+		records = append(records, vschemaUnsafeRecord{identity: identity, raw: element})
+	}
+	return records, nil
 }
 
 // stampReplannedTables stamps each change with its re-planned counterpart,
@@ -764,6 +908,20 @@ func vschemaNamespacesFromPlanResult(c *LocalClient, result *engine.PlanResult) 
 	for _, sc := range result.Changes {
 		if sc.Metadata["vschema_changed"] == "true" {
 			out[c.planNamespace(sc.Namespace)] = true
+		}
+	}
+	return out
+}
+
+// vschemaMetadataFromPlanResult returns, per namespace, the VSchema
+// change-metadata of each recomputed change that carries VSchema work — the
+// same subset a stored plan persists (see storage.VSchemaPlanMetadata).
+func vschemaMetadataFromPlanResult(c *LocalClient, result *engine.PlanResult) map[string][]map[string]string {
+	out := map[string][]map[string]string{}
+	for _, sc := range result.Changes {
+		if meta := storage.VSchemaPlanMetadata(sc.Metadata); meta != nil {
+			ns := c.planNamespace(sc.Namespace)
+			out[ns] = append(out[ns], meta)
 		}
 	}
 	return out

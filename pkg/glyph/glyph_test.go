@@ -20,6 +20,7 @@ func vocabulary() map[string]string {
 		"Attention":  glyph.Attention,
 		"Info":       glyph.Info,
 		"Docs":       glyph.Docs,
+		"Tip":        glyph.Tip,
 	}
 }
 

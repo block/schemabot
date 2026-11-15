@@ -614,6 +614,57 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.NotNil(t, failed.CompletedAt)
 	})
 
+	// A refusal reason past the column's width is stored cut to fit, whether
+	// the pending request is failed by operation or by the revision a writer
+	// evaluated, so the request resolves instead of staying pending (CO-2).
+	t.Run("FailPending_PastColumnWidth_IsCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "control_fail_long_db", storage.DatabaseTypeMySQL)
+		apply := CreateClaimedApply(t, store, lock, "apply_control_fail_long", 804, "current-driver")
+		ownedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{
+			ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken,
+		})
+		request := func(operation storage.ControlOperation) *storage.ApplyControlRequest {
+			t.Helper()
+			req, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID:     apply.ID,
+				Operation:   operation,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "operator",
+				Metadata:    []byte(`{}`),
+			})
+			require.NoError(t, err)
+			require.False(t, alreadyPending)
+			return req
+		}
+		assertFailed := func(operation storage.ControlOperation, msg string) {
+			t.Helper()
+			failed, err := store.ControlRequests().GetByOperation(ctx, apply.ID, operation)
+			require.NoError(t, err)
+			require.NotNil(t, failed)
+			assert.Equal(t, storage.ControlRequestFailed, failed.Status, msg)
+			assertStoredMessage(t, overLongFailureMessageStored, failed.ErrorMessage, msg)
+		}
+
+		request(storage.ControlOperationStop)
+		require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationStop, overLongFailureMessage),
+			"failing a pending request without a lease with a long reason is stored")
+		assertFailed(storage.ControlOperationStop, "failed without a lease")
+
+		request(storage.ControlOperationCancel)
+		require.NoError(t, store.ControlRequests().FailPending(ownedCtx, apply.ID, storage.ControlOperationCancel, overLongFailureMessage),
+			"failing a pending request under the lease with a long reason is stored")
+		assertFailed(storage.ControlOperationCancel, "failed under the lease")
+
+		cutover := request(storage.ControlOperationCutover)
+		settled, err := store.ControlRequests().SettlePendingRevision(ownedCtx, cutover, storage.ControlRequestFailed, overLongFailureMessage)
+		require.NoError(t, err, "settling a revision as failed with a long reason is stored")
+		assert.True(t, settled)
+		assertFailed(storage.ControlOperationCutover, "settled by revision")
+	})
+
 	// SettlePendingRevision_SettlesOnlyTheCommandItWasGiven verifies a writer
 	// that evaluated one command cannot settle a later command re-armed on the
 	// same row: the stale revision settles nothing, under a lease or without
@@ -1054,6 +1105,53 @@ func TestControlRequests(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, row)
 		assert.Equal(t, "remote cutover rejected for a new reason", row.ErrorMessage)
+	})
+
+	// A rejection too long for the column is stored cut to fit, and the same
+	// report on the next poll still matches the row that recorded it, so it is
+	// recorded once rather than rewritten on every poll.
+	t.Run("RecordRemoteFailure_OverLongReportIsCutAndIdempotent", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		applyID := createControlRequestApply(t, store, "control_mirror_long_db", "apply_control_mirror_long")
+		report := &storage.ApplyControlRequest{
+			ApplyID:      applyID,
+			Operation:    storage.ControlOperationCutover,
+			RequestedBy:  storage.ForwardingControlRequestCaller,
+			ErrorMessage: overLongFailureMessage,
+		}
+		changed, err := store.ControlRequests().RecordRemoteFailure(ctx, report)
+		require.NoError(t, err, "a remote rejection with a long reason is stored")
+		require.True(t, changed)
+		row, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, row)
+		assert.Equal(t, storage.ControlRequestFailed, row.Status)
+		assertStoredMessage(t, overLongFailureMessageStored, row.ErrorMessage, "the rejection is cut")
+		assert.True(t, report.ErrorMessage == overLongFailureMessage, "the caller's report is left as it was given")
+
+		changed, err = store.ControlRequests().RecordRemoteFailure(ctx, report)
+		require.NoError(t, err)
+		assert.False(t, changed, "the same long rejection reported again is already recorded")
+
+		changed, err = store.ControlRequests().RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
+			ApplyID:      applyID,
+			Operation:    storage.ControlOperationCutover,
+			RequestedBy:  storage.ForwardingControlRequestCaller,
+			ErrorMessage: overLongFailureMessage + " and more",
+		})
+		require.NoError(t, err)
+		assert.False(t, changed, "a report that differs only past the column's width stores the same message, so nothing changes")
+
+		changed, err = store.ControlRequests().RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
+			ApplyID:      applyID,
+			Operation:    storage.ControlOperationCutover,
+			RequestedBy:  storage.ForwardingControlRequestCaller,
+			ErrorMessage: "y" + overLongFailureMessage[1:],
+		})
+		require.NoError(t, err)
+		assert.True(t, changed, "a long rejection that differs within the column's width is a distinct failure")
 	})
 
 	// ClearRemoteFailure_ClearsMirroredRejection verifies the mirror retires

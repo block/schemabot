@@ -424,11 +424,11 @@ func TestLocalClient_ResumeAfterStopMidQuarantineQuarantinesEachTableOnce(t *tes
 // the server when the resume plans again. The second table is still on the
 // target, so the resume hands its DROP to the engine, whose quarantine of it
 // queues on the server behind the abandoned RENAME. When the transaction ends
-// the abandoned RENAME lands first and the resume's attempt fails on a table
-// that is already in pending drops: the apply pauses as retryable without
-// touching the quarantined copy, and the next drive settles the task from the
-// live schema and finishes the apply. Every table ends up quarantined exactly
-// once and none is dropped outright.
+// the abandoned RENAME lands first and the resume's own RENAME finds no table.
+// The quarantine log names the copy the abandoned RENAME wrote, so the engine
+// reports the table as already quarantined, leaves the copy alone, and the
+// resume finishes the apply without pausing. Every table ends up quarantined
+// exactly once and none is dropped outright.
 func TestLocalClient_ResumeWhileAbandonedRenameQueuedQuarantinesEachTableOnce(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -448,22 +448,28 @@ func TestLocalClient_ResumeWhileAbandonedRenameQueuedQuarantinesEachTableOnce(t 
 	// quarantine wait on it.
 	_, err := s.locker.ExecContext(ctx, "UNLOCK TABLES")
 	require.NoError(t, err)
-	if err := awaitPendingDropReplayDrive(t, resume, "the resume did not return once the lock was released"); err != nil {
-		t.Logf("resume drive returned: %v", err)
-	}
+	require.NoError(t, awaitPendingDropReplayDrive(t, resume, "the resume did not return once the lock was released"),
+		"the resume must complete the apply")
 
 	resumed, err := s.stor.Applies().Get(ctx, s.apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, resumed)
-	require.True(t, state.IsState(resumed.State, state.Apply.FailedRetryable),
-		"the resume that lost the lock to the abandoned RENAME must pause as retryable, got %s (error: %s)",
+	require.True(t, state.IsState(resumed.State, state.Apply.Completed),
+		"the resume overtaken by the abandoned RENAME must find the table in pending drops and complete, got %s (error: %s)",
 		resumed.State, resumed.ErrorMessage)
-	assert.Contains(t, resumed.ErrorMessage, "replay_b_sessions", "the pause must name the table whose quarantine was overtaken")
-	requireQuarantinedOnce(t, s.dsn, "replay_b_sessions", pendingDropReplayRows)
-	assert.True(t, targetTableExists(t, s.dsn, "replay_c_tokens"), "the pause must leave the third table in place")
-
-	retry := s.claimAndDrive(t, second, "retry")
-	require.NoError(t, awaitPendingDropReplayDrive(t, retry, "the retry did not return"),
-		"the retry must complete the apply")
 	s.requirePendingDropReplayConverged(t, second)
+
+	// The apply log is where an operator learns, in the same drive, which
+	// pending drops table holds the rows of the table the abandoned RENAME
+	// moved.
+	var abandonedCopy string
+	for name := range quarantinedCopies(t, s.dsn, "replay_b_sessions") {
+		abandonedCopy = name
+	}
+	logs, err := s.stor.ApplyLogs().GetByApply(ctx, s.apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs, fmt.Sprintf(
+		"[replay_b_sessions] table `testdb`.`replay_b_sessions` already quarantined as `%s`.`%s` earlier in this schema change; recoverable until the pending drops retention period expires",
+		pendingdrops.Database, abandonedCopy)),
+		"the apply log must name the pending drops copy of replay_b_sessions exactly once")
 }

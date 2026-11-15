@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // rollbackTx rolls back tx, logging a warning if the rollback fails for a
@@ -31,6 +34,29 @@ func nullString(s string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: s, Valid: true}
+}
+
+// storedMessage returns msg in the form storage.StoredMessage records it in
+// column, and logs a warning when that form differs from msg: the stored value
+// shows a cut or a replacement character but not how long the original was.
+// rowAttrs, when not nil, returns the triage attributes of the row being
+// written, and is only called when there is something to log.
+func storedMessage(ctx context.Context, column, msg string, rowAttrs func() []any) string {
+	stored := storage.StoredMessage(msg)
+	if stored == msg {
+		return msg
+	}
+	var attrs []any
+	if rowAttrs != nil {
+		attrs = rowAttrs()
+	}
+	slog.WarnContext(ctx, "a message is longer than its column holds or is not valid UTF-8; storing it with invalid bytes replaced and cut to the column width",
+		append(attrs,
+			"column", column,
+			"original_bytes", len(msg),
+			"stored_bytes", len(stored),
+			"valid_utf8", utf8.ValidString(msg))...)
+	return stored
 }
 
 // nullInt64 returns a sql.NullInt64 for a row reference held as an int64, where

@@ -9,8 +9,9 @@ import (
 )
 
 // ShardWork is one keyspace shard's work in a sharded apply: the (shard,
-// table) operations it runs, in resolved order. Each operation's Deployment is
-// ignored; the shard is its identity.
+// table) operations it runs, in resolved order. The shard is the identity a
+// status names; each operation's Deployment and OperationKey only place the
+// row an EndedBy names.
 type ShardWork struct {
 	Keyspace   string
 	Shard      string
@@ -40,31 +41,29 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 		keyspaces[sw.Keyspace] = true
 	}
 	qualify := len(keyspaces) > 1
+	shardOf := shardIdentities(shards, qualify)
 	inputs := make([]Operation, 0, len(shards))
 	for _, sw := range shards {
 		if len(sw.Operations) == 0 {
 			continue
 		}
-		best := sw.Operations[0]
-		for _, op := range sw.Operations[1:] {
-			if ShardStateRank(op.State) > ShardStateRank(best.State) {
-				best = op
+		best := 0
+		for k, op := range sw.Operations[1:] {
+			if ShardStateRank(op.State) > ShardStateRank(sw.Operations[best].State) {
+				best = k + 1
 			}
 		}
 		first := sw.Operations[0]
-		identity := sw.Shard
-		if qualify {
-			identity = sw.Keyspace + "/" + sw.Shard
-		}
 		inputs = append(inputs, Operation{
-			Deployment:        identity,
-			State:             best.State,
+			Deployment:        shardIdentity(sw, qualify),
+			State:             sw.Operations[best].State,
 			Barrier:           first.Barrier,
 			Parallel:          first.Parallel,
 			ContinueOnFailure: first.ContinueOnFailure,
 			PauseOnFailure:    first.PauseOnFailure,
 			Released:          first.Released,
-			Error:             best.Error,
+			Error:             sw.Operations[best].Error,
+			EndedBy:           shardEndedBy(sw.Operations, best, shardOf),
 		})
 	}
 	byIdentity := make(map[string]Deployment, len(inputs))
@@ -73,10 +72,7 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 	}
 	out := make([]ShardStatus, 0, len(inputs))
 	for _, sw := range shards {
-		identity := sw.Shard
-		if qualify {
-			identity = sw.Keyspace + "/" + sw.Shard
-		}
+		identity := shardIdentity(sw, qualify)
 		d, ok := byIdentity[identity]
 		if !ok {
 			// Derive returns one deployment per input with its identity
@@ -89,6 +85,44 @@ func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 		out = append(out, ShardStatus{Keyspace: sw.Keyspace, Shard: sw.Shard, Deployment: d})
 	}
 	return out
+}
+
+// shardIdentity is the name a shard's status goes by: the shard, qualified by
+// its keyspace when the apply spans more than one.
+func shardIdentity(sw ShardWork, qualify bool) string {
+	if qualify {
+		return sw.Keyspace + "/" + sw.Shard
+	}
+	return sw.Shard
+}
+
+// shardIdentities maps each operation row of the shards to the identity of
+// the shard that runs it.
+func shardIdentities(shards []ShardWork, qualify bool) map[OperationRef]string {
+	shardOf := make(map[OperationRef]string)
+	for _, sw := range shards {
+		for _, op := range sw.Operations {
+			shardOf[OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = shardIdentity(sw, qualify)
+		}
+	}
+	return shardOf
+}
+
+// shardEndedBy is the EndedBy of the shard whose status its operation at best
+// speaks for, rewritten to name the shard its row belongs to, since a shard's
+// status is derived with the shard as its identity. It is set only when every
+// failed operation of the shard was failed for another row. A row no shard
+// runs, such as a finalizer, keeps an EndedBy that resolves to no name.
+func shardEndedBy(ops []Operation, best int, shardOf map[OperationRef]string) *OperationRef {
+	rows := make([]int, len(ops))
+	for k := range ops {
+		rows[k] = k
+	}
+	ref := endedByAll(ops, rows, best)
+	if ref == nil {
+		return nil
+	}
+	return &OperationRef{Deployment: shardOf[*ref]}
 }
 
 // ShardCounts is the per-status count of a sharded apply's shards, given each

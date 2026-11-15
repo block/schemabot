@@ -1722,6 +1722,35 @@ func TestTaskStore_ReapStrandedActive_SettlesTasksUnderSettledParents(t *testing
 	}
 }
 
+// The reaper settles a stranded task under a failed parent with the parent's
+// explanation. An explanation past the column's width is stored cut to fit, so
+// the settle lands instead of being refused on every sweep. The parent row
+// stored its own message cut already, so the long message is given in the
+// parent the sweep read rather than written to the parent row.
+func TestTaskStore_ReapStrandedActive_CutsAnOverLongParentFailureToFit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_long_failure_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_long_failure", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_long_failure", "users", state.Task.Running, "")
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+	parent.ErrorMessage = "x" + strings.Repeat("é", 40_000)
+
+	settled, err := store.tasks.reapStrandedActiveTask(ctx, task, parent)
+	require.NoError(t, err, "settling under a parent with a long failure message is stored")
+	assert.True(t, settled)
+	reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
+	want := "x" + strings.Repeat("é", 32_765) + "…"
+	assert.Equal(t, len(want), len(reloaded.ErrorMessage), "stored length in bytes")
+	assert.True(t, want == reloaded.ErrorMessage, "the parent's failure is cut on a character boundary")
+}
+
 // The guarded write re-verifies the row's state, so a task a driver advanced
 // between the sweep's scan and its write belongs to that driver, not the reaper.
 func TestTaskStore_ReapStrandedActive_SkipsRowThatLeftTheStateItWasReadIn(t *testing.T) {

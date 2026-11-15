@@ -276,7 +276,33 @@ func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.Prog
 		responses = append(responses, progressOperationResponseFromStorage(op))
 		memberByOperationID[op.ID] = routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
 	}
+	setProgressEndedBy(responses, ops)
 	return responses, memberByOperationID
+}
+
+// setProgressEndedBy names, on each response whose row was failed for
+// another row of the apply (ended_by_operation_id), that row by deployment
+// and operation key. responses is index-parallel to ops. A row the apply no
+// longer lists is not named, so the client reads the operation as stopped at
+// the cutover without placing the row that ended.
+func setProgressEndedBy(responses []*apitypes.ProgressOperationResponse, ops []*storage.ApplyOperation) {
+	byID := make(map[int64]*storage.ApplyOperation, len(ops))
+	for _, op := range ops {
+		byID[op.ID] = op
+	}
+	for i, op := range ops {
+		if op.EndedByOperationID == 0 {
+			continue
+		}
+		ended, ok := byID[op.EndedByOperationID]
+		if !ok {
+			slog.Warn("progress response names no operation for a row failed for another: the ended operation is not listed",
+				append(op.LogAttrs(), "ended_by_operation_id", op.EndedByOperationID)...)
+			responses[i].EndedBy = &apitypes.ProgressOperationRef{}
+			continue
+		}
+		responses[i].EndedBy = &apitypes.ProgressOperationRef{Deployment: ended.Deployment, OperationKey: ended.OperationKey}
+	}
 }
 
 // storedProgressOperations is every projection the storage-served progress

@@ -2,9 +2,12 @@ package pendingdrops
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -101,4 +104,98 @@ func TestCleaner_RunContinuesPastFailedTarget(t *testing.T) {
 	reasons := cleanupErrorReasonsByDatabase(t, reader)
 	assert.Equal(t, "locker_missing", reasons["firstdb"])
 	assert.Equal(t, "locker_missing", reasons["seconddb"])
+}
+
+// hangingLocker is a namedlock.Locker whose Release blocks until its context
+// ends, as a release on a half-open connection does. It records the context
+// it was handed so tests can assert how the release was bounded.
+type hangingLocker struct {
+	releaseDeadline    time.Time
+	releaseHasDeadline bool
+	releaseCtxErr      error
+}
+
+func (l *hangingLocker) Acquire(context.Context, *sql.Conn, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (l *hangingLocker) Release(ctx context.Context, _ *sql.Conn, _ string) (bool, error) {
+	l.releaseDeadline, l.releaseHasDeadline = ctx.Deadline()
+	l.releaseCtxErr = ctx.Err()
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func (l *hangingLocker) HeldByAnySession(context.Context, *sql.Conn, string) (bool, error) {
+	return false, nil
+}
+
+// The release runs after the pass's context may already be cancelled, and it
+// must still return: a release stuck on a half-open connection would
+// otherwise pin the pass for good. The pass gives up at the release bound,
+// logs that the lock releases with the session, and does not inherit the
+// cancellation that ended the pass.
+func TestCleaner_ReleaseIsBoundedAndSurvivesCancellation(t *testing.T) {
+	previous := lockReleaseTimeout
+	lockReleaseTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { lockReleaseTimeout = previous })
+
+	var logs bytes.Buffer
+	cleaner := NewCleaner(nil, DefaultRetention, false, slog.New(slog.NewTextHandler(&logs, nil)))
+	locker := &hangingLocker{}
+	target := Target{Database: "testdb", Environment: "staging", Locker: locker}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cleaner.releaseCleanupLock(ctx, target, nil, targetLockName(target))
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("release did not return at its bound")
+	}
+
+	require.True(t, locker.releaseHasDeadline, "the release must carry a deadline")
+	assert.LessOrEqual(t, time.Until(locker.releaseDeadline), lockReleaseTimeout)
+	assert.NoError(t, locker.releaseCtxErr, "the release must not inherit the pass's cancellation")
+	assert.Contains(t, logs.String(), "failed to release pending drops cleanup lock")
+	assert.Contains(t, logs.String(), context.DeadlineExceeded.Error())
+	assert.Contains(t, logs.String(), targetLockName(target))
+}
+
+// notHeldLocker is a namedlock.Locker whose Release answers that the session
+// no longer held the lock, as a server does when the lock was lost to another
+// session.
+type notHeldLocker struct{}
+
+func (notHeldLocker) Acquire(context.Context, *sql.Conn, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (notHeldLocker) Release(context.Context, *sql.Conn, string) (bool, error) {
+	return false, nil
+}
+
+func (notHeldLocker) HeldByAnySession(context.Context, *sql.Conn, string) (bool, error) {
+	return false, nil
+}
+
+// A release that is answered, but answered "not held", is the only sign that
+// another instance may have run against the target during this pass. It is
+// logged as lost ownership, not as a release failure.
+func TestCleaner_ReleaseWarnsWhenTheLockWasNotHeld(t *testing.T) {
+	var logs bytes.Buffer
+	cleaner := NewCleaner(nil, DefaultRetention, false, slog.New(slog.NewTextHandler(&logs, nil)))
+	target := Target{Database: "testdb", Environment: "staging", Locker: notHeldLocker{}}
+
+	cleaner.releaseCleanupLock(t.Context(), target, nil, targetLockName(target))
+
+	assert.Contains(t, logs.String(), "no longer held at release")
+	assert.Contains(t, logs.String(), targetLockName(target))
+	assert.NotContains(t, logs.String(), "failed to release")
+	assert.NotContains(t, logs.String(), context.DeadlineExceeded.Error())
 }

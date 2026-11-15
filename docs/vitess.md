@@ -76,11 +76,14 @@ still deleted.
 
 Without `delete_branch` the delete is refused. The apply still fails with its
 own error, and SchemaBot logs the refused delete at error level with the
-organization, database, and branch to delete by hand. A cancel still
-resolves, and its apply log names the branch left in place and says to
-delete it by hand. Grant only `delete_branch`, not
-`delete_production_branch`: SchemaBot deletes only the development branches
-it creates.
+organization, database, and branch to delete by hand. When PlanetScale
+refused the delete as unauthorized, the log also carries a `permission_hint`.
+That answer does not say whether the service token is no longer accepted or
+lacks `delete_branch`, so the hint says to check both. A cancel still
+resolves, and its apply log names the branch left in place, says to check the
+same two things, and says to delete the branch by hand.
+Grant only `delete_branch`, not `delete_production_branch`: SchemaBot
+deletes only the development branches it creates.
 
 ## Reclaiming orphaned branches
 
@@ -112,6 +115,9 @@ all of these hold:
 - no open deploy request uses it.
 
 Anything the pass cannot read keeps the branch, and the next pass tries again.
+A delete that fails is logged at error level and retried on the next pass.
+When PlanetScale refused it as unauthorized, that log carries the same
+`permission_hint` as [Branch cleanup](#branch-cleanup).
 On a data plane, a recently applied target that the inventory no longer has,
 or that has no PlanetScale client, is skipped with a warning and does not fail
 the pass; its branches are kept until deleted by hand.

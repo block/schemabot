@@ -145,15 +145,12 @@ func RecordedQuarantines(ctx context.Context, db *sql.DB, applyIdentifier, schem
 // ER_BAD_DB_ERROR when the pending drops database is missing and
 // ER_NO_SUCH_TABLE when the database exists without the log. A denied read is
 // neither; it is reported, not read as an empty log.
-const (
-	erBadDB       = 1049
-	erNoSuchTable = 1146
-)
+const erBadDB = 1049
 
 // isMissingLog reports whether err is the server saying the quarantine log, or
 // the pending drops database that holds it, does not exist.
 func isMissingLog(err error) bool {
-	return mysqlerr.Is(err, erBadDB, erNoSuchTable)
+	return mysqlerr.Is(err, erBadDB, mysqlerr.NoSuchTable)
 }
 
 // expiredLogRecords returns the log records the cleaner may delete, given the

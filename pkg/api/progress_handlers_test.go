@@ -243,6 +243,29 @@ func TestProgressOperationsCarryAlreadyConverged(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(string(encoded), `"already_converged":true`), string(encoded))
 }
 
+// A shard SchemaBot failed at the cutover for another shard's failure names
+// that shard's operation by deployment and key in the progress response, so a
+// client reads it as stopped at cutover. A row whose ended operation the
+// apply does not list still carries an empty reference, and a row that failed
+// on its own carries none.
+func TestProgressOperationsCarryEndedBy(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary", OperationKey: "shop/-40/users", State: state.ApplyOperation.Failed},
+		{ID: 2, Deployment: "primary", OperationKey: "shop/40-80/users", State: state.ApplyOperation.Failed, EndedByOperationID: 1},
+		{ID: 3, Deployment: "primary", OperationKey: "shop/80-/users", State: state.ApplyOperation.Failed, EndedByOperationID: 99},
+	}
+
+	responses, _ := progressOperationsFromRows(ops)
+	require.Len(t, responses, 3)
+	assert.Nil(t, responses[0].EndedBy)
+	assert.Equal(t, &apitypes.ProgressOperationRef{Deployment: "primary", OperationKey: "shop/-40/users"}, responses[1].EndedBy)
+	assert.Equal(t, &apitypes.ProgressOperationRef{}, responses[2].EndedBy)
+
+	encoded, err := json.Marshal(responses[1])
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"ended_by":{"deployment":"primary","operation_key":"shop/-40/users"}`)
+}
+
 // A row of a rollout run table by table keeps its table step in the progress
 // response and its JSON encoding, which is what folds a target's rows into one
 // member and counts the rollout in tables. A row of a member's whole change

@@ -102,7 +102,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 
 	// When check publishing is disabled for this repo, SchemaBot's check is not
 	// required either, so skipping the merge-group check is correct.
-	if !h.shouldPublishChecks(ctx, repo, "merge_group_check") {
+	if !h.shouldRunPassingAggregateChecks(ctx, repo, "merge_group_check") {
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check publishing disabled"})
 		return
 	}
@@ -160,6 +160,10 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		return
 	}
 
+	if h.isRepoListenOnly(repo) {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group checks skipped (listen-only repository)"})
+		return
+	}
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group checks posted"})
 }
 
@@ -239,8 +243,8 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return false, nil
 	}
 
-	if !h.shouldPublishChecks(ctx, repo, "merge_group_check") {
-		// shouldPublishChecks logs and records the skip.
+	if !h.shouldRunPassingAggregateChecks(ctx, repo, "merge_group_check") {
+		// shouldRunPassingAggregateChecks logs and records the skip.
 		return false, nil
 	}
 
@@ -265,6 +269,11 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return true, fmt.Errorf("post durable merge_group checks for %s@%s: %w", repo, headSHA, err)
 	}
 
+	if h.isRepoListenOnly(repo) {
+		h.logger.Info("durable merge_group delivery completed without posting checks because the repository is listen-only",
+			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
+		return false, nil
+	}
 	h.logger.Info("durable merge_group checks posted",
 		"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
 	return false, nil
@@ -295,6 +304,7 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			targets = append(targets, aggregateCheckTarget{name: aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), env), environment: env})
 		}
 	}
+	listenOnly := h.isRepoListenOnly(repo)
 	for _, target := range targets {
 		opts := ghclient.CheckRunOptions{
 			Name:       target.name,
@@ -315,6 +325,15 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			h.logger.Warn("could not look up existing check; creating a new one",
 				"repo", repo, "head_sha", headSHA, "check_name", target.name,
 				"operation", content.operation, "error", findErr)
+		}
+		// The coverage and lookup reads above run as for any repository, so a
+		// listen-only repository still shows what this path costs; only the
+		// write is skipped.
+		if listenOnly {
+			h.logger.Info("skipping passing aggregate Check Run on listen-only repository",
+				"repo", repo, "head_sha", headSHA, "check_name", target.name,
+				"environment", target.environment, "operation", content.operation)
+			continue
 		}
 		action := "created"
 		switch {

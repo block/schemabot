@@ -1,7 +1,6 @@
 package github
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -29,7 +28,8 @@ const gitSymlinkModeDecimal = 0o120000
 
 // symlinkModeGraphQLBatch is how many directories one GraphQL query lists.
 // A query lists each directory's entries once, so the batch bounds the
-// response size rather than the request budget.
+// response size. Paths in more directories than one batch holds are read
+// from the recursive tree instead, so the request count stays constant.
 const symlinkModeGraphQLBatch = 100
 
 // ChangeRange identifies a change whose files' modes are read. Base is the
@@ -69,18 +69,28 @@ type SymlinkMode struct {
 // (new file mode, deleted file mode, old mode / new mode, or the mode on the
 // index line). One request covers every changed file however deep it sits.
 // The diff omits a mode only for a pure rename, and GitHub refuses a diff
-// larger than its limits; those paths are read from their parent directories
-// in batched GraphQL queries instead, which spend GitHub's GraphQL budget
-// rather than the REST budget webhook deliveries depend on. The tree is never
-// walked level by level.
+// larger than its limits (or too slow to build). The paths it leaves unknown
+// are read on each side with at most one request, however many there are:
+//
+//   - Paths in at most symlinkModeGraphQLBatch distinct directories are read
+//     from those directories in one GraphQL query.
+//   - More are read from one recursive listing of the whole tree.
+//   - When GitHub truncates that listing, the paths it still names keep the
+//     modes it gives. The paths it leaves out are read with batched GraphQL
+//     queries only if scopedToSchemaDirs says the caller probed only paths
+//     inside the configured schema directories, so the queries grow with the
+//     schema directories the PR touches rather than with the rest of the PR.
+//     Otherwise they are not read: they are reported as not symlinks, with a
+//     warning and a count in schemabot.github.symlink_modes_unread_total.
+//
+// The tree is never walked level by level, and a request GitHub fails is an
+// error, never "not a symlink".
 //
 // Callers probe only the change's schema inputs: paths in or beside a schema
-// directory, and paths that could be a symlink into one. The diff costs one
-// request however many paths are probed, but the GraphQL fallback costs one
-// query per batch of distinct parent directories, so probing every changed
-// file would let a PR's request count grow with its non-schema files, which
-// AV-15 forbids.
-func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, change ChangeRange, probes []SymlinkProbe) (map[string]SymlinkMode, error) {
+// directory, and paths that could be a symlink into one. Either way the read
+// costs a bounded number of requests per side, so a PR's request count never
+// grows with its non-schema files (AV-15).
+func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, change ChangeRange, probes []SymlinkProbe, scopedToSchemaDirs bool) (map[string]SymlinkMode, error) {
 	modes := make(map[string]SymlinkMode, len(probes))
 	if len(probes) == 0 {
 		return modes, nil
@@ -114,7 +124,7 @@ func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, cha
 	}
 
 	if len(unknownAtHead) > 0 {
-		symlinks, err := ic.graphQLSymlinks(ctx, repo, change.Head, unknownAtHead)
+		symlinks, err := ic.symlinksAtRef(ctx, repo, change, change.Head, unknownAtHead, scopedToSchemaDirs)
 		if err != nil {
 			return nil, fmt.Errorf("read the modes of %d changed paths at head %s in %s: %w", len(unknownAtHead), change.Head, repo, err)
 		}
@@ -125,7 +135,7 @@ func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, cha
 		}
 	}
 	if len(unknownAtBase) > 0 {
-		symlinks, err := ic.graphQLSymlinks(ctx, repo, change.Base, unknownAtBase)
+		symlinks, err := ic.symlinksAtRef(ctx, repo, change, change.Base, unknownAtBase, scopedToSchemaDirs)
 		if err != nil {
 			return nil, fmt.Errorf("read the modes of %d changed paths at base %s in %s: %w", len(unknownAtBase), change.Base, repo, err)
 		}
@@ -136,6 +146,82 @@ func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, cha
 		}
 	}
 	return modes, nil
+}
+
+// symlinksAtRef reports which of paths, whose modes the diff did not give,
+// are symlinks at ref (see SymlinkModes for how the read is chosen).
+func (ic *InstallationClient) symlinksAtRef(ctx context.Context, repo string, change ChangeRange, ref string, paths []string, scopedToSchemaDirs bool) (map[string]bool, error) {
+	dirs := parentDirs(paths)
+	if len(dirs) <= symlinkModeGraphQLBatch {
+		return ic.graphQLSymlinks(ctx, repo, ref, paths)
+	}
+
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
+	if err != nil {
+		return nil, fmt.Errorf("list the tree at %s to read the modes of %d paths in %d directories: %w", ref, len(paths), len(dirs), err)
+	}
+	listedSymlink := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		listedSymlink[entry.Path] = entry.Mode == gitSymlinkModeOctal
+	}
+	symlinks := make(map[string]bool, len(paths))
+	var unlisted []string
+	for _, p := range paths {
+		symlink, listed := listedSymlink[path.Clean(p)]
+		symlinks[p] = symlink
+		if !listed {
+			unlisted = append(unlisted, p)
+		}
+	}
+	if !truncated {
+		// A whole listing names every path at ref, so a path it leaves out is
+		// absent there, and an absent path is not a symlink.
+		return symlinks, nil
+	}
+
+	// A truncated listing still gives the mode of every path it names. Only
+	// the paths it leaves out are unknown: each is either absent at ref or was
+	// cut from the listing.
+	if len(unlisted) == 0 {
+		ic.logger.Debug("GitHub truncated the tree listing but it names every changed path whose mode was unknown, so no further read is needed",
+			"repo", repo, "pr", change.PR, "ref", ref, "paths", len(paths))
+		return symlinks, nil
+	}
+	unlistedDirs := parentDirs(unlisted)
+
+	if scopedToSchemaDirs {
+		ic.logger.Info("GitHub truncated the tree listing, so the modes of the changed paths inside the configured schema directories that it left out are read from their directories with GraphQL",
+			"repo", repo, "pr", change.PR, "ref", ref, "paths", len(unlisted), "directories", len(unlistedDirs))
+		read, err := ic.graphQLSymlinks(ctx, repo, ref, unlisted)
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(symlinks, read)
+		return symlinks, nil
+	}
+
+	// Without configured schema directories bounding the paths, reading them
+	// directory by directory would cost requests in proportion to the PR's
+	// other files, so they are left unread and reported as not symlinks.
+	ic.logger.Warn("GitHub truncated the tree listing and no configured schema directories bound the changed paths, so the paths it left out are treated as not symlinks: a symlink among them that names a schema root or namespace is not planned; set allowed_dirs on every database the repository serves so only paths inside them are read",
+		"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "ref", ref, "paths", len(unlisted), "directories", len(unlistedDirs))
+	metrics.RecordSymlinkModesUnread(ctx, repo, len(unlisted))
+	return symlinks, nil
+}
+
+// parentDirs returns the distinct parent directories of paths, in first-seen
+// order.
+func parentDirs(paths []string) []string {
+	var dirs []string
+	seen := map[string]bool{}
+	for _, p := range paths {
+		dir := path.Dir(p)
+		if !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
 }
 
 // diffModes holds, per path, whether the change's diff shows it as a symlink
@@ -151,32 +237,33 @@ type diffModes struct {
 // parses its file modes. The diff is read as a comparison of the two commits
 // rather than as the PR's diff, so a push to the PR while it is read cannot
 // move the result away from the commits the GraphQL fallback reads. A diff
-// GitHub refuses as too large yields no modes, so every probe falls back to
+// GitHub will not produce yields no modes, so every probe falls back to
 // GraphQL.
 func (ic *InstallationClient) fetchChangeDiffModes(ctx context.Context, repo string, change ChangeRange) (diffModes, error) {
 	owner, repoName := splitRepo(repo)
 	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationFetchDiff, repo)
 	diff, _, err := ic.client.Repositories.CompareCommitsRaw(ctx, owner, repoName, change.Base, change.Head, gh.RawOptions{Type: gh.Diff})
-	if isDiffTooLarge(err) {
-		ic.logger.Info("GitHub refused the change's diff as too large, so changed file modes are read from their directories with GraphQL",
-			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head)
+	if isDiffUnavailable(err) {
+		ic.logger.Info("GitHub did not produce the change's diff, so changed file modes are read from their directories with GraphQL",
+			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "error", err)
 		return diffModes{}, nil
 	}
 	if err != nil {
 		return diffModes{}, fmt.Errorf("read the diff of %s (pr %d, %s...%s) for changed file modes: %w", repo, change.PR, change.Base, change.Head, err)
 	}
-	modes, err := parseDiffModes(diff)
-	if err != nil {
-		return diffModes{}, fmt.Errorf("parse the diff of %s (pr %d, %s...%s) for changed file modes: %w", repo, change.PR, change.Base, change.Head, err)
-	}
-	return modes, nil
+	return parseDiffModes(diff), nil
 }
 
-// isDiffTooLarge reports whether GitHub refused a diff for exceeding its size
-// limits (files, lines, or bytes), which it answers with 406.
-func isDiffTooLarge(err error) bool {
+// isDiffUnavailable reports whether GitHub declined to produce a diff: it
+// answers one that exceeds its size limits (files, lines, or bytes) with 406,
+// and one that takes too long to generate with 422. Neither says anything
+// about the commits themselves, so the modes are read another way.
+func isDiffUnavailable(err error) bool {
 	var errResp *gh.ErrorResponse
-	return errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusNotAcceptable
+	if !errors.As(err, &errResp) || errResp.Response == nil {
+		return false
+	}
+	return errResp.Response.StatusCode == http.StatusNotAcceptable || errResp.Response.StatusCode == http.StatusUnprocessableEntity
 }
 
 // parseDiffModes reads each file block's extended headers in a git diff and
@@ -194,20 +281,19 @@ func isDiffTooLarge(err error) bool {
 // path, so a path's mode on a side is the one its headers state explicitly,
 // and a block's inferred absence never overrides it.
 //
-// A diff the scanner cannot read to the end is an error: the files after the
-// unreadable line would otherwise lose their modes without a trace.
-func parseDiffModes(diff string) (diffModes, error) {
+// The diff is read line by line whatever the lines hold, so a file whose
+// content is one very long line, such as a minified bundle, does not cut the
+// files after it off from their modes.
+func parseDiffModes(diff string) diffModes {
 	modes := diffModes{base: map[string]bool{}, head: map[string]bool{}}
 	var block diffBlock
 	flush := func() {
 		block.record(modes)
 		block = diffBlock{}
 	}
-	scanner := bufio.NewScanner(strings.NewReader(diff))
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	inHeader := false
-	for scanner.Scan() {
-		line := scanner.Text()
+	for line := range strings.Lines(diff) {
+		line = strings.TrimRight(line, "\r\n")
 		if rest, ok := strings.CutPrefix(line, "diff --git "); ok {
 			flush()
 			block.basePath, block.headPath = parseDiffGitPaths(rest)
@@ -238,11 +324,8 @@ func parseDiffModes(diff string) (diffModes, error) {
 			block.headPath = unquoteDiffPath(line[strings.Index(line, "to ")+len("to "):])
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return diffModes{}, fmt.Errorf("scan diff for file modes: %w", err)
-	}
 	flush()
-	return modes, nil
+	return modes
 }
 
 // diffBlock accumulates one file's extended diff headers.
@@ -327,16 +410,7 @@ func unquoteDiffPath(s string) string {
 // their parent directories, up to symlinkModeGraphQLBatch directories per
 // query. A path absent at ref is not a symlink.
 func (ic *InstallationClient) graphQLSymlinks(ctx context.Context, repo, ref string, paths []string) (map[string]bool, error) {
-	var dirs []string
-	seen := map[string]bool{}
-	for _, p := range paths {
-		dir := path.Dir(p)
-		if !seen[dir] {
-			seen[dir] = true
-			dirs = append(dirs, dir)
-		}
-	}
-
+	dirs := parentDirs(paths)
 	symlinkEntries := map[string]bool{}
 	for start := 0; start < len(dirs); start += symlinkModeGraphQLBatch {
 		batch := dirs[start:min(start+symlinkModeGraphQLBatch, len(dirs))]

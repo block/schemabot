@@ -5,9 +5,10 @@
 // emphasis) is markup around the glyph and stays with the surface.
 //
 // Most of the vocabulary is severity: how urgently an operator should react
-// to the line beside the glyph. Docs is the one member that is not — it marks
-// a pointer to documentation and carries no urgency — and it lives here so
-// both surfaces render the same glyph and the rules below cover it.
+// to the line beside the glyph. Docs and Tip are the members that are not —
+// one marks a pointer to documentation, the other advice nothing blocks on,
+// and neither carries urgency — and they live here so both surfaces render
+// the same glyph and the rules below cover them.
 //
 // Two rules keep the vocabulary unambiguous at the sites that could blur it:
 //
@@ -61,4 +62,10 @@ const (
 	// question the surface beside it raises. It is not a severity: the line
 	// it introduces asks nothing of the operator beyond reading.
 	Docs = "📖"
+
+	// Tip marks advice that nothing blocks on: an advisory lint finding, or
+	// how to make the change beside it safe, such as what to deploy before a
+	// destructive drop. It is not a severity: following the advice is the
+	// operator's call, and a finding it accompanies carries its own.
+	Tip = "💡"
 )

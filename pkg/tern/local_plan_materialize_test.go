@@ -103,13 +103,14 @@ func TestPlanForApplyRequest_LocalPlanWins(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return existing, nil }}
 	c := newPlanMaterializeClient(store)
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, replanned, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:     "plan_local",
 		DdlChanges: []*ternv1.TableChange{{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}},
 	})
 
 	require.NoError(t, err)
 	assert.Same(t, existing, got)
+	assert.False(t, replanned, "a stored plan row is returned without checking the dispatch against live schema")
 	assert.Nil(t, store.created, "must not materialize when a local plan exists")
 }
 
@@ -122,7 +123,7 @@ func TestPlanForApplyRequest_MaterializesFromRequest(t *testing.T) {
 	}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, replanned, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:      "plan_remote",
 		Environment: "staging",
 		Target:      "testapp-us",
@@ -136,6 +137,7 @@ func TestPlanForApplyRequest_MaterializesFromRequest(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
+	assert.True(t, replanned, "materializing checks the dispatch against live schema")
 	assert.Equal(t, int64(42), got.ID)
 	assert.Equal(t, "plan_remote", got.PlanIdentifier)
 	assert.Equal(t, "testapp", got.Database)
@@ -158,7 +160,7 @@ func TestPlanForApplyRequest_NoPayloadResolvesNil(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClient(store)
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{PlanId: "plan_missing"})
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{PlanId: "plan_missing"})
 
 	require.NoError(t, err)
 	assert.Nil(t, got)
@@ -182,7 +184,7 @@ func TestPlanForApplyRequest_DuplicateCreateReloads(t *testing.T) {
 	}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:     "plan_race",
 		DdlChanges: []*ternv1.TableChange{{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"}},
 	})
@@ -321,7 +323,7 @@ func TestMaterializedPlanCarriesLocalReplannedStatement(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 31}
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 
-	got, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_local_statement"))
+	got, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_local_statement"))
 
 	require.NoError(t, err)
 	require.NotNil(t, store.created)
@@ -356,7 +358,7 @@ func TestMaterializedPostgresPlanNamesThisDeploymentsSchema(t *testing.T) {
 	c.config.SchemaOverrides = map[string]string{"svc": "svc-database-us-qa"}
 	c.storage = &fakePlanStorage{plans: store}
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:      "plan_pg_schema",
 		Environment: "qa",
 		DdlChanges: []*ternv1.TableChange{
@@ -393,7 +395,7 @@ func TestMaterializedPlanKeepsDispatchedTextForBlockedChange(t *testing.T) {
 	req.DdlChanges[0].ExecutionMode = engine.ExecutionModeBlocked
 	req.DdlChanges[0].ModeReason = "the primary's engine refuses this statement"
 
-	_, err := c.planForApplyRequest(t.Context(), req)
+	_, _, err := c.planForApplyRequest(t.Context(), req)
 
 	require.NoError(t, err)
 	change := store.created.Namespaces["testapp"].Tables[0]
@@ -415,7 +417,7 @@ func TestShardScopedDispatchScopeCarriesLocalReplannedStatement(t *testing.T) {
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 	req := alterUsersEmailDispatch("plan_shard_local_statement", "-80")
 
-	plan, err := c.planForApplyRequest(t.Context(), req)
+	plan, _, err := c.planForApplyRequest(t.Context(), req)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	assert.Equal(t, local, plan.Namespaces["testapp"].Tables[0].DDL)
@@ -471,7 +473,7 @@ func TestWholeDeploymentDispatchScopeIsThePlanRow(t *testing.T) {
 	c := newPlanMaterializeClientWithPlan(store, recomputed)
 	req := alterUsersEmailDispatch("plan_whole_local_statement")
 
-	plan, err := c.planForApplyRequest(t.Context(), req)
+	plan, _, err := c.planForApplyRequest(t.Context(), req)
 	require.NoError(t, err)
 
 	scope, err := c.dispatchScopeForApply(plan, req)

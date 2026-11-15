@@ -345,7 +345,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 		assert.Contains(t, body, "Rollback Plan")
 		assert.Contains(t, body, "1 unsafe change detected")
 		assert.Contains(t, body, "`idx_name`")
-		assert.Contains(t, body, "To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `users`")
+		assert.Contains(t, body, "To confirm this rollback:\n1. Make the dropped index invisible, then verify application queries no longer rely on it for safe performance.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for rollback plan comment")
 	}
@@ -367,7 +367,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	assert.Contains(t, refusal, "**⛔ Rollback rejected**: 1 unsafe change detected")
 	assert.Contains(t, refusal, "`idx_name`")
 	assert.Contains(t, refusal, "DROP INDEX")
-	assert.Contains(t, refusal, "```\nschemabot rollback-confirm -e staging\n```")
+	assertPasteableCommand(t, refusal, "schemabot rollback-confirm -e staging")
 	applies, err := svc.Storage().Applies().GetByDatabase(ctx, dbName, "mysql", "staging")
 	require.NoError(t, err)
 	for _, a := range applies {

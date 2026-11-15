@@ -30,7 +30,7 @@ func Register(m localruntime.Manager, r Registration) (bool, error) {
 	if _, err := registrationConfig(nil, r); err != nil {
 		return false, err
 	}
-	resolved, err := r.Connection.ResolveDSN()
+	resolved, err := r.Connection.ResolveDSN(r.Engine)
 	if err != nil {
 		return false, fmt.Errorf("resolve new database connection")
 	}

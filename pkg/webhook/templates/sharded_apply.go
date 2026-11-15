@@ -150,6 +150,11 @@ type ShardStatus struct {
 	Label string
 	State string
 	Error string
+	// StoppedAtCutover is true for a shard SchemaBot stopped at the cutover
+	// because EndedBy, another shard, failed. Its State reads failed, but the
+	// failure it names is EndedBy's.
+	StoppedAtCutover bool
+	EndedBy          string
 }
 
 // ShardCell is one (shard, table) operation: the statements that table runs
@@ -204,6 +209,7 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
+	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeFinalizeStatus(&sb, data.Finalizes)
@@ -240,6 +246,7 @@ func renderShardedApplySummaryComment(data ShardedApplyData, formatter *shardedD
 	}
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
+	writeShardsStoppedAtCutover(&sb, data)
 	writeShardKeyspaceSections(&sb, data, formatter, budget)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeFinalizeStatus(&sb, data.Finalizes)
@@ -755,7 +762,7 @@ func shardedTableStatusPhrase(status string) string {
 	case state.Task.Reverted:
 		return "↩️ Reverted"
 	case state.Task.WaitingForDeploy:
-		return "🟡 Waiting for deploy"
+		return ui.WaitingForDeploy
 	default:
 		return "🔄 In progress"
 	}
@@ -859,7 +866,7 @@ func isShardFailureState(opState string) bool {
 // failure to explain.
 func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 	for _, s := range allShardStatuses(data.Keyspaces) {
-		if !isShardFailureState(s.State) {
+		if !isShardFailureState(s.State) || s.StoppedAtCutover {
 			continue
 		}
 		severity := failureSeverity(s.State == state.ApplyOperation.FailedRetryable)
@@ -876,6 +883,21 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
+	}
+}
+
+// writeShardsStoppedAtCutover explains, under the first failure, the shards
+// SchemaBot stopped at the cutover because that failure meant the cutover
+// could never run, and that applying again resumes their saved copies.
+func writeShardsStoppedAtCutover(sb *strings.Builder, data ShardedApplyData) {
+	var stopped presentation.StoppedAtCutover
+	for _, s := range allShardStatuses(data.Keyspaces) {
+		if s.StoppedAtCutover {
+			stopped.Add(s.EndedBy)
+		}
+	}
+	if note := stopped.Note(presentation.ShardNoun, summaryCode); note != "" {
+		fmt.Fprintf(sb, "\n> ⏹️ %s\n", note)
 	}
 }
 

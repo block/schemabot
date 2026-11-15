@@ -64,8 +64,8 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		// that lands is never reported stopped twice over. With no runner
 		// alive the wait returns at once; a runner that will not come down
 		// bounds this stop at its caller's context, and the caller retries.
-		if err := waitForRunExit(ctx, rm); err != nil {
-			return nil, fmt.Errorf("stop on database %s tables %v: the stopped runner has not returned after %w", database, tables, err)
+		if err := waitForInterruptedRunner(ctx, rm, logger, "stop", database, tables); err != nil {
+			return nil, err
 		}
 		if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
 			return nil, err
@@ -118,8 +118,9 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		"tables", tables,
 	)
 
-	// Wait for the goroutine to complete
-	rm.wg.Wait()
+	if err := waitForInterruptedRunner(ctx, rm, logger, "stop", database, tables); err != nil {
+		return nil, err
+	}
 	if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
 		return nil, err
 	}
@@ -133,6 +134,39 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		Accepted: true,
 		Message:  "Stopped - checkpoint saved for resume",
 	}, nil
+}
+
+// waitForInterruptedRunner waits for the runner a stop or cancel has just
+// interrupted to return, bounded by ctx. A runner that will not come down ends
+// the wait at the caller's context with a retryable error, not a permanent one:
+// the schema change stays tracked as stopped or cancelled with its runner still
+// alive, no artifacts are released, and the same operation can be sent again
+// once the runner has returned. Until then the engine starts no other run on
+// the target: Start refuses to resume the change, and Apply drains the tracked
+// change before it installs a new one.
+func waitForInterruptedRunner(ctx context.Context, rm *runningSchemaChange, logger *slog.Logger, operation, database string, tables []string) error {
+	err := waitForRunExit(ctx, rm)
+	if err == nil {
+		return nil
+	}
+	if rm.active.Load() == 0 {
+		// A context that had already ended can end the wait before it has
+		// observed anything, so the wait ending says nothing about a runner
+		// by itself. With no run goroutine executing there is no runner left
+		// to wait out, and the stop or cancel goes on as it would have.
+		logger.Debug(operation+" wait ended at the caller's context with no runner alive; nothing to wait out",
+			"database", database,
+			"tables", tables,
+			"reason", err,
+		)
+		return nil
+	}
+	logger.Warn(operation+" wait ended before the runner returned; the schema change stays tracked and the "+operation+" can be sent again",
+		"database", database,
+		"tables", tables,
+		"error", err,
+	)
+	return fmt.Errorf("%s on database %s tables %v: the runner has not returned after %w; send the %s again once it has", operation, database, tables, err, operation)
 }
 
 // settleAfterRunnerExit reads the change's state once its runner has returned
@@ -273,7 +307,9 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		"database", database,
 		"tables", tables,
 	)
-	rm.wg.Wait()
+	if err := waitForInterruptedRunner(ctx, rm, logger, "cancel", database, tables); err != nil {
+		return nil, err
+	}
 	if err := settleAfterRunnerExit(e, rm, logger, "cancel", database, tables); err != nil {
 		return nil, err
 	}
@@ -360,6 +396,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	combinedStatement := rm.combinedStatement
 	deferCutover := rm.deferCutover
 	directExecPolicy := rm.directPolicy
+	runnerAlive := rm.active.Load() != 0
 	e.mu.Unlock()
 
 	if state == engine.StateRunning {
@@ -371,6 +408,19 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 
 	if state != engine.StateStopped {
 		return nil, fmt.Errorf("cannot resume schema change in state %s", state)
+	}
+
+	if runnerAlive {
+		// Stopped is provisional while the runner the stop interrupted is
+		// still returning, as after a stop whose wait ended at its caller's
+		// context. A resume now would run beside that runner on the same
+		// tables, so the start is refused with a retryable error and succeeds
+		// once the runner has returned.
+		e.schemaChangeLogger(rm).Warn("start refused: the stopped runner has not returned; the schema change stays stopped and the start can be sent again",
+			"database", database,
+			"tables", tables,
+		)
+		return nil, fmt.Errorf("start on database %s tables %v: the stopped runner has not returned; send the start again once it has", database, tables)
 	}
 
 	// Verify we have credentials for resume

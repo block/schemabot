@@ -95,6 +95,8 @@ var reasons = map[int]string{
 	1050: "The table already exists on the target.",
 	1146: "The table does not exist on the target.",
 	1091: "The column, index, or constraint does not exist on the target.",
+	1142: "The target's user lacks a privilege this change needs. Grant it, then apply the change again.",
+	1235: "The target's MySQL version does not support this change. Rewrite the statement, then apply it again.",
 	1205: "The change timed out waiting for a lock on the target. Retrying when the table is quieter usually clears it.",
 	1213: "The target rolled the change back after a deadlock. Retrying usually clears it.",
 

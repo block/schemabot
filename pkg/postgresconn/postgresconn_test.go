@@ -176,6 +176,30 @@ func TestConnectionConfigExplicitSSLRootCertWins(t *testing.T) {
 	assert.False(t, cfg.TLSConfig.RootCAs.Equal(rds))
 }
 
+// PGSSLROOTCERT in the process environment is the operator's chosen trust
+// root, the same as an sslrootcert in the DSN: a verify-full RDS DSN without
+// one verifies against the named file, not the embedded RDS bundle.
+func TestConnectionConfigEnvironmentSSLRootCertWins(t *testing.T) {
+	caPath := writeSelfSignedCA(t)
+	t.Setenv("PGSSLROOTCERT", caPath)
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.False(t, cfg.TLSConfig.InsecureSkipVerify)
+	require.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	pemBytes, err := os.ReadFile(caPath)
+	require.NoError(t, err)
+	fromFile := x509.NewCertPool()
+	require.True(t, fromFile.AppendCertsFromPEM(pemBytes))
+	assert.True(t, cfg.TLSConfig.RootCAs.Equal(fromFile))
+
+	rds, err := rdsRootPool()
+	require.NoError(t, err)
+	assert.False(t, cfg.TLSConfig.RootCAs.Equal(rds))
+}
+
 // writeSelfSignedCA generates a self-signed CA certificate, writes it in PEM
 // form to a temp file, and returns the file path.
 func writeSelfSignedCA(t *testing.T) string {

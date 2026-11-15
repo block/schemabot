@@ -154,4 +154,8 @@ independent fences make this safe:
 3. **Heartbeat retry tolerance.** The operator-level heartbeat distinguishes
    "heartbeat failed" (storage unreachable — logged, retried next tick, drive
    continues) from "lease lost" (token mismatch — self-fence). Transient
-   storage errors do not stop a healthy drive.
+   storage errors do not stop a healthy drive. A heartbeat write that hangs
+   instead of failing, as on a half-open connection, is cut off at its own
+   deadline and counted as a failed heartbeat, so a drive that cannot reach
+   storage for the whole staleness window still stops before a peer can
+   reclaim its work.

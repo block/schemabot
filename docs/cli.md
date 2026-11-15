@@ -631,9 +631,11 @@ ESC detach • s stop
 
 The live view refreshes until completion or a state that needs your decision.
 It includes rows copied, ETA when available, and the reason for throttling.
-Press **Esc** to detach while copying; the apply keeps running. **s** requests
-a stop for this MySQL example. At deferred cutover, **Enter** requests the
-swap. During cutover, the watcher asks you to wait and disables Esc/stop.
+Press **Esc** to detach while copying; the apply keeps running and the
+command exits 130, the status that tells a script the watch ended without an
+outcome. **s** requests a stop for this MySQL example. At deferred cutover,
+**Enter** requests the swap. During cutover, the watcher asks you to wait and
+disables Esc/stop.
 
 For progress bar colors, phase labels, and keyboard controls, see the
 [progress display reference](#progress-display-reference).
@@ -908,10 +910,55 @@ The default is the newest 50 entries, printed oldest first. `-n` changes that
 window; `-f` follows new entries. Follow mode is text output and cannot be
 combined with `--json`.
 
+The first read is not retried: if it fails, the command fails at once. After
+that, following stops with a non-zero exit when the server gives an answer a
+retry cannot change, such as `apply not found` or a refused token. A server it
+cannot reach is retried with backoff, the same way the watchers retry, and
+following stops with a non-zero exit once polls have kept failing for a few
+minutes in a row. Run the same `logs` command again to keep following: it
+prints the newest entries again and does not resume from the last line shown.
+Ctrl-C ends following normally.
+
+With `--deployment`, a source whose logs could not be read is reported as a
+warning while the other sources keep printing. That warning does not end
+following, even when every poll fails the same way.
+
 In local mode, omit `--deployment`: the stored log includes engine activity.
 In gRPC mode, add it with a deployment name from the apply's progress to read
 remote engine details such as copying, throttling, or cutover. It requires an
 explicit apply ID. See [deployment log examples](schema-intelligence.md#read-deployment-logs).
+
+A multi-target apply logs every target into one history. `--target` narrows
+either read to one target: its own entries plus the entries about the apply as
+a whole, such as state changes.
+
+```console
+$ schemabot logs apply-example-73 --target shop-002
+11:47:07 [INF] Apply queued: apply-example-73
+11:48:12 [INF] [orders] acquired advisory lock
+11:52:40 [INF] [orders] Table complete
+...
+```
+
+A target the apply never ran on is refused, and the error lists the targets it
+did run on.
+
+`--shard` narrows a sharded apply's read to one shard, such as `-80`. Shard
+names repeat across targets, so add `--target` to read one target's shard. A
+shard name that starts with `-` has to be joined to the flag with `=`, since
+`--shard -80` reads `-80` as a flag of its own:
+
+```console
+$ schemabot logs apply-example-73 --target shop-002 --shard=-80 --follow
+Following logs for apply-example-73, target shop-002, shard -80... (Ctrl+C to stop)
+```
+
+A shard the apply never ran on is refused, and the error lists the shards it did
+run on. An apply not divided by shard, such as an unsharded target's, is refused
+too; read it without `--shard`. A shard read keeps the entries about the apply
+as a whole, but not those of a namespace's group finalizer, the step that runs
+once the namespace's DDL has landed on every shard. They belong to no one
+shard, so read them with `--target` alone or with no scope.
 
 ### Explain a blocked check
 
@@ -1040,6 +1087,27 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
+are. Each says on stderr that it was canceled and exits 130, the status a
+shell reports for an interrupted process, so a script can tell an interrupted
+run from one that failed or left findings. Exit 130 is the only mark of a
+report that was cut short; the JSON output has no field for it.
+
+What an interrupted run reports depends on where it stopped:
+
+- `checks backfill` interrupted during its scan, with or without `--dry-run`,
+  prints no report. What the scan had found so far is discarded.
+- `checks backfill` interrupted while recreating checks prints its report with
+  the outcomes it received. A PR with no outcome was either not reached or was
+  in the batch the interrupt cut off.
+- `webhooks redrive` prints the redelivery counts from the chunks that
+  completed, and prints none under `--dry-run`.
+
+Treat those outcomes and counts as a lower bound: the server may have finished
+part of the request that was in flight. Checks already recreated and
+deliveries already redelivered are not undone. Run `checks backfill` again to
+finish the sweep; it only acts on PRs whose Check Runs are still missing.
+
 An `--all-repos` sweep skips a declared repository the server's GitHub App is
 not installed on, names it, and keeps scanning the rest. The skip still makes
 the run exit nonzero, because that repository was never read. Any other scan
@@ -1159,7 +1227,7 @@ specific state. The bar is 20 squares wide; filled squares represent percent com
 
 **Waiting for cutover** — yellow bar at 100%:
 ```
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
 ```
 
@@ -1276,8 +1344,10 @@ reaches a final state. It exits 0 only when the apply completed, and non-zero
 when it was stopped, failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. For a stopped apply the error
 names the `start` command that resumes it. The interactive watcher follows
-the same exit rule once the apply ends, and exits 0 when you detach with Esc
-while the apply is still running. A watcher that cannot reach the server
+the same exit rule once the apply ends, and exits 130, the status a Ctrl-C
+ends a log watch with, when you leave it while the apply is still running:
+with Esc, q, or Ctrl-C, with a SIGINT or SIGTERM sent to the process, or
+before its first poll has answered. A watcher that cannot reach the server
 retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
@@ -1287,7 +1357,10 @@ pasting it reaches the same server. When a refused poll
 carries a `Retry-After` header, as a proxy or rate limiter in front of
 SchemaBot may send, a watcher waits at least that long before polling again,
 up to 5 minutes per poll, so a watcher held off this way takes longer to give
-up.
+up. When the header asked for more than that, the retry line says so, for
+example `retrying in 5m0s (server asked for 1h0m0s, capped)`, and the `-o log`
+retry line carries the asked-for delay as `retry_capped_from`; a delay past a
+day is given only as `more than 24h`.
 
 A single Ctrl-C or SIGTERM ends only the watch. The command prints a notice to
 stderr saying the apply continues and how to watch it again with `progress`,
@@ -1296,6 +1369,20 @@ script can tell an interrupted watch from an apply that failed. The apply
 itself runs on unaffected. A Ctrl-C that lands before the apply or rollback
 has been submitted ends the command before anything is started, with a notice
 saying so, and the same exit status.
+
+A Ctrl-C or SIGTERM during the convergence of `storage apply`, during the `init`
+wizard, during the connection checks `init` runs before it registers its
+runtime, or after it has registered it also exits 130, with a notice on stderr
+instead of an error. So does the cancel key of an `init` screen: a terminal
+hands Ctrl-C to those screens as a key, the same as Esc. The notice says what
+the stop left behind and what to run next. A direct convergence cancels the
+statement in flight, while one running on a server carries on there (see
+[storage schema](storage-schema.md)); after either, the notice names the
+command that shows what is left. The wizard has changed nothing, and a stop
+during the connection checks leaves no runtime registered. A registered runtime
+is kept, so running `init` again with the same flags finishes it. Any other
+failure of either command, including a timeout or a setup display that fails,
+still exits 1 with its error.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

@@ -718,7 +718,7 @@ func malformedTokenError(key, ref, resolved, requirement string) error {
 
 func (s *Service) newLocalTernClient(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
 	// Resolve target DSN (handles env:, file: prefixes and structured DSN sources)
-	targetDSN, err := envConfig.ResolveDSN()
+	targetDSN, err := envConfig.ResolveDSN(dbType)
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
 	}

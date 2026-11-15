@@ -62,12 +62,12 @@ func TestShardTaskInsertStatement(t *testing.T) {
 	}
 }
 
-// The leased log append selects its row from the leased applies row: the nine
+// The leased log append selects its row from the leased applies row: the ten
 // inserted columns bind first, then the apply ID and the token, and the token
 // check locks the applies row on both dialects.
 func TestApplyLogLeasedAppendStatement(t *testing.T) {
-	const insert = "INSERT INTO apply_logs (apply_id, task_id, level, event_type, source, message, old_state, new_state, metadata) " +
-		"SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND "
+	const insert = "INSERT INTO apply_logs (apply_id, task_id, apply_operation_id, level, event_type, source, message, old_state, new_state, metadata) " +
+		"SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND "
 
 	assert.Equal(t, insert+mysqlApplySourceFence, applyLogLeasedAppendStatement(MySQLDialect{}))
 	assert.Equal(t, insert+postgresApplySourceFence, applyLogLeasedAppendStatement(PostgresDialect{}))

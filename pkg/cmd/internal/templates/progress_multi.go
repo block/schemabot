@@ -27,6 +27,9 @@ func writeMultiDeploymentProgress(data ProgressData) {
 
 	writeMultiDeploymentHeader(data, model, groups)
 	writeMultiDeploymentFirstFailure(model.FirstFailure)
+	if note := RolloutStoppedAtCutoverNote(model, groups); note != "" {
+		fmt.Printf("\n  ⏹️ %s\n", note)
+	}
 	fmt.Println()
 
 	// A deployment that addresses several targets renders as one rollup
@@ -67,6 +70,7 @@ func ProgressOperationsForPresentation(ops []ProgressOperation, tables []TablePr
 			Finalizer:           op.OperationKind == storage.ApplyOperationKindGroupFinalizer,
 			NeverStarted:        op.StartedAt == "",
 			AlreadyConverged:    op.AlreadyConverged,
+			EndedBy:             op.EndedBy,
 			RolloutStep:         op.RolloutStep,
 			Barrier:             op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:            op.CutoverPolicy == storage.CutoverPolicyParallel,

@@ -1,6 +1,6 @@
 module github.com/block/schemabot
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/alecthomas/kong v1.16.1
@@ -174,7 +174,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.18.7 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/linkdata/deadlock v0.5.5 // indirect
@@ -274,4 +274,4 @@ require (
 )
 
 // needed for Strata and vtcombo OnlineDDL suppport
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261103173808-12cc16cbb567
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261112160743-c58a2176754c

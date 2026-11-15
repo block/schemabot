@@ -23,6 +23,13 @@ import (
 // rather than as cancelled, and the next cancel attempt waits for it again.
 const cancelSettleTimeout = 2 * time.Minute
 
+// cancelAttemptSettleTimeout bounds how long a drive that sees a cancelled
+// build waits for in-flight Cancel calls to learn whether their signal was
+// sent. By then the build has returned and released the tracker's session,
+// so a waiting call finds no build to signal at once, and a call already
+// signalling is held to the tracker's own bound on the signal's round trip.
+const cancelAttemptSettleTimeout = 30 * time.Second
+
 // Cancel ends this apply's concurrent index build and answers with the
 // outcome the drive settles on. The build backend is signalled through the
 // apply's pg-sprite tracker; when that signal cannot reach a running
@@ -72,6 +79,9 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	}
 	// The intent is visible to the drive before the signal goes out, since the
 	// build can return cancelled before CancelBuild does.
+	if tracked.cancelsInFlight == 0 {
+		tracked.cancelsSettled = make(chan struct{})
+	}
 	tracked.cancelsInFlight++
 	e.mu.Unlock()
 
@@ -147,6 +157,9 @@ func (e *Engine) settleCancelAttempt(tracked *trackedApply, mayHaveActed bool) {
 		tracked.cancelRequested = true
 	}
 	tracked.cancelsInFlight--
+	if tracked.cancelsInFlight == 0 {
+		close(tracked.cancelsSettled)
+	}
 }
 
 // cancelAttemptMayHaveActed reports whether one Cancel call may have reached
@@ -180,14 +193,58 @@ func cancelSignalNotSent(err error) bool {
 		errors.Is(err, progress.ErrCancelNotDispatched)
 }
 
-// cancelRequested reports whether a Cancel may have acted on the apply, or is
-// acting on it now, so the drive can classify the cancellation it sees as the
-// operator's.
+// cancelRequested reports whether a Cancel may have acted on the apply, so
+// the drive can classify the cancellation it sees as the operator's. Cancel
+// calls still in flight are waited for, up to cancelAttemptSettleTimeout,
+// because only they know whether their signal went out.
 func (e *Engine) cancelRequested(key string) bool {
+	return e.cancelRequestedWithin(key, cancelAttemptSettleTimeout)
+}
+
+// cancelRequestedWithin is cancelRequested with the wait for in-flight Cancel
+// calls bounded by bound. A call still in flight when the bound passes may
+// yet have signalled the build, so the cancel is then read as requested.
+func (e *Engine) cancelRequestedWithin(key string, bound time.Duration) bool {
+	e.mu.Lock()
+	tracked := e.progress[key]
+	if tracked == nil {
+		e.mu.Unlock()
+		return false
+	}
+	if tracked.cancelRequested || tracked.cancelsInFlight == 0 {
+		requested := tracked.cancelRequested
+		e.mu.Unlock()
+		return requested
+	}
+	settled, inFlight, logger := tracked.cancelsSettled, tracked.cancelsInFlight, tracked.logger
+	e.mu.Unlock()
+
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-settled:
+		return e.cancelRequestedAfterSettle(tracked)
+	case <-timer.C:
+	}
+	// The calls can settle just as the bound passes, so the drive falls back
+	// to reading the cancel as the operator's only while they are still in
+	// flight.
+	select {
+	case <-settled:
+		return e.cancelRequestedAfterSettle(tracked)
+	default:
+	}
+	logger.Warn("PostgreSQL cancel attempts did not settle before the drive classified the cancelled build; reading it as the operator's cancel",
+		"task_id", key, "cancels_in_flight", inFlight, "waited", bound)
+	return true
+}
+
+// cancelRequestedAfterSettle reads the verdict the settled Cancel calls left
+// on the apply.
+func (e *Engine) cancelRequestedAfterSettle(tracked *trackedApply) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	tracked := e.progress[key]
-	return tracked != nil && (tracked.cancelRequested || tracked.cancelsInFlight > 0)
+	return tracked.cancelRequested
 }
 
 // isCancellation reports whether an executor error is a cancelled statement in

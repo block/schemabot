@@ -76,7 +76,7 @@ type blockingExpiryApplyStore struct {
 	enterOnce sync.Once
 }
 
-func (s *blockingExpiryApplyStore) ExpireRetryable(context.Context, int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *blockingExpiryApplyStore) ExpireRetryable(context.Context, []string, int) ([]*storage.RetryableApplyExpiration, error) {
 	s.enterOnce.Do(func() { close(s.entered) })
 	<-s.release
 	return nil, nil

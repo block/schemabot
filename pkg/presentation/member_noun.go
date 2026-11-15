@@ -12,6 +12,7 @@ var (
 	ShardNoun      = Noun{Singular: "shard", Plural: "shards"}
 	TargetNoun     = Noun{Singular: "target", Plural: "targets"}
 	DeploymentNoun = Noun{Singular: "deployment", Plural: "deployments"}
+	TableNoun      = Noun{Singular: "table", Plural: "tables"}
 )
 
 // Label is the noun for count members: "target" for one, "targets" otherwise.

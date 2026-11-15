@@ -45,6 +45,7 @@ func setupSynthesizedDispatchTest(t *testing.T, dbName, headSHA string) (*Handle
 	}
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 	result.HeadSHAs = []string{headSHA}
+	registerFreshBaseComparison(t, mux, headSHA)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)

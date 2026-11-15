@@ -1126,6 +1126,9 @@ var knownRemoteApplyDedupOutcomes = map[string]bool{
 //     wants to see spike during an incident).
 //   - "conflict_race" / "create_race": a concurrent same-key dispatch was
 //     resolved to the winning apply instead of a spurious rejection or error.
+//     "create_race" covers a winner found at the create itself and one found
+//     after this dispatch's drift check failed because the winner had
+//     already run the change.
 //   - "key_collision_refused": a stored apply's environment/database/type
 //     disagreed with the request, so the dispatch was refused fail-closed
 //     (a safety event worth investigating).
@@ -1301,6 +1304,7 @@ func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deploy
 
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
+	"expire_degraded_retry_error":              true,
 	"stranded_reaper_error":                    true,
 	"stranded_task_reaper_error":               true,
 	"stranded_active_task_reaper_error":        true,
@@ -1570,30 +1574,33 @@ func RecordSchemaRequestError(ctx context.Context, repo, command, database, envi
 const (
 	gitHubMetricValueUnknown = "unknown"
 
-	GitHubOperationAddCommentReaction            = "add_comment_reaction"
-	GitHubOperationCreateCheckRun                = "create_check_run"
-	GitHubOperationCreateIssueComment            = "create_issue_comment"
-	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
-	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
-	GitHubOperationEditIssueComment              = "edit_issue_comment"
-	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
-	GitHubOperationFetchBlob                     = "fetch_blob"
-	GitHubOperationFetchDiff                     = "fetch_diff"
-	GitHubOperationFetchFileContent              = "fetch_file_content"
-	GitHubOperationFetchGitTree                  = "fetch_git_tree"
-	GitHubOperationFetchPullRequest              = "fetch_pull_request"
-	GitHubOperationGetCombinedStatus             = "get_combined_status"
-	GitHubOperationGetTeamMembership             = "get_team_membership"
-	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
-	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
-	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
-	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
-	GitHubOperationListPRFiles                   = "list_pr_files"
-	GitHubOperationListReviews                   = "list_reviews"
-	GitHubOperationListTeamMembers               = "list_team_members"
-	GitHubOperationRequestReviewers              = "request_reviewers"
-	GitHubOperationUnknown                       = gitHubMetricValueUnknown
-	GitHubOperationUpdateCheckRun                = "update_check_run"
+	GitHubOperationAddCommentReaction             = "add_comment_reaction"
+	GitHubOperationCreateCheckRun                 = "create_check_run"
+	GitHubOperationCreateIssueComment             = "create_issue_comment"
+	GitHubOperationCreateInstallationAccessToken  = "create_installation_access_token"
+	GitHubOperationDeleteIssueComment             = "delete_issue_comment"
+	GitHubOperationEditIssueComment               = "edit_issue_comment"
+	GitHubOperationFetchAppSlug                   = "fetch_app_slug"
+	GitHubOperationFetchBlob                      = "fetch_blob"
+	GitHubOperationFetchDiff                      = "fetch_diff"
+	GitHubOperationFetchFileContent               = "fetch_file_content"
+	GitHubOperationFetchGitTree                   = "fetch_git_tree"
+	GitHubOperationFetchPullRequest               = "fetch_pull_request"
+	GitHubOperationGetBranchRules                 = "get_branch_rules"
+	GitHubOperationGetCombinedStatus              = "get_combined_status"
+	GitHubOperationGetPullRequestReviewProtection = "get_pull_request_review_protection"
+	GitHubOperationGetTeam                        = "get_team"
+	GitHubOperationGetTeamMembership              = "get_team_membership"
+	GitHubOperationGraphQLMinimizeComment         = "graphql_minimize_comment"
+	GitHubOperationGraphQLStatusCheckRollup       = "graphql_status_check_rollup"
+	GitHubOperationGraphQLTreeEntries             = "graphql_tree_entries"
+	GitHubOperationListCheckRunsForRef            = "list_check_runs_for_ref"
+	GitHubOperationListPRFiles                    = "list_pr_files"
+	GitHubOperationListReviews                    = "list_reviews"
+	GitHubOperationListTeamMembers                = "list_team_members"
+	GitHubOperationRequestReviewers               = "request_reviewers"
+	GitHubOperationUnknown                        = gitHubMetricValueUnknown
+	GitHubOperationUpdateCheckRun                 = "update_check_run"
 )
 
 const (
@@ -1621,6 +1628,11 @@ const (
 	// operation is a genuine failure (a suspended App installation answers
 	// every token exchange with 404) and stays GitHubRequestStatusError.
 	GitHubRequestStatusNotFound = "not_found"
+	// GitHubRequestStatusSuppressed marks write requests SchemaBot refused to
+	// send because the target repository is configured listen-only. They never
+	// reach GitHub and spend no rate limit, so they show what a deployment
+	// would have written without being mistaken for traffic or errors.
+	GitHubRequestStatusSuppressed = "suppressed"
 	// GitHubRequestStatusTransportError marks requests that never produced an
 	// HTTP response: dials that failed, TLS errors, and requests cut off by a
 	// context deadline. These are the signature of GitHub (or the network path
@@ -1698,6 +1710,8 @@ type GitHubRateLimitSample struct {
 	Limit          int64
 	Remaining      int64
 	Used           int64
+	ObservedAt     time.Time
+	ResetAt        time.Time
 }
 
 // RecordGitHubRateLimit records the latest GitHub primary rate-limit header
@@ -1706,14 +1720,9 @@ func RecordGitHubRateLimit(ctx context.Context, sample GitHubRateLimitSample) {
 	sample.Operation = normalizeGitHubOperation(sample.Operation)
 	sample.Resource = normalizeGitHubRateLimitResource(sample.Resource)
 
-	attrs := gitHubMetricAttributes(sample.Operation, sample.Resource, sample.Repository, sample.GitHubApp, sample.InstallationID)
-
-	recordGauge(ctx, "schemabot.github.rate_limit.limit", sample.Limit,
-		"GitHub primary rate limit for the observed API resource", "{request}", attrs...)
-	recordGauge(ctx, "schemabot.github.rate_limit.remaining", sample.Remaining,
-		"GitHub primary rate limit requests remaining for the observed API resource", "{request}", attrs...)
-	recordGauge(ctx, "schemabot.github.rate_limit.used", sample.Used,
-		"GitHub primary rate limit requests used for the observed API resource", "{request}", attrs...)
+	if recorder := activeGitHubRateLimits.Load(); recorder != nil {
+		recorder.record(sample)
+	}
 }
 
 func gitHubMetricAttributes(operation, resource, repository, githubApp string, installationID int64) []attribute.KeyValue {
@@ -1783,7 +1792,10 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
 		GitHubOperationFetchPullRequest,
+		GitHubOperationGetBranchRules,
 		GitHubOperationGetCombinedStatus,
+		GitHubOperationGetPullRequestReviewProtection,
+		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
@@ -1818,6 +1830,7 @@ func isKnownGitHubRequestStatus(status string) bool {
 	case GitHubRequestStatusCancelled,
 		GitHubRequestStatusError,
 		GitHubRequestStatusNotFound,
+		GitHubRequestStatusSuppressed,
 		GitHubRequestStatusTransportError,
 		GitHubRequestStatusSuccess,
 		GitHubRequestStatusUnknown:
@@ -2302,6 +2315,21 @@ func RecordPRFileCapExceeded(ctx context.Context, repo string, schemaVisible boo
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo),
 		attribute.Bool("schema_visible", schemaVisible))
+}
+
+// RecordSymlinkModesUnread counts changed paths whose symlink mode SchemaBot
+// did not read: GitHub refused the change's diff (or gave no mode for a pure
+// rename), truncated the repository's tree listing, and no configured schema
+// directories bound which paths could be schema symlinks. Reading them
+// directory by directory would cost GitHub requests in proportion to the PR's
+// non-schema files, so they are treated as not symlinks. A nonzero rate names
+// a repository whose databases need allowed_dirs, so a symlink that changes a
+// schema is planned there.
+func RecordSymlinkModesUnread(ctx context.Context, repo string, paths int) {
+	addCounterN(ctx, int64(paths), "schemabot.github.symlink_modes_unread_total",
+		"Total number of changed paths treated as not symlinks because GitHub truncated the tree listing and no configured schema directories bound them", "{path}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
 }
 
 var knownStatusCheckOperations = map[string]bool{

@@ -33,6 +33,8 @@ type LogsCmd struct {
 	Limit       int    `short:"n" help:"Show the newest N log entries" default:"50"`
 	Follow      bool   `short:"f" help:"Print the newest N entries, then poll for new ones until interrupted"`
 	Deployment  string `help:"Read logs from the selected data-plane deployment"`
+	Target      string `help:"Show only one target's entries, plus the entries about the whole apply"`
+	Shard       string `help:"Show only one shard's entries of a sharded apply, plus the entries about the whole apply; with --target, that target's shard. Join a shard that starts with - to the flag: --shard=-80"`
 	JSON        bool   `help:"Output as JSON"`
 }
 
@@ -64,23 +66,24 @@ func (cmd *LogsCmd) Run(ctx context.Context, g *Globals) error {
 		return err
 	}
 
+	scope := client.LogScope{Target: cmd.Target, Shard: cmd.Shard}
 	switch {
 	case cmd.Follow && cmd.Deployment != "":
-		return followDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, cmd.Limit)
+		return followDeploymentLogs(ctx, ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit)
 	case cmd.Follow:
-		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Limit)
+		return followLogs(ctx, ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit)
 	case cmd.Deployment != "":
-		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, cmd.Limit, cmd.JSON)
+		return showDeploymentLogs(ep, cmd.ApplyID, cmd.Deployment, scope, cmd.Limit, cmd.JSON)
 	default:
-		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Limit, cmd.JSON)
+		return showLogs(ep, cmd.Database, cmd.Environment, cmd.ApplyID, scope, cmd.Limit, cmd.JSON)
 	}
 }
 
-func showDeploymentLogs(endpoint, applyID, deployment string, limit int, outputJSON bool) error {
+func showDeploymentLogs(endpoint, applyID, deployment string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.DeploymentLogsResponse
 	err := withLoading("Loading data-plane logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, limit)
+		result, loadErr = client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
 		return loadErr
 	})
 	if err != nil {
@@ -127,11 +130,11 @@ func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperation
 }
 
 // showLogs displays logs once and exits.
-func showLogs(endpoint, database, environment, applyID string, limit int, outputJSON bool) error {
+func showLogs(endpoint, database, environment, applyID string, scope client.LogScope, limit int, outputJSON bool) error {
 	var result *apitypes.LogsResponse
 	err := withLoading("Loading logs...", !outputJSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, limit)
+		result, loadErr = client.GetLogs(endpoint, database, environment, applyID, scope, limit)
 		return loadErr
 	})
 	if err != nil {
@@ -171,19 +174,20 @@ func printFollowGapNotice() {
 
 // followLogs prints the newest initialLimit entries, then polls for new ones
 // until the command context is cancelled (Ctrl+C).
-func followLogs(ctx context.Context, endpoint, database, environment, applyID string, initialLimit int) error {
+func followLogs(ctx context.Context, endpoint, database, environment, applyID string, scope client.LogScope, initialLimit int) error {
+	header := scopeHeader(scope)
 	switch {
 	case applyID != "" && database == "":
-		fmt.Printf("Following logs for %s... (Ctrl+C to stop)\n\n", applyID)
+		fmt.Printf("Following logs for %s%s... (Ctrl+C to stop)\n\n", applyID, header)
 	case applyID != "":
-		fmt.Printf("Following logs for %s (apply %s)... (Ctrl+C to stop)\n\n", database, applyID)
+		fmt.Printf("Following logs for %s (apply %s)%s... (Ctrl+C to stop)\n\n", database, applyID, header)
 	default:
-		fmt.Printf("Following logs for %s/%s... (Ctrl+C to stop)\n\n", database, environment)
+		fmt.Printf("Following logs for %s/%s%s... (Ctrl+C to stop)\n\n", database, environment, header)
 	}
 
 	state := &followState{}
 	fetch := func(limit int) (*apitypes.LogsResponse, error) {
-		return client.GetLogs(endpoint, database, environment, applyID, limit)
+		return client.GetLogs(endpoint, database, environment, applyID, scope, limit)
 	}
 	emit := func(result *apitypes.LogsResponse, initial bool) {
 		switch {
@@ -194,18 +198,31 @@ func followLogs(ctx context.Context, endpoint, database, environment, applyID st
 		}
 		printLogs(state.advance(result.Logs))
 	}
-	return runFollowLoop(ctx, fetch, emit, initialLimit, followInterval)
+	return runFollowLoop(ctx, fetch, emit, initialLimit, defaultFollowPacing)
+}
+
+// scopeHeader names the target and shard a followed read is narrowed to, for
+// the header that opens the tail.
+func scopeHeader(scope client.LogScope) string {
+	var header string
+	if scope.Target != "" {
+		header += ", target " + scope.Target
+	}
+	if scope.Shard != "" {
+		header += ", shard " + scope.Shard
+	}
+	return header
 }
 
 // followDeploymentLogs tails data-plane logs: it prints the newest
 // initialLimit entries from every remote source, then polls for new ones
 // until the command context is cancelled (Ctrl+C).
-func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, initialLimit int) error {
-	fmt.Printf("Following data-plane logs for %s on %s... (Ctrl+C to stop)\n\n", applyID, deployment)
+func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, scope client.LogScope, initialLimit int) error {
+	fmt.Printf("Following data-plane logs for %s on %s%s... (Ctrl+C to stop)\n\n", applyID, deployment, scopeHeader(scope))
 
 	state := newDeploymentFollowState()
 	fetch := func(limit int) (*apitypes.DeploymentLogsResponse, error) {
-		return client.GetDeploymentLogs(endpoint, applyID, deployment, limit)
+		return client.GetDeploymentLogs(endpoint, applyID, deployment, scope, limit)
 	}
 	// The loop-wide initial flag is unused here: each source owes the
 	// truncation notice to its own first successful read, which for a source
@@ -228,7 +245,7 @@ func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment str
 			fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 		}
 	}
-	return runFollowLoop(ctx, fetch, emit, initialLimit, followInterval)
+	return runFollowLoop(ctx, fetch, emit, initialLimit, defaultFollowPacing)
 }
 
 // followState tracks the newest log entry already printed so each poll prints
@@ -374,37 +391,87 @@ func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse)
 	return batches, warnings
 }
 
+// followPacing sets how long a tail waits before its next poll: interval after
+// a poll that succeeded, and retryWait after one that failed transiently, given
+// that failure and how many polls in a row have failed. sleep performs the
+// wait and returns early once the tail is cancelled.
+type followPacing struct {
+	interval  time.Duration
+	retryWait func(err error, consecutiveFailures int) time.Duration
+	sleep     func(ctx context.Context, d time.Duration)
+}
+
+// defaultFollowPacing polls at followInterval, and backs off after a transient
+// failure on the same schedule the progress watches use, so a tail rides out a
+// server restart for as long as a watch does.
+var defaultFollowPacing = followPacing{interval: followInterval, retryWait: progressRetryWait, sleep: sleepUnlessDone}
+
 // runFollowLoop fetches the newest initialLimit entries and hands them to
-// emit, then polls fetch on every interval tick until ctx is cancelled. emit
+// emit, then polls fetch after each pacing wait until ctx is cancelled. emit
 // owns dedupe and printing, so each log mode decides how to track what was
 // already shown; it is told whether it is rendering the initial window, which
 // is the only one bounded by the operator's own limit. The initial fetch must
-// succeed — a broken endpoint should fail the command, not tail nothing. Later
-// polls warn and retry on the next tick instead: a tail during an incident must
-// survive transient server blips.
-func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error), emit func(result T, initial bool), initialLimit int, interval time.Duration) error {
+// succeed — a broken endpoint should fail the command, not tail nothing.
+//
+// Later polls follow the rule the progress watches use. A transient failure
+// warns and is retried with backoff, so a tail during an incident survives a
+// server blip, up to maxConsecutiveProgressFailures polls in a row. A permanent
+// failure, such as the apply no longer existing or the credentials being
+// refused, or one transient failure too many, ends the tail with an error:
+// retrying cannot change the answer, and a tail that prints nothing looks like
+// an apply with nothing to say.
+func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error), emit func(result T, initial bool), initialLimit int, pacing followPacing) error {
 	result, err := fetch(initialLimit)
 	if err != nil {
 		return fmt.Errorf("fetch initial log window: %w", err)
 	}
 	emit(result, true)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	wait := pacing.interval
+	failures := 0
 	for {
-		select {
-		case <-ctx.Done():
+		pacing.sleep(ctx, wait)
+		if ctx.Err() != nil {
 			// Interrupting a tail is its normal exit, not a failure.
 			return nil
-		case <-ticker.C:
 		}
 		result, err := fetch(followFetchLimit)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to fetch logs, retrying next poll: %v\n", err)
+			if ctx.Err() != nil {
+				// A poll the operator's Ctrl-C landed on is part of the interrupt,
+				// not a failure of the endpoint.
+				return nil
+			}
+			failures++
+			var stopErr error
+			wait, stopErr = followFailureOutcome(err, failures, pacing)
+			if stopErr != nil {
+				return stopErr
+			}
 			continue
 		}
+		failures = 0
+		wait = pacing.interval
 		emit(result, false)
 	}
+}
+
+// followFailureOutcome decides what a failed follow poll means. A failure the
+// watches treat as permanent, or the maxConsecutiveProgressFailures-th
+// transient failure in a row, is returned as the error that ends the tail.
+// Otherwise it warns on stderr, which keeps stdout to the log lines, and
+// returns the wait before the next poll.
+func followFailureOutcome(err error, failures int, pacing followPacing) (time.Duration, error) {
+	if !isRetryableFetchError(err) {
+		return 0, fmt.Errorf("stopped following logs: %w", err)
+	}
+	if failures >= maxConsecutiveProgressFailures {
+		return 0, fmt.Errorf("stopped following logs after %d consecutive failed polls; following logs does not affect the apply; run the same logs command again to keep following: %w", failures, err)
+	}
+	wait := pacing.retryWait(err, failures)
+	fmt.Fprintf(os.Stderr, "Warning: failed to fetch logs (attempt %d/%d), retrying in %s: %v\n",
+		failures, maxConsecutiveProgressFailures, wait, err)
+	return wait, nil
 }
 
 // printLogs formats and prints log entries.

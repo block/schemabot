@@ -111,7 +111,18 @@ func previewTUI(name string, live bool) error {
 	fmt.Printf("Starting TUI preview: %s\n", scenario.Description)
 	fmt.Println("Press Esc to exit.")
 	fmt.Println()
-	return watchApplyProgressByApplyIDWithEnvironment(server.URL, scenario.ApplyID, "staging", true)
+	return previewWatchExit(watchApplyProgressByApplyIDWithEnvironment(server.URL, scenario.ApplyID, "staging", true))
+}
+
+// previewWatchExit is the preview's result once its watch has returned. The
+// scenario never ends, so pressing Esc is the only way out and is the preview
+// finishing as intended, not an operator leaving an apply behind; it exits 0
+// rather than with the watch's detach status.
+func previewWatchExit(err error) error {
+	if ExitCodeFor(err) == ExitInterrupted {
+		return nil
+	}
+	return err
 }
 
 func previewTUIStatic(scenario tuiPreviewScenario) {

@@ -1457,7 +1457,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrActiveApplyExists) {
 			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
-			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, activeApplyConflictMessage(err))
 			return
 		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
@@ -1661,6 +1661,42 @@ func (e *applyStorageError) LogAttrs() []any {
 // nothing refuses the retry, so the caller checks the apply's state first.
 func applyStorageFailedMessage(planID string) string {
 	return fmt.Sprintf("apply failed: storage error while queueing plan %s; see server logs and check for a stored apply before retrying", planID)
+}
+
+// activeApplyConflictMessage tells the operator which apply holds the target
+// and what to do before applying again. Each state names only the controls
+// that state accepts. The store's own account names internal deployments, so
+// it stays in the server log.
+func activeApplyConflictMessage(err error) string {
+	conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
+	if !ok {
+		return "apply blocked: another apply is still in progress on this database. Wait for it to finish, then apply again."
+	}
+	id := conflict.HolderApplyID
+	where := fmt.Sprintf("on %s in %s", conflict.Database, conflict.Environment)
+	switch {
+	case state.IsState(conflict.HolderState, state.Apply.Stopped):
+		return fmt.Sprintf("apply blocked: %s is stopped %s. Start or cancel it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.Paused):
+		return fmt.Sprintf("apply blocked: %s is paused %s. Release or cancel it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.WaitingForDeploy):
+		return fmt.Sprintf("apply blocked: %s is waiting for its deploy %s. Start or cancel it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.WaitingForCutover):
+		return fmt.Sprintf("apply blocked: %s is waiting for its cutover %s. Run its cutover or cancel it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.RevertWindow):
+		// The cutover already ran, so stop and cancel are rejected here.
+		return fmt.Sprintf("apply blocked: %s is in its revert window %s. Skip-revert or revert it, then apply again.", id, where)
+	case state.IsState(conflict.HolderState, state.Apply.FailedRetryable):
+		// The driver retries it without an operator, so waiting is enough,
+		// and cancel abandons it instead.
+		return fmt.Sprintf("apply blocked: %s is retrying after an error %s. Wait for it to finish or cancel it, then apply again.", id, where)
+	case state.IsTerminalApplyState(conflict.HolderState):
+		// An ended apply accepts no control, so the only step is to wait for
+		// its operation still in progress.
+		return fmt.Sprintf("apply blocked: %s has ended, but part of its work is still in progress %s. Wait for that to finish, then apply again.", id, where)
+	default:
+		return fmt.Sprintf("apply blocked: %s is still in progress %s. Wait for it to finish, then apply again.", id, where)
+	}
 }
 
 // isApplyCreationStorageRefusal reports whether storing an apply failed with

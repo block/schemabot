@@ -42,7 +42,8 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// The rollback's unsafe changes are named here, because confirming them
 	// takes --allow-unsafe and the operator should see what that destroys.
 	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL)
+		_, footerSteps := planUnsafeConsent(data)
+		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL, !footerSteps)
 	}
 
 	// Lint violations. Only the lint fold names a finding's rule here: the
@@ -65,12 +66,14 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// the command and the flag stays out of the pasteable command, so
 	// consenting to destroy data takes typing it.
 	sb.WriteString("---\n\n")
+	confirmCmd := TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant)
 	if consent, ok := planUnsafeConsent(data); ok {
-		fmt.Fprintf(&sb, "To confirm this rollback, %s:\n", consent.instruction())
+		writeUnsafeConsentCommand(&sb, "To confirm this rollback", consent, confirmCmd)
 	} else {
 		sb.WriteString("To confirm this rollback, comment:\n")
+		fmt.Fprintf(&sb, "```\n%s\n```\n", confirmCmd)
 	}
-	fmt.Fprintf(&sb, "```\n%s\n```\n\n", TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
+	sb.WriteString("\n")
 	writeRollbackCancel(&sb, data.Tenant)
 
 	return appendAgentHint(sb.String(), data.AgentHint)

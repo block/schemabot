@@ -811,8 +811,12 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	var targetApply *storage.Apply
 	if req.ApplyId != "" {
 		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if err != nil || apply == nil {
-			return nil, fmt.Errorf("apply %s not found", req.ApplyId)
+		if err != nil {
+			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, err)
+		}
+		if apply == nil {
+			c.logger.Warn("stop rejected because the requested apply does not exist", "apply_id", req.ApplyId, "database", c.config.Database)
+			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, storage.ErrApplyNotFound)
 		}
 		targetApplyID = apply.ID
 		targetApply = apply
@@ -837,6 +841,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		return nil, errors.New(revertPhaseControlRejectionMessage(targetApply.ApplyIdentifier, targetApply.State))
 	}
 
+	tasks = c.operationShareOfTasks(ctx, tasks, targetApply, "stop")
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
 
@@ -862,7 +867,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// Cancel the apply goroutine's context so it stops iterating over tasks.
 	// Without this, executeApplySequential would continue to the next table
 	// after Spirit's runner exits, racing with the resume goroutine.
-	c.cancelApplyHandle(applyCancel, nil)
+	c.wakeDriveForControl(ctx, applyCancel, nil, targetApply, "stop")
 
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
@@ -890,7 +895,11 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		if terminalState == state.Task.Cancelled {
 			eventMsg = fmt.Sprintf("Cancel requested: %d tasks cancelled, %d skipped (deploy request cancelled)", stoppedCount, skippedCount)
 			eventType = storage.LogEventCancelRequested
-
+		}
+		switch opLease, operationScoped := operationLeaseOnlyDrive(ctx); {
+		case operationScoped:
+			c.leaveApplyRowToProjection(targetApply, opLease, terminalState)
+		case terminalState == state.Task.Cancelled:
 			// For Vitess: set the apply state to cancelled now. The apply
 			// goroutine will see a context cancellation error from the engine
 			// and call failApplyWithTasks, but we set cancelled first so the
@@ -899,8 +908,10 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 			if err := c.markApplyCancelled(ctx, applyID); err != nil {
 				return nil, err
 			}
-		} else if err := c.markApplyStopped(ctx, applyID); err != nil {
-			return nil, err
+		default:
+			if err := c.markApplyStopped(ctx, applyID); err != nil {
+				return nil, err
+			}
 		}
 		if caller != "" {
 			eventMsg += callerApplyLogSuffix(caller)
@@ -919,7 +930,14 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		// queued apply stopped before its first drive created tasks). The apply
 		// row itself is still active work, so settle it directly — erroring here
 		// would leave the durable stop request pending and the apply re-claimed
-		// on every operator poll forever.
+		// on every operator poll forever. A drive holding only its operation's
+		// lease settles just that operation; its siblings' tasks are not its own.
+		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+			if err := c.settleTasklessOperationShare(ctx, targetApply, opLease, storage.ControlOperationStop, state.ApplyOperation.Stopped, caller); err != nil {
+				return nil, err
+			}
+			return &ternv1.StopResponse{Accepted: true}, nil
+		}
 		return c.settleStopForTasklessApply(ctx, targetApply, caller)
 	}
 
@@ -983,6 +1001,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return nil, errors.New(revertPhaseControlRejectionMessage(targetApply.ApplyIdentifier, targetApply.State))
 	}
 
+	tasks = c.operationShareOfTasks(ctx, tasks, targetApply, "cancel")
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
 	if err := c.cancelEngineForTasks(ctx, eng, tasks, targetApplyID); err != nil {
@@ -999,7 +1018,11 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		return nil, fmt.Errorf("engine cancel failed: %w", err)
 	}
-	c.cancelApplyHandle(applyCancel, engine.ErrCancelledByOperator)
+	// The drive is woken before the tasks are recorded cancelled: its engine
+	// run has just been cancelled underneath it, and a drive still running
+	// would read that run's end as the task's own outcome and record it. Woken
+	// with the operator's cause, it records no verdict and hands back.
+	c.wakeDriveForControl(ctx, applyCancel, engine.ErrCancelledByOperator, targetApply, "cancel")
 
 	if targetApply != nil {
 		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
@@ -1029,7 +1052,9 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return nil, fmt.Errorf("cancel schema change on database %s: %w", c.config.Database, err)
 	}
 	if applyID > 0 && cancelledCount > 0 {
-		if err := c.markApplyCancelled(ctx, applyID); err != nil {
+		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+			c.leaveApplyRowToProjection(targetApply, opLease, state.Task.Cancelled)
+		} else if err := c.markApplyCancelled(ctx, applyID); err != nil {
 			return nil, err
 		}
 		eventMsg := fmt.Sprintf("Cancel requested: %d tasks cancelled, %d skipped", cancelledCount, skippedCount)
@@ -1050,7 +1075,14 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		// VSchema-only apply that never has any). The apply row itself is still
 		// active work, so settle it directly — erroring here would leave the
 		// durable cancel request pending and the apply re-claimed on every
-		// operator poll forever.
+		// operator poll forever. A drive holding only its operation's lease
+		// settles just that operation; its siblings' tasks are not its own.
+		if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+			if err := c.settleTasklessOperationShare(ctx, targetApply, opLease, storage.ControlOperationCancel, state.ApplyOperation.Cancelled, caller); err != nil {
+				return nil, err
+			}
+			return &ternv1.CancelResponse{Accepted: true}, nil
+		}
 		return c.settleCancelForTasklessApply(ctx, targetApply, caller)
 	}
 	if cancelledCount == 0 && skippedCount > 0 && applyID > 0 {
@@ -1147,6 +1179,43 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }
 
+// settleTasklessOperationShare settles a stop or cancel consumed by a drive
+// that holds only its operation's lease when that operation owns no tasks,
+// such as a VSchema-only operation beside shard operations that do. The
+// drive's operation row is the only work it can settle: each sibling's tasks
+// belong to the sibling's drive, which consumes the still-pending request at
+// its next checkpoint, and the apply row belongs to the apply-state
+// projection, which settles it and completes the request once every operation
+// has settled. Fails closed when the operation does own tasks that this
+// client's database-scoped read could not see.
+func (c *LocalClient) settleTasklessOperationShare(ctx context.Context, apply *storage.Apply, opLease storage.OperationLease, operation storage.ControlOperation, operationState, caller string) error {
+	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, opLease.OperationID)
+	if err != nil {
+		return fmt.Errorf("load tasks of apply_operation %d before task-less %s settle of apply %s: %w",
+			opLease.OperationID, operation, apply.ApplyIdentifier, err)
+	}
+	if len(tasks) > 0 {
+		c.logger.Warn(string(operation)+" found no targetable tasks for its operation in this client's database scope, but the operation owns tasks; failing closed rather than settling over unseen task work",
+			append(apply.LogAttrs(), "apply_operation_id", opLease.OperationID, "task_count", len(tasks), "client_database", c.config.Database)...)
+		return fmt.Errorf("%s cannot settle apply_operation %d of apply %s: its %d tasks are outside this client's database scope (%s)",
+			operation, opLease.OperationID, apply.ApplyIdentifier, len(tasks), c.config.Database)
+	}
+	if err := c.settleLeasedOperationRow(ctx, apply, opLease, operationState); err != nil {
+		return err
+	}
+	eventType := storage.LogEventStopRequested
+	eventMsg := "Stop requested: task-less operation settled as stopped; the apply record follows via the operator's state projection"
+	if operation == storage.ControlOperationCancel {
+		eventType = storage.LogEventCancelRequested
+		eventMsg = "Cancel requested: task-less operation settled as cancelled; the apply record follows via the operator's state projection"
+	}
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, eventType, storage.LogSourceSchemaBot, eventMsg, "", "")
+	return nil
+}
+
 // deferTasklessCancelToProjection settles a task-less cancel whose apply-row
 // write was refused because the apply lease was lost. Only the operation row is
 // heartbeated through a drive, so a drive can outlive its parent apply lease
@@ -1211,6 +1280,14 @@ func (c *LocalClient) settleLeasedOperationRowForTasklessApply(ctx context.Conte
 		return fmt.Errorf("task-less settle of apply %s to %s: apply lease was lost and no operation lease is held: %w",
 			apply.ApplyIdentifier, operationState, applyWriteErr)
 	}
+	return c.settleLeasedOperationRow(ctx, apply, opLease, operationState)
+}
+
+// settleLeasedOperationRow moves the operation row opLease covers to
+// operationState for a task-less settle, leaving the apply row to the
+// apply-state projection. Fails closed when the row cannot be loaded or belongs
+// to a different apply, and leaves an already-terminal row unchanged.
+func (c *LocalClient) settleLeasedOperationRow(ctx context.Context, apply *storage.Apply, opLease storage.OperationLease, operationState string) error {
 	op, err := c.storage.ApplyOperations().Get(ctx, opLease.OperationID)
 	if err != nil {
 		return fmt.Errorf("load leased apply_operation %d for task-less settle of apply %s to %s: %w",
@@ -1405,22 +1482,21 @@ func (c *LocalClient) stopStandsDownUnlessStartPending(ctx context.Context, logg
 // the caller applies its normal error handling. When declined=true the
 // operation did not take effect: a stop or cancel caller must keep its drive
 // going, or the drive loop would mark the still-running apply stopped.
+//
+// The decline answers controlReq, the command the engine was sent, and no
+// other: see failEngineAnsweredControlRequest.
 func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	unsupported, ok := engine.AsUnsupportedOperation(opErr)
 	if !ok {
 		return false, nil
 	}
-	message := unsupported.Error()
-	caller := controlRequestCaller(controlReq)
-	logger.Warn("rejecting pending control request: the engine does not support the operation; the schema change continues and settles on its own",
-		"operation", string(operation),
-		"requested_by", caller,
-		"state", apply.State,
-		"error", opErr)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
-	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
-		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	answered, err := c.failEngineAnsweredControlRequest(ctx, logger, apply, operation, eventType, controlReq, unsupported.Error(), opErr,
+		"rejecting pending control request: the engine does not support the operation; the schema change continues and settles on its own")
+	if err != nil {
+		return true, err
+	}
+	if !answered {
+		return true, nil
 	}
 	engineName := "unknown"
 	if eng := c.getEngine(); eng != nil {
@@ -1440,24 +1516,52 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 // settled=false when the error is not a settled-outcome refusal, so the caller
 // applies its normal error handling. When settled=true the operation did not
 // take effect, so a stop or cancel caller must keep its drive going, or the
-// drive loop would record the operator's command over the engine's outcome.
+// drive loop would record the operator's command over the engine's outcome. A
+// revert-window control the engine answered without accepting reaches here as
+// the same typed refusal, and resolves the same way.
+//
+// The refusal answers controlReq, the command the engine was sent, and no
+// other: see failEngineAnsweredControlRequest.
 func (c *LocalClient) failPendingRequestForSettledOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	refusal, ok := engine.AsSettledOutcome(opErr)
 	if !ok {
 		return false, nil
 	}
-	message := refusal.Error()
+	_, err := c.failEngineAnsweredControlRequest(ctx, logger, apply, operation, eventType, controlReq, refusal.Error(), opErr,
+		"rejecting pending control request: the engine refused it for this schema change; the drive keeps going and records the outcome the engine reports")
+	return true, err
+}
+
+// failEngineAnsweredControlRequest fails controlReq with the reason the engine
+// gave for refusing it, and records the rejection on the apply's timeline.
+//
+// The engine's answer belongs to the one command it was sent. The API settles
+// a request on its own immediate attempt, and the row is re-armed in place for
+// the operator's next command of the same operation, so by the time the engine
+// answers, the row can carry a newer command the engine never saw. The request
+// is therefore failed only while its row still carries the command this drive
+// sent, and the rejection is logged and put on the timeline only when it was:
+// a newer command stays pending for the next drive tick to send, with no
+// rejection recorded against it. answered reports whether controlReq was the
+// command failed here.
+func (c *LocalClient) failEngineAnsweredControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, message string, opErr error, rejection string) (answered bool, err error) {
+	answered, err = settleControlRequestRevisionIfCurrent(ctx, c.storage, logger, apply, controlReq, storage.ControlRequestFailed, message)
+	if err != nil {
+		return false, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	}
+	if !answered {
+		// settleControlRequestRevisionIfCurrent logged that the row had already
+		// been settled or re-armed.
+		return false, nil
+	}
 	caller := controlRequestCaller(controlReq)
-	logger.Warn("rejecting pending control request: the schema change already settled on its own outcome; the drive keeps going and records that outcome",
+	logger.Warn(rejection,
 		"operation", string(operation),
 		"requested_by", caller,
 		"state", apply.State,
 		"error", opErr)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
-	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
-		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
-	}
 	return true, nil
 }
 
@@ -2533,6 +2637,77 @@ func cancelAlreadySettledResponse(settledState string, skippedCount int64) *tern
 	}
 }
 
+// leaveApplyRowToProjection records that a stop or cancel which reached this
+// apply's tasks leaves the apply row alone. The drive consuming it holds only
+// its operation's lease, and under that lease the apply row belongs to the
+// apply-state projection, which storage enforces by refusing the write. The
+// tasks already record the outcome, each drive settles its own operation from
+// its tasks as it returns, and the projection settles the apply from those
+// operations and completes the durable request.
+func (c *LocalClient) leaveApplyRowToProjection(apply *storage.Apply, opLease storage.OperationLease, taskState string) {
+	attrs := []any{"apply_operation_id", opLease.OperationID, "task_state", taskState}
+	if apply != nil {
+		attrs = append(apply.LogAttrs(), attrs...)
+	}
+	c.logger.Info("control request recorded on the apply's tasks; the apply-state projection settles the apply row this operation-scoped drive does not own", attrs...)
+}
+
+// operationShareOfTasks narrows a stop or cancel to the tasks the consuming
+// drive's lease covers. A drive holding only its operation's lease stops,
+// records, and reclaims its own operation's work: storage refuses its writes
+// to any other operation's tasks. The durable request stays pending until the
+// apply resolves, so each sibling operation's drive consumes it at its next
+// checkpoint and does the same for its own tasks under its own lease. A drive
+// holding the apply lease covers every task, and its tasks are returned as is.
+func (c *LocalClient) operationShareOfTasks(ctx context.Context, tasks []*storage.Task, apply *storage.Apply, operation string) []*storage.Task {
+	opLease, operationScoped := operationLeaseOnlyDrive(ctx)
+	if !operationScoped {
+		return tasks
+	}
+	own := make([]*storage.Task, 0, len(tasks))
+	var siblings int
+	for _, task := range tasks {
+		if task.ApplyOperationID != nil && *task.ApplyOperationID == opLease.OperationID {
+			own = append(own, task)
+			continue
+		}
+		if task.ApplyID == opLease.ApplyID {
+			siblings++
+		}
+	}
+	if siblings > 0 {
+		attrs := []any{"apply_operation_id", opLease.OperationID, "operation", operation, "own_tasks", len(own), "sibling_tasks", siblings}
+		if apply != nil {
+			attrs = append(apply.LogAttrs(), attrs...)
+		}
+		c.logger.Info("operation-scoped drive takes the control request for its own operation's tasks; each sibling operation's drive consumes the pending request for its own", attrs...)
+	}
+	return own
+}
+
+// wakeDriveForControl cancels the drive the handle was taken from, so it
+// stops iterating once a stop or cancel reaches its engine work, with cause as
+// the drive context's cause.
+//
+// A drive holding only its operation's lease consumed the request at one of
+// its own checkpoints and stands down by its return, so there is no other
+// drive of its share to wake. The client's current drive may then be a sibling
+// operation's, and woken it would hand its operation back without recording
+// the request, leaving the operation under a lease nobody renews until it goes
+// stale. Left running, that drive consumes the request at its next checkpoint
+// and settles its own operation.
+func (c *LocalClient) wakeDriveForControl(ctx context.Context, handle applyCancelHandle, cause error, apply *storage.Apply, operation string) {
+	if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+		attrs := []any{"apply_operation_id", opLease.OperationID, "operation", operation}
+		if apply != nil {
+			attrs = append(apply.LogAttrs(), attrs...)
+		}
+		c.logger.Info("operation-scoped drive consumed the control request at its own checkpoint; no other drive is woken", attrs...)
+		return
+	}
+	c.cancelApplyHandle(handle, cause)
+}
+
 func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error {
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -2829,12 +3004,16 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 		return nil, fmt.Errorf("build revert request for task %s: %w", task.TaskIdentifier, err)
 	}
 	c.logger.Info("sending revert request to engine", task.LogAttrs()...)
-	if _, err = eng.Revert(ctx, controlReq); err != nil {
+	result, err := eng.Revert(ctx, controlReq)
+	if err != nil {
 		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
 			c.logDeclinedControlOperation(task, "revert", unsupported)
 			return &ternv1.RevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
 		}
 		return nil, fmt.Errorf("revert failed: %w", err)
+	}
+	if refusal, refused := c.engineControlRefusal(task, "revert", result); refused {
+		return &ternv1.RevertResponse{Accepted: false, ErrorMessage: refusal}, nil
 	}
 	c.logger.Info("engine accepted the revert request", task.LogAttrs()...)
 	return &ternv1.RevertResponse{Accepted: true}, nil
@@ -2852,15 +3031,57 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 		return nil, fmt.Errorf("build skip-revert request for task %s: %w", task.TaskIdentifier, err)
 	}
 	c.logger.Info("sending skip-revert request to engine", task.LogAttrs()...)
-	if _, err = eng.SkipRevert(ctx, controlReq); err != nil {
+	result, err := eng.SkipRevert(ctx, controlReq)
+	if err != nil {
 		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
 			c.logDeclinedControlOperation(task, "skip-revert", unsupported)
 			return &ternv1.SkipRevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
 		}
 		return nil, fmt.Errorf("skip revert failed: %w", err)
 	}
+	if refusal, refused := c.engineControlRefusal(task, "skip-revert", result); refused {
+		return &ternv1.SkipRevertResponse{Accepted: false, ErrorMessage: refusal}, nil
+	}
 	c.logger.Info("engine accepted the skip-revert request", task.LogAttrs()...)
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
+}
+
+// engineControlRefusal reads the engine's answer to a revert-window control and
+// returns the refusal reason when the engine did not accept it. A missing
+// result is a refusal too: only an explicit acceptance lets the control be
+// reported as accepted. The engine's own message is the reason when it gave
+// one, so the caller and the durable control request resolve on it.
+func (c *LocalClient) engineControlRefusal(task *storage.Task, operation string, result *engine.ControlResult) (string, bool) {
+	reason, refused := controlResultRefusal(operation, result)
+	switch {
+	case !refused:
+		return "", false
+	case result == nil:
+		c.logger.Warn("the engine returned no result for the control operation; it is reported as refused",
+			append(task.LogAttrs(), "operation", operation)...)
+	default:
+		c.logger.Warn("the engine refused the control operation; it is reported as refused",
+			append(task.LogAttrs(), "operation", operation, "error_message", reason)...)
+	}
+	return reason, true
+}
+
+// controlResultRefusal returns the refusal reason when an engine's answer to a
+// revert-window control is not an acceptance: a missing result, or one the
+// engine did not accept, carrying the engine's own message when it gave one.
+// Every path that sends the control resolves the same answer on the same
+// reason, whether the API sent it or the drive did.
+func controlResultRefusal(operation string, result *engine.ControlResult) (string, bool) {
+	if result == nil {
+		return fmt.Sprintf("the engine returned no result for the %s", operation), true
+	}
+	if !result.Accepted {
+		if result.Message != "" {
+			return result.Message, true
+		}
+		return fmt.Sprintf("the engine did not accept the %s", operation), true
+	}
+	return "", false
 }
 
 // logDeclinedControlOperation records an engine declining a control operation

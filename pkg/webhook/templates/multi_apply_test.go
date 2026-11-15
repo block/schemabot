@@ -2583,6 +2583,21 @@ func TestRenderMultiDeploymentApplyComment_EveryTargetParkedReadsItsPhase(t *tes
 		"  - ● `testapp-002`: waiting for cutover\n", "%s", out)
 }
 
+// Every target waiting for its deploy request reads with the glyph the
+// single-deployment comment and the CLI progress table give that state, so the
+// rolled-up line does not borrow the cutover glyph for a different meaning.
+func TestRenderMultiDeploymentApplyComment_WaitingForDeployReadsOneGlyph(t *testing.T) {
+	ops := rollingTargets(2)
+	ops[0].State, ops[1].State = so.WaitingForDeploy, so.WaitingForDeploy
+	staged := func(database string) *ApplyStatusCommentData {
+		return tablesDetail(database, TableProgressData{TableName: "orders", Status: state.Task.WaitingForDeploy})
+	}
+	out := renderTargets(presentation.Derive(ops), staged("testapp_001"), staged("testapp_002"))
+	assert.Contains(t, out, "**`orders`**: "+ui.WaitingForDeploy+"\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (2 waiting for deploy)\n", "%s", out)
+	assert.NotContains(t, out, "🟡 Waiting for deploy", "%s", out)
+}
+
 // A target that has reported no table progress counts toward a rolled-up
 // table at where its operation stands, the way the CLI counts it: one that
 // failed before reporting is listed as failed and counts as no progress in

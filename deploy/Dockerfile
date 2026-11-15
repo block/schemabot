@@ -12,7 +12,7 @@
 # Build stage. It runs on the build machine's own platform and Go cross-compiles
 # for the target, so a multi-arch build does not compile Go under QEMU emulation,
 # which is many times slower.
-FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine AS builder
 
 # The Alpine CDN intermittently answers "temporary error (try again later)" and a
 # single failed fetch fails the whole build, so every apk add in this repo's

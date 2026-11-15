@@ -115,7 +115,6 @@ func startLeaseTakeoverInstance(t *testing.T, name string, store storage.Storage
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	addr := "http://" + listener.Addr().String()
-	waitForHTTP(t, addr+"/health", 5*time.Second)
 
 	t.Cleanup(func() {
 		svc.StopOperator()

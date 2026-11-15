@@ -626,6 +626,19 @@ func (r *TargetRouter) Progress(ctx context.Context, req *ternv1.ProgressRequest
 	return routeStoredApply(ctx, r, req, "progress", Client.Progress)
 }
 
+// BatchProgress returns progress for several operations of a stored apply by
+// routing through its target. A target client that cannot batch answers
+// ErrBatchProgressUnsupported.
+func (r *TargetRouter) BatchProgress(ctx context.Context, req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+	return routeStoredApply(ctx, r, req, "batch progress", func(client Client, ctx context.Context, req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+		batcher, ok := client.(BatchProgressClient)
+		if !ok {
+			return nil, ErrBatchProgressUnsupported
+		}
+		return batcher.BatchProgress(ctx, req)
+	})
+}
+
 func (r *TargetRouter) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("logs request is required")
@@ -957,7 +970,7 @@ func (r *TargetRouter) clientForApplyIdentifier(ctx context.Context, applyIdenti
 		return nil, nil, fmt.Errorf("load apply %q for %s routing: %w", applyIdentifier, operation, err)
 	}
 	if apply == nil {
-		return nil, nil, fmt.Errorf("apply %q not found for %s routing", applyIdentifier, operation)
+		return nil, nil, fmt.Errorf("apply %q for %s routing: %w", applyIdentifier, operation, storage.ErrApplyNotFound)
 	}
 	if requestEnvironment != "" && requestEnvironment != apply.Environment {
 		return nil, nil, fmt.Errorf("apply %q is stored for environment %q, not %q; cannot route %s", applyIdentifier, apply.Environment, requestEnvironment, operation)

@@ -3,6 +3,7 @@
 package tern
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -305,4 +306,274 @@ func TestLocalClient_StartRecoversAfterAStrandedTaskIsSettled(t *testing.T) {
 	assert.Equal(t, stoppedApply.ApplyIdentifier, resumed.ApplyIdentifier)
 	assert.Equal(t, int64(1), startedCount, "the settled table is resumed, not skipped")
 	assert.Equal(t, int64(0), skippedCount)
+}
+
+// staleRetryMember is one operation of an apply seeded by
+// seedStaleRetryableApply, with the task it owns.
+type staleRetryMember struct {
+	deployment string
+	table      string
+	opState    string
+	taskState  string
+	// taskAge backdates the task's creation, so the conflict check, which reads
+	// a database's newest task first, meets the members' tasks in a known order.
+	taskAge time.Duration
+}
+
+// seedStaleRetryableApply stores a running apply with one operation and one
+// task per member, and returns the apply and its operations in member order.
+// apply_operations rows other tests left behind are cleared first, so an
+// operation claim in the test can only return this apply's rows.
+func seedStaleRetryableApply(t *testing.T, stor storage.Storage, dsn string, members []staleRetryMember) (*storage.Apply, []*storage.ApplyOperation) {
+	t.Helper()
+	ctx := t.Context()
+	execSQL(t, dsn, "DELETE FROM apply_operations")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-stale-retry-%d", now.UnixNano()),
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      members[0].deployment,
+		Environment:     localClientTestEnvironment,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
+	for _, m := range members {
+		ddl := fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN `email` varchar(255)", m.table)
+		groups = append(groups, &storage.ApplyOperationWithTasks{
+			Operation: &storage.ApplyOperation{
+				Deployment:   m.deployment,
+				OperationKey: m.deployment,
+				Target:       m.deployment,
+				State:        m.opState,
+				OnFailure:    storage.OnFailureHalt,
+				CreatedAt:    now,
+				UpdatedAt:    now,
+			},
+			Tasks: []*storage.Task{{
+				TaskIdentifier: fmt.Sprintf("%s-%s", apply.ApplyIdentifier, m.table),
+				Database:       "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				Engine:         storage.EngineSpirit,
+				Environment:    localClientTestEnvironment,
+				State:          m.taskState,
+				Namespace:      "testdb",
+				TableName:      m.table,
+				DDL:            ddl,
+				DDLAction:      "alter",
+				CreatedAt:      now.Add(-m.taskAge),
+				UpdatedAt:      now,
+			}},
+		})
+	}
+	applyID, err := stor.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	ops := make([]*storage.ApplyOperation, 0, len(groups))
+	for _, group := range groups {
+		op, err := stor.ApplyOperations().Get(ctx, group.Operation.ID)
+		require.NoError(t, err)
+		require.NotNil(t, op)
+		ops = append(ops, op)
+	}
+	return apply, ops
+}
+
+// execSQL runs one statement against the storage database.
+func execSQL(t *testing.T, dsn, query string, args ...any) {
+	t.Helper()
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	_, err = db.ExecContext(t.Context(), query, args...)
+	require.NoError(t, err, "exec %s", query)
+}
+
+// leaveLeaseStale records a lease on the row as a driver that has since died
+// would leave it: an owner and a token, with a heartbeat older than the
+// staleness window. table is applies or apply_operations.
+func leaveLeaseStale(t *testing.T, dsn, table string, id int64, owner, token string) {
+	t.Helper()
+	execSQL(t, dsn, fmt.Sprintf(
+		"UPDATE %s SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(), updated_at = NOW() - INTERVAL ? MICROSECOND WHERE id = ?", table),
+		owner, token, 2*storage.ApplyLeaseStaleAfter.Microseconds(), id)
+}
+
+// newRetryableFailureClient returns a client whose engine remembers the last
+// copy it ran failing with an error it marks retryable.
+func newRetryableFailureClient(t *testing.T, dsn string, stor storage.Storage) *LocalClient {
+	t.Helper()
+	client, _ := newTasklessControlClient(t, dsn, stor)
+	client.spiritEngine = &fakeControlEngine{progressResult: retryableCopyFailure}
+	return client
+}
+
+// checkConflictOnTestdb runs the dispatch conflict check for a new apply on
+// testdb and returns its error.
+func checkConflictOnTestdb(t *testing.T, client *LocalClient) error {
+	t.Helper()
+	_, _, err := client.checkActiveTaskConflict(t.Context(), &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}, "", "", 0)
+	return err
+}
+
+// requireStoredStates asserts the stored states of an apply and its operations.
+func requireStoredStates(t *testing.T, stor storage.Storage, applyID int64, applyState string, ops map[int64]string) {
+	t.Helper()
+	stored, err := stor.Applies().Get(t.Context(), applyID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, applyState, stored.State, "apply state")
+	for id, opState := range ops {
+		op, err := stor.ApplyOperations().Get(t.Context(), id)
+		require.NoError(t, err)
+		require.NotNil(t, op)
+		assert.Equal(t, opState, op.State, "state of operation %d", id)
+	}
+}
+
+// A drive in this process was copying `users` and died, leaving its apply and
+// operation running under stale leases. A new dispatch's conflict check asks
+// the engine, which remembers the copy failing with an error it marks
+// retryable. The task rests failed_retryable and keeps the database held, and
+// the apply and its operation are paused for retry with it, so the recovery
+// that follows goes through the retryable claim and is charged against the
+// retry budget instead of re-leasing the apply for free.
+func TestLocalClient_ConflictCheckPausesAStaleApplyForRetry(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client := newRetryableFailureClient(t, dsn, stor)
+
+	apply, ops := seedStaleRetryableApply(t, stor, dsn, []staleRetryMember{
+		{deployment: "testdb", table: "users", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
+	})
+	leaveLeaseStale(t, dsn, "applies", apply.ID, storage.LeaseOwnerProcess()+"/driver-0", "apply-token-dead")
+	leaveLeaseStale(t, dsn, "apply_operations", ops[0].ID, storage.LeaseOwnerProcess()+"/driver-0", "op-token-dead")
+
+	err := checkConflictOnTestdb(t, client)
+	require.Error(t, err, "a task paused for retry keeps holding the database")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+
+	task, err := stor.Tasks().Get(ctx, apply.ApplyIdentifier+"-users")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Equal(t, state.Task.FailedRetryable, task.State)
+	paused, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, paused)
+	assert.Equal(t, state.Apply.FailedRetryable, paused.State)
+	assert.Equal(t, "lost connection to the target during the copy", paused.ErrorMessage)
+	assert.Empty(t, paused.LeaseOwner)
+	assert.Equal(t, 0, paused.Attempt, "the pause leaves the attempt for the recovery claim to charge")
+	requireStoredStates(t, stor, apply.ID, state.Apply.FailedRetryable, map[int64]string{ops[0].ID: state.ApplyOperation.FailedRetryable})
+
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "recovery-driver")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a freshly paused apply is within its retry budget")
+	assert.Equal(t, 1, claimed.Attempt, "the recovery is charged against the retry budget")
+}
+
+// A multi-operation apply: the drive copying `users` died, its operation and
+// the parent's leases are stale, and a sibling operation for `orders` has not
+// started. The engine reports the `users` copy failing retryably. The parent and
+// the failed operation are paused for retry together — the parent state the
+// rollout projection derives from a failed_retryable operation — and the
+// pending sibling is left as it was. Redispatching the failed operation charges
+// the parent's retry budget.
+func TestLocalClient_ConflictCheckPausesAStaleMultiOperationApplyForRetry(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client := newRetryableFailureClient(t, dsn, stor)
+
+	apply, ops := seedStaleRetryableApply(t, stor, dsn, []staleRetryMember{
+		{deployment: "testdb", table: "users", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
+		{deployment: "testdb-2", table: "orders", opState: state.ApplyOperation.Pending, taskState: state.Task.Pending, taskAge: time.Minute},
+	})
+	leaveLeaseStale(t, dsn, "applies", apply.ID, storage.LeaseOwnerProcess()+"/driver-0", "apply-token-dead")
+	leaveLeaseStale(t, dsn, "apply_operations", ops[0].ID, storage.LeaseOwnerProcess()+"/driver-0", "op-token-dead")
+
+	err := checkConflictOnTestdb(t, client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema change already in progress")
+
+	requireStoredStates(t, stor, apply.ID, state.Apply.FailedRetryable, map[int64]string{
+		ops[0].ID: state.ApplyOperation.FailedRetryable,
+		ops[1].ID: state.ApplyOperation.Pending,
+	})
+
+	redispatched, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "recovery-driver")
+	require.NoError(t, err)
+	require.NotNil(t, redispatched)
+	assert.Equal(t, ops[0].ID, redispatched.ID, "the paused operation is redispatched")
+	charged, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, charged)
+	assert.Equal(t, 1, charged.Attempt, "the redispatch is charged against the parent's retry budget")
+}
+
+// The same stale `users` drive, but a sibling operation's drive for `orders`
+// is live and heartbeating its own lease. Pausing the parent would put a live
+// rollout under a retry it did not ask for, so the store refuses the move: the
+// task still rests failed_retryable and holds the database, and the apply and
+// both operations are left as they were.
+func TestLocalClient_ConflictCheckLeavesTheApplyActiveUnderALiveSiblingDrive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client := newRetryableFailureClient(t, dsn, stor)
+
+	apply, ops := seedStaleRetryableApply(t, stor, dsn, []staleRetryMember{
+		{deployment: "testdb", table: "users", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
+		{deployment: "testdb-2", table: "orders", opState: state.ApplyOperation.Running, taskState: state.Task.Running, taskAge: time.Minute},
+	})
+	leaveLeaseStale(t, dsn, "applies", apply.ID, storage.LeaseOwnerProcess()+"/driver-0", "apply-token-dead")
+	leaveLeaseStale(t, dsn, "apply_operations", ops[0].ID, storage.LeaseOwnerProcess()+"/driver-0", "op-token-dead")
+	execSQL(t, dsn, "UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(), updated_at = NOW() WHERE id = ?",
+		"live-host/77/driver-3", "op-token-live", ops[1].ID)
+
+	err := checkConflictOnTestdb(t, client)
+	require.Error(t, err, "the task keeps holding the database")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+
+	task, err := stor.Tasks().Get(ctx, apply.ApplyIdentifier+"-users")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Equal(t, state.Task.FailedRetryable, task.State)
+	requireStoredStates(t, stor, apply.ID, state.Apply.Running, map[int64]string{
+		ops[0].ID: state.ApplyOperation.Running,
+		ops[1].ID: state.ApplyOperation.Running,
+	})
+	stored, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "apply-token-dead", stored.LeaseToken, "the refused move writes nothing")
 }

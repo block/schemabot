@@ -645,11 +645,12 @@ func rollupTaskStatus(cells []TableProgressData) string {
 }
 
 // writeFailedTargets names each failed or retrying target and its error, the
-// way the sharded comment names a failed shard.
+// way the sharded comment names a failed shard. A target stopped at the
+// cutover for another's failure is not listed or counted as failed.
 func writeFailedTargets(sb *strings.Builder, model presentation.Apply, g presentation.Group) {
 	var failed []presentation.Deployment
 	for _, i := range g.Members {
-		if d := model.Deployments[i]; isShardFailureState(d.State) {
+		if d := model.Deployments[i]; d.FailedOrRetrying() {
 			failed = append(failed, d)
 		}
 	}

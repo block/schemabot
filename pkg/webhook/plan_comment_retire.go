@@ -23,6 +23,10 @@ type planCommentSlot struct {
 	// UpToDate records that the comment shows nothing to act on, so a later
 	// plan can tell whether the comment still matches its outcome.
 	UpToDate bool
+	// BaseSchemaNotice records that the comment warns the base branch has
+	// newer changes to the schema, or that it could not check, so a later plan
+	// can tell whether the comment still says the same about the base.
+	BaseSchemaNotice bool
 }
 
 // environmentScope canonicalizes the slot's environments (sorted,
@@ -90,6 +94,7 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		GitHubCommentID:  commentID,
 		GitHubNodeID:     nodeID,
 		UpToDate:         slot.UpToDate,
+		BaseSchemaNotice: slot.BaseSchemaNotice,
 	}
 	if err := h.service.Storage().PlanComments().Insert(ctx, posted); err != nil {
 		// The comment is live on GitHub either way, but without a row it can
@@ -148,8 +153,9 @@ func (h *Handler) retireSupersededPlanComments(ctx context.Context, client *ghcl
 // fits this head: the push left the schema inputs unchanged, or the plan
 // re-runs after a terminal apply. The live target can still move without the
 // inputs — a change applied outside this PR turns a plan with DDL into no
-// changes — so the answer is kept only while its recorded outcome matches
-// slot.UpToDate. Otherwise an answer from a prior head is replaced, so an
+// changes — and so can the base branch, so the answer is kept only while its
+// recorded outcome matches slot.UpToDate and its recorded base-schema notice
+// matches slot.BaseSchemaNotice. Otherwise an answer from a prior head is replaced, so an
 // auto-plan that resolves to no changes supersedes it rather than leaving it
 // in place. An answer already rendered at this head is kept while its outcome
 // matches, either way.
@@ -204,9 +210,14 @@ func (h *Handler) planCommentAnswerNeedsReplacing(ctx context.Context, repo stri
 		return false
 	}
 	answerAttrs := append(planCommentAttrs(answer), "current_head_sha", slot.HeadSHA,
-		"comment_up_to_date", answer.UpToDate, "plan_up_to_date", slot.UpToDate)
+		"comment_up_to_date", answer.UpToDate, "plan_up_to_date", slot.UpToDate,
+		"comment_base_schema_notice", answer.BaseSchemaNotice, "plan_base_schema_notice", slot.BaseSchemaNotice)
 	if answer.UpToDate != slot.UpToDate {
 		h.logger.Info("the visible plan comment shows a different outcome than this head's plan; this head's plan comment replaces it", answerAttrs...)
+		return true
+	}
+	if answer.BaseSchemaNotice != slot.BaseSchemaNotice {
+		h.logger.Info("the visible plan comment says something different about the base branch than this head's plan; this head's plan comment replaces it", answerAttrs...)
 		return true
 	}
 	if answer.HeadSHA != slot.HeadSHA && !keepMatchingOutcome {
@@ -279,11 +290,18 @@ func (h *Handler) retireStalePlanCommentsForPR(ctx context.Context, client *ghcl
 // nothing replacing it — minimized comments are never automatically restored,
 // and deleted comments cannot be restored at all. On a fetch failure or a
 // moved head nothing is retired — the newer head's own plan outcome sweeps
-// instead. attrs name what is being swept.
+// instead. A run whose context has ended skips the sweep without an error:
+// the sweep is cleanup, and the next supersede sweep finishes it. attrs name
+// what is being swept.
 func (h *Handler) planSweepHeadIsCurrent(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, attrs ...any) bool {
 	sweepAttrs := append([]any{"repo", repo, "pr", pr, "head_sha", headSHA}, attrs...)
 
 	freshPR, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil && ctx.Err() != nil {
+		h.logger.Info("skipping stale plan comment sweep because its run has ended; prior plan comments stay visible until the next supersede sweep",
+			append(sweepAttrs, "cause", context.Cause(ctx), "error", err)...)
+		return false
+	}
 	if err != nil {
 		h.logger.Error("failed to verify PR head for stale plan comment sweep; prior plan comments stay visible until the next supersede sweep",
 			append(sweepAttrs, "error", err)...)

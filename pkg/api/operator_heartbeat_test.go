@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -54,6 +57,141 @@ func TestOperationHeartbeatFailureStopsDrive(t *testing.T) {
 		hbErr := errors.New("connection refused")
 		lastSuccess := time.Now().Add(-storage.ApplyLeaseStaleAfter)
 		assert.True(t, svc.operationHeartbeatFailureStopsDrive(t.Context(), 1, op, apply, hbErr, lastSuccess))
+	})
+
+	t.Run("a timed-out write inside the window keeps driving", func(t *testing.T) {
+		hbErr := fmt.Errorf("%w after 15s: %w", storage.ErrLeaseHeartbeatTimedOut, context.DeadlineExceeded)
+		assert.False(t, svc.operationHeartbeatFailureStopsDrive(t.Context(), 1, op, apply, hbErr, time.Now()))
+	})
+
+	t.Run("timed-out writes spanning the staleness window stop the driver", func(t *testing.T) {
+		hbErr := fmt.Errorf("%w after 15s: %w", storage.ErrLeaseHeartbeatTimedOut, context.DeadlineExceeded)
+		lastSuccess := time.Now().Add(-storage.ApplyLeaseStaleAfter)
+		assert.True(t, svc.operationHeartbeatFailureStopsDrive(t.Context(), 1, op, apply, hbErr, lastSuccess))
+	})
+}
+
+// hangingHeartbeatOperationStore is an operation store whose heartbeat write is
+// stuck on a half-open storage connection: it returns only once its context
+// ends, the way the SQL driver unblocks a read when its context is done.
+type hangingHeartbeatOperationStore struct {
+	storage.ApplyOperationStore
+	attempts atomic.Int32
+}
+
+func (s *hangingHeartbeatOperationStore) Heartbeat(ctx context.Context, id int64) error {
+	s.attempts.Add(1)
+	<-ctx.Done()
+	return fmt.Errorf("heartbeat apply_operation %d: %w", id, ctx.Err())
+}
+
+// TestOperationHeartbeatThatHangsStopsTheDrive covers an operation drive whose
+// storage connection has gone half-open: every heartbeat write hangs instead
+// of failing. A peer reclaims the row once its heartbeat is older than the
+// staleness window, so the drive must stop by then too. Each hung write is cut
+// off and counted as a failed heartbeat, and the run is cancelled no later than
+// the end of the window, so two drivers never run the operation's engine work
+// at once.
+func TestOperationHeartbeatThatHangsStopsTheDrive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		ops := &hangingHeartbeatOperationStore{}
+		svc := New(&resumePromotionStorage{applyOps: ops}, testServerConfig(), nil, logger)
+		op := &storage.ApplyOperation{
+			ID:            7,
+			ApplyID:       41,
+			Deployment:    "default",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Running,
+		}
+		apply := &storage.Apply{
+			ID:              41,
+			ApplyIdentifier: "apply-operation-heartbeat-hangs",
+			Database:        "widgets",
+			Deployment:      "default",
+			Environment:     "staging",
+			State:           state.Apply.Running,
+		}
+
+		runCtx, cancelRun := context.WithCancel(t.Context())
+		defer cancelRun()
+		driveStart := time.Now()
+		stop := svc.startApplyOperationHeartbeat(runCtx, 1, op, apply, cancelRun)
+		defer stop()
+
+		select {
+		case <-runCtx.Done():
+		case <-time.After(2 * storage.ApplyLeaseStaleAfter):
+			require.Fail(t, "a drive whose heartbeat writes hang must stop once a peer can reclaim its operation")
+		}
+		assert.LessOrEqual(t, time.Since(driveStart), storage.ApplyLeaseStaleAfter,
+			"the drive must stop no later than a peer may reclaim the row")
+		assert.GreaterOrEqual(t, ops.attempts.Load(), int32(2), "each hung write is cut off and retried")
+	})
+}
+
+// countingHeartbeatOperationStore is an operation store whose heartbeat write
+// always succeeds and counts each attempt.
+type countingHeartbeatOperationStore struct {
+	storage.ApplyOperationStore
+	heartbeats atomic.Int32
+}
+
+func (s *countingHeartbeatOperationStore) Heartbeat(context.Context, int64) error {
+	s.heartbeats.Add(1)
+	return nil
+}
+
+// hangingTaskStore is a task store whose reads are stuck on a half-open storage
+// connection: they return only once their context ends.
+type hangingTaskStore struct {
+	storage.TaskStore
+}
+
+func (s *hangingTaskStore) GetByApplyOperationID(ctx context.Context, id int64) ([]*storage.Task, error) {
+	<-ctx.Done()
+	return nil, fmt.Errorf("get tasks for apply_operation %d: %w", id, ctx.Err())
+}
+
+// TestOperationHeartbeatKeepsBeatingWhenAFollowUpReadHangs covers a resumed
+// operation whose heartbeat writes succeed while the task read that follows
+// each one hangs on a half-open connection. The read is cut off and retried on
+// the next tick, so the loop keeps renewing the lease and the drive keeps
+// running instead of the loop stalling behind the read.
+func TestOperationHeartbeatKeepsBeatingWhenAFollowUpReadHangs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		ops := &countingHeartbeatOperationStore{}
+		svc := New(&resumePromotionStorage{applyOps: ops, tasks: &hangingTaskStore{}}, testServerConfig(), nil, logger)
+		op := &storage.ApplyOperation{
+			ID:            7,
+			ApplyID:       41,
+			Deployment:    "default",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Resuming,
+		}
+		apply := &storage.Apply{
+			ID:              41,
+			ApplyIdentifier: "apply-operation-follow-up-read-hangs",
+			Database:        "widgets",
+			Deployment:      "default",
+			Environment:     "staging",
+			State:           state.Apply.Running,
+		}
+
+		runCtx, cancelRun := context.WithCancel(t.Context())
+		defer cancelRun()
+		stop := svc.startApplyOperationHeartbeat(runCtx, 1, op, apply, cancelRun)
+
+		select {
+		case <-runCtx.Done():
+			require.Fail(t, "a hung read after a successful heartbeat must not stop the drive")
+		case <-time.After(2 * storage.ApplyLeaseStaleAfter):
+		}
+		stop()
+		minHeartbeats := int32(2 * storage.ApplyLeaseStaleAfter / (ApplyOperationHeartbeatInterval + storage.LeaseHeartbeatAttemptTimeout))
+		assert.GreaterOrEqual(t, ops.heartbeats.Load(), minHeartbeats,
+			"each hung read is cut off, so the loop goes on renewing the lease")
 	})
 }
 

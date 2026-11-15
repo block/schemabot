@@ -1,6 +1,9 @@
 package github
 
 import (
+	"io"
+	"log/slog"
+	"slices"
 	"testing"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -40,6 +43,13 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 		{name: "renamed to a non-schema file", files: []PRFile{{Filename: "schema/removed/orders.txt", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
 		{name: "environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
 		{name: "brace environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
+		{name: "removed namespace symlink", files: []PRFile{{Filename: "schema/removed", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}, want: []string{"removed"}},
+		{name: "removed namespace symlink with an environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}, want: []string{"removed_test"}},
+		{name: "namespace symlink renamed away", files: []PRFile{{Filename: "archive/removed", PreviousFilename: "schema/removed", Status: "renamed", PreviousSymlink: true, VacatedDirectoryLink: true}}, want: []string{"removed"}},
+		{name: "removed symlink to a namespace head still declares", files: []PRFile{{Filename: "schema/surviving", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}},
+		{name: "removed symlink inside a namespace", files: []PRFile{{Filename: "schema/removed/link", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}},
+		{name: "removed symlink to a file directly under the root", files: []PRFile{{Filename: "schema/README", Status: "removed", Symlink: true}}},
+		{name: "renamed regular file at a namespace path", files: []PRFile{{Filename: "archive/removed", PreviousFilename: "schema/removed", Status: "renamed"}}},
 	}
 
 	for _, tt := range tests {
@@ -76,11 +86,15 @@ func TestVacatedSchemaFilesReportsDeletionsOfTheVacatedPath(t *testing.T) {
 		{Filename: "schema/removed/vschema.json", Status: "removed"},
 		{Filename: "schema/payments/archive/backfill.sql", Status: "removed"},
 		{Filename: "schema/added/new.sql", Status: "added"},
+		{Filename: "archive/linked", PreviousFilename: "schema/linked", Status: "renamed", PreviousSymlink: true, VacatedDirectoryLink: true},
+		{Filename: "schema/payments/link", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+		{Filename: "schema/README", Status: "removed", Symlink: true},
 	}, "schema/")
 
 	assert.Equal(t, []PRFile{
 		{Filename: "schema/removed/orders.sql", Status: "removed"},
 		{Filename: "schema/removed/vschema.json", Status: "removed"},
+		{Filename: "schema/linked", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
 	}, vacated)
 }
 
@@ -223,4 +237,23 @@ func TestGroupFilesByNamespace_MixedLayout_Rejected(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "both flat files and namespace subdirectories")
+}
+
+// Removing an environment's own schema root symlink, such as
+// orders/schema/staging -> production, moves staging's schema root back to
+// the config directory. The link then sits directly under that root, but it
+// named the environment's root, not a namespace, so it empties nothing.
+// Another environment's link and namespace links are kept.
+func TestWithoutEnvironmentLinkDropsTheEnvironmentsOwnLink(t *testing.T) {
+	ic := NewInstallationClient(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	vacated := []PRFile{
+		{Filename: "orders/schema/staging", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+		{Filename: "orders/schema/production", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+		{Filename: "orders/schema/orders_archive", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+	}
+
+	assert.Equal(t, []string{"orders/schema/production", "orders/schema/orders_archive"},
+		filenames(ic.withoutEnvironmentLink("octocat/hello-world", 1, slices.Clone(vacated), "orders/schema", "staging")))
+	assert.Equal(t, filenames(vacated), filenames(ic.withoutEnvironmentLink("octocat/hello-world", 1, slices.Clone(vacated), "orders/schema", "")),
+		"a request with no environment has no environment link")
 }

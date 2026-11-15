@@ -380,10 +380,18 @@ func isOperationFailureState(opState string) bool {
 // presentation.DeriveShards reads them.
 func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
 	work := make([]presentation.ShardWork, 0, len(groups))
+	var all []*storage.ApplyOperation
+	for _, g := range groups {
+		all = append(all, g.ops...)
+	}
+	endedBy := endedByRefs(all)
 	for _, g := range groups {
 		sw := presentation.ShardWork{Keyspace: g.namespace, Shard: g.shard}
 		for _, op := range g.ops {
 			sw.Operations = append(sw.Operations, presentation.Operation{
+				Deployment:        op.Deployment,
+				OperationKey:      op.OperationKey,
+				EndedBy:           endedBy[op.ID],
 				State:             op.State,
 				Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 				Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
@@ -398,11 +406,13 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 	out := make(map[string][]templates.ShardStatus, len(groups))
 	for _, s := range presentation.DeriveShards(applyState, work) {
 		out[s.Keyspace] = append(out[s.Keyspace], templates.ShardStatus{
-			Shard: s.Shard,
-			Emoji: s.Emoji,
-			Label: s.Label,
-			State: s.State,
-			Error: s.Error,
+			Shard:            s.Shard,
+			Emoji:            s.Emoji,
+			Label:            s.Label,
+			State:            s.State,
+			Error:            s.Error,
+			StoppedAtCutover: s.Presentation == presentation.StateStoppedAtCutover,
+			EndedBy:          s.EndedBy,
 		})
 	}
 	return out
@@ -569,23 +579,48 @@ func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.Apply
 	if data.ErrorMessage == "" {
 		data.ErrorMessage = mostSignificantFailure(ops, tasksByOp)
 	}
+	data.StoppedAtCutover = tablesStoppedAtCutover(workOps)
 	return data
 }
 
 // mostSignificantFailure is the error of the operation an operator should act
 // on first (presentation.ShardStateRank) when that operation failed, and ""
-// otherwise.
+// otherwise. An operation failed for another (ended_by_operation_id) never
+// failed on its own, so it is never the one named.
 func mostSignificantFailure(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) string {
-	best := ops[0]
-	for _, op := range ops[1:] {
-		if presentation.ShardStateRank(op.State) > presentation.ShardStateRank(best.State) {
+	var best *storage.ApplyOperation
+	for _, op := range ops {
+		if op.EndedByOperationID != 0 {
+			continue
+		}
+		if best == nil || presentation.ShardStateRank(op.State) > presentation.ShardStateRank(best.State) {
 			best = op
 		}
 	}
-	if !isOperationFailureState(best.State) {
+	if best == nil || !isOperationFailureState(best.State) {
 		return ""
 	}
 	return shardOperationError(best, tasksByOp[best.ID])
+}
+
+// tablesStoppedAtCutover counts the table operations of a single-shard layout
+// that SchemaBot stopped at the cutover because another failed, naming that
+// other operation's table when it is listed. ops are the layout's shard work
+// operations, one per keyspace and table.
+func tablesStoppedAtCutover(ops []*storage.ApplyOperation) presentation.StoppedAtCutover {
+	tableByID := make(map[int64]string, len(ops))
+	for _, op := range ops {
+		if _, _, table, ok := state.ShardWorkKey(op.OperationKey); ok {
+			tableByID[op.ID] = table
+		}
+	}
+	var stopped presentation.StoppedAtCutover
+	for _, op := range ops {
+		if op.EndedByOperationID != 0 && isOperationFailureState(op.State) {
+			stopped.Add(tableByID[op.EndedByOperationID])
+		}
+	}
+	return stopped
 }
 
 // applyOperationKeys returns the keys of every operation the apply is made of:

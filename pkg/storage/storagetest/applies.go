@@ -20,6 +20,8 @@ import (
 // create/get/update lifecycle, claimability and lease rotation, stale-lease
 // recovery, lease-guarded writes, and concurrent claim exclusion.
 func TestApplies(t *testing.T, h Harness) {
+	t.Run("EndedOperation", func(t *testing.T) { testEndedOperationApplies(t, h) })
+
 	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -425,18 +427,69 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Empty(t, persisted.ErrorMessage)
 	})
 
+	// Every row here has no lease owner, so only the state guard moves it.
+	// These are the states a retry restarts from running: the apply is copying,
+	// or staging the change before any rows move.
+	t.Run("MarkStaleApplyRetryable_MovesEveryRestartableState", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		for i, applyState := range []string{
+			state.Apply.Running,
+			state.Apply.RunningDegraded,
+			state.Apply.CatchingUp,
+			state.Apply.Checksumming,
+			state.Apply.PostChecksum,
+			state.Apply.Resuming,
+			state.Apply.PreparingBranch,
+			state.Apply.ApplyingBranchChanges,
+			state.Apply.ValidatingBranch,
+			state.Apply.CreatingDeployRequest,
+			state.Apply.ValidatingDeployRequest,
+		} {
+			t.Run(applyState, func(t *testing.T) {
+				lock := CreateLock(t, store, "apply_stale_restartable_"+applyState+"_db", storage.DatabaseTypeMySQL)
+				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stale_restartable_"+applyState, int64(9430+i), applyState, "production")
+
+				moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+					ApplyID:      apply.ID,
+					ErrorMessage: "driver gone during the copy",
+				})
+				require.NoError(t, err)
+				assert.True(t, moved)
+
+				persisted, err := store.Applies().Get(ctx, apply.ID)
+				require.NoError(t, err)
+				require.NotNil(t, persisted)
+				assert.Equal(t, state.Apply.FailedRetryable, persisted.State)
+				assert.Equal(t, "driver gone during the copy", persisted.ErrorMessage)
+			})
+		}
+	})
+
 	// Every row here has no lease owner, so only the state guard keeps it
-	// where it is.
-	t.Run("MarkStaleApplyRetryable_NeverMovesAnApplyOutsideTheActiveStates", func(t *testing.T) {
+	// where it is. Resting and terminal applies are never reopened; an apply
+	// waiting for a deploy, at or past its cutover (recovering reattaches to a
+	// cutover checkpoint), or in its revert window has work behind it that a
+	// retry's running would misdescribe, so it is left to the stale-active
+	// claim.
+	t.Run("MarkStaleApplyRetryable_NeverMovesAnApplyOutsideTheRestartableStates", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		for i, applyState := range []string{
 			state.Apply.Pending,
 			state.Apply.FailedRetryable,
 			state.Apply.Stopped,
+			state.Apply.Paused,
 			state.Apply.Completed,
 			state.Apply.Failed,
 			state.Apply.Cancelled,
+			state.Apply.WaitingForDeploy,
+			state.Apply.WaitingForCutover,
+			state.Apply.Recovering,
+			state.Apply.CuttingOver,
+			state.Apply.RevertWindow,
+			state.Apply.Reverting,
+			state.Apply.SkippingRevert,
 		} {
 			t.Run(applyState, func(t *testing.T) {
 				lock := CreateLock(t, store, "apply_stale_retryable_"+applyState+"_db", storage.DatabaseTypeMySQL)
@@ -498,6 +551,83 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, charged)
 		assert.Equal(t, 1, charged.Attempt, "the redispatch charges the parent's retry budget")
+	})
+
+	// Marking a stale apply retryable records why. An over-long reason is
+	// stored cut to fit, on the apply and on its operation alike, so the move
+	// lands instead of being refused.
+	t.Run("MarkStaleApplyRetryable_StoresAnOverLongReasonCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_retryable_long_db", storage.DatabaseTypeMySQL)
+		apply, op := createStaleRunningApplyWithOperation(t, store, lock, "apply_stale_retryable_long", 9425)
+
+		moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+			ApplyID:      apply.ID,
+			OperationID:  op.ID,
+			ErrorMessage: overLongFailureMessage,
+		})
+		require.NoError(t, err)
+		require.True(t, moved, "a stale apply marked retryable with a long reason moves")
+
+		marked, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, marked)
+		assert.Equal(t, state.Apply.FailedRetryable, marked.State)
+		assertStoredMessage(t, overLongFailureMessageStored, marked.ErrorMessage, "the apply's reason is cut")
+		markedOp, err := store.ApplyOperations().Get(ctx, op.ID)
+		require.NoError(t, err)
+		require.NotNil(t, markedOp)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, markedOp.State)
+		assertStoredMessage(t, overLongFailureMessageStored, markedOp.ErrorMessage, "the operation's reason is cut")
+	})
+
+	// An apply created already carrying a failure, and the projection that
+	// derives the parent's state from its operations, store an over-long
+	// failure cut to fit rather than refusing the row.
+	t.Run("FailureMessage_PastColumnWidth_OnCreateAndDerivedState_IsCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_long_failure_create_db", storage.DatabaseTypeMySQL)
+		newFailedApply := func(identifier string, planID int64) *storage.Apply {
+			return &storage.Apply{
+				ApplyIdentifier: identifier,
+				LockID:          lock.ID,
+				PlanID:          planID,
+				Database:        lock.DatabaseName,
+				DatabaseType:    lock.DatabaseType,
+				Environment:     "staging",
+				Engine:          storage.EngineForType(lock.DatabaseType),
+				State:           state.Apply.Failed,
+				ErrorMessage:    overLongFailureMessage,
+			}
+		}
+
+		created := newFailedApply("apply_long_failure_create", 9430)
+		createdID, err := store.Applies().Create(ctx, created)
+		require.NoError(t, err, "an apply created with a long failure message is stored")
+		got, err := store.Applies().Get(ctx, createdID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assertStoredMessage(t, overLongFailureMessageStored, got.ErrorMessage, "the create cuts the message")
+
+		withTasks := newFailedApply("apply_long_failure_create_tasks", 9431)
+		withTasksID, err := store.Applies().CreateWithTasks(ctx, withTasks, []*storage.Task{newTask(withTasks, "task_long_failure_create_tasks", "users", time.Now())})
+		require.NoError(t, err, "an apply created with its tasks and a long failure message is stored")
+		got, err = store.Applies().Get(ctx, withTasksID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assertStoredMessage(t, overLongFailureMessageStored, got.ErrorMessage, "the create with tasks cuts the message")
+
+		derived := CreateApplyWithStateAndEnv(t, store, lock, "apply_long_failure_derived", 9432, state.Apply.Running, "staging")
+		swapped, err := store.Applies().UpdateDerivedState(ctx, derived.ID, derived.State, state.Apply.Failed, overLongFailureMessage, nil, nil)
+		require.NoError(t, err, "a derived failure with a long message is stored")
+		require.True(t, swapped)
+		got, err = store.Applies().Get(ctx, derived.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, state.Apply.Failed, got.State)
+		assertStoredMessage(t, overLongFailureMessageStored, got.ErrorMessage, "the derived state cuts the message")
 	})
 
 	t.Run("MarkStaleApplyRetryable_LeavesBothRowsWhenTheOperationTokenMoved", func(t *testing.T) {
@@ -562,7 +692,7 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "a spent retry budget stops recovery claims")
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, apply.ID, expired[0].Apply.ID)
@@ -1262,6 +1392,11 @@ func TestApplies(t *testing.T, h Harness) {
 		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "a running operation holds its deployment even with no lease on it")
 		assert.Contains(t, err.Error(), "apply_rollout_failed_early", "the refusal names the apply still in progress")
 		assert.Contains(t, err.Error(), "running operation on deployment region-b", "the refusal names the operation keeping it live")
+		conflict, ok := errors.AsType[*storage.ActiveApplyError](err)
+		require.True(t, ok, "the refusal carries the holding apply: %v", err)
+		assert.Equal(t, "apply_rollout_failed_early", conflict.HolderApplyID)
+		assert.Equal(t, state.Apply.Failed, conflict.HolderState, "the refusal reports the holder's own state, which decides which controls it still accepts")
+		assert.Equal(t, "production", conflict.Environment)
 		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_a_while_running", 9302, "region-a"), storage.ErrActiveApplyExists,
 			"a deployment whose operation failed stays reserved while the rollout is live")
 		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_c_while_running", 9303, "region-c"), storage.ErrActiveApplyExists,
@@ -1562,8 +1697,9 @@ func TestApplies(t *testing.T, h Harness) {
 	// A deployment-keyed generation declared two targets and only target-002
 	// attached before the data plane failed. The operator drives that lone row
 	// under its operation lease because the manifest still expects target-001,
-	// so the redispatch claim charges the parent's retry budget and moves the
-	// row to running, the same as when a sibling has attached.
+	// so the redispatch claim charges the operation's retry budget, raises the
+	// parent's attempt to it, and moves the row to running, the same as when a
+	// sibling has attached.
 	t.Run("FindNextApplyOperation_ManifestExpectedRedispatchMovesTheRowToRunning", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1582,7 +1718,7 @@ func TestApplies(t *testing.T, h Harness) {
 		parent, err := store.Applies().Get(ctx, rollout.ID)
 		require.NoError(t, err)
 		require.NotNil(t, parent)
-		assert.Equal(t, 1, parent.Attempt, "the redispatch consumes one unit of the parent retry budget")
+		assert.Equal(t, 1, parent.Attempt, "the redispatch raises the parent attempt to the operation's")
 
 		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 		require.NoError(t, err)
@@ -2109,7 +2245,19 @@ func TestApplies(t *testing.T, h Harness) {
 			return store.CheckLease(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
 		},
 		"ExpireRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			_, err := store.ExpireRetryable(t.Context(), 10)
+			_, err := store.ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
+			return err
+		},
+		"ListAppliesHeldByEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ListAppliesHeldByEndedOperation(t.Context(), []string{storage.DatabaseTypeMySQL}, 10)
+			return err
+		},
+		"SettleAppliesStoppedForEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.SettleAppliesStoppedForEndedOperation(t.Context(), 10)
+			return err
+		},
+		"ExpireRetryableOperations_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ExpireRetryableOperations(t.Context(), 10)
 			return err
 		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {

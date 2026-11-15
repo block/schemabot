@@ -59,7 +59,7 @@ func (a Apply) TableSteps(g Group) (TableSteps, bool) {
 // copying, queued, waiting between tables, at cutover or in its revert window
 // is where the table count already places it.
 var tableStepOutcomeStates = []PresentationState{
-	StateFailed, StateRetrying, StateHalted, StatePaused, StateStopped, StateCancelled, StateReverted, StateUnknown,
+	StateFailed, StateRetrying, StateHalted, StatePaused, StateStopped, StateStoppedAtCutover, StateCancelled, StateReverted, StateUnknown,
 }
 
 // TableStepsHeadline states a rollout run table by table in one line, the

@@ -80,6 +80,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentPlanIgnoredNamespaces, templates.PreviewCommentPlanExemptTables,
 		templates.PreviewCommentPlanUnmanagedSchema,
 		templates.PreviewCommentPlanIgnoreTables,
+		templates.PreviewCommentPlanWhoCanApply,
 		templates.PreviewCommentPlanDirect,
 		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
 		templates.PreviewCommentPlanCopyDiscardedPaused,
@@ -110,7 +111,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyRetrying,
 		templates.PreviewCommentApplyRemoteRetryablePause,
 		templates.PreviewCommentApplyStopped,
-		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
+		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyWaitingCutoverAutomatic,
+		templates.PreviewCommentApplyWaitingCutoverLanded, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
 		templates.PreviewCommentMultiDeployCompleted, templates.PreviewCommentMultiDeployAll,
 		templates.PreviewCLIMultiDeployInProgress, templates.PreviewCLIMultiDeployFailed,
@@ -311,6 +313,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
   comment_apply_waiting_cutover_automatic Waiting for cutover (non-deferred, drive triggers)
+  comment_apply_waiting_cutover_landed Waiting for cutover after one table has completed
   comment_apply_cutting_over    Cutting over
   cli_multi_deploy_in_progress  CLI multi-deployment apply in progress
   cli_multi_deploy_failed       CLI multi-deployment apply with one failed deployment

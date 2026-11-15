@@ -401,7 +401,7 @@ func TestDurableCheckRunDriverReplansCurrentHead(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
 		fileListCalls.Add(1)
 		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
-			{"filename": "README.md", "status": "modified"},
+			{"filename": "README.md", "status": "modified", "additions": 4, "deletions": 2},
 		}))
 	})
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}

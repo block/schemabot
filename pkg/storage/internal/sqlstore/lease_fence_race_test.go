@@ -102,8 +102,8 @@ func TestLeaseFencedWritesFailClosedUnderReadCommittedMySQL(t *testing.T) {
 
 // An operation lease speaks only for its own operation's tasks: a driver
 // holding a sibling operation's current lease must not write this task. The
-// mis-scoped write matches no row, and the sibling's lease is still current,
-// so Update reports no lease loss; the task row is what the test checks.
+// write is refused rather than reported as landed, so a caller never counts a
+// task as settled when its row did not move.
 func TestTaskStore_OperationLeaseDoesNotWriteASiblingOperationsTask(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -122,7 +122,7 @@ func TestTaskStore_OperationLeaseDoesNotWriteASiblingOperationsTask(t *testing.T
 
 	siblingCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: sibling, Owner: "driver-b", Token: "tok-b"})
 	task.State = state.Task.Failed
-	require.NoError(t, store.Tasks().Update(siblingCtx, task))
+	require.ErrorIs(t, store.Tasks().Update(siblingCtx, task), storage.ErrTaskOutsideOperationLease)
 	assert.Equal(t, state.Task.Pending, loadTask(t, store, task.TaskIdentifier).State, "a sibling operation's lease must not write this task")
 }
 

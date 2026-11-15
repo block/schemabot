@@ -444,7 +444,7 @@ func (c *StaticDSNFromConfig) validate(target, databaseType string) error {
 		}
 		return nil
 	}
-	if err := validatePostgresDSNParams(c.Params); err != nil {
+	if err := ValidatePostgresDSNParams(c.Params); err != nil {
 		return fmt.Errorf("target %q dsn_from: %w", target, err)
 	}
 	if c.CARef != "" {

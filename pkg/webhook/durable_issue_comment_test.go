@@ -470,6 +470,30 @@ func TestDurableIssueCommentDriverCompletesUnregisteredRepo(t *testing.T) {
 	}
 }
 
+// An apply command enqueued before its repository became listen-only completes
+// as a no-op at drive time, without creating a client, so the apply never
+// starts.
+func TestDurableIssueCommentDriverCompletesListenOnlyRepo(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot apply -e production"))
+	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/hello-world": {ListenOnly: true}}}
+	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
+	h := newDurableDriverHandler(t, store, config, factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected listen-only issue_comment delivery to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	select {
+	case <-factory.forInstallationStarted:
+		t.Fatal("listen-only repo must not create a GitHub client")
+	default:
+	}
+}
+
 // durableIssueCommentCoreConfig returns a server config where the test repo is
 // registered and the databases registry configures "orders" for production
 // only, so an apply targeting another environment reaches the command core and

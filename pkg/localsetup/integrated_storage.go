@@ -36,7 +36,7 @@ func PrepareIntegratedStorage(ctx context.Context, manager localruntime.Manager,
 	if data != nil {
 		return nil
 	}
-	dsn, err := r.Connection.ResolveDSN()
+	dsn, err := r.Connection.ResolveDSN(r.Engine)
 	if err != nil {
 		return fmt.Errorf("resolve application connection")
 	}

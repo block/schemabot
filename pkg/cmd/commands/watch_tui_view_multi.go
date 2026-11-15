@@ -96,6 +96,9 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Name)))
 		}
 	}
+	if note := templates.RolloutStoppedAtCutoverNote(model, groups); note != "" {
+		fmt.Fprintf(b, "⏹️ %s\n", note)
+	}
 }
 
 // rolloutStateIsActive reports whether the rollout is still working toward its

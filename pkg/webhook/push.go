@@ -109,7 +109,7 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 
 	// When check publishing is disabled for this repo, SchemaBot's check is not
 	// required either, so there is no check source to maintain.
-	if !h.shouldPublishChecks(ctx, repo, "default_branch_check") {
+	if !h.shouldRunPassingAggregateChecks(ctx, repo, "default_branch_check") {
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check publishing disabled"})
 		return
 	}
@@ -167,6 +167,10 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 		return
 	}
 
+	if h.isRepoListenOnly(repo) {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "default-branch checks skipped (listen-only repository)"})
+		return
+	}
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "default-branch checks posted"})
 }
 
@@ -259,8 +263,8 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		return false, nil
 	}
 
-	if !h.shouldPublishChecks(ctx, repo, "default_branch_check") {
-		// shouldPublishChecks logs and records the skip.
+	if !h.shouldRunPassingAggregateChecks(ctx, repo, "default_branch_check") {
+		// shouldRunPassingAggregateChecks logs and records the skip.
 		return false, nil
 	}
 
@@ -285,6 +289,11 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		return true, fmt.Errorf("post durable default-branch checks for %s@%s: %w", repo, headSHA, err)
 	}
 
+	if h.isRepoListenOnly(repo) {
+		h.logger.Info("durable default-branch delivery completed without posting checks because the repository is listen-only",
+			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
+		return false, nil
+	}
 	h.logger.Info("durable default-branch checks posted",
 		"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
 	return false, nil

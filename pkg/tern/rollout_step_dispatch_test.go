@@ -150,7 +150,7 @@ func TestPlanForApplyRequest_MemberStepBuildsItsTargetsWholePlan(t *testing.T) {
 	c := newPlanMaterializeClientWithPlan(store, testapp002LivePlan())
 	req := memberStepDispatch("2", "orders")
 
-	got, err := c.planForApplyRequest(t.Context(), req)
+	got, _, err := c.planForApplyRequest(t.Context(), req)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
@@ -181,7 +181,7 @@ func TestPlanForApplyRequest_MemberStepRefusesAPlanItsLiveSchemaDisagreesWith(t 
 	live.Changes[0].TableChanges = live.Changes[0].TableChanges[1:]
 	c := newPlanMaterializeClientWithPlan(store, live)
 
-	got, err := c.planForApplyRequest(t.Context(), memberStepDispatch("2", "orders"))
+	got, _, err := c.planForApplyRequest(t.Context(), memberStepDispatch("2", "orders"))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "local schema has drifted from the reviewed plan")
@@ -200,7 +200,7 @@ func TestPlanForApplyRequest_RefusesAStepWithNoPlanToBuildFrom(t *testing.T) {
 	req := memberStepDispatch("1", "users")
 	req.PlanDdlChanges = nil
 
-	got, err := c.planForApplyRequest(t.Context(), req)
+	got, _, err := c.planForApplyRequest(t.Context(), req)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dispatch for rollout step 1 has no plan plan-testapp-002 stored on this deployment and carries no plan to build it from")

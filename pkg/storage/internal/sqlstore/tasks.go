@@ -92,7 +92,7 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
-		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
+		task.State, nullString(storedMessage(ctx, "tasks.error_message", task.ErrorMessage, task.LogAttrs)), string(options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
@@ -257,7 +257,7 @@ func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	boundEngineReportedFields(task)
 	args := []any{
-		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
+		task.State, nullString(storedMessage(ctx, "tasks.error_message", task.ErrorMessage, task.LogAttrs)), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID), task.DDL,
 		task.StartedAt, task.CompletedAt,
@@ -276,6 +276,14 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	} else if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
+		}
+		// The guarded statement matches only the leased operation's rows, so a
+		// task of another operation would update nothing while the lease check
+		// still passed, and the caller would read a write that never landed as
+		// one that did.
+		if task.ApplyOperationID == nil || *task.ApplyOperationID != opLease.OperationID {
+			return fmt.Errorf("update task %d (%s) of operation %s under the lease for operation %d: %w",
+				task.ID, task.TaskIdentifier, taskOperationLabel(task), opLease.OperationID, storage.ErrTaskOutsideOperationLease)
 		}
 		guard = taskGuardOperation
 		args = append(args, opLease.OperationID, opLease.Token)
@@ -306,6 +314,14 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		return verifyLeaseStillOwned()
 	}
 	return nil
+}
+
+// taskOperationLabel names a task's operation for an error message.
+func taskOperationLabel(task *storage.Task) string {
+	if task.ApplyOperationID == nil {
+		return "none"
+	}
+	return strconv.FormatInt(*task.ApplyOperationID, 10)
 }
 
 // UpsertShardProgress creates or updates the per-shard task row for
@@ -493,7 +509,7 @@ const shardTaskInsertColumns = `
 // per-shard task INSERT ... SELECT, matching shardTaskInsertColumns.
 // shardTaskInsertStatement renders the lease guard; the caller appends the
 // guard's args.
-func shardTaskInsertValues(task *storage.Task) (string, []any) {
+func shardTaskInsertValues(ctx context.Context, task *storage.Task) (string, []any) {
 	boundEngineReportedFields(task)
 	options := task.Options
 	if len(options) == 0 {
@@ -504,7 +520,7 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
-			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
+			task.State, nullString(storedMessage(ctx, "tasks.error_message", task.ErrorMessage, task.LogAttrs)), string(options), task.Attempt,
 			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
@@ -529,7 +545,7 @@ func shardTaskInsertStatement(d Dialect, values, leaseTable, leaseAlias string) 
 // operation's lease_token matches means a displaced operator inserts zero rows
 // and fails closed rather than writing a stale shard row.
 func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Task, opLease storage.OperationLease) error {
-	values, args := shardTaskInsertValues(task)
+	values, args := shardTaskInsertValues(ctx, task)
 	args = append(args, opLease.OperationID, opLease.Token)
 	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
 		shardTaskInsertStatement(s.dialect, values, "apply_operations", "ao"), args...)
@@ -557,7 +573,7 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 // INSERT ... SELECT ... WHERE the apply's lease_token matches means a displaced
 // operator inserts zero rows and fails closed rather than writing a stale row.
 func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *storage.Task, lease storage.ApplyLease) error {
-	values, args := shardTaskInsertValues(task)
+	values, args := shardTaskInsertValues(ctx, task)
 	args = append(args, lease.ApplyID, lease.Token)
 	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
 		shardTaskInsertStatement(s.dialect, values, "applies", "a"), args...)
@@ -1219,7 +1235,7 @@ func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Ta
 	args := []any{taskState}
 	if state.IsState(parent.State, state.Apply.Failed) {
 		setClause = "state = ?, error_message = COALESCE(NULLIF(error_message, ''), ?), completed_at = COALESCE(completed_at, NOW())"
-		args = []any{taskState, nullString(parent.ErrorMessage)}
+		args = []any{taskState, nullString(storedMessage(ctx, "tasks.error_message", parent.ErrorMessage, task.LogAttrs))}
 	}
 	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
 	args = append(args, task.ID, task.State)

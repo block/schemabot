@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -206,6 +207,11 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	// with no aggregate config) never fetch files or fold — their behavior is
 	// unchanged.
 	var expectedParticipants []api.ExpectedTenant
+	// proposedFiles is what the PR proposes against the default branch. Only
+	// the unscoped leader reads it, and leaderReadProposedFiles records that it
+	// did.
+	var proposedFiles []ghclient.PRFile
+	leaderReadProposedFiles := false
 	if config.IsAggregateLeaderForRepo(repo) && len(config.AllowedEnvironments) == 0 {
 		files, err := client.FetchPRFiles(ctx, repo, pr)
 		if err != nil {
@@ -225,24 +231,82 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
 			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("fetch PR files for aggregate leader %s#%d: %w", repo, pr, err)
 		}
-		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
+		// The participants a PR requires are read from what it proposes against
+		// the default branch, the list auto-plan reads, so a file the PR only
+		// inherited from history it has not caught up with expects no
+		// participant on any path. Without the comparison the leader cannot
+		// tell an inherited file from a proposed one, so it fails closed the
+		// same way as a failed listing.
+		listed := files
+		files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("aggregate leader cannot scope PR files to what the PR proposes, not publishing aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("scope PR files for aggregate leader %s#%d to what it proposes: %w", repo, pr, err)
+		}
+		// A participant only the listed files select keeps blocking while its
+		// own Check Run on this head is not passing; one it cannot read leaves
+		// the leader unable to tell, so it fails closed the same way.
+		expectedParticipants, err = h.leaderParticipantsForPR(ctx, client, repo, pr, headSHA, listed, files)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("aggregate leader cannot read a participant the PR no longer proposes work for, not publishing aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("resolve participants for aggregate leader %s#%d: %w", repo, pr, err)
+		}
+		proposedFiles = files
+		leaderReadProposedFiles = true
 	}
 
 	var scope *aggregatePRScope
+	// expectedByEnvironment is what an environment-scoped fold reads in place
+	// of expectedParticipants.
+	var expectedByEnvironment map[string][]api.ExpectedTenant
 	if len(config.AllowedEnvironments) > 0 {
 		var scopeErr error
 		scope, scopeErr = h.discoverAggregatePRScope(ctx, client, repo, pr, headSHA)
-		if scopeErr != nil {
-			h.logger.Error("aggregate scope could not be verified; no no-work success will be published",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "error", scopeErr)
-			errorsByEnvironment := map[string]string{}
-			for _, target := range h.aggregateCheckTargetsForRepo(repo) {
-				errorsByEnvironment[target.environment] = "Environment coverage could not be verified. Retry planning this PR."
-			}
-			h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errorsByEnvironment, checkBlockReason{})
-			return aggregateFoldScheduleParticipantRefold, scopeErr
+		if errors.Is(scopeErr, errAggregateHeadMoved) {
+			// The same disposition as a head that was already superseded when
+			// the fold began: a failing aggregate on the old head would gate
+			// nothing, and a leader's bounded re-fold reads the new head.
+			h.logger.Info("aggregate fold stopped because the PR head moved during discovery; the new head's own fold publishes its aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA)
+			return aggregateFoldScheduleRefold, nil
 		}
-		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(scope.files))
+		if scopeErr != nil {
+			return h.failAggregatesForUnverifiedScope(ctx, client, repo, pr, headSHA, scopeErr)
+		}
+		// Each environment's aggregate folds the participants it expects for
+		// that environment. A participant only the listed files select keeps
+		// blocking while its own run for the environment on this head is not
+		// passing; one the leader cannot read leaves it unable to tell, so it
+		// fails closed the same way as the unscoped leader.
+		expectedByEnvironment, err = h.expectedParticipantsByEnvironment(ctx, client, repo, pr, headSHA, scope)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("scoped aggregate leader cannot read a participant the PR no longer proposes work for, not publishing aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("resolve participants for scoped aggregate leader %s#%d: %w", repo, pr, err)
+		}
+		// Unlike a failed read, an environment the order omits is a known
+		// coverage gap, so every aggregate fails as it does when discovery
+		// finds the same gap in a participant the PR proposes work for.
+		if err := scope.validateExpectedParticipantOrder(config, expectedByEnvironment); err != nil {
+			return h.failAggregatesForUnverifiedScope(ctx, client, repo, pr, headSHA, err)
+		}
 		if h.isAggregateParticipant(repo) && !scope.participantSelected && !hasBlockingCheckForEnvironment(dbChecks, aggregateSentinel) {
 			h.logger.Debug("aggregate participant has no selected paths; staying silent", "repo", repo, "pr", pr, "head_sha", headSHA)
 			return aggregateFoldNoFollowUp, nil
@@ -262,6 +326,9 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 			return aggregateFoldScheduleRefold, nil
 		}
 	} else if len(dbChecks) == 0 && len(expectedParticipants) == 0 {
+		if leaderReadProposedFiles {
+			return h.settleLeaderAggregateWithNoProposedWork(ctx, client, repo, pr, headSHA, checks, proposedFiles)
+		}
 		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate", "repo", repo, "pr", pr)
 		return aggregateFoldNoFollowUp, nil
 	}
@@ -297,7 +364,7 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		}
 		for _, env := range environments {
 			envChecks := filterChecksByEnvironment(dbChecks, env)
-			participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedParticipants, retryPending)
+			participantChecks, retriable := h.participantCheckOutcomes(ctx, client, repo, pr, env, headSHA, expectedByEnvironment[env], retryPending)
 			participantsRetriable = participantsRetriable || retriable
 			envChecks = h.withLocalPrerequisites(envChecks, dbChecks, env, repo, pr, headSHA)
 			envChecks = append(envChecks, participantChecks...)
@@ -311,12 +378,12 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 				if !config.IsEnvironmentAllowed(prior) {
 					continue
 				}
-				priorChecks, retry := h.participantCheckOutcomes(ctx, client, repo, pr, prior, headSHA, expectedParticipants, retryPending)
+				priorChecks, retry := h.participantCheckOutcomes(ctx, client, repo, pr, prior, headSHA, expectedByEnvironment[prior], retryPending)
 				participantsRetriable = participantsRetriable || retry
 				for _, check := range priorChecks {
 					if check.Status != checkStatusCompleted || check.Conclusion != checkConclusionSuccess {
 						check.BlockingReason = prerequisiteContribution
-						for _, tenant := range expectedParticipants {
+						for _, tenant := range expectedByEnvironment[prior] {
 							if tenant.Tenant == check.DatabaseName {
 								check.ChangeSummary = participantCheckName(tenant.CheckName, prior)
 							}
@@ -363,6 +430,92 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		// state, such as a passing aggregate persisting over a just-claimed
 		// rollback.
 		return aggregateFoldScheduleParticipantRefold, errors.Join(upsertErrs...)
+	}
+	return aggregateFoldClearParticipantRefoldBudget, nil
+}
+
+// failAggregatesForUnverifiedScope fails every aggregate the repository
+// publishes when the fold cannot establish which environments the PR's
+// participants and databases cover. It returns scopeErr with the follow-up that
+// arms the bounded re-fold.
+func (h *Handler) failAggregatesForUnverifiedScope(
+	ctx context.Context,
+	client *ghclient.InstallationClient,
+	repo string,
+	pr int,
+	headSHA string,
+	scopeErr error,
+) (aggregateFoldFollowUp, error) {
+	h.logger.Error("aggregate scope could not be verified; no no-work success will be published",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "error", scopeErr)
+	errorsByEnvironment := map[string]string{}
+	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+		errorsByEnvironment[target.environment] = "Environment coverage could not be verified. Retry planning this PR."
+	}
+	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errorsByEnvironment, checkBlockReason{})
+	return aggregateFoldScheduleParticipantRefold, scopeErr
+}
+
+// settleLeaderAggregateWithNoProposedWork handles an unscoped leader fold that
+// finds no per-database checks and no expected participant in what the PR
+// proposes against the default branch.
+//
+// That answer can change on the same head commit: when the default branch
+// acquires a change the PR carried, the participant it selected is no longer
+// expected and, if it never reported, never will. A participant that did report
+// a run on the head that is not passing stays expected
+// (participantsExpectedOnHead), so this is reached only when every dropped
+// participant has no run on the head or a passing one. An aggregate this leader
+// already published on the head while waiting for that participant would then
+// block with nothing left to fold it again (MG-10), so a non-passing aggregate on
+// the head is settled through the verified no-work publish, which leaves stored
+// blockers and any stored aggregate block in place. Everything else stays
+// silent: with no aggregate on the head, the head-commit events own the first
+// publish, and while the PR still proposes SchemaBot files the leader's own plan
+// owns the gate.
+//
+// The settle runs only when something else folds the PR. Nothing re-folds open
+// PRs when the default branch moves, and the participant refold budget runs out
+// shortly after the participant was first expected, so an aggregate left
+// waiting when the default branch absorbs the change converges here only on a
+// later fold event, such as a Check Run or a command on the PR.
+func (h *Handler) settleLeaderAggregateWithNoProposedWork(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, headSHA string,
+	stored []*storage.Check, proposedFiles []ghclient.PRFile,
+) (aggregateFoldFollowUp, error) {
+	var existing *storage.Check
+	for _, c := range stored {
+		if isAggregateCheck(c) && c.Environment == aggregateSentinel {
+			existing = c
+		}
+	}
+	if existing == nil {
+		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate and no stored aggregate; staying silent",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return aggregateFoldNoFollowUp, nil
+	}
+	if existing.HeadSHA != headSHA {
+		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate and the stored aggregate names another commit; staying silent",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "aggregate_head_sha", existing.HeadSHA)
+		return aggregateFoldNoFollowUp, nil
+	}
+	if existing.Status == checkStatusCompleted && existing.Conclusion == checkConclusionSuccess {
+		h.logger.Debug("no per-database checks or expected participants for unscoped aggregate and the aggregate on this head already passes",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "check_run_id", existing.CheckRunID)
+		return aggregateFoldNoFollowUp, nil
+	}
+	if prHasCurrentSchemaBotFiles(proposedFiles) {
+		h.logger.Info("unscoped aggregate keeps blocking: no participant is expected, but the PR still proposes SchemaBot files whose plan has stored no checks",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "check_run_id", existing.CheckRunID,
+			"check_status", existing.Status, "conclusion", existing.Conclusion)
+		return aggregateFoldNoFollowUp, nil
+	}
+	h.logger.Info("settling unscoped aggregate as verified no-work: the PR no longer proposes anything an expected participant or this leader must check",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "check_run_id", existing.CheckRunID,
+		"check_status", existing.Status, "conclusion", existing.Conclusion)
+	if err := h.postPassingAggregateTargets(ctx, client, repo, pr, headSHA, nil, h.aggregateCheckTargetsForRepo(repo)); err != nil {
+		return aggregateFoldScheduleParticipantRefold, fmt.Errorf("settle unscoped aggregate with no proposed work for %s#%d: %w", repo, pr, err)
 	}
 	return aggregateFoldClearParticipantRefoldBudget, nil
 }
@@ -947,6 +1100,44 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errors, checkBlockReason{})
 }
 
+// failClosedPostTimeout bounds a failing aggregate post that runs past the
+// deadline of the run that found the failure.
+const failClosedPostTimeout = 10 * time.Second
+
+// failClosedPostContext returns the context a failing aggregate post runs on.
+// The post is what tells the author why the PR is blocked, and the failure it
+// reports is often the run's own work deadline, so it must not lose to that
+// same deadline. When an auto-plan run's or a PR command's deadline has passed,
+// or leaves less than failClosedPostTimeout, the post gets its own short
+// budget.
+//
+// That budget hangs off the context the run was started from, so whatever
+// would have stopped the run still stops the post at any point: for a durable
+// delivery that is lease loss or shutdown, and the delivery is re-run by
+// whichever driver picks it up next. A run started from a context that never
+// ends is bounded by the budget alone. The post also starts with an empty
+// PR-info cache, so its head check reads the PR again rather than trusting a
+// head cached before a push could have replaced it.
+func (h *Handler) failClosedPostContext(ctx context.Context, repo string, pr int, headSHA string) (context.Context, context.CancelFunc) {
+	parent, isBoundedRun := runParent(ctx)
+	if !isBoundedRun {
+		return ctx, func() {}
+	}
+	if parent.Err() != nil {
+		h.logger.Info("failing aggregate post keeps the run's context because the run has ended; the next driver re-runs the delivery",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "cause", context.Cause(parent))
+		return ctx, func() {}
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline || time.Until(deadline) >= failClosedPostTimeout {
+		return ctx, func() {}
+	}
+	h.logger.Info("failing aggregate post runs on its own budget because the run that found the failure is at or near its deadline",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "budget", failClosedPostTimeout, "run_time_left", time.Until(deadline).Round(time.Millisecond))
+	postCtx, cancel := context.WithTimeout(parent, failClosedPostTimeout)
+	return ghclient.WithPRInfoCache(postCtx), cancel
+}
+
 // postFailingAggregatesWithBlock stores a blocking reason only for callers with
 // a stable failure class. Generic plan errors should use postFailingAggregates.
 //
@@ -954,6 +1145,16 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 // and stored. A caller about to fold the aggregate from stored check state
 // reads false as "the fold may not see this failure" and must not fold.
 func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) bool {
+	return h.postFailingAggregateTargetsWithBlock(ctx, client, repo, pr, headSHA, h.aggregateCheckTargetsForRepo(repo), errors, block)
+}
+
+// postFailingAggregateTargetsWithBlock is postFailingAggregatesWithBlock over
+// the aggregates the caller names. With allowed environments configured, it
+// posts the targets whose environment has an error.
+func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, targets []aggregateCheckTarget, errors map[string]string, block checkBlockReason) bool {
+	ctx, cancel := h.failClosedPostContext(ctx, repo, pr, headSHA)
+	defer cancel()
+
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return false
 	}
@@ -972,7 +1173,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 
 	var checks []envCheck
 	if len(config.AllowedEnvironments) > 0 {
-		for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+		for _, target := range targets {
 			env := target.environment
 			if _, hasError := errors[env]; hasError {
 				checks = append(checks, envCheck{
@@ -1063,7 +1264,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Environment: ec.environment,
 				Status:      "error",
 			})
-			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "error", err)
+			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "environment", ec.environment, "check_name", ec.name, "error", err)
 			stored = false
 			continue
 		}
@@ -1089,7 +1290,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Environment: ec.environment,
 				Status:      "error",
 			})
-			h.logger.Error("failed to store failing aggregate check", "error", err)
+			h.logger.Error("failed to store failing aggregate check", "repo", repo, "pr", pr, "head_sha", headSHA, "environment", ec.environment, "check_name", ec.name, "check_run_id", id, "error", err)
 			stored = false
 			continue
 		}

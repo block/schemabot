@@ -31,6 +31,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/dbconn"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1009,13 +1010,16 @@ func validatePositiveDuration(context, field, value string) error {
 	return nil
 }
 
-// DSNFromConfig configures a MySQL DSN assembled from separate secret values.
+// DSNFromConfig configures a DSN assembled from separate secret values: a Go
+// MySQL driver DSN for MySQL-family databases (and for storage), or a libpq URL
+// for a PostgreSQL database.
 type DSNFromConfig struct {
 	// ConfigRef is a secret reference containing database connection metadata.
 	ConfigRef string `yaml:"config_ref"`
 
 	// ConfigPaths selects fields from the referenced config document. Paths are
-	// dot-separated YAML map keys and default to host, port, and database.
+	// dot-separated YAML map keys and default to host, port, and database (dbname
+	// for a PostgreSQL database).
 	ConfigPaths DSNFromConfigPaths `yaml:"config_paths,omitempty"`
 
 	// Username is the database user to include in the generated DSN.
@@ -1024,15 +1028,21 @@ type DSNFromConfig struct {
 	// PasswordRef is a secret reference containing the database user's password.
 	PasswordRef string `yaml:"password_ref"`
 
-	// Params are appended as MySQL DSN query parameters.
+	// Params are appended as MySQL DSN query parameters. For a PostgreSQL
+	// database they are validate-only under the assembler's allowlist: the
+	// libpq URL always carries sslmode=verify-full and nothing else.
 	Params map[string]string `yaml:"params,omitempty"`
 }
 
 // DSNFromConfigPaths configures where to find connection fields in ConfigRef.
 type DSNFromConfigPaths struct {
-	Host     string `yaml:"host,omitempty"`
-	Port     string `yaml:"port,omitempty"`
+	Host string `yaml:"host,omitempty"`
+	Port string `yaml:"port,omitempty"`
+	// Database is the database name path for MySQL-family DSNs.
 	Database string `yaml:"database,omitempty"`
+	// DBName is the database name path for a PostgreSQL database, named as on
+	// a target_resolver target's dsn_from so the two blocks read the same.
+	DBName string `yaml:"dbname,omitempty"`
 }
 
 // TargetResolverConfig configures the data-plane connection resolver. Targets
@@ -1299,6 +1309,12 @@ type DatabaseReviewPolicyConfig struct {
 	// approve still comes from the instance-wide review_policy: its admins,
 	// repo admins, this database's operators, and CODEOWNERS when included.
 	Enabled bool `yaml:"enabled,omitempty"`
+
+	// RequireReapproval overrides review_policy.require_reapproval for this
+	// database, in either direction. Unset, the database follows the
+	// instance-wide value. Setting it needs the review gate on for the
+	// database.
+	RequireReapproval *bool `yaml:"require_reapproval,omitempty"`
 }
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
@@ -1339,6 +1355,18 @@ type ReviewPolicyConfig struct {
 	// IncludeCodeowners allows matching CODEOWNERS approvals to satisfy the
 	// review gate. Defaults to false.
 	IncludeCodeowners bool `yaml:"include_codeowners,omitempty"`
+
+	// RequireReapproval decides whether an approval on an earlier commit
+	// still counts after the PR's schema change differs from the one it
+	// reviewed. True makes SchemaBot compare the commits and require a new
+	// approval when they differ. False keeps every authorized approval
+	// counting until the reviewer withdraws it or GitHub dismisses it. Unset,
+	// the default, follows the PR's base branch: when its rules dismiss stale
+	// approvals on push, GitHub has already removed every stale approval, so
+	// SchemaBot does not compare; otherwise, or when SchemaBot cannot read
+	// those rules, it compares as if true. A database's own
+	// review_policy.require_reapproval overrides it.
+	RequireReapproval *bool `yaml:"require_reapproval,omitempty"`
 }
 
 // EnvironmentConfig holds per-environment database configuration.
@@ -1350,7 +1378,8 @@ type EnvironmentConfig struct {
 	DSN string `yaml:"dsn"`
 
 	// DSNFrom builds the database connection string for local mode from separate
-	// database config and password references. It is mutually exclusive with DSN.
+	// database config and password references, in the format the database's
+	// type connects with. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
 
 	// Target is the opaque Tern-facing target identifier for gRPC mode.
@@ -1841,6 +1870,15 @@ type RepoConfig struct {
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
 	EnableChecks *bool `yaml:"enable_checks,omitempty"`
+
+	// ListenOnly makes SchemaBot read from this repository without ever
+	// writing to it: webhooks are processed and GitHub is read as for any
+	// repository, but no comment, reaction, review request, or Check Run is
+	// sent, and comment commands are ignored, so no apply ever starts from
+	// it. It lets a deployment measure what a repository costs in GitHub
+	// requests before that repository is onboarded. Listen-only implies
+	// enable_checks: false, and cannot be combined with an aggregate role.
+	ListenOnly bool `yaml:"listen_only,omitempty"`
 
 	// GitHubApp names the App in ServerConfig.Apps that owns webhooks and
 	// outbound GitHub API calls for this repository. Required when Apps is
@@ -2525,7 +2563,7 @@ func (c *ServerConfig) Validate() error {
 			case hasScalarRouting && hasMapRouting:
 				return fmt.Errorf("database %q environment %q cannot configure both scalar target/deployment and a deployments map", name, env)
 			case hasDSN:
-				if err := envConfig.validateLocalDSNConfig(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+				if err := envConfig.validateLocalDSNConfig(fmt.Sprintf("database %q environment %q", name, env), dbConfig.Type); err != nil {
 					return err
 				}
 				continue
@@ -2589,6 +2627,9 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("repos repository key %q must be canonical", repo)
 		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
+			return err
+		}
+		if err := validateListenOnlyRepo(repo, repoConfig); err != nil {
 			return err
 		}
 		if err := validateRepoActorAuthorization(repo, repoConfig); err != nil {
@@ -3517,16 +3558,66 @@ func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 
 // AreChecksEnabled returns whether SchemaBot should publish GitHub Check Runs
 // for the given repository. Repositories not present in the server-side repo
-// config use the default enabled behavior.
+// config use the default enabled behavior. A listen-only repository never
+// publishes Check Runs.
 func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 	if c == nil || len(c.Repos) == 0 {
 		return true
 	}
 	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
-	if !ok || repoConfig.EnableChecks == nil {
+	if !ok {
+		return true
+	}
+	if repoConfig.ListenOnly {
+		return false
+	}
+	if repoConfig.EnableChecks == nil {
 		return true
 	}
 	return *repoConfig.EnableChecks
+}
+
+// validateListenOnlyRepo rejects settings that ask a listen-only repository
+// to write to GitHub. Check Runs are writes, and an aggregate leader or
+// participant exists to publish or nudge a check other deployments rely on,
+// so either combination would be a config that cannot do what it says.
+func validateListenOnlyRepo(repo string, repoConfig RepoConfig) error {
+	if !repoConfig.ListenOnly {
+		return nil
+	}
+	if repoConfig.EnableChecks != nil && *repoConfig.EnableChecks {
+		return fmt.Errorf("repos %q: listen_only cannot be combined with enable_checks: true, because a listen-only repository never publishes Check Runs", repo)
+	}
+	if repoConfig.Aggregate != nil {
+		return fmt.Errorf("repos %q: listen_only cannot be combined with aggregate, because a listen-only repository never publishes or nudges a check", repo)
+	}
+	return nil
+}
+
+// HasListenOnlyRepos reports whether any configured repository is
+// listen-only. A GitHub client installs its listen-only guard only when one
+// is, so a deployment without listen-only repositories sends every request
+// unchanged.
+func (c *ServerConfig) HasListenOnlyRepos() bool {
+	if c == nil {
+		return false
+	}
+	for _, repoConfig := range c.Repos {
+		if repoConfig.ListenOnly {
+			return true
+		}
+	}
+	return false
+}
+
+// IsRepoListenOnly returns whether SchemaBot reads from the repository without
+// ever writing to it. Only a repository configured with listen_only: true is.
+func (c *ServerConfig) IsRepoListenOnly(repo string) bool {
+	if c == nil {
+		return false
+	}
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
+	return ok && repoConfig.ListenOnly
 }
 
 // DeletesUnactionedPlanComments returns whether this server uses the
@@ -3922,7 +4013,7 @@ func (c *ServerConfig) StorageDSN() (string, error) {
 
 func (c *ServerConfig) resolveStorageDSN() (string, error) {
 	if c.Storage.DSNFrom != nil {
-		return c.Storage.DSNFrom.Resolve()
+		return c.Storage.DSNFrom.Resolve(storage.DatabaseTypeMySQL)
 	}
 	if c.Storage.DSN == "" {
 		if dsn := os.Getenv("STORAGE_DSN"); dsn != "" {
@@ -3937,7 +4028,7 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
 	}
 	if c.DSNFrom != nil {
-		if err := c.DSNFrom.Validate(context); err != nil {
+		if err := c.DSNFrom.Validate(context, storage.DatabaseTypeMySQL); err != nil {
 			return err
 		}
 	}
@@ -3974,22 +4065,24 @@ func (c EnvironmentConfig) HasLocalDSN() bool {
 	return c.DSN != "" || c.DSNFrom != nil
 }
 
-func (c EnvironmentConfig) validateLocalDSNConfig(context string) error {
+func (c EnvironmentConfig) validateLocalDSNConfig(context, databaseType string) error {
 	if c.DSN != "" && c.DSNFrom != nil {
 		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
 	}
 	if c.DSNFrom != nil {
-		return c.DSNFrom.Validate(context)
+		return c.DSNFrom.Validate(context, databaseType)
 	}
 	return nil
 }
 
-func (c EnvironmentConfig) ResolveDSN() (string, error) {
+// ResolveDSN returns the environment's local connection string for a database
+// of the given type, which selects the DSN format dsn_from assembles.
+func (c EnvironmentConfig) ResolveDSN(databaseType string) (string, error) {
 	if c.resolvedLocalDSN != "" {
 		return c.resolvedLocalDSN, nil
 	}
 	if c.DSNFrom != nil {
-		return c.DSNFrom.Resolve()
+		return c.DSNFrom.Resolve(databaseType)
 	}
 	return secrets.Resolve(c.DSN, "")
 }
@@ -4153,16 +4246,13 @@ func (c *ServerConfig) DirectExecutionPolicyFor(database, environment, databaseT
 	return c.DirectExecutionPolicy(c.DatabaseEnvironment(database, environment), databaseType)
 }
 
-func (c *DSNFromConfig) Validate(context string) error {
+// Validate checks a dsn_from block for a database of the given type. The type
+// selects the DSN format: MySQL-family types assemble a Go MySQL driver DSN, a
+// PostgreSQL database assembles a libpq URL, and any other type fails closed
+// because no assembler builds its DSN.
+func (c *DSNFromConfig) Validate(context, databaseType string) error {
 	if c.ConfigRef == "" {
 		return fmt.Errorf("%s dsn_from missing config_ref", context)
-	}
-	paths := c.configPaths()
-	if paths.Host == "" {
-		return fmt.Errorf("%s dsn_from missing config_paths.host", context)
-	}
-	if paths.Database == "" {
-		return fmt.Errorf("%s dsn_from missing config_paths.database", context)
 	}
 	if c.Username == "" {
 		return fmt.Errorf("%s dsn_from missing username", context)
@@ -4170,11 +4260,28 @@ func (c *DSNFromConfig) Validate(context string) error {
 	if c.PasswordRef == "" {
 		return fmt.Errorf("%s dsn_from missing password_ref", context)
 	}
+	switch schema.DialectForDatabaseType(databaseType) {
+	case schema.DialectMySQL:
+		if c.ConfigPaths.DBName != "" {
+			return fmt.Errorf("%s dsn_from config_paths.dbname is only supported for postgres databases; use config_paths.database", context)
+		}
+	case schema.DialectPostgres:
+		if c.ConfigPaths.Database != "" {
+			return fmt.Errorf("%s dsn_from config_paths.database is not supported for postgres databases; use config_paths.dbname", context)
+		}
+		if err := inventory.ValidatePostgresDSNParams(c.Params); err != nil {
+			return fmt.Errorf("%s dsn_from: %w", context, err)
+		}
+	default:
+		return fmt.Errorf("%s dsn_from is not supported with database type %q; use dsn", context, databaseType)
+	}
 	return nil
 }
 
-func (c *DSNFromConfig) Resolve() (string, error) {
-	if err := c.Validate("database connection"); err != nil {
+// Resolve assembles the DSN for a database of the given type from the
+// referenced config document and password, both read fresh.
+func (c *DSNFromConfig) Resolve(databaseType string) (string, error) {
+	if err := c.Validate("database connection", databaseType); err != nil {
 		return "", err
 	}
 
@@ -4188,21 +4295,26 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 		return "", fmt.Errorf("parse database config: %w", err)
 	}
 
-	paths := c.configPaths()
+	paths := c.configPaths(databaseType)
 	host, err := stringAtPath(config, paths.Host)
 	if err != nil {
 		return "", fmt.Errorf("read database config host: %w", err)
 	}
-	database, err := stringAtPath(config, paths.Database)
+	isPostgres := schema.DialectForDatabaseType(databaseType) == schema.DialectPostgres
+	databaseField, databasePath := "database", paths.Database
+	if isPostgres {
+		databaseField, databasePath = "dbname", paths.DBName
+	}
+	database, err := stringAtPath(config, databasePath)
 	if err != nil {
-		return "", fmt.Errorf("read database config database: %w", err)
+		return "", fmt.Errorf("read database config %s: %w", databaseField, err)
 	}
 	port, err := optionalIntAtPath(config, paths.Port)
 	if err != nil {
 		return "", fmt.Errorf("read database config port: %w", err)
 	}
 	endpoint := externalDatabaseEndpoint{Host: host, Port: port, Database: database}
-	if err := endpoint.validate(); err != nil {
+	if err := endpoint.validate(databaseField); err != nil {
 		return "", err
 	}
 
@@ -4211,9 +4323,13 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 		return "", fmt.Errorf("resolve database password reference: %w", err)
 	}
 
+	if isPostgres {
+		return c.assemblePostgres(endpoint, password)
+	}
+
 	mysqlConfig := gomysql.NewConfig()
 	mysqlConfig.Net = "tcp"
-	mysqlConfig.Addr = endpoint.address()
+	mysqlConfig.Addr = endpoint.address("3306")
 	mysqlConfig.User = c.Username
 	mysqlConfig.Passwd = password
 	mysqlConfig.DBName = endpoint.Database
@@ -4222,13 +4338,47 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 	return mysqlConfig.FormatDSN(), nil
 }
 
-func (c *DSNFromConfig) configPaths() DSNFromConfigPaths {
+// assemblePostgres builds the libpq URL through the same assembler a
+// target_resolver target's dsn_from uses, so both blocks escape, require a
+// database name, and pin sslmode=verify-full identically. No CA reference is
+// configured, so the assembler resolves one only for an RDS host, to the
+// embedded RDS bundle; any other host fails here rather than falling back to
+// ambient trust. The returned metadata is safe to drop because the connection
+// layer makes the same choice for a verify-full RDS URL without sslrootcert:
+// it verifies against the embedded bundle unless the process's libpq
+// environment (PGSSLROOTCERT) names other roots, exactly as it does for a
+// target_resolver target.
+func (c *DSNFromConfig) assemblePostgres(endpoint externalDatabaseEndpoint, password string) (string, error) {
+	address := endpoint.address("5432")
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("parse postgres address %q: %w", address, err)
+	}
+	if !dbconn.IsRDSHost(strings.ToLower(host)) {
+		return "", fmt.Errorf("host %q is not an RDS endpoint: dsn_from on a postgres database verifies only RDS hosts, so set dsn for this host instead", host)
+	}
+	assembler := inventory.PostgresConnectionAssembler{Params: c.Params}
+	attrs := map[string]string{inventory.PostgresDBNameAttribute: endpoint.Database}
+	dsn, _, err := assembler.Assemble(address, attrs, &inventory.Credentials{Username: c.Username, Password: password})
+	if err != nil {
+		return "", fmt.Errorf("assemble postgres DSN: %w", err)
+	}
+	return dsn, nil
+}
+
+func (c *DSNFromConfig) configPaths(databaseType string) DSNFromConfigPaths {
 	paths := c.ConfigPaths
 	if paths.Host == "" {
 		paths.Host = "host"
 	}
 	if paths.Port == "" {
 		paths.Port = "port"
+	}
+	if schema.DialectForDatabaseType(databaseType) == schema.DialectPostgres {
+		if paths.DBName == "" {
+			paths.DBName = inventory.PostgresDBNameAttribute
+		}
+		return paths
 	}
 	if paths.Database == "" {
 		paths.Database = "database"
@@ -4304,22 +4454,25 @@ func valueAtPath(document any, path string) (any, error) {
 	return current, nil
 }
 
-func (e externalDatabaseEndpoint) validate() error {
+// validate reports a missing host or database name. databaseField is the
+// key the database name was read from (database or dbname), so the error
+// names the key the operator has to set.
+func (e externalDatabaseEndpoint) validate(databaseField string) error {
 	if e.Host == "" {
 		return fmt.Errorf("database config missing host")
 	}
 	if e.Database == "" {
-		return fmt.Errorf("database config missing database")
+		return fmt.Errorf("database config missing %s", databaseField)
 	}
 	return nil
 }
 
-func (e externalDatabaseEndpoint) address() string {
+func (e externalDatabaseEndpoint) address(defaultPort string) string {
 	if _, _, err := net.SplitHostPort(e.Host); err == nil {
 		return e.Host
 	}
 	if e.Port == 0 {
-		return net.JoinHostPort(e.Host, "3306")
+		return net.JoinHostPort(e.Host, defaultPort)
 	}
 	return net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
 }

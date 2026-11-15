@@ -446,7 +446,7 @@ func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 	if len(warnings) == 0 {
 		return
 	}
-	fmt.Printf("\U0001f4a1 Lint Warnings (%d):\n", len(warnings))
+	fmt.Printf("%s Lint Warnings (%d):\n", glyph.Tip, len(warnings))
 	for _, w := range warnings {
 		if w.Table != "" {
 			fmt.Printf("  • %s: %s\n", w.Table, w.Message)

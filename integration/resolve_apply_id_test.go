@@ -84,9 +84,6 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 	t.Cleanup(func() { utils.CloseAndLog(httpSrv) })
 	baseURL := "http://" + httpLis.Addr().String()
 
-	// Wait for HTTP server to be ready.
-	waitForHTTP(t, baseURL+"/health", 5*time.Second)
-
 	// 3. Plan: create a table with a unique name to avoid conflicts with other tests.
 	tableName := fmt.Sprintf("resolve_%d", time.Now().UnixNano()%100000)
 	schemaSQL := fmt.Sprintf(`CREATE TABLE %s (

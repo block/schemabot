@@ -2110,6 +2110,29 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
 	})
 
+	// A pause for retry whose reason is past the column's width stores the
+	// reason cut to fit, so the pause lands instead of being refused.
+	t.Run("MarkFailedRetryable_StoresAnOverLongReasonCutToFit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_failed_retryable_long_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_failed_retryable_long", 913)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, overLongFailureMessage))
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, operation.State)
+		assertStoredMessage(t, overLongFailureMessageStored, operation.ErrorMessage, "the pause cuts the reason")
+	})
+
 	// ClearEngineResumeState verifies the clear removes both the context and
 	// the metadata so a later read reports the state missing, takes the same
 	// lease fence as the other operation writes, and is a no-op on a row whose
@@ -2857,6 +2880,97 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.ApplyOperations().ListRecentTargets(t.Context(), storage.DatabaseTypeVitess, time.Hour)
 		require.Error(t, err)
+	})
+
+	// An interruption reaches both shards of an apply at once, as a data plane
+	// restart does. Each shard spends one attempt of its own budget, so the
+	// apply's attempt reads 1 rather than 2. When a shard fails again, it
+	// spends its second attempt and the apply records 2.
+	t.Run("FailedRetryableRedispatch_PerOperationBudget", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_redispatch_budget_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_operation_redispatch_budget", 914, state.Apply.FailedRetryable, "staging")
+		shardIDs := map[int64]bool{}
+		for _, shard := range []string{"-80", "80-"} {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", OperationKey: shard, Target: shard,
+				State: state.ApplyOperation.FailedRetryable, ErrorMessage: "data plane unavailable",
+			})
+			require.NoError(t, err)
+			shardIDs[id] = true
+		}
+
+		var first *storage.ApplyOperation
+		for range shardIDs {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "each shard is redispatched")
+			assert.True(t, shardIDs[claimed.ID])
+			assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+			assert.Equal(t, 1, claimed.Attempt)
+			if first == nil {
+				first = claimed
+			}
+		}
+
+		reloaded, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, 1, reloaded.Attempt, "each shard spends its own budget, so the apply records the highest attempt, not their sum")
+
+		ownedCtx := storage.WithOperationLease(ctx, first.Lease())
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, first.ID, "data plane unavailable"))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, first.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, again, "a shard that failed again is redispatched again")
+		assert.Equal(t, first.ID, again.ID)
+		assert.Equal(t, 2, again.Attempt)
+
+		reloaded, err = store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, 2, reloaded.Attempt, "the apply records the shard's second attempt")
+	})
+
+	// region-a halt-failed and region-b paused on a retryable failure, so the
+	// projection holds the apply at running_degraded. Claiming region-b's row
+	// is a deliberate retry: the row moves to running, spends one attempt of
+	// its own budget, and the apply records that attempt. A second driver sees
+	// a running row under a fresh lease and leaves it alone.
+	t.Run("FailedRetryableRedispatch_DegradedRollout", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_redispatch_degraded_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_operation_redispatch_degraded", 914, state.Apply.RunningDegraded, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+		})
+		require.NoError(t, err)
+		retryID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.FailedRetryable, ErrorMessage: "data plane unavailable",
+		})
+		require.NoError(t, err)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the paused deployment under a degraded rollout is redispatched")
+		assert.Equal(t, retryID, claimed.ID)
+		assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+		assert.Equal(t, 1, claimed.Attempt)
+
+		reloaded, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, 1, reloaded.Attempt, "the apply records the deployment's attempt")
+
+		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, second, "a running row under a fresh lease is not re-claimed")
 	})
 }
 

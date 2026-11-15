@@ -1296,7 +1296,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 	dbName := matches[0]
 	dbConfig := config.Databases[dbName]
 	envConfig := dbConfig.Environments[env]
-	targetDSN, err := envConfig.ResolveDSN()
+	targetDSN, err := envConfig.ResolveDSN(dbConfig.Type)
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
@@ -1440,7 +1440,8 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 
 	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
-		ghclient.WithConfigDirHints(serverConfig))
+		ghclient.WithConfigDirHints(serverConfig),
+		ghclient.WithListenOnlyRepos(serverConfig))
 	handlerOpts := append([]webhook.HandlerOption{
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
 		webhook.WithDurableWebhookDispatch(),
@@ -1524,7 +1525,8 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 
 		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger,
 			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs),
-			ghclient.WithConfigDirHints(serverConfig))
+			ghclient.WithConfigDirHints(serverConfig),
+			ghclient.WithListenOnlyRepos(serverConfig))
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 

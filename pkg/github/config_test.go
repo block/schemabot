@@ -111,6 +111,7 @@ func TestFindConfigsForPRFilesResolvesRenamedAwaySchemaFiles(t *testing.T) {
 		{name: "renamed to a non-schema file", file: PRFile{Filename: "docs/users.md", PreviousFilename: "schema/users.sql", Status: "renamed"}},
 		{name: "renamed out of every config directory", file: PRFile{Filename: "archive/users.sql", PreviousFilename: "schema/users.sql", Status: "renamed"}},
 		{name: "renamed within the config directory", file: PRFile{Filename: "schema/users_v2.sql", PreviousFilename: "schema/users.sql", Status: "renamed"}},
+		{name: "an environment symlink renamed away", file: PRFile{Filename: "archive/staging", PreviousFilename: "schema/staging", Status: "renamed", PreviousSymlink: true}},
 	}
 
 	for _, tt := range tests {
@@ -686,6 +687,66 @@ func TestCreateSchemaRequestFromPRUsesRepoRootEnvironmentSymlinkSchemaRoot(t *te
 	assert.Equal(t, "schemabot.yaml", result.ConfigPath, "a repository-root config is carried as a repo-relative path")
 	require.Contains(t, result.SchemaFiles, "orders_001")
 	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
+}
+
+// Removing the environment's own schema root symlink moves the environment
+// back to reading the config directory. The link sat directly under that
+// directory, where a removed directory symlink would otherwise read as an
+// emptied namespace, so the plan request must name no namespace after the
+// environment: the engine would plan every table in it as a drop, and the
+// base never declared one.
+func TestCreateSchemaRequestFromPRReadsTheConfigDirectoryWhenThePRRemovesTheEnvironmentLink(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.PullRequest{
+			State: new("open"),
+			Head:  &gh.PullRequestBranch{SHA: new("head-sha"), Ref: new("feature")},
+			Base:  &gh.PullRequestBranch{SHA: new("default-tip-sha"), Ref: new("main")},
+		}))
+	})
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename:  new("schema/production"),
+		Status:    new("removed"),
+		Deletions: new(1),
+	}})
+	proposedFilesRepo{
+		head: map[string]string{"schema/schemabot.yaml": "blob-config", "schema/base/orders.sql": "blob-orders"},
+		defaultTip: map[string]string{
+			"schema/schemabot.yaml":  "blob-config",
+			"schema/base/orders.sql": "blob-orders",
+			"schema/production":      "blob-production",
+		},
+		modes: map[string]map[string]string{"default-tip-sha": {"schema/production": gitSymlinkMode}},
+	}.serve(t, mux)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/default-tip-sha...head-sha", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "diff") {
+			_, _ = io.WriteString(w, "diff --git a/schema/production b/schema/production\ndeleted file mode 120000\nindex 1111111..0000000\n--- a/schema/production\n+++ /dev/null\n@@ -1 +0,0 @@\n-base\n")
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"merge_base_commit": map[string]any{"sha": "default-tip-sha"}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/blob-production", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"content": "base", "encoding": "utf-8"}))
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: orders\ntype: mysql\n")
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
+		{Type: new("dir"), Name: new("base"), Path: new("schema/base")},
+	})
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema/base", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("orders.sql"), Path: new("schema/base/orders.sql")},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/base/orders.sql", "CREATE TABLE orders (id bigint primary key);\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "production", "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "schema", result.SchemaPath, "with the link gone, the config directory is the environment's schema root")
+	assert.Empty(t, result.SchemaLinkPath)
+	assert.NotContains(t, result.SchemaFiles, "production", "the removed link named the schema root, not a namespace")
+	require.Contains(t, result.SchemaFiles, "base")
+	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["base"].Files["orders.sql"])
 }
 
 // TestCreateSchemaRequestFromPRSurfacesEmptiedNamespace verifies the wiring
@@ -1324,8 +1385,10 @@ func TestFindConfigByDatabaseNameTruncatedTreeUsesConfigDirHints(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerPullRequest(t, mux, "abc123")
 	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
-		Filename: new("docs/readme.md"),
-		Status:   new("modified"),
+		Filename:  new("docs/readme.md"),
+		Status:    new("modified"),
+		Additions: new(3),
+		Deletions: new(2),
 	}})
 	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
 		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},

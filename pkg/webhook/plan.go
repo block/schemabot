@@ -147,7 +147,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan refused by namespace placement"})
 		return
 	}
-	if err != nil && target != "" {
+	if narrowedPlanFailureLeavesEnvironmentCheck(err, target) {
 		// A plan narrowed to one target speaks for that target only, so its
 		// failure (an unknown target included) answers on the comment and leaves
 		// the environment's check as its last plan of every target recorded it.
@@ -159,11 +159,21 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 	if err != nil {
-		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
+		h.logger.Error("plan execution failed",
+			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
+			"deployment", deployment, "environment", environment, "target", target, "error", err)
 		userError := userFacingError(err)
-		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
-			environment: userError,
-		})
+		if planRefusedBySourcePolicy(err) {
+			// A source the policy refused stores no check state, so its
+			// refusal fails only the aggregate. The policy refuses the source
+			// for the database, so a plan narrowed to one target fails the
+			// aggregate the same way.
+			h.postSourcePolicyRefusal(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
+				environment: userError,
+			})
+		} else {
+			h.recordPlanFailuresAndFold(ctx, client, repo, pr, schemaResult.HeadSHA, schemaResult, []string{environment})
+		}
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userError)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
@@ -180,10 +190,14 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
 	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, environment)
+	if commentData.OffersApply() {
+		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
+	}
 
 	// Store per-database check record and update aggregate
 	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, drift)
@@ -202,6 +216,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 			Environments: []string{environment},
 			Plans:        map[string]*templates.PlanCommentData{environment: &commentData},
 		}, drift.work.pending > 0),
+		BaseSchemaNotice: commentData.BaseSchema.HasNotice(),
 	}, templates.RenderPlanComment(commentData))
 
 	// When drift blocked the check, or any rollout member has work (the primary
@@ -236,14 +251,19 @@ func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.Install
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "environment", environment,
 		"target", target, "narrowed_to", planResp.NarrowedTo, "plan_id", planResp.PlanID, "head_sha", schemaResult.HeadSHA)
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.BaseSchema = h.planBaseSchema(ctx, client, repo, pr, schemaResult, environment)
 	commentData.ScopedDatabase = databaseName
 	commentData.Target = target
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
+	if commentData.OffersApply() {
+		commentData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, schemaResult.Database, requestedBy)
+	}
 	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
-		Database:     schemaResult.Database,
-		DatabaseType: schemaResult.Type,
-		Environments: []string{environment},
-		HeadSHA:      schemaResult.HeadSHA,
+		Database:         schemaResult.Database,
+		DatabaseType:     schemaResult.Type,
+		Environments:     []string{environment},
+		HeadSHA:          schemaResult.HeadSHA,
+		BaseSchemaNotice: commentData.BaseSchema.HasNotice(),
 	}, templates.RenderPlanComment(commentData))
 	h.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "plan generated successfully",
@@ -286,6 +306,166 @@ func (h *Handler) failClosedOnNamespacePlacement(ctx context.Context, client *gh
 	}
 	h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
 	h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+}
+
+// planRefusedBySourcePolicy reports whether server-side source policy refused
+// the plan because the pull request's repository or schema directory is not
+// authorized for the database. Such a refusal stores no check state: a row
+// written for it would record state for the database on behalf of a source
+// the policy refused, so the failing aggregate alone answers for it, carrying
+// a block no fold replaces (postSourcePolicyRefusal).
+func planRefusedBySourcePolicy(err error) bool {
+	_, ok := errors.AsType[*api.SourcePolicyError](err)
+	return ok
+}
+
+// narrowedPlanFailureLeavesEnvironmentCheck reports whether a failed plan was
+// narrowed to one target and failed for that target alone, so the
+// environment's check stays as its last plan of every target recorded it. A
+// source policy refusal is not such a failure: the policy refuses the pull
+// request's source for the database, whichever target the plan named.
+func narrowedPlanFailureLeavesEnvironmentCheck(err error, target string) bool {
+	if err == nil || target == "" {
+		return false
+	}
+	return !planRefusedBySourcePolicy(err)
+}
+
+// sourcePolicyRefusalHoldingEachFailure returns the source policy refusal the
+// aggregate of each failed environment shows, keyed by environment. failures
+// holds what the plan comment shows for each one, and refused names those the
+// policy refused. A refused environment shows its own refusal. An environment
+// that failed some other way is held by the same block without being refused,
+// so it shows the refusal of the first refused environment in plan order, and
+// its own failure stays on the plan comment. A deployment that publishes one
+// aggregate for every environment then names a refusal whichever environment
+// it reads, and never a failure the source policy did not cause.
+func sourcePolicyRefusalHoldingEachFailure(planOrder []string, failures map[string]string, refused map[string]bool) map[string]string {
+	holding := ""
+	for _, env := range planOrder {
+		if refused[env] {
+			holding = failures[env]
+			break
+		}
+	}
+	refusals := make(map[string]string, len(failures))
+	for env, failure := range failures {
+		if refused[env] {
+			refusals[env] = failure
+		} else {
+			refusals[env] = holding
+		}
+	}
+	return refusals
+}
+
+// postSourcePolicyRefusal posts the failing aggregate for environments whose
+// plan the database's source policy refused, keyed by environment with the
+// refusal the plan comment shows. With no row stored for the refused source, a
+// fold from stored check state would read the environment's earlier row, which
+// can be a success on this same head. So the aggregate carries
+// sourcePolicyRefusedBlock, which no fold replaces: it lifts only when a re-run
+// of the check or a new commit re-verifies the PR and re-plans every
+// environment. The summary names that step ahead of the refusal: a Check Run
+// summary is clamped to a fixed length, and the refusal's length follows the
+// schema directory it names.
+func (h *Handler) postSourcePolicyRefusal(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, refusals map[string]string) {
+	summaries := make(map[string]string, len(refusals))
+	for env, refusal := range refusals {
+		summaries[env] = sourcePolicyRefusedBlock.message + " Refusal: " + refusal
+	}
+	targets, unpublished := h.sourcePolicyRefusalAggregateTargets(repo, refusals)
+	if len(unpublished) > 0 {
+		h.logger.Warn("source policy refused a plan of environments this deployment publishes no aggregate for; no aggregate is posted for them",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "environments", unpublished)
+	}
+	if len(unpublished) == len(refusals) {
+		return
+	}
+	if !h.postFailingAggregateTargetsWithBlock(ctx, client, repo, pr, headSHA, targets, summaries, sourcePolicyRefusedBlock) {
+		h.logger.Warn("source policy refusal block is not in place on every aggregate; each such aggregate keeps the state it last stored, and a later fold reads the refused environment's earlier stored row",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "environments", slices.Sorted(maps.Keys(refusals)))
+		return
+	}
+	h.logger.Info("failing aggregate posted with the source policy refusal block; no fold replaces it until a re-run of the check or a new commit re-plans every environment",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "environments", slices.Sorted(maps.Keys(refusals)))
+}
+
+// sourcePolicyRefusalAggregateTargets returns the aggregates a source policy
+// refusal fails: the repository's own aggregates, and the aggregate of every
+// refused environment this deployment publishes that those leave out. A
+// database that stops authorizing the repository can take its environment out
+// of the repository's aggregates while that environment's aggregate from an
+// earlier plan still stands on the head, so the refusal fails it by name. The
+// block on it lifts like any other once the policy authorizes the repository
+// again and the environment is back among its aggregates.
+//
+// unpublished lists the refused environments that get no aggregate because
+// they are outside this deployment's allowed environments.
+func (h *Handler) sourcePolicyRefusalAggregateTargets(repo string, refusals map[string]string) (targets []aggregateCheckTarget, unpublished []string) {
+	targets = h.aggregateCheckTargetsForRepo(repo)
+	config, ok := h.serverConfig()
+	if !ok || len(config.AllowedEnvironments) == 0 {
+		return targets, nil
+	}
+	covered := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		covered[target.environment] = true
+	}
+	base := h.aggregateCheckNameForRepo(repo)
+	for _, env := range slices.Sorted(maps.Keys(refusals)) {
+		switch {
+		case covered[env]:
+			// Already one of the repository's own aggregates.
+		case config.IsEnvironmentAllowed(env):
+			targets = append(targets, aggregateCheckTarget{
+				name:        aggregateCheckNameForEnv(base, env),
+				environment: env,
+			})
+		default:
+			unpublished = append(unpublished, env)
+		}
+	}
+	return targets, unpublished
+}
+
+// recordPlanFailuresAndFold stores a failing check row for each environment
+// whose plan could not be produced at all, then folds the aggregate from
+// stored check state. Without the row the fold reads only the environments
+// that did plan, or the environment's earlier passing row, and can pass over a
+// plan that failed (MG-2). A failure stored check state does not hold is
+// invisible to the fold, so its failing aggregate is posted first, carrying a
+// block every fold leaves in place: neither this fold nor one from a later
+// plan publishes success over it. Should the block itself not be stored, the
+// fold is skipped rather than allowed to publish. schema names the database
+// and head SHA every listed environment shares, and headSHA is the commit the
+// aggregate is folded for.
+func (h *Handler) recordPlanFailuresAndFold(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, schema *ghclient.SchemaRequestResult, planFailedEnvironments []string) {
+	planFailedUnstored := map[string]string{}
+	for _, env := range planFailedEnvironments {
+		if _, checkErr := h.storePlanFailedCheck(ctx, client, repo, pr, schema, env); checkErr != nil {
+			h.logger.Error("failed to store failing check record for an environment that could not plan; posting a blocked failing aggregate before the fold instead",
+				"repo", repo, "pr", pr, "head_sha", schema.HeadSHA, "database", schema.Database, "database_type", schema.Type,
+				"environment", env, "error", checkErr)
+			planFailedUnstored[env] = planFailedUnstoredSummary
+			continue
+		}
+		h.logger.Info("failing check record written for an environment that could not plan; the aggregate is folded from stored check state next",
+			"repo", repo, "pr", pr, "head_sha", schema.HeadSHA, "database", schema.Database, "database_type", schema.Type,
+			"environment", env)
+	}
+	foldSeesEveryFailure := true
+	if len(planFailedUnstored) > 0 {
+		foldSeesEveryFailure = h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, planFailedUnstored, planFailedUnrecordedBlock)
+	}
+	h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schema.Database, schema.Type)
+	if foldSeesEveryFailure {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+	} else {
+		h.logger.Error("aggregate not folded: an environment's plan failure is recorded neither on its check row nor as an aggregate block, so a fold could pass without it; the aggregate check keeps its prior state until the check is re-run or a commit is pushed",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database_type", schema.Type,
+			"database", schema.Database, "environments", slices.Sorted(maps.Keys(planFailedUnstored)))
+	}
 }
 
 // planForResolvedDatabaseBlocked enforces actor authorization once a
@@ -503,8 +683,15 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	placementBlockUnstored := map[string]string{}
 	// Environments whose plan could not be produced at all, in plan order. Each
 	// gets a failing stored check row once the loop knows the head SHA, so the
-	// aggregate fold cannot pass on the environments that did plan.
+	// aggregate fold cannot pass on the environments that did plan, or on an
+	// earlier passing row of the environment that failed.
 	var planFailedEnvironments []string
+	// Environments whose plan source policy refused. When every environment
+	// fails and any of them was refused, no environment stores a check row: a
+	// source the policy refused records no check state, the others failed
+	// before their source was authorized, and the failing aggregate alone
+	// answers for all of them.
+	sourcePolicyRefused := map[string]bool{}
 	// Whether any environment's rollout round found a member with work. The
 	// primary's plan alone cannot say, so auto-plan reads this before skipping
 	// its comment.
@@ -529,8 +716,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	planFailed := func(env string, err error) {
 		multiEnvData.Errors[env] = userFacingError(err)
 		planFailedEnvironments = append(planFailedEnvironments, env)
+		if planRefusedBySourcePolicy(err) {
+			sourcePolicyRefused[env] = true
+		}
 	}
 
+	// plannedSchemas are the environments whose plan reaches the comment, so
+	// their base-schema freshness is checked together once every one has planned.
+	plannedSchemas := map[string]*ghclient.SchemaRequestResult{}
 	for _, env := range environments {
 		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
 		if err != nil {
@@ -638,12 +831,16 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint(), h.cliName())
+		plannedSchemas[env] = schemaResult
 		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
 		h.annotateMemberApplyRefusal(ctx, &commentData, planResp, env, drift, repo, pr)
 		multiEnvData.Plans[env] = &commentData
+	}
+	for env, base := range h.planBaseSchemas(ctx, client, repo, pr, plannedSchemas) {
+		multiEnvData.Plans[env].BaseSchema = base
 	}
 
 	// When every environment fails before a schema request resolves, no
@@ -658,11 +855,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			multiEnvData.IsMySQL = db.Type == storage.DatabaseTypeMySQL
 		}
 	}
-
 	// Update aggregate check once after all environments are planned.
-	// If all environments errored, no check records were stored and headSHA
-	// is empty. Post a failing aggregate so branch protection isn't stuck
-	// waiting for a check that will never arrive.
+	// If all environments errored, no plan stored a row and headSHA is empty;
+	// the PR's head stands in, so the failures still reach the gate instead of
+	// leaving branch protection waiting for a check that will never arrive.
 	if headSHA != "" {
 		// The fold below reads stored rows only, so an environment that failed
 		// to plan while another stored a row must fail through a row of its own.
@@ -674,39 +870,52 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			Repository: multiEnvData.Repository,
 			HeadSHA:    multiEnvData.HeadSHA,
 		}
-		planFailedUnstored := map[string]string{}
-		for _, env := range planFailedEnvironments {
-			if _, checkErr := h.storePlanFailedCheck(ctx, client, repo, pr, failedSchema, env); checkErr != nil {
-				h.logger.Error("failed to store failing check record for an environment that could not plan; posting a blocked failing aggregate before the fold instead",
-					"repo", repo, "pr", pr, "env", env, "database_type", failedSchema.Type,
-					"database", failedSchema.Database, "head_sha", failedSchema.HeadSHA, "error", checkErr)
-				planFailedUnstored[env] = planFailedUnstoredSummary
-			}
-		}
-		// A failure stored check state does not hold is invisible to the fold,
-		// which would pass on the environments that did plan. Its failing
-		// aggregate is posted first, carrying a block every fold leaves in
-		// place, so neither this fold nor one from a later plan of another
-		// environment publishes success over it. Should the block itself not be
-		// stored, the fold is skipped rather than allowed to publish.
-		foldSeesEveryFailure := true
-		if len(planFailedUnstored) > 0 {
-			foldSeesEveryFailure = h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, planFailedUnstored, planFailedUnrecordedBlock)
-		}
-		h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, multiEnvData.Database, multiEnvData.DatabaseType)
-		if foldSeesEveryFailure {
-			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-		} else {
-			h.logger.Error("aggregate not folded: an environment's plan failure is recorded neither on its check row nor as an aggregate block, so a fold could pass without it; the aggregate check keeps its prior state until the check is re-run or a commit is pushed",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "database_type", multiEnvData.DatabaseType,
-				"database", multiEnvData.Database, "environments", slices.Sorted(maps.Keys(planFailedUnstored)))
-		}
+		h.recordPlanFailuresAndFold(ctx, client, repo, pr, headSHA, failedSchema, planFailedEnvironments)
 	} else if len(multiEnvData.Errors) > 0 {
 		prInfo, fetchErr := client.FetchPullRequest(ctx, repo, pr)
 		if fetchErr != nil {
 			h.logger.Error("failed to fetch PR for error aggregate", "repo", repo, "pr", pr, "error", fetchErr)
 		} else {
-			h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA, multiEnvData.Errors)
+			// Every environment failed, so no row of this plan carries the head
+			// SHA or database identity. The PR's head and the config-resolved
+			// database stand in for them, so each environment that failed to
+			// plan still replaces its stored row, and an earlier passing row
+			// cannot pass a later fold.
+			failedSchema := &ghclient.SchemaRequestResult{
+				Database:   multiEnvData.Database,
+				Type:       multiEnvData.DatabaseType,
+				Repository: repo,
+				HeadSHA:    prInfo.HeadSHA,
+			}
+			// A source policy refusal of any environment stores no row for
+			// any of them. The other environments failed before their source
+			// was authorized, so a row for them would still record state on
+			// behalf of a source the policy refused.
+			var recordable []string
+			if len(sourcePolicyRefused) == 0 {
+				recordable = planFailedEnvironments
+			}
+			if len(recordable) > 0 {
+				h.recordPlanFailuresAndFold(ctx, client, repo, pr, prInfo.HeadSHA, failedSchema, recordable)
+			}
+			// Every failure on the comment that stored no row still fails the
+			// aggregate: every environment's failure once the source policy
+			// refused any of them, since no check state is stored on behalf
+			// of a source the policy refused, and a namespace placement
+			// refusal whose row could not be stored. It is posted after the
+			// fold so the fold cannot replace it. A source policy refusal
+			// carries its block, so no later fold replaces it either, and
+			// every aggregate it holds names the refusal.
+			unrecorded := maps.Clone(multiEnvData.Errors)
+			for _, env := range recordable {
+				delete(unrecorded, env)
+			}
+			if len(unrecorded) > 0 && len(sourcePolicyRefused) > 0 {
+				h.postSourcePolicyRefusal(ctx, client, repo, pr, prInfo.HeadSHA,
+					sourcePolicyRefusalHoldingEachFailure(environments, unrecorded, sourcePolicyRefused))
+			} else if len(unrecorded) > 0 {
+				h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA, unrecorded)
+			}
 		}
 	}
 
@@ -740,11 +949,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	}
 
 	slot := planCommentSlot{
-		Database:     multiEnvData.Database,
-		DatabaseType: multiEnvData.DatabaseType,
-		Environments: multiEnvData.Environments,
-		HeadSHA:      multiEnvData.HeadSHA,
-		UpToDate:     planCommentUpToDate(multiEnvData, rolloutHasWork),
+		Database:         multiEnvData.Database,
+		DatabaseType:     multiEnvData.DatabaseType,
+		Environments:     multiEnvData.Environments,
+		HeadSHA:          multiEnvData.HeadSHA,
+		UpToDate:         planCommentUpToDate(multiEnvData, rolloutHasWork),
+		BaseSchemaNotice: templates.AnyEnvHasBaseSchemaNotice(multiEnvData),
 	}
 
 	// The caller asked not to re-post: either the push left the schema inputs
@@ -752,7 +962,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// operator asked for an apply rather than a plan. The visible plan comment
 	// stays the PR's answer unless its outcome no longer matches this plan.
 	if !postPlanComment {
-		if !h.priorHeadPlanCommentNeedsReplacing(ctx, client, repo, pr, slot, true) {
+		// A base-schema notice is new information even when the schema inputs
+		// did not change, since the base branch moves without a push to the PR.
+		// A visible comment from a prior head cannot be shown to name the same
+		// paths, so it is replaced. One rendering this head stays, as any
+		// re-plan of an unchanged head does. A notice that no longer applies is
+		// caught by the recorded notice differing from this plan's.
+		keepMatchingOutcome := !slot.BaseSchemaNotice
+		if !h.priorHeadPlanCommentNeedsReplacing(ctx, client, repo, pr, slot, keepMatchingOutcome) {
 			h.logger.Info("auto-plan refreshed checks without posting plan comment because the visible plan comment still answers for this plan",
 				"repo", repo, "pr", pr, "database", slot.Database,
 				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate)
@@ -780,17 +997,26 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA)
 	}
 
+	// Who can apply is read only once the comment is certain to post, so a
+	// refresh that keeps the visible comment makes no team lookups.
+	if multiEnvData.OffersApply() {
+		multiEnvData.ApplyAuthorization = h.applyAuthorizationForPlanComment(ctx, client, repo, pr, multiEnvData.Database, h.planCommentReader(ctx, client, repo, pr, requestedBy))
+	}
+
 	// Post a single combined comment
 	h.postTrackedPlanComment(repo, pr, installationID, slot, templates.RenderMultiEnvPlanComment(multiEnvData))
 }
 
 // planCommentUpToDate reports whether the plan shows nothing to act on: no
-// changes on any rollout member, no errors in any environment or plan, and no
-// deployment drift. A member with work keeps the check pending, and a drifted
-// or unverifiable deployment fails it closed, even when every primary plan is
-// a clean no-op, so neither is up to date.
+// changes on any rollout member, no errors in any environment or plan, no
+// deployment drift, and no base-schema notice. A member with work keeps the
+// check pending, and a drifted or unverifiable deployment fails it closed,
+// even when every primary plan is a clean no-op, so neither is up to date. A
+// branch missing newer base-branch schema changes, or one that could not be
+// checked, has a merge to make or an apply refusal ahead, so it is not up to
+// date either.
 func planCommentUpToDate(data templates.MultiEnvPlanCommentData, rolloutHasWork bool) bool {
-	if rolloutHasWork || len(data.Errors) > 0 || templates.AnyEnvHasDriftToShow(data) {
+	if rolloutHasWork || len(data.Errors) > 0 || templates.AnyEnvHasDriftToShow(data) || templates.AnyEnvHasBaseSchemaNotice(data) {
 		return false
 	}
 	for _, plan := range data.Plans {

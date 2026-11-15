@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -638,8 +639,21 @@ func TestListKeyspacesCallerDeadlineWins(t *testing.T) {
 	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at the caller's deadline")
 }
 
-// requestedURL makes one SDK call and one raw-HTTP call on a cancelled context,
-// so neither leaves the process, and returns the URL each was addressed to.
+// urlCapturingTransport records the URL of the request it is handed and fails
+// it, so a raw-HTTP call never leaves the process.
+type urlCapturingTransport struct {
+	url string
+}
+
+func (ct *urlCapturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ct.url = req.URL.String()
+	return nil, errors.New("request captured")
+}
+
+// requestedURL makes one SDK call on a cancelled context and one raw-HTTP call
+// through a capturing transport, so neither leaves the process, and returns the
+// URL each was addressed to. The raw call's error names only the path, so its
+// URL is read from the request itself.
 func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -649,11 +663,114 @@ func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
 	var sdkErr *url.Error
 	require.ErrorAs(t, err, &sdkErr)
 
-	_, err = client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
-	var rawErr *url.Error
-	require.ErrorAs(t, err, &rawErr)
+	wrapper, ok := client.(*psClientWrapper)
+	require.True(t, ok)
+	capture := &urlCapturingTransport{}
+	wrapper.httpClient = &http.Client{Transport: capture}
+	_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+	require.Error(t, err)
 
-	return sdkErr.URL, rawErr.URL
+	return sdkErr.URL, capture.url
+}
+
+// errDialFailed stands in for whatever the network returns when the API host
+// cannot be reached.
+var errDialFailed = errors.New("dial failed")
+
+// secretHost is the API host the raw-request tests address. Its name is what
+// the tests look for in error messages.
+const secretHost = "secret-host.example"
+
+// unreachableWrapper addresses a host that every connection attempt fails to
+// reach with dialErr, so the request fails in the transport before any
+// response.
+func unreachableWrapper(dialErr error) *psClientWrapper {
+	return &psClientWrapper{
+		httpClient: &http.Client{Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return nil, dialErr
+			},
+		}},
+		baseURL:    "https://" + secretHost,
+		tokenName:  "token-name",
+		tokenValue: "token-value",
+	}
+}
+
+// A raw-HTTP call that never reaches the API fails with an error that travels
+// up into apply failure messages and logs. It names the method and the
+// endpoint path in place of the request URL, so the URL's host and query
+// string are not in the message. The network's own error stays in the chain
+// as it was reported, for callers that classify it; when that error names the
+// host, as a failed DNS lookup does, the host appears there and nowhere else.
+func TestRawRequestTransportFailureNamesOnlyThePath(t *testing.T) {
+	const keyspacesPath = "/v1/organizations/block/databases/orders/branches/main/keyspaces"
+	lookupFailed := &net.DNSError{Err: "no such host", Name: secretHost, IsNotFound: true}
+	for _, tc := range []struct {
+		name          string
+		dialErr       error
+		ctx           func(t *testing.T) context.Context
+		wantErr       error
+		wantHostCount int
+	}{
+		{
+			name:    "the host cannot be reached",
+			dialErr: errDialFailed,
+			ctx:     func(t *testing.T) context.Context { return t.Context() },
+			wantErr: errDialFailed,
+		},
+		{
+			name:          "the host does not resolve",
+			dialErr:       lookupFailed,
+			ctx:           func(t *testing.T) context.Context { return t.Context() },
+			wantErr:       lookupFailed,
+			wantHostCount: 1,
+		},
+		{
+			name:    "the caller's context is cancelled",
+			dialErr: errDialFailed,
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			wantErr: context.Canceled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unreachableWrapper(tc.dialErr).ListKeyspaces(tc.ctx(t), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "send GET "+keyspacesPath+" request")
+			assert.NotContains(t, err.Error(), "https://"+secretHost, "the request URL does not belong in an operator-facing message")
+			assert.Equal(t, tc.wantHostCount, strings.Count(err.Error(), secretHost), "the host appears only where the transport's own error names it")
+			assert.NotContains(t, err.Error(), "per_page", "the query string does not belong in an operator-facing message")
+			assert.NotContains(t, err.Error(), "?")
+			assert.ErrorIs(t, err, tc.wantErr)
+
+			var urlErr *url.Error
+			require.ErrorAs(t, err, &urlErr)
+			assert.Equal(t, keyspacesPath, urlErr.URL)
+			assert.Equal(t, "Get", urlErr.Op)
+		})
+	}
+}
+
+// A raw request that cannot be built, because an identifier does not form a
+// valid URL, fails before anything is sent. That error names the endpoint in
+// place of the URL too, so the base URL is in no raw-request error at all.
+func TestRawRequestThatCannotBeBuiltNamesOnlyThePath(t *testing.T) {
+	const badPath = "/v1/organizations/bad%zzorg/databases/orders/deploy-requests/1"
+	_, err := unreachableWrapper(errDialFailed).DeployRequestAutoCutover(t.Context(), "bad%zzorg", "orders", 1)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create GET "+badPath+" request")
+	assert.NotContains(t, err.Error(), secretHost, "the base URL does not belong in an operator-facing message")
+
+	var urlErr *url.Error
+	require.ErrorAs(t, err, &urlErr)
+	assert.Equal(t, badPath, urlErr.URL)
+	assert.Equal(t, "parse", urlErr.Op)
 }
 
 // A database configured without an API base URL is a real PlanetScale one, so

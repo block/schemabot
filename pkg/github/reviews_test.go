@@ -6,7 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -196,74 +198,122 @@ func TestGetApprovedReviewsOrdersBySubmission(t *testing.T) {
 	assert.Equal(t, []string{"alice", "carol", "Bob", "dave"}, users)
 }
 
+// IsTeamMember reads the one membership rather than listing the team, and a
+// 404 counts as "not a member" only when the team itself reads back: GitHub
+// returns 404 for a team the App cannot see too, and that must stay an
+// unreadable error, never a denial dressed as an answer.
+// Within one delivery, every authorization check for the same login and team
+// answers from one read. The next delivery reads again, so a member added or
+// removed on GitHub takes effect on the next command. A failed read is not
+// cached, so the next check in the same delivery reads again.
+func TestIsTeamMemberCachesWithinOneDelivery(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+	client, mux := setupConfigTestGitHubServer(t)
+	var reads atomic.Int32
+	var state, status atomic.Value
+	state.Store("pending")
+	status.Store(http.StatusOK)
+	mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/mona", func(w http.ResponseWriter, _ *http.Request) {
+		reads.Add(1)
+		code := status.Load().(int)
+		w.WriteHeader(code)
+		if code == http.StatusOK {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": state.Load().(string), "role": "member"}))
+		}
+	})
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	delivery := WithPRInfoCache(t.Context())
+	member, err := ic.IsTeamMember(delivery, "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.False(t, member)
+	member, err = ic.IsTeamMember(delivery, "OctoCat", "DB-Operators", "Mona")
+	require.NoError(t, err)
+	assert.False(t, member)
+	assert.Equal(t, int32(1), reads.Load(), "a second check in the same delivery reuses the first read")
+
+	state.Store("active")
+	member, err = ic.IsTeamMember(WithPRInfoCache(t.Context()), "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.True(t, member, "the next delivery sees mona join the team")
+	assert.Equal(t, int32(2), reads.Load())
+
+	failing := WithPRInfoCache(t.Context())
+	status.Store(http.StatusForbidden)
+	_, err = ic.IsTeamMember(failing, "octocat", "db-operators", "mona")
+	require.ErrorIs(t, err, ErrTeamMembershipUnreadable)
+	status.Store(http.StatusOK)
+	member, err = ic.IsTeamMember(failing, "octocat", "db-operators", "mona")
+	require.NoError(t, err)
+	assert.True(t, member, "a failed read is not cached")
+}
+
 func TestIsTeamMember(t *testing.T) {
 	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 	tests := []struct {
-		name            string
-		statusCode      int
-		members         []string
-		wantMember      bool
-		wantErr         bool
-		wantErrContains string
-		wantUnreadable  bool
+		name             string
+		membershipStatus int
+		membershipState  string
+		rateLimited      bool // the membership read answers with an exhausted primary rate limit
+		teamStatus       int  // 0 means the team endpoint must not be called
+		wantMember       bool
+		wantErr          bool
+		wantUnreadable   bool
 	}{
-		{
-			name:       "listed member allows",
-			statusCode: http.StatusOK,
-			members:    []string{"mona"},
-			wantMember: true,
-		},
-		{
-			name:       "listed member allows case-insensitively",
-			statusCode: http.StatusOK,
-			members:    []string{"Mona"},
-			wantMember: true,
-		},
-		{
-			name:       "readable team without actor is not a member",
-			statusCode: http.StatusOK,
-			members:    []string{"hubot"},
-		},
-		{
-			name:            "unreadable team returns sentinel error",
-			statusCode:      http.StatusNotFound,
-			wantErr:         true,
-			wantErrContains: "check team membership",
-			wantUnreadable:  true,
-		},
-		{
-			name:            "server error returns generic error",
-			statusCode:      http.StatusInternalServerError,
-			wantErr:         true,
-			wantErrContains: "check team membership",
-		},
+		{name: "active member allows", membershipStatus: http.StatusOK, membershipState: "active", wantMember: true},
+		{name: "pending invitation is not a member", membershipStatus: http.StatusOK, membershipState: "pending"},
+		{name: "no membership on a readable team is not a member", membershipStatus: http.StatusNotFound, teamStatus: http.StatusOK},
+		{name: "team the App cannot see is unreadable", membershipStatus: http.StatusNotFound, teamStatus: http.StatusNotFound, wantErr: true, wantUnreadable: true},
+		{name: "team read failing is a generic error", membershipStatus: http.StatusNotFound, teamStatus: http.StatusInternalServerError, wantErr: true},
+		{name: "forbidden membership read is unreadable", membershipStatus: http.StatusForbidden, wantErr: true, wantUnreadable: true},
+		{name: "server error is a generic error", membershipStatus: http.StatusInternalServerError, wantErr: true},
+		{name: "exhausted rate limit is a generic error, not unreadable", membershipStatus: http.StatusForbidden, rateLimited: true, wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupConfigTestGitHubServer(t)
-			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/members", func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tt.statusCode)
-				if tt.statusCode == http.StatusOK {
-					users := make([]map[string]string, 0, len(tt.members))
-					for _, member := range tt.members {
-						users = append(users, map[string]string{"login": member})
-					}
-					require.NoError(t, json.NewEncoder(w).Encode(users))
+			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/mona", func(w http.ResponseWriter, _ *http.Request) {
+				if tt.rateLimited {
+					w.Header().Set("X-RateLimit-Limit", "5000")
+					w.Header().Set("X-RateLimit-Remaining", "0")
+					w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
 				}
+				w.WriteHeader(tt.membershipStatus)
+				if tt.membershipStatus == http.StatusOK {
+					require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": tt.membershipState, "role": "member"}))
+				}
+			})
+			var teamReads atomic.Int32
+			mux.HandleFunc("GET /orgs/octocat/teams/db-operators", func(w http.ResponseWriter, _ *http.Request) {
+				teamReads.Add(1)
+				if tt.teamStatus == 0 {
+					t.Error("the team is read only after a 404 on the membership read")
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(tt.teamStatus)
+				if tt.teamStatus == http.StatusOK {
+					require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1, "slug": "db-operators"}))
+				}
+			})
+			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/members", func(w http.ResponseWriter, _ *http.Request) {
+				t.Error("IsTeamMember must not list the team")
+				w.WriteHeader(http.StatusInternalServerError)
 			})
 
 			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			member, err := ic.IsTeamMember(t.Context(), "octocat", "db-operators", "mona")
+			if tt.teamStatus == 0 {
+				assert.Zero(t, teamReads.Load(), "the team is read only to tell a missing membership from an unreadable team")
+			}
 			if tt.wantErr {
 				require.Error(t, err)
+				assert.Contains(t, err.Error(), "check team membership octocat/db-operators for mona")
 				if tt.wantUnreadable {
 					assert.ErrorIs(t, err, ErrTeamMembershipUnreadable)
 				} else {
 					assert.NotErrorIs(t, err, ErrTeamMembershipUnreadable)
-				}
-				if tt.wantErrContains != "" {
-					assert.Contains(t, err.Error(), tt.wantErrContains)
 				}
 				return
 			}

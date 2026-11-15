@@ -536,13 +536,10 @@ func TestE2EApplyTeamSlugApproval(t *testing.T) {
 		},
 	)
 
-	// Team members endpoint — bob is a member
-	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/members", func(w http.ResponseWriter, _ *http.Request) {
+	// Team membership endpoint — bob is an active member
+	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/memberships/bob", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]*gh.User{
-			{Login: new("bob")},
-			{Login: new("carol")},
-		})
+		_ = json.NewEncoder(w).Encode(map[string]string{"state": "active", "role": "member"})
 	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -602,13 +599,14 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 		},
 	)
 
-	// Team members — dave is not in the list
-	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/members", func(w http.ResponseWriter, _ *http.Request) {
+	// Team membership — dave has none, and the team itself reads back, so
+	// he is not a member rather than the team being unreadable
+	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/memberships/dave", func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	})
+	mux.HandleFunc("GET /orgs/octocat/teams/dba-team", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]*gh.User{
-			{Login: new("bob")},
-			{Login: new("carol")},
-		})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "slug": "dba-team"})
 	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))

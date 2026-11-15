@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"io"
 	"testing"
 
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -33,6 +34,35 @@ func TestSampleChoiceAndCancellation(t *testing.T) {
 	connect.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	require.True(t, connect.confirmed)
 	require.False(t, connect.sample)
+}
+
+// An operator presses Ctrl-C or Esc on init's first screen, which asks whether
+// to connect a database or try a sample. Nothing has been acted on, so the
+// command says so and exits with the interrupt status.
+func TestInitStartChoiceCancelKeyExitsInterrupted(t *testing.T) {
+	for name, key := range map[string]string{"ctrl-c": "\x03", "esc": "\x1b"} {
+		t.Run(name, func(t *testing.T) {
+			input, writer := io.Pipe()
+			t.Cleanup(func() { require.NoError(t, input.Close()); require.NoError(t, writer.Close()) })
+			output := initSignalWriter{started: make(chan struct{}, 1)}
+			done := make(chan error, 1)
+			go func() {
+				_, err := chooseInitStart(t.Context(), tea.WithInput(input), tea.WithOutput(output))
+				done <- err
+			}()
+			awaitSignal(t, output.started, "the choice to be drawn")
+			_, err := io.WriteString(writer, key)
+			require.NoError(t, err)
+
+			err = awaitSignal(t, done, "the choice to close")
+
+			var status error
+			stderr := captureStderr(t, func() { status = initStopped(err) })
+			require.ErrorIs(t, status, ErrSilent)
+			require.Equal(t, ExitInterrupted, ExitCodeFor(status))
+			require.Equal(t, "Setup cancelled; nothing was changed.\n", stderr)
+		})
+	}
 }
 
 func TestSampleRejectsExistingConnections(t *testing.T) {

@@ -176,16 +176,31 @@ var narrowedApplyBlock = checkBlockReason{
 }
 
 // planFailedUnrecordedBlock is carried by the failing aggregate posted for an
-// environment that could not plan while another environment of the same plan
-// did, when the failing check row recording that could not be stored either.
-// Stored check state then holds nothing of the failure, so a fold from it, on
-// this plan or on a later plan of another environment, could pass on the
-// environments that did plan. The block keeps every such fold off the
-// aggregate until auto-plan re-verifies the PR and durably invalidates prior
-// successful results. Only replacement results can then pass the aggregate.
+// environment that could not plan, when the failing check row recording that
+// could not be stored either. Stored check state then holds nothing of the
+// failure, so a fold from it, on this plan or on a later plan, could pass on
+// the environments that did plan or on the environment's earlier passing row.
+// The block keeps every such fold off the aggregate until auto-plan
+// re-verifies the PR and durably invalidates prior successful results. Only
+// replacement results can then pass the aggregate.
 var planFailedUnrecordedBlock = checkBlockReason{
 	blockingReason: checkstate.BlockPlanFailedUnrecorded,
 	message:        planFailedUnstoredSummary,
+}
+
+// sourcePolicyRefusedBlock is carried by the failing aggregate posted when the
+// database's source policy refused a plan. No check row is stored on behalf of
+// a refused source, so stored check state holds nothing of the refusal, and a
+// fold from it, on a later plan of another environment, could pass on the
+// refused environment's earlier passing row. The block keeps every such fold
+// off the aggregate until auto-plan re-verifies the PR and durably invalidates
+// prior successful results. A re-plan the policy refuses again posts the block
+// again; one it authorizes stores replacement results that can pass the
+// aggregate. message opens the Check Run summary, ahead of the refusal, so the
+// summary names the step that lifts the block once the policy is fixed.
+var sourcePolicyRefusedBlock = checkBlockReason{
+	blockingReason: checkstate.BlockPlanRefusedBySourcePolicy,
+	message:        "Once the source policy authorizes this pull request, re-run this check or push a commit to re-plan every environment.",
 }
 
 // noAllowedConfiguredEnvironmentsBlock holds the gate when a changed database
@@ -218,5 +233,6 @@ var allCheckBlockReasons = []checkBlockReason{
 	noAllowedConfiguredEnvironmentsBlock,
 	narrowedApplyBlock,
 	planFailedUnrecordedBlock,
+	sourcePolicyRefusedBlock,
 	{blockingReason: participantUnresolvedBlockingReason},
 }

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -275,6 +276,16 @@ func postgresCreateSetStatements(script string) ([]string, error) {
 }
 
 func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger, tracker *progress.Tracker) {
+	// The invalid-index cleanup and the published outcome both classify the
+	// cancelled build. Once a Cancel is read as the operator's, it stays so,
+	// and the second read does not wait for in-flight calls again.
+	var operatorCancel atomic.Bool
+	cancelRequested := func() bool {
+		if !operatorCancel.Load() && e.cancelRequested(key) {
+			operatorCancel.Store(true)
+		}
+		return operatorCancel.Load()
+	}
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request) and ends only when the engine cancels the drive,
 	// so boundedness comes from the ceiling instead.
@@ -282,7 +293,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	if change.concurrentIndex {
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
-		change.cancelRequested = func() bool { return e.cancelRequested(key) }
+		change.cancelRequested = cancelRequested
 	}
 	ctx, cancel := context.WithTimeout(ctx, ceiling)
 	defer cancel()
@@ -314,7 +325,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 
 	var invalidErr *executor.InvalidIndexError
-	if isCancellation(err) && e.cancelRequested(key) {
+	if isCancellation(err) && cancelRequested() {
 		// The cancellation is the operator's only when this engine recorded
 		// that it acted on the apply: a backend cancelled from outside
 		// SchemaBot is a failure the next drive retries, never a cancel
@@ -1606,8 +1617,8 @@ func cleanupCancelledConcurrentIndex(ctx context.Context, pool *pgxpool.Pool, ch
 }
 
 func cancelledBuildLeftOwnIndex(change nativeApply, err error, invalidErr *executor.InvalidIndexError) bool {
-	return change.cancelRequested != nil && change.cancelRequested() && isCancellation(err) &&
-		cancelledBuildMayHaveLeftIndex(invalidErr.Code()) && invalidErr.Table == change.table
+	return isCancellation(err) && cancelledBuildMayHaveLeftIndex(invalidErr.Code()) && invalidErr.Table == change.table &&
+		change.cancelRequested != nil && change.cancelRequested()
 }
 
 // cancelledBuildMayHaveLeftIndex identifies verdicts that can describe the
