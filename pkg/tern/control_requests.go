@@ -708,29 +708,39 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 // command it now carries. remoteIDs are the remote applies a failure message
 // may name, kept out of the operator-facing text.
 func settlePendingControlRequestRevision(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string, remoteIDs ...string) error {
+	_, err := settleControlRequestRevisionIfCurrent(ctx, store, logger, apply, controlReq, status, errorMessage, remoteIDs...)
+	return err
+}
+
+// settleControlRequestRevisionIfCurrent is settlePendingControlRequestRevision
+// for a caller that acts on the answer. settled reports whether this call wrote
+// the outcome onto the row: it is false when the row had already been settled
+// or re-armed for a newer command, so the caller records nothing further
+// against a command it did not evaluate.
+func settleControlRequestRevisionIfCurrent(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string, remoteIDs ...string) (settled bool, err error) {
 	if store == nil {
-		return fmt.Errorf("storage is not available")
+		return false, fmt.Errorf("storage is not available")
 	}
 	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, controlReq.Operation); err != nil {
-		return err
+		return false, err
 	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
-		return fmt.Errorf("control request store is not available")
+		return false, fmt.Errorf("control request store is not available")
 	}
 	if status == storage.ControlRequestFailed {
 		errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
 	}
-	settled, err := controlStore.SettlePendingRevision(ctx, controlReq, status, errorMessage)
+	settled, err = controlStore.SettlePendingRevision(ctx, controlReq, status, errorMessage)
 	if err != nil {
-		return fmt.Errorf("settle pending %s control request for apply %s as %s: %w", controlReq.Operation, apply.ApplyIdentifier, status, err)
+		return false, fmt.Errorf("settle pending %s control request for apply %s as %s: %w", controlReq.Operation, apply.ApplyIdentifier, status, err)
 	}
 	if !settled {
 		logger.InfoContext(ctx, "pending control request was not settled: the request this drive evaluated has already been settled or replaced by a newer command",
 			append(apply.LogAttrs(), "operation", controlReq.Operation, "requested_by", controlRequestCaller(controlReq),
 				"request_revision", controlReq.Revision, "status", status)...)
 	}
-	return nil
+	return settled, nil
 }
 
 // controlRefusalMessage renders the reason the executing side gave for refusing

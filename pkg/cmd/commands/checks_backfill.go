@@ -2,7 +2,6 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -183,7 +182,7 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.AllRepos {
 		updateProgress("listing the repositories declared on the server...")
 		declared, err := cmdclient.ChecksRepos(ctx, endpoint)
-		if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
+		if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
 			return canceled
 		}
 		if err != nil {
@@ -235,7 +234,7 @@ scanning:
 				// server may answer with it instead of an error.
 				ReportAppNotInstalled: true,
 			})
-			if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
+			if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
 				return canceled
 			}
 			if err != nil {
@@ -310,7 +309,7 @@ scanning:
 				break
 			}
 			if err := pauseForRateLimit(ctx, chunk.RateLimit, cmd.RateLimitFloor, updateProgress); err != nil {
-				if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
+				if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
 					return canceled
 				}
 				return err
@@ -330,8 +329,9 @@ scanning:
 		// Act phase: synthesize the missing checks in server-bounded batches
 		// per repository, skipping held PRs.
 		err := cmd.act(ctx, endpoint, report, updateProgress)
-		if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
-			// Print what completed before the interrupt, then exit non-zero.
+		if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
+			// Print what completed before the interrupt, then exit with the
+			// interrupt status.
 			stopProgress()
 			_ = cmd.write(report)
 			return canceled
@@ -472,17 +472,17 @@ func checksScanProgressLine(repoIndex, repoCount int, repo string, repoScanned, 
 }
 
 // backfillCanceledError maps an operator cancellation (Ctrl+C) to a clean
-// stop: it clears the progress line, prints a notice, and returns ErrSilent so
-// the CLI exits non-zero without a raw "context canceled" error line. It
-// returns nil for any other error (including none) so the caller handles it
-// normally.
-func backfillCanceledError(err error, stopProgress func()) error {
-	if !errors.Is(err, context.Canceled) {
+// stop: it clears the progress line, prints a notice, and returns a silent
+// error so the CLI exits with the interrupt status without a raw "context
+// canceled" error line. It returns nil for any other error (including none)
+// so the caller handles it normally.
+func backfillCanceledError(ctx context.Context, err error, stopProgress func()) error {
+	if !endedByInterrupt(ctx, err) {
 		return nil
 	}
 	stopProgress()
 	fmt.Fprintln(os.Stderr, "checks backfill canceled")
-	return ErrSilent
+	return interrupted(ctx)
 }
 
 // pauseForRateLimit sleeps until the GitHub budget resets when the remaining

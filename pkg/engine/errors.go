@@ -149,7 +149,9 @@ func IsAlreadyCompleted(err error) bool {
 // back, so a caller consuming a durable control request should resolve the
 // request terminally with the engine's reason and keep driving, so the drive
 // records the outcome the engine reports. A completed change has its own type,
-// AlreadyCompletedError, because its caller reconciles to completed instead.
+// AlreadyCompletedError, because its caller reconciles to completed instead. A
+// ControlResult that is not accepted is the same terminal refusal, and a
+// caller that disposes of errors carries it as this type.
 type SettledOutcomeError struct {
 	Err error
 }

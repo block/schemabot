@@ -983,3 +983,93 @@ func TestLocalClient_FinalizerEngineErrorDispositionFollowsDatabaseType(t *testi
 		})
 	}
 }
+
+// The engine accepts ns_0's VSchema deploy, then every progress poll fails with
+// a transient error. The finalizer must not poll forever: once the poll's error
+// budget is spent it pauses as failed_retryable with the poll error recorded,
+// the drive ends without an error because the pause is its outcome, and the
+// claim's re-drive reattaches to the stored deploy and completes it. Both
+// database types whose recovery can pick accepted work back up take this path:
+// one resumes from a checkpoint, the other reattaches to the deploy request.
+func TestLocalClient_FinalizerProgressOutagePausesThenRedriveCompletes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	tests := []struct {
+		name         string
+		databaseType string
+	}{
+		{"checkpoint-resuming type", storage.DatabaseTypeStrata},
+		{"reattaching type", storage.DatabaseTypeVitess},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{databaseType: tt.databaseType})
+			f.client.taskPollIntervalOverride = time.Millisecond
+			f.eng.applyResult = &engine.ApplyResult{Accepted: true, ResumeState: &engine.ResumeState{MigrationContext: "deploy-ns-0"}}
+			f.eng.progressErr = fmt.Errorf("get deploy request: rate limited")
+
+			require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID),
+				"a stored pause is the drive's outcome, not a resume failure")
+
+			paused := f.finalizerOperation(t)
+			assert.Equal(t, state.ApplyOperation.FailedRetryable, paused.State)
+			assert.Contains(t, paused.ErrorMessage, fmt.Sprintf("failed after %d consecutive errors", maxConsecutiveProgressPollErrors))
+			assert.Contains(t, paused.ErrorMessage, "rate limited")
+			assert.Nil(t, paused.CompletedAt, "a paused finalizer is resumable, so it carries no completion time")
+
+			f.eng.progressErr = nil
+			redriveCtx := f.redispatch(t)
+			require.NoError(t, f.client.ResumeApplyOperation(redriveCtx, f.apply, f.finalizerID))
+
+			applies := f.eng.applies()
+			require.Len(t, applies, 2)
+			require.NotNil(t, applies[1].ResumeState, "the re-drive hands the engine the deploy the first drive stored")
+			assert.Equal(t, "deploy-ns-0", applies[1].ResumeState.MigrationContext)
+			completed := f.finalizerOperation(t)
+			assert.Equal(t, state.ApplyOperation.Completed, completed.State)
+			assert.Empty(t, completed.ErrorMessage)
+		})
+	}
+}
+
+// A progress outage on work the engine already accepted follows the
+// accepted-work policy: a type whose recovery resumes from a checkpoint or
+// reattaches to accepted work pauses the finalizer, while a type with neither
+// fails it, because a retry there could dispatch the work again. What the
+// drive returns follows what it recorded: a pause ends the drive without an
+// error, a failure returns the poll error.
+func TestLocalClient_FinalizerProgressOutageDispositionFollowsDatabaseType(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	const embeddedEngineType = "embedded-engine"
+	tests := []struct {
+		name         string
+		databaseType string
+		wantState    string
+	}{
+		{"checkpoint-resuming type pauses", storage.DatabaseTypeStrata, state.ApplyOperation.FailedRetryable},
+		{"reattaching type pauses", storage.DatabaseTypeVitess, state.ApplyOperation.FailedRetryable},
+		{"type with neither fails", embeddedEngineType, state.ApplyOperation.Failed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{databaseType: tt.databaseType})
+			f.client.taskPollIntervalOverride = time.Millisecond
+			f.eng.applyResult = &engine.ApplyResult{Accepted: true, ResumeState: &engine.ResumeState{MigrationContext: "deploy-ns-0"}}
+			f.eng.progressErr = fmt.Errorf("get deploy request: connection reset")
+
+			err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
+			if tt.wantState == state.ApplyOperation.FailedRetryable {
+				require.NoError(t, err, "a stored pause is the drive's outcome, not a resume failure")
+			} else {
+				require.ErrorContains(t, err, "connection reset")
+			}
+
+			op := f.finalizerOperation(t)
+			assert.Equal(t, tt.wantState, op.State)
+			assert.Contains(t, op.ErrorMessage, "connection reset")
+		})
+	}
+}

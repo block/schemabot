@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,6 +174,53 @@ func TestDoGetIntoCarriesTheCappedRetryAfterHeader(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, apiErr.Status)
 	assert.Equal(t, maxRetryAfterHeader, apiErr.RetryAfterHeader)
 	assert.Equal(t, time.Hour, apiErr.RetryAfterHeaderUncapped)
+}
+
+// A server that stops partway through its answer leaves the caller with a
+// ResponseReadError on either protocol, so a poller can retry it without
+// knowing how each protocol reports the break: HTTP/1 ends the body early,
+// and HTTP/2 resets the stream.
+func TestDoGetIntoReportsAnInterruptedBodyAsAResponseReadError(t *testing.T) {
+	tests := []struct {
+		name      string
+		http2     bool
+		wantCause string
+	}{
+		{name: "HTTP/1 body ends early", http2: false, wantCause: "unexpected EOF"},
+		{name: "HTTP/2 stream reset", http2: true, wantCause: "stream error"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotProto atomic.Int32
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotProto.Store(int32(r.ProtoMajor))
+				w.Header().Set("Content-Type", "application/json")
+				// A declared length the body never reaches makes the early
+				// end visible to an HTTP/1 client.
+				w.Header().Set("Content-Length", "64")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"logs":[`))
+				_ = http.NewResponseController(w).Flush()
+				panic(http.ErrAbortHandler)
+			}))
+			srv.EnableHTTP2 = tc.http2
+			srv.StartTLS()
+			t.Cleanup(srv.Close)
+
+			var result apitypes.LogsResponse
+			err := doGetIntoWithClient(t.Context(), srv.Client(), srv.URL, "/api/logs", &result)
+
+			wantProto := int32(1)
+			if tc.http2 {
+				wantProto = 2
+			}
+			require.Equal(t, wantProto, gotProto.Load(), "the request used the protocol under test")
+			var readErr *ResponseReadError
+			require.ErrorAs(t, err, &readErr)
+			assert.ErrorContains(t, readErr.Err, tc.wantCause)
+			assert.Equal(t, "read response: "+readErr.Err.Error(), err.Error())
+		})
+	}
 }
 
 // RetryAfter decides whether to retry from the error code alone, and when it

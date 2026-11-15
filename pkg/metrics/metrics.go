@@ -1589,6 +1589,7 @@ const (
 	GitHubOperationGetBranchRules                 = "get_branch_rules"
 	GitHubOperationGetCombinedStatus              = "get_combined_status"
 	GitHubOperationGetPullRequestReviewProtection = "get_pull_request_review_protection"
+	GitHubOperationGetTeam                        = "get_team"
 	GitHubOperationGetTeamMembership              = "get_team_membership"
 	GitHubOperationGraphQLMinimizeComment         = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup       = "graphql_status_check_rollup"
@@ -1794,6 +1795,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationGetBranchRules,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetPullRequestReviewProtection,
+		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
@@ -2313,6 +2315,21 @@ func RecordPRFileCapExceeded(ctx context.Context, repo string, schemaVisible boo
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo),
 		attribute.Bool("schema_visible", schemaVisible))
+}
+
+// RecordSymlinkModesUnread counts changed paths whose symlink mode SchemaBot
+// did not read: GitHub refused the change's diff (or gave no mode for a pure
+// rename), truncated the repository's tree listing, and no configured schema
+// directories bound which paths could be schema symlinks. Reading them
+// directory by directory would cost GitHub requests in proportion to the PR's
+// non-schema files, so they are treated as not symlinks. A nonzero rate names
+// a repository whose databases need allowed_dirs, so a symlink that changes a
+// schema is planned there.
+func RecordSymlinkModesUnread(ctx context.Context, repo string, paths int) {
+	addCounterN(ctx, int64(paths), "schemabot.github.symlink_modes_unread_total",
+		"Total number of changed paths treated as not symlinks because GitHub truncated the tree listing and no configured schema directories bound them", "{path}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
 }
 
 var knownStatusCheckOperations = map[string]bool{

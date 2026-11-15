@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	cmdclient "github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -505,38 +506,37 @@ func blockUnattendedNamedSchema(selector string, autoApprove bool) error {
 // changes while converging a different schema than the one the refusal was
 // about — and on a cross-release convergence that is the schema of a different
 // release.
-//
-// A DSN is named rather than repeated: it carries the storage database's
-// credentials, and this is printed to a terminal and scrolled back through.
 func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() string {
-	parts := []string{"storage", "apply"}
-	switch {
-	case strings.TrimSpace(cmd.DSN) != "":
-		parts = append(parts, "--dsn <the same DSN>")
-	case cmd.Config != "":
-		parts = append(parts, "--config", cmd.Config)
-	case cmd.Deployment != "":
-		parts = append(parts, "--deployment", cmd.Deployment, "-e", cmd.Environment)
-	}
-	if cmd.Dialect != "" {
-		parts = append(parts, "--dialect", cmd.Dialect)
-	}
+	parts := append([]string{"storage", "apply"}, cmd.targetArgs()...)
 	// A budget the operator chose is part of the run being offered back. An
 	// operator who shortened it to fail fast, and copies a command that drops
 	// the flag, gets the target's default instead of the ceiling they picked.
 	if cmd.Timeout > 0 {
 		parts = append(parts, "--timeout", cmd.Timeout.String())
 	}
-	switch {
-	case strings.TrimSpace(cmd.Release) != "":
-		parts = append(parts, "--release", cmd.Release)
-		if strings.TrimSpace(cmd.Repo) != "" {
-			parts = append(parts, "--release-repo", cmd.Repo)
-		}
-	case strings.TrimSpace(cmd.SchemaDir) != "":
-		parts = append(parts, "--schema-dir", cmd.SchemaDir)
-	}
+	parts = append(parts, cmd.sourceArgs()...)
 	return strings.Join(append(parts, "--allow-unsafe"), " ")
+}
+
+// targetArgs renders the flags that address the same storage database again,
+// for a command printed back to the operator.
+//
+// A DSN is named rather than repeated: it carries the storage database's
+// credentials, and this is printed to a terminal and scrolled back through.
+func (f *storageSchemaTargetFlags) targetArgs() []string {
+	var args []string
+	switch {
+	case strings.TrimSpace(f.DSN) != "":
+		args = append(args, "--dsn <the same DSN>")
+	case f.Config != "":
+		args = append(args, "--config", f.Config)
+	case f.Deployment != "":
+		args = append(args, "--deployment", f.Deployment, "-e", f.Environment)
+	}
+	if f.Dialect != "" {
+		args = append(args, "--dialect", f.Dialect)
+	}
+	return args
 }
 
 // blockManualStorageApply stops a convergence that cannot run at all.
@@ -817,6 +817,33 @@ func dialectOfTarget(ctx context.Context, g *Globals, flags *storageSchemaTarget
 	}
 }
 
+// The notices a convergence the operator stopped prints before it exits with
+// the interrupt status. Each says what the stop left behind on its path, since
+// the two paths leave different things: a direct convergence releases what it
+// was doing, while the server carries on with one it had started, because a
+// client hanging up is not a decision about its storage (AV-13). The command
+// that shows what is left follows each (see seeWhatIsLeft).
+const (
+	storageApplyInterruptedDirect     = "Storage apply interrupted. Any statement in flight was cancelled, and statements that had finished stay applied."
+	storageApplyInterruptedThroughAPI = "Storage apply interrupted. A convergence the server had already started carries on, holding the storage bootstrap lock, until it finishes or its budget runs out."
+)
+
+// seeWhatIsLeft names the command that shows what an interrupted convergence
+// left outstanding on the same storage database.
+//
+// A plan always compares against a schema the operator names, so it is offered
+// with the selector this apply was given. An apply that named none converged
+// the answering binary's own schema, which no plan flag selects, so the apply
+// itself is offered instead: it plans what is left before it converges it.
+func (cmd *StorageApplyCmd) seeWhatIsLeft() string {
+	if cmd.namedSource() == "" {
+		return fmt.Sprintf("Run the same `%s storage apply` command again to see what is left and converge it.", cliname.Name())
+	}
+	plan := append([]string{"storage", "plan"}, cmd.targetArgs()...)
+	plan = append(plan, cmd.sourceArgs()...)
+	return fmt.Sprintf("Run `%s` to see what is left.", cliname.Command(strings.Join(plan, " ")))
+}
+
 // converge runs the convergence over whichever path the flags selected, against
 // the schema already resolved for the plan the operator approved.
 func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *storageSchemaTargetFlags, desired *api.StorageSchemaSource) (planned, remaining *apitypes.StorageSchemaReport, err error) {
@@ -846,6 +873,10 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *sto
 			append(target.ensureSchemaOptions(cmd.AllowUnsafe),
 				api.WithConvergenceTimeout(budget),
 				api.WithConvergenceProgress(progress.observe))...)
+		if endedByInterrupt(ctx, err) {
+			fmt.Fprintln(os.Stderr, storageApplyInterruptedDirect, cmd.seeWhatIsLeft())
+			return nil, nil, interrupted(ctx)
+		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("converge storage schema on the database from %s: %w", target.source, err)
 		}
@@ -871,6 +902,10 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals, flags *sto
 		request.SchemaSource = desired.Description
 	}
 	response, err := cmdclient.StorageSchemaApply(ctx, endpoint, request)
+	if endedByInterrupt(ctx, err) {
+		fmt.Fprintln(os.Stderr, storageApplyInterruptedThroughAPI, cmd.seeWhatIsLeft())
+		return nil, nil, interrupted(ctx)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("converge storage schema%s: %w", storageSchemaTargetSuffix(flags.Deployment, flags.Environment), err)
 	}

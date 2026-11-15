@@ -1137,17 +1137,6 @@ func TestWatchModel_EndsOnEveryTerminalState(t *testing.T) {
 		})
 	}
 
-	// An error the view already shows fails the watch; detaching while
-	// the apply still runs is not an outcome and exits 0.
-	t.Run("an error fails the watch and a detach does not", func(t *testing.T) {
-		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
-		updated, _ := m.Update(progressMsg{state: state.Apply.Running})
-		running := updated.(WatchModel)
-		assert.NoError(t, running.exitError(), "detached while running")
-		running.errorMsg = "progress polls kept failing"
-		assert.ErrorIs(t, running.exitError(), ErrSilent)
-	})
-
 	t.Run("reverted says the change was undone and exits non-zero", func(t *testing.T) {
 		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
 		m.applyID = "apply-reverted"

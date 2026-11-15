@@ -104,7 +104,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build"
         run: go build -v ./...
@@ -130,7 +130,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
 
   unit:
     name: "Unit Tests"
@@ -151,8 +151,22 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # At the end of a build the go command deletes build cache entries it
+      # has not used for several days, unless trim.txt in the cache records a
+      # recent trim. Every file in a restored cache is as old as the day the
+      # cache was saved, and some tests run a go build of their own. On an old
+      # cache the first of those builds would delete entries that later tests
+      # load packages from, and those tests would then compile their
+      # dependencies from source inside their own deadlines. This job never
+      # saves the cache, so nothing is lost by keeping it whole.
+      - name: "Keep the restored Go build cache"
+        run: |
+          set -euo pipefail
+          gocache="$(go env GOCACHE)"
+          mkdir -p "$gocache"
+          date +%s > "$gocache/trim.txt"
       - name: "Test"
         run: make test-unit
       - name: "Consumer-module startup test"
@@ -217,7 +231,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so transient registry outages
       # surface here as a named, retryable, fail-fast step instead of as many
@@ -414,7 +428,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the image
@@ -465,7 +479,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -522,7 +536,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -595,7 +609,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -730,7 +744,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -790,7 +804,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # setup-minikube's own download cache cannot reach the cache service, so
       # every run would download the node image and the Kubernetes preload.
@@ -885,7 +899,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # setup-minikube's own download cache cannot reach the cache service, so
       # every run would download the node image and the Kubernetes preload.
@@ -1031,7 +1045,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # setup-minikube's own download cache cannot reach the cache service, so
       # every run would download the node image and the Kubernetes preload.
@@ -1122,7 +1136,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # The runner ships a preinstalled MySQL whose AppArmor profile confines
       # /usr/sbin/mysqld to its packaged data dirs. LocalScale runs vtcombo's

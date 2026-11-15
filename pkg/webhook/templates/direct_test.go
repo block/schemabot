@@ -27,7 +27,7 @@ func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 
 	plan := RenderPlanComment(data)
 	assert.Contains(t, plan, "⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit")
-	assert.Contains(t, plan, "`users`: the table has ~1,240 rows")
+	assert.Contains(t, plan, "`users`: the table has \\~1,240 rows")
 	assert.Contains(t, plan, "Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.\n")
 	assert.NotContains(t, plan, "Confirming the apply", "the policy approves a direct change, so the disclosure asks for no confirmation")
 	assert.NotContains(t, plan, "revertible", "a MySQL direct change is undone like any other MySQL change, so no revert warning is shown")
@@ -123,7 +123,7 @@ func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "table user\\_events\\_v2 \\| column \\`event\\_id\\` runs directly")
+	assert.Contains(t, out, "table user_events_v2 \\| column \\`event_id\\` runs directly")
 }
 
 func TestRenderPlanComment_DirectSanitizesReason(t *testing.T) {
@@ -155,7 +155,7 @@ func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "`users` (shards `-40`, `40-80`): the table has ~40 rows")
+	assert.Contains(t, out, "`users` (shards `-40`, `40-80`): the table has \\~40 rows")
 }
 
 // The direct-execution disclosure copy is keyed by database type: MySQL-family
@@ -278,7 +278,7 @@ func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {
 	})
 
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
-	assert.Contains(t, out, "`users`: refused by \\[endpoint redacted\\] \\*event\\_id\\* \\| \\<details>\n",
+	assert.Contains(t, out, "`users`: refused by \\[endpoint redacted\\] \\*event_id\\* \\| \\<details>\n",
 		"the reason stays on one line with Markdown escaped")
 }
 
@@ -311,11 +311,11 @@ func TestRenderPlanComment_DirectDisclosedPerTargetGroup(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the primary plan's direct change is disclosed once, under its group")
-	assert.Contains(t, out, "- `users` on targets `payments-001`, `payments-003`: the table has ~1,240 rows\n",
+	assert.Contains(t, out, "- `users` on targets `payments-001`, `payments-003`: the table has \\~1,240 rows\n",
 		"only the targets that run it directly are named")
 
 	data.DeploymentDrift.Plans[0].DirectChanges = nil
 	fallback := RenderPlanComment(data)
 	assert.Equal(t, 1, strings.Count(fallback, "**Direct execution**"), "a group that carries none leaves the plan-wide disclosure in place")
-	assert.Contains(t, fallback, "- `users`: the table has ~1,240 rows\n")
+	assert.Contains(t, fallback, "- `users`: the table has \\~1,240 rows\n")
 }

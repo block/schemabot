@@ -406,6 +406,34 @@ func PreviewCommentShardedPlanDivergent() string {
 	})
 }
 
+// PreviewCommentShardedPlanMultiEnvShardOnly renders a multi-environment plan
+// whose keyspace carries its DDL only per shard, with no keyspace-wide
+// statements. Each environment still counts as having work, so each gets its
+// own section and apply command.
+func PreviewCommentShardedPlanMultiEnvShardOnly() string {
+	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	plan := func(env string, shards ...string) *PlanCommentData {
+		changes := make([]KeyspaceShardChange, 0, len(shards))
+		for _, shard := range shards {
+			changes = append(changes, KeyspaceShardChange{Shard: shard, Statements: []string{idx}})
+		}
+		return &PlanCommentData{
+			Database: "cdb_resolute", Environment: env, DatabaseType: "strata", RequestedBy: previewRequestedBy,
+			Changes: []KeyspaceChangeData{{Keyspace: "cdb_resolute_sharded", Shards: changes}},
+		}
+	}
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "cdb_resolute", DatabaseType: "strata",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{
+			"staging":    plan("staging", "-80", "80-"),
+			"production": plan("production", "-40", "40-80", "80-c0", "c0-"),
+		},
+		Errors: map[string]string{},
+	})
+}
+
 // PreviewCommentShardedPlanManyShards renders a uniform sharded plan across a
 // wide keyspace: the DDL shows once under an "all N shards" heading, with the
 // shard names behind a collapsed block instead of walling the comment.

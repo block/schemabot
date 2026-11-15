@@ -129,9 +129,12 @@ type gatedVSchemaClient struct {
 	billingErr     error
 }
 
-// billingHold bounds how long billing waits for a cancellation that a correct
-// plan never sends. It only sets how long the test takes; the outcome a correct
-// plan reports does not depend on it.
+// billingHold bounds how long billing waits, once commerce has failed, for a
+// cancellation that a correct plan never sends, so every run of these tests
+// waits it out in full. A plan that cancels sibling keyspaces does so as soon
+// as commerce fails, long before the hold ends. Raising it therefore slows
+// every run of the suite without catching anything more, and the outcome a
+// correct plan reports does not depend on it.
 const billingHold = 200 * time.Millisecond
 
 func newGatedVSchemaClient(billingErr error) *gatedVSchemaClient {

@@ -1332,9 +1332,10 @@ func throttledSuffix(table TableProgressData) string {
 
 // writeThrottleTooltip explains the header's "(throttled)" annotation with the
 // engine's reason, using the same tooltip idiom as the estimate-exceeded note.
-// The reason is sanitized at the engine boundary before it is stored, so it is
-// safe to render in markdown. When the engine reports throttled without a
-// reason, the header annotation stands alone.
+// The reason is sanitized at the engine boundary before it is stored, and is
+// escaped here like any other engine prose, so a delimiter in it cannot end
+// the italic span and a mention in it notifies nobody. When the engine reports
+// throttled without a reason, the header annotation stands alone.
 func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	if !table.Throttled || table.ThrottleReason == "" {
 		return
@@ -1344,10 +1345,10 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	// whose signal has no tip renders alone so a new engine signal degrades
 	// to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeProse(table.ThrottleReason), tip, ui.ThrottleDocURL)
 		return
 	}
-	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
+	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeProse(table.ThrottleReason))
 }
 
 // tableBegan reports whether the engine began a table's change before it

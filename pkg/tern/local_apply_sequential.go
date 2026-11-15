@@ -801,7 +801,7 @@ type atomicPollState struct {
 
 	// revertSkipped is set once the engine accepts SkipRevert, so the drive
 	// stops re-attempting it and surfaces skipping_revert while the engine
-	// finalizes. A rejected attempt leaves it unset for the next tick to retry.
+	// finalizes. A failed or refused attempt leaves it unset.
 	revertSkipped bool
 
 	// revertTriggered is set once this drive has seen that the engine accepted
@@ -826,6 +826,11 @@ type atomicPollState struct {
 	// autoSkipRevertEscalated is set once the persisting skip-revert failure
 	// has been recorded on the timeline, so the escalation lands there once.
 	autoSkipRevertEscalated bool
+
+	// autoSkipRevertRefused is set once the engine refuses the automatic
+	// skip-revert for this schema change, so this drive does not ask again and
+	// the window waits for an operator's revert or skip-revert.
+	autoSkipRevertRefused bool
 
 	// resumeEventLogged is set after this drive claim records the
 	// engine-resumed-from-checkpoint timeline event, so the flag the engine

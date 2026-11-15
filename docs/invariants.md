@@ -332,7 +332,12 @@ content, DDL fences drawing on a budget shared across the comment, and the code 
 an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —
 table, namespace, keyspace, shard, schema path, database, check name — flattened to one line and
 delimited past any backtick run inside it (`pkg/webhook/templates/fence.go`, exercised across
-its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`); the Check Run
+its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`), and the prose
+escaper that writes a mention as code and a character reference as text (`escapeProse` in
+`pkg/webhook/templates/fence.go`), applied to a lint or unsafe change reason that quotes such
+names outside any code span (`markdownReason`, also there) and to engine reasons, exempt-table
+reasons, per-deployment apply refusals, and throttle reasons
+(`pkg/webhook/templates/plan.go`, `pkg/webhook/templates/apply.go`); the Check Run
 summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
 clamp (`pkg/webhook/plan_drift.go`); the log-text sanitizer applied to every line, level, and
 group heading in the failed-summary log fold (`pkg/webhook/templates/failure_logs.go`); the
@@ -517,15 +522,18 @@ repository it serves, so routine edits in one large repository use it up and req
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
 configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
 (`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
-symlinks from one diff of the change, or from directory listings batched across those paths when
-GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
-the server's configuration names every directory the repository's configs can sit in, and reads a
-symlink's target only when a config file sits above it; and
+symlinks from one diff of the change, and reads the paths the diff gives no mode for with at most
+one request per side: one directory listing when they fit in one batch, otherwise one listing of
+the whole tree. It asks only about paths inside the configured schema directories when the
+server's configuration names every directory the repository's configs can sit in. When GitHub
+truncates the tree, the paths the listing still names keep its modes; the rest are listed by
+directory in batches when they are inside those schema directories, and are otherwise treated as
+not symlinks. It reads a symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
 (`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
-one-line edits outside its schema directory and requires the same GitHub requests. It covers an
-auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
-repository whose tree GitHub truncates.
+one-line edits outside its schema directory and requires the same GitHub requests, with the diff
+served, refused as too large, and naming pure renames. It covers an auto-plan when the PR opens and
+when a push lands, a plan command, and a plan command in a repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
@@ -575,6 +583,11 @@ automatic apply, which dispatches only after its pending changes are stored
 fold observes; concurrent publication can leave stale success over a later blocker
 ([publication concurrency](check-runs.md#publication-concurrency)).
 
+The one exception is a changed path whose file mode cannot be read within AV-15's request budget.
+It is treated as a regular file, so a PR whose only schema change is a symlink among such paths
+gets a passing "no schema files changed". The case is logged as a warning and counted
+(`symlinksAtRef` in `pkg/github/symlink_modes.go`); a request GitHub fails is still an error.
+
 ### MG-2: Absence never passes
 
 The aggregate check is created on every PR head commit. A PR that touches no managed schema files
@@ -598,7 +611,9 @@ alongside environments that also failed, or while another of the same plan did, 
 failing check that replaces its earlier passing one, or, when that row cannot be stored, a
 failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
 `pkg/webhook/check_records.go`, called through `recordPlanFailuresAndFold` by
-`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
+`handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`); a plan the database's
+source policy refused, which stores no row, posted as a failing aggregate carrying a block no
+fold replaces (`postSourcePolicyRefusal` in `pkg/webhook/plan.go`);
 retry preparation durably invalidating old successes before releasing aggregate blocks (`MarkPlanPending` in `pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-3: The rollup is conservative
@@ -1147,8 +1162,15 @@ admitted after that result and before the correction lands is recorded active be
 rollout. *Enforced:* the exclusivity check in the storage apply create and activate paths, over
 active parents and over terminal parents with an operation in progress
 (`checkNoActiveApplyForTargets`, `checkNoInProgressRolloutForTargets`), under the apply target lock
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`). The
-admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` and
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`). The order
+of that lock before any apply row is checked by `TestApplyTargetLockPrecedesApplyRowLocks`
+(`pkg/storage/internal/sqlstore/target_lock_order_test.go`, on both dialects), which drives every
+entry point that takes the lock and refuses the lock while any transaction holds an apply row, on
+the branches its cases drive, and `TestApplyTargetLockAcquirersAreListed`
+(`pkg/storage/internal/sqlstore/target_lock_acquirers_test.go`), which walks the package's call
+graph, following interface calls to the package's own implementations, so a new exported entry
+point that reaches the lock fails until the first test drives it. The admission past a settled
+manifest hold is `checkNoActiveApplyForNewGeneration` and
 `settledManifestHold`, which record the handoff in the create's transaction (`markAdmittedPast`);
 `activeApplyHoldersForTargets` stops counting the held apply once it carries the handoff, and
 `AttachOperationWithTasks` refuses an attach to it, all in the same file. The same create
@@ -1333,7 +1355,10 @@ not replace (CO-3), which is typed apart from a decline for the database type.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
 `pkg/tern/control_requests.go`), the terminal resolution of a typed settled-outcome refusal on the
-stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_control.go`), the
+stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_control.go`) and on
+the revert and skip-revert paths, which carry an engine answer that is not an acceptance as that
+refusal (`resolveOrRetryRevertPhaseRequest` and `resolveOrRetryAutoSkipRevert`,
+`pkg/tern/local_apply_grouped.go`), the
 terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in

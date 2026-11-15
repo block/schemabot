@@ -82,6 +82,7 @@ const (
 	BlockParticipantUnresolved            = "participant_unresolved"
 	BlockNarrowedApply                    = "narrowed_apply"
 	BlockPlanFailedUnrecorded             = "plan_failed_unrecorded"
+	BlockPlanRefusedBySourcePolicy        = "plan_refused_by_source_policy"
 	BlockReviewTimeDeploymentDrift        = storage.ReviewTimeDeploymentDriftBlockingReason
 	BlockNamespacePlacementRefused        = storage.NamespacePlacementRefusedBlockingReason
 )
@@ -134,6 +135,7 @@ var blockClasses = map[string]blockClass{
 	BlockNoAllowedConfiguredEnvironments:  blockGuard,
 	BlockNarrowedApply:                    blockGuard,
 	BlockPlanFailedUnrecorded:             blockGuard,
+	BlockPlanRefusedBySourcePolicy:        blockGuard,
 	BlockParticipantUnresolved:            blockAwaitingReport,
 }
 

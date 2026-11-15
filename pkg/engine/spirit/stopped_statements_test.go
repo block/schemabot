@@ -1,6 +1,7 @@
 package spirit
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -43,11 +44,11 @@ func TestStartFailsWhenAStoppedRunsStatementCannotBeChecked(t *testing.T) {
 	assert.Equal(t, []unconfirmedStatement{recorded}, eng.unconfirmedStatements, "the statement stays recorded for the next start")
 }
 
-// A start that arrives while a stop is still waiting for its run to exit waits
-// for that run. The run records a statement it could not confirm had ended only
-// as it exits, so the start checks that statement rather than starting before
-// it is recorded.
-func TestStartWaitsForAStoppingRunToRecordItsStatement(t *testing.T) {
+// A start that arrives while a stop is still waiting for its run to exit is
+// refused until that run returns. The run records a statement it could not
+// confirm had ended only as it exits, so the start sent once it has returned
+// checks that statement instead of starting before it is recorded.
+func TestStartAfterAStoppingRunReturnsChecksItsStatement(t *testing.T) {
 	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	// The statement ran as another user, so the check holds the target
 	// without reaching the server.
@@ -62,23 +63,16 @@ func TestStartWaitsForAStoppingRunToRecordItsStatement(t *testing.T) {
 		eng.mu.Unlock()
 	})
 
-	started := make(chan error, 1)
-	go func() {
-		_, err := eng.Start(t.Context(), &engine.ControlRequest{})
-		started <- err
-	}()
-	select {
-	case <-started:
-		require.FailNow(t, "Start returned while the stopped run was still exiting")
-	case <-time.After(100 * time.Millisecond):
-	}
+	_, err := eng.Start(t.Context(), &engine.ControlRequest{})
+	require.Error(t, err, "the start is refused while the stopped run has not returned")
+	assert.True(t, engine.IsRetryable(err), "the refused start can be sent again")
+
 	close(release)
-	select {
-	case err := <-started:
-		require.NoError(t, err, "Start()")
-	case <-time.After(10 * time.Second):
-		require.FailNow(t, "Start did not return")
-	}
+	exitCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, waitForRunExit(exitCtx, rm), "the stopped run returns")
+	_, err = eng.Start(t.Context(), &engine.ControlRequest{})
+	require.NoError(t, err, "Start()")
 
 	var progress *engine.ProgressResult
 	require.Eventually(t, func() bool {

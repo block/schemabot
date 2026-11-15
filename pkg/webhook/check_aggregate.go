@@ -72,6 +72,13 @@ func (h *Handler) hasAggregateRole(repo string) bool {
 // on the head after narrowing dropped it gates all of them alike. Non-leaders
 // get no participants: the expected set only exists on the leader. A failed
 // participant read is returned as an error so the caller publishes nothing.
+//
+// An environment-scoped leader publishes every aggregate through its own fold,
+// which reads the participants it expects under their environment-scoped
+// names, so its callers only use the answer to choose how to describe that
+// fold. It returns every participant the listed files select without reading
+// any Check Run: participants publish no run under the unscoped name there,
+// and selecting too many only ever routes to the fold, which fails closed.
 func (h *Handler) leaderParticipantsForPR(
 	ctx context.Context, client checkRunFinder,
 	repo string, pr int, headSHA string,
@@ -81,7 +88,12 @@ func (h *Handler) leaderParticipantsForPR(
 	if !ok {
 		return nil, nil
 	}
-	return h.participantsExpectedOnHead(ctx, client, repo, pr, headSHA,
+	if len(config.AllowedEnvironments) > 0 {
+		h.logger.Debug("environment-scoped leader selects participants from the listed files without reading their Check Runs; its fold reads them per environment",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)), nil
+	}
+	return h.participantsExpectedOnHead(ctx, client, repo, pr, aggregateSentinel, headSHA,
 		config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)),
 		config.ExpectedParticipantChecksForPR(repo, prFilePaths(proposed)))
 }

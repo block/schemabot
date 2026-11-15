@@ -1060,6 +1060,38 @@ func TestLocalClient_FailedReclaimDoesNotHoldBackTheCancel(t *testing.T) {
 	assert.Contains(t, messages, "Left in place because the delete failed; delete it by hand to reclaim branch quota: branch schemabot-testdb-1a2b")
 }
 
+// A PlanetScale apply is cancelled before its deploy request exists, and its
+// stored resume state cannot be read. The reclaim cannot tell the engine what
+// the apply left in the service, so it asks the engine nothing and returns the
+// read failure, which the cancel then logs, rather than report that nothing
+// was left to reclaim.
+func TestLocalClient_CancelReclaimReportsAStoredStateThatCannotBeLoaded(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-unreadable-state",
+		State:           state.Apply.PreparingBranch,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-unreadable-state",
+		State:            state.Task.Pending,
+	}
+	eng := &resumeStateReclaimEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+	client.storage.(*controlTestStorage).applyOperations = &controlTestApplyOperationStore{err: errors.New("storage unavailable")}
+
+	err := client.reclaimCancelledResumeState(t.Context(), eng, apply, []*storage.Task{task})
+
+	require.Error(t, err, "a stored state that cannot be loaded is reported, not read as nothing to reclaim")
+	assert.Contains(t, err.Error(), "load persisted engine resume state for apply operation 99: storage unavailable")
+	assert.Nil(t, eng.reclaimReq, "the engine is not asked to reclaim a state that was never read")
+}
+
 // A PlanetScale failed_retryable task paused after a transient failure (e.g.
 // repeated progress-poll errors) still has its created, startable deploy request
 // and persisted resume state. Cancel must cancel that deploy request via the

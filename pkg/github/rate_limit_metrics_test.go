@@ -410,6 +410,12 @@ func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
 			repository: "octocat/hello-world",
 		},
 		{
+			name:      "get team",
+			method:    http.MethodGet,
+			url:       "https://api.github.com/orgs/octocat/teams/db-team",
+			operation: metrics.GitHubOperationGetTeam,
+		},
+		{
 			name:      "list team members",
 			method:    http.MethodGet,
 			url:       "https://api.github.com/orgs/octocat/teams/db-team/members",

@@ -467,8 +467,13 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 	data.Tables[0].Throttled = true
 	data.Tables[0].ThrottleReason = "signal_a 1_000ms >= `500ms` [gradual]"
 	escaped := RenderApplyStatusComment(data)
-	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal\\_a 1\\_000ms >= \\`500ms\\` \\[gradual\\]_",
-		"markdown delimiters in an unrecognized reason are escaped and render with no tip")
+	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal_a 1_000ms >= \\`500ms\\` \\[gradual\\]_",
+		"markdown delimiters in an unrecognized reason are escaped and render with no tip; an underscore inside a word cannot end the italic span, so it is left as written")
+
+	data.Tables[0].ThrottleReason = "lag_ held by @octocat and &#64;hubot"
+	mention := RenderApplyStatusComment(data)
+	assert.Contains(t, mention, "- ℹ️ _Throttled: lag\\_ held by `@octocat` and \\&#64;hubot_",
+		"a mention in the reason reads as code and a character reference as text, so neither notifies anyone; an underscore that ends a word is escaped so it cannot close the italic span")
 }
 
 // A throttled checksum verify carries the same header annotation and tooltip
