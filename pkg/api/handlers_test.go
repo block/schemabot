@@ -4726,6 +4726,106 @@ func TestProgressByApplyIDOnlySendsApplyIDAndEnvironment(t *testing.T) {
 	assert.Equal(t, "staging", mock.progressReq.Environment)
 }
 
+// An active apply whose tern client cannot be resolved answers differently by
+// cause. A deployment missing from the server config is a 404 that names the
+// config gap. A deployment that is configured but whose client cannot be built,
+// such as a secret that fails to resolve, is a 503 with a fixed message that
+// never echoes the underlying error, so the CLI reports an outage instead of
+// "no schema change found".
+func TestProgressByApplyIDWhenTernClientIsUnavailable(t *testing.T) {
+	const credentialFragment = "credential-fragment-not-for-clients"
+
+	tests := []struct {
+		name         string
+		deployment   string
+		config       *ServerConfig
+		wantStatus   int
+		wantCode     string
+		wantContains string
+	}{
+		{
+			name:       "client construction fails",
+			deployment: "ledger",
+			config: &ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"ledger": {
+						Type: storage.DatabaseTypeVitess,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {
+								DSN:            "root@tcp(localhost:3306)/ledger",
+								Organization:   "acme",
+								TokenSecretRef: credentialFragment,
+							},
+						},
+					},
+				},
+			},
+			wantStatus:   http.StatusServiceUnavailable,
+			wantCode:     apitypes.ErrCodeEngineUnavailable,
+			wantContains: "the schema change engine for this apply is unavailable",
+		},
+		{
+			name:         "named deployment is not in the server config",
+			deployment:   "ledger",
+			config:       &ServerConfig{},
+			wantStatus:   http.StatusNotFound,
+			wantCode:     apitypes.ErrCodeDeploymentNotFound,
+			wantContains: `no tern client configured for database "testdb"`,
+		},
+		{
+			name:         "default deployment is not in the server config",
+			deployment:   DefaultDeployment,
+			config:       &ServerConfig{},
+			wantStatus:   http.StatusNotFound,
+			wantCode:     apitypes.ErrCodeDeploymentNotFound,
+			wantContains: `no tern client configured for database "testdb"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := activeTestApply("apply-no-client")
+			apply.Deployment = tc.deployment
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			svc := New(&mockStorageWithApplyStores{
+				applies: &staticApplyStore{apply: apply},
+				tasks:   &capturingTaskStore{},
+			}, tc.config, nil, logger)
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-no-client", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			require.Equal(t, tc.wantStatus, w.Code, w.Body.String())
+			var resp apitypes.ErrorResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			assert.Equal(t, tc.wantCode, resp.ErrorCode)
+			assert.Contains(t, resp.Error, tc.wantContains)
+			assert.NotContains(t, w.Body.String(), credentialFragment)
+		})
+	}
+}
+
+func TestProgressByApplyIDAnswers503WhenEngineProgressFails(t *testing.T) {
+	mock := &mockTernClient{isRemote: true, progressErr: errors.New("rpc timeout")}
+	apply := activeTestApply("apply-engine-down")
+	apply.ExternalID = "remote-engine-down"
+	svc := newControlTestService(mock, apply)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-engine-down", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, apitypes.ErrCodeEngineUnavailable, resp.ErrorCode)
+}
+
 func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
 	applies := &capturingApplyStore{}
 	mock := &mockTernClient{}

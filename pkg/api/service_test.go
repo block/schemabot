@@ -282,6 +282,21 @@ func TestService_TernClientPrefersConfiguredEndpointOverDefault(t *testing.T) {
 		"misconfigured endpoint must not be treated as unconfigured")
 }
 
+// A deployment absent from the server config is marked as not configured for
+// the default deployment and for a named one alike, so callers can tell it
+// apart from a client that is configured but cannot be built.
+func TestService_TernClientMarksMissingDeploymentsAsNotConfigured(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}
+	svc := New(store, &ServerConfig{}, nil, logger)
+
+	for _, deployment := range []string{DefaultDeployment, "", "unconfigured"} {
+		_, err := svc.TernClient(deployment, "staging")
+		require.Error(t, err, "deployment %q", deployment)
+		assert.ErrorIs(t, err, errTernDeploymentNotConfigured, "deployment %q", deployment)
+	}
+}
+
 func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {
 	config := TernConfig{
 		"default": {

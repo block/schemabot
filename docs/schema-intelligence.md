@@ -734,6 +734,14 @@ apply whose manifest declares more than one operation, and a remote apply the
 data plane has not yet been handed. `Unknown` means the data
 plane reported an engine this server does not recognize.
 
+An unknown `apply_id` answers `404` with `error_code` `not_found`. When the apply
+exists but the server cannot reach the data plane that runs it, the route answers
+`503` with `error_code` `engine_unavailable`. That covers a client that cannot be
+built, for example because a secret does not resolve, and a data plane that does
+not answer. Retry after a short wait; the server logs hold the cause. A server
+with no configuration for the apply's deployment answers `404` with
+`error_code` `deployment_not_found`, which retrying does not fix.
+
 <details>
 <summary>Request and response example</summary>
 

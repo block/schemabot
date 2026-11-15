@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -438,11 +439,19 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.logger.Error("no tern client for active apply — server is misconfigured",
+		if errors.Is(err, errTernDeploymentNotConfigured) {
+			s.logger.Error("no tern client for active apply — server is misconfigured",
+				append(apply.LogAttrs(),
+					"error", err)...)
+			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
+				fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
+			return
+		}
+		s.logger.Error("tern client for active apply could not be built; progress is unavailable",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
-			fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable,
+			"the schema change engine for this apply is unavailable; try again shortly")
 		return
 	}
 	s.logger.Debug("progress by apply-id: got client",
@@ -468,7 +477,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	})
 	if err != nil {
 		s.logger.Error("progress failed", append(apply.LogAttrs(), "error", err)...)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
 		return
 	}
 
