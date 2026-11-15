@@ -28,6 +28,11 @@ const (
 	maxStatusLimit     = 1000
 )
 
+// progressEngineUnavailableMessage is what a progress request for an active
+// apply answers when its engine cannot be reached. The cause can carry
+// connection details, so it goes to the server log and never to the client.
+const progressEngineUnavailableMessage = "the schema change engine for this apply is unavailable; try again shortly"
+
 // changeTypeToString converts a proto change type for progress responses.
 // Unmapped values stay empty because progress omits unavailable change types.
 func changeTypeToString(ct ternv1.ChangeType) string {
@@ -450,8 +455,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		s.logger.Error("tern client for active apply could not be built; progress is unavailable",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable,
-			"the schema change engine for this apply is unavailable; try again shortly")
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, progressEngineUnavailableMessage)
 		return
 	}
 	s.logger.Debug("progress by apply-id: got client",
@@ -477,7 +481,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	})
 	if err != nil {
 		s.logger.Error("progress failed", append(apply.LogAttrs(), "error", err)...)
-		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, progressEngineUnavailableMessage)
 		return
 	}
 

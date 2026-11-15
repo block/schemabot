@@ -4808,8 +4808,13 @@ func TestProgressByApplyIDWhenTernClientIsUnavailable(t *testing.T) {
 	}
 }
 
+// An active apply whose engine fails the progress request answers 503 with the
+// same fixed message as a client that cannot be built. The engine's error can
+// name a target and its connection details, for example when a target's client
+// is built on the request, so the response never echoes it.
 func TestProgressByApplyIDAnswers503WhenEngineProgressFails(t *testing.T) {
-	mock := &mockTernClient{isRemote: true, progressErr: errors.New("rpc timeout")}
+	const connectionFragment = "connection-fragment-not-for-clients"
+	mock := &mockTernClient{isRemote: true, progressErr: errors.New("create local client for target \"ledger\": dial " + connectionFragment)}
 	apply := activeTestApply("apply-engine-down")
 	apply.ExternalID = "remote-engine-down"
 	svc := newControlTestService(mock, apply)
@@ -4824,6 +4829,8 @@ func TestProgressByApplyIDAnswers503WhenEngineProgressFails(t *testing.T) {
 	var resp apitypes.ErrorResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, apitypes.ErrCodeEngineUnavailable, resp.ErrorCode)
+	assert.Equal(t, "the schema change engine for this apply is unavailable; try again shortly", resp.Error)
+	assert.NotContains(t, w.Body.String(), connectionFragment)
 }
 
 func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
