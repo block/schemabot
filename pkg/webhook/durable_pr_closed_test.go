@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -31,12 +32,16 @@ func (s *durableClosedTestStorage) Applies() storage.ApplyStore              { r
 func (s *durableClosedTestStorage) Checks() storage.CheckStore               { return s.checks }
 
 func durableClosedEvent() *storage.WebhookEvent {
-	payload := []byte(`{
+	return durableClosedEventWithMerged(true)
+}
+
+func durableClosedEventWithMerged(merged bool) *storage.WebhookEvent {
+	payload := fmt.Appendf(nil, `{
 		"action": "closed",
-		"pull_request": {"number": 1, "merged": true, "head": {"sha": "head-sha", "ref": "feature"}},
+		"pull_request": {"number": 1, "merged": %t, "head": {"sha": "head-sha", "ref": "feature"}},
 		"repository": {"full_name": "octocat/hello-world"},
 		"installation": {"id": 12345}
-	}`)
+	}`, merged)
 	return &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  "delivery-closed-1",
@@ -131,6 +136,69 @@ func TestDurablePRClosedDriverRetriesOnApplyLookupFailure(t *testing.T) {
 	select {
 	case failure := <-scripted.failed:
 		require.NotNil(t, failure.retryAfter, "a failed apply lookup must stay retryable")
+	default:
+		t.Fatal("expected the close delivery to be marked failed and retryable")
+	}
+	require.Empty(t, scripted.completed)
+}
+
+// A close delivery retried after the PR was reopened must not undo the
+// reopened PR's state: the operator took a lock owned by repo#pr after the
+// reopen, so the driver sees the live PR is open, releases and deletes
+// nothing, and completes the stale delivery instead of retrying it.
+func TestDurablePRClosedDriverSkipsCleanupForReopenedPR(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	scripted := newScriptedWebhookEventStore(durableClosedEventWithMerged(false))
+	st := &durableClosedTestStorage{
+		webhookEvents: scripted,
+		locks:         lockStore,
+		applies:       &prClosedApplyStore{},
+		checks:        checkStore,
+	}
+	factory, fetches := prClosedGitHub(t, "open", 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(st, &api.ServerConfig{}, nil, logger)
+	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Equal(t, int32(1), fetches.Load(), "the driver reads the live PR once")
+	require.Empty(t, lockStore.released, "the lock taken after the reopen must stay held")
+	require.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive the stale close delivery")
+	select {
+	case <-scripted.completed:
+	default:
+		t.Fatal("expected the stale close delivery to be marked completed")
+	}
+	require.Empty(t, scripted.failed)
+}
+
+// A close delivery whose live PR read fails fails closed — nothing is released
+// or deleted — and stays retryable, so the driver re-checks the PR on the next
+// attempt instead of cleaning up on an unverified state.
+func TestDurablePRClosedDriverRetriesWhenLivePRReadFails(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	scripted := newScriptedWebhookEventStore(durableClosedEventWithMerged(false))
+	st := &durableClosedTestStorage{
+		webhookEvents: scripted,
+		locks:         lockStore,
+		applies:       &prClosedApplyStore{},
+		checks:        checkStore,
+	}
+	factory, _ := prClosedGitHub(t, "closed", http.StatusForbidden)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(st, &api.ServerConfig{}, nil, logger)
+	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, lockStore.released, "no lock is released when the live PR state is unknown")
+	require.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when the live PR state is unknown")
+	select {
+	case failure := <-scripted.failed:
+		require.NotNil(t, failure.retryAfter, "a failed live PR read must stay retryable")
 	default:
 		t.Fatal("expected the close delivery to be marked failed and retryable")
 	}

@@ -923,6 +923,13 @@ func (pri *PullRequestInfo) IsClosed() bool {
 	return pri.State == "closed"
 }
 
+// IsOpen reports whether the PR is open. A PR whose state is neither open nor
+// closed is reported by neither method, so callers that act on one answer can
+// fail closed on an unrecognized state.
+func (pri *PullRequestInfo) IsOpen() bool {
+	return pri.State == "open"
+}
+
 // FetchPullRequest is the dedupe-friendly variant. It honours the
 // request-scoped PR-info cache attached to ctx via WithPRInfoCache, so
 // repeated calls for the same (repo, pr) within one webhook delivery

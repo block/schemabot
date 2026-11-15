@@ -136,7 +136,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			// retried. That direction is fail-closed — retained locks and
 			// check state block until an operator or a reopen reconciles;
 			// nothing is wrongly unblocked. The durable path retries instead.
-			if err := h.runPRCloseCleanup(context.Background(), payload.Repository.FullName, payload.PullRequest.Number, payload.PullRequest.Merged); err != nil {
+			if err := h.runPRCloseCleanup(context.Background(), payload.Repository.FullName, payload.PullRequest.Number, installationID, payload.PullRequest.Merged); err != nil {
 				h.logger.Error("PR close cleanup failed",
 					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "error", err)
 			}
@@ -961,9 +961,33 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 // list-then-release lock pass, and the check delete — is safe to re-run, so
 // re-running the whole cleanup after a partial failure reconciles rather than
 // double-acts.
-func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, merged bool) error {
+//
+// A close delivery can run long after the close: the durable driver retries a
+// failed cleanup at one-minute intervals. Cleanup therefore acts on the PR's
+// live state, not on the delivery's. A PR that is open again keeps its lock
+// and stored check state, because the lock owner (repo#pr) is the same across
+// a close and a reopen, so a stale close delivery would otherwise release a
+// lock an operator took after the reopen. A merged PR cannot reopen, so a
+// merged delivery skips the live read. When the live state cannot be read,
+// cleanup fails closed and nothing is released or deleted.
+func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, installationID int64, merged bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+
+	stillClosed, err := h.prStillClosed(ctx, repo, pr, installationID, merged)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("PR close cleanup skipped: cannot verify the PR is still closed; all locks and check state are retained",
+			"repo", repo, "pr", pr, "installation_id", installationID, "merged", merged, "error", err)
+		return fmt.Errorf("verify PR %s#%d is still closed before cleanup: %w", repo, pr, err)
+	}
+	if !stillClosed {
+		return nil
+	}
 
 	// A closed PR gets no more scheduled re-folds; drop its budget entry so the
 	// in-memory map does not accumulate one entry per closed PR. A reopen folds
@@ -1027,6 +1051,44 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, me
 			"repo", repo, "pr", pr)
 	}
 	return nil
+}
+
+// prStillClosed reports whether close cleanup should proceed for the PR. It
+// reads the PR live — a cached snapshot could predate a reopen — and answers
+// false, with the skip logged, when the PR is open again. Any state other than
+// open or closed is an error, so an unrecognized answer never authorizes
+// cleanup. A merged PR cannot reopen, so merged skips the read and costs no
+// GitHub request. Otherwise the cost is one request per close delivery
+// attempt.
+func (h *Handler) prStillClosed(ctx context.Context, repo string, pr int, installationID int64, merged bool) (bool, error) {
+	if merged {
+		h.logger.Debug("PR close cleanup proceeds without a live read: a merged PR cannot reopen",
+			"repo", repo, "pr", pr)
+		return true, nil
+	}
+	if installationID <= 0 {
+		return false, fmt.Errorf("no GitHub installation ID to read the live PR (installation_id=%d)", installationID)
+	}
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		return false, fmt.Errorf("create GitHub client for repo %s installation %d: %w", repo, installationID, err)
+	}
+	// FetchPullRequestNoCache: only a live read can prove the PR did not reopen
+	// after the close this delivery carries.
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		return false, fmt.Errorf("fetch live PR %s#%d: %w", repo, pr, err)
+	}
+	switch {
+	case prInfo.IsClosed():
+		return true, nil
+	case prInfo.IsOpen():
+		h.logger.Info("PR close cleanup skipped because the PR was reopened; its locks and check state are retained",
+			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA)
+		return false, nil
+	default:
+		return false, fmt.Errorf("live PR %s#%d reports unrecognized state %q", repo, pr, prInfo.State)
+	}
 }
 
 // closedPRDatabase identifies the database lock an apply holds.
