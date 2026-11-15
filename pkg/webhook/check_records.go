@@ -452,7 +452,13 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			repo, pr, environment, schema.Type, schema.Database)
 	}
 
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	// Every plan writer decides staleness here, so the head must be read
+	// uncached: a plan can run long enough for a push to land, and the
+	// delivery's cached PR snapshot would still name the head the plan ran on,
+	// letting an older head's result replace the newer head's row (MG-4). One
+	// PR read per stored plan result, so the cost grows with the databases and
+	// environments planned, never with the files the PR changes (AV-15).
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "plan_check_recorded",
