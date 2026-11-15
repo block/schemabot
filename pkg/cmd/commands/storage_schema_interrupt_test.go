@@ -36,7 +36,51 @@ func TestStorageApplyThroughAPI_InterruptExitsInterrupted(t *testing.T) {
 	require.ErrorIs(t, err, ErrSilent)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Equal(t, ExitInterrupted, ExitCodeFor(err))
-	assert.Equal(t, fmt.Sprintf(storageApplyInterruptedThroughAPI+"\n", cliname.Name()), stderr)
+	assert.Equal(t, fmt.Sprintf("Storage apply interrupted. A convergence the server had already started carries on, holding the storage bootstrap lock, until it finishes or its budget runs out. Run the same `%s storage apply` command again to see what is left and converge it.\n", cliname.Name()), stderr)
+}
+
+// The notice of an interrupted convergence ends with a command that shows what
+// is left, and that command has to run as printed. `storage plan` needs a
+// named schema, so it is offered with the selector the apply was given and the
+// flags that address the same storage database, and never with the DSN, which
+// is a credential. An apply that named no schema is offered itself instead.
+func TestStorageApplyCmd_InterruptNoticeNamesACommandThatShowsWhatIsLeft(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  StorageApplyCmd
+		want string
+	}{
+		{
+			name: "the answering binary's own schema",
+			cmd:  StorageApplyCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{Deployment: "shard-a", Environment: "production"}, AutoApprove: true},
+			want: "Run the same `%s storage apply` command again to see what is left and converge it.",
+		},
+		{
+			name: "a named release on a data plane",
+			cmd: StorageApplyCmd{
+				storageSchemaTargetFlags: storageSchemaTargetFlags{Deployment: "shard-a", Environment: "production"},
+				storageSchemaSourceFlags: storageSchemaSourceFlags{Release: "v1.5.0", Repo: "example/mirror"},
+				AllowUnsafe:              true,
+				Timeout:                  10 * time.Minute,
+			},
+			want: "Run `%s storage plan --deployment shard-a -e production --release v1.5.0 --release-repo example/mirror` to see what is left.",
+		},
+		{
+			name: "a named checkout over a direct connection",
+			cmd: StorageApplyCmd{
+				storageSchemaTargetFlags: storageSchemaTargetFlags{DSN: "postgres://schemabot:hunter2@db-1.example:5432/schemabot", Dialect: "postgres"},
+				storageSchemaSourceFlags: storageSchemaSourceFlags{SchemaDir: "./pkg/schema/postgres"},
+			},
+			want: "Run `%s storage plan --dsn <the same DSN> --dialect postgres --schema-dir ./pkg/schema/postgres` to see what is left.",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			next := tc.cmd.seeWhatIsLeft()
+			assert.Equal(t, fmt.Sprintf(tc.want, cliname.Name()), next)
+			assert.NotContains(t, next, "hunter2", "a suggested command must not print the storage credentials")
+		})
+	}
 }
 
 // A convergence the server answers with an error is a failure: it exits 1 and
@@ -89,7 +133,7 @@ func TestStorageApplyDirect_InterruptExitsInterrupted(t *testing.T) {
 	require.ErrorIs(t, err, ErrSilent)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Equal(t, ExitInterrupted, ExitCodeFor(err))
-	assert.Contains(t, stderr, fmt.Sprintf(storageApplyInterruptedDirect+"\n", cliname.Name()))
+	assert.Contains(t, stderr, fmt.Sprintf("Storage apply interrupted. Any statement in flight was cancelled, and statements that had finished stay applied. Run the same `%s storage apply` command again to see what is left and converge it.\n", cliname.Name()))
 }
 
 // A direct convergence that cannot reach its database is a failure: it exits 1

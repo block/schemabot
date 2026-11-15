@@ -79,6 +79,22 @@ func (f *storageSchemaSourceFlags) namedSource() string {
 	return ""
 }
 
+// sourceArgs renders the selector the operator used, for a command printed
+// back to them, or nothing when they named none.
+func (f *storageSchemaSourceFlags) sourceArgs() []string {
+	switch {
+	case strings.TrimSpace(f.Release) != "":
+		args := []string{"--release", f.Release}
+		if strings.TrimSpace(f.Repo) != "" {
+			args = append(args, "--release-repo", f.Repo)
+		}
+		return args
+	case strings.TrimSpace(f.SchemaDir) != "":
+		return []string{"--schema-dir", f.SchemaDir}
+	}
+	return nil
+}
+
 // validateSourceCombination refuses combinations that are wrong on either
 // command: both selectors at once, and --release-repo without the flag it
 // modifies. The parser refuses the first on its own; it is restated here for

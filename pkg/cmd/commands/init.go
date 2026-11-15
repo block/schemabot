@@ -56,6 +56,9 @@ type initResult struct {
 
 func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 	if err := cmd.prepareSample(ctx, g); err != nil {
+		if stopped := initStopped(err); stopped != nil {
+			return stopped
+		}
 		if cmd.JSON && !errors.Is(err, ErrSilent) {
 			return client.ExitWithJSON("initialization_error", err.Error())
 		}
@@ -183,7 +186,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	if err := localsetup.CheckConnection(ctx, cmd.Type, targetDSN); err != nil {
-		return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.DSN, err)
+		return nil, unregisteredInitError(ctx, fmt.Errorf("check %s before registering runtime: %w", cmd.DSN, err), initCancelledBeforeRegistration)
 	}
 	registration := localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
@@ -192,7 +195,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if cmd.Integrated {
 		cmd.reportProgress("Preparing a separate schemabot database on your server...")
 		if err := localsetup.PrepareIntegratedStorage(ctx, manager, registration); err != nil {
-			return nil, err
+			return nil, unregisteredInitError(ctx, err, initCancelledPreparingStorage)
 		}
 	} else {
 		stateDSN, err := resolveInitConnection(cmd.StorageDSN)
@@ -200,7 +203,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 			return nil, err
 		}
 		if err := localsetup.CheckConnection(ctx, cmd.Type, stateDSN); err != nil {
-			return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err)
+			return nil, unregisteredInitError(ctx, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err), initCancelledBeforeRegistration)
 		}
 	}
 	_, err = localsetup.Register(manager, registration)
@@ -391,10 +394,46 @@ func retainedInitError(ctx context.Context, err error) error {
 	if errors.As(err, &drift) {
 		return err
 	}
-	if endedByInterrupt(ctx, err) {
-		return initInterrupted(ctx, fmt.Sprintf("Setup cancelled; runtime registration is retained for retry. Run `%s init` again with the same flags to finish it.", cliname.Name()))
+	if initStoppedByOperator(ctx, err) {
+		return initInterrupted(ctx, fmt.Sprintf(initCancelledAfterRegistration, cliname.Name()))
 	}
 	return fmt.Errorf("initialization incomplete; runtime registration is retained for retry: %w", err)
+}
+
+// The notices an init the operator stopped prints before it exits with the
+// interrupt status. Each says what the stop left behind at the step it landed
+// on. A %s is the CLI's own name, filled in when the notice is built.
+const (
+	// Stopped on a screen that asks for the setup's inputs, before any of them
+	// was acted on.
+	initCancelledNothingChanged = "Setup cancelled; nothing was changed."
+	// Stopped during a connection check, which only reads.
+	initCancelledBeforeRegistration = "Setup cancelled before the runtime was registered. Run `%s init` again to retry."
+	// Stopped while the integrated state database was being created. Whether
+	// the creation finished is not known here, and a retry answers it: it
+	// creates the database, or refuses one that exists and says how to connect
+	// to it instead.
+	initCancelledPreparingStorage = "Setup cancelled while preparing the schemabot database on your server; the runtime was not registered. Run `%s init` again: it finishes the setup, or says how to continue if the database was already created."
+	// Stopped once the runtime was registered.
+	initCancelledAfterRegistration = "Setup cancelled; runtime registration is retained for retry. Run `%s init` again with the same flags to finish it."
+)
+
+// initStoppedByOperator reports whether err is the operator stopping the
+// setup: their signal, or the cancel key of the setup display. The display
+// also cancels a setup it can no longer show, and that is the display failing,
+// not the operator stopping it.
+func initStoppedByOperator(ctx context.Context, err error) bool {
+	return endedByInterrupt(ctx, err) && !errors.Is(context.Cause(ctx), errInitDisplayClosed)
+}
+
+// unregisteredInitError is the error of a setup step that ran before the
+// runtime was registered: the interrupt with notice when the operator stopped
+// the setup during it, and otherwise the failure the step reported.
+func unregisteredInitError(ctx context.Context, failure error, notice string) error {
+	if initStoppedByOperator(ctx, failure) {
+		return initInterrupted(ctx, fmt.Sprintf(notice, cliname.Name()))
+	}
+	return failure
 }
 
 // initInterruptedError is an init the operator stopped: the interrupt status,
@@ -411,6 +450,13 @@ func (e *initInterruptedError) Unwrap() error { return e.status }
 
 func initInterrupted(ctx context.Context, notice string) error {
 	return &initInterruptedError{notice: notice, status: interrupted(ctx)}
+}
+
+// initCancelled is an init the operator ended with the cancel key of one of
+// its own screens. No signal arrived, so there is no cancellation to carry,
+// and the interrupt status is all it reports.
+func initCancelled(notice string) error {
+	return &initInterruptedError{notice: notice, status: &ExitCodeError{Code: ExitInterrupted, Err: ErrSilent}}
 }
 
 // initStopped prints the notice of an init the operator stopped and returns

@@ -209,6 +209,68 @@ func TestInitReuseRejectsInvalidRootBeforeRegistration(t *testing.T) {
 	}
 }
 
+// An operator presses Ctrl-C while init checks its connections, before it has
+// registered a runtime. The command says the runtime was not registered and
+// exits with the interrupt status rather than reporting a failed connection
+// check, and it leaves no runtime or schema directory behind.
+func TestInitInterruptBeforeRegistrationExitsInterrupted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SCHEMABOT_ENDPOINT", "")
+	t.Setenv("SCHEMABOT_TOKEN", "")
+	t.Setenv("INIT_TARGET", "user@tcp(127.0.0.1:1)/app")
+	t.Setenv("INIT_STATE", "user@tcp(127.0.0.1:1)/state")
+	cmd := InitCmd{Database: "app", Environment: "dev", Type: "mysql", DSN: "env:INIT_TARGET", StorageDSN: "env:INIT_STATE", Runtime: "local", Namespaces: []string{"app"}, SchemaDir: filepath.Join(home, "schema")}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := cmd.initialize(ctx, &Globals{})
+
+	var status error
+	stderr := captureStderr(t, func() { status = initStopped(err) })
+	require.ErrorIs(t, status, ErrSilent)
+	require.ErrorIs(t, status, context.Canceled)
+	require.Equal(t, ExitInterrupted, ExitCodeFor(status))
+	require.Equal(t, fmt.Sprintf("Setup cancelled before the runtime was registered. Run `%s init` again to retry.\n", cliname.Name()), stderr)
+	require.NoDirExists(t, filepath.Join(home, ".schemabot", "runtimes", "local"))
+	require.NoDirExists(t, cmd.SchemaDir)
+}
+
+// A setup step that runs before the runtime is registered reports the
+// operator's stop as an interrupt with the notice for that step, such as the
+// one for a schemabot database that was being created. A cancellation while
+// the command is still running, or a deadline, stays the step's own failure.
+func TestInitStepBeforeRegistrationTellsAnInterruptFromAFailure(t *testing.T) {
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Now())
+	defer cancelExpired()
+	cancelledStep := fmt.Errorf("could not connect to your application server: %w", context.Canceled)
+
+	err := unregisteredInitError(stopped, cancelledStep, initCancelledPreparingStorage)
+	var status error
+	stderr := captureStderr(t, func() { status = initStopped(err) })
+	require.Equal(t, ExitInterrupted, ExitCodeFor(status))
+	require.ErrorIs(t, status, ErrSilent)
+	require.Equal(t, fmt.Sprintf("Setup cancelled while preparing the schemabot database on your server; the runtime was not registered. Run `%s init` again: it finishes the setup, or says how to continue if the database was already created.\n", cliname.Name()), stderr)
+
+	timedOut := fmt.Errorf("could not connect to your application server: %w", context.DeadlineExceeded)
+	for name, tc := range map[string]struct {
+		ctx     context.Context
+		failure error
+	}{
+		"cancellation while still running": {ctx: t.Context(), failure: cancelledStep},
+		"deadline":                         {ctx: expired, failure: timedOut},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := unregisteredInitError(tc.ctx, tc.failure, initCancelledPreparingStorage)
+			require.Same(t, tc.failure, err)
+			require.Equal(t, 1, ExitCodeFor(err))
+			require.Nil(t, initStopped(err))
+		})
+	}
+}
+
 // An operator presses Ctrl-C after init registered its runtime. The command
 // says setup was cancelled and that the registration is kept for a retry, and
 // exits with the interrupt status rather than reporting a failed setup.

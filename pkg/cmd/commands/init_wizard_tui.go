@@ -314,8 +314,10 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 func (m *initWizard) contentView() string {
+	// The command says what a cancelled setup left behind once the wizard has
+	// closed, so the wizard clears instead of saying it twice.
 	if m.cancelled {
-		return "\n  Setup cancelled.\n"
+		return ""
 	}
 	blue := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	bold := m.renderer.NewStyle().Bold(true)
@@ -441,13 +443,18 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	// The program reports how it ended in its own terms, so the context's own
 	// error is the one that says whether the operator's signal ended it.
 	if endedByInterrupt(ctx, ctx.Err()) {
-		return initInterrupted(ctx, "Setup cancelled; nothing was changed.")
+		return initInterrupted(ctx, initCancelledNothingChanged)
 	}
 	if ctx.Err() != nil {
 		return fmt.Errorf("setup cancelled: %w", ctx.Err())
 	}
 	if err != nil {
 		return err
+	}
+	// A terminal hands Ctrl-C to the wizard as a key, not as a signal, so the
+	// operator's stop arrives here as the wizard's own cancel, the same as Esc.
+	if m.cancelled {
+		return initCancelled(initCancelledNothingChanged)
 	}
 	if !m.confirmed {
 		return ErrSilent

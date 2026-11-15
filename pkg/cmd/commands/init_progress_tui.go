@@ -96,13 +96,21 @@ func runInitProgress(ctx context.Context, heading string, initialize func(contex
 	})
 }
 
+// errInitDisplayClosed is why the setup's context was cancelled when the setup
+// display ended while the setup was still running: the display stops a setup
+// it can no longer show. It is recorded as the cancellation's cause so the
+// setup can tell this from the operator stopping it (initStoppedByOperator).
+var errInitDisplayClosed = errors.New("setup display closed")
+
 func runInitProgressProgram(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), newProgram func(tea.Model) initProgressProgram) (*initResult, error) {
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(errInitDisplayClosed)
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
-	m := &initProgress{spinner: s, cancel: cancel, width: 72}
+	// The display's cancel key is the operator stopping the setup, so it
+	// cancels with no cause of its own.
+	m := &initProgress{spinner: s, cancel: func() { cancel(nil) }, width: 72}
 	p := newProgram(m)
 	started := make(chan struct{})
 	finished := make(chan struct{})
@@ -127,7 +135,7 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 	}()
 	m.run = func() tea.Msg { close(started); <-finished; return outcome }
 	_, runErr := p.Run()
-	cancel()
+	cancel(errInitDisplayClosed)
 	p.Kill()
 	<-finished
 	if runErr != nil {

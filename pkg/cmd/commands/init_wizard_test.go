@@ -15,6 +15,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 func wizardKey(m *initWizard, k tea.KeyType) { m.Update(tea.KeyMsg{Type: k}) }
@@ -141,6 +143,39 @@ func TestInitWizardContextCancellationLeavesInputsUntouched(t *testing.T) {
 	require.ErrorIs(t, status, ErrSilent)
 	require.Equal(t, ExitInterrupted, ExitCodeFor(status))
 	require.Equal(t, "Setup cancelled; nothing was changed.\n", stderr)
+}
+
+// An operator presses Ctrl-C or Esc in the wizard. A terminal hands either to
+// the wizard as a key rather than as a signal, so the command's context is
+// never cancelled. The command still says nothing was changed and exits with
+// the interrupt status, and it leaves the inputs untouched.
+func TestInitWizardCancelKeyExitsInterrupted(t *testing.T) {
+	for name, key := range map[string]string{"ctrl-c": "\x03", "esc": "\x1b"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			input, writer := io.Pipe()
+			t.Cleanup(func() { require.NoError(t, input.Close()); require.NoError(t, writer.Close()) })
+			output := initSignalWriter{started: make(chan struct{}, 1)}
+			original := InitCmd{Database: "shop"}
+			cmd := original
+			done := make(chan error, 1)
+			go func() { done <- cmd.promptInputs(t.Context(), input, output, &Globals{}) }()
+			awaitSignal(t, output.started, "the wizard to draw its first screen")
+			_, err := io.WriteString(writer, key)
+			require.NoError(t, err)
+
+			err = awaitSignal(t, done, "the wizard to close")
+
+			require.NotErrorIs(t, err, context.Canceled, "no signal arrived")
+			var status error
+			stderr := captureStderr(t, func() { status = initStopped(err) })
+			require.ErrorIs(t, status, ErrSilent)
+			require.Equal(t, ExitInterrupted, ExitCodeFor(status))
+			require.Equal(t, "Setup cancelled; nothing was changed.\n", stderr)
+			require.Equal(t, original.Database, cmd.Database)
+			require.Empty(t, cmd.Type)
+		})
+	}
 }
 
 // A wizard whose context ran out of time was not stopped by the operator, so
@@ -497,6 +532,68 @@ func TestInitTerminalFailureJoinsCleanup(t *testing.T) {
 	default:
 		t.Fatal("terminal returned before cleanup")
 	}
+}
+
+// The setup display fails while init is importing the schema, after it has
+// registered its runtime, and the operator has stopped nothing. The display
+// stops the import so the command can end, and that stop is not the
+// operator's: the command exits 1 with the display's failure and the retained
+// registration, and prints no interrupt notice.
+func TestInitTerminalFailureAfterRegistrationExitsOne(t *testing.T) {
+	started := make(chan struct{})
+	_, err := runInitProgress(t.Context(), "connect and verify", func(ctx context.Context, report func(string)) (*initResult, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, retainedInitError(ctx, fmt.Errorf("import live schema: %w", ctx.Err()))
+	}, tea.WithInput(initBrokenTerminal{started: started}), tea.WithOutput(io.Discard), tea.WithoutRenderer())
+
+	require.ErrorContains(t, err, "terminal failed")
+	require.ErrorContains(t, err, "initialization incomplete; runtime registration is retained for retry")
+	require.NotErrorIs(t, err, ErrSilent)
+	require.Equal(t, 1, ExitCodeFor(err))
+	var status error
+	stderr := captureStderr(t, func() { status = initStopped(err) })
+	require.NoError(t, status)
+	require.Empty(t, stderr)
+}
+
+// initCancelKeyProgram is a setup display whose operator presses the cancel
+// key once the setup is running, and which then shows the setup to its end.
+type initCancelKeyProgram struct {
+	model   *initProgress
+	running <-chan struct{}
+}
+
+func (p initCancelKeyProgram) Run() (tea.Model, error) {
+	finished := make(chan tea.Msg, 1)
+	go func() { finished <- p.model.run() }()
+	<-p.running
+	p.model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	p.model.Update(<-finished)
+	return p.model, nil
+}
+func (initCancelKeyProgram) Kill()        {}
+func (initCancelKeyProgram) Send(tea.Msg) {}
+
+// An operator presses the setup display's cancel key while init is importing
+// the schema, after it has registered its runtime. The key is the operator's
+// stop, so the command says the registration is kept for a retry and exits
+// with the interrupt status.
+func TestInitProgressCancelKeyAfterRegistrationExitsInterrupted(t *testing.T) {
+	running := make(chan struct{})
+	_, err := runInitProgressProgram(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+		close(running)
+		<-ctx.Done()
+		return nil, retainedInitError(ctx, fmt.Errorf("import live schema: %w", ctx.Err()))
+	}, func(model tea.Model) initProgressProgram {
+		return initCancelKeyProgram{model: model.(*initProgress), running: running}
+	})
+
+	var status error
+	stderr := captureStderr(t, func() { status = initStopped(err) })
+	require.ErrorIs(t, status, ErrSilent)
+	require.Equal(t, ExitInterrupted, ExitCodeFor(status))
+	require.Equal(t, fmt.Sprintf("Setup cancelled; runtime registration is retained for retry. Run `%s init` again with the same flags to finish it.\n", cliname.Name()), stderr)
 }
 
 type initStartupFailure struct{}
