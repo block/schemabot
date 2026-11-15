@@ -1370,6 +1370,20 @@ itself runs on unaffected. A Ctrl-C that lands before the apply or rollback
 has been submitted ends the command before anything is started, with a notice
 saying so, and the same exit status.
 
+A Ctrl-C or SIGTERM during the convergence of `storage apply`, during the `init`
+wizard, during the connection checks `init` runs before it registers its
+runtime, or after it has registered it also exits 130, with a notice on stderr
+instead of an error. So does the cancel key of an `init` screen: a terminal
+hands Ctrl-C to those screens as a key, the same as Esc. The notice says what
+the stop left behind and what to run next. A direct convergence cancels the
+statement in flight, while one running on a server carries on there (see
+[storage schema](storage-schema.md)); after either, the notice names the
+command that shows what is left. The wizard has changed nothing, and a stop
+during the connection checks leaves no runtime registered. A registered runtime
+is kept, so running `init` again with the same flags finishes it. Any other
+failure of either command, including a timeout or a setup display that fails,
+still exits 1 with its error.
+
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted
 apply may still be running. Use [schema intelligence](schema-intelligence.md)
