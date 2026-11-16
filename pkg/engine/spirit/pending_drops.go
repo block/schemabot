@@ -90,10 +90,11 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 	}
 
 	// The destinations are recorded before the RENAME is issued, not after it
-	// returns. A RENAME that is waiting on a metadata lock when the schema
-	// change is stopped is abandoned by the client with a context error, yet
-	// the server still completes it once the lock is released, so the table
-	// ends up in pending drops with nothing to say this attempt put it there.
+	// returns. A stop ends a RENAME that is waiting on a metadata lock on the
+	// server, but a process that exits mid-RENAME, or a stop that cannot
+	// confirm the RENAME ended, leaves it for the server to complete once the
+	// lock is released, so the table ends up in pending drops with nothing to
+	// say this attempt put it there.
 	// Recording first keeps the replay honest either way: if the RENAME never
 	// landed the source table still exists and is quarantined again under a
 	// new destination; if it landed the recorded copy exists and the replay
@@ -113,7 +114,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 	// the table does not run, so no copy lands in pending drops that a later
 	// attempt cannot recognize as its own.
 	if applyIdentifier := e.runningApplyIdentifier(); applyIdentifier != "" {
-		if err := pendingdrops.RecordQuarantines(ctx, db, applyIdentifier, moved, time.Now()); err != nil {
+		if err := pendingdrops.RecordQuarantines(ctx, db, e.changeLogger(), applyIdentifier, moved, time.Now()); err != nil {
 			return fmt.Errorf("record which apply quarantines the DROP TABLE targets before moving them: %w", err)
 		}
 	} else {
@@ -122,7 +123,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			"tables", quarantinedSourceTables(moved),
 		)
 	}
-	if err := pendingdrops.MoveTablesTo(ctx, db, moved); err != nil {
+	if err := pendingdrops.MoveTablesTo(ctx, db, e.changeLogger(), moved); err != nil {
 		// ER_NO_SUCH_TABLE is what the RENAME returns when a source table is
 		// gone by the time the server runs it.
 		if !mysqlerr.Is(err, mysqlerr.NoSuchTable) {
