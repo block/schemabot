@@ -150,26 +150,54 @@ type secretGetter interface {
 // STS, on every resolve. Secret values are not cached: each resolve reads the
 // secret's current value, so a rotated secret takes effect on the next resolve.
 var (
-	secretsManagerMu        sync.Mutex
-	secretsManagerClient    secretGetter
+	secretsManagerMu     sync.Mutex
+	secretsManagerClient secretGetter
+	// secretsManagerBuild is non-nil while one resolve builds the client, and
+	// is closed when that build ends.
+	secretsManagerBuild     chan struct{}
 	newSecretsManagerClient = loadSecretsManagerClient
 )
 
 // sharedSecretsManagerClient returns the process's Secrets Manager client,
-// building it on first use. A failed build is not kept, so the next resolve
-// tries again rather than failing for the life of the process.
+// building it on first use. Only one resolve builds at a time, outside the
+// mutex; the others wait for that build or for their own context, whichever
+// ends first, so a cancelled or short-deadline resolve does not wait out
+// another caller's AWS config load. A failed build is not kept: a waiter, or
+// the next resolve, builds the client again rather than failing for the life
+// of the process.
 func sharedSecretsManagerClient(ctx context.Context) (secretGetter, error) {
-	secretsManagerMu.Lock()
-	defer secretsManagerMu.Unlock()
-	if secretsManagerClient != nil {
-		return secretsManagerClient, nil
+	for {
+		secretsManagerMu.Lock()
+		if client := secretsManagerClient; client != nil {
+			secretsManagerMu.Unlock()
+			return client, nil
+		}
+		if building := secretsManagerBuild; building != nil {
+			secretsManagerMu.Unlock()
+			select {
+			case <-building:
+				// The build ended: loop to use its client, or to build
+				// again if it failed.
+			case <-ctx.Done():
+				return nil, fmt.Errorf("wait for Secrets Manager client: %w", ctx.Err())
+			}
+			continue
+		}
+		done := make(chan struct{})
+		secretsManagerBuild = done
+		secretsManagerMu.Unlock()
+
+		client, err := newSecretsManagerClient(ctx)
+
+		secretsManagerMu.Lock()
+		if err == nil {
+			secretsManagerClient = client
+		}
+		secretsManagerBuild = nil
+		secretsManagerMu.Unlock()
+		close(done)
+		return client, err
 	}
-	client, err := newSecretsManagerClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	secretsManagerClient = client
-	return client, nil
 }
 
 // loadSecretsManagerClient builds a client from the default AWS config: the

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -90,11 +91,13 @@ func useSecretsManagerBuilder(t *testing.T, build func(context.Context) (secretG
 	t.Helper()
 	secretsManagerMu.Lock()
 	secretsManagerClient = nil
+	secretsManagerBuild = nil
 	newSecretsManagerClient = build
 	secretsManagerMu.Unlock()
 	t.Cleanup(func() {
 		secretsManagerMu.Lock()
 		secretsManagerClient = nil
+		secretsManagerBuild = nil
 		newSecretsManagerClient = loadSecretsManagerClient
 		secretsManagerMu.Unlock()
 	})
@@ -149,6 +152,54 @@ func TestResolve_SecretsManagerRetriesFailedClientBuild(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "s3cret", value)
 	assert.Equal(t, 2, builds)
+}
+
+// While one resolve is still loading the AWS config, another resolve whose
+// context is cancelled returns straight away instead of waiting for that load.
+// When the load finishes, the first resolve gets its value and later resolves
+// reuse the client it built.
+func TestResolve_SecretsManagerWaiterHonorsItsContext(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{"/example/orders": "s3cret"}}
+	building := make(chan struct{})
+	release := make(chan struct{})
+	var builds atomic.Int32
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds.Add(1)
+		close(building)
+		<-release
+		return fake, nil
+	})
+
+	type result struct {
+		value string
+		err   error
+	}
+	first := make(chan result, 1)
+	go func() {
+		value, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+		first <- result{value, err}
+	}()
+	<-building
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := ResolveContext(cancelled, "secretsmanager:/example/orders", "")
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case <-first:
+		t.Fatal("the first resolve finished before its client build was released")
+	default:
+	}
+
+	close(release)
+	got := <-first
+	require.NoError(t, got.err)
+	assert.Equal(t, "s3cret", got.value)
+
+	value, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", value)
+	assert.Equal(t, int32(1), builds.Load(), "the waiter did not build, and later resolves reuse the client")
 }
 
 func TestValueFromGetSecretOutput(t *testing.T) {
