@@ -1035,6 +1035,64 @@ func PreviewCommentPlanRolloutCopyDiscardedPaused() string {
 	})
 }
 
+// PreviewCommentPlanRolloutWide renders a plan comment for a 32-target rollout
+// where 4 targets already hold the tables and 28 new targets are about to
+// create them. The 28 targets' names sit in a collapsed grid. Lint names the
+// targets that raised a finding once above the findings they share, names no
+// targets for the finding every target raised, and keeps the names of a
+// finding's targets on its own line when it is alone in its set.
+func PreviewCommentPlanRolloutWide() string {
+	var deployments []DeploymentDriftEntry
+	var existing, created []string
+	for n := 1; n <= 32; n++ {
+		target := fmt.Sprintf("testapp_%03d", n)
+		deployments = append(deployments, DeploymentDriftEntry{Deployment: "us", Target: target, Primary: n == 1, Class: "planned"})
+		if n <= 4 {
+			existing = append(existing, "us/"+target)
+		} else {
+			created = append(created, "us/"+target)
+		}
+	}
+	const sharedTimestamp = `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`
+	alter := []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `orders` ADD COLUMN `notes` varchar(255) NULL;"},
+	}}
+	create := []KeyspaceChangeData{{
+		Keyspace: "testapp",
+		Statements: []string{
+			"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  `last_login_at` timestamp NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+			"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `notes` varchar(255) NULL,\n  `created_at` timestamp DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_status` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		},
+	}}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      alter,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: deployments,
+			Plans: []DeploymentPlanGroup{
+				{Members: existing, Primary: true, Changes: alter, LintViolations: []LintViolationData{
+					{Message: sharedTimestamp, Table: "orders", LinterName: "has_timestamp"},
+					{Message: `Index "idx_user" on column "user_id" is redundant - covered by index "idx_user_status" on columns ("user_id", "status")`, Table: "orders", LinterName: "redundant_indexes"},
+					{Message: `AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's "int" data type`, Table: "orders", LinterName: "auto_inc_capacity"},
+				}},
+				{Members: created, Changes: create, LintViolations: []LintViolationData{
+					{Message: sharedTimestamp, Table: "orders", LinterName: "has_timestamp"},
+					{Message: `Column "last_login_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "users", LinterName: "has_timestamp"},
+				}},
+			},
+		},
+	})
+}
+
 // PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
 // independent targets that need different work: the primary target and one
 // other need the email column, and the third needs it with an index as well.

@@ -3461,7 +3461,7 @@ func groupLintWarningsByTargets(warnings []LintViolationData) (labeled []LintVio
 // other findings is set apart from them by a blank line, so it starts a list
 // of its own rather than reading as an item of the list above.
 func writeLintTargetsHeading(sb *strings.Builder, set lintTargetSet, afterFindings bool) {
-	if afterFindings {
+	if afterFindings && !strings.HasSuffix(sb.String(), "\n\n") {
 		sb.WriteString("\n")
 	}
 	fmt.Fprintf(sb, "On %s:\n", planGroupList(targetNoun, set.targets, set.total))

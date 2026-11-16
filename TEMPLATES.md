@@ -2610,6 +2610,100 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="rollout-plans-wide-rollout"></a><strong>Rollout Plans (Wide Rollout)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 28 of 32 targets
+
+<details>
+<summary>Target names</summary>
+
+```
+us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+us/testapp_030  us/testapp_031  us/testapp_032
+```
+
+</details>
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `last_login_at` timestamp NULL,
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `notes` varchar(255) NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_status`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+### 4 of 32 targets
+
+- `us/testapp_001`
+- `us/testapp_002`
+- `us/testapp_003`
+- `us/testapp_004`
+
+```sql
+ALTER TABLE `orders` ADD COLUMN `notes` varchar(255) NULL;
+```
+
+💡 **Lint Warnings**: 4 advisory findings
+- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `users` on 28 of 32 targets: Column `last_login_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+  <details>
+  <summary>Target names</summary>
+
+  ```
+  us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+  us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+  us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+  us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+  us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+  us/testapp_030  us/testapp_031  us/testapp_032
+  ```
+
+  </details>
+
+On targets `us/testapp_001`, `us/testapp_002`, `us/testapp_003`, `us/testapp_004`:
+- `orders`: Index `idx_user` on column `user_id` is redundant - covered by index `idx_user_status` on columns (`user_id`, `status`)
+- `orders`: AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type
+
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 32 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="rollout-plans-copy-discarded-on-another-target-paused"></a><strong>Rollout Plans (Copy Discarded On Another Target, Paused)</strong></summary>
 
 

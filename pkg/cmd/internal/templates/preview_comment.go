@@ -105,6 +105,7 @@ func previewCommentAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (WIDE ROLLOUT)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutWide()) }},
 		{"ROLLOUT PLANS (COPY DISCARDED ON ANOTHER TARGET, PAUSED)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutCopyDiscardedPaused())
 		}},
@@ -250,6 +251,7 @@ func previewCommentPlanAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (WIDE ROLLOUT)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutWide()) }},
 		{"ROLLOUT PLANS (COPY DISCARDED ON ANOTHER TARGET, PAUSED)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutCopyDiscardedPaused())
 		}},
