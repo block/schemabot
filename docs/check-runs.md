@@ -767,7 +767,10 @@ without parsing the output. A `--dry-run` acts on nothing, so any finding —
 missing, held, or stuck — fails the run. Outside `--dry-run`, successfully
 recreated checks are resolved and do not fail the run; held PRs, failed
 recreations, and stuck Check Runs do, because the backfill never acts on
-those and an operator still has to.
+those and an operator still has to. A run stopped by Ctrl-C or SIGTERM exits
+130 instead. Any report it prints is marked as interrupted, with
+`"interrupted": true` in its JSON; see
+[the CLI reference](cli.md#recover-missing-github-checks) for what it holds.
 
 [github-create-check-run]: https://docs.github.com/en/rest/checks/runs#create-a-check-run
 [github-check-runs]: https://docs.github.com/en/rest/checks/runs
