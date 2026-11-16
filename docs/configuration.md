@@ -2086,7 +2086,7 @@ review_policy:
     - myorg/db-admins
   include_database_operators: true   # default: true
   include_codeowners: false          # default: false
-  require_reapproval: true           # default: unset, which follows the base branch
+  require_reapproval: false          # default: false
 
 repos:
   myorg/monorepo:
@@ -2149,22 +2149,15 @@ Approval is checked at the time of `schemabot apply` and `schemabot apply-confir
 
 ### Re-approval
 
-Each reviewer's latest decisive review is used: an approval counts until the reviewer requests changes or GitHub dismisses it. `require_reapproval` decides whether an approval on an earlier commit still counts once the PR's schema change differs from the one it reviewed:
+SchemaBot reads the PR's current reviews and uses each reviewer's latest decisive review. By default, an authorized approval counts on whichever commit it was given, until the reviewer requests changes or GitHub dismisses it. To have a later push take approvals away, turn on "Dismiss stale pull request approvals when new commits are pushed" in the base branch's ruleset or branch protection: GitHub then dismisses them, and SchemaBot no longer counts them.
 
-| `require_reapproval` | An approval on an earlier commit |
-|---|---|
-| unset (default) | Follows the PR's base branch. When the branch's rules dismiss stale approvals on push, GitHub has already removed every approval a later commit made stale, so the approval counts. Otherwise it counts only while the PR's schema change is the one it reviewed. |
-| `true` | Counts only while the PR's schema change is the one it reviewed. |
-| `false` | Counts until the reviewer withdraws it or GitHub dismisses it, whatever the PR pushes after it. |
-
-Following the base branch, SchemaBot reads the branch's rulesets and its classic branch protection, and only when an approval on an earlier commit needs the answer. Turn on "Dismiss stale pull request approvals when new commits are pushed" in either to have GitHub decide. Reading classic protection needs the App's **Administration** read permission (see [GitHub App setup](github-app-setup.md#permissions)). When SchemaBot cannot read the rules, it treats the branch as one that does not dismiss stale approvals.
+Set `require_reapproval: true` to have SchemaBot check this itself: an approval on an earlier commit then counts only while the PR's schema change is the one it reviewed.
 
 Set `require_reapproval` under `review_policy` for every database on the instance, or under a database's own `review_policy` to override it for that database, in either direction:
 
 ```yaml
 review_policy:
   enabled: true
-  require_reapproval: false
 
 databases:
   payments:

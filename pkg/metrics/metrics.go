@@ -1574,33 +1574,31 @@ func RecordSchemaRequestError(ctx context.Context, repo, command, database, envi
 const (
 	gitHubMetricValueUnknown = "unknown"
 
-	GitHubOperationAddCommentReaction             = "add_comment_reaction"
-	GitHubOperationCreateCheckRun                 = "create_check_run"
-	GitHubOperationCreateIssueComment             = "create_issue_comment"
-	GitHubOperationCreateInstallationAccessToken  = "create_installation_access_token"
-	GitHubOperationDeleteIssueComment             = "delete_issue_comment"
-	GitHubOperationEditIssueComment               = "edit_issue_comment"
-	GitHubOperationFetchAppSlug                   = "fetch_app_slug"
-	GitHubOperationFetchBlob                      = "fetch_blob"
-	GitHubOperationFetchDiff                      = "fetch_diff"
-	GitHubOperationFetchFileContent               = "fetch_file_content"
-	GitHubOperationFetchGitTree                   = "fetch_git_tree"
-	GitHubOperationFetchPullRequest               = "fetch_pull_request"
-	GitHubOperationGetBranchRules                 = "get_branch_rules"
-	GitHubOperationGetCombinedStatus              = "get_combined_status"
-	GitHubOperationGetPullRequestReviewProtection = "get_pull_request_review_protection"
-	GitHubOperationGetTeam                        = "get_team"
-	GitHubOperationGetTeamMembership              = "get_team_membership"
-	GitHubOperationGraphQLMinimizeComment         = "graphql_minimize_comment"
-	GitHubOperationGraphQLStatusCheckRollup       = "graphql_status_check_rollup"
-	GitHubOperationGraphQLTreeEntries             = "graphql_tree_entries"
-	GitHubOperationListCheckRunsForRef            = "list_check_runs_for_ref"
-	GitHubOperationListPRFiles                    = "list_pr_files"
-	GitHubOperationListReviews                    = "list_reviews"
-	GitHubOperationListTeamMembers                = "list_team_members"
-	GitHubOperationRequestReviewers               = "request_reviewers"
-	GitHubOperationUnknown                        = gitHubMetricValueUnknown
-	GitHubOperationUpdateCheckRun                 = "update_check_run"
+	GitHubOperationAddCommentReaction            = "add_comment_reaction"
+	GitHubOperationCreateCheckRun                = "create_check_run"
+	GitHubOperationCreateIssueComment            = "create_issue_comment"
+	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
+	GitHubOperationEditIssueComment              = "edit_issue_comment"
+	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
+	GitHubOperationFetchBlob                     = "fetch_blob"
+	GitHubOperationFetchDiff                     = "fetch_diff"
+	GitHubOperationFetchFileContent              = "fetch_file_content"
+	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchPullRequest              = "fetch_pull_request"
+	GitHubOperationGetCombinedStatus             = "get_combined_status"
+	GitHubOperationGetTeam                       = "get_team"
+	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
+	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
+	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
+	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
+	GitHubOperationListPRFiles                   = "list_pr_files"
+	GitHubOperationListReviews                   = "list_reviews"
+	GitHubOperationListTeamMembers               = "list_team_members"
+	GitHubOperationRequestReviewers              = "request_reviewers"
+	GitHubOperationUnknown                       = gitHubMetricValueUnknown
+	GitHubOperationUpdateCheckRun                = "update_check_run"
 )
 
 const (
@@ -1792,9 +1790,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
 		GitHubOperationFetchPullRequest,
-		GitHubOperationGetBranchRules,
 		GitHubOperationGetCombinedStatus,
-		GitHubOperationGetPullRequestReviewProtection,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
