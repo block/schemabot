@@ -1550,6 +1550,11 @@ serve.
 and database can still resolve to a different schema per user, so SchemaBot
 rejects the setting at config load.
 
+`schema_dsn` cannot be combined with `storage.dsn_from`. `dsn_from` reads the
+server and database from a secret, and a hand-written `schema_dsn` would not
+follow that secret when it changes. SchemaBot rejects the combination at config
+load; use `storage.dsn` with `schema_dsn`.
+
 ## Spirit Run Settings
 
 For MySQL databases this server drives directly, the Spirit engine runs every

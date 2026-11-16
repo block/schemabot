@@ -837,9 +837,11 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
-	// StorageSchemaDSN refuses a schema DSN that names a different database
-	// from dsn, so the pool only serves storage this server converged.
-	schemaDSN, err := cfg.StorageSchemaDSN()
+	// The schema DSN is derived from dsn, the DSN the pool below opens, and
+	// is refused when it names a different database. The pool therefore only
+	// serves storage this attempt converged, even when the configured
+	// reference is rewritten while the attempt runs.
+	schemaDSN, err := cfg.StorageSchemaDSNFor(dsn)
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve storage schema DSN: %w", err)
 	}

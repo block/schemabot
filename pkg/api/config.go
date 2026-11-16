@@ -4022,13 +4022,30 @@ func (c *ServerConfig) StorageDSN() (string, error) {
 // StorageSchemaDSN returns the DSN that converges the storage schema:
 // storage.schema_dsn when configured, otherwise StorageDSN.
 //
-// A configured schema DSN must name the same server and database as the pool's
-// DSN, and every caller (startup, the storage schema API, and the storage CLI)
-// gets that check here: otherwise the schema user would converge a database
-// the pool never serves, under this config's destructive policy.
+// It resolves the storage DSN once and answers for that resolution. A caller
+// that already holds the DSN its pool opens uses StorageSchemaDSNFor instead,
+// so the pool and the schema it converges come from one resolution.
 func (c *ServerConfig) StorageSchemaDSN() (string, error) {
+	poolDSN, err := c.StorageDSN()
+	if err != nil {
+		return "", err
+	}
+	return c.StorageSchemaDSNFor(poolDSN)
+}
+
+// StorageSchemaDSNFor returns the DSN that converges the storage schema for a
+// pool that opens poolDSN: poolDSN itself when storage.schema_dsn is not
+// configured, otherwise the configured schema DSN.
+//
+// A configured schema DSN must name the same server and database as poolDSN,
+// and every caller (startup, the storage schema API, and the storage CLI) gets
+// that check here: otherwise the schema user would converge a database the
+// pool never serves, under this config's destructive policy. The storage DSN
+// is not resolved again, because a reference rewritten since the caller
+// resolved it would name a database the caller's pool does not open.
+func (c *ServerConfig) StorageSchemaDSNFor(poolDSN string) (string, error) {
 	if c.Storage.SchemaDSN == "" {
-		return c.StorageDSN()
+		return poolDSN, nil
 	}
 	schemaDSN, err := secrets.Resolve(c.Storage.SchemaDSN, "")
 	if err != nil {
@@ -4038,10 +4055,6 @@ func (c *ServerConfig) StorageSchemaDSN() (string, error) {
 		if schemaDSN, err = storageDatabaseDSN(c.Storage.Dialect, schemaDSN, c.Storage.Database); err != nil {
 			return "", fmt.Errorf("storage schema_dsn: %w", err)
 		}
-	}
-	poolDSN, err := c.StorageDSN()
-	if err != nil {
-		return "", fmt.Errorf("resolve storage dsn to check schema_dsn against: %w", err)
 	}
 	schemaTarget, err := mysqlStorageTarget(schemaDSN)
 	if err != nil {
@@ -4060,6 +4073,12 @@ func (c *ServerConfig) StorageSchemaDSN() (string, error) {
 // mysqlStorageTarget names the server and database a MySQL DSN connects to,
 // without its credentials. Hostnames compare case-insensitively; database
 // names do not, because MySQL database names can be case sensitive.
+//
+// pkg/serve has the same rule in storageTargetFor, which it uses to check a
+// re-resolved DSN against the database the server booted on. The two must
+// agree on which DSNs name one database, so change them together.
+// TestSchemaDSNCheckAgreesWithBootTargetCheck in pkg/serve fails when they
+// disagree.
 func mysqlStorageTarget(dsn string) (string, error) {
 	cfg, err := gomysql.ParseDSN(dsn)
 	if err != nil {
@@ -4105,6 +4124,13 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 	// MySQL-only until both are checked.
 	if dialect != schema.DialectMySQL && c.SchemaDSN != "" {
 		return fmt.Errorf("%s schema_dsn is only supported with dialect %q, not %q", context, schema.DialectMySQL, dialect)
+	}
+	// dsn_from reads the server and database from a secret, and schema_dsn
+	// spells them out by hand. A secret rewritten with another host would
+	// leave the two naming different databases and stop every instance at
+	// startup, so the combination is refused at config load.
+	if c.SchemaDSN != "" && c.DSNFrom != nil {
+		return fmt.Errorf("%s cannot configure schema_dsn with dsn_from; set dsn instead of dsn_from to use schema_dsn", context)
 	}
 	return c.Pool.Validate(context)
 }

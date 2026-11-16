@@ -3714,6 +3714,48 @@ func TestServerConfig_StorageSchemaDSN(t *testing.T) {
 		assert.Equal(t, "ddl:pw@tcp(storage.example.com)/schemabot", dsn)
 	})
 
+	// A file-backed storage DSN is rewritten to another database after the
+	// caller resolved it for its pool. The schema DSN still answers for the
+	// DSN the caller holds, so the schema converged is the pool's own.
+	t.Run("answers for the pool DSN it is given when the reference is rewritten", func(t *testing.T) {
+		const bootDSN = "rw:pw@tcp(storage:3306)/schemabot"
+		const rewrittenDSN = "rw:pw@tcp(storage:3306)/other"
+		dsnFile := filepath.Join(t.TempDir(), "storage-dsn")
+		require.NoError(t, os.WriteFile(dsnFile, []byte(bootDSN), 0o600))
+
+		unset := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile}}
+		poolDSN, err := unset.StorageDSN()
+		require.NoError(t, err)
+		require.Equal(t, bootDSN, poolDSN)
+		require.NoError(t, os.WriteFile(dsnFile, []byte(rewrittenDSN), 0o600))
+
+		dsn, err := unset.StorageSchemaDSNFor(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, bootDSN, dsn, "without schema_dsn the schema converges over the pool's own DSN")
+
+		matchesPool := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile, SchemaDSN: "ddl:pw@tcp(storage:3306)/schemabot"}}
+		dsn, err = matchesPool.StorageSchemaDSNFor(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, "ddl:pw@tcp(storage:3306)/schemabot", dsn)
+
+		matchesRewrite := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile, SchemaDSN: "ddl:pw@tcp(storage:3306)/other"}}
+		_, err = matchesRewrite.StorageSchemaDSNFor(poolDSN)
+		require.EqualError(t, err, "storage.schema_dsn names storage:3306/other but storage.dsn names storage:3306/schemabot; both must name the same storage database")
+	})
+
+	t.Run("is rejected with dsn_from", func(t *testing.T) {
+		storageConfig := StorageConfig{
+			DSNFrom: &DSNFromConfig{
+				ConfigRef:   "env:STORAGE_CONFIG",
+				Username:    "rw",
+				PasswordRef: "env:STORAGE_PASSWORD",
+			},
+			SchemaDSN: "ddl:pw@tcp(storage:3306)/schemabot",
+		}
+		require.EqualError(t, storageConfig.validateLocalDSNConfig("storage"),
+			"storage cannot configure schema_dsn with dsn_from; set dsn instead of dsn_from to use schema_dsn")
+	})
+
 	t.Run("is rejected for PostgreSQL storage", func(t *testing.T) {
 		cfg := ServerConfig{Storage: StorageConfig{
 			Dialect:   "postgres",
