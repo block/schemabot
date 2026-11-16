@@ -1,6 +1,9 @@
 package secrets
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,8 +70,86 @@ func TestResolve_LiteralWithColon(t *testing.T) {
 	assert.Equal(t, "host:port:path", result)
 }
 
-// Note: secretsmanager: tests would require mocking AWS SDK or integration tests
-// The AWS functionality is tested via integration tests with MiniStack
+// fakeSecretsManager serves secret strings by name.
+type fakeSecretsManager struct {
+	values map[string]string
+}
+
+func (f *fakeSecretsManager) GetSecretValue(_ context.Context, in *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+	value, ok := f.values[aws.ToString(in.SecretId)]
+	if !ok {
+		return nil, fmt.Errorf("secret %s not found", aws.ToString(in.SecretId))
+	}
+	return &secretsmanager.GetSecretValueOutput{SecretString: aws.String(value)}, nil
+}
+
+// useSecretsManagerBuilder makes build the way the resolver gets its client
+// for the rest of the test, starting from no shared client, and restores the
+// real builder afterwards.
+func useSecretsManagerBuilder(t *testing.T, build func(context.Context) (secretGetter, error)) {
+	t.Helper()
+	secretsManagerMu.Lock()
+	secretsManagerClient = nil
+	newSecretsManagerClient = build
+	secretsManagerMu.Unlock()
+	t.Cleanup(func() {
+		secretsManagerMu.Lock()
+		secretsManagerClient = nil
+		newSecretsManagerClient = loadSecretsManagerClient
+		secretsManagerMu.Unlock()
+	})
+}
+
+// A target's password is resolved again on every connection. The resolves
+// share one client, so the AWS config and credentials are loaded once, while
+// each resolve still reads the secret's current value and picks up a rotation.
+func TestResolve_SecretsManagerReusesClientAndReadsCurrentValue(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{
+		"/example/orders": `{"username":"schemabot","password":"first"}`,
+	}}
+	builds := 0
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds++
+		return fake, nil
+	})
+
+	password, err := ResolveContext(t.Context(), "secretsmanager:/example/orders#password", "")
+	require.NoError(t, err)
+	assert.Equal(t, "first", password)
+
+	fake.values["/example/orders"] = `{"username":"schemabot","password":"rotated"}`
+	password, err = ResolveContext(t.Context(), "secretsmanager:/example/orders#password", "")
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", password, "a rotated secret takes effect on the next resolve")
+
+	document, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"username":"schemabot","password":"rotated"}`, document)
+
+	assert.Equal(t, 1, builds, "every resolve uses the one shared client")
+}
+
+// A client that fails to build is not kept: the resolve that hit the failure
+// returns it, and the next resolve builds the client again.
+func TestResolve_SecretsManagerRetriesFailedClientBuild(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{"/example/orders": "s3cret"}}
+	builds := 0
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds++
+		if builds == 1 {
+			return nil, errors.New("load AWS config: no region")
+		}
+		return fake, nil
+	})
+
+	_, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.ErrorContains(t, err, "load AWS config: no region")
+
+	value, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", value)
+	assert.Equal(t, 2, builds)
+}
 
 func TestValueFromGetSecretOutput(t *testing.T) {
 	// The string form is used when present.

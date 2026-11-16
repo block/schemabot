@@ -138,6 +138,50 @@ func resolveFile(path string) (string, error) {
 	return strings.TrimSpace(string(content)), nil
 }
 
+// secretGetter is the one Secrets Manager call the resolver makes.
+type secretGetter interface {
+	GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+}
+
+// The process shares one Secrets Manager client. Building a client loads the
+// AWS config, which sets up the credential chain and the cache in front of it,
+// so reusing the client fetches credentials again only as they near expiry
+// instead of walking the chain, and calling the instance metadata service or
+// STS, on every resolve. Secret values are not cached: each resolve reads the
+// secret's current value, so a rotated secret takes effect on the next resolve.
+var (
+	secretsManagerMu        sync.Mutex
+	secretsManagerClient    secretGetter
+	newSecretsManagerClient = loadSecretsManagerClient
+)
+
+// sharedSecretsManagerClient returns the process's Secrets Manager client,
+// building it on first use. A failed build is not kept, so the next resolve
+// tries again rather than failing for the life of the process.
+func sharedSecretsManagerClient(ctx context.Context) (secretGetter, error) {
+	secretsManagerMu.Lock()
+	defer secretsManagerMu.Unlock()
+	if secretsManagerClient != nil {
+		return secretsManagerClient, nil
+	}
+	client, err := newSecretsManagerClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	secretsManagerClient = client
+	return client, nil
+}
+
+// loadSecretsManagerClient builds a client from the default AWS config: the
+// standard credential chain (environment, shared config, IAM role) and region.
+func loadSecretsManagerClient(ctx context.Context) (secretGetter, error) {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	return secretsmanager.NewFromConfig(cfg), nil
+}
+
 // resolveSecretsManager fetches a secret from AWS Secrets Manager.
 // Format: "secret-name" or "secret-name#json-key"
 //
@@ -148,16 +192,13 @@ func resolveSecretsManager(ctx context.Context, ref string) (string, error) {
 	// Parse secret name and optional JSON key
 	secretName, jsonKey, _ := strings.Cut(ref, "#")
 
-	// Create AWS config (uses default credential chain: env vars, IAM role, etc.)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cfg, err := config.LoadDefaultConfig(ctx)
+	client, err := sharedSecretsManagerClient(ctx)
 	if err != nil {
-		return "", fmt.Errorf("load AWS config: %w", err)
+		return "", err
 	}
-
-	client := secretsmanager.NewFromConfig(cfg)
 
 	// Fetch the secret
 	result, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
