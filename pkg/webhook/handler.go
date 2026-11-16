@@ -89,6 +89,10 @@ type Handler struct {
 	// the package default.
 	transientPlanRetryDelay time.Duration
 
+	// terminalCheckRefreshTimeoutOverride overrides how long one terminal-apply
+	// check refresh may take. Zero means terminalCheckRefreshTimeout.
+	terminalCheckRefreshTimeoutOverride time.Duration
+
 	// participantNudgeRefoldDelay overrides the pause before the second
 	// aggregate re-fold after a participant-comment nudge. Zero means the
 	// package default.
@@ -420,12 +424,34 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 	return h
 }
 
+// terminalCheckRefreshTimeout bounds one terminal-apply check refresh: the
+// stored check write, the PR head read, and the aggregate Check Run publish.
+// The observer hooks that call it run on an apply's drive path with no deadline
+// of their own. Each GitHub request has its own limit, but a refresh makes
+// several in a row and its storage calls have none, so without this bound a
+// slow GitHub or an unresponsive storage call would hold that path for as long
+// as they take. A refresh cut short fails closed: either the
+// stored check stays in progress, which keeps merge blocked until terminal check
+// reconciliation completes it, or the Check Run keeps showing the apply as
+// running. The bound also stops one stuck apply from holding up the rest of a
+// reconciliation pass.
+const terminalCheckRefreshTimeout = time.Minute
+
+func (h *Handler) terminalCheckRefreshDeadline() time.Duration {
+	if h.terminalCheckRefreshTimeoutOverride > 0 {
+		return h.terminalCheckRefreshTimeoutOverride
+	}
+	return terminalCheckRefreshTimeout
+}
+
 // refreshChecksForTerminalApply updates the stored check record for a terminal
 // apply result and refreshes the GitHub aggregate Check Run. It drives every
 // identifier and side effect from the apply it is handed so logs and check
 // updates never mix fields from two apply instances. logCtx names the caller
 // (e.g. "recovered apply") so operators can tell which path refreshed the check.
 func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.Apply, logCtx string) {
+	ctx, cancel := context.WithTimeout(ctx, h.terminalCheckRefreshDeadline())
+	defer cancel()
 	fields := applyCheckLogFields(a, logCtx)
 	updated, err := h.updateCheckRecordForApplyResult(ctx, a.Repository, a.PullRequest, a)
 	if err != nil {
