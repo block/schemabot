@@ -111,7 +111,7 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		h.logger.Warn("webhook from unregistered repository",
 			"event", "check_suite", "action", payload.Action, "repo", repo,
 			"delivery_id", deliveryID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "check_suite", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "check_suite", payload.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "repository not registered"})
 		return
 	}
@@ -221,7 +221,7 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
 		h.logger.Warn("durable check_suite delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_suite", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_suite", payload.Action)
 		return false, nil
 	}
 	installationID, err := durableInstallationID(event)

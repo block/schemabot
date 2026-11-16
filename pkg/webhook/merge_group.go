@@ -78,7 +78,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
 		h.logger.Warn("merge_group webhook from unregistered repository",
 			"repo", repo, "head_sha", headSHA, "installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "merge_group", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "merge_group", payload.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "repository not registered"})
 		return
 	}
@@ -228,7 +228,7 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
 		h.logger.Warn("durable merge_group delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "merge_group", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "merge_group", payload.Action)
 		return false, nil
 	}
 

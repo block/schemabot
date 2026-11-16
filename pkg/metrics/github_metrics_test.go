@@ -60,6 +60,8 @@ func TestUnknownGitHubMetricLabelsAreTrackedOncePerDistinctValue(t *testing.T) {
 	assert.Equal(t, 2, seen)
 }
 
+// Any repository that installs the App can deliver to it, so deliveries from
+// two unconfigured repositories land on one series rather than one each.
 func TestRecordUnregisteredRepositoryWebhook(t *testing.T) {
 	reader := metric.NewManualReader()
 	mp := metric.NewMeterProvider(metric.WithReader(reader))
@@ -70,7 +72,8 @@ func TestRecordUnregisteredRepositoryWebhook(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	}()
 
-	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "issue_comment", "created", "octocat/hello-world")
+	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "issue_comment", "created")
+	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "issue_comment", "created")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -85,12 +88,13 @@ func TestRecordUnregisteredRepositoryWebhook(t *testing.T) {
 			sum, ok := m.Data.(metricdata.Sum[int64])
 			require.True(t, ok)
 			require.Len(t, sum.DataPoints, 1)
-			assert.Equal(t, int64(1), sum.DataPoints[0].Value)
+			assert.Equal(t, int64(2), sum.DataPoints[0].Value)
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "environment", "unknown")
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "app_name", "default")
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "event_type", "issue_comment")
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "action", "created")
-			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "repository", "octocat/hello-world")
+			_, hasRepository := sum.DataPoints[0].Attributes.Value("repository")
+			assert.False(t, hasRepository, "the repository belongs in the caller's log, not a label")
 		}
 	}
 	assert.True(t, found)

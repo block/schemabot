@@ -1955,14 +1955,16 @@ func logUnknownWebhookMetricLabel(metric, label, value, appName, repo, status st
 // RecordUnregisteredRepositoryWebhook increments the counter for webhook events
 // ignored because the repository is outside this SchemaBot instance's configured
 // ownership. A spike means GitHub is delivering events for repositories that this
-// deployment will not process.
-func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType, action, repo string) {
+// deployment will not process. The counter carries no repository label: the set
+// of repositories that can deliver to an App is not bounded by SchemaBot's
+// configuration, so callers log the repository instead.
+func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType, action string) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "event_type", eventType, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "event_type", eventType, appName, "", "ignored")
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
-		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "action", action, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "action", action, appName, "", "ignored")
 		action = "unknown"
 	}
 	if appName == "" {
@@ -1973,7 +1975,6 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 		EnvironmentAttribute(""),
 		attribute.String("app_name", appName),
 		attribute.String("event_type", eventType),
-		attribute.String("repository", repo),
 	}
 	if action != "" {
 		attrs = append(attrs, attribute.String("action", action))
