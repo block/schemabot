@@ -1088,9 +1088,12 @@ What an interrupted run reports depends on where it stopped:
   interrupted before its first page came back prints no report.
 - `checks backfill` interrupted while recreating checks prints its report with
   a line under the headline saying it was interrupted. Every PR the server
-  answered keeps its outcome. The PR the interrupt cut off and every PR after
-  it read `not confirmed: interrupted before the server answered`, because the
-  server may have acted on the request in flight.
+  answered keeps its outcome. PRs are sent to the server in batches. A PR in
+  the batch the interrupt cut off reads
+  `not confirmed: interrupted before the server answered`, because the server
+  may have acted on the request in flight. A PR in a later batch reads
+  `not attempted: interrupted before this PR was sent`, because it never
+  reached the server.
 - `webhooks redrive` prints the redelivery counts from the chunks that
   completed, and prints none under `--dry-run`.
 
@@ -1110,9 +1113,9 @@ https://github.com/acme/store/pull/12  SchemaBot (production)  not confirmed: in
 
 With `--json`, the report carries a top-level `interrupted` field, `false` on
 a run that finished and `true` on one an interrupt cut short. A PR the server
-never answered has the same `not confirmed` value in its `outcome`. A PR in an
-interrupted scan has no `outcome`, since nothing was sent for it. The same
-interrupted run, cut down to two of its PRs:
+never answered has the same `not confirmed` or `not attempted` value in its
+`outcome`. A PR in an interrupted scan has no `outcome`, since nothing was
+sent for it. The same interrupted run, cut down to two of its PRs:
 
 ```json
 {

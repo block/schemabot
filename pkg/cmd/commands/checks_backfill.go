@@ -67,17 +67,46 @@ const checksSynthesizeBatchSize = 10
 const checksBackfillHeldStatus = "held: an uncompleted Check Run sits on this head (a started apply may own it); investigate before backfilling"
 
 // checksBackfillUnconfirmedStatus is the outcome of a PR an interrupted run
-// sent, or would have sent, for recreation but never heard back about. The
-// request may have reached the server, so it claims neither way whether the
-// Check Run was recreated.
+// sent for recreation but never heard back about. The request may have
+// reached the server, so it claims neither way whether the Check Run was
+// recreated.
 const checksBackfillUnconfirmedStatus = "not confirmed: interrupted before the server answered"
 
-// The notes under the headline of an interrupted report, one per phase the
-// interrupt can land in.
-const (
-	checksBackfillInterruptedScanNote     = "Interrupted during the scan: only the PRs scanned so far are listed, and no Check Run was recreated. Run the command again for a full sweep."
-	checksBackfillInterruptedRecreateNote = `Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet. Run the command again to finish; it recreates only the Check Runs still missing.`
-)
+// checksBackfillNotAttemptedStatus is the outcome of a PR an interrupted run
+// never sent for recreation. The server did not hear of it, so its Check Run
+// is still missing.
+const checksBackfillNotAttemptedStatus = "not attempted: interrupted before this PR was sent"
+
+// checksBackfillInterruptedScanNote is the note under the headline of a
+// report whose scan was interrupted.
+const checksBackfillInterruptedScanNote = "Interrupted during the scan: only the PRs scanned so far are listed, and no Check Run was recreated. Run the command again for a full sweep."
+
+// checksBackfillInterruptedRecreateNote is the note under the headline of a
+// report whose recreation was interrupted. It explains only the interrupted
+// outcomes the report shows.
+func checksBackfillInterruptedRecreateNote(report *checksBackfillReport) string {
+	var unconfirmed, notAttempted bool
+	for _, action := range report.Actions {
+		switch action.Outcome {
+		case checksBackfillUnconfirmedStatus:
+			unconfirmed = true
+		case checksBackfillNotAttemptedStatus:
+			notAttempted = true
+		}
+	}
+	var explained []string
+	if unconfirmed {
+		explained = append(explained, `a PR whose outcome is "not confirmed" may or may not have its Check Run yet`)
+	}
+	if notAttempted {
+		explained = append(explained, `a PR whose outcome is "not attempted" was never sent to the server`)
+	}
+	note := "Interrupted while recreating Check Runs"
+	if len(explained) > 0 {
+		note += ": " + strings.Join(explained, ", and ")
+	}
+	return note + ". Run the command again to finish; it recreates only the Check Runs still missing."
+}
 
 // What stderr says about how far an interrupted run got when its report could
 // not be written to stdout, one per phase the interrupt can land in.
@@ -106,8 +135,11 @@ type checksBackfillAction struct {
 	Held    bool   `json:"held,omitempty"`
 	Outcome string `json:"outcome,omitempty"`
 	Error   string `json:"error,omitempty"`
-	// answered records that the server sent this PR's result, so an
-	// interrupted run can tell the PRs it heard back about from the rest.
+	// sent records that this PR was in a batch handed to the server, and
+	// answered that the server sent its result. An interrupted run uses them
+	// to tell the PRs it heard back about from the batch in flight, and that
+	// batch from the PRs it never sent.
+	sent     bool
 	answered bool
 }
 
@@ -175,16 +207,21 @@ type checksBackfillReport struct {
 	interruptedScan bool
 }
 
-// markUnconfirmed sets the unconfirmed outcome on every PR an interrupted act
-// phase sent, or would have sent, for recreation without hearing back. Held
-// PRs never reach the server and keep the reason they were held.
-func (r *checksBackfillReport) markUnconfirmed() {
+// markUnanswered sets the outcome of every PR an interrupted act phase did
+// not hear back about: unconfirmed when the PR was sent, since the server may
+// have acted on it, and not attempted when it was never sent. Held PRs never
+// reach the server and keep the reason they were held.
+func (r *checksBackfillReport) markUnanswered() {
 	for i := range r.Actions {
 		action := &r.Actions[i]
 		if action.Held || action.answered {
 			continue
 		}
-		action.Outcome = checksBackfillUnconfirmedStatus
+		if action.sent {
+			action.Outcome = checksBackfillUnconfirmedStatus
+			continue
+		}
+		action.Outcome = checksBackfillNotAttemptedStatus
 	}
 }
 
@@ -403,7 +440,7 @@ scanning:
 			// interrupt status.
 			stopProgress()
 			report.Interrupted = true
-			report.markUnconfirmed()
+			report.markUnanswered()
 			cmd.writeInterrupted(report)
 			return canceled
 		}
@@ -716,6 +753,11 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 				progressLine += fmt.Sprintf(" (%d failed so far)", failed)
 			}
 			updateProgress(progressLine)
+			// Mark the batch before the request: once it is handed over, an
+			// interrupt cannot tell whether it reached the server.
+			for _, pr := range batch {
+				actionByPR[repoPR{repo: repo, pr: pr}].sent = true
+			}
 			resp, err := cmdclient.ChecksSynthesize(ctx, endpoint, apitypes.ChecksSynthesizeRequest{Repo: repo, PRs: batch})
 			if err != nil {
 				return fmt.Errorf("synthesize Check Runs for %s: %w", repo, err)
@@ -860,7 +902,7 @@ func writeChecksInterruptedNote(w io.Writer, report *checksBackfillReport) error
 	if !report.Interrupted {
 		return nil
 	}
-	note := checksBackfillInterruptedRecreateNote
+	note := checksBackfillInterruptedRecreateNote(report)
 	if report.interruptedScan {
 		note = checksBackfillInterruptedScanNote
 	}

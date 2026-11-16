@@ -927,9 +927,11 @@ func checksBackfillRecreateServer(t *testing.T, prCount int, hold *holdingHandle
 // first batch of PRs has its outcomes, the second batch is waiting on the
 // server, and the third was never sent. The command says the backfill was
 // canceled and still prints the report, marked as interrupted. Every PR it
-// heard back about keeps its outcome; the PR the interrupt cut off and every
-// PR after it read "not confirmed", since the server may have acted on the
-// batch in flight. It then exits with the interrupt status.
+// heard back about keeps its outcome. The PRs in the batch the interrupt cut
+// off read "not confirmed", since the server may have acted on that batch.
+// The PR in the batch that was never sent reads "not attempted", so the
+// operator can tell it apart from the ones that may already have a Check Run.
+// The command then exits with the interrupt status.
 func TestChecksBackfillCancelWhileRecreatingChecksPrintsPartialReport(t *testing.T) {
 	hold := newHoldingHandler(t)
 	const prCount = 2*checksSynthesizeBatchSize + 1
@@ -950,15 +952,69 @@ func TestChecksBackfillCancelWhileRecreatingChecksPrintsPartialReport(t *testing
 	for _, action := range report.Actions[:checksSynthesizeBatchSize] {
 		assert.Equal(t, "created 1 Check Run", action.Outcome, "PR %d was recreated before the interrupt", action.PR)
 	}
-	for _, action := range report.Actions[checksSynthesizeBatchSize:] {
-		assert.Equal(t, checksBackfillUnconfirmedStatus, action.Outcome, "PR %d was never answered", action.PR)
+	for _, action := range report.Actions[checksSynthesizeBatchSize : 2*checksSynthesizeBatchSize] {
+		assert.Equal(t, "not confirmed: interrupted before the server answered", action.Outcome, "PR %d was sent but never answered", action.PR)
 		assert.Empty(t, action.Error)
+	}
+	neverSent := report.Actions[2*checksSynthesizeBatchSize]
+	assert.Equal(t, "not attempted: interrupted before this PR was sent", neverSent.Outcome, "PR %d was never sent", neverSent.PR)
+	assert.Empty(t, neverSent.Error)
+}
+
+// The note under an interrupted report's headline explains only the
+// interrupted outcomes the report shows: "not confirmed" for a PR the server
+// may have acted on, "not attempted" for a PR that was never sent.
+func TestChecksBackfillInterruptedRecreateNoteExplainsTheOutcomesShown(t *testing.T) {
+	const finish = " Run the command again to finish; it recreates only the Check Runs still missing."
+	tests := []struct {
+		name     string
+		outcomes []string
+		wantNote string
+	}{
+		{
+			name:     "a batch was in flight and later PRs were never sent",
+			outcomes: []string{"created 1 Check Run", checksBackfillUnconfirmedStatus, checksBackfillNotAttemptedStatus},
+			wantNote: `Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet, and a PR whose outcome is "not attempted" was never sent to the server.` + finish,
+		},
+		{
+			name:     "the last batch was in flight",
+			outcomes: []string{"created 1 Check Run", checksBackfillUnconfirmedStatus},
+			wantNote: `Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet.` + finish,
+		},
+		{
+			name:     "interrupted between batches",
+			outcomes: []string{"created 1 Check Run", checksBackfillNotAttemptedStatus},
+			wantNote: `Interrupted while recreating Check Runs: a PR whose outcome is "not attempted" was never sent to the server.` + finish,
+		},
+		{
+			name:     "every PR was answered",
+			outcomes: []string{"created 1 Check Run"},
+			wantNote: "Interrupted while recreating Check Runs." + finish,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			report := &checksBackfillReport{Repos: []string{"octo/repo"}, Scanned: len(tt.outcomes), Interrupted: true}
+			for i, outcome := range tt.outcomes {
+				report.Actions = append(report.Actions, checksBackfillAction{
+					Repo: "octo/repo", PR: i + 1, URL: "https://github.com/octo/repo/pull/" + strconv.Itoa(i+1),
+					MissingNames: []string{"SchemaBot (production)"}, Outcome: outcome,
+				})
+			}
+
+			var out strings.Builder
+			require.NoError(t, writeChecksBackfillReport(&out, report))
+
+			lines := strings.Split(out.String(), "\n")
+			require.GreaterOrEqual(t, len(lines), 2)
+			assert.Equal(t, tt.wantNote, lines[1])
+		})
 	}
 }
 
 // The same interrupt in the text report: the PRs the server answered show
-// their outcome, every other PR reads "not confirmed", and a line under the
-// headline says the run was interrupted and how to finish it.
+// their outcome, the PR in the batch in flight reads "not confirmed", and a
+// line under the headline says the run was interrupted and how to finish it.
 func TestChecksBackfillCancelWhileRecreatingChecksMarksTheTextReport(t *testing.T) {
 	hold := newHoldingHandler(t)
 	const prCount = checksSynthesizeBatchSize + 1
@@ -972,7 +1028,7 @@ func TestChecksBackfillCancelWhileRecreatingChecksMarksTheTextReport(t *testing.
 	lines := strings.Split(output, "\n")
 	require.GreaterOrEqual(t, len(lines), 2)
 	assert.Equal(t, "Scanned 11 open PRs in octo/repo for SchemaBot (production).", lines[0])
-	assert.Equal(t, checksBackfillInterruptedRecreateNote, lines[1])
+	assert.Equal(t, `Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet. Run the command again to finish; it recreates only the Check Runs still missing.`, lines[1])
 	assert.Equal(t, []string{"https://github.com/octo/repo/pull/1", "SchemaBot (production)", "created 1 Check Run"},
 		renderedCells(lineContaining(t, output, "/pull/1 ")))
 	assert.Equal(t, []string{"https://github.com/octo/repo/pull/11", "SchemaBot (production)", checksBackfillUnconfirmedStatus},
@@ -995,7 +1051,7 @@ func TestChecksBackfillCancelAfterAFailedRecreationPrintsTheTextReport(t *testin
 	assert.Equal(t, ExitInterrupted, ExitCodeFor(runErr))
 	assert.True(t, strings.HasSuffix(stderr, "checks backfill canceled\n"), stderr)
 	assert.NotContains(t, stderr, "could not be written")
-	assert.Equal(t, checksBackfillInterruptedRecreateNote, strings.Split(output, "\n")[1])
+	assert.Equal(t, `Interrupted while recreating Check Runs: a PR whose outcome is "not confirmed" may or may not have its Check Run yet. Run the command again to finish; it recreates only the Check Runs still missing.`, strings.Split(output, "\n")[1])
 	assert.Equal(t, []string{"https://github.com/octo/repo/pull/1", "SchemaBot (production)", "created 1 Check Run"},
 		renderedCells(lineContaining(t, output, "/pull/1 ")))
 	assert.Equal(t, []string{"https://github.com/octo/repo/pull/2", "SchemaBot (production)", "failed: boom"},
