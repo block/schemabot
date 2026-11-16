@@ -155,7 +155,9 @@ func TestPRClosedRetainsLockAndChecksForInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Empty(t, lockStore.released, "lock for a database with an in-flight apply must not be released on PR close")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while an apply is in flight")
@@ -179,7 +181,9 @@ func TestPRClosedReleasesOnlyLocksWithoutInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Equal(t, []string{"billing"}, lockStore.released, "only the lock without an in-flight apply is released")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while any apply is in flight")
@@ -201,7 +205,9 @@ func TestPRClosedCleansUpWhenAllAppliesTerminal(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Equal(t, []string{"orders", "billing"}, lockStore.released, "all locks are released when applies are terminal")
 	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted when applies are terminal")
@@ -225,7 +231,9 @@ func TestPRClosedCleansUpWhenPRHasNoApplies(t *testing.T) {
 
 	factory, fetches := prClosedGitHub(t, "closed", 0)
 	h := prClosedTestHandlerWithGitHub(t, st, factory)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Equal(t, int32(1), fetches.Load(), "an unmerged close reads the live PR once")
 	assert.Equal(t, []string{"orders"}, lockStore.released, "locks are released when the PR has no applies")
@@ -247,8 +255,8 @@ func TestPRClosedSkipsCleanupWhenApplyLookupFails(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.Error(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true),
-		"a failed apply lookup must be returned so the durable driver retries")
+	_, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.Error(t, err, "a failed apply lookup must be returned so the durable driver retries")
 
 	assert.Empty(t, lockStore.released, "no lock is released when apply state is unknown")
 	assert.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when apply state is unknown")
@@ -264,7 +272,9 @@ func TestPRClosedCleanupSkipsMergedLiveRead(t *testing.T) {
 	factory, fetches := prClosedGitHub(t, "open", 0)
 
 	h := prClosedTestHandlerWithGitHub(t, st, factory)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Equal(t, int32(0), fetches.Load(), "a merged close must not read the live PR")
 	assert.Equal(t, []string{"orders"}, lockStore.released, "a merged close releases the lock")
@@ -282,9 +292,32 @@ func TestPRClosedCleanupSkipsReopenedPR(t *testing.T) {
 	factory, fetches := prClosedGitHub(t, "open", 0)
 
 	h := prClosedTestHandlerWithGitHub(t, st, factory)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	assert.NoError(t, err)
+	assert.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
 
 	assert.Equal(t, int32(1), fetches.Load(), "cleanup reads the live PR once")
+	assert.Empty(t, lockStore.released, "the lock taken after the reopen must stay held")
+	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive a close delivery for a reopened PR")
+}
+
+// TestPRClosedCleanupReadsLivePRPastCachedSnapshot covers a close delivery
+// whose context already carries a snapshot of the PR taken while it was
+// closed. The PR has reopened since, so cleanup must read GitHub instead of
+// trusting the snapshot, and it releases nothing and deletes nothing.
+func TestPRClosedCleanupReadsLivePRPastCachedSnapshot(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: checkStore}
+	factory, fetches := prClosedGitHub(t, "open", 0)
+	ctx := ghclient.WithPRInfo(t.Context(), "octocat/hello-world", 1, &ghclient.PullRequestInfo{State: "closed"})
+
+	h := prClosedTestHandlerWithGitHub(t, st, factory)
+	ran, err := h.runPRCloseCleanup(ctx, "octocat/hello-world", 1, 12345, false)
+	assert.NoError(t, err)
+	assert.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
+
+	assert.Equal(t, int32(1), fetches.Load(), "cleanup reads the live PR instead of the cached snapshot")
 	assert.Empty(t, lockStore.released, "the lock taken after the reopen must stay held")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive a close delivery for a reopened PR")
 }
@@ -312,8 +345,9 @@ func TestPRClosedCleanupFailsClosedWhenLivePRUnreadable(t *testing.T) {
 			factory, _ := prClosedGitHub(t, tt.prState, tt.status)
 
 			h := prClosedTestHandlerWithGitHub(t, st, factory)
-			err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, tt.installationID, false)
+			ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, tt.installationID, false)
 
+			assert.False(t, ran, "cleanup does not run on an unverifiable PR state")
 			assert.Error(t, err, "an unverifiable PR state must be returned so the durable driver retries")
 			assert.Empty(t, lockStore.released, "no lock is released when the live PR state is unknown")
 			assert.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when the live PR state is unknown")

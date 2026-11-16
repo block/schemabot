@@ -342,7 +342,7 @@ SchemaBot listens to these GitHub `pull_request` webhook actions:
 | `opened` | PR was opened. | Discover managed schema configs, auto-plan, and publish aggregate checks on the PR head SHA. |
 | `synchronize` | PR head changed, usually from a pushed commit or force-push. | Treat the new head SHA as the source of truth, auto-plan affected configs, clean up stale records, and publish checks on the new SHA. |
 | `reopened` | Closed PR was reopened. | Re-discover configs and auto-plan the current head. Stored rows deleted on close are not restored. |
-| `closed` | PR was closed or merged. | Release locks held by the PR and delete internal check records. In-flight applies continue in Tern. |
+| `closed` | PR was closed or merged. | Release locks held by the PR and delete internal check records, unless the PR is open again by the time cleanup runs. In-flight applies continue in Tern. See [PR closed](#pr-closed). |
 | `edited` | PR metadata changed. | Auto-plan **only when the edit retargeted the base branch**. A retarget changes which commits the PR proposes, and so which databases it touches; a title or body edit arrives under the same action and is ignored. |
 
 Other `pull_request` actions are ignored by the check-run lifecycle.
@@ -955,6 +955,27 @@ continue to their terminal state in Tern.
 GitHub check runs already published to commits remain in GitHub history, but
 SchemaBot removes its internal PR safety state because the PR is no longer
 active.
+
+Cleanup can run after the close, because a failed cleanup is retried. Before a
+close without merge releases or deletes anything, SchemaBot reads the PR from
+GitHub:
+
+- If the PR is still closed, cleanup runs.
+- If the PR is open again, cleanup is skipped. The lock and the stored check
+  records belong to the reopened PR and stay.
+- If GitHub cannot be read, nothing is released or deleted and the cleanup is
+  retried.
+
+A merged PR cannot reopen, so a merge skips the read.
+
+The retry is limited to five attempts, one minute apart. A GitHub outage that
+lasts longer, a suspended or removed App installation, or a deleted repository
+uses up those attempts. The lock then stays held and blocks other PRs on that
+database until an operator runs `schemabot unlock`.
+
+The read is made once, before cleanup starts. A PR that reopens while cleanup
+is already running is not seen by that cleanup, which finishes as if the PR
+were still closed.
 
 ### PR reopened
 

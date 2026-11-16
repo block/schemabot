@@ -782,8 +782,14 @@ func (h *Handler) processDurablePullRequestClosed(ctx context.Context, event *st
 	if err != nil && !payload.PullRequest.Merged {
 		return false, err
 	}
-	if err := h.runPRCloseCleanup(ctx, repo, pr, installationID, payload.PullRequest.Merged); err != nil {
+	ran, err := h.runPRCloseCleanup(ctx, repo, pr, installationID, payload.PullRequest.Merged)
+	if err != nil {
 		return true, fmt.Errorf("pr close cleanup for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, err)
+	}
+	if !ran {
+		h.logger.Info("durable pull_request close delivery completed without cleanup because the PR is open again",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr)
+		return false, nil
 	}
 	h.logger.Info("durable pull_request close cleanup completed",
 		"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "merged", payload.PullRequest.Merged)

@@ -136,7 +136,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			// retried. That direction is fail-closed — retained locks and
 			// check state block until an operator or a reopen reconciles;
 			// nothing is wrongly unblocked. The durable path retries instead.
-			if err := h.runPRCloseCleanup(context.Background(), payload.Repository.FullName, payload.PullRequest.Number, installationID, payload.PullRequest.Merged); err != nil {
+			if _, err := h.runPRCloseCleanup(context.Background(), payload.Repository.FullName, payload.PullRequest.Number, installationID, payload.PullRequest.Merged); err != nil {
 				h.logger.Error("PR close cleanup failed",
 					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "error", err)
 			}
@@ -970,7 +970,14 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 // lock an operator took after the reopen. A merged PR cannot reopen, so a
 // merged delivery skips the live read. When the live state cannot be read,
 // cleanup fails closed and nothing is released or deleted.
-func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, installationID int64, merged bool) error {
+//
+// The live state is read once, before anything is released or deleted. A
+// reopen that lands after that read, while cleanup is still running, is not
+// seen by this pass.
+//
+// The returned bool reports whether cleanup ran. It is false, with a nil
+// error, when the PR is open again and nothing was touched.
+func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, installationID int64, merged bool) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -983,10 +990,10 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 		})
 		h.logger.Error("PR close cleanup skipped: cannot verify the PR is still closed; all locks and check state are retained",
 			"repo", repo, "pr", pr, "installation_id", installationID, "merged", merged, "error", err)
-		return fmt.Errorf("verify PR %s#%d is still closed before cleanup: %w", repo, pr, err)
+		return false, fmt.Errorf("verify PR %s#%d is still closed before cleanup: %w", repo, pr, err)
 	}
 	if !stillClosed {
-		return nil
+		return false, nil
 	}
 
 	// A closed PR gets no more scheduled re-folds; drop its budget entry so the
@@ -1005,19 +1012,19 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 		})
 		h.logger.Error("PR close cleanup skipped: cannot verify apply state; all locks and check state are retained",
 			"repo", repo, "pr", pr, "error", err)
-		return fmt.Errorf("read applies for closed PR %s#%d: %w", repo, pr, err)
+		return false, fmt.Errorf("read applies for closed PR %s#%d: %w", repo, pr, err)
 	}
 
 	inFlight := h.inFlightAppliesForClosedPR(ctx, repo, pr, applies)
 
 	if err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight); err != nil {
-		return fmt.Errorf("release locks for closed PR %s#%d: %w", repo, pr, err)
+		return false, fmt.Errorf("release locks for closed PR %s#%d: %w", repo, pr, err)
 	}
 
 	if len(inFlight) > 0 {
 		h.logger.Info("check state retained for closed PR until all applies reach a terminal state",
 			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight))
-		return nil
+		return true, nil
 	}
 
 	// Delete stored check state for this PR. Apply-owned rows that still block
@@ -1036,7 +1043,7 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 			Status:     "error",
 		})
 		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "merged", merged, "error", err)
-		return fmt.Errorf("delete checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
+		return false, fmt.Errorf("delete checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "pr_close_cleanup",
@@ -1050,7 +1057,7 @@ func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, in
 		h.logger.Info("deleted plan-only checks for unmerged closed PR; all apply-owned rows are retained",
 			"repo", repo, "pr", pr)
 	}
-	return nil
+	return true, nil
 }
 
 // prStillClosed reports whether close cleanup should proceed for the PR. It

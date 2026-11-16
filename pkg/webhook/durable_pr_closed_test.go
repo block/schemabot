@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -112,6 +113,37 @@ func TestDurablePRClosedDriverRunsCleanup(t *testing.T) {
 	require.Empty(t, scripted.failed)
 }
 
+// A merged close never reads GitHub, so a delivery whose stored installation
+// cannot be resolved still releases the lock, deletes stored check state, and
+// completes instead of being marked failed.
+func TestDurablePRClosedDriverCleansMergedCloseWithoutInstallation(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	event := durableClosedEventWithMerged(true)
+	event.TenantID = ""
+	scripted := newScriptedWebhookEventStore(event)
+	st := &durableClosedTestStorage{
+		webhookEvents: scripted,
+		locks:         lockStore,
+		applies:       &prClosedApplyStore{},
+		checks:        checkStore,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(st, &api.ServerConfig{}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Equal(t, []string{"orders"}, lockStore.released, "a merged close releases the lock without an installation")
+	require.Equal(t, 1, checkStore.deleteCalls, "a merged close deletes stored check state without an installation")
+	select {
+	case <-scripted.completed:
+	default:
+		t.Fatal("expected the merged close delivery to be marked completed")
+	}
+	require.Empty(t, scripted.failed)
+}
+
 // A failed apply lookup fails closed — nothing is released or deleted — and the
 // delivery stays retryable so a transient storage blip does not permanently
 // skip cleanup and leave a lock stranded.
@@ -145,7 +177,8 @@ func TestDurablePRClosedDriverRetriesOnApplyLookupFailure(t *testing.T) {
 // A close delivery retried after the PR was reopened must not undo the
 // reopened PR's state: the operator took a lock owned by repo#pr after the
 // reopen, so the driver sees the live PR is open, releases and deletes
-// nothing, and completes the stale delivery instead of retrying it.
+// nothing, and completes the stale delivery instead of retrying it. Its log
+// says the delivery completed without cleanup, not that cleanup completed.
 func TestDurablePRClosedDriverSkipsCleanupForReopenedPR(t *testing.T) {
 	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
 	checkStore := &prClosedCheckStore{}
@@ -157,7 +190,8 @@ func TestDurablePRClosedDriverSkipsCleanupForReopenedPR(t *testing.T) {
 		checks:        checkStore,
 	}
 	factory, fetches := prClosedGitHub(t, "open", 0)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	service := api.New(st, &api.ServerConfig{}, nil, logger)
 	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
 
@@ -172,6 +206,10 @@ func TestDurablePRClosedDriverSkipsCleanupForReopenedPR(t *testing.T) {
 		t.Fatal("expected the stale close delivery to be marked completed")
 	}
 	require.Empty(t, scripted.failed)
+	require.Contains(t, logs.String(), "completed without cleanup because the PR is open again",
+		"the driver must say that the delivery completed without cleaning up")
+	require.NotContains(t, logs.String(), "close cleanup completed",
+		"the driver must not report a cleanup that did not run")
 }
 
 // A close delivery whose live PR read fails fails closed — nothing is released

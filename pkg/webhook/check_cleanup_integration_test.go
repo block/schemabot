@@ -95,7 +95,9 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 	// Close the PR while the apply is running. Cleanup is invoked directly (not
 	// through the async webhook goroutine) so the retention assertions below
 	// observe a finished cleanup pass.
-	require.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	require.NoError(t, err)
+	require.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
@@ -165,7 +167,9 @@ func TestE2EPRCloseCleanupSkipsReopenedPR(t *testing.T) {
 
 	reopened, _ := prClosedGitHub(t, "open", 0)
 	h := NewHandler(svc, reopened, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
-	require.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	require.NoError(t, err)
+	require.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
@@ -177,7 +181,9 @@ func TestE2EPRCloseCleanupSkipsReopenedPR(t *testing.T) {
 
 	closed, _ := prClosedGitHub(t, "closed", 0)
 	h = NewHandler(svc, closed, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
-	require.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false))
+	ran, err = h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	require.NoError(t, err)
+	require.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	lock, err = svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
