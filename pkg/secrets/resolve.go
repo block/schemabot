@@ -149,6 +149,13 @@ type secretGetter interface {
 // instead of walking the chain, and calling the instance metadata service or
 // STS, on every resolve. Secret values are not cached: each resolve reads the
 // secret's current value, so a rotated secret takes effect on the next resolve.
+//
+// Everything else the config loader reads is fixed for the life of the
+// process once the client is built: the region, endpoint and profile, and
+// static access keys from the environment or the shared credentials file.
+// Credentials from a refreshing provider (instance metadata, container
+// credentials, web identity, an assumed role) still renew themselves. Changing
+// a static key in place, or the region or profile, needs a restart.
 var (
 	secretsManagerMu     sync.Mutex
 	secretsManagerClient secretGetter
@@ -186,18 +193,26 @@ func sharedSecretsManagerClient(ctx context.Context) (secretGetter, error) {
 		done := make(chan struct{})
 		secretsManagerBuild = done
 		secretsManagerMu.Unlock()
+		return buildSecretsManagerClient(ctx, done)
+	}
+}
 
-		client, err := newSecretsManagerClient(ctx)
-
+// buildSecretsManagerClient builds the shared client and publishes the
+// outcome. The publish runs in a defer so the build marker is cleared and the
+// waiters are woken on every exit, including a panic in the config loader
+// that a caller recovers; otherwise every later resolve would wait on a build
+// that never ends.
+func buildSecretsManagerClient(ctx context.Context, done chan struct{}) (client secretGetter, err error) {
+	defer func() {
 		secretsManagerMu.Lock()
-		if err == nil {
+		if err == nil && client != nil {
 			secretsManagerClient = client
 		}
 		secretsManagerBuild = nil
 		secretsManagerMu.Unlock()
 		close(done)
-		return client, err
-	}
+	}()
+	return newSecretsManagerClient(ctx)
 }
 
 // loadSecretsManagerClient builds a client from the default AWS config: the
