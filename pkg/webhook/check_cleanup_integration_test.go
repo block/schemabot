@@ -1153,6 +1153,8 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 
 	// Close the PR. Close cleanup runs async, so wait for the plan-only row to
 	// be deleted before asserting on the retained row.
+	// Cleanup reads the live PR, so fake GitHub serves it as closed.
+	result.PRState.Store(new("closed"))
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed"}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -1174,6 +1176,7 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 
 	// Reopen the PR. Auto-plan finds no schema files, and stale-check cleanup
 	// re-blocks the retained row on the current head SHA.
+	result.PRState.Store(new("open"))
 	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "reopened"}, nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -1293,6 +1296,8 @@ func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
 	// Close the PR without merging. Close cleanup runs async, so wait for the
 	// plan-only row to be deleted — the same cleanup statement decides the
 	// retained row's fate — before asserting on the retained row.
+	// Cleanup reads the live PR, so fake GitHub serves it as closed.
+	result.PRState.Store(new("closed"))
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed", merged: false}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -1314,6 +1319,7 @@ func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
 	// Reopen the PR. Auto-plan finds no schema files; stale-check cleanup
 	// converts the retained row on the current head SHA before the aggregate
 	// for that commit is published.
+	result.PRState.Store(new("open"))
 	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "reopened"}, nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
