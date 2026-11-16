@@ -73,6 +73,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
+| `schemabot.webhook.inbox_claimable_depth` | Gauge | environment | Rows ready to claim now; excludes scheduled work, active leases and exhausted retries. Use max across replicas sharing an inbox. |
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
 | `schemabot.webhook.inbox_stuck_processing` | Gauge | environment | Durable webhook inbox rows stuck in processing past the attempt cap |
 | `schemabot.webhook.inbox_stats_collection_failures` | Counter | environment | Failed durable webhook inbox metric snapshots (liveness signal for the inbox gauges) |
