@@ -73,6 +73,41 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Nil(t, deleted)
 	})
 
+	// A logs lookup without an apply ID reads only the newest apply for the
+	// database in the requested environment. An apply in another environment,
+	// however recent, is not it, and a database with no applies has none.
+	t.Run("GetLatestByDatabase_ReturnsNewestInEnvironment", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "latest_db", storage.DatabaseTypeMySQL)
+		create := func(identifier, environment string) int64 {
+			id, err := store.Applies().Create(ctx, &storage.Apply{
+				ApplyIdentifier: identifier,
+				LockID:          lock.ID,
+				Database:        "latest_db",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     environment,
+				State:           state.Apply.Completed,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		create("apply_latest_older", "staging")
+		newer := create("apply_latest_newer", "staging")
+		create("apply_latest_production", "production")
+
+		latest, err := store.Applies().GetLatestByDatabase(ctx, "LATEST_DB", "", "Staging")
+		require.NoError(t, err)
+		require.NotNil(t, latest)
+		assert.Equal(t, newer, latest.ID)
+		assert.Equal(t, "apply_latest_newer", latest.ApplyIdentifier)
+		assert.Equal(t, "staging", latest.Environment)
+
+		none, err := store.Applies().GetLatestByDatabase(ctx, "no_such_db", "", "staging")
+		require.NoError(t, err)
+		assert.Nil(t, none)
+	})
+
 	// An operator walks the recent-applies list page by page, each page starting
 	// below the last apply the previous one showed, while a new apply is created
 	// between pages. Every apply that existed when the walk began is listed
@@ -2179,6 +2214,10 @@ func TestApplies(t *testing.T, h Harness) {
 		},
 		"GetByDatabase_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.GetByDatabase(t.Context(), "db", storage.DatabaseTypeMySQL, "staging")
+			return err
+		},
+		"GetLatestByDatabase_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetLatestByDatabase(t.Context(), "db", storage.DatabaseTypeMySQL, "staging")
 			return err
 		},
 		"Update_DBError": func(t *testing.T, store storage.ApplyStore) error {

@@ -783,6 +783,11 @@ type ApplyStore interface {
 	// Used for checking active schema changes before starting a new one.
 	GetByDatabase(ctx context.Context, database, dbType, environment string) ([]*Apply, error)
 
+	// GetLatestByDatabase returns the most recently created apply for a
+	// database, or nil when it has none. An empty dbType or environment is not
+	// used as a filter, as for GetByDatabase.
+	GetLatestByDatabase(ctx context.Context, database, dbType, environment string) (*Apply, error)
+
 	// Update updates apply state and fields.
 	// Returns ErrActiveApplyExists when moving an apply into an active state
 	// would overlap another active apply for the same database, database type,
