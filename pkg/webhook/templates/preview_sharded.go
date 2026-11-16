@@ -436,12 +436,31 @@ func PreviewCommentShardedPlanMultiEnvShardOnly() string {
 
 // PreviewCommentShardedPlanManyShards renders a uniform sharded plan across a
 // wide keyspace: the DDL shows once under an "all N shards" heading, with the
-// shard names behind a collapsed block instead of walling the comment.
+// shard names in a collapsed grid instead of walling the comment.
 func PreviewCommentShardedPlanManyShards() string {
+	return previewShardedPlanUniform(32)
+}
+
+// PreviewCommentShardedPlanFewShards renders a uniform sharded plan across a
+// keyspace narrow enough that its shard names fit in the heading.
+func PreviewCommentShardedPlanFewShards() string {
+	return previewShardedPlanUniform(8)
+}
+
+// PreviewCommentShardedPlanHugeShards renders a uniform sharded plan across
+// the widest keyspace an even two-hex-digit split allows, where the collapsed
+// grid packs the short key ranges many to a row.
+func PreviewCommentShardedPlanHugeShards() string {
+	return previewShardedPlanUniform(256)
+}
+
+// previewShardedPlanUniform renders a plan that runs the same DDL on every
+// shard of an evenly split keyspace of n shards.
+func previewShardedPlanUniform(n int) string {
 	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
-	shards := make([]KeyspaceShardChange, 0, 32)
-	for i := range 32 {
-		shards = append(shards, KeyspaceShardChange{Shard: previewShardRange(i, 32), Statements: []string{idx}})
+	shards := make([]KeyspaceShardChange, 0, n)
+	for i := range n {
+		shards = append(shards, KeyspaceShardChange{Shard: previewShardRange(i, n), Statements: []string{idx}})
 	}
 	return RenderPlanComment(PlanCommentData{
 		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",

@@ -27,6 +27,7 @@ require (
 	github.com/hashicorp/go-cleanhttp v0.5.2
 	github.com/hmarr/codeowners v1.2.1
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/mattn/go-runewidth v0.0.23
 	github.com/moby/moby/api v1.54.2
 	github.com/pganalyze/pg_query_go/v6 v6.2.2
 	github.com/planetscale/planetscale-go v0.155.0
@@ -185,7 +186,6 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
-	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/minio/simdjson-go v0.4.5 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect

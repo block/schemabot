@@ -1042,9 +1042,22 @@ func PreviewCommentPlanRolloutCopyDiscardedPaused() string {
 // targets for the finding every target raised, and keeps the names of a
 // finding's targets on its own line when it is alone in its set.
 func PreviewCommentPlanRolloutWide() string {
+	return previewPlanRolloutWide(32)
+}
+
+// PreviewCommentPlanRolloutWider renders the same rollout across 128 targets,
+// where the 124 new targets' names fill a longer collapsed grid and are still
+// named once in the lint section.
+func PreviewCommentPlanRolloutWider() string {
+	return previewPlanRolloutWide(128)
+}
+
+// previewPlanRolloutWide renders a rollout of total targets where the first 4
+// already hold the tables and the rest are about to create them.
+func previewPlanRolloutWide(total int) string {
 	var deployments []DeploymentDriftEntry
 	var existing, created []string
-	for n := 1; n <= 32; n++ {
+	for n := 1; n <= total; n++ {
 		target := fmt.Sprintf("testapp_%03d", n)
 		deployments = append(deployments, DeploymentDriftEntry{Deployment: "us", Target: target, Primary: n == 1, Class: "planned"})
 		if n <= 4 {

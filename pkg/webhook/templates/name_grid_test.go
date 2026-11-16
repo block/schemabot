@@ -38,6 +38,35 @@ func TestNameGrid(t *testing.T) {
 		long := strings.Repeat("x", nameGridWidth+5)
 		assert.Equal(t, "a\n"+long+"\n", nameGrid([]string{"a", long}), "a row ends at its last name, with no padding after it")
 	})
+
+	t.Run("a line break or format character in a name cannot add a row or disguise it", func(t *testing.T) {
+		assert.Equal(t,
+			"db/orders-001   db/orders- 002\n",
+			nameGrid([]string{"db/orders-001", "db/orders-\n002"}),
+			"the line break collapses to one space, so the name stays on its row")
+		assert.Equal(t,
+			"db/orders-001  db/orders-002\n",
+			nameGrid([]string{"db/orders-001", "db/\u202eorders-002"}),
+			"the right-to-left override is removed, so the name reads as written")
+	})
+
+	t.Run("columns are measured in terminal cells", func(t *testing.T) {
+		var wide []string
+		for n := 1; n <= 9; n++ {
+			wide = append(wide, fmt.Sprintf("db/订单-%03d", n))
+		}
+		grid := nameGrid(wide)
+		assert.Equal(t,
+			"db/订单-001  db/订单-002  db/订单-003  db/订单-004  db/订单-005  db/订单-006\n"+
+				"db/订单-007  db/订单-008  db/订单-009\n",
+			grid,
+			"each ideograph takes two cells, so six 11-cell names fill the 80-cell row")
+
+		assert.Equal(t,
+			"db/cafe\u0301-01   db/cafe-002\n",
+			nameGrid([]string{"db/café-01", "db/cafe-002"}),
+			"a combining accent takes no cell, so the padding after it lines up the next column")
+	})
 }
 
 // A wide set of targets that raised several findings is named once, as its

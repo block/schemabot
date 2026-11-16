@@ -6,7 +6,8 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
-	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
@@ -2272,24 +2273,39 @@ func writeCollapsedNameGrid(sb *strings.Builder, indent, summary string, members
 // of long target names packs few, and a gap in a numbered or key-range
 // sequence shows as a break in the column. A name wider than the grid gets a
 // row of its own.
+//
+// Each name is flattened as inlineCode flattens it, so a line break or a
+// format character in a name the PR author chose cannot add a row or disguise
+// a name. Widths are terminal cells rather than runes, so a wide character
+// such as a CJK ideograph counts twice and a combining mark not at all, and
+// the columns stay aligned and within the grid.
 func nameGrid(names []string) string {
+	flat := make([]string, len(names))
+	widths := make([]int, len(names))
 	column := 0
-	for _, name := range names {
-		column = max(column, utf8.RuneCountInString(name))
+	for i, name := range names {
+		flat[i] = flattenIdentifier(name)
+		widths[i] = nameGridCells.StringWidth(flat[i])
+		column = max(column, widths[i])
 	}
 	perRow := max(1, (nameGridWidth+len(nameGridGap))/(column+len(nameGridGap)))
 	var sb strings.Builder
-	for i, name := range names {
-		last := i == len(names)-1 || (i+1)%perRow == 0
+	for i, name := range flat {
+		last := i == len(flat)-1 || (i+1)%perRow == 0
 		sb.WriteString(name)
 		if last {
 			sb.WriteString("\n")
 			continue
 		}
-		sb.WriteString(strings.Repeat(" ", column-utf8.RuneCountInString(name)) + nameGridGap)
+		sb.WriteString(strings.Repeat(" ", column-widths[i]) + nameGridGap)
 	}
 	return sb.String()
 }
+
+// nameGridCells measures names the same way on every server: characters whose
+// width depends on an East Asian locale count as one cell, whatever locale the
+// server runs in.
+var nameGridCells = &runewidth.Condition{EastAsianWidth: false}
 
 // BaseSchemaData describes how an environment's schema on the PR branch
 // compares to the PR's base branch.
