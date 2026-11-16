@@ -522,6 +522,33 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, 100, tables[0].Progress)
 		assert.Equal(t, 100, overall)
 	})
+
+	// Nothing says a shard in a status SchemaBot does not recognize has
+	// finished, so its table reads as running, never complete, and the shard
+	// keeps the status Vitess reported so an operator can see it.
+	t.Run("unknown shard status is not complete", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "complete"},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "postponed"},
+		}
+
+		tables, overall := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Running, tables[0].State)
+		assert.Equal(t, "postponed", tables[0].Shards[1].State)
+		assert.Equal(t, 0, overall)
+	})
+
+	t.Run("unknown shard status does not hide a failed shard", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "failed"},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "postponed"},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Failed, tables[0].State)
+	})
 }
 
 func TestParseProgressPercent(t *testing.T) {

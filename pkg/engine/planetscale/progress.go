@@ -65,7 +65,11 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		return nil, fmt.Errorf("get deploy request: %w", err)
 	}
 
-	engineState := deployStateToEngineState(dr.DeploymentState)
+	engineState, knownState := deployStateToEngineState(dr.DeploymentState)
+	if !knownState {
+		e.logger.Warn("unknown planetscale deploy request state; reporting the apply as running until planetscale reports a known state",
+			"database", req.Database, "deploy_request", dr.Number, "deployment_state", dr.DeploymentState)
+	}
 	message := deployStateToMessage(dr.DeploymentState)
 
 	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
@@ -656,6 +660,13 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 		return nil, 0, vitessMigrationRow{}, false
 	}
 
+	for _, r := range allRows {
+		if !state.IsKnownVitessState(r.Status) {
+			e.logger.Warn("unknown vitess schema change status; showing the table as running until vitess reports a known status",
+				"database", database, "keyspace", r.Keyspace, "shard", r.Shard, "table", r.Table, "vitess_status", r.Status)
+		}
+	}
+
 	tables, overallProgress := aggregateShardProgress(allRows)
 	failed, shardFailed := failedShard(allRows)
 	return tables, overallProgress, failed, shardFailed
@@ -670,7 +681,7 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 func failedShard(rows []vitessMigrationRow) (vitessMigrationRow, bool) {
 	failed := make([]vitessMigrationRow, 0, len(rows))
 	for _, r := range rows {
-		if r.Status == state.Vitess.Failed && strings.TrimSpace(r.Message) != "" {
+		if state.IsState(r.Status, state.Vitess.Failed) && strings.TrimSpace(r.Message) != "" {
 			failed = append(failed, r)
 		}
 	}
@@ -724,8 +735,7 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			colPtrs[i] = &colValues[i]
 		}
 		if err := rows.Scan(colPtrs...); err != nil {
-			e.logger.Debug("scan vitess_migrations row", "keyspace", keyspace, "error", err)
-			continue
+			return nil, fmt.Errorf("scan vitess_migrations row for keyspace %s: %w", keyspace, err)
 		}
 		colMap := make(map[string]string)
 		for i, col := range columns {
@@ -1074,6 +1084,9 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 //	queued            — at least one shard not started, none running or failed
 //	ready_to_complete — all shards done copying, waiting for cutover
 //	complete          — all shards finished (initial value)
+//
+// A status Vitess reports that SchemaBot does not recognize counts as running:
+// nothing says that shard is done, so the table must not read as complete.
 func resolveTableState(tableState, shardState string) string {
 	switch shardState {
 	case state.Vitess.Failed, state.Vitess.Cancelled:
@@ -1089,6 +1102,12 @@ func resolveTableState(tableState, shardState string) string {
 	case state.Vitess.ReadyToComplete:
 		if tableState == state.Vitess.Complete {
 			return state.Vitess.ReadyToComplete
+		}
+	case state.Vitess.Complete:
+		// A finished shard leaves the table state as the other shards set it.
+	default:
+		if tableState != state.Vitess.Failed {
+			return state.Vitess.Running
 		}
 	}
 	return tableState
