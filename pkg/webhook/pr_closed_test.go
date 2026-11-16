@@ -2,12 +2,17 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -81,6 +86,36 @@ func prClosedTestHandler(t *testing.T, st storage.Storage) *Handler {
 	}
 }
 
+// prClosedTestHandlerWithGitHub is prClosedTestHandler with a GitHub client
+// factory, for closes that read the PR's live state.
+func prClosedTestHandlerWithGitHub(t *testing.T, st storage.Storage, factory *fakeClientFactory) *Handler {
+	t.Helper()
+	service := api.New(st, &api.ServerConfig{}, nil, testLogger())
+	return NewHandler(service, factory, nil, testLogger())
+}
+
+// prClosedGitHub serves octocat/hello-world#1 with the given live state, or
+// the given HTTP error status when status is not zero. The returned counter
+// reports how many live PR reads cleanup issued.
+func prClosedGitHub(t *testing.T, prState string, status int) (*fakeClientFactory, *atomic.Int32) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	fetches := &atomic.Int32{}
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		fetches.Add(1)
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"number": 1,
+			"state":  prState,
+			"head":   map[string]any{"sha": "live-head-sha", "ref": "feature"},
+		}))
+	})
+	return &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")}, fetches
+}
+
 func prClosedLock(database string) *storage.Lock {
 	return &storage.Lock{
 		DatabaseName: database,
@@ -120,7 +155,9 @@ func TestPRClosedRetainsLockAndChecksForInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Empty(t, lockStore.released, "lock for a database with an in-flight apply must not be released on PR close")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while an apply is in flight")
@@ -144,7 +181,9 @@ func TestPRClosedReleasesOnlyLocksWithoutInFlightApply(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Equal(t, []string{"billing"}, lockStore.released, "only the lock without an in-flight apply is released")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must not be deleted while any apply is in flight")
@@ -166,7 +205,9 @@ func TestPRClosedCleansUpWhenAllAppliesTerminal(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	assert.Equal(t, []string{"orders", "billing"}, lockStore.released, "all locks are released when applies are terminal")
 	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted when applies are terminal")
@@ -188,9 +229,13 @@ func TestPRClosedCleansUpWhenPRHasNoApplies(t *testing.T) {
 		checks:  checkStore,
 	}
 
-	h := prClosedTestHandler(t, st)
-	assert.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, false))
+	factory, fetches := prClosedGitHub(t, "closed", 0)
+	h := prClosedTestHandlerWithGitHub(t, st, factory)
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
 
+	assert.Equal(t, int32(1), fetches.Load(), "an unmerged close reads the live PR once")
 	assert.Equal(t, []string{"orders"}, lockStore.released, "locks are released when the PR has no applies")
 	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted when the PR has no applies")
 	assert.Equal(t, []bool{false}, checkStore.deleteMerged, "the storage delete must run in unmerged mode for a close without merge")
@@ -210,9 +255,102 @@ func TestPRClosedSkipsCleanupWhenApplyLookupFails(t *testing.T) {
 	}
 
 	h := prClosedTestHandler(t, st)
-	assert.Error(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, true),
-		"a failed apply lookup must be returned so the durable driver retries")
+	_, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.Error(t, err, "a failed apply lookup must be returned so the durable driver retries")
 
 	assert.Empty(t, lockStore.released, "no lock is released when apply state is unknown")
 	assert.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when apply state is unknown")
+}
+
+// TestPRClosedCleanupSkipsMergedLiveRead verifies that a merged close never
+// reads GitHub: a merged PR cannot reopen, so the delivery's own state is
+// already final and the close costs no extra request.
+func TestPRClosedCleanupSkipsMergedLiveRead(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: checkStore}
+	factory, fetches := prClosedGitHub(t, "open", 0)
+
+	h := prClosedTestHandlerWithGitHub(t, st, factory)
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	assert.NoError(t, err)
+	assert.True(t, ran, "cleanup runs for a PR that is still closed")
+
+	assert.Equal(t, int32(0), fetches.Load(), "a merged close must not read the live PR")
+	assert.Equal(t, []string{"orders"}, lockStore.released, "a merged close releases the lock")
+	assert.Equal(t, 1, checkStore.deleteCalls, "a merged close deletes stored check state")
+}
+
+// TestPRClosedCleanupSkipsReopenedPR covers a close delivery that runs after
+// the PR was reopened: the operator holds a lock owned by repo#pr and plan-only
+// check state exists. The live PR is open, so cleanup releases nothing and
+// deletes nothing, and the delivery completes without error.
+func TestPRClosedCleanupSkipsReopenedPR(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: checkStore}
+	factory, fetches := prClosedGitHub(t, "open", 0)
+
+	h := prClosedTestHandlerWithGitHub(t, st, factory)
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	assert.NoError(t, err)
+	assert.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
+
+	assert.Equal(t, int32(1), fetches.Load(), "cleanup reads the live PR once")
+	assert.Empty(t, lockStore.released, "the lock taken after the reopen must stay held")
+	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive a close delivery for a reopened PR")
+}
+
+// TestPRClosedCleanupReadsLivePRPastCachedSnapshot covers a close delivery
+// whose context already carries a snapshot of the PR taken while it was
+// closed. The PR has reopened since, so cleanup must read GitHub instead of
+// trusting the snapshot, and it releases nothing and deletes nothing.
+func TestPRClosedCleanupReadsLivePRPastCachedSnapshot(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: checkStore}
+	factory, fetches := prClosedGitHub(t, "open", 0)
+	ctx := ghclient.WithPRInfo(t.Context(), "octocat/hello-world", 1, &ghclient.PullRequestInfo{State: "closed"})
+
+	h := prClosedTestHandlerWithGitHub(t, st, factory)
+	ran, err := h.runPRCloseCleanup(ctx, "octocat/hello-world", 1, 12345, false)
+	assert.NoError(t, err)
+	assert.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
+
+	assert.Equal(t, int32(1), fetches.Load(), "cleanup reads the live PR instead of the cached snapshot")
+	assert.Empty(t, lockStore.released, "the lock taken after the reopen must stay held")
+	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive a close delivery for a reopened PR")
+}
+
+// TestPRClosedCleanupFailsClosedWhenLivePRUnreadable covers a close delivery
+// whose live PR read fails, or reports no usable state: cleanup cannot tell
+// whether the PR reopened, so it returns an error for the durable driver to
+// retry and releases and deletes nothing.
+func TestPRClosedCleanupFailsClosedWhenLivePRUnreadable(t *testing.T) {
+	tests := []struct {
+		name           string
+		prState        string
+		status         int
+		installationID int64
+	}{
+		{name: "GitHub read fails", prState: "closed", status: http.StatusForbidden, installationID: 12345},
+		{name: "unrecognized state", prState: "", installationID: 12345},
+		{name: "no installation", prState: "closed", installationID: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+			checkStore := &prClosedCheckStore{}
+			st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: checkStore}
+			factory, _ := prClosedGitHub(t, tt.prState, tt.status)
+
+			h := prClosedTestHandlerWithGitHub(t, st, factory)
+			ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, tt.installationID, false)
+
+			assert.False(t, ran, "cleanup does not run on an unverifiable PR state")
+			assert.Error(t, err, "an unverifiable PR state must be returned so the durable driver retries")
+			assert.Empty(t, lockStore.released, "no lock is released when the live PR state is unknown")
+			assert.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when the live PR state is unknown")
+		})
+	}
 }

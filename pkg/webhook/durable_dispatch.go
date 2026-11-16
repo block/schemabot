@@ -775,8 +775,21 @@ func (h *Handler) processDurablePullRequestClosed(ctx context.Context, event *st
 	if repo == "" || pr == 0 {
 		return false, fmt.Errorf("durable pull_request closed delivery %s missing repo or PR", event.DeliveryID)
 	}
-	if err := h.runPRCloseCleanup(ctx, repo, pr, payload.PullRequest.Merged); err != nil {
+	// The installation is needed only for the live-state read an unmerged
+	// close makes; a merged close never reads GitHub, so an unresolvable
+	// installation is terminal only when that read is needed.
+	installationID, err := durableInstallationID(event)
+	if err != nil && !payload.PullRequest.Merged {
+		return false, err
+	}
+	ran, err := h.runPRCloseCleanup(ctx, repo, pr, installationID, payload.PullRequest.Merged)
+	if err != nil {
 		return true, fmt.Errorf("pr close cleanup for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, err)
+	}
+	if !ran {
+		h.logger.Info("durable pull_request close delivery completed without cleanup because the PR is open again",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr)
+		return false, nil
 	}
 	h.logger.Info("durable pull_request close cleanup completed",
 		"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "merged", payload.PullRequest.Merged)
