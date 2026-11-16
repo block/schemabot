@@ -138,7 +138,8 @@ func (w *psClientWrapper) listingTimeout() time.Duration {
 // PR comment, so Error() is written for that surface: it names the request, the
 // status, and the API's own refusal when there is one. Path is the endpoint
 // without the base URL, so the message says what was called without naming where
-// it lives, and Body keeps the whole response for the server log.
+// it lives, and Body keeps the response for the server log, up to
+// maxAPIErrorBodyBytes.
 type APIError struct {
 	Method     string
 	Path       string
@@ -543,11 +544,11 @@ func (w *psClientWrapper) doRawJSON(ctx context.Context, method, path string, bo
 		return nil, rawRequestError("send", method, endpoint, err)
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read %s %s response: %w", method, endpoint, err)
-	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		respBody, truncated, err := readBounded(resp.Body, maxAPIErrorBodyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("read %s %s response (status %d): %w", method, endpoint, resp.StatusCode, err)
+		}
 		// The body is logged rather than returned: it is what explains a refusal,
 		// and this is the only place it is still in hand.
 		slog.Error("PlanetScale API request failed",
@@ -555,10 +556,49 @@ func (w *psClientWrapper) doRawJSON(ctx context.Context, method, path string, bo
 			"path", endpoint,
 			"status_code", resp.StatusCode,
 			"response_body", string(respBody),
+			"response_body_truncated", truncated,
 		)
 		return nil, &APIError{Method: method, Path: endpoint, StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
+	respBody, truncated, err := readBounded(resp.Body, maxRawResponseBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read %s %s response: %w", method, endpoint, err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("read %s %s response: %w", method, endpoint, ErrResponseTooLarge)
+	}
 	return respBody, nil
+}
+
+// maxRawResponseBytes bounds how much of a successful raw response is read.
+// Every raw endpoint answers with a single small JSON document, so a body this
+// large is not one SchemaBot can use, and reading it whole would only hold an
+// unbounded amount of memory for the request's lifetime.
+const maxRawResponseBytes = 8 << 20
+
+// maxAPIErrorBodyBytes bounds how much of a failed response is read, logged,
+// and kept on APIError. The API's own refusal is a short JSON document well
+// inside it; anything longer is a proxy page or an upstream dump, and its start
+// is enough for triage.
+const maxAPIErrorBodyBytes = 8 << 10
+
+// ErrResponseTooLarge is returned when a successful raw response is larger
+// than maxRawResponseBytes. The response is refused rather than cut short,
+// because a truncated JSON document would only fail to decode later with a
+// less useful error.
+var ErrResponseTooLarge = errors.New("PlanetScale API response is larger than SchemaBot reads")
+
+// readBounded reads at most limit bytes of body and reports whether the body
+// held more than that.
+func readBounded(body io.Reader, limit int64) ([]byte, bool, error) {
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(data)) > limit {
+		return data[:limit], true, nil
+	}
+	return data, false, nil
 }
 
 // rawRequestError wraps a raw request that could not be built or could not be

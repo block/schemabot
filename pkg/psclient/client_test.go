@@ -253,9 +253,50 @@ func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
 			var apiErr *APIError
 			require.ErrorAs(t, err, &apiErr)
 			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
-			assert.Equal(t, tc.body, apiErr.Body, "the whole response stays on the error for the server log")
+			assert.Equal(t, tc.body, apiErr.Body, "a short response stays on the error whole for the server log")
 		})
 	}
+}
+
+// A failed call reads only the start of its response: a proxy that answers
+// with megabytes of HTML still produces a typed APIError with the status, and
+// only its first maxAPIErrorBodyBytes are kept for the server log.
+func TestRawRequestFailureKeepsOnlyTheStartOfALargeBody(t *testing.T) {
+	body := strings.Repeat("<p>gateway</p>", maxAPIErrorBodyBytes)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+	assert.Equal(t, body[:maxAPIErrorBodyBytes], apiErr.Body)
+}
+
+// A successful response larger than any raw endpoint sends is refused with a
+// typed error naming the endpoint, rather than read whole into memory or cut
+// short into JSON that fails to decode.
+func TestRawRequestRefusesAnOversizedResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"number":132,"padding":"`))
+		_, _ = w.Write([]byte(strings.Repeat("x", maxRawResponseBytes)))
+		_, _ = w.Write([]byte(`"}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+	require.ErrorIs(t, err, ErrResponseTooLarge)
+	assert.Contains(t, err.Error(), "GET /v1/organizations/block/databases/orders/deploy-requests/132")
+	assert.NotContains(t, err.Error(), srv.URL)
 }
 
 // A plan decides that a branch has no keyspace by a given name only on the
