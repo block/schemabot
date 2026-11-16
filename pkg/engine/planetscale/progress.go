@@ -996,7 +996,7 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 			// briefly renders as ready for cutover until Vitess recomputes the flag once
 			// the copy restarts. This affects display only — apply state comes from the
 			// deploy request.
-			shardState := state.EffectiveVitessState(sh.status, sh.readyToComplete)
+			shardState := effectiveShardState(sh.status, sh.readyToComplete)
 
 			shardPct := min(sh.progress, 100)
 			shardCopied := sh.rowsCopied
@@ -1073,6 +1073,18 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 	}
 
 	return tables, overallProgress
+}
+
+// effectiveShardState resolves the state a shard is shown in. A status
+// SchemaBot recognizes is resolved with the ready_to_complete flag. A status it
+// does not recognize is kept as Vitess reported it, even with the flag set:
+// the flag says the copy has finished, and nothing says what the unrecognized
+// status means for the cutover.
+func effectiveShardState(status string, readyToComplete bool) string {
+	if !state.IsKnownVitessState(status) {
+		return state.EffectiveVitessState(status, false)
+	}
+	return state.EffectiveVitessState(status, readyToComplete)
 }
 
 // resolveTableState merges a shard's state into the current table state.
