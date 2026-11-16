@@ -4754,22 +4754,22 @@ databases:
 	for _, tt := range []struct {
 		name             string
 		instance, orders string
-		wantOrders       Reapproval
-		wantPayments     Reapproval
+		wantOrders       bool
+		wantPayments     bool
 	}{
-		{"unset everywhere follows the base branch", "", ordersUnset, ReapprovalFollowsBaseBranch, ReapprovalFollowsBaseBranch},
-		{"instance true covers every database", instanceTrue, ordersUnset, ReapprovalRequired, ReapprovalRequired},
-		{"instance false covers every database", instanceFalse, ordersUnset, ReapprovalNotRequired, ReapprovalNotRequired},
-		{"a database can require it alone", "", ordersTrue, ReapprovalRequired, ReapprovalFollowsBaseBranch},
-		{"a database can opt out alone", "", ordersFalse, ReapprovalNotRequired, ReapprovalFollowsBaseBranch},
-		{"a database can require it when the instance opts out", instanceFalse, ordersTrue, ReapprovalRequired, ReapprovalNotRequired},
-		{"a database can opt out when the instance requires it", instanceTrue, ordersFalse, ReapprovalNotRequired, ReapprovalRequired},
+		{"unset everywhere does not require it", "", ordersUnset, false, false},
+		{"instance true covers every database", instanceTrue, ordersUnset, true, true},
+		{"instance false covers every database", instanceFalse, ordersUnset, false, false},
+		{"a database can require it alone", "", ordersTrue, true, false},
+		{"a database can set false alone", "", ordersFalse, false, false},
+		{"a database can require it when the instance does not", instanceFalse, ordersTrue, true, false},
+		{"a database can opt out when the instance requires it", instanceTrue, ordersFalse, false, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg, err := loadConfig(t, config(tt.instance, tt.orders))
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantOrders, cfg.ReviewPolicyReapprovalForDatabase("orders"))
-			assert.Equal(t, tt.wantPayments, cfg.ReviewPolicyReapprovalForDatabase("payments"))
+			assert.Equal(t, tt.wantOrders, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+			assert.Equal(t, tt.wantPayments, cfg.ReviewPolicyRequiresReapprovalForDatabase("payments"))
 		})
 	}
 
@@ -4789,7 +4789,7 @@ databases:
 `)
 		require.NoError(t, err)
 		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
-		assert.Equal(t, ReapprovalNotRequired, cfg.ReviewPolicyReapprovalForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
 	})
 
 	for _, value := range []string{"true", "false"} {

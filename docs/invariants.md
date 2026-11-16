@@ -2064,9 +2064,9 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
 their own review requirement. An approval that the reviewer withdrew or that the repository
-dismissed does not count. An approval counts only for the schema change it reviewed, unless the
-change's target branch dismisses stale approvals itself or the review policy turns re-approval
-off: it was given on the commit being applied, or on an earlier commit at which the change's own
+dismissed does not count. By default an authorized approval counts on whichever commit of the
+change it was given. Where the review policy requires re-approval, an approval counts only for the
+schema change it reviewed: it was given on the commit being applied, or on an earlier commit at which the change's own
 effect on every schema input is provably the same, or the change has stopped touching an input that newer default
 branch content has changed since, so any difference between the two came from newer content on the
 repository's default branch; when that cannot be proved, the approval does not count. A change
@@ -2080,9 +2080,7 @@ generates no statement the approval did not cover: with `SameTableChange`
 (`pkg/ddl/table_change.go`) for MySQL-family table files, `SameVSchemaChange`
 (`pkg/ddl/vschema_change.go`) for a Vitess keyspace's VSchema, and on the environment's primary
 target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for PostgreSQL
-files. Whether the target branch dismisses stale approvals is read by
-`BaseBranchDismissesStaleApprovals` (`pkg/github/branch_rules.go`); when it cannot be read, the
-gate compares.
+files.
 
 ### AZ-5: Commands never guess
 

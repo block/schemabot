@@ -1367,13 +1367,10 @@ type ReviewPolicyConfig struct {
 	// RequireReapproval decides whether an approval on an earlier commit
 	// still counts after the PR's schema change differs from the one it
 	// reviewed. True makes SchemaBot compare the commits and require a new
-	// approval when they differ. False keeps every authorized approval
-	// counting until the reviewer withdraws it or GitHub dismisses it. Unset,
-	// the default, follows the PR's base branch: when its rules dismiss stale
-	// approvals on push, GitHub has already removed every stale approval, so
-	// SchemaBot does not compare; otherwise, or when SchemaBot cannot read
-	// those rules, it compares as if true. A database's own
-	// review_policy.require_reapproval overrides it.
+	// approval when they differ. False or unset, the default, keeps every
+	// authorized approval counting until the reviewer withdraws it or GitHub
+	// dismisses it. A database's own review_policy.require_reapproval
+	// overrides it.
 	RequireReapproval *bool `yaml:"require_reapproval,omitempty"`
 }
 

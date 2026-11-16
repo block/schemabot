@@ -61,54 +61,20 @@ func (c *ServerConfig) ReviewPolicyEnabledForDatabase(database string) bool {
 	return dbConfig != nil && dbConfig.ReviewPolicy.Enabled
 }
 
-// Reapproval is the re-approval rule the review gate applies to an approval
-// given on an earlier commit than the one being applied.
-type Reapproval int
-
-const (
-	// ReapprovalFollowsBaseBranch compares the commits unless the PR's base
-	// branch rules dismiss stale approvals on push. It is the default.
-	ReapprovalFollowsBaseBranch Reapproval = iota
-	// ReapprovalRequired always compares the commits: the approval counts
-	// only while the PR's schema change is the one it reviewed.
-	ReapprovalRequired
-	// ReapprovalNotRequired never compares the commits: an authorized
-	// approval counts until the reviewer withdraws it or GitHub dismisses it.
-	ReapprovalNotRequired
-)
-
-func (r Reapproval) String() string {
-	switch r {
-	case ReapprovalRequired:
-		return "required"
-	case ReapprovalNotRequired:
-		return "not_required"
-	default:
-		return "follows_base_branch"
-	}
-}
-
-// ReviewPolicyReapprovalForDatabase returns the re-approval rule for
-// database: its own review_policy.require_reapproval when set, otherwise the
-// instance-wide one, otherwise ReapprovalFollowsBaseBranch.
-func (c *ServerConfig) ReviewPolicyReapprovalForDatabase(database string) Reapproval {
+// ReviewPolicyRequiresReapprovalForDatabase returns whether an approval on
+// an earlier commit counts for database only while the PR's schema change is
+// the one it reviewed: the database's own review_policy.require_reapproval
+// when set, otherwise the instance-wide one. Unset in both, it is false, and
+// an authorized approval counts until the reviewer withdraws it or GitHub
+// dismisses it.
+func (c *ServerConfig) ReviewPolicyRequiresReapprovalForDatabase(database string) bool {
 	if c == nil {
-		return ReapprovalFollowsBaseBranch
+		return false
 	}
 	if dbConfig := c.Database(database); dbConfig != nil && dbConfig.ReviewPolicy.RequireReapproval != nil {
-		return reapprovalFromSetting(*dbConfig.ReviewPolicy.RequireReapproval)
+		return *dbConfig.ReviewPolicy.RequireReapproval
 	}
-	if c.ReviewPolicy.RequireReapproval != nil {
-		return reapprovalFromSetting(*c.ReviewPolicy.RequireReapproval)
-	}
-	return ReapprovalFollowsBaseBranch
-}
-
-func reapprovalFromSetting(require bool) Reapproval {
-	if require {
-		return ReapprovalRequired
-	}
-	return ReapprovalNotRequired
+	return c.ReviewPolicy.RequireReapproval != nil && *c.ReviewPolicy.RequireReapproval
 }
 
 // ReviewPolicyIncludesDatabaseOperators returns whether database-scoped
