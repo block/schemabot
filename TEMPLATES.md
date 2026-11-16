@@ -2580,7 +2580,8 @@ schemabot apply -e production
 
 ### 2 of 3 targets
 
-`us/testapp_1`, `us/testapp_2`
+- `us/testapp_1`
+- `us/testapp_2`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -10296,7 +10297,11 @@ schemabot apply -e production
 <details>
 <summary><b>all 32 shards</b></summary>
 
-`-08`, `08-10`, `10-18`, `18-20`, `20-28`, `28-30`, `30-38`, `38-40`, `40-48`, `48-50`, `50-58`, `58-60`, `60-68`, `68-70`, `70-78`, `78-80`, `80-88`, `88-90`, `90-98`, `98-a0`, `a0-a8`, `a8-b0`, `b0-b8`, `b8-c0`, `c0-c8`, `c8-d0`, `d0-d8`, `d8-e0`, `e0-e8`, `e8-f0`, `f0-f8`, `f8-`
+```
+-08    08-10  10-18  18-20  20-28  28-30  30-38  38-40  40-48  48-50  50-58
+58-60  60-68  68-70  70-78  78-80  80-88  88-90  90-98  98-a0  a0-a8  a8-b0
+b0-b8  b8-c0  c0-c8  c8-d0  d0-d8  d8-e0  e0-e8  e8-f0  f0-f8  f8-
+```
 
 </details>
 

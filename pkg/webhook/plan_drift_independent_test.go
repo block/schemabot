@@ -220,7 +220,7 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 	})
 	rest, primary, found := strings.Cut(body, "### Target `commerce/orders-001`")
 	require.True(t, found, "the primary renders under its own heading")
-	assert.Contains(t, rest, "### 2 of 3 targets\n\n`commerce/orders-002`, `commerce/orders-003`", "the larger group leads")
+	assert.Contains(t, rest, "### 2 of 3 targets\n\n- `commerce/orders-002`\n- `commerce/orders-003`", "the larger group leads")
 	assert.True(t, strings.Contains(primary, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_reviewed`."),
 		"the primary's cut DDL names the primary target's plan")
 	assert.False(t, strings.Contains(body, "plan_orders_001"), "the primary's own entry identifier is never named")
@@ -387,9 +387,51 @@ func TestReviewDriftComment_LintSortsByTableAndCollapsesWideTargetLists(t *testi
 		"- `docks`: "+shared+"\n"+
 		"- `riders` on 9 of 10 targets: "+ui.CodeQuoteIdentifiers(drift)+"\n"+
 		"  <details>\n  <summary>Target names</summary>\n\n"+
-		"  `commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`, `commerce/orders-004`, `commerce/orders-005`, "+
-		"`commerce/orders-006`, `commerce/orders-007`, `commerce/orders-008`, `commerce/orders-009`\n\n  </details>\n",
-		"findings sort by table, and a wide target list collapses under its coverage")
+		"  ```\n"+
+		"  commerce/orders-001  commerce/orders-002  commerce/orders-003\n"+
+		"  commerce/orders-004  commerce/orders-005  commerce/orders-006\n"+
+		"  commerce/orders-007  commerce/orders-008  commerce/orders-009\n"+
+		"  ```\n\n  </details>\n",
+		"findings sort by table, and a wide target list collapses under its coverage as a grid")
+}
+
+// Several findings raised by the same targets name those targets once, above
+// the findings, rather than repeating the list on every line. This is the
+// shape of a rollout where some targets already hold tables the others are
+// about to create: every finding the existing tables raise comes from the
+// same few targets. A finding every target raised still names none, and a
+// finding alone in its set of targets keeps them on its own line, ahead of
+// the shared sets so it never reads as one of a heading's findings.
+func TestReviewDriftComment_LintNamesSharedTargetsOnce(t *testing.T) {
+	const shared = "table `docks` has no primary key"
+	const created = "Column `created_at` uses `TIMESTAMP`"
+	const updated = "Column `updated_at` uses `TIMESTAMP`"
+	const counter = "AUTO_INCREMENT value is above 85% of the column's capacity"
+	var diffs []api.DeploymentPlanDiff
+	for n := 1; n <= 4; n++ {
+		d := independentMemberDiff(fmt.Sprintf("orders-%03d", n), "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false)
+		d.LintViolations = append(d.LintViolations, memberLint("docks", shared, "warning"))
+		if n <= 2 {
+			d.LintViolations = append(d.LintViolations, memberLint("bikes", created, "warning"), memberLint("bikes", updated, "warning"))
+		}
+		if n == 4 {
+			d.LintViolations = append(d.LintViolations, memberLint("trips", counter, "warning"))
+		}
+		diffs = append(diffs, d)
+	}
+
+	body := renderLintComment(t, diffs...)
+
+	assert.Contains(t, body, "💡 **Lint Warnings**: 4 advisory findings\n"+
+		"- `docks`: "+shared+"\n"+
+		"- `trips` on target `commerce/orders-004`: "+counter+"\n"+
+		"\n"+
+		"On targets `commerce/orders-001`, `commerce/orders-002`:\n"+
+		"- `bikes`: "+created+"\n"+
+		"- `bikes`: "+updated+"\n\n",
+		"findings that name their own targets come first, then each set of shared targets is named once above its findings")
+	assert.Equal(t, 1, strings.Count(body, "`commerce/orders-001`"), "the targets the findings share are named once")
+	assertLintFollowsTargetPlans(t, body)
 }
 
 // assertLintFollowsTargetPlans asserts the plan carries one lint section, after
