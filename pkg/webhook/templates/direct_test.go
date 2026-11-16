@@ -28,7 +28,7 @@ func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 	plan := RenderPlanComment(data)
 	assert.Contains(t, plan, "⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit")
 	assert.Contains(t, plan, "`users`: the table has \\~1,240 rows")
-	assert.Contains(t, plan, "Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.\n")
+	assert.Contains(t, plan, "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again ([how](https://github.com/block/schemabot/blob/main/docs/direct-execution.md)). It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end: the apply fails as busy instead. Writes to each table are blocked until its statement finishes.\n")
 	assert.NotContains(t, plan, "Confirming the apply", "the policy approves a direct change, so the disclosure asks for no confirmation")
 	assert.NotContains(t, plan, "revertible", "a MySQL direct change is undone like any other MySQL change, so no revert warning is shown")
 	assert.NotContains(t, plan, "--defer-cutover", "a plan with no --defer-cutover apply behind it does not mention the flag")
@@ -36,7 +36,7 @@ func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 	data.IsLocked = true
 	apply := RenderPlanComment(data)
 	assert.Contains(t, apply, "⚙️ **Direct execution**", "the locked apply comment keeps the direct disclosure")
-	assert.Contains(t, apply, "Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.\n")
+	assert.Contains(t, apply, "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again ([how](https://github.com/block/schemabot/blob/main/docs/direct-execution.md)). It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end: the apply fails as busy instead. Writes to each table are blocked until its statement finishes.\n")
 	assert.NotContains(t, apply, "--defer-cutover")
 }
 
@@ -59,7 +59,7 @@ func TestRenderPlanComment_DirectNotesDeferCutoverOnlyWhenPassed(t *testing.T) {
 	}
 
 	apply := RenderPlanComment(data)
-	assert.Contains(t, apply, "Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer.\n")
+	assert.Contains(t, apply, "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again ([how](https://github.com/block/schemabot/blob/main/docs/direct-execution.md)). It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end: the apply fails as busy instead. Writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer.\n")
 }
 
 // A paused --defer-cutover apply whose every change runs as direct execution
@@ -165,8 +165,8 @@ func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
 func TestDirectDisclosureCopy_KeyedByDatabaseType(t *testing.T) {
 	mysqlHeader, mysqlConsequence := directDisclosureCopy("mysql", true)
 	assert.Equal(t, "native MySQL DDL, not through Spirit", mysqlHeader)
-	assert.Equal(t, "Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.", mysqlConsequence,
-		"MySQL direct statements kill the transactions blocking them, so the disclosure says so")
+	assert.Equal(t, "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again ([how](https://github.com/block/schemabot/blob/main/docs/direct-execution.md)). It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end: the apply fails as busy instead. Writes to each table are blocked until its statement finishes.", mysqlConsequence,
+		"MySQL direct statements kill the transactions blocking them within limits, so the disclosure says so and names the blockers it spares")
 
 	strataHeader, strataConsequence := directDisclosureCopy("strata", false)
 	assert.Equal(t, mysqlHeader, strataHeader, "Strata shards run the same native MySQL DDL")
