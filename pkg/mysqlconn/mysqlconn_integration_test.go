@@ -86,7 +86,7 @@ func TestOpenReadsTinyInt1AsNumber(t *testing.T) {
 
 // SchemaBot's own tinyint(1) columns hold 0 or 1 and are scanned into a Go
 // bool, which keeps working because database/sql converts the number back. A
-// value no bool can represent now fails the scan instead of reading as true,
+// value no bool can represent fails the scan instead of reading as true,
 // so a column that has been corrupted is reported rather than guessed at.
 func TestOpenScansBooleanColumnsIntoBool(t *testing.T) {
 	ctx := t.Context()
