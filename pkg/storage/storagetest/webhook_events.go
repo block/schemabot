@@ -769,9 +769,11 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "repository, pull request, and head SHA are required", "missing head SHA must be rejected")
 	})
 
-	// A terminally failed row's coverage depends on its origin: a failed
-	// organic delivery still covers its head because the operator's GitHub
-	// Redeliver lever exists for it, while a failed synthesized row must not
+	// A terminally failed row's coverage depends on its origin: a freshly
+	// failed organic delivery covers its head because the operator's GitHub
+	// Redeliver lever exists for it (the dialect suites age the row past
+	// WebhookEventFailedCoverageCoolOff, after which it stops covering),
+	// while a failed synthesized row must not
 	// cover, because there is no Redeliver lever for a synthesized GUID and
 	// re-synthesis is the only recovery path. A dead-lettered row covers
 	// regardless of origin: the driver proved the head can never succeed. A
@@ -793,7 +795,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		createEvent(t, store, organic)
 		claimed := claimExpecting(t, store, "delivery-failed-organic")
 		require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "boom", nil))
-		assert.True(t, coversHead("head-organic"), "a failed organic delivery covers: Redeliver exists for it")
+		assert.True(t, coversHead("head-organic"), "a freshly failed organic delivery covers during the cool-off: Redeliver exists for it")
 
 		synthesized := newPullRequestEvent(storage.SynthesizedWebhookDeliveryIDPrefix+"delivery-failed-synth", "synchronize", 7, "head-synth", time.Time{})
 		createEvent(t, store, synthesized)

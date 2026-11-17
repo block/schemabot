@@ -22,7 +22,10 @@
 //     dispatcher plans through the ordinary auto-plan flow; otherwise the scan
 //     is report-only. A dead-lettered head (failed_permanent) is not a miss —
 //     HasEventForHead reports it covered — so synthesis cannot resurrect a
-//     delivery the driver proved can never succeed for that head.
+//     delivery the driver proved can never succeed for that head. An organic
+//     delivery that exhausted its transient retries (failed) covers its head
+//     only for storage.WebhookEventFailedCoverageCoolOff, so a PR whose plan
+//     delivery kept failing is re-planned without anyone redelivering it.
 //
 // The missing-delivery scan pages each repository's updated-descending open
 // PR listing under a per-pass page budget, in two phases. A fresh-window walk
@@ -350,8 +353,9 @@ func (h *Handler) startWebhookReconciler(ctx context.Context, stop <-chan struct
 // publisher left undelivered, an active stuck-processing sweep that
 // terminalizes inbox rows wedged past the attempt cap, then a missing-delivery
 // scan over registered repositories. The
-// scan reports every open PR head with no inbox delivery and, when synthesis
-// is enabled, recovers each miss by enqueueing a synthesized inbox row.
+// scan reports every open PR head that no inbox delivery covers and, when
+// synthesis is enabled, recovers each miss by enqueueing a synthesized inbox
+// row.
 func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 	// Terminal outcomes are repaired from apply and check state, not from the
 	// inbox or the repo registry, so they run before either gate below. The
@@ -447,8 +451,8 @@ func (h *Handler) terminateStuckWebhookEvents(ctx context.Context, store storage
 }
 
 // reconcileRepoWebhookInbox scans one repository's recently updated open PRs
-// for heads with no inbox delivery, synthesizing a recovery row per miss when
-// synthesis is enabled and reporting otherwise. Returns how many PRs were
+// for heads that no inbox delivery covers, synthesizing a recovery row per
+// miss when synthesis is enabled and reporting otherwise. Returns how many PRs were
 // checked, how many were missing rows, and how many recovery rows were
 // enqueued.
 func (h *Handler) reconcileRepoWebhookInbox(ctx context.Context, store storage.WebhookEventStore, repo string) (scanned, missing, synthesized int) {
@@ -720,11 +724,11 @@ func (h *Handler) examineOpenPRHead(ctx context.Context, store storage.WebhookEv
 		// pass until synthesis is enabled or an organic delivery
 		// arrives, so the per-head line is info; the metric and the
 		// per-pass summary carry the operator signal.
-		h.logger.Info("webhook reconciler found open PR head with no inbox delivery (report-only; synthesis disabled)",
+		h.logger.Info("webhook reconciler found open PR head that no inbox delivery covers (report-only; synthesis disabled)",
 			"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
 		return 1, 1, 0
 	}
-	h.logger.Warn("webhook reconciler found open PR head with no inbox delivery; synthesizing recovery delivery",
+	h.logger.Warn("webhook reconciler found open PR head that no inbox delivery covers; synthesizing recovery delivery",
 		"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
 	inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(ctx, repo, pr.Number, pr.HeadSHA, installationID)
 	if err != nil {

@@ -457,10 +457,11 @@ type WebhookEventStore interface {
 	// SHA. The reconciliation loop uses it to detect open PR heads whose
 	// auto-plan delivery never reached the inbox. Rows of other event types
 	// or actions can carry the same PR + head SHA without planning it, so
-	// they do not cover the head. A terminally failed row covers its head
-	// when it is organic (the operator's GitHub Redeliver lever exists for
-	// it), but not when it is a plain failed synthesized row
-	// (SynthesizedWebhookDeliveryIDPrefix) — there is no Redeliver lever for
+	// they do not cover the head. A plain failed organic row covers its head
+	// for WebhookEventFailedCoverageCoolOff after it failed (the window for
+	// the operator's GitHub Redeliver lever), after which the reconciler
+	// re-plans the head. A plain failed synthesized row
+	// (SynthesizedWebhookDeliveryIDPrefix) never covers — there is no Redeliver lever for
 	// a synthesized GUID, so the reconciler must be able to synthesize a
 	// fresh recovery delivery that reopens it through Create's
 	// duplicate-GUID branch. A permanently failed (dead-lettered) row covers
