@@ -17,25 +17,12 @@ const mysqlDriverName = "block-mysql"
 // names none — the shape of databaseBackend.mysqlDSNBase — or "" to keep
 // whatever the DSN already names.
 //
-// Every DSN comes from here so that no pool maps a signed TINYINT(1) column to
-// a Go bool, which the driver does by default. The (1) is a display width
-// rather than a range: the column legally holds -128..127, so the mapping
-// answers true for every non-zero value and the stored number is gone before
-// the caller sees it. LocalScale reads columns whose types it knows nothing
-// about on two paths — the admin query endpoints scan every column into a
-// sql.NullString, and the branch proxy scans into an any before forwarding the
-// value on the wire — so neither can recognize a bool that should have been a
-// number. Disabling the mapping is what keeps a stored 2 a 2 on both.
-//
 // LocalScale is local test and dev infrastructure and deliberately does not
 // route through pkg/mysqlconn, whose RDS transport settings it has no use for.
 func mysqlDSN(dsn, database string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", fmt.Errorf("parse MySQL DSN: %w", err)
-	}
-	if err := cfg.Apply(mysql.TinyInt1IsBool(false)); err != nil {
-		return "", fmt.Errorf("disable TINYINT(1) bool mapping: %w", err)
 	}
 	if database != "" {
 		cfg.DBName = database

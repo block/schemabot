@@ -349,6 +349,13 @@ type RolloutChild struct {
 //     failure once the continue/released rollout has settled);
 //   - else → running_degraded (siblings still holding their targets).
 //
+// Pending means none of the rollout's work has started. Once any child is past
+// pending, the parent is Running even while no child happens to be mid-copy,
+// so it never reads pending in the gap between one child finishing and the next
+// being claimed. A child's own projection keeps pending for its queued rows:
+// a target that finished one table and waits its turn on the next is waiting,
+// not running.
+//
 // An empty child set returns Pending, matching DeriveApplyState.
 func DeriveRolloutApplyState(children []RolloutChild) string {
 	if len(children) == 0 {
@@ -365,6 +372,9 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 	}
 	if IsState(base, Apply.Stopped) {
 		return deriveStoppedRollout(children)
+	}
+	if IsState(base, Apply.Pending) && rolloutWorkHasStarted(children) {
+		return Apply.Running
 	}
 	if !IsState(base, Apply.Failed) {
 		return base
@@ -428,6 +438,16 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		return Apply.Failed
 	}
 	return Apply.RunningDegraded
+}
+
+// rolloutWorkHasStarted reports whether any child is past pending.
+func rolloutWorkHasStarted(children []RolloutChild) bool {
+	for _, c := range children {
+		if !IsState(normalizeApplyState(c.State), Apply.Pending) {
+			return true
+		}
+	}
+	return false
 }
 
 // deriveCancelledRollout projects a rollout in which at least one child was
