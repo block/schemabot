@@ -335,6 +335,15 @@ production plans `app_production`.
   symlink to a file, such as one documentation file linking another, is not a
   schema input unless it sits directly in a config directory, where an
   environment's schema root is named.
+- SchemaBot learns which changed files are symlinks from the pull request's
+  diff. When GitHub will not produce the diff, because the pull request
+  changes too many files or lines, or a file is renamed without changes, and
+  the repository is also too large for GitHub to list in one request, the
+  files that listing leaves out are read only inside the databases'
+  `allowed_dirs`. Without `allowed_dirs` on every database the repository
+  serves, SchemaBot treats them as regular files, logs a warning, and counts
+  them in `schemabot.github.symlink_modes_unread_total`, so a symlink change
+  among them is not planned.
 
 ## Ignoring Namespaces
 

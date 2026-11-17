@@ -1574,33 +1574,31 @@ func RecordSchemaRequestError(ctx context.Context, repo, command, database, envi
 const (
 	gitHubMetricValueUnknown = "unknown"
 
-	GitHubOperationAddCommentReaction             = "add_comment_reaction"
-	GitHubOperationCreateCheckRun                 = "create_check_run"
-	GitHubOperationCreateIssueComment             = "create_issue_comment"
-	GitHubOperationCreateInstallationAccessToken  = "create_installation_access_token"
-	GitHubOperationDeleteIssueComment             = "delete_issue_comment"
-	GitHubOperationEditIssueComment               = "edit_issue_comment"
-	GitHubOperationFetchAppSlug                   = "fetch_app_slug"
-	GitHubOperationFetchBlob                      = "fetch_blob"
-	GitHubOperationFetchDiff                      = "fetch_diff"
-	GitHubOperationFetchFileContent               = "fetch_file_content"
-	GitHubOperationFetchGitTree                   = "fetch_git_tree"
-	GitHubOperationFetchPullRequest               = "fetch_pull_request"
-	GitHubOperationGetBranchRules                 = "get_branch_rules"
-	GitHubOperationGetCombinedStatus              = "get_combined_status"
-	GitHubOperationGetPullRequestReviewProtection = "get_pull_request_review_protection"
-	GitHubOperationGetTeam                        = "get_team"
-	GitHubOperationGetTeamMembership              = "get_team_membership"
-	GitHubOperationGraphQLMinimizeComment         = "graphql_minimize_comment"
-	GitHubOperationGraphQLStatusCheckRollup       = "graphql_status_check_rollup"
-	GitHubOperationGraphQLTreeEntries             = "graphql_tree_entries"
-	GitHubOperationListCheckRunsForRef            = "list_check_runs_for_ref"
-	GitHubOperationListPRFiles                    = "list_pr_files"
-	GitHubOperationListReviews                    = "list_reviews"
-	GitHubOperationListTeamMembers                = "list_team_members"
-	GitHubOperationRequestReviewers               = "request_reviewers"
-	GitHubOperationUnknown                        = gitHubMetricValueUnknown
-	GitHubOperationUpdateCheckRun                 = "update_check_run"
+	GitHubOperationAddCommentReaction            = "add_comment_reaction"
+	GitHubOperationCreateCheckRun                = "create_check_run"
+	GitHubOperationCreateIssueComment            = "create_issue_comment"
+	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
+	GitHubOperationEditIssueComment              = "edit_issue_comment"
+	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
+	GitHubOperationFetchBlob                     = "fetch_blob"
+	GitHubOperationFetchDiff                     = "fetch_diff"
+	GitHubOperationFetchFileContent              = "fetch_file_content"
+	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchPullRequest              = "fetch_pull_request"
+	GitHubOperationGetCombinedStatus             = "get_combined_status"
+	GitHubOperationGetTeam                       = "get_team"
+	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
+	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
+	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
+	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
+	GitHubOperationListPRFiles                   = "list_pr_files"
+	GitHubOperationListReviews                   = "list_reviews"
+	GitHubOperationListTeamMembers               = "list_team_members"
+	GitHubOperationRequestReviewers              = "request_reviewers"
+	GitHubOperationUnknown                       = gitHubMetricValueUnknown
+	GitHubOperationUpdateCheckRun                = "update_check_run"
 )
 
 const (
@@ -1792,9 +1790,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
 		GitHubOperationFetchPullRequest,
-		GitHubOperationGetBranchRules,
 		GitHubOperationGetCombinedStatus,
-		GitHubOperationGetPullRequestReviewProtection,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
@@ -2007,8 +2003,8 @@ var knownWebhookInboxStates = func() map[string]bool {
 //
 // One caveat on pending: a row created with a not-before time sits in pending
 // by design until it becomes due, so steady nonzero pending depth alone does
-// not imply dispatch lag — cross-check the oldest-claimable-age gauge, which
-// counts only dispatchable rows.
+// not imply dispatch lag — use claimable depth and oldest claimable age,
+// which count only dispatchable rows.
 func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 	if !knownWebhookInboxStates[state] {
 		state = "unknown"
@@ -2017,6 +2013,17 @@ func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 		"Number of durable webhook inbox rows by state", "{row}",
 		EnvironmentAttribute(""),
 		attribute.String("state", state),
+	)
+}
+
+// RecordWebhookInboxClaimableDepth records rows ready for a worker now, excluding
+// scheduled work, active leases and exhausted retries. A sustained rise means
+// workers are not keeping up; inspect worker health and claim/storage errors.
+// Replicas observe the same inbox, so aggregate with max rather than sum.
+func RecordWebhookInboxClaimableDepth(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.webhook.inbox_claimable_depth", count,
+		"Number of durable webhook inbox rows ready to claim", "{row}",
+		EnvironmentAttribute(""),
 	)
 }
 
@@ -2315,6 +2322,21 @@ func RecordPRFileCapExceeded(ctx context.Context, repo string, schemaVisible boo
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo),
 		attribute.Bool("schema_visible", schemaVisible))
+}
+
+// RecordSymlinkModesUnread counts changed paths whose symlink mode SchemaBot
+// did not read: GitHub refused the change's diff (or gave no mode for a pure
+// rename), truncated the repository's tree listing, and no configured schema
+// directories bound which paths could be schema symlinks. Reading them
+// directory by directory would cost GitHub requests in proportion to the PR's
+// non-schema files, so they are treated as not symlinks. A nonzero rate names
+// a repository whose databases need allowed_dirs, so a symlink that changes a
+// schema is planned there.
+func RecordSymlinkModesUnread(ctx context.Context, repo string, paths int) {
+	addCounterN(ctx, int64(paths), "schemabot.github.symlink_modes_unread_total",
+		"Total number of changed paths treated as not symlinks because GitHub truncated the tree listing and no configured schema directories bound them", "{path}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
 }
 
 var knownStatusCheckOperations = map[string]bool{

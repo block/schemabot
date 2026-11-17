@@ -55,6 +55,16 @@ func TestFailedShard(t *testing.T) {
 		assert.Equal(t, "80-", failed.Shard)
 	})
 
+	t.Run("failed status in any casing", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "FAILED", Message: notNullFailure},
+		}
+
+		failed, ok := failedShard(rows)
+		require.True(t, ok)
+		assert.Equal(t, "-80", failed.Shard)
+	})
+
 	t.Run("failed shard Vitess left no message for", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			{Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Failed, Message: "   "},

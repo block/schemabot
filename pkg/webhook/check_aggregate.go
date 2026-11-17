@@ -93,7 +93,7 @@ func (h *Handler) leaderParticipantsForPR(
 			"repo", repo, "pr", pr, "head_sha", headSHA)
 		return config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)), nil
 	}
-	return h.participantsExpectedOnHead(ctx, client, repo, pr, headSHA,
+	return h.participantsExpectedOnHead(ctx, client, repo, pr, aggregateSentinel, headSHA,
 		config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)),
 		config.ExpectedParticipantChecksForPR(repo, prFilePaths(proposed)))
 }

@@ -4,6 +4,7 @@ package serve
 
 import (
 	"bytes"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/testcontainers/testcontainers-go"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -250,6 +252,75 @@ func TestConnectStorageMySQLSessionsRunInUTC(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "a delivery whose not-before time has passed is claimable")
 	assert.Equal(t, "deferred-past", claimed.DeliveryID)
+}
+
+// A deployment can keep DDL privileges off the long-lived storage pool: the
+// schema DSN converges the storage schema, and the pool then runs as a user
+// that can only read and write rows. That user cannot boot the server alone,
+// and a schema DSN that names another database is refused before anything is
+// converged, so the pool never serves storage whose schema it did not check.
+func TestConnectStorageMySQLSeparateSchemaUser(t *testing.T) {
+	ctx := t.Context()
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", "schemabot"), Started: true,
+	})
+	require.NoError(t, err)
+	testcontainers.CleanupContainer(t, container)
+	rootDSN, err := testutil.MySQLDSN(ctx, container, "schemabot")
+	require.NoError(t, err)
+
+	admin, err := sql.Open("block-mysql", rootDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(admin) })
+	for _, stmt := range []string{
+		"CREATE USER 'schemabot_rw'@'%' IDENTIFIED BY 'rw-pass'",
+		"GRANT SELECT, INSERT, UPDATE, DELETE ON `schemabot`.* TO 'schemabot_rw'@'%'",
+	} {
+		_, err := admin.ExecContext(ctx, stmt)
+		require.NoError(t, err)
+	}
+	rootCfg, err := mysql.ParseDSN(rootDSN)
+	require.NoError(t, err)
+	rwCfg := rootCfg.Clone()
+	rwCfg.User, rwCfg.Passwd = "schemabot_rw", "rw-pass"
+	rwDSN := rwCfg.FormatDSN()
+	logger := slog.New(slog.DiscardHandler)
+
+	t.Run("row-only user cannot converge the schema alone", func(t *testing.T) {
+		cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: rwDSN}}
+		_, _, err := connectStorage(ctx, cfg, schema.DialectMySQL, logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ensure storage schema")
+	})
+
+	t.Run("schema DSN naming another database is refused", func(t *testing.T) {
+		otherCfg := rootCfg.Clone()
+		otherCfg.DBName = "other"
+		cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: rwDSN, SchemaDSN: otherCfg.FormatDSN()}}
+		_, _, err := connectStorage(ctx, cfg, schema.DialectMySQL, logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "both must name the same storage database")
+	})
+
+	t.Run("schema user converges and the row-only pool serves", func(t *testing.T) {
+		cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: rwDSN, SchemaDSN: rootDSN}}
+		db, dsn, err := connectStorage(ctx, cfg, schema.DialectMySQL, logger)
+		require.NoError(t, err)
+		t.Cleanup(func() { utils.CloseAndLog(db) })
+		assert.Equal(t, rwDSN, dsn, "the pool must dial as the row-only user")
+
+		var user string
+		require.NoError(t, db.QueryRowContext(ctx, "SELECT SUBSTRING_INDEX(CURRENT_USER(), '@', 1)").Scan(&user))
+		assert.Equal(t, "schemabot_rw", user)
+
+		store, err := newStore(schema.DialectMySQL, db)
+		require.NoError(t, err)
+		require.NoError(t, store.Settings().Set(ctx, "boot-check", "ok"))
+		setting, err := store.Settings().Get(ctx, "boot-check")
+		require.NoError(t, err)
+		require.NotNil(t, setting)
+		assert.Equal(t, "ok", setting.Value)
+	})
 }
 
 func TestConnectStorageMySQLReadsPlanTimestamps(t *testing.T) {

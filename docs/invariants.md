@@ -522,15 +522,18 @@ repository it serves, so routine edits in one large repository use it up and req
 posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
 configs, probing each directory once (`pkg/github/config.go`); the changed-file listing
 (`pkg/github/client.go`, `pkg/github/symlink_modes.go`), which learns which changed paths are
-symlinks from one diff of the change, or from directory listings batched across those paths when
-GitHub cannot serve the diff, asks only about paths inside the configured schema directories when
-the server's configuration names every directory the repository's configs can sit in, and reads a
-symlink's target only when a config file sits above it; and
+symlinks from one diff of the change, and reads the paths the diff gives no mode for with at most
+one request per side: one directory listing when they fit in one batch, otherwise one listing of
+the whole tree. It asks only about paths inside the configured schema directories when the
+server's configuration names every directory the repository's configs can sit in. When GitHub
+truncates the tree, the paths the listing still names keep its modes; the rest are listed by
+directory in batches when they are inside those schema directories, and are otherwise treated as
+not symlinks. It reads a symlink's target only when a config file sits above it; and
 `TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
 (`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then many
-one-line edits outside its schema directory and requires the same GitHub requests. It covers an
-auto-plan when the PR opens and when a push lands, a plan command, and a plan command in a
-repository whose tree GitHub truncates.
+one-line edits outside its schema directory and requires the same GitHub requests, with the diff
+served, refused as too large, and naming pure renames. It covers an auto-plan when the PR opens and
+when a push lands, a plan command, and a plan command in a repository whose tree GitHub truncates.
 
 ### AV-16: Applies that wait on a person never wait on each other
 
@@ -579,6 +582,11 @@ automatic apply, which dispatches only after its pending changes are stored
 (`applyCommandCore` in `pkg/webhook/apply_handlers.go`). These guards apply to the state a
 fold observes; concurrent publication can leave stale success over a later blocker
 ([publication concurrency](check-runs.md#publication-concurrency)).
+
+The one exception is a changed path whose file mode cannot be read within AV-15's request budget.
+It is treated as a regular file, so a PR whose only schema change is a symlink among such paths
+gets a passing "no schema files changed". The case is logged as a warning and counted
+(`symlinksAtRef` in `pkg/github/symlink_modes.go`); a request GitHub fails is still an error.
 
 ### MG-2: Absence never passes
 
@@ -2056,9 +2064,9 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
 their own review requirement. An approval that the reviewer withdrew or that the repository
-dismissed does not count. An approval counts only for the schema change it reviewed, unless the
-change's target branch dismisses stale approvals itself or the review policy turns re-approval
-off: it was given on the commit being applied, or on an earlier commit at which the change's own
+dismissed does not count. By default an authorized approval counts on whichever commit of the
+change it was given. Where the review policy requires re-approval, an approval counts only for the
+schema change it reviewed: it was given on the commit being applied, or on an earlier commit at which the change's own
 effect on every schema input is provably the same, or the change has stopped touching an input that newer default
 branch content has changed since, so any difference between the two came from newer content on the
 repository's default branch; when that cannot be proved, the approval does not count. A change
@@ -2072,9 +2080,7 @@ generates no statement the approval did not cover: with `SameTableChange`
 (`pkg/ddl/table_change.go`) for MySQL-family table files, `SameVSchemaChange`
 (`pkg/ddl/vschema_change.go`) for a Vitess keyspace's VSchema, and on the environment's primary
 target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for PostgreSQL
-files. Whether the target branch dismisses stale approvals is read by
-`BaseBranchDismissesStaleApprovals` (`pkg/github/branch_rules.go`); when it cannot be read, the
-gate compares.
+files.
 
 ### AZ-5: Commands never guess
 

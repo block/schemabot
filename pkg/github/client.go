@@ -923,6 +923,13 @@ func (pri *PullRequestInfo) IsClosed() bool {
 	return pri.State == "closed"
 }
 
+// IsOpen reports whether the PR is open. A PR whose state is neither open nor
+// closed is reported by neither method, so callers that act on one answer can
+// fail closed on an unrecognized state.
+func (pri *PullRequestInfo) IsOpen() bool {
+	return pri.State == "open"
+}
+
 // FetchPullRequest is the dedupe-friendly variant. It honours the
 // request-scoped PR-info cache attached to ctx via WithPRInfoCache, so
 // repeated calls for the same (repo, pr) within one webhook delivery
@@ -1290,7 +1297,7 @@ func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, cha
 			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "scoped_to_schema_dirs", scope.bounded)
 		return nil
 	}
-	modes, err := ic.SymlinkModes(ctx, repo, change, probes)
+	modes, err := ic.SymlinkModes(ctx, repo, change, probes, scope.bounded)
 	if err != nil {
 		return fmt.Errorf("read the modes of %d changed paths: %w", len(probes), err)
 	}

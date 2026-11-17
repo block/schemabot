@@ -20,14 +20,9 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 		if _, err := os.Stat(cmd.SchemaDir); !os.IsNotExist(err) {
 			return nil
 		}
-		m := &initStartChoice{}
-		result, err := tea.NewProgram(m, tea.WithContext(ctx)).Run()
+		selected, err := chooseInitStart(ctx)
 		if err != nil {
 			return err
-		}
-		selected := result.(*initStartChoice)
-		if !selected.confirmed {
-			return ErrSilent
 		}
 		if !selected.sample {
 			return nil
@@ -101,6 +96,27 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 		fmt.Printf("\n  %s\n  Docker container: %s\n\n", heading, sample.Name)
 	}
 	return nil
+}
+
+// chooseInitStart asks whether to connect a database or try a sample, and
+// returns the confirmed choice. A choice the operator left without confirming,
+// by their signal or by the screen's cancel key, is a stopped init: nothing
+// has been acted on yet.
+func chooseInitStart(ctx context.Context, options ...tea.ProgramOption) (*initStartChoice, error) {
+	m := &initStartChoice{}
+	_, err := tea.NewProgram(m, append(options, tea.WithContext(ctx))...).Run()
+	// The program reports how it ended in its own terms, so the context's own
+	// error is the one that says whether the operator's signal ended it.
+	if endedByInterrupt(ctx, ctx.Err()) {
+		return nil, initInterrupted(ctx, initCancelledNothingChanged)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !m.confirmed {
+		return nil, initCancelled(initCancelledNothingChanged)
+	}
+	return m, nil
 }
 
 type initStartChoice struct {
