@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"golang.org/x/text/width"
 )
@@ -87,8 +88,32 @@ func stripControl(s string) string {
 	}, s)
 }
 
+// isControl reports whether a terminal acts on r instead of displaying it. That
+// is the C0 range, DEL, and the C1 range, which some terminals treat the way
+// they treat ESC, plus the bidirectional controls, which reorder the text
+// around them so that a line reads differently from what was sent. Other
+// invisible runes are not included: the joiners inside an emoji sequence, and
+// inside ordinary words in several scripts, change no other text.
 func isControl(r rune) bool {
-	return r < 32 || r == 127
+	return unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r)
+}
+
+// TerminalSafe removes the control runes from text a server sent, such as an
+// error message, so printing it cannot move the cursor, recolor or clear the
+// screen, set the window title, plant a hyperlink, or reorder the text around
+// it. Newlines and tabs are kept because multi-line error messages rely on
+// them. Bytes that are not valid UTF-8 come out as U+FFFD, so the result is not
+// byte for byte the input.
+func TerminalSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if isControl(r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // terminalEscapePattern matches the zero-width escape sequences this CLI

@@ -51,6 +51,23 @@ func TestLink(t *testing.T) {
 			Link("acme/shop#412", "https://example.com/a\nb"))
 	})
 
+	t.Run("a C1 or bidirectional control in the URL is stripped from the plain output", func(t *testing.T) {
+		setHyperlinks(t, true)
+		assert.Equal(t,
+			"https://example.com/2Jevil",
+			Link("acme/shop#412", "https://example.com/\u009b2Jevil"))
+		assert.Equal(t,
+			"https://example.com/live",
+			Link("acme/shop#412", "https://example.com/\u202elive"))
+	})
+
+	t.Run("a C1 control in the text falls back to plain output", func(t *testing.T) {
+		setHyperlinks(t, true)
+		assert.Equal(t,
+			"https://example.com/pr/1",
+			Link("acme\u009b2Jshop#1", "https://example.com/pr/1"))
+	})
+
 	t.Run("a non-ASCII URL falls back to plain output", func(t *testing.T) {
 		setHyperlinks(t, true)
 		assert.Equal(t,
@@ -147,6 +164,33 @@ func TestVisibleWidth(t *testing.T) {
 		assert.Equal(t, 2, VisibleWidth("⛔️"))
 		assert.Equal(t, 0, VisibleWidth("️"))
 	})
+}
+
+// Text a server sends, such as a failed apply's error, is printed straight to
+// the operator's terminal. Escape sequences in it would act on the terminal,
+// so every control rune is removed except the newlines and tabs that lay out a
+// multi-line message.
+func TestTerminalSafe(t *testing.T) {
+	cases := map[string]struct {
+		in, want string
+	}{
+		"plain text is unchanged":                                         {"duplicate key name 'idx_orders_source'", "duplicate key name 'idx_orders_source'"},
+		"newlines and tabs are kept":                                      {"deploy request failed\n  [INVALID_VSCHEMA]\tusers", "deploy request failed\n  [INVALID_VSCHEMA]\tusers"},
+		"a screen clear is removed":                                       {"lock wait timeout\x1b[2J\x1b[H", "lock wait timeout[2J[H"},
+		"a window title is removed":                                       {"\x1b]0;owned\x07failed", "]0;ownedfailed"},
+		"a carriage return is removed, so the line cannot be overwritten": {"failed\rcompleted", "failedcompleted"},
+		"a C1 control sequence introducer is removed":                     {"failed\u009b2J", "failed2J"},
+		"printable Unicode is kept":                                       {"table café · ⚠️", "table café · ⚠️"},
+		"a right-to-left override is removed, so the text reads as sent":  {"apply \u202edeliaf\u202c completed", "apply deliaf completed"},
+		"bidirectional isolates and marks are removed":                    {"a\u2066b\u2069c\u200ed\u200fe\u061cf", "abcdef"},
+		"the joiner inside an emoji sequence is kept":                     {"👩\u200d💻 on call", "👩\u200d💻 on call"},
+		"a byte that is not valid UTF-8 becomes the replacement rune":     {"failed\x9b2J\xff", "failed\ufffd2J\ufffd"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, TerminalSafe(tc.in))
+		})
+	}
 }
 
 func TestPadVisible(t *testing.T) {

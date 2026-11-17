@@ -17,6 +17,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/commands"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Set by ldflags at build time.
@@ -104,7 +105,7 @@ func main() {
 			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)
 			cancelLocal()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error: %s\n", errorText(err))
 				os.Exit(1)
 			}
 			if connection != nil {
@@ -121,10 +122,10 @@ func main() {
 			// failure; a non-empty token with an error is a non-fatal warning (the
 			// returned token is still usable and re-login can fix it).
 			if token == "" {
-				fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+				fmt.Fprintf(os.Stderr, "\033[31mError: %s\033[0m\n", errorText(err))
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
+			fmt.Fprintf(os.Stderr, "\033[33mWarning: %s\033[0m\n", errorText(err))
 		}
 		client.SetAuthToken(token)
 		if localEndpoint != "" {
@@ -174,10 +175,18 @@ func main() {
 		// scripting it needs to tell two successful-but-different outcomes
 		// apart (see commands.ExitCodeFor); anything else exits 1.
 		if !errors.Is(err, commands.ErrSilent) {
-			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+			fmt.Fprintf(os.Stderr, "\033[31mError: %s\033[0m\n", errorText(err))
 		}
 		os.Exit(commands.ExitCodeFor(err))
 	}
+}
+
+// errorText is the text of err as main prints it to the operator's terminal.
+// An error a command returns can quote the server, or a proxy that answered in
+// its place, so control runes are removed here, where every such error is
+// printed, rather than by each command that builds one.
+func errorText(err error) string {
+	return ui.TerminalSafe(err.Error())
 }
 
 // Only commands that use the schema API may implicitly start a selected runtime.
