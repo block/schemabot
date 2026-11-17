@@ -833,7 +833,7 @@ func TestApplyCommentShardListingsFitWithinTheLimit(t *testing.T) {
 		assert.LessOrEqual(t, len(body), limit)
 		assert.Contains(t, body, ddlTruncatedMarker)
 		assert.Equal(t, 60, strings.Count(body, "- Shards: 16 (16 copying)\n"))
-		assert.Equal(t, 60*3, strings.Count(body, "  - ◉ `"), "each table names its three slowest shards")
+		assert.Equal(t, 60*4, strings.Count(body, "  - ◉ `"), "each table names its four slowest shards")
 	})
 
 	t.Run("the listings keep only their counts", func(t *testing.T) {

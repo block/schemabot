@@ -106,7 +106,7 @@ const partListInlineLimit = 8
 // copying parts are named because they set the ETA.
 const (
 	maxFailedParts  = 5
-	maxCopyingParts = 3
+	maxCopyingParts = 4
 )
 
 // ListsParts reports whether a table in status lists its parts one per line

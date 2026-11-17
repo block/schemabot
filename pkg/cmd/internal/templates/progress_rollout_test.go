@@ -500,7 +500,8 @@ func TestWriteProgress_WideTargetRollupNamesEveryPhase(t *testing.T) {
 		"           ◉ payments-001: catching up\n"+
 		"           ◉ payments-002: catching up\n"+
 		"           ◉ payments-003: catching up\n"+
-		"           ... 9 more targets past copying\n", "%s", out)
+		"           ◉ payments-004: checksumming\n"+
+		"           ... 8 more targets past copying\n", "%s", out)
 	assert.NotContains(t, out, "(none)")
 }
 

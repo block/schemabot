@@ -100,7 +100,7 @@ func TestListParts(t *testing.T) {
 			}
 		}
 		add(12, Part{Status: task.Failed})
-		add(4, Part{Status: task.WaitingForCutover})
+		add(5, Part{Status: task.WaitingForCutover})
 		for i := range 7 {
 			add(1, Part{Status: task.Running, RowsCopied: int64(100 * (7 - i)), RowsTotal: 1000})
 		}
@@ -114,10 +114,10 @@ func TestListParts(t *testing.T) {
 		}
 		want = append(want, PartListLine{Part: -1, Summary: "7 more failed targets"})
 		// The slowest copying targets, furthest behind first.
-		want = append(want, PartListLine{Part: 22}, PartListLine{Part: 21}, PartListLine{Part: 20})
-		want = append(want, PartListLine{Part: -1, Summary: "4 more copying targets"})
+		want = append(want, PartListLine{Part: 23}, PartListLine{Part: 22}, PartListLine{Part: 21}, PartListLine{Part: 20})
+		want = append(want, PartListLine{Part: -1, Summary: "3 more copying targets"})
 		// The targets working past the copy, in order, each as live as a copier.
-		want = append(want, PartListLine{Part: 12}, PartListLine{Part: 13}, PartListLine{Part: 14})
+		want = append(want, PartListLine{Part: 12}, PartListLine{Part: 13}, PartListLine{Part: 14}, PartListLine{Part: 15})
 		want = append(want, PartListLine{Part: -1, Summary: "1 more target past copying"})
 		assert.Equal(t, want, got)
 	})
@@ -126,7 +126,7 @@ func TestListParts(t *testing.T) {
 		for i := range 6 {
 			parts = append(parts, Part{Name: fmt.Sprintf("failed%d", i), Status: task.Failed})
 		}
-		for i := range 4 {
+		for i := range 5 {
 			parts = append(parts, Part{Name: fmt.Sprintf("copying%d", i), Status: task.Running, RowsCopied: int64(100 * (i + 1)), RowsTotal: 1000})
 		}
 		var summaries []string
@@ -153,7 +153,7 @@ func TestListParts(t *testing.T) {
 			}
 			names = append(names, parts[line.Part].Name)
 		}
-		assert.Equal(t, []string{"measured0", "measured1", "measured2", "7 more copying shards"}, names,
+		assert.Equal(t, []string{"measured0", "measured1", "measured2", "measured3", "6 more copying shards"}, names,
 			"the slowest measured copiers set the pace; ones with nothing reported are not named ahead of them")
 	})
 	t.Run("the heading counts an unlisted phase before cancelled", func(t *testing.T) {

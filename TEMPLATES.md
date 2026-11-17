@@ -5976,7 +5976,8 @@ ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
   - ◉ `f7-`: 12%
   - ◉ `c8-`: 55%
   - ◉ `dc-`: 55%
-  - … 49 more copying shards
+  - ◉ `f0-`: 55%
+  - … 48 more copying shards
 
 
 ---
@@ -8751,11 +8752,13 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ fe-ff: 10.00% · 100,800 / 1,008,000 rows · ETA: 4m 40s
            ◉ ff-: 10.00% · 101,000 / 1,010,000 rows · ETA: 4m 40s
            ◉ fc-fd: 11.00% · 110,440 / 1,004,000 rows · ETA: 4m 38s
-           ... 223 more copying shards
+           ◉ fd-fe: 11.00% · 110,660 / 1,006,000 rows · ETA: 4m 38s
+           ... 222 more copying shards
            ● -01: waiting for cutover
            ● 01-02: waiting for cutover
            ● 02-03: waiting for cutover
-           ... 27 more shards past copying
+           ● 03-04: waiting for cutover
+           ... 26 more shards past copying
 
 ```
 </details>
@@ -8785,11 +8788,13 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ f8-: 23.00% · 347,300 / 1,510,000 rows · ETA: 2m 37s
            ◉ f0-f8: 26.00% · 390,000 / 1,500,000 rows · ETA: 2m 34s
            ◉ e8-f0: 29.00% · 432,100 / 1,490,000 rows · ETA: 2m 31s
-           ... 17 more copying shards
+           ◉ e0-e8: 32.00% · 473,600 / 1,480,000 rows · ETA: 2m 28s
+           ... 16 more copying shards
            ● -08: waiting for cutover
            ● 08-10: waiting for cutover
            ● 10-18: waiting for cutover
-           ... 9 more shards past copying
+           ● 18-20: waiting for cutover
+           ... 8 more shards past copying
 
   ── commerce_001 ──
 
@@ -9733,7 +9738,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_040`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
-  - … 1 more copying target
+  - ◉ `orders_043`: 62.38% · 914,707 / 1,466,232 rows
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 
@@ -9766,7 +9771,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_002`: 12.48% · 183,029 / 1,466,232 rows
-  - … 1 more copying target
+  - ◉ `orders_003`: 12.48% · 183,029 / 1,466,232 rows
 
 
 </dd></dl>
@@ -11367,7 +11372,8 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
            ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
            ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
            ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
-           ... 16 more copying targets
+           ◉ payments-045: 36.25% · 29,000 / 80,000 rows · ETA: 8m 45s
+           ... 15 more copying targets
 
   Targets needing attention:
     ❌ payments-041 — failed: duplicate key name 'idx_orders_source'
