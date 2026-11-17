@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/square/etre"
 )
@@ -49,17 +50,34 @@ type Config struct {
 	// Etre through a header-aware proxy or service mesh can supply the routing
 	// headers that proxy requires; no header is baked into the client.
 	Headers map[string]string
-	// Retry is the per-request retry count on network or API error.
+	// Retry is the per-request retry count on network or API error. Every
+	// attempt shares the lookup's one timeout, so a retry does not get a fresh
+	// one.
 	Retry uint
 	// Logger receives debug logs for lookups. Defaults to slog.Default().
 	Logger *slog.Logger
 }
 
+// queryTimeout bounds one Etre lookup, retries included. Neither HTTP client
+// New builds has a timeout of its own, so without it a registry that accepts
+// the connection and never answers holds the caller, and every caller queued
+// behind it, until the caller's own context ends.
+//
+// The bound is for each lookup. Callers queued behind a stalled lookup make
+// their own when their turn comes, so each of them can wait this long in turn.
+//
+// Every attempt shares the one timeout. It ends a request that is in flight,
+// but it does not interrupt the wait the Etre client sleeps between attempts.
+// New leaves that wait at zero, which is what keeps the whole lookup inside the
+// bound.
+const queryTimeout = 10 * time.Second
+
 // Client looks up entities in an Etre entity registry.
 type Client struct {
-	entities   etre.EntityClient
-	entityType string
-	logger     *slog.Logger
+	entities     etre.EntityClient
+	entityType   string
+	logger       *slog.Logger
+	queryTimeout time.Duration
 }
 
 // New builds a Client backed by a real Etre entity client.
@@ -149,9 +167,10 @@ func newClient(entities etre.EntityClient, entityType string, logger *slog.Logge
 		logger = slog.Default()
 	}
 	return &Client{
-		entities:   entities,
-		entityType: entityType,
-		logger:     logger,
+		entities:     entities,
+		entityType:   entityType,
+		logger:       logger,
+		queryTimeout: queryTimeout,
 	}
 }
 
@@ -188,14 +207,25 @@ func (c *Client) Query(ctx context.Context, selector map[string]string) ([]etre.
 	query := buildQuery(selector)
 	c.logger.Debug("etre: querying entities", "entity_type", c.entityType, "query", query)
 
-	matches, err := c.entities.Query(ctx, query, etre.QueryFilter{})
+	queryCtx, cancel := context.WithTimeout(ctx, c.queryTimeout)
+	defer cancel()
+	matches, err := c.entities.Query(queryCtx, query, etre.QueryFilter{})
 	if err != nil {
+		if lookupTimedOut(ctx, queryCtx) {
+			return nil, fmt.Errorf("query etre %q entities matching %q: no answer within %s: %w", c.entityType, query, c.queryTimeout, err)
+		}
 		return nil, fmt.Errorf("query etre %q entities matching %q: %w", c.entityType, query, err)
 	}
 	if len(matches) == 0 {
 		return nil, fmt.Errorf("no etre %q entity matched %q: %w", c.entityType, query, ErrNotFound)
 	}
 	return matches, nil
+}
+
+// lookupTimedOut reports whether a failed lookup ran out of the client's own
+// query timeout, as opposed to the caller cancelling or reaching its deadline.
+func lookupTimedOut(callerCtx, queryCtx context.Context) bool {
+	return callerCtx.Err() == nil && errors.Is(queryCtx.Err(), context.DeadlineExceeded)
 }
 
 // buildQuery turns equality predicates into a deterministic Etre query string
