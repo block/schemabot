@@ -2182,9 +2182,11 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 // deliberately terminal; the organic failure has GitHub Redeliver as its
 // lever until the cool-off passes). A nonzero rate usually means
 // deliveries are being lost upstream of the inbox (edge auth, GitHub send
-// failures), but a head covered only by superseded rows is a
-// coalescing-created miss with no upstream loss — check the superseded
-// dispatch outcome for the repo before blaming delivery. With synthesis
+// failures), but two causes involve no upstream loss. A head covered only by
+// superseded rows is a coalescing-created miss — check the superseded
+// dispatch outcome for the repo before blaming delivery. A head whose
+// organic row failed longer ago than the cool-off reached the inbox and
+// failed inside it — read that row's last_error. With synthesis
 // enabled each miss also triggers a recovery delivery, counted by
 // RecordWebhookReconcileSynthesizedEvent.
 func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {

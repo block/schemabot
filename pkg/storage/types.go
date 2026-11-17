@@ -2929,6 +2929,12 @@ const SynthesizedWebhookDeliveryIDPrefix = "recon:"
 // The failure was transient or unproven, so a later attempt can succeed; a
 // failure the driver proved deterministic is dead-lettered as
 // WebhookEventFailedPermanent instead and covers its head for good.
+//
+// The window is the earliest a recovery can start, not when it starts. The
+// reconciler acts on the first scan that reaches the head after the window,
+// so the wait is the window plus up to one reconcile interval, and longer
+// for a head deep in a busy repository's open PR listing, which a scan
+// reaches once per cycle rather than once per pass.
 const WebhookEventFailedCoverageCoolOff = 30 * time.Minute
 
 // AutoPlanPullRequestActions are the pull_request actions that trigger

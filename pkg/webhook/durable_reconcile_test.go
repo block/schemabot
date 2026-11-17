@@ -350,13 +350,13 @@ func TestWebhookReconcilerMissingHeadSeverityByMode(t *testing.T) {
 		{
 			name:      "report-only mode logs the repeating per-head line at info",
 			wantLevel: slog.LevelInfo,
-			wantMsg:   "webhook reconciler found open PR head with no inbox delivery (report-only; synthesis disabled)",
+			wantMsg:   "webhook reconciler found open PR head that no inbox delivery covers (report-only; synthesis disabled)",
 		},
 		{
 			name:      "synthesis mode warns because a recovery delivery is being enqueued",
 			opts:      []HandlerOption{WithWebhookReconcileSynthesis()},
 			wantLevel: slog.LevelWarn,
-			wantMsg:   "webhook reconciler found open PR head with no inbox delivery; synthesizing recovery delivery",
+			wantMsg:   "webhook reconciler found open PR head that no inbox delivery covers; synthesizing recovery delivery",
 		},
 	}
 	for _, tc := range scenarios {

@@ -115,6 +115,11 @@ func (s *recordingWebhookEventStore) Create(_ context.Context, event *storage.We
 	if copy.State == "" {
 		copy.State = storage.WebhookEventPending
 	}
+	// Mirror the real store's updated_at, which every insert stamps. A test
+	// that seeds an older write time keeps it.
+	if copy.UpdatedAt.IsZero() {
+		copy.UpdatedAt = time.Now()
+	}
 	s.events[key] = &copy
 	return true, nil
 }
@@ -151,15 +156,17 @@ func (s *recordingWebhookEventStore) HasEventForHead(_ context.Context, provider
 // failedOrganicRowInCoolOff mirrors the real store's rule for a failed row:
 // only an organic delivery that failed less than
 // storage.WebhookEventFailedCoverageCoolOff ago still covers its head. A row
-// seeded without a completion time counts as just failed.
+// without a completion time is measured from its last write, as the real
+// query's COALESCE(completed_at, updated_at) does.
 func failedOrganicRowInCoolOff(event *storage.WebhookEvent) bool {
 	if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
 		return false
 	}
-	if event.CompletedAt == nil {
-		return true
+	failedAt := event.UpdatedAt
+	if event.CompletedAt != nil {
+		failedAt = *event.CompletedAt
 	}
-	return time.Since(*event.CompletedAt) < storage.WebhookEventFailedCoverageCoolOff
+	return time.Since(failedAt) < storage.WebhookEventFailedCoverageCoolOff
 }
 
 func (s *recordingWebhookEventStore) FindNext(context.Context, string, time.Duration) (*storage.WebhookEvent, error) {
