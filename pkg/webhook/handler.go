@@ -430,12 +430,42 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 // of their own. Each GitHub request has its own limit, but a refresh makes
 // several in a row and its storage calls have none, so without this bound a
 // slow GitHub or an unresponsive storage call would hold that path for as long
-// as they take. A refresh cut short fails closed: either the
-// stored check stays in progress, which keeps merge blocked until terminal check
-// reconciliation completes it, or the Check Run keeps showing the apply as
-// running. The bound also stops one stuck apply from holding up the rest of a
-// reconciliation pass.
+// as they take.
+//
+// A refresh cut short fails closed, and what retries it depends on where the
+// cut falls. Before the stored check write is confirmed, the stored check stays
+// in progress: merge stays blocked and terminal check reconciliation retries
+// the refresh. After it, the stored check is complete, so reconciliation no
+// longer finds the apply, and the Check Run keeps showing the apply as running.
+// That also blocks merge, and it lasts until the aggregate is folded again: a
+// fold that fails arms a bounded re-fold on an aggregate leader or an
+// environment-scoped deployment, and anywhere else the Check Run waits for the
+// next event on the PR.
+//
+// The bound applies to each apply, so a terminal check reconciliation pass
+// waits at most this long on one stuck apply before moving to the next. A pass
+// in which every apply is stuck still takes this long for each of them.
+//
+// The bound is deliberately shorter than the longest the GitHub client could
+// spend on the refresh's requests if each one used its own limit and every
+// retry the client allows. The client's retries give way to the caller's
+// deadline by design, and the aggregate re-fold, which makes the same head read
+// and fold, runs under a shorter deadline than this one. A longer bound would
+// hold the drive path, and each apply of a reconciliation pass, for that much
+// longer while GitHub is slow.
 const terminalCheckRefreshTimeout = time.Minute
+
+// errTerminalCheckRefreshTimedOut is the cause of a refresh context that ended
+// at the refresh's own deadline, as opposed to one its caller ended.
+var errTerminalCheckRefreshTimedOut = errors.New("terminal check refresh reached its deadline")
+
+// What a terminal check refresh that reached its deadline leaves on the PR,
+// by how far it got.
+const (
+	terminalCheckRefreshCutBeforeStoredCheck = "terminal check refresh reached its deadline before the stored check write was confirmed; stored check state still in progress blocks merge and is retried by terminal check reconciliation"
+	terminalCheckRefreshCutAfterStoredCheck  = "terminal check refresh reached its deadline after stored check state was completed; terminal check reconciliation does not retry it, so a Check Run still showing the apply as running blocks merge until the aggregate is folded again"
+	terminalCheckRefreshCutOnStoppedApply    = "terminal check refresh reached its deadline while republishing a stopped apply's Check Run; the stored check stays in progress and blocks merge, and a Check Run still showing the apply as running is corrected when the aggregate is folded again"
+)
 
 func (h *Handler) terminalCheckRefreshDeadline() time.Duration {
 	if h.terminalCheckRefreshTimeoutOverride > 0 {
@@ -444,19 +474,33 @@ func (h *Handler) terminalCheckRefreshDeadline() time.Duration {
 	return terminalCheckRefreshTimeout
 }
 
+// warnIfTerminalCheckRefreshTimedOut logs outcome when the refresh's own
+// deadline ended ctx. Each step a cut-short refresh fails logs its own error,
+// but none of them says the deadline was the cause or what the PR is left
+// showing. storedCheckCompleted reports whether the stored check write landed.
+func (h *Handler) warnIfTerminalCheckRefreshTimedOut(ctx context.Context, a *storage.Apply, logCtx, outcome string, storedCheckCompleted bool) {
+	if errors.Is(context.Cause(ctx), errTerminalCheckRefreshTimedOut) {
+		h.logger.Warn(outcome, append(a.LogAttrs(),
+			"context", logCtx,
+			"deadline", h.terminalCheckRefreshDeadline(),
+			"stored_check_completed", storedCheckCompleted)...)
+	}
+}
+
 // refreshChecksForTerminalApply updates the stored check record for a terminal
 // apply result and refreshes the GitHub aggregate Check Run. It drives every
 // identifier and side effect from the apply it is handed so logs and check
 // updates never mix fields from two apply instances. logCtx names the caller
 // (e.g. "recovered apply") so operators can tell which path refreshed the check.
 func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.Apply, logCtx string) {
-	ctx, cancel := context.WithTimeout(ctx, h.terminalCheckRefreshDeadline())
+	ctx, cancel := context.WithTimeoutCause(ctx, h.terminalCheckRefreshDeadline(), errTerminalCheckRefreshTimedOut)
 	defer cancel()
 	fields := applyCheckLogFields(a, logCtx)
 	updated, err := h.updateCheckRecordForApplyResult(ctx, a.Repository, a.PullRequest, a)
 	if err != nil {
 		h.logger.Error("observer: failed to update check record for terminal apply",
 			append(fields(), "error", err)...)
+		h.warnIfTerminalCheckRefreshTimedOut(ctx, a, logCtx, terminalCheckRefreshCutBeforeStoredCheck, false)
 		return
 	}
 	if state.IsState(a.State, state.Apply.Stopped) {
@@ -467,6 +511,7 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 		// check, so a plan for a newer head would be refused until the apply is
 		// started or cancelled.
 		h.republishAggregateForHeldCheck(ctx, a, logCtx)
+		h.warnIfTerminalCheckRefreshTimedOut(ctx, a, logCtx, terminalCheckRefreshCutOnStoppedApply, false)
 		return
 	}
 	if !updated {
@@ -475,6 +520,7 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 		return
 	}
 	checkRecord, prInfo, published := h.publishApplyAggregate(ctx, a, fields, false)
+	h.warnIfTerminalCheckRefreshTimedOut(ctx, a, logCtx, terminalCheckRefreshCutAfterStoredCheck, true)
 	if !published || prInfo == nil {
 		return
 	}
