@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -247,7 +248,7 @@ func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error 
 		return loadErr
 	})
 	if err != nil {
-		if client.IsNotFound(err) {
+		if client.IsNotFound(err) && !deploymentNotConfigured(err) {
 			fmt.Printf("No schema change found for apply '%s'\n", applyID)
 			return nil
 		}
@@ -269,6 +270,18 @@ func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error 
 	templates.WriteProgress(data)
 
 	return nil
+}
+
+// deploymentNotConfigured reports whether the server answered that it has no
+// configuration for the apply's deployment. That answer is a 404 like an
+// unknown apply's, but the apply exists, so it is an error to report and not
+// an absence.
+func deploymentNotConfigured(err error) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.ErrorCode == apitypes.ErrCodeDeploymentNotFound
 }
 
 // showDatabaseHistory shows all applies for a database.

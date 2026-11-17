@@ -4762,7 +4762,7 @@ func TestProgressByApplyIDWhenTernClientIsUnavailable(t *testing.T) {
 			},
 			wantStatus:   http.StatusServiceUnavailable,
 			wantCode:     apitypes.ErrCodeEngineUnavailable,
-			wantContains: "the schema change engine for this apply is unavailable",
+			wantContains: "a SchemaBot operator can find the cause in the server log",
 		},
 		{
 			name:         "named deployment is not in the server config",
@@ -4829,7 +4829,8 @@ func TestProgressByApplyIDAnswers503WhenEngineProgressFails(t *testing.T) {
 	var resp apitypes.ErrorResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, apitypes.ErrCodeEngineUnavailable, resp.ErrorCode)
-	assert.Equal(t, "the schema change engine for this apply is unavailable; try again shortly", resp.Error)
+	assert.Equal(t, "SchemaBot could not read this apply's progress from its schema change engine. "+
+		"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log.", resp.Error)
 	assert.NotContains(t, w.Body.String(), connectionFragment)
 }
 

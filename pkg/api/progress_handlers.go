@@ -29,9 +29,13 @@ const (
 )
 
 // progressEngineUnavailableMessage is what a progress request for an active
-// apply answers when its engine cannot be reached. The cause can carry
-// connection details, so it goes to the server log and never to the client.
-const progressEngineUnavailableMessage = "the schema change engine for this apply is unavailable; try again shortly"
+// apply answers when its engine's client cannot be built or the engine fails
+// the progress read. The cause can carry connection details, so it goes to the
+// server log and never to the client. The message does not promise that a
+// retry will succeed, because the cause can also be a configuration error that
+// only an operator can fix.
+const progressEngineUnavailableMessage = "SchemaBot could not read this apply's progress from its schema change engine. " +
+	"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log."
 
 // changeTypeToString converts a proto change type for progress responses.
 // Unmapped values stay empty because progress omits unavailable change types.
