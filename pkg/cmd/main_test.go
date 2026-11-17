@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"testing"
 
@@ -90,4 +91,13 @@ func TestInitWithoutFlagsReachesWizard(t *testing.T) {
 	require.NoError(t, err)
 	_, err = parser.Parse([]string{"init"})
 	require.NoError(t, err)
+}
+
+// main prints the error a command returns, and that error can quote text the
+// server relayed from an engine or a database. Escape sequences in it are
+// removed where it is printed, while the line break of a multi-line error stays.
+func TestErrorTextDropsTerminalEscapes(t *testing.T) {
+	err := errors.New("cutover failed: lock wait timeout\x1b[2J\rcompleted\n  retry the apply")
+
+	assert.Equal(t, "cutover failed: lock wait timeout[2Jcompleted\n  retry the apply", errorText(err))
 }

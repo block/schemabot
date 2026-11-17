@@ -28,3 +28,15 @@ func TestActiveApplyDataDropsTerminalEscapesFromTheError(t *testing.T) {
 
 	assert.Equal(t, "lock wait timeout[2Jcompleted", data.ErrorMessage)
 }
+
+// A database's history prints the same server-supplied error for each failed
+// apply, so escape sequences are removed from it too.
+func TestApplyHistoryDataDropsTerminalEscapesFromTheError(t *testing.T) {
+	data := applyHistoryDataFromResponse(&apitypes.ApplyHistoryResponse{
+		ApplyID: "apply-abc",
+		State:   "failed",
+		Error:   "lock wait timeout\x1b[2J\rcompleted",
+	})
+
+	assert.Equal(t, "lock wait timeout[2Jcompleted", data.Error)
+}

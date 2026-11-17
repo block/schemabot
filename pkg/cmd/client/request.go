@@ -443,6 +443,10 @@ func checkNonJSONResponse(resp *http.Response, body []byte, parseErr error) erro
 		// Extract visible text from HTML for context (strip tags).
 		text := stripHTMLTags(string(body))
 		text = strings.Join(strings.Fields(text), " ") // collapse whitespace
+		// The tokenizer decodes character references, so a control rune can
+		// arrive spelled out as one. They are removed before the text is cut to
+		// length.
+		text = ui.TerminalSafe(text)
 		if len(text) > 200 {
 			text = text[:200] + "..."
 		}

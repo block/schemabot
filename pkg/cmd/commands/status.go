@@ -272,6 +272,19 @@ func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error 
 	return nil
 }
 
+func applyHistoryDataFromResponse(a *apitypes.ApplyHistoryResponse) templates.ApplyHistoryData {
+	return templates.ApplyHistoryData{
+		ApplyID:     a.ApplyID,
+		Environment: a.Environment,
+		State:       a.State,
+		Engine:      a.Engine,
+		Caller:      a.Caller,
+		StartedAt:   a.StartedAt,
+		CompletedAt: a.CompletedAt,
+		Error:       ui.TerminalSafe(a.Error),
+	}
+}
+
 // showDatabaseHistory shows all applies for a database.
 func showDatabaseHistory(endpoint, database, environment string, outputJSON, showLoader bool) error {
 	var result *apitypes.DatabaseHistoryResponse
@@ -291,16 +304,7 @@ func showDatabaseHistory(endpoint, database, environment string, outputJSON, sho
 	// Convert to template format
 	applies := make([]templates.ApplyHistoryData, 0, len(result.Applies))
 	for _, a := range result.Applies {
-		applies = append(applies, templates.ApplyHistoryData{
-			ApplyID:     a.ApplyID,
-			Environment: a.Environment,
-			State:       a.State,
-			Engine:      a.Engine,
-			Caller:      a.Caller,
-			StartedAt:   a.StartedAt,
-			CompletedAt: a.CompletedAt,
-			Error:       a.Error,
-		})
+		applies = append(applies, applyHistoryDataFromResponse(a))
 	}
 
 	templates.WriteDatabaseHistory(templates.DatabaseHistoryData{
