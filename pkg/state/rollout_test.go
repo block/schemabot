@@ -458,6 +458,24 @@ func TestDeriveRolloutApplyState_StartedRolloutStaysRunning(t *testing.T) {
 			want: Apply.Running,
 		},
 		{
+			// A deferred deploy reads waiting_for_deploy only once every target
+			// is ready, so /start stays refused while the rest are still queued.
+			name: "one target waiting for deploy, the rest queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForDeploy),
+				rolloutShard("payments-002", "-", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			name: "every target waiting for deploy",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForDeploy),
+				rolloutShard("payments-002", "-", ApplyOperation.WaitingForDeploy),
+			},
+			want: Apply.WaitingForDeploy,
+		},
+		{
 			name: "every target completed",
 			ops:  []RolloutOperation{rolloutShard("payments-001", "-", ApplyOperation.Completed), rolloutShard("payments-002", "-", ApplyOperation.Completed)},
 			want: Apply.Completed,
