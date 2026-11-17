@@ -73,7 +73,12 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 				"task_id", blocking.taskIdentifier, "table", blocking.table, "shard", blocking.shard,
 				"apply_id", blocking.applyIdentifier(), "apply_state", blocking.applyStateName(),
 				"attempt", attempt)
-			time.Sleep(100 * time.Millisecond)
+			if err := waitBeforeConflictRetry(ctx); err != nil {
+				c.logger.Info("conflict check: dispatch context ended while waiting to re-check an active task; the dispatch is abandoned without a conflict verdict",
+					"database", plan.Database, "plan_id", plan.PlanIdentifier, "shard", dispatchShard,
+					"task_id", blocking.taskIdentifier, "apply_id", blocking.applyIdentifier(), "attempt", attempt, "error", err)
+				return blockingTask{}, nil, fmt.Errorf("wait to re-check active task %s on database %q: %w", blocking.taskIdentifier, plan.Database, err)
+			}
 			continue
 		}
 
@@ -84,6 +89,24 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 			plan.Database, plan.PlanIdentifier, blocking.describe())
 	}
 	return blockingTask{}, nil, nil
+}
+
+// conflictRetryInterval is the floor of each conflict-check retry attempt.
+const conflictRetryInterval = 100 * time.Millisecond
+
+// waitBeforeConflictRetry waits out conflictRetryInterval before the conflict
+// check reads the database's tasks again, and returns the context's error
+// instead when the dispatch is cancelled or times out first, so a caller that
+// has gone away is not held for the rest of the retry budget.
+func waitBeforeConflictRetry(ctx context.Context) error {
+	timer := time.NewTimer(conflictRetryInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // findBlockingTask checks if any non-terminal task for this database is truly active.

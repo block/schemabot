@@ -147,9 +147,11 @@ func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.App
 // write does not land, the in-memory apply is put back to its pre-failure
 // state, the active-apply gauge is left alone, and the write error is
 // returned: the stored apply is still active, so nothing that answers for its
-// outcome may run, and the claim that picks it up next settles it. A drive
-// cancelled before or while recording the failure hands the apply back with
-// nil and the apply untouched.
+// outcome may run, and the claim that picks it up next settles it. The same
+// holds when the re-read before the write fails (see storedTerminalApply): the
+// failure is not written and the read error is returned. A drive cancelled
+// before or while recording the failure hands the apply back with nil and the
+// apply untouched.
 //
 // It records the failure only. The side effects a terminal apply owes —
 // settling the control requests it moots and posting the terminal summary —
@@ -181,8 +183,16 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	}
 	// Re-read the apply from storage — Stop() may have already set a terminal
 	// state (e.g., cancelled) between when the engine error occurred and now.
-	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
-	if err == nil && fresh != nil && state.IsTerminalApplyState(fresh.State) {
+	fresh, err := c.storedTerminalApply(ctx, apply)
+	if err != nil {
+		if c.driveCancelled(ctx, apply, "while re-reading the apply before recording that it failed") {
+			return nil
+		}
+		logger.Error("could not re-read the apply before recording that it failed; current apply owner will exit for operator retry with the apply still active and no terminal summary posted",
+			append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
+		return fmt.Errorf("record apply %s failed: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh != nil {
 		logger.Debug("apply already in terminal state, not overwriting",
 			"state", fresh.State)
 		*apply = *fresh
@@ -213,6 +223,30 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	c.logApplyFailure(ctx, apply, previous.State, errMsg)
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 	return nil
+}
+
+// storedTerminalApply re-reads the apply before the drive records an outcome
+// for it, and returns the stored row when that row is already terminal, so the
+// caller keeps the outcome that landed first. It returns nil when the stored
+// apply is still active.
+//
+// The re-read is what keeps a stopped apply stopped: storage refuses an outcome
+// that would reopen a finished apply or replace a settled one, but a stopped
+// apply is not settled, so a failed write would land on it and turn an apply
+// the operator can resume into one they must re-apply. A re-read that fails, or
+// finds no row, is therefore an error and not a reason to write blind.
+func (c *LocalClient) storedTerminalApply(ctx context.Context, apply *storage.Apply) (*storage.Apply, error) {
+	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("re-read apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	if fresh == nil {
+		return nil, fmt.Errorf("re-read apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, storage.ErrApplyNotFound)
+	}
+	if !state.IsTerminalApplyState(fresh.State) {
+		return nil, nil
+	}
+	return fresh, nil
 }
 
 // outcomeWriteLanded re-reads the apply after a write recording it in
@@ -365,7 +399,8 @@ func (c *LocalClient) failPendingStartForFailedApply(ctx context.Context, logger
 // the write landed and the helper runs those side effects as if it had
 // returned nil, so the retry claim that counts the apply again finds it
 // released. Otherwise the in-memory apply is put back to its pre-pause state,
-// the gauge is left alone, and the write error is returned.
+// the gauge is left alone, and the write error is returned. A re-read before
+// the write that fails returns its error the same way, with nothing written.
 func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error {
 	if c.driveCancelled(ctx, apply, "before pausing the apply for retry") {
 		return nil
@@ -391,8 +426,16 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	}
 	// Re-read the apply from storage; Stop() may have already moved it to a
 	// terminal state between the engine error and this update.
-	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
-	if err == nil && fresh != nil && state.IsTerminalApplyState(fresh.State) {
+	fresh, err := c.storedTerminalApply(ctx, apply)
+	if err != nil {
+		if c.driveCancelled(ctx, apply, "while re-reading the apply before pausing it for retry") {
+			return nil
+		}
+		logger.Error("could not re-read the apply before pausing it for retry; current apply owner will exit for operator retry with the apply still active",
+			append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
+		return fmt.Errorf("pause apply %s for retry: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh != nil {
 		logger.Debug("apply already in terminal state, not marking retryable",
 			"state", fresh.State)
 		*apply = *fresh
