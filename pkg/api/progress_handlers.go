@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -26,6 +27,15 @@ const (
 	defaultStatusLimit = 20
 	maxStatusLimit     = 1000
 )
+
+// progressEngineUnavailableMessage is what a progress request for an active
+// apply answers when its engine's client cannot be built or the engine fails
+// the progress read. The cause can carry connection details, so it goes to the
+// server log and never to the client. The message does not promise that a
+// retry will succeed, because the cause can also be a configuration error that
+// only an operator can fix.
+const progressEngineUnavailableMessage = "SchemaBot could not read this apply's progress from its schema change engine. " +
+	"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log."
 
 // changeTypeToString converts a proto change type for progress responses.
 // Unmapped values stay empty because progress omits unavailable change types.
@@ -438,11 +448,18 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.logger.Error("no tern client for active apply — server is misconfigured",
+		if errors.Is(err, errTernDeploymentNotConfigured) {
+			s.logger.Error("no tern client for active apply — server is misconfigured",
+				append(apply.LogAttrs(),
+					"error", err)...)
+			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
+				fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
+			return
+		}
+		s.logger.Error("tern client for active apply could not be built; progress is unavailable",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
-			fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, progressEngineUnavailableMessage)
 		return
 	}
 	s.logger.Debug("progress by apply-id: got client",
@@ -468,7 +485,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	})
 	if err != nil {
 		s.logger.Error("progress failed", append(apply.LogAttrs(), "error", err)...)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, progressEngineUnavailableMessage)
 		return
 	}
 
