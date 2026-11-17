@@ -2271,8 +2271,10 @@ func writeCollapsedNameGrid(sb *strings.Builder, indent, summary string, members
 // fit in nameGridWidth, in the order given. Names are never shortened: a wide
 // group of short names such as shard key ranges packs many to a row, a group
 // of long target names packs few, and a gap in a numbered or key-range
-// sequence shows as a break in the column. A name wider than the grid gets a
-// row of its own.
+// sequence shows as a break in the column. The widest name that fits in the
+// grid sets the column width for the group. A name wider than the grid ends
+// the row before it and gets a row of its own, without widening the columns
+// of the other names.
 //
 // Each name is flattened as inlineCode flattens it, so a line break or a
 // format character in a name the PR author chose cannot add a row or disguise
@@ -2286,18 +2288,34 @@ func nameGrid(names []string) string {
 	for i, name := range names {
 		flat[i] = flattenIdentifier(name)
 		widths[i] = nameGridCells.StringWidth(flat[i])
-		column = max(column, widths[i])
+		if widths[i] <= nameGridWidth {
+			column = max(column, widths[i])
+		}
 	}
 	perRow := max(1, (nameGridWidth+len(nameGridGap))/(column+len(nameGridGap)))
 	var sb strings.Builder
+	inRow := 0
 	for i, name := range flat {
-		last := i == len(flat)-1 || (i+1)%perRow == 0
-		sb.WriteString(name)
-		if last {
-			sb.WriteString("\n")
+		if widths[i] > nameGridWidth {
+			if inRow > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(name + "\n")
+			inRow = 0
 			continue
 		}
-		sb.WriteString(strings.Repeat(" ", column-widths[i]) + nameGridGap)
+		if inRow > 0 {
+			sb.WriteString(strings.Repeat(" ", column-widths[i-1]) + nameGridGap)
+		}
+		sb.WriteString(name)
+		inRow++
+		if inRow == perRow {
+			sb.WriteString("\n")
+			inRow = 0
+		}
+	}
+	if inRow > 0 {
+		sb.WriteString("\n")
 	}
 	return sb.String()
 }
@@ -3437,7 +3455,9 @@ type lintTargetSet struct {
 // set of targets names them on its line; both stay in the order they arrive
 // in. Sets of shared targets follow in first-appearance order, each keeping
 // its findings' order, so a heading's findings sit together after every
-// labeled line rather than between them.
+// labeled line rather than between them. Two findings share a set when they
+// name the same targets out of the same total, in any order; the heading
+// lists them in the order the set's first finding gave.
 func groupLintWarningsByTargets(warnings []LintViolationData) (labeled []LintViolationData, shared []lintTargetSet) {
 	index := make(map[string]int)
 	var sets []lintTargetSet
@@ -3445,7 +3465,7 @@ func groupLintWarningsByTargets(warnings []LintViolationData) (labeled []LintVio
 		if len(w.Targets) == 0 {
 			continue
 		}
-		key := strings.Join(w.Targets, "\x00")
+		key := lintTargetSetKey(w)
 		i, ok := index[key]
 		if !ok {
 			i = len(sets)
@@ -3455,7 +3475,7 @@ func groupLintWarningsByTargets(warnings []LintViolationData) (labeled []LintVio
 		sets[i].warnings = append(sets[i].warnings, w)
 	}
 	for _, w := range warnings {
-		if len(w.Targets) == 0 || len(sets[index[strings.Join(w.Targets, "\x00")]].warnings) == 1 {
+		if len(w.Targets) == 0 || len(sets[index[lintTargetSetKey(w)]].warnings) == 1 {
 			labeled = append(labeled, w)
 		}
 	}
@@ -3469,6 +3489,14 @@ func groupLintWarningsByTargets(warnings []LintViolationData) (labeled []LintVio
 		shared = append(shared, set)
 	}
 	return labeled, shared
+}
+
+// lintTargetSetKey identifies the set of targets a finding names, out of how
+// many, whatever order its producer listed them in.
+func lintTargetSetKey(w LintViolationData) string {
+	targets := slices.Clone(w.Targets)
+	slices.Sort(targets)
+	return fmt.Sprintf("%d\x00%s", w.TotalTargets, strings.Join(targets, "\x00"))
 }
 
 // writeLintTargetsHeading names the targets that raised every finding under
