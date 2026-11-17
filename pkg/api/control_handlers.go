@@ -129,6 +129,16 @@ func controlHTTPErrorf(status int, format string, args ...any) error {
 	}
 }
 
+// controlHTTPCodeErrorf is controlHTTPErrorf with an error code, for an answer
+// a client acts on by its code rather than by its status or message.
+func controlHTTPCodeErrorf(status int, code, format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: status,
+		code:   code,
+		err:    fmt.Errorf(format, args...),
+	}
+}
+
 // RollbackSourceRequest identifies the completed apply that a rollback command
 // wants to reverse. GitHub comment flows require repository and pull request
 // scope to keep a PR from rolling back another PR's work.
@@ -459,8 +469,8 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 		s.logger.Error("failed to create Tern client",
 			append(apply.LogAttrs(),
 				"operation", operation, "error", err)...)
-		status, message := controlTernClientFailure(err)
-		s.writeError(w, status, message)
+		failure := controlTernClientFailure(apply, deployment, err)
+		s.writeErrorCode(w, controlOperationHTTPStatus(failure), controlOperationErrorCode(failure), failure.Error())
 		return nil, nil, "", false
 	}
 
@@ -507,25 +517,43 @@ func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier,
 		s.logger.Error("failed to create Tern client",
 			append(apply.LogAttrs(),
 				"operation", operation, "error", err)...)
-		status, message := controlTernClientFailure(err)
-		return nil, apply, "", controlHTTPErrorf(status, "%s", message)
+		return nil, apply, "", controlTernClientFailure(apply, deployment, err)
 	}
 	return client, apply, ternApplyIDForStoredApply(apply), nil
 }
 
-// controlTernClientFailure maps a failure to obtain a deployment's Tern client
-// to the HTTP status and message a control request answers with. A deployment
-// that is not in the server configuration is a 404, which the requester cannot
-// repair by retrying. Any other failure means the client could not be built,
-// for example because a DSN or token did not resolve or the gRPC client did not
-// start. That is a 503 so durable callers retry, and its message is fixed
-// because the raw error can carry DSN or host fragments; the caller logs it.
-func controlTernClientFailure(err error) (int, string) {
+// controlEngineUnavailableMessage is what a control request answers when the
+// Tern client for its apply's deployment cannot be built. The cause can carry
+// DSN or host fragments, so it goes to the server log and never to the
+// requester. The message does not promise that a retry will succeed, because
+// the cause can also be a configuration error that only an operator can fix.
+const controlEngineUnavailableMessage = "SchemaBot could not connect to the schema change engine for this deployment. " +
+	"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log."
+
+// controlTernClientFailure maps a failure to obtain the Tern client for an
+// apply's deployment to the error a control request answers with.
+//
+// A deployment that is not in the server configuration is a 404 with the
+// deployment-not-found code, which the requester cannot repair by retrying.
+// Its message is built from the apply's own database, deployment, and
+// environment, never from the failure's text, so nothing a later wrap adds to
+// that text can reach the requester.
+//
+// Any other failure means the client could not be built, for example because
+// a DSN or token did not resolve or the gRPC client did not start. That is a
+// 503 with the engine-unavailable code, which clients treat as retryable. A
+// configuration entry that exists but can never produce a client lands here
+// too, because it cannot be told apart from an outage at this point. Nothing
+// is recorded for a request answered this way, so a retry cannot wedge an
+// apply, and a caller that retries must bound its attempts.
+func controlTernClientFailure(apply *storage.Apply, deployment string, err error) error {
 	if errors.Is(err, errTernDeploymentNotConfigured) {
-		return http.StatusNotFound, err.Error()
+		return controlHTTPCodeErrorf(http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
+			"no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config",
+			apply.Database, deployment, apply.Environment)
 	}
-	return http.StatusServiceUnavailable,
-		"SchemaBot could not connect to the schema change engine for this deployment. Retry shortly."
+	return controlHTTPCodeErrorf(http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable,
+		"%s", controlEngineUnavailableMessage)
 }
 
 // ternApplyIDForStoredApply returns the identifier that a Tern RPC expects for

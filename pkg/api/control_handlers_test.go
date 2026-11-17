@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -132,9 +131,9 @@ func TestWriteControlError_LogsCarryFullApplyAttrs(t *testing.T) {
 // callers retry once the outage clears, and the message is fixed because the
 // raw error names the DSN source and stays in the server log. A deployment
 // that is missing from the server configuration answers 404, since retrying
-// cannot change that.
+// cannot change that. Each answer carries the error code clients decide a
+// retry from, and neither message repeats the failure's own text.
 func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
-	const clientUnavailableMessage = "SchemaBot could not connect to the schema change engine for this deployment. Retry shortly."
 	missingDSNFile := filepath.Join(t.TempDir(), "missing-dsn-file")
 
 	tests := []struct {
@@ -142,6 +141,8 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 		deployment    string
 		wantStatus    int
 		wantMessage   string
+		wantCode      string
+		wantRetryable bool
 		wantTerminal  bool
 		wantInternal  bool
 		wantLogged    bool
@@ -151,7 +152,9 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 			name:          "client cannot be built",
 			deployment:    "brokendb",
 			wantStatus:    http.StatusServiceUnavailable,
-			wantMessage:   clientUnavailableMessage,
+			wantMessage:   controlEngineUnavailableMessage,
+			wantCode:      apitypes.ErrCodeEngineUnavailable,
+			wantRetryable: true,
 			wantInternal:  true,
 			wantLogged:    true,
 			wantLogDetail: "resolve DSN for brokendb/staging",
@@ -160,14 +163,16 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 			name:         "named deployment not in the server configuration",
 			deployment:   "ghost",
 			wantStatus:   http.StatusNotFound,
-			wantMessage:  `unknown deployment "ghost"`,
+			wantMessage:  `no tern client configured for database "testdb" (deployment="ghost", environment="staging") — add this database to the server config`,
+			wantCode:     apitypes.ErrCodeDeploymentNotFound,
 			wantTerminal: true,
 		},
 		{
 			name:         "default deployment not in the server configuration",
 			deployment:   DefaultDeployment,
 			wantStatus:   http.StatusNotFound,
-			wantMessage:  "not found in server configuration",
+			wantMessage:  `no tern client configured for database "testdb" (deployment="` + DefaultDeployment + `", environment="staging") — add this database to the server config`,
+			wantCode:     apitypes.ErrCodeDeploymentNotFound,
 			wantTerminal: true,
 		},
 	}
@@ -209,12 +214,11 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 				require.Equal(t, tc.wantStatus, w.Code, "%s: %s", route, w.Body.String())
 				var resp apitypes.ErrorResponse
 				require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
-				assert.Contains(t, resp.Error, tc.wantMessage, route)
-				assert.NotContains(t, resp.Error, missingDSNFile, route)
-				if tc.wantStatus == http.StatusServiceUnavailable {
-					assert.Equal(t, tc.wantMessage, resp.Error, route)
-				}
-				assertTernClientFailureLogged(t, logBuf.Bytes(), tc.wantLogged, tc.wantLogDetail, route)
+				assert.Equal(t, tc.wantMessage, resp.Error, route)
+				assert.Equal(t, tc.wantCode, resp.ErrorCode, route)
+				retryable, _ := resp.RetryAfter()
+				assert.Equal(t, tc.wantRetryable, retryable, "%s: whether a client following the error code retries", route)
+				assertTernClientFailureLogged(t, logBuf.Bytes(), tc.wantLogged, tc.wantLogDetail, strings.TrimPrefix(route, "/api/"))
 			}
 		})
 
@@ -240,11 +244,8 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 				assert.Equal(t, tc.wantStatus, ControlOperationHTTPStatus(err), operation)
 				assert.Equal(t, tc.wantInternal, IsInternalControlError(err), operation)
 				assert.Equal(t, tc.wantTerminal, IsTerminalControlError(err), operation)
-				assert.Contains(t, err.Error(), tc.wantMessage, operation)
-				assert.NotContains(t, err.Error(), missingDSNFile, operation)
-				if tc.wantStatus == http.StatusServiceUnavailable {
-					assert.Equal(t, tc.wantMessage, err.Error(), operation)
-				}
+				assert.Equal(t, tc.wantMessage, err.Error(), operation)
+				assert.Equal(t, tc.wantCode, controlOperationErrorCode(err), operation)
 				assertTernClientFailureLogged(t, logBuf.Bytes(), tc.wantLogged, tc.wantLogDetail, operation)
 			}
 		})
@@ -252,39 +253,53 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 }
 
 // assertTernClientFailureLogged checks that the server log keeps the raw
-// client-construction error for triage when a request was answered with the
-// fixed 503 message.
-func assertTernClientFailureLogged(t *testing.T, logs []byte, wantRawError bool, detail, route string) {
+// client-construction error for triage, with the operation that was asked for,
+// when a request was answered with the fixed 503 message.
+func assertTernClientFailureLogged(t *testing.T, logs []byte, wantRawError bool, detail, operation string) {
 	t.Helper()
 	if !wantRawError {
 		return
 	}
 	line := requireLogLine(t, decodeLogLines(t, logs), "failed to create Tern client")
-	assert.Equal(t, "apply-client-failure", line["apply_id"], route)
-	assert.Equal(t, "brokendb", line["deployment"], route)
-	assert.Contains(t, line["error"], detail, route)
-	assert.Contains(t, line["error"], "missing-dsn-file", route)
+	assert.Equal(t, operation, line["operation"])
+	assert.Equal(t, "apply-client-failure", line["apply_id"], operation)
+	assert.Equal(t, "brokendb", line["deployment"], operation)
+	assert.Contains(t, line["error"], detail, operation)
+	assert.Contains(t, line["error"], "missing-dsn-file", operation)
 }
 
 // A client-construction failure must not be mistaken for a missing
 // configuration entry: the retry decision for durable control callers hangs on
 // the difference.
 func TestControlTernClientFailure(t *testing.T) {
-	t.Run("missing configuration entry is a 404 with its own message", func(t *testing.T) {
-		status, message := controlTernClientFailure(fmt.Errorf("unknown deployment %q: %w", "ghost", errTernDeploymentNotConfigured))
-		assert.Equal(t, http.StatusNotFound, status)
-		assert.Equal(t, `unknown deployment "ghost": tern deployment not configured`, message)
+	apply := activeTestApply("apply-client-failure")
+	const notConfiguredMessage = `no tern client configured for database "testdb" (deployment="ghost", environment="staging") — add this database to the server config`
+
+	t.Run("missing configuration entry is a terminal 404 with the deployment-not-found code", func(t *testing.T) {
+		err := controlTernClientFailure(apply, "ghost", fmt.Errorf("unknown deployment %q: %w", "ghost", errTernDeploymentNotConfigured))
+		assert.Equal(t, http.StatusNotFound, ControlOperationHTTPStatus(err))
+		assert.Equal(t, apitypes.ErrCodeDeploymentNotFound, controlOperationErrorCode(err))
+		assert.Equal(t, notConfiguredMessage, err.Error())
+		assert.True(t, IsTerminalControlError(err))
 	})
 
-	t.Run("any other failure is a 503 with a fixed message", func(t *testing.T) {
-		status, message := controlTernClientFailure(errors.New("resolve DSN for orders/staging: open /secrets/dsn: no such file"))
-		assert.Equal(t, http.StatusServiceUnavailable, status)
-		assert.Equal(t, "SchemaBot could not connect to the schema change engine for this deployment. Retry shortly.", message)
+	// The 404 message names the apply's own database, deployment, and
+	// environment. Text that a caller wrapped around the not-configured error
+	// never reaches the requester.
+	t.Run("missing configuration entry does not repeat the text wrapped around it", func(t *testing.T) {
+		wrapped := fmt.Errorf("dial tern at db-7.internal:9090 as user:secret: %w",
+			fmt.Errorf("unknown deployment %q: %w", "ghost", errTernDeploymentNotConfigured))
+		err := controlTernClientFailure(apply, "ghost", wrapped)
+		assert.Equal(t, http.StatusNotFound, ControlOperationHTTPStatus(err))
+		assert.Equal(t, notConfiguredMessage, err.Error())
 	})
 
-	t.Run("503 is retryable", func(t *testing.T) {
-		_, message := controlTernClientFailure(io.ErrUnexpectedEOF)
-		err := controlHTTPErrorf(http.StatusServiceUnavailable, "%s", message)
+	t.Run("any other failure is a retryable 503 with a fixed message and the engine-unavailable code", func(t *testing.T) {
+		err := controlTernClientFailure(apply, "ghost", errors.New("resolve DSN for orders/staging: open /secrets/dsn: no such file"))
+		assert.Equal(t, http.StatusServiceUnavailable, ControlOperationHTTPStatus(err))
+		assert.Equal(t, apitypes.ErrCodeEngineUnavailable, controlOperationErrorCode(err))
+		assert.True(t, apitypes.IsRetryableErrorCode(controlOperationErrorCode(err)))
+		assert.Equal(t, controlEngineUnavailableMessage, err.Error())
 		assert.True(t, IsInternalControlError(err))
 		assert.False(t, IsTerminalControlError(err))
 	})
