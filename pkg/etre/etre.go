@@ -50,7 +50,9 @@ type Config struct {
 	// Etre through a header-aware proxy or service mesh can supply the routing
 	// headers that proxy requires; no header is baked into the client.
 	Headers map[string]string
-	// Retry is the per-request retry count on network or API error.
+	// Retry is the per-request retry count on network or API error. Every
+	// attempt shares the lookup's one timeout, so a retry does not get a fresh
+	// one.
 	Retry uint
 	// Logger receives debug logs for lookups. Defaults to slog.Default().
 	Logger *slog.Logger
@@ -60,6 +62,14 @@ type Config struct {
 // New builds has a timeout of its own, so without it a registry that accepts
 // the connection and never answers holds the caller, and every caller queued
 // behind it, until the caller's own context ends.
+//
+// The bound is for each lookup. Callers queued behind a stalled lookup make
+// their own when their turn comes, so each of them can wait this long in turn.
+//
+// Every attempt shares the one timeout. It ends a request that is in flight,
+// but it does not interrupt the wait the Etre client sleeps between attempts.
+// New leaves that wait at zero, which is what keeps the whole lookup inside the
+// bound.
 const queryTimeout = 10 * time.Second
 
 // Client looks up entities in an Etre entity registry.
