@@ -29,7 +29,14 @@ type sessionVtgate struct {
 	defaultKeyspace string
 	// tables lists the table with an in-flight schema change per keyspace.
 	tables map[string]string
+	// unreadableShard names, per keyspace, a second shard whose row follows the
+	// keyspace's readable one and carries a value no reader can scan.
+	unreadableShard map[string]string
 }
+
+// unreadableValue is a column value that cannot be scanned into any Go type a
+// progress read uses.
+type unreadableValue struct{}
 
 var sessionVtgateSeq atomic.Int64
 
@@ -95,9 +102,13 @@ func (c *sessionVtgateConn) QueryContext(_ context.Context, query string, _ []dr
 		if !ok {
 			return nil, fmt.Errorf("session vtgate: unknown keyspace %q", keyspace)
 		}
+		values := [][]driver.Value{{"uuid-" + keyspace, "vtctl:" + keyspace, keyspace, "0", table, "running"}}
+		if shard, ok := c.vtgate.unreadableShard[keyspace]; ok {
+			values = append(values, []driver.Value{"uuid-" + keyspace, "vtctl:" + keyspace, keyspace, shard, table, unreadableValue{}})
+		}
 		return &valueRows{
 			columns: []string{"migration_uuid", "migration_context", "keyspace", "shard", "mysql_table", "migration_status"},
-			values:  [][]driver.Value{{"uuid-" + keyspace, "vtctl:" + keyspace, keyspace, "0", table, "running"}},
+			values:  values,
 		}, nil
 	}
 	return nil, fmt.Errorf("session vtgate: unsupported query %q", query)
@@ -159,4 +170,39 @@ func TestShowVitessMigrationsForKeyspaceLeavesThePooledSessionUnchanged(t *testi
 	require.NoError(t, planPool.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&sessionKeyspace))
 	assert.Equal(t, "commerce", sessionKeyspace,
 		"the pooled connection came back switched to another keyspace; a live-schema read on it would list that keyspace's tables")
+}
+
+// A keyspace reports `orders` on two shards. The first shard's row reads
+// cleanly and the second cannot be read. The read for that keyspace returns an
+// error that names the keyspace and carries the cause, and it returns none of
+// the rows it had already read, so a sample that is missing a shard is never
+// mistaken for the keyspace's whole progress. Another keyspace still reads.
+func TestShowVitessMigrationsForKeyspaceFailsOnAnUnreadableRow(t *testing.T) {
+	ctx := t.Context()
+
+	cfg := mysql.NewConfig()
+	cfg.User = "schemabot"
+	cfg.Net = "tcp"
+	cfg.Addr = "vtgate.internal:3306"
+	cfg.DBName = "commerce"
+	dsn := cfg.FormatDSN()
+
+	vtgate := &sessionVtgate{
+		defaultKeyspace: "commerce",
+		tables:          map[string]string{"commerce": "orders", "customers": "profiles"},
+		unreadableShard: map[string]string{"commerce": "80-"},
+	}
+	eng := New(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	eng.vtgateDBs[dsn] = openSessionVtgate(t, vtgate)
+
+	rows, err := eng.showVitessMigrationsForKeyspace(ctx, dsn, "commerce", "")
+	require.Error(t, err, "a row that cannot be read must fail the keyspace's read")
+	assert.ErrorContains(t, err, "scan vitess_migrations row for keyspace commerce")
+	assert.ErrorContains(t, err, "unreadableValue", "the error must carry the cause of the failed read")
+	assert.Nil(t, rows, "the shard that was read before the failure must not be returned on its own")
+
+	rows, err = eng.showVitessMigrationsForKeyspace(ctx, dsn, "customers", "")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "profiles", rows[0].Table)
 }
