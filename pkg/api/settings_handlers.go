@@ -3,6 +3,7 @@ package api
 import (
 	"cmp"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -71,7 +72,9 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -87,6 +90,17 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Component-state rows share the settings table but belong to the
+	// component that writes them; an operator value there would silently
+	// steer that component, so the API reads them but never writes them.
+	if storage.IsComponentStateSettingKey(req.Key) {
+		s.logger.Warn("refused settings write to a component-state key", "key", req.Key,
+			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
+		s.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("%q is kept by SchemaBot itself and cannot be set through the settings API", req.Key))
+		return
+	}
+
 	err := s.storage.Settings().Set(r.Context(), req.Key, req.Value)
 	if err != nil {
 		s.logger.Error("set setting failed", "key", req.Key, "error", err)
@@ -94,7 +108,9 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info("setting updated", "key", req.Key, "value", req.Value,
+	// The value is not logged: a setting can hold anything an operator
+	// stores, and the API response already returns it to the caller.
+	s.logger.Info("setting updated", "key", req.Key, "value_bytes", len(req.Value),
 		"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
 
 	s.writeJSON(w, http.StatusOK, map[string]any{

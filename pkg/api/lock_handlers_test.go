@@ -682,3 +682,34 @@ func TestUnverifiedScopedLockAcquireRefusalIsCountedAndLogged(t *testing.T) {
 	assert.Equal(t, "cli:bob@laptop", entry["owner"])
 	assert.Equal(t, "org/payments-service", entry["repository"])
 }
+
+// A misspelt field in a lock request is refused before anything changes. A
+// tolerant decode would drop "forcce" and fall through to an owner release
+// the caller did not ask for, or take a lock without the field they meant.
+func TestLockRequestsRejectUnknownFields(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+
+	t.Run("release", func(t *testing.T) {
+		held := paymentsLock(7, "cli:bob@laptop", nil)
+		locks := &memoryLockStore{lock: paymentsLock(7, "cli:bob@laptop", nil)}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockRelease, admin, http.MethodDelete, "/api/locks",
+			`{"database":"payments","database_type":"mysql","forcce":true}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), `unknown field \"forcce\"`)
+		assert.Equal(t, held, locks.lock, "the lock stays held")
+	})
+
+	t.Run("acquire", func(t *testing.T) {
+		locks := &memoryLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockAcquire, admin, http.MethodPost, "/api/locks/acquire",
+			`{"database":"payments","database_type":"mysql","owner":"cli:alice@laptop","repo":"org/payments-service"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), `unknown field \"repo\"`)
+		assert.Nil(t, locks.lock, "no lock is taken")
+	})
+}

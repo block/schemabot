@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -122,4 +123,65 @@ func TestCLIGetSettingReadsComponentStateKeyWithSlash(t *testing.T) {
 	value, err := client.GetSetting(srv.URL, key)
 	require.NoError(t, err)
 	assert.Equal(t, `{"page":3}`, value)
+}
+
+// recordingSettingsStore records each write so a test can tell a refused
+// settings request from one that reached storage.
+type recordingSettingsStore struct {
+	staticSettingsStore
+	setKeys []string
+}
+
+func (s *recordingSettingsStore) Set(_ context.Context, key, _ string) error {
+	s.setKeys = append(s.setKeys, key)
+	return nil
+}
+
+// An admin's settings write reaches storage only for an operator key sent with
+// known fields. A misspelt field would otherwise store an empty value, and a
+// component-state key would overwrite state the webhook reconciler keeps for
+// itself, so both are refused with nothing written. A non-admin is still
+// refused as unauthorized first, whatever the key.
+func TestSettingsSetRefusesUnknownFieldsAndComponentStateKeys(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+	operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
+	cursorKey := storage.WebhookReconcileScanCursorSettingKeyPrefix + "octo/payments"
+
+	set := func(t *testing.T, user *auth.User, body string) (*httptest.ResponseRecorder, *recordingSettingsStore) {
+		t.Helper()
+		store := &recordingSettingsStore{}
+		svc := New(&mockStorageWithSettings{settings: store}, scopedWriteConfig(), nil, logger)
+		return scopedDenialRequest(t, svc.handleSettingsSet, user, http.MethodPost, "/api/settings", body), store
+	}
+
+	t.Run("an operator key is stored", func(t *testing.T) {
+		rec, store := set(t, admin, `{"key":"pause_applies","value":"true"}`)
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Equal(t, []string{"pause_applies"}, store.setKeys)
+	})
+
+	t.Run("a misspelt field is refused", func(t *testing.T) {
+		rec, store := set(t, admin, `{"key":"pause_applies","valeu":"true"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), `unknown field \"valeu\"`)
+		assert.Empty(t, store.setKeys, "nothing is written")
+	})
+
+	t.Run("a component-state key is refused", func(t *testing.T) {
+		rec, store := set(t, admin, `{"key":"`+cursorKey+`","value":"{\"page\":1}"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "cannot be set through the settings API")
+		assert.Empty(t, store.setKeys, "the reconciler's cursor is left alone")
+	})
+
+	t.Run("a non-admin is refused as unauthorized before the key is checked", func(t *testing.T) {
+		rec, store := set(t, operator, `{"key":"`+cursorKey+`","value":"{\"page\":1}"}`)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Empty(t, store.setKeys)
+	})
 }
