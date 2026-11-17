@@ -109,8 +109,10 @@ func TestRefreshChecksForTerminalApplyGivesUpWhenGitHubNeverAnswers(t *testing.T
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// The drive-path hooks hand the refresh a context with no deadline.
-		h.refreshChecksForTerminalApply(context.WithoutCancel(ctx), apply, "test terminal refresh timeout")
+		// The drive-path hooks hand the refresh a context with no deadline. The
+		// test's context has none either, and it ends when the test does, so a
+		// refresh that never gives up is released before the server closes.
+		h.refreshChecksForTerminalApply(ctx, apply, "test terminal refresh timeout")
 	}()
 	select {
 	case <-done:
