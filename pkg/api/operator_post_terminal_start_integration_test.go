@@ -526,7 +526,7 @@ func TestOperator_ResumedRolloutObserverReattachesAfterALaterStop(t *testing.T) 
 // region-b had started, and then started it again. The start resumes region-a,
 // and region-b, which the stop caught before it began, goes back to the queue
 // rather than staying stopped. When region-a finishes, the rollout reads as
-// one never stopped does between members, with region-b queued: nothing
+// one never stopped does between members, running with region-b queued: nothing
 // reports the rollout stopped at the handoff, so no stopped summary posts
 // while the start is still working through the rollout. Region-b then starts like any queued member, and the
 // rollout completes with one summary that answers the start.
@@ -574,8 +574,8 @@ func TestOperator_StartQueuesTheMembersAStopCaughtBeforeTheyStarted(t *testing.T
 	assert.Equal(t, state.ApplyOperation.Pending, regionB.State, "the start puts the member the stop caught before it began back in the queue")
 	assert.Nil(t, regionB.StartedAt)
 	apply := getApply(t, ctx, stor, seed.applyID)
-	assert.Equal(t, state.Apply.Pending, apply.State,
-		"with region-a done and region-b queued, the rollout reads as one that was never stopped does between members")
+	assert.Equal(t, state.Apply.Running, apply.State,
+		"with region-a done and region-b queued, the rollout reads running, as one that was never stopped does between members")
 	assert.Zero(t, svc.matrixSummary.count(), "no stopped summary posts while the start works through the rollout")
 	start, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
 	require.NoError(t, err)
