@@ -2009,6 +2009,11 @@ Response excerpt (illustrative values):
 
 </details>
 
+Without `apply_id`, `GET /api/logs/{database}?environment=…` reads the newest
+apply for the database in that environment, which is the one created last. When
+two applies were created in the same instant, the same one is read every time.
+A database with no applies in that environment returns an empty `logs` list.
+
 The database-independent route, `GET /api/logs?apply_id=apply-example-73`,
 returns the same shape. The default window is the latest 50 entries, returned
 oldest first. Set `limit` to request a larger window. When `truncated` is true,

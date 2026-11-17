@@ -76,6 +76,10 @@ func TestApplies(t *testing.T, h Harness) {
 	// A logs lookup without an apply ID reads only the newest apply for the
 	// database in the requested environment. An apply in another environment,
 	// however recent, is not it, and a database with no applies has none.
+	//
+	// Which apply is newest when ids and creation times disagree, or when two
+	// applies share a creation time, is covered in the dialect suites, which
+	// can set creation times directly.
 	t.Run("GetLatestByDatabase_ReturnsNewestInEnvironment", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -106,6 +110,31 @@ func TestApplies(t *testing.T, h Harness) {
 		none, err := store.Applies().GetLatestByDatabase(ctx, "no_such_db", "", "staging")
 		require.NoError(t, err)
 		assert.Nil(t, none)
+
+		// A database of another type can carry the same name. A newer apply
+		// there is the latest only for a lookup that does not name a type.
+		otherTypeLock := CreateLock(t, store, "latest_db", storage.DatabaseTypeVitess)
+		otherTypeID, err := store.Applies().Create(ctx, &storage.Apply{
+			ApplyIdentifier: "apply_latest_other_type",
+			LockID:          otherTypeLock.ID,
+			Database:        "latest_db",
+			DatabaseType:    storage.DatabaseTypeVitess,
+			Environment:     "staging",
+			State:           state.Apply.Completed,
+		})
+		require.NoError(t, err)
+
+		latestOfType, err := store.Applies().GetLatestByDatabase(ctx, "latest_db", "MySQL", "staging")
+		require.NoError(t, err)
+		require.NotNil(t, latestOfType)
+		assert.Equal(t, newer, latestOfType.ID)
+		assert.Equal(t, storage.DatabaseTypeMySQL, latestOfType.DatabaseType)
+
+		latestOfAnyType, err := store.Applies().GetLatestByDatabase(ctx, "latest_db", "", "staging")
+		require.NoError(t, err)
+		require.NotNil(t, latestOfAnyType)
+		assert.Equal(t, otherTypeID, latestOfAnyType.ID)
+		assert.Equal(t, storage.DatabaseTypeVitess, latestOfAnyType.DatabaseType)
 	})
 
 	// An operator walks the recent-applies list page by page, each page starting
