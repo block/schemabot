@@ -13,6 +13,7 @@
 - [Engine capability mapping](#engine-capability-mapping)
 - [Failure and recovery](#failure-and-recovery)
 - [Configuration and credentials](#configuration-and-credentials)
+- [Table ownership](#table-ownership)
 - [Supabase compatibility tests](#supabase-compatibility-tests)
 - [SchemaBot storage](#schemabot-storage)
 
@@ -342,7 +343,8 @@ A target configured with `table_owner` runs each create step with `SET LOCAL
 ROLE`, so the owner's default privileges apply to the table and its serial
 sequences. The connected engine role needs membership in that role (`GRANT
 app_owner TO engine`), and the owner needs `USAGE` and `CREATE` on the schema.
-Without `table_owner`, the connected role owns new tables as before. The
+Without `table_owner`, the connected role owns new tables as before; see
+[Table ownership](#table-ownership) for why that matters. The
 owner is checked at plan time as the role the create will run as: missing
 membership blocks the create step with the `GRANT` that provides it, and an
 owner the target has no role for blocks it with no grant to print.
@@ -758,6 +760,8 @@ the pinned roots would never be consulted.
 For apply, the target role must be able to connect to the database, use the
 target schema, and act as the table owner for in-place `ALTER TABLE`. A
 greenfield `CREATE TABLE` instead requires `CREATE` on the target schema.
+[Table ownership](#table-ownership) explains owner roles and how to
+provision them.
 SchemaBot checks the tier required by the exact planned statement and refuses
 before execution with specific provisioning advice when the role is
 insufficient.
@@ -771,6 +775,135 @@ but a role provisioned with only the apply-time privileges fails at plan time
 with a permission error on the database. A schema file that declares a foreign
 key also needs `SELECT` on each referenced table, because planning copies that
 table's shape.
+
+## Table ownership
+
+PostgreSQL gives every table exactly one owner: a role, initially whichever
+role ran `CREATE TABLE`. Ownership decides two things a schema change depends
+on:
+
+- **Who can change the table.** Only the owner, a member of the owner role, or
+  a superuser can `ALTER`, `DROP`, or index a table. No grant confers this.
+- **Who can use the table.** A new table is usable by its owner alone; every
+  other role needs a grant on that table. Default privileges
+  (`ALTER DEFAULT PRIVILEGES FOR ROLE app_owner ...`) issue those grants
+  automatically, but only for tables created by the role they name.
+
+MySQL has no equivalent. Its privileges attach to the database
+(`GRANT ... ON app.*`), so a new table is covered by the grants already in
+place no matter who created it, and any user with `ALTER` on the database can
+alter it. The nearest MySQL concept is the `DEFINER` of a view or stored
+routine. This is why `table_owner` is valid only on PostgreSQL targets.
+
+### What `table_owner` changes
+
+A common PostgreSQL layout separates the role that owns the tables
+(`app_owner`) from the role the service connects as (`app`) and a read-only
+role (`app_read_only`). Default privileges on `app_owner` give the other two
+access to every table it creates. SchemaBot connects as a role of its own,
+`schemabot` below, which is a member of `app_owner`:
+
+```
+                ┌───────────┐
+                │ schemabot │  SchemaBot's connected role
+                └─────┬─────┘
+                      │ member of
+                      ▼
+                ┌───────────┐  owns   ┌────────────────────────┐
+                │ app_owner │ ──────▶ │ app.orders, app.users  │
+                └─────┬─────┘         └────────────────────────┘
+                      │ default privileges
+                      ▼
+       ┌──────────────────────────────┐
+       │ app            read + write  │
+       │ app_read_only  read          │
+       └──────────────────────────────┘
+```
+
+A pull request adds an `orders` table to the `app` schema on a target set up
+this way:
+
+```
+Without table_owner                       With table_owner: app_owner
+
+┌───────────────────────────┐             ┌───────────────────────────┐
+│ CREATE TABLE orders       │             │ SET LOCAL ROLE app_owner  │
+│ runs as schemabot         │             │ CREATE TABLE orders       │
+└─────────────┬─────────────┘             └─────────────┬─────────────┘
+              │                                         │
+              ▼                                         ▼
+┌───────────────────────────┐             ┌───────────────────────────┐
+│ owner: schemabot          │             │ owner: app_owner          │
+│ app_owner's default       │             │ app_owner's default       │
+│ privileges don't fire     │             │ privileges fire           │
+└─────────────┬─────────────┘             └─────────────┬─────────────┘
+              │                                         │
+              ▼                                         ▼
+┌───────────────────────────┐             ┌───────────────────────────┐
+│ app: permission denied    │             │ app reads and writes      │
+│ for table orders     ✗    │             │ orders               ✓    │
+└───────────────────────────┘             └───────────────────────────┘
+```
+
+Without `table_owner`, `schemabot` owns `orders`, so the service's first query
+fails with `permission denied for table orders`. Anything that runs as
+`app_owner`, such as the service's own schema change tooling, also cannot
+alter or drop the table, and the schema is left with tables of two different
+owners.
+
+With `table_owner: app_owner`, each create step runs `SET LOCAL ROLE
+app_owner` inside its transaction. The table and its serial sequences are
+owned by `app_owner`, the default privileges grant the service roles access,
+and `schemabot` can still alter the table in later schema changes through its
+membership in `app_owner`. Indexes always belong to their table's owner, so
+they need nothing further.
+
+`table_owner` applies only to tables SchemaBot creates. A table that already
+exists keeps its owner, and default privileges never apply retroactively: a
+table created under the wrong owner needs `ALTER TABLE ... OWNER TO app_owner`
+and explicit `GRANT`s for the service roles.
+
+### Provisioning the roles
+
+SchemaBot does not create roles or default privileges; they belong to the
+database's own provisioning. For the layout above:
+
+```sql
+-- SchemaBot can SET ROLE to the owner for creates, and act as the owner
+-- for in-place ALTER TABLE.
+GRANT app_owner TO schemabot;
+
+-- The owner can create tables in the schema.
+GRANT USAGE, CREATE ON SCHEMA app TO app_owner;
+
+-- Tables and sequences app_owner creates are usable by the service roles.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT USAGE, SELECT ON SEQUENCES TO app;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
+  GRANT SELECT ON TABLES TO app_read_only;
+```
+
+Then set `table_owner: app_owner` on the target (see
+[configuration](configuration.md#postgresql-dsn_from-targets)). A missing
+membership or an owner role the target does not have blocks the create step
+at plan time, as described in [Greenfield tables](#greenfield-tables), so a
+misconfigured owner never reaches apply.
+
+### Checking ownership
+
+List the owner of every table in a schema:
+
+```sql
+SELECT tablename, tableowner
+FROM pg_tables
+WHERE schemaname = 'app'
+ORDER BY tablename;
+```
+
+Every row should name the owner role. In `psql`, `\dp app.orders` lists the
+table's grants, which should include each service role.
 
 ## Supabase compatibility tests
 
