@@ -52,7 +52,7 @@ func stdoutSupportsHyperlinks() bool {
 // so they cannot inject escapes on the plain path either.
 func Link(text, url string) string {
 	if !Hyperlinks || !osc8SafeURL(url) || containsControl(text) {
-		return stripControl(url)
+		return TerminalSafeLine(url)
 	}
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
@@ -77,9 +77,11 @@ func containsControl(s string) bool {
 	return strings.ContainsFunc(s, isControl)
 }
 
-// stripControl removes control runes so a value from a server response is
-// safe to print as plain terminal output.
-func stripControl(s string) string {
+// TerminalSafeLine is TerminalSafe for a value printed on one line, such as a
+// lock owner, an apply's caller, or a URL: the newline and the tab go with the
+// other control runes, so the value cannot start a line of its own under the
+// one it was printed on or push the rest of the row out of its column.
+func TerminalSafeLine(s string) string {
 	return strings.Map(func(r rune) rune {
 		if isControl(r) {
 			return -1
@@ -103,7 +105,8 @@ func isControl(r rune) bool {
 // screen, set the window title, plant a hyperlink, or reorder the text around
 // it. Newlines and tabs are kept because multi-line error messages rely on
 // them. Bytes that are not valid UTF-8 come out as U+FFFD, so the result is not
-// byte for byte the input.
+// byte for byte the input. A value that belongs on one line takes
+// TerminalSafeLine instead.
 func TerminalSafe(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {

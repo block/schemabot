@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ui"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -106,11 +107,15 @@ func showDeploymentLogs(endpoint, applyID, deployment string, scope client.LogSc
 		}
 	}
 	for _, sourceErr := range result.Errors {
-		fmt.Printf("Warning: %s: %s\n", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), sourceErr.Message)
+		fmt.Printf("Warning: %s: %s\n", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), ui.TerminalSafe(sourceErr.Message))
 	}
 	return nil
 }
 
+// deploymentLogSourceLabel names a data-plane log source for the line that
+// heads its entries or its warning. The target, the operation kinds and the
+// external ID all come from the response, so the label has its control runes
+// removed; deploymentFollowSourceKey, not this label, identifies the source.
 func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperationProvenance, externalID string) string {
 	if target == "" && len(operations) > 0 {
 		target = operations[0].Target
@@ -123,10 +128,11 @@ func deploymentLogSourceLabel(target string, operations []*apitypes.LogOperation
 			parts = append(parts, op.OperationKind)
 		}
 	}
+	label := strings.Join(parts, " / ") + " (" + externalID + ")"
 	if len(parts) == 1 && parts[0] == "" {
-		return externalID
+		label = externalID
 	}
-	return strings.Join(parts, " / ") + " (" + externalID + ")"
+	return ui.TerminalSafeLine(label)
 }
 
 // showLogs displays logs once and exits.
@@ -379,7 +385,7 @@ func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse)
 	var warnings []string
 	for _, sourceErr := range result.Errors {
 		key := deploymentFollowSourceKey(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID)
-		warning := fmt.Sprintf("%s: %s", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), sourceErr.Message)
+		warning := fmt.Sprintf("%s: %s", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), ui.TerminalSafe(sourceErr.Message))
 		if s.lastWarned[key] == warning {
 			// This exact failure was already reported; repeating it on every
 			// poll would drown the tail.
@@ -469,19 +475,22 @@ func followFailureOutcome(err error, failures int, pacing followPacing) (time.Du
 		return 0, fmt.Errorf("stopped following logs after %d consecutive failed polls; following logs does not affect the apply; run the same logs command again to keep following: %w", failures, err)
 	}
 	wait := pacing.retryWait(err, failures)
-	fmt.Fprintf(os.Stderr, "Warning: failed to fetch logs (attempt %d/%d), retrying in %s: %v\n",
-		failures, maxConsecutiveProgressFailures, wait, err)
+	fmt.Fprintf(os.Stderr, "Warning: failed to fetch logs (attempt %d/%d), retrying in %s: %s\n",
+		failures, maxConsecutiveProgressFailures, wait, ui.TerminalSafe(err.Error()))
 	return wait, nil
 }
 
-// printLogs formats and prints log entries.
+// printLogs formats and prints log entries. An entry's level, message and
+// states are relayed from the engine and the database, so control runes are
+// removed from them; the colors around the timestamp and the level are the
+// CLI's own and are added afterwards.
 func printLogs(logs []*client.LogEntry) {
 	for _, log := range logs {
 		// Format timestamp
 		ts := log.CreatedAt.Local().Format("15:04:05")
 
 		// Format level with color
-		level := formatLogLevel(log.Level)
+		level := formatLogLevel(ui.TerminalSafeLine(log.Level))
 
 		// Build the message
 		msg := log.Message
@@ -492,7 +501,7 @@ func printLogs(logs []*client.LogEntry) {
 		}
 
 		// Print formatted log line
-		fmt.Printf("%s%s%s %s %s\n", templates.ANSIDim, ts, templates.ANSIReset, level, msg)
+		fmt.Printf("%s%s%s %s %s\n", templates.ANSIDim, ts, templates.ANSIReset, level, ui.TerminalSafe(msg))
 	}
 }
 

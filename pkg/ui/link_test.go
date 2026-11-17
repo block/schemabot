@@ -193,6 +193,26 @@ func TestTerminalSafe(t *testing.T) {
 	}
 }
 
+// A value printed on one line, such as a lock owner, loses its line breaks
+// too: with them it could add a line that reads as the CLI's own.
+func TestTerminalSafeLine(t *testing.T) {
+	cases := map[string]struct {
+		in, want string
+	}{
+		"plain text is unchanged":             {"cli:jdoe@macbook.local", "cli:jdoe@macbook.local"},
+		"a newline is removed":                {"jdoe\n     PR:    acme/shop#1", "jdoe     PR:    acme/shop#1"},
+		"a tab is removed":                    {"jdoe\tadmin", "jdoeadmin"},
+		"an escape sequence is removed":       {"jdoe\x1b]0;owned\x07", "jdoe]0;owned"},
+		"a right-to-left override is removed": {"jdoe\u202enimda", "jdoenimda"},
+		"printable Unicode is kept":           {"josé · 👩\u200d💻", "josé · 👩\u200d💻"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, TerminalSafeLine(tc.in))
+		})
+	}
+}
+
 func TestPadVisible(t *testing.T) {
 	t.Run("pads plain text to the requested cell count", func(t *testing.T) {
 		assert.Equal(t, "ab   ", PadVisible("ab", 5))
