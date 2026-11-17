@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.5
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
-	github.com/block/mysql v0.0.0-20261110174027-9d0d79e18242
+	github.com/block/mysql v0.0.0-20261116155036-06749ae6a01b
 	github.com/block/pg-sprite v0.4.1
 	github.com/block/spirit v0.20.1-0.20261116063139-3cd7b8da1420
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0

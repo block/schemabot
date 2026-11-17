@@ -169,9 +169,8 @@ func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (
 }
 
 // ConnectionDSN returns a MySQL DSN with required connection settings applied
-// (RDS TLS, client-side parameter interpolation, default transport timeouts,
-// and a signed TINYINT(1) read as the number it holds rather than as a Go
-// bool), plus any caller-supplied options (for example WithConnectTimeout).
+// (RDS TLS, client-side parameter interpolation, and default transport
+// timeouts), plus any caller-supplied options (for example WithConnectTimeout).
 // Settings and options are applied on every return path so they take effect
 // regardless of whether the DSN also needs RDS TLS enhancement.
 func ConnectionDSN(dsn string, opts ...Option) (string, error) {
@@ -262,18 +261,6 @@ func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) (string, error) {
 	}
 	if cfg.WriteTimeout <= 0 {
 		cfg.WriteTimeout = defaultWriteTimeout
-	}
-	// Read a signed TINYINT(1) as the number it is rather than as a Go bool,
-	// which the driver does by default. The (1) is a display width, not a
-	// range: the column holds -128..127, so the mapping answers true for every
-	// non-zero value and the stored number is gone before the caller sees it.
-	// SchemaBot's own boolean columns are unharmed — they hold 0 or 1 and
-	// database/sql converts the number back on a bool scan, which now also
-	// rejects a value no bool can represent instead of reading it as true. The
-	// setting matters for target databases, whose tinyint(1) columns are
-	// application data this package must hand back unaltered.
-	if err := cfg.Apply(mysql.TinyInt1IsBool(false)); err != nil {
-		return "", fmt.Errorf("disable TINYINT(1) bool mapping: %w", err)
 	}
 	// Interpolate query parameters client-side instead of using server-side
 	// prepared statements. database/sql prepares, executes once, and closes on
