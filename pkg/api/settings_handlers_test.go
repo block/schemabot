@@ -178,10 +178,28 @@ func TestSettingsSetRefusesUnknownFieldsAndComponentStateKeys(t *testing.T) {
 		assert.Empty(t, store.setKeys, "the reconciler's cursor is left alone")
 	})
 
-	t.Run("a non-admin is refused as unauthorized before the key is checked", func(t *testing.T) {
-		rec, store := set(t, operator, `{"key":"`+cursorKey+`","value":"{\"page\":1}"}`)
+	t.Run("a component-state key in another letter case is refused", func(t *testing.T) {
+		rec, store := set(t, admin, `{"key":"WEBHOOK_RECONCILE_SCAN_CURSOR:octo/payments","value":"{\"page\":1}"}`)
 
-		assert.Equal(t, http.StatusForbidden, rec.Code)
-		assert.Empty(t, store.setKeys)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "cannot be set through the settings API")
+		assert.Empty(t, store.setKeys, "storage that ignores letter case would write the reconciler's cursor")
+	})
+
+	t.Run("a key with a character outside printable ASCII is refused", func(t *testing.T) {
+		rec, store := set(t, admin, `{"key":"pause_appliés","value":"true"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "must contain only printable ASCII characters")
+		assert.Empty(t, store.setKeys, "storage could treat the key as naming another key's row")
+	})
+
+	t.Run("a non-admin is refused as unauthorized before the key is checked", func(t *testing.T) {
+		for _, key := range []string{cursorKey, "pause_appliés"} {
+			rec, store := set(t, operator, `{"key":"`+key+`","value":"{\"page\":1}"}`)
+
+			assert.Equal(t, http.StatusForbidden, rec.Code, key)
+			assert.Empty(t, store.setKeys, key)
+		}
 	})
 }

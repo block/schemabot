@@ -90,6 +90,17 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Storage can treat a key with an accented or full-width letter, or an
+	// invisible character, as naming another key's row. Printable ASCII keys
+	// differ to storage only by letter case, which the check below allows for.
+	if !storage.IsPrintableASCIISettingKey(req.Key) {
+		s.logger.Warn("refused settings write to a key with characters outside printable ASCII", "key", req.Key,
+			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
+		s.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("setting key %q must contain only printable ASCII characters", req.Key))
+		return
+	}
+
 	// Component-state rows share the settings table but belong to the
 	// component that writes them; an operator value there would silently
 	// steer that component, so the API reads them but never writes them.

@@ -742,6 +742,33 @@ func TestIsComponentStateSettingKey(t *testing.T) {
 	assert.False(t, IsComponentStateSettingKey("spirit_debug_logs"))
 	assert.False(t, IsComponentStateSettingKey("octo/"+WebhookReconcileScanCursorSettingKeyPrefix+"repo"),
 		"the namespace is a prefix, not a substring")
+	assert.True(t, IsComponentStateSettingKey("WEBHOOK_RECONCILE_SCAN_CURSOR:octo/payments"),
+		"storage that ignores letter case keeps this key in the reconciler's row")
+	assert.True(t, IsComponentStateSettingKey("Webhook_Reconcile_Scan_Cursor:Octo/Payments"))
+	assert.False(t, IsComponentStateSettingKey("WEBHOOK_RECONCILE_SCAN_CURSOR"),
+		"without the separator the key is an operator's in any letter case")
+}
+
+// A setting key is safe to compare in Go only while it stays within printable
+// ASCII: every character from space to tilde, and nothing else.
+func TestIsPrintableASCIISettingKey(t *testing.T) {
+	assert.True(t, IsPrintableASCIISettingKey("spirit_debug_logs"))
+	assert.True(t, IsPrintableASCIISettingKey(WebhookReconcileScanCursorSettingKeyPrefix+"octo/payments"))
+	assert.True(t, IsPrintableASCIISettingKey(" ~"), "space and tilde are the first and last printable characters")
+	assert.True(t, IsPrintableASCIISettingKey(""), "an empty key has no character outside the range")
+
+	notPrintableASCII := map[string]string{
+		"an accented letter":             "spirit_débug_logs",
+		"a full-width letter":            "ｓpirit_debug_logs",
+		"a soft hyphen":                  "spirit\u00ad_debug_logs",
+		"a tab":                          "spirit\tdebug_logs",
+		"a NUL byte":                     "spirit\x00debug_logs",
+		"the delete character":           "spirit\x7fdebug_logs",
+		"a byte that is not valid UTF-8": "spirit\xffdebug_logs",
+	}
+	for name, key := range notPrintableASCII {
+		assert.False(t, IsPrintableASCIISettingKey(key), name)
+	}
 }
 
 // A task spanning the whole table carries the plan's estimate, copied so the
