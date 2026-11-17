@@ -40,6 +40,14 @@ func WriteLockKept(database, dbType, reason string) {
 	fmt.Printf("   Release it once nothing is left to run: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
+// WriteUnsubmittedLockKept writes the message when the lock a command took
+// for a schema change it never submitted could not be released. Nothing runs
+// under the lock, so the second line says it can be released now.
+func WriteUnsubmittedLockKept(database, dbType string, releaseErr error) {
+	fmt.Printf("🔒 Lock kept for %s (%s): the server did not release it (%v).\n", database, dbType, releaseErr)
+	fmt.Printf("   Nothing was submitted, so release it now: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
+}
+
 // WriteLockForceReleased writes the force release message.
 func WriteLockForceReleased(database, dbType, previousOwner string) {
 	fmt.Printf(glyph.Attention+"  Force released lock for %s (%s)\n", database, dbType)

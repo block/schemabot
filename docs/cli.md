@@ -595,7 +595,11 @@ attention refuses the apply first. So after you fix a target that needed
 attention and plan again, the plan can still list a target the apply refuses.
 
 A database lock can also block a new apply. Inspect the owner and ongoing
-work before releasing it. Locks span the database's environments; forcing
+work before releasing it. `apply` and `rollback` release a lock they took
+themselves when the schema change was never submitted: the server refused it,
+or you pressed Ctrl-C before it was sent. A server error or a lost connection
+leaves it unknown whether the apply started, so the lock stays held. A lock
+you already held before the command started also stays held. Locks span the database's environments; forcing
 one away from its owner is an administrative action, not a routine retry.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
 response, and [access rules](auth.md#what-read-and-write-access-include) for

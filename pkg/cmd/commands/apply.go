@@ -269,6 +269,10 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		return stoppedBeforeSubmit(ctx, "apply")
 	}
 
+	// lockCreated is set when this command's acquire took the lock rather than
+	// finding it already held under this owner, so only a lock this command
+	// took is released when its apply is never submitted.
+	var lockCreated bool
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
@@ -293,7 +297,8 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 		// Acquire the lock
 		err = withLoading("Acquiring database lock...", cmd.Output != OutputFormatJSON, func() error {
-			_, lockErr := client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+			var lockErr error
+			_, lockCreated, lockErr = client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
 			return lockErr
 		})
 		if errors.Is(err, client.ErrLockHeld) {
@@ -335,6 +340,9 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// without having listed it is refused by POST /api/apply instead.
 	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
+		if lockCreated && neverSubmitted(err) {
+			return releaseUnsubmittedLock(ep, cfg.Database, cfg.Type, owner, err)
+		}
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
 			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
 		}
