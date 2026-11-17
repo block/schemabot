@@ -338,7 +338,7 @@ func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclus
 }
 
 // aggregateSummary builds a human-readable title and markdown summary for the aggregate check.
-func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs) (title, summary string) {
+func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs, progress rolloutProgress) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
 		if allChecksAreUpToDate(checks) {
@@ -346,10 +346,10 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		} else {
 			title = "All applies complete"
 		}
-		summary = buildAggregateTable(checks, stopped)
+		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionFailure:
 		title = "Apply failed"
-		summary = buildAggregateTable(checks, stopped)
+		summary = buildAggregateTable(checks, stopped, progress)
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
@@ -420,7 +420,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		if pending > 0 && stoppedApplies > 0 {
 			title = fmt.Sprintf("%s (%d stopped)", title, stoppedApplies)
 		}
-		summary = buildAggregateTable(checks, stopped)
+		summary = buildAggregateTable(checks, stopped, progress)
 	default:
 		// in_progress — conclusion is empty
 		inProgress := 0
@@ -452,11 +452,11 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		case paused > 0:
 			title = fmt.Sprintf("Apply in progress (%d stopped)", paused)
 		case inProgress == 1:
-			title = "Apply in progress" + rolloutTargetsPhrase(inProgressCheck)
+			title = "Apply in progress" + rolloutTargetsPhrase(inProgressCheck) + rolloutDoneSuffix(inProgressCheck, progress)
 		default:
 			title = "Apply in progress"
 		}
-		summary = buildAggregateTable(checks, stopped)
+		summary = buildAggregateTable(checks, stopped, progress)
 	}
 	return title, summary
 }
@@ -538,7 +538,7 @@ func isParticipantCheck(c *storage.Check) bool {
 // so the Tenant deployments section is rendered first and its size reserved: it
 // is never dropped, even when many per-database rows would otherwise fill the
 // Check Run text limit — those rows truncate instead.
-func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs) string {
+func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs, progress rolloutProgress) string {
 	var dbChecks, participantChecks []*storage.Check
 	for _, c := range checks {
 		if isParticipantCheck(c) {
@@ -549,10 +549,12 @@ func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs) strin
 	}
 
 	tenantSection := renderParticipantSection(participantChecks)
-	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection), stopped)
+	progressSection := renderRolloutProgress(dbChecks, progress, stopped)
+	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection)-len(progressSection), stopped, progress)
 
 	var sb strings.Builder
 	sb.WriteString(dbSection)
+	sb.WriteString(progressSection)
 	if tenantSection != "" {
 		if sb.Len() > 0 {
 			sb.WriteString("\n")
@@ -580,7 +582,7 @@ func changeSummaryLabel(c *storage.Check) string {
 // environments into one table, so an Environment column is added when the rows
 // span more than one environment — otherwise staging and production rows for the
 // same database would be indistinguishable.
-func renderDatabaseSection(dbChecks []*storage.Check, budget int, stopped stoppedApplyIDs) string {
+func renderDatabaseSection(dbChecks []*storage.Check, budget int, stopped stoppedApplyIDs, progress rolloutProgress) string {
 	if len(dbChecks) == 0 {
 		return ""
 	}
@@ -596,9 +598,9 @@ func renderDatabaseSection(dbChecks []*storage.Check, budget int, stopped stoppe
 	for i, c := range dbChecks {
 		var row string
 		if showEnv {
-			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped))
+			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped, progress))
 		} else {
-			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped))
+			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped, progress))
 		}
 		if sb.Len()+len(row) > budget {
 			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
@@ -634,7 +636,7 @@ func renderParticipantSection(participantChecks []*storage.Check) string {
 	sb.WriteString("| Tenant | Status |\n")
 	sb.WriteString("|--------|--------|\n")
 	for i, c := range participantChecks {
-		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c, nil))
+		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c, nil, nil))
 		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
 			fmt.Fprintf(&sb, "\n... and %d more tenant(s)\n", len(participantChecks)-i)
 			break
@@ -656,7 +658,7 @@ func allChecksAreUpToDate(checks []*storage.Check) bool {
 	return true
 }
 
-func checkStatusLabel(c *storage.Check, stopped stoppedApplyIDs) string {
+func checkStatusLabel(c *storage.Check, stopped stoppedApplyIDs, progress rolloutProgress) string {
 	if c.Status == checkStatusCompleted && c.Conclusion == checkConclusionSuccess && !c.HasChanges {
 		return "Up to date"
 	}
@@ -670,6 +672,9 @@ func checkStatusLabel(c *storage.Check, stopped stoppedApplyIDs) string {
 			return "Waiting to report"
 		}
 		return "Not reported"
+	}
+	if c.Status == checkStatusInProgress {
+		return rolloutStatusLabel(c, progress)
 	}
 	return conclusionEmoji(c.Status, c.Conclusion)
 }

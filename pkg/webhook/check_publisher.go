@@ -604,7 +604,9 @@ func prFilePaths(files []ghclient.PRFile) []string {
 // and with nothing serializing folds for a PR, a fold that read the older state
 // can be the last to publish. So once a fold that consulted the stopped set has
 // published, the set is read again, and if it moved the aggregate is folded
-// once more from the current state.
+// once more from the current state. A rollout's target counts are re-read the
+// same way, so a target that finishes while the fold publishes is not left
+// out of the counts the run shows.
 func (h *Handler) upsertAggregateCheckRunOnce(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,
@@ -624,13 +626,27 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			"environment", environment, "head_sha", headSHA, "error", err)
 		return nil
 	}
-	if maps.Equal(current, folded.stopped) {
+	if !maps.Equal(current, folded.stopped) {
+		h.logger.Info("re-folding aggregate check: an apply stopped or started again while the fold published",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA,
+			"folded_stopped_applies", len(folded.stopped), "current_stopped_applies", len(current))
+		_, err = h.foldAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
+		return err
+	}
+	currentProgress, err := h.loadRolloutProgress(ctx, folded.contributions)
+	if err != nil {
+		h.logger.Warn("aggregate check not re-checked against the rollout's target counts; the published counts stand until the next fold",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA, "error", err)
 		return nil
 	}
-	h.logger.Info("re-folding aggregate check: an apply stopped or started again while the fold published",
+	if maps.Equal(currentProgress, folded.progress) {
+		return nil
+	}
+	h.logger.Info("re-folding aggregate check: a rollout target moved while the fold published",
 		"repo", repo, "pr", pr, "check_name", checkName,
-		"environment", environment, "head_sha", headSHA,
-		"folded_stopped_applies", len(folded.stopped), "current_stopped_applies", len(current))
+		"environment", environment, "head_sha", headSHA)
 	_, err = h.foldAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
 	return err
 }
@@ -641,6 +657,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 type aggregateFold struct {
 	contributions []*storage.Check
 	stopped       stoppedApplyIDs
+	progress      rolloutProgress
 }
 
 // foldAggregateCheckRun folds the given checks into one aggregate and publishes
@@ -715,7 +732,8 @@ func (h *Handler) foldAggregateCheckRun(
 			ownContributions = append(ownContributions, contribution)
 		}
 	}
-	title, summary := aggregateSummary(ownContributions, conclusion, stopped)
+	progress := h.rolloutProgressForPR(ctx, repo, pr, ownContributions)
+	title, summary := aggregateSummary(ownContributions, conclusion, stopped, progress)
 	if notice := prerequisiteSummary(contributions, h.aggregateCheckNameForRepo(repo), repo, headSHA); notice != "" {
 		title = "Waiting for prerequisite environments"
 		summary = appendPrerequisiteSummary(summary, notice)
@@ -900,7 +918,7 @@ func (h *Handler) foldAggregateCheckRun(
 		"environment", environment, "check_run_id", checkRunID,
 		"check_status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
-	return aggregateFold{contributions: contributions, stopped: stopped}, nil
+	return aggregateFold{contributions: contributions, stopped: stopped, progress: progress}, nil
 }
 
 // rewindsConcludedCheckRun reports whether publishing the recomputed status to

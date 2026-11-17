@@ -4030,6 +4030,17 @@ Apply in progress on 3 of 4 targets
 |----------|------|--------|--------|
 | `orders` | mysql | 1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004` | In progress |
 
+
+**Once shop-001 finishes**
+
+Apply in progress on 3 of 4 targets: 1 done
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | 1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004` | In progress · 1 of 3 done |
+
+- `orders` targets: 3 (1 in progress, 1 queued, 1 complete) · [progress](https://github.com/octocat/shop/pull/12#issuecomment-4242)
+
 </details>
 
 ## Locking

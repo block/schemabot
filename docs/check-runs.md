@@ -1157,6 +1157,18 @@ When the apply reaches a terminal state:
   publish fails, the run keeps saying the apply is stopped until the next
   aggregate publish for the PR; merge stays blocked either way.
 
+While an apply across several targets runs, SchemaBot republishes the
+aggregate each time one more target finishes, at most as often as it edits the
+progress comment. The title and the database row count the finished targets
+("Apply in progress on all 32 targets: 5 done"), and a line under the table
+counts every target by state and links the progress comment. The counts are
+read from the apply's stored operations and never change the Check Run's status
+or conclusion. If they cannot be read, the Check Run is published without them.
+An apply can finish while one of these refreshes publishes, so the refresh
+reads the stored check state again once it has published, and publishes once
+more if the apply has settled. That keeps the refresh's in-progress run from
+being the last one GitHub shows.
+
 Completion is conditional on ownership: the watcher can only update the row if
 the row still represents that `apply_id` and no newer apply exists for the same
 PR/environment/database.
