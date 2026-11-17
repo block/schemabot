@@ -1574,33 +1574,31 @@ func RecordSchemaRequestError(ctx context.Context, repo, command, database, envi
 const (
 	gitHubMetricValueUnknown = "unknown"
 
-	GitHubOperationAddCommentReaction             = "add_comment_reaction"
-	GitHubOperationCreateCheckRun                 = "create_check_run"
-	GitHubOperationCreateIssueComment             = "create_issue_comment"
-	GitHubOperationCreateInstallationAccessToken  = "create_installation_access_token"
-	GitHubOperationDeleteIssueComment             = "delete_issue_comment"
-	GitHubOperationEditIssueComment               = "edit_issue_comment"
-	GitHubOperationFetchAppSlug                   = "fetch_app_slug"
-	GitHubOperationFetchBlob                      = "fetch_blob"
-	GitHubOperationFetchDiff                      = "fetch_diff"
-	GitHubOperationFetchFileContent               = "fetch_file_content"
-	GitHubOperationFetchGitTree                   = "fetch_git_tree"
-	GitHubOperationFetchPullRequest               = "fetch_pull_request"
-	GitHubOperationGetBranchRules                 = "get_branch_rules"
-	GitHubOperationGetCombinedStatus              = "get_combined_status"
-	GitHubOperationGetPullRequestReviewProtection = "get_pull_request_review_protection"
-	GitHubOperationGetTeam                        = "get_team"
-	GitHubOperationGetTeamMembership              = "get_team_membership"
-	GitHubOperationGraphQLMinimizeComment         = "graphql_minimize_comment"
-	GitHubOperationGraphQLStatusCheckRollup       = "graphql_status_check_rollup"
-	GitHubOperationGraphQLTreeEntries             = "graphql_tree_entries"
-	GitHubOperationListCheckRunsForRef            = "list_check_runs_for_ref"
-	GitHubOperationListPRFiles                    = "list_pr_files"
-	GitHubOperationListReviews                    = "list_reviews"
-	GitHubOperationListTeamMembers                = "list_team_members"
-	GitHubOperationRequestReviewers               = "request_reviewers"
-	GitHubOperationUnknown                        = gitHubMetricValueUnknown
-	GitHubOperationUpdateCheckRun                 = "update_check_run"
+	GitHubOperationAddCommentReaction            = "add_comment_reaction"
+	GitHubOperationCreateCheckRun                = "create_check_run"
+	GitHubOperationCreateIssueComment            = "create_issue_comment"
+	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
+	GitHubOperationEditIssueComment              = "edit_issue_comment"
+	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
+	GitHubOperationFetchBlob                     = "fetch_blob"
+	GitHubOperationFetchDiff                     = "fetch_diff"
+	GitHubOperationFetchFileContent              = "fetch_file_content"
+	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchPullRequest              = "fetch_pull_request"
+	GitHubOperationGetCombinedStatus             = "get_combined_status"
+	GitHubOperationGetTeam                       = "get_team"
+	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
+	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
+	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
+	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
+	GitHubOperationListPRFiles                   = "list_pr_files"
+	GitHubOperationListReviews                   = "list_reviews"
+	GitHubOperationListTeamMembers               = "list_team_members"
+	GitHubOperationRequestReviewers              = "request_reviewers"
+	GitHubOperationUnknown                       = gitHubMetricValueUnknown
+	GitHubOperationUpdateCheckRun                = "update_check_run"
 )
 
 const (
@@ -1792,9 +1790,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
 		GitHubOperationFetchPullRequest,
-		GitHubOperationGetBranchRules,
 		GitHubOperationGetCombinedStatus,
-		GitHubOperationGetPullRequestReviewProtection,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
@@ -2007,8 +2003,8 @@ var knownWebhookInboxStates = func() map[string]bool {
 //
 // One caveat on pending: a row created with a not-before time sits in pending
 // by design until it becomes due, so steady nonzero pending depth alone does
-// not imply dispatch lag — cross-check the oldest-claimable-age gauge, which
-// counts only dispatchable rows.
+// not imply dispatch lag — use claimable depth and oldest claimable age,
+// which count only dispatchable rows.
 func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 	if !knownWebhookInboxStates[state] {
 		state = "unknown"
@@ -2017,6 +2013,17 @@ func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 		"Number of durable webhook inbox rows by state", "{row}",
 		EnvironmentAttribute(""),
 		attribute.String("state", state),
+	)
+}
+
+// RecordWebhookInboxClaimableDepth records rows ready for a worker now, excluding
+// scheduled work, active leases and exhausted retries. A sustained rise means
+// workers are not keeping up; inspect worker health and claim/storage errors.
+// Replicas observe the same inbox, so aggregate with max rather than sum.
+func RecordWebhookInboxClaimableDepth(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.webhook.inbox_claimable_depth", count,
+		"Number of durable webhook inbox rows ready to claim", "{row}",
+		EnvironmentAttribute(""),
 	)
 }
 
@@ -2174,15 +2181,19 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 
 // RecordWebhookReconcileMissingEvent counts open PR heads the webhook
 // reconciler found without a live inbox delivery — no row at all, or only
-// rows that cannot attest coverage (plain-failed synthesized rows, or
-// superseded rows whose work was discarded by claim-time coalescing). A
-// dead-lettered row or a plain-failed organic row covers its head, so neither
-// counts as missing (the dead-letter is deliberately terminal; the organic
-// failure has GitHub Redeliver as its lever). A nonzero rate usually means
+// rows that cannot attest coverage (plain-failed synthesized rows, organic
+// rows that failed longer ago than storage.WebhookEventFailedCoverageCoolOff,
+// or superseded rows whose work was discarded by claim-time coalescing). A
+// dead-lettered row covers its head, as does a plain-failed organic row
+// within the cool-off, so neither counts as missing (the dead-letter is
+// deliberately terminal; the organic failure has GitHub Redeliver as its
+// lever until the cool-off passes). A nonzero rate usually means
 // deliveries are being lost upstream of the inbox (edge auth, GitHub send
-// failures), but a head covered only by superseded rows is a
-// coalescing-created miss with no upstream loss — check the superseded
-// dispatch outcome for the repo before blaming delivery. With synthesis
+// failures), but two causes involve no upstream loss. A head covered only by
+// superseded rows is a coalescing-created miss — check the superseded
+// dispatch outcome for the repo before blaming delivery. A head whose
+// organic row failed longer ago than the cool-off reached the inbox and
+// failed inside it — read that row's last_error. With synthesis
 // enabled each miss also triggers a recovery delivery, counted by
 // RecordWebhookReconcileSynthesizedEvent.
 func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
@@ -2194,11 +2205,13 @@ func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 
 // RecordWebhookReconcileSynthesizedEvent counts inbox deliveries the webhook
 // reconciler synthesized for open PR heads whose organic delivery never
-// reached the inbox. Each synthesized delivery re-plans the PR through the
-// durable dispatch path. The outcome attribute separates recovery from
-// thrash: "first" is the healthy case — a genuinely lost delivery recovered
-// once, so investigate the upstream loss (edge auth, GitHub send failures)
-// rather than the recovery — while "resynthesis" means a previously
+// reached the inbox, or failed and stayed failed past
+// storage.WebhookEventFailedCoverageCoolOff. Each synthesized delivery
+// re-plans the PR through the durable dispatch path. The outcome attribute
+// separates recovery from thrash: "first" is the healthy case — a head
+// recovered once, so investigate the upstream loss (edge auth, GitHub send
+// failures) or the organic row's last_error rather than the recovery —
+// while "resynthesis" means a previously
 // synthesized row terminally failed or was superseded and was reopened, so a
 // sustained resynthesis rate is the same head repeatedly failing or being
 // discarded after recovery — investigate that head's processing, not

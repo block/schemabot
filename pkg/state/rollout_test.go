@@ -413,3 +413,77 @@ func TestDeriveRolloutApplyState_StopWaitsForWorkUnderWay(t *testing.T) {
 	assert.Equal(t, Apply.Stopped, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Completed, ApplyOperation.Completed, ApplyOperation.Stopped))),
 		"completed targets hold nothing, so only the stopped work remains")
 }
+
+// TestDeriveRolloutApplyState_StartedRolloutStaysRunning verifies that a
+// rollout across payments-001..003 reads pending only until any of its work
+// has started. Once payments-001 has completed, or parked at the cutover gate,
+// the parent reads running while the rest wait to be claimed: there is no
+// moment between one target finishing and the next being claimed in which a
+// half-finished rollout reads as not started.
+func TestDeriveRolloutApplyState_StartedRolloutStaysRunning(t *testing.T) {
+	cases := []struct {
+		name string
+		ops  []RolloutOperation
+		want string
+	}{
+		{
+			name: "nothing started",
+			ops:  []RolloutOperation{rolloutShard("payments-001", "-", ApplyOperation.Pending), rolloutShard("payments-002", "-", ApplyOperation.Pending)},
+			want: Apply.Pending,
+		},
+		{
+			name: "one target completed, the rest queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.Completed),
+				rolloutShard("payments-002", "-", ApplyOperation.Pending),
+				rolloutShard("payments-003", "-", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			name: "work completed, finalizer queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-80", ApplyOperation.Completed),
+				rolloutShard("payments-001", "80-", ApplyOperation.Completed),
+				rolloutFinalizer("payments-001", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			name: "one target parked at the cutover gate, the rest queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForCutover),
+				rolloutShard("payments-002", "-", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			// A deferred deploy reads waiting_for_deploy only once every target
+			// is ready, so /start stays refused while the rest are still queued.
+			name: "one target waiting for deploy, the rest queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForDeploy),
+				rolloutShard("payments-002", "-", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			name: "every target waiting for deploy",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForDeploy),
+				rolloutShard("payments-002", "-", ApplyOperation.WaitingForDeploy),
+			},
+			want: Apply.WaitingForDeploy,
+		},
+		{
+			name: "every target completed",
+			ops:  []RolloutOperation{rolloutShard("payments-001", "-", ApplyOperation.Completed), rolloutShard("payments-002", "-", ApplyOperation.Completed)},
+			want: Apply.Completed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(RolloutChildren(tc.ops)))
+		})
+	}
+}

@@ -127,6 +127,48 @@ func TestStorageTargetForFoldsHostCase(t *testing.T) {
 	}
 }
 
+// Two checks decide whether two MySQL DSNs name one storage database: the
+// config's check of schema_dsn against the pool's DSN, and this package's
+// check of a re-resolved DSN against the database the server booted on. They
+// must give the same answer for every pair, or a schema DSN accepted at boot
+// could be refused on the next resolution, or the reverse.
+func TestSchemaDSNCheckAgreesWithBootTargetCheck(t *testing.T) {
+	tests := []struct {
+		name      string
+		poolDSN   string
+		schemaDSN string
+		wantSame  bool
+	}{
+		{name: "only credentials differ", poolDSN: "rw:pw@tcp(db.example:3306)/schemabot", schemaDSN: "ddl:other@tcp(db.example:3306)/schemabot", wantSame: true},
+		{name: "host recased", poolDSN: "rw:pw@tcp(DB.Example:3306)/schemabot", schemaDSN: "ddl:pw@tcp(db.example:3306)/schemabot", wantSame: true},
+		{name: "default port spelled out", poolDSN: "rw:pw@tcp(db.example)/schemabot", schemaDSN: "ddl:pw@tcp(db.example:3306)/schemabot", wantSame: true},
+		{name: "IPv6 host recased", poolDSN: "rw:pw@tcp([FE80::1]:3306)/schemabot", schemaDSN: "ddl:pw@tcp([fe80::1]:3306)/schemabot", wantSame: true},
+		{name: "only parameters differ", poolDSN: "rw:pw@tcp(db.example:3306)/schemabot?parseTime=true", schemaDSN: "ddl:pw@tcp(db.example:3306)/schemabot", wantSame: true},
+		{name: "other host", poolDSN: "rw:pw@tcp(db.example:3306)/schemabot", schemaDSN: "ddl:pw@tcp(replica.example:3306)/schemabot"},
+		{name: "other port", poolDSN: "rw:pw@tcp(db.example:3306)/schemabot", schemaDSN: "ddl:pw@tcp(db.example:3307)/schemabot"},
+		{name: "other database", poolDSN: "rw:pw@tcp(db.example:3306)/schemabot", schemaDSN: "ddl:pw@tcp(db.example:3306)/other"},
+		{name: "database recased", poolDSN: "rw:pw@tcp(db.example:3306)/schemabot", schemaDSN: "ddl:pw@tcp(db.example:3306)/SchemaBot"},
+		{name: "loopback name and address", poolDSN: "rw:pw@tcp(localhost:3306)/schemabot", schemaDSN: "ddl:pw@tcp(127.0.0.1:3306)/schemabot"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poolTarget, err := storageTargetFor(schema.DialectMySQL, tc.poolDSN)
+			require.NoError(t, err)
+			schemaTarget, err := storageTargetFor(schema.DialectMySQL, tc.schemaDSN)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantSame, poolTarget == schemaTarget, "boot target check")
+
+			cfg := api.ServerConfig{Storage: api.StorageConfig{SchemaDSN: tc.schemaDSN}}
+			_, err = cfg.StorageSchemaDSNFor(tc.poolDSN)
+			if tc.wantSame {
+				assert.NoError(t, err, "schema_dsn check")
+				return
+			}
+			assert.ErrorContains(t, err, "both must name the same storage database", "schema_dsn check")
+		})
+	}
+}
+
 // Only the host folds. A database name is case sensitive on both engines this
 // serves, so two names differing in case are two databases, and folding them
 // would let a reload follow a secret rewritten to a database nothing

@@ -251,6 +251,25 @@ func TestSettleRunnerError(t *testing.T) {
 	}
 }
 
+// A stop that lands while Spirit drops a leftover table after the change has
+// applied, and cannot confirm that the DROP ended on the server, still settles
+// the change as finished. The engine records the DROP's session, so the next
+// start on the database waits for it to leave the server.
+func TestSettleRunnerErrorRecordsACleanupDropThatMayStillRun(t *testing.T) {
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	eng.runningSchemaChange = &runningSchemaChange{database: "app", state: engine.StateStopped, host: "db-1:3306", username: "schemabot"}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	runErr := fmt.Errorf("run Spirit: %w", &dbconn.CancelledStatementError{ConnID: 4242, Err: context.Canceled})
+
+	err := eng.settleRunnerError(ctx, runErr, status.WorkflowResult{DurableMutation: true}, "app", []string{"orders"})
+
+	require.NoError(t, err, "the applied change settles as finished")
+	assert.True(t, eng.CancelledStatementMayStillRun())
+	assert.Equal(t, []unconfirmedStatement{{host: "db-1:3306", username: "schemabot", database: "app", connID: 4242}}, eng.unconfirmedStatements,
+		"the record names the target and the DROP's session")
+}
+
 // A row the copy cannot write into the new table definition fails every
 // attempt the same way, because every attempt copies the same rows into the
 // same definition. Those failures are permanent; what a retry can clear — a
@@ -476,4 +495,37 @@ func TestFailedProgressReportsAHeldTarget(t *testing.T) {
 			assert.Equal(t, tc.held, drained.TargetHeld, "drained progress")
 		})
 	}
+}
+
+// A stopped run reports a statement as possibly still running only when Spirit
+// could not confirm that the statement ended on the server. The record names
+// the statement's session, and a later stop that Spirit did confirm leaves it
+// in place.
+func TestNoteStoppedStatementRecordsAnUnconfirmedEnd(t *testing.T) {
+	eng := New(Config{Logger: slog.Default()})
+
+	eng.noteStoppedStatement(slog.Default(), "orders_db", fmt.Errorf("run Spirit: %w", context.Canceled))
+	assert.False(t, eng.CancelledStatementMayStillRun(), "a stop Spirit confirmed leaves nothing running")
+
+	eng.noteStoppedStatement(slog.Default(), "orders_db",
+		fmt.Errorf("run Spirit: %w", &dbconn.CancelledStatementError{ConnID: 7, Err: context.Canceled}))
+	assert.True(t, eng.CancelledStatementMayStillRun(), "an unconfirmed end may leave the statement running")
+
+	eng.noteStoppedStatement(slog.Default(), "orders_db", context.Canceled)
+	assert.True(t, eng.CancelledStatementMayStillRun(), "a later confirmed stop does not clear an earlier unconfirmed one")
+	assert.Equal(t, []unconfirmedStatement{{database: "orders_db", connID: 7}}, eng.unconfirmedStatements,
+		"the record names the database and the session to check")
+}
+
+// A statement recorded without its target matches every target, and one with a
+// target matches only that target's database.
+func TestUnconfirmedStatementMatches(t *testing.T) {
+	unknownHost := unconfirmedStatement{database: "orders_db", connID: 7}
+	assert.True(t, unknownHost.matches("db-1:3306", "orders_db"))
+	assert.True(t, unknownHost.matches("db-2:3306", "orders_db"))
+	assert.False(t, unknownHost.matches("db-1:3306", "payments_db"))
+
+	known := unconfirmedStatement{host: "db-1:3306", database: "orders_db", connID: 7}
+	assert.True(t, known.matches("db-1:3306", "orders_db"))
+	assert.False(t, known.matches("db-2:3306", "orders_db"))
 }

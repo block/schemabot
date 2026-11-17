@@ -728,6 +728,50 @@ func TestDurableCheckSuiteResynthesizesFailedRecoveryRow(t *testing.T) {
 	assert.Equal(t, storage.WebhookEventPending, row.State, "the failed recovery row must be reopened")
 }
 
+// An organic plan delivery that exhausted its retries covers its head against
+// the check_suite signal for the same cool-off it does against the
+// reconciler. Within the cool-off the signal leaves the head to the
+// operator's GitHub Redeliver; once it passes, the signal enqueues the
+// recovery delivery that plans the head.
+func TestDurableCheckSuiteRecoversFailedOrganicRowOnlyAfterCoolOff(t *testing.T) {
+	tests := []struct {
+		name          string
+		failedAgo     time.Duration
+		wantRecovered bool
+	}{
+		{name: "within the cool-off the head is left alone", failedAgo: 5 * time.Minute},
+		{name: "past the cool-off a recovery delivery is enqueued", failedAgo: storage.WebhookEventFailedCoverageCoolOff + time.Minute, wantRecovered: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newRecordingWebhookEventStore()
+			seedFailedOrganicDelivery(t, store, time.Now().Add(-tt.failedAgo))
+			h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+			mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+				writeSinglePR(t, w, 7, "open", "head-sha")
+			})
+
+			retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "head-sha", 7))
+
+			require.NoError(t, err)
+			require.False(t, retry)
+			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+			require.NoError(t, err)
+			if tt.wantRecovered {
+				require.NotNil(t, row, "a recovery delivery is enqueued for the head")
+				assert.Equal(t, storage.WebhookEventPending, row.State)
+				assert.Equal(t, webhookReconcileSynthesizedAction, row.Action)
+			} else {
+				assert.Nil(t, row, "no recovery delivery is enqueued during the cool-off")
+			}
+			organic, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "organic-github-guid")
+			require.NoError(t, err)
+			require.NotNil(t, organic)
+			assert.Equal(t, storage.WebhookEventFailed, organic.State, "the organic row stays failed")
+		})
+	}
+}
+
 // GitHub API failures while resolving the suite head are transient: the
 // delivery must be retried under its attempt budget, not dropped.
 func TestDurableCheckSuiteGitHubFailureRetries(t *testing.T) {

@@ -845,6 +845,14 @@ type StorageConfig struct {
 	// and password references. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
 
+	// SchemaDSN is the connection string used only to converge the storage
+	// schema at startup and by the storage CLI. Optional: when unset the
+	// schema is converged over DSN. Set it to keep DDL privileges off the
+	// long-lived pool, so DSN can name a user that only reads and writes
+	// rows. It must name the same server and database as DSN. Accepts the
+	// same env:/file: references as DSN; Database applies to it too.
+	SchemaDSN string `yaml:"schema_dsn,omitempty"`
+
 	// Dialect selects the database family of SchemaBot's internal storage
 	// database: "mysql" (the default when unset) or "postgres". It routes
 	// schema bootstrapping, connection handling, and the storage
@@ -1359,13 +1367,10 @@ type ReviewPolicyConfig struct {
 	// RequireReapproval decides whether an approval on an earlier commit
 	// still counts after the PR's schema change differs from the one it
 	// reviewed. True makes SchemaBot compare the commits and require a new
-	// approval when they differ. False keeps every authorized approval
-	// counting until the reviewer withdraws it or GitHub dismisses it. Unset,
-	// the default, follows the PR's base branch: when its rules dismiss stale
-	// approvals on push, GitHub has already removed every stale approval, so
-	// SchemaBot does not compare; otherwise, or when SchemaBot cannot read
-	// those rules, it compares as if true. A database's own
-	// review_policy.require_reapproval overrides it.
+	// approval when they differ. False or unset, the default, keeps every
+	// authorized approval counting until the reviewer withdraws it or GitHub
+	// dismisses it. A database's own review_policy.require_reapproval
+	// overrides it.
 	RequireReapproval *bool `yaml:"require_reapproval,omitempty"`
 }
 
@@ -4011,6 +4016,74 @@ func (c *ServerConfig) StorageDSN() (string, error) {
 	return storageDatabaseDSN(c.Storage.Dialect, dsn, c.Storage.Database)
 }
 
+// StorageSchemaDSN returns the DSN that converges the storage schema:
+// storage.schema_dsn when configured, otherwise StorageDSN.
+//
+// It resolves the storage DSN once and answers for that resolution. A caller
+// that already holds the DSN its pool opens uses StorageSchemaDSNFor instead,
+// so the pool and the schema it converges come from one resolution.
+func (c *ServerConfig) StorageSchemaDSN() (string, error) {
+	poolDSN, err := c.StorageDSN()
+	if err != nil {
+		return "", err
+	}
+	return c.StorageSchemaDSNFor(poolDSN)
+}
+
+// StorageSchemaDSNFor returns the DSN that converges the storage schema for a
+// pool that opens poolDSN: poolDSN itself when storage.schema_dsn is not
+// configured, otherwise the configured schema DSN.
+//
+// A configured schema DSN must name the same server and database as poolDSN,
+// and every caller (startup, the storage schema API, and the storage CLI) gets
+// that check here: otherwise the schema user would converge a database the
+// pool never serves, under this config's destructive policy. The storage DSN
+// is not resolved again, because a reference rewritten since the caller
+// resolved it would name a database the caller's pool does not open.
+func (c *ServerConfig) StorageSchemaDSNFor(poolDSN string) (string, error) {
+	if c.Storage.SchemaDSN == "" {
+		return poolDSN, nil
+	}
+	schemaDSN, err := secrets.Resolve(c.Storage.SchemaDSN, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve storage schema_dsn: %w", err)
+	}
+	if c.Storage.Database != "" {
+		if schemaDSN, err = storageDatabaseDSN(c.Storage.Dialect, schemaDSN, c.Storage.Database); err != nil {
+			return "", fmt.Errorf("storage schema_dsn: %w", err)
+		}
+	}
+	schemaTarget, err := mysqlStorageTarget(schemaDSN)
+	if err != nil {
+		return "", fmt.Errorf("storage schema_dsn: %w", err)
+	}
+	poolTarget, err := mysqlStorageTarget(poolDSN)
+	if err != nil {
+		return "", fmt.Errorf("storage dsn: %w", err)
+	}
+	if schemaTarget != poolTarget {
+		return "", fmt.Errorf("storage.schema_dsn names %s but storage.dsn names %s; both must name the same storage database", schemaTarget, poolTarget)
+	}
+	return schemaDSN, nil
+}
+
+// mysqlStorageTarget names the server and database a MySQL DSN connects to,
+// without its credentials. Hostnames compare case-insensitively; database
+// names do not, because MySQL database names can be case sensitive.
+//
+// pkg/serve has the same rule in storageTargetFor, which it uses to check a
+// re-resolved DSN against the database the server booted on. The two must
+// agree on which DSNs name one database, so change them together.
+// TestSchemaDSNCheckAgreesWithBootTargetCheck in pkg/serve fails when they
+// disagree.
+func mysqlStorageTarget(dsn string) (string, error) {
+	cfg, err := gomysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("invalid MySQL storage connection")
+	}
+	return strings.ToLower(cfg.Addr) + "/" + cfg.DBName, nil
+}
+
 func (c *ServerConfig) resolveStorageDSN() (string, error) {
 	if c.Storage.DSNFrom != nil {
 		return c.Storage.DSNFrom.Resolve(storage.DatabaseTypeMySQL)
@@ -4041,6 +4114,20 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 	// the first connection attempt.
 	if dialect != schema.DialectMySQL && c.DSNFrom != nil {
 		return fmt.Errorf("%s dsn_from builds a MySQL DSN and is not supported with dialect %q; use dsn", context, dialect)
+	}
+	// On PostgreSQL the same host and database can still resolve to another
+	// schema (search_path, role defaults), and the pool's session affinity is
+	// only proven for the bootstrap connection, so a separate schema user is
+	// MySQL-only until both are checked.
+	if dialect != schema.DialectMySQL && c.SchemaDSN != "" {
+		return fmt.Errorf("%s schema_dsn is only supported with dialect %q, not %q", context, schema.DialectMySQL, dialect)
+	}
+	// dsn_from reads the server and database from a secret, and schema_dsn
+	// spells them out by hand. A secret rewritten with another host would
+	// leave the two naming different databases and stop every instance at
+	// startup, so the combination is refused at config load.
+	if c.SchemaDSN != "" && c.DSNFrom != nil {
+		return fmt.Errorf("%s cannot configure schema_dsn with dsn_from; set dsn instead of dsn_from to use schema_dsn", context)
 	}
 	return c.Pool.Validate(context)
 }

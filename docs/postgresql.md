@@ -619,7 +619,7 @@ PostgreSQL targets do not support:
 
 - pending drops;
 - deferred cutover (`--defer-cutover`);
-- stop, start, cutover, revert, skip-revert, or volume controls;
+- stop, start, cutover, revert, or skip-revert controls;
 - cancel of anything other than a concurrent index build (see
   [Control operations](#control-operations)).
 

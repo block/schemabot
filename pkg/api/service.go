@@ -615,7 +615,7 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 				return s.defaultTernClient, nil
 			}
 			if deployment == DefaultDeployment {
-				return nil, fmt.Errorf("not found in server configuration")
+				return nil, fmt.Errorf("not found in server configuration: %w", errTernDeploymentNotConfigured)
 			}
 		}
 		return nil, err

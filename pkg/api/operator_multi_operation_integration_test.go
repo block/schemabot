@@ -107,8 +107,8 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workAID))
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workBID))
 		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID))
-		assert.Equal(t, state.Apply.Pending, getApply(t, ctx, stor, seed.applyID).State,
-			"completed shard work plus a pending finalizer must remain non-terminal")
+		assert.Equal(t, state.Apply.Running, getApply(t, ctx, stor, seed.applyID).State,
+			"completed shard work plus a pending finalizer must remain running, not terminal")
 
 		driveNextOperation(t, ctx, svc, 3)
 
@@ -768,8 +768,8 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workBID))
 		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID),
 			"the finalizer must remain pending until both shard work siblings complete")
-		assert.Equal(t, state.Apply.Pending, getApply(t, ctx, stor, seed.applyID).State,
-			"the parent must stay non-terminal while the finalizer is pending")
+		assert.Equal(t, state.Apply.Running, getApply(t, ctx, stor, seed.applyID).State,
+			"the parent must stay running while the finalizer is pending")
 
 		// The finalizer is now claimable; drive it and the parent terminalizes.
 		driveNextOperation(t, ctx, svc, 1)
