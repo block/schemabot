@@ -124,7 +124,7 @@ func PreviewCommentPlanExemptTables() string {
 		ExemptTables: []ExemptTablesData{{
 			Namespace: "app",
 			Tables:    []string{"events_archive_2025_01", "orders_archive_2024"},
-			Reason:    "archive naming",
+			Reason:    engine.ExemptReasonArchiveNaming,
 		}},
 	})
 }

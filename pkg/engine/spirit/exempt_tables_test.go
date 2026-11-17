@@ -18,6 +18,36 @@ func mustIgnoredTables(t *testing.T, entries []string) engine.IgnoredTables {
 	return ignored
 }
 
+// Every engine leaves the same undeclared archive tables in place. The MySQL
+// engine relies on Spirit's loader for that exclusion and engines that do not
+// load through Spirit use engine.IsArchiveTable, so the two predicates must
+// agree on every name, including the ones just outside the convention.
+func TestIsArchiveTable_MatchesSpiritLoaderConvention(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"orders_archive_2024", true},
+		{"orders_archive_2024_01", true},
+		{"orders_archive_2024_01_15", true},
+		{"_archive_2024", true},
+		{"orders_archive", false},
+		{"orders_archive_24", false},
+		{"orders_archive_2024_1", false},
+		{"orders_archive_2024_01_15_09", false},
+		{"orders_archive_2024x", false},
+		{"orders_archived_2024", false},
+		{"archive_2024", false},
+		{"orders_ARCHIVE_2024", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, engine.IsArchiveTable(tc.name), "engine.IsArchiveTable")
+			assert.Equal(t, tc.want, table.IsArchiveTable(tc.name), "Spirit table.IsArchiveTable")
+		})
+	}
+}
+
 // The loader drops an archive table before reading its definition. Moving that
 // exclusion to this side would cost one SHOW CREATE TABLE per archive table on
 // every plan, and would fail a plan outright on an archive-named object that

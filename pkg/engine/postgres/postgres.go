@@ -26,7 +26,6 @@ import (
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/pg-sprite/pkg/verdict"
-	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -369,7 +368,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			result.ExemptTables = append(result.ExemptTables, &engine.ExemptTables{
 				Namespace: namespace,
 				Tables:    exempt,
-				Reason:    exemptReasonArchiveNaming,
+				Reason:    engine.ExemptReasonArchiveNaming,
 			})
 		}
 		if exemption := ignored.Exemption(namespace, withheld); exemption != nil {
@@ -957,11 +956,6 @@ func concurrentIndexStatement(sql string) (bool, error) {
 	return statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent(), nil
 }
 
-// exemptReasonArchiveNaming is the exemption reason a plan carries for an
-// undeclared live table whose name marks it as an archive: the table is left
-// in place rather than dropped, and left out of the rollback baseline.
-const exemptReasonArchiveNaming = "archive naming"
-
 // undeclaredTableDrops surfaces every live table in the namespace that no
 // schema file declares, whether its file was deleted or it was never declared
 // at all. Desired state is declarative: an undeclared table converges only by
@@ -1011,7 +1005,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 			withheld = append(withheld, live.name)
 			continue
 		}
-		if spirittable.IsArchiveTable(live.name) {
+		if engine.IsArchiveTable(live.name) {
 			slog.Info("PostgreSQL archive table has no schema file and is left in place rather than dropped",
 				"database", database,
 				"namespace", namespace,
