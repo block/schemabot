@@ -169,9 +169,8 @@ func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (
 }
 
 // ConnectionDSN returns a MySQL DSN with required connection settings applied
-// (RDS TLS, client-side parameter interpolation, default transport timeouts,
-// and a signed TINYINT(1) read as the number it holds rather than as a Go
-// bool), plus any caller-supplied options (for example WithConnectTimeout).
+// (RDS TLS, client-side parameter interpolation, and default transport
+// timeouts), plus any caller-supplied options (for example WithConnectTimeout).
 // Settings and options are applied on every return path so they take effect
 // regardless of whether the DSN also needs RDS TLS enhancement.
 func ConnectionDSN(dsn string, opts ...Option) (string, error) {
