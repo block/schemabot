@@ -282,6 +282,33 @@ func TestService_TernClientPrefersConfiguredEndpointOverDefault(t *testing.T) {
 		"misconfigured endpoint must not be treated as unconfigured")
 }
 
+// A deployment or environment that is absent from the server configuration is
+// reported as not configured, including the default deployment, so callers can
+// tell it apart from a client that exists in configuration but cannot be built.
+func TestService_TernClientNotConfiguredMiss(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}
+	cfg := &ServerConfig{
+		TernDeployments: TernConfig{
+			"primary": {"staging": "localhost:9090"},
+		},
+	}
+	svc := New(store, cfg, nil, logger)
+
+	_, err := svc.TernClient("", "staging")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errTernDeploymentNotConfigured, "the default deployment is absent from the configuration")
+	assert.Contains(t, err.Error(), "not found in server configuration")
+
+	_, err = svc.TernClient("unconfigured", "staging")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errTernDeploymentNotConfigured)
+
+	_, err = svc.TernClient("primary", "production")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errTernDeploymentNotConfigured)
+}
+
 func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {
 	config := TernConfig{
 		"default": {

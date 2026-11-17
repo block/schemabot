@@ -22,12 +22,12 @@ import (
 // The tests here cover only behaviors that require raw SQL or
 // database-specific conditions.
 
-// A terminally failed row's coverage depends on its origin: a failed organic
-// delivery still covers its head because the operator's GitHub Redeliver
-// lever exists for it — synthesizing over it would loop a deterministically
-// failing head through a fresh claim budget every pass — while a failed
-// synthesized row must not cover, because there is no Redeliver lever for a
-// synthesized GUID and re-synthesis is the only recovery path. A dead-lettered
+// A terminally failed row's coverage depends on its origin: a freshly failed
+// organic delivery covers its head because the operator's GitHub Redeliver
+// lever exists for it (TestWebhookEventStore_FailedOrganicRowCoversOnlyDuringCoolOff
+// covers how long), while a failed synthesized row must not cover, because
+// there is no Redeliver lever for a synthesized GUID and re-synthesis is the
+// only recovery path. A dead-lettered
 // row covers regardless of origin: the driver proved the head can never
 // succeed, so re-synthesis would replay the identical failure every
 // reconciler pass. A superseded row never covers regardless of origin: its
@@ -76,6 +76,75 @@ func TestWebhookEventStore_HasEventForHeadExcludesFailedStateSynthesized(t *test
 		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, headSHA)
 		require.NoError(t, err, tc.state)
 		assert.Equal(t, tc.covers, found, "state %s", tc.state)
+	}
+}
+
+// A PR's plan delivery that exhausted its transient retries covers its head
+// only for WebhookEventFailedCoverageCoolOff, so once the window passes the
+// reconciler re-plans the PR instead of leaving its check blocked until
+// someone pushes or comments. A dead-lettered row covers however old it is,
+// and a failed synthesized row never covers.
+func TestWebhookEventStore_FailedOrganicRowCoversOnlyDuringCoolOff(t *testing.T) {
+	clearTables(t)
+	assertFailedRowCoverageCoolOff(t, NewMySQL(testDB), testDB, MySQLDialect{}, func(query string) string { return query })
+}
+
+// assertFailedRowCoverageCoolOff ages terminal rows on the database clock and
+// checks which still cover their head. The cutoff is rendered SQL, so each
+// dialect suite runs it; rebind adapts the raw aging statement's placeholders.
+func assertFailedRowCoverageCoolOff(t *testing.T, store storage.Storage, db *sql.DB, dialect Dialect, rebind func(string) string) {
+	t.Helper()
+	ctx := t.Context()
+	coolOff := storage.WebhookEventFailedCoverageCoolOff
+	ago := func(d time.Duration) string {
+		return dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+			LiteralIntervalAmount(uint64(d.Microseconds())), IntervalMicrosecond)
+	}
+
+	for i, tc := range []struct {
+		name        string
+		state       string
+		synthesized bool
+		failedAgo   time.Duration
+		// noCompletedAt leaves completed_at unset, so updated_at dates the failure.
+		noCompletedAt bool
+		covers        bool
+	}{
+		{name: "organic failed a minute ago", state: storage.WebhookEventFailed, failedAgo: time.Minute, covers: true},
+		{name: "organic failed just inside the cool-off", state: storage.WebhookEventFailed, failedAgo: coolOff - time.Minute, covers: true},
+		{name: "organic failed past the cool-off", state: storage.WebhookEventFailed, failedAgo: coolOff + time.Minute, covers: false},
+		{name: "organic failed past the cool-off without completed_at", state: storage.WebhookEventFailed, failedAgo: coolOff + time.Minute, noCompletedAt: true, covers: false},
+		{name: "synthesized failed a minute ago", state: storage.WebhookEventFailed, synthesized: true, failedAgo: time.Minute, covers: false},
+		{name: "organic dead-lettered past the cool-off", state: storage.WebhookEventFailedPermanent, failedAgo: coolOff + time.Minute, covers: true},
+		{name: "synthesized dead-lettered past the cool-off", state: storage.WebhookEventFailedPermanent, synthesized: true, failedAgo: coolOff + time.Minute, covers: true},
+		{name: "organic completed past the cool-off", state: storage.WebhookEventCompleted, failedAgo: coolOff + time.Minute, covers: true},
+	} {
+		deliveryID := fmt.Sprintf("delivery-cool-off-%d", i)
+		if tc.synthesized {
+			deliveryID = storage.SynthesizedWebhookDeliveryIDPrefix + deliveryID
+		}
+		headSHA := fmt.Sprintf("cool-off-head-%d", i)
+		_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID:  deliveryID,
+			Event:       "pull_request",
+			Action:      "synchronize",
+			Repository:  "block/example",
+			PullRequest: 7,
+			HeadSHA:     headSHA,
+			Payload:     []byte(`{}`),
+		})
+		require.NoError(t, err, tc.name)
+		completedAt := ago(tc.failedAgo)
+		if tc.noCompletedAt {
+			completedAt = "NULL"
+		}
+		_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ?, completed_at = `+completedAt+
+			`, updated_at = `+ago(tc.failedAgo)+` WHERE delivery_id = ?`), tc.state, deliveryID)
+		require.NoError(t, err, tc.name)
+
+		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, headSHA)
+		require.NoError(t, err, tc.name)
+		assert.Equal(t, tc.covers, found, tc.name)
 	}
 }
 

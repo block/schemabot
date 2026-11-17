@@ -200,8 +200,11 @@ func TestRenderPlanComment_ShardedUniformManyShardsCollapse(t *testing.T) {
 
 	assert.Contains(t, out, "<summary><b>all 32 shards</b></summary>", "a uniform wide keyspace leads with its coverage on one collapsed line")
 	assert.NotContains(t, out, "**shards `", "the heading does not enumerate ranges inline")
-	assert.Contains(t, out, "`s00`, `s01`", "the collapsed block lists the shard names")
-	assert.Contains(t, out, "`s31`", "the collapsed block lists every shard")
+	assert.Contains(t, out, "<summary><b>all 32 shards</b></summary>\n\n```\n"+
+		"s00  s01  s02  s03  s04  s05  s06  s07  s08  s09  s10  s11  s12  s13  s14  s15\n"+
+		"s16  s17  s18  s19  s20  s21  s22  s23  s24  s25  s26  s27  s28  s29  s30  s31\n"+
+		"```\n\n</details>",
+		"the collapsed block lists every shard name in a grid of as many columns as fit the row")
 	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown once")
 }
 
@@ -321,7 +324,7 @@ func TestWriteShardGroupHeading_InlineLimitBoundary(t *testing.T) {
 		var sb strings.Builder
 		writeShardGroupHeading(&sb, shardNames(shardNamesInlineLimit+1), shardNamesInlineLimit+1)
 		assert.Contains(t, sb.String(), fmt.Sprintf("<summary><b>all %d shards</b></summary>", shardNamesInlineLimit+1), "the heading leads with coverage")
-		assert.Contains(t, sb.String(), "`s00`, `s01`", "the collapsed block lists the names")
+		assert.Contains(t, sb.String(), "```\ns00  s01  s02  s03  s04  s05  s06  s07  s08\n```", "the collapsed block lists the names in a grid")
 	})
 }
 

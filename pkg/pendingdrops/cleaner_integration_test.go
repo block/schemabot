@@ -237,7 +237,7 @@ func TestCleaner_DropFailureReturnsError(t *testing.T) {
 
 	quarantinedAt := time.Now().Add(-8 * 24 * time.Hour)
 	expired := createUndroppableQuarantinedTable(t, db, "parent_table", quarantinedAt)
-	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", []QuarantinedTable{
+	require.NoError(t, RecordQuarantines(t.Context(), db, slog.Default(), "apply-a", []QuarantinedTable{
 		{SchemaName: "testdb", TableName: "parent_table", QuarantineSchema: Database, QuarantineTable: expired},
 	}, quarantinedAt))
 

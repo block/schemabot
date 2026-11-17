@@ -127,6 +127,7 @@ func (s *Service) CollectWebhookInboxMetrics(ctx context.Context) {
 	// drops back to 0 would leave the gauge re-exporting its last nonzero value
 	// forever, showing a phantom unknown-state population that never resolves.
 	metrics.RecordWebhookInboxDepth(ctx, "unknown", unknownCount)
+	metrics.RecordWebhookInboxClaimableDepth(ctx, stats.ClaimableDepth)
 	metrics.RecordWebhookInboxOldestClaimableAge(ctx, stats.OldestClaimableAge)
 	metrics.RecordWebhookInboxStuckProcessing(ctx, stats.StuckProcessing)
 

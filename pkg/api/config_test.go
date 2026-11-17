@@ -3659,6 +3659,115 @@ func TestServerConfig_StorageDSNEnvFallback(t *testing.T) {
 	})
 }
 
+// The schema DSN falls back to the storage DSN, so existing configs converge
+// exactly as before; when set, it resolves its own reference and still lands
+// on the configured storage database.
+func TestServerConfig_StorageSchemaDSN(t *testing.T) {
+	t.Run("falls back to the storage DSN", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(storage:3306)/schemabot"}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "rw:pw@tcp(storage:3306)/schemabot", dsn)
+	})
+
+	t.Run("resolves its own reference and applies the storage database", func(t *testing.T) {
+		t.Setenv("SCHEMA_DSN_UNDER_TEST", "ddl:pw@tcp(storage:3306)/")
+		cfg := ServerConfig{Storage: StorageConfig{
+			DSN:       "rw:pw@tcp(storage:3306)/schemabot",
+			SchemaDSN: "env:SCHEMA_DSN_UNDER_TEST",
+			Database:  "schemabot_tenant",
+		}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		parsed, err := gomysql.ParseDSN(dsn)
+		require.NoError(t, err)
+		assert.Equal(t, "ddl", parsed.User)
+		assert.Equal(t, "schemabot_tenant", parsed.DBName)
+
+		poolDSN, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		parsed, err = gomysql.ParseDSN(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, "rw", parsed.User, "the pool keeps the storage DSN's user")
+	})
+
+	t.Run("refuses a schema DSN naming another server or database", func(t *testing.T) {
+		for name, schemaDSN := range map[string]string{
+			"other database": "ddl:pw@tcp(storage:3306)/other",
+			"other host":     "ddl:pw@tcp(replica:3306)/schemabot",
+			"other port":     "ddl:pw@tcp(storage:3307)/schemabot",
+			"database case":  "ddl:pw@tcp(storage:3306)/SchemaBot",
+		} {
+			t.Run(name, func(t *testing.T) {
+				cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(storage:3306)/schemabot", SchemaDSN: schemaDSN}}
+				_, err := cfg.StorageSchemaDSN()
+				require.ErrorContains(t, err, "both must name the same storage database")
+				assert.NotContains(t, err.Error(), "pw", "the refusal must not echo credentials")
+			})
+		}
+	})
+
+	t.Run("accepts the same server spelled in another case", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(Storage.Example.com:3306)/schemabot", SchemaDSN: "ddl:pw@tcp(storage.example.com)/schemabot"}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "ddl:pw@tcp(storage.example.com)/schemabot", dsn)
+	})
+
+	// A file-backed storage DSN is rewritten to another database after the
+	// caller resolved it for its pool. The schema DSN still answers for the
+	// DSN the caller holds, so the schema converged is the pool's own.
+	t.Run("answers for the pool DSN it is given when the reference is rewritten", func(t *testing.T) {
+		const bootDSN = "rw:pw@tcp(storage:3306)/schemabot"
+		const rewrittenDSN = "rw:pw@tcp(storage:3306)/other"
+		dsnFile := filepath.Join(t.TempDir(), "storage-dsn")
+		require.NoError(t, os.WriteFile(dsnFile, []byte(bootDSN), 0o600))
+
+		unset := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile}}
+		poolDSN, err := unset.StorageDSN()
+		require.NoError(t, err)
+		require.Equal(t, bootDSN, poolDSN)
+		require.NoError(t, os.WriteFile(dsnFile, []byte(rewrittenDSN), 0o600))
+
+		dsn, err := unset.StorageSchemaDSNFor(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, bootDSN, dsn, "without schema_dsn the schema converges over the pool's own DSN")
+
+		matchesPool := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile, SchemaDSN: "ddl:pw@tcp(storage:3306)/schemabot"}}
+		dsn, err = matchesPool.StorageSchemaDSNFor(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, "ddl:pw@tcp(storage:3306)/schemabot", dsn)
+
+		matchesRewrite := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile, SchemaDSN: "ddl:pw@tcp(storage:3306)/other"}}
+		_, err = matchesRewrite.StorageSchemaDSNFor(poolDSN)
+		require.EqualError(t, err, "storage.schema_dsn names storage:3306/other but storage.dsn names storage:3306/schemabot; both must name the same storage database")
+	})
+
+	t.Run("is rejected with dsn_from", func(t *testing.T) {
+		storageConfig := StorageConfig{
+			DSNFrom: &DSNFromConfig{
+				ConfigRef:   "env:STORAGE_CONFIG",
+				Username:    "rw",
+				PasswordRef: "env:STORAGE_PASSWORD",
+			},
+			SchemaDSN: "ddl:pw@tcp(storage:3306)/schemabot",
+		}
+		require.EqualError(t, storageConfig.validateLocalDSNConfig("storage"),
+			"storage cannot configure schema_dsn with dsn_from; set dsn instead of dsn_from to use schema_dsn")
+	})
+
+	t.Run("is rejected for PostgreSQL storage", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{
+			Dialect:   "postgres",
+			DSN:       "postgres://rw:pw@storage:5432/schemabot",
+			SchemaDSN: "postgres://ddl:pw@storage:5432/schemabot",
+		}, Databases: map[string]DatabaseConfig{
+			"appdb": {Type: "mysql", Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/appdb"}}},
+		}}
+		require.ErrorContains(t, cfg.Validate(), `schema_dsn is only supported with dialect "mysql", not "postgres"`)
+	})
+}
+
 func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
 	dir := t.TempDir()
 	databaseConfigPath := filepath.Join(dir, "storage.yaml")
@@ -4645,22 +4754,22 @@ databases:
 	for _, tt := range []struct {
 		name             string
 		instance, orders string
-		wantOrders       Reapproval
-		wantPayments     Reapproval
+		wantOrders       bool
+		wantPayments     bool
 	}{
-		{"unset everywhere follows the base branch", "", ordersUnset, ReapprovalFollowsBaseBranch, ReapprovalFollowsBaseBranch},
-		{"instance true covers every database", instanceTrue, ordersUnset, ReapprovalRequired, ReapprovalRequired},
-		{"instance false covers every database", instanceFalse, ordersUnset, ReapprovalNotRequired, ReapprovalNotRequired},
-		{"a database can require it alone", "", ordersTrue, ReapprovalRequired, ReapprovalFollowsBaseBranch},
-		{"a database can opt out alone", "", ordersFalse, ReapprovalNotRequired, ReapprovalFollowsBaseBranch},
-		{"a database can require it when the instance opts out", instanceFalse, ordersTrue, ReapprovalRequired, ReapprovalNotRequired},
-		{"a database can opt out when the instance requires it", instanceTrue, ordersFalse, ReapprovalNotRequired, ReapprovalRequired},
+		{"unset everywhere does not require it", "", ordersUnset, false, false},
+		{"instance true covers every database", instanceTrue, ordersUnset, true, true},
+		{"instance false covers every database", instanceFalse, ordersUnset, false, false},
+		{"a database can require it alone", "", ordersTrue, true, false},
+		{"a database can set false alone", "", ordersFalse, false, false},
+		{"a database can require it when the instance does not", instanceFalse, ordersTrue, true, false},
+		{"a database can opt out when the instance requires it", instanceTrue, ordersFalse, false, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg, err := loadConfig(t, config(tt.instance, tt.orders))
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantOrders, cfg.ReviewPolicyReapprovalForDatabase("orders"))
-			assert.Equal(t, tt.wantPayments, cfg.ReviewPolicyReapprovalForDatabase("payments"))
+			assert.Equal(t, tt.wantOrders, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+			assert.Equal(t, tt.wantPayments, cfg.ReviewPolicyRequiresReapprovalForDatabase("payments"))
 		})
 	}
 
@@ -4680,7 +4789,7 @@ databases:
 `)
 		require.NoError(t, err)
 		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
-		assert.Equal(t, ReapprovalNotRequired, cfg.ReviewPolicyReapprovalForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
 	})
 
 	for _, value := range []string{"true", "false"} {

@@ -4,8 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 )
 
 // TableMove is one source table to quarantine.
@@ -29,8 +33,8 @@ type QuarantinedTable struct {
 // RENAME TABLE is atomic and metadata-only, so the move is fast regardless of
 // table size and the data is preserved until the cleaner's retention period
 // expires.
-func MoveTable(ctx context.Context, db *sql.DB, schemaName, tableName string, now time.Time) (string, error) {
-	moved, err := MoveTables(ctx, db, []TableMove{{SchemaName: schemaName, TableName: tableName}}, now)
+func MoveTable(ctx context.Context, db *sql.DB, logger *slog.Logger, schemaName, tableName string, now time.Time) (string, error) {
+	moved, err := MoveTables(ctx, db, logger, []TableMove{{SchemaName: schemaName, TableName: tableName}}, now)
 	if err != nil {
 		return "", err
 	}
@@ -43,12 +47,12 @@ func MoveTable(ctx context.Context, db *sql.DB, schemaName, tableName string, no
 // MoveTables quarantines source tables with a single atomic RENAME TABLE
 // statement. Either all source tables move to the pending drops database or
 // none of them do.
-func MoveTables(ctx context.Context, db *sql.DB, tables []TableMove, now time.Time) ([]QuarantinedTable, error) {
+func MoveTables(ctx context.Context, db *sql.DB, logger *slog.Logger, tables []TableMove, now time.Time) ([]QuarantinedTable, error) {
 	moved, err := Destinations(tables, now)
 	if err != nil {
 		return nil, err
 	}
-	if err := MoveTablesTo(ctx, db, moved); err != nil {
+	if err := MoveTablesTo(ctx, db, logger, moved); err != nil {
 		return nil, err
 	}
 	return moved, nil
@@ -57,14 +61,15 @@ func MoveTables(ctx context.Context, db *sql.DB, tables []TableMove, now time.Ti
 // MoveTablesTo renames each source table to the quarantine destination chosen
 // for it by Destinations, in a single atomic RENAME TABLE statement. A caller
 // that must know the destinations before the rename is issued, because the
-// rename may complete on the server after the client has given up on it,
-// computes them with Destinations, records them, and then calls this.
-func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) error {
+// rename may complete on the server after the client has given up on it (the
+// process can exit mid-rename, or a cancel can fail to confirm that the rename
+// ended), computes them with Destinations, records them, and then calls this.
+func MoveTablesTo(ctx context.Context, db *sql.DB, logger *slog.Logger, moved []QuarantinedTable) error {
 	if len(moved) == 0 {
 		return nil
 	}
 
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(Database))); err != nil {
+	if err := dbconn.ExecKillOnCancel(ctx, db, logger, "CREATE DATABASE IF NOT EXISTS %n", Database); err != nil {
 		return fmt.Errorf("create %s database: %w", Database, err)
 	}
 
@@ -72,7 +77,11 @@ func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) err
 	if err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, renameSQL); err != nil {
+	// Both statements can wait for a metadata lock. A cancel ends each on the
+	// server before returning, so neither takes effect after the caller gave
+	// up; an error wrapping dbconn.ErrCancelledStatementMayStillRun means that
+	// could not be confirmed.
+	if err := dbconn.ExecKillOnCancel(ctx, db, logger, "%r", sqlescape.RawSQL(renameSQL)); err != nil {
 		return fmt.Errorf("rename tables to pending drops (query = %s): %w", renameSQL, err)
 	}
 	return nil

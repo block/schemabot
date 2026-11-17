@@ -615,7 +615,7 @@ func TestMultiEnvPlanCommentSharedTargetGroupNamesItsTargetsPlan(t *testing.T) {
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
 	group, primary, found := strings.Cut(body, "#### Target `primary/orders_1`")
 	require.True(t, found, body)
-	assert.Contains(t, group, "#### 2 of 3 targets\n\n`primary/orders_2`, `primary/orders_3`", "the larger group leads")
+	assert.Contains(t, group, "#### 2 of 3 targets\n\n- `primary/orders_2`\n- `primary/orders_3`", "the larger group leads")
 	assert.Contains(t, primary, "the full staging plan for this target is available from the CLI with `schemabot list-plans -e staging plan_staging1` (production runs the same DDL).")
 	assert.Contains(t, group, "the full staging plan for `primary/orders_2` is available from the CLI with `schemabot list-plans -e staging plan_staging_member_2` (every target in this group runs the same DDL; production runs the same DDL).")
 	assert.NotContains(t, body, "the full staging plan is available")
@@ -739,7 +739,7 @@ func TestPlanCommentCutTargetGroupNamesWhosePlanItPointsAt(t *testing.T) {
 	body := RenderPlanComment(primary)
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
 
-	first, rest, found := strings.Cut(body, "`primary/orders_3`, `primary/orders_4`")
+	first, rest, found := strings.Cut(body, "- `primary/orders_3`\n- `primary/orders_4`")
 	require.True(t, found, body)
 	assert.Contains(t, first, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_1` is available from the CLI with `schemabot list-plans -e production plan_reviewed` (every target in this group runs the same DDL)._\n")
 	assert.Contains(t, rest, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_3` is available from the CLI with `schemabot list-plans -e production plan_member_3` (every target in this group runs the same DDL)._\n")

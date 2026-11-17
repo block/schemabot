@@ -88,12 +88,16 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	h := NewHandler(svc, nil, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	factory, _ := prClosedGitHub(t, "closed", 0)
+	h := NewHandler(svc, factory, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	drainWebhookWorkOnCleanup(t, h)
 
 	// Close the PR while the apply is running. Cleanup is invoked directly (not
 	// through the async webhook goroutine) so the retention assertions below
 	// observe a finished cleanup pass.
-	require.NoError(t, h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, false))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	require.NoError(t, err)
+	require.True(t, ran, "cleanup runs for a PR that is still closed")
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
@@ -130,6 +134,63 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 		return err == nil && check == nil
 	}, 5*time.Second, 100*time.Millisecond, "check should be deleted on PR close once the apply is terminal")
+}
+
+// TestE2EPRCloseCleanupSkipsReopenedPR verifies PR-close cleanup against real
+// storage when the PR was reopened after the close: an operator took a lock
+// owned by repo#pr and plan-only check state exists. The live PR is open, so a
+// close delivery that runs now releases nothing and deletes nothing. Once the
+// PR closes again, cleanup runs as usual.
+func TestE2EPRCloseCleanupSkipsReopenedPR(t *testing.T) {
+	dbName := "webhook_pr_close_reopened"
+	svc := setupE2EService(t, dbName)
+
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName: dbName,
+		DatabaseType: "mysql",
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		Owner:        "octocat/hello-world#1",
+	}))
+	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}))
+
+	reopened, _ := prClosedGitHub(t, "open", 0)
+	h := NewHandler(svc, reopened, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	require.NoError(t, err)
+	require.False(t, ran, "cleanup reports that it did not run for a PR that is open again")
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the lock must stay held while the PR is open")
+	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "stored check state must stay while the PR is open")
+
+	closed, _ := prClosedGitHub(t, "closed", 0)
+	h = NewHandler(svc, closed, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	ran, err = h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, false)
+	require.NoError(t, err)
+	require.True(t, ran, "cleanup runs for a PR that is still closed")
+
+	lock, err = svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "the lock is released once the PR is closed")
+	check, err = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	assert.Nil(t, check, "plan-only check state is deleted once the PR is closed")
 }
 
 // TestE2EStaleCheckCleanup verifies that checks for databases no longer in the PR
@@ -1098,6 +1159,8 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 
 	// Close the PR. Close cleanup runs async, so wait for the plan-only row to
 	// be deleted before asserting on the retained row.
+	// Cleanup reads the live PR, so fake GitHub serves it as closed.
+	result.PRState.Store(new("closed"))
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed"}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -1119,6 +1182,7 @@ func TestE2EPRCloseReopenRetainsStartedApplyBlock(t *testing.T) {
 
 	// Reopen the PR. Auto-plan finds no schema files, and stale-check cleanup
 	// re-blocks the retained row on the current head SHA.
+	result.PRState.Store(new("open"))
 	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "reopened"}, nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -1238,6 +1302,8 @@ func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
 	// Close the PR without merging. Close cleanup runs async, so wait for the
 	// plan-only row to be deleted — the same cleanup statement decides the
 	// retained row's fate — before asserting on the retained row.
+	// Cleanup reads the live PR, so fake GitHub serves it as closed.
+	result.PRState.Store(new("closed"))
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed", merged: false}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -1259,6 +1325,7 @@ func TestE2EUnmergedCloseRetainsSuccessfulApplyOwnedCheck(t *testing.T) {
 	// Reopen the PR. Auto-plan finds no schema files; stale-check cleanup
 	// converts the retained row on the current head SHA before the aggregate
 	// for that commit is published.
+	result.PRState.Store(new("open"))
 	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "reopened"}, nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)

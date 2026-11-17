@@ -105,6 +105,8 @@ func previewCommentAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (WIDE ROLLOUT)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutWide()) }},
+		{"ROLLOUT PLANS (WIDE ROLLOUT, 128 TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutWider()) }},
 		{"ROLLOUT PLANS (COPY DISCARDED ON ANOTHER TARGET, PAUSED)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutCopyDiscardedPaused())
 		}},
@@ -250,6 +252,8 @@ func previewCommentPlanAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (WIDE ROLLOUT)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutWide()) }},
+		{"ROLLOUT PLANS (WIDE ROLLOUT, 128 TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutWider()) }},
 		{"ROLLOUT PLANS (COPY DISCARDED ON ANOTHER TARGET, PAUSED)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutCopyDiscardedPaused())
 		}},
@@ -460,7 +464,9 @@ func previewCommentShardedAllOutput() {
 		fn   func()
 	}{
 		{"PLAN: DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanDivergent()) }},
+		{"PLAN: FEW SHARDS (8)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanFewShards()) }},
 		{"PLAN: MANY SHARDS (32)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanManyShards()) }},
+		{"PLAN: MANY SHARDS (256)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanHugeShards()) }},
 		{"MULTI-ENV PLAN: CHANGES ONLY ON SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanMultiEnvShardOnly()) }},
 		{"PLAN: PARTIALLY APPLIED SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanPartiallyApplied()) }},
 		{"PLAN: UNSAFE CHANGE ON ONE SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanUnsafe()) }},

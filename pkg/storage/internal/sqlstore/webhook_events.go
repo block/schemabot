@@ -161,7 +161,7 @@ func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliv
 // pending row whose not-before time (retry_after) is unset or has passed, a
 // retryable row whose retry window has elapsed and is under the attempt cap,
 // or a processing row whose lease has expired and is under the attempt cap.
-// FindNext and the InboxStats backlog-age query derive from this single source
+// FindNext and the InboxStats claimable aggregate derive from this single source
 // so the "ready to claim" definition cannot drift between what a driver picks
 // up and what the backlog gauge measures. Bind its placeholders with
 // webhookClaimableArgs.
@@ -183,6 +183,19 @@ func webhookClaimableArgs() []any {
 	}
 }
 
+// failedOrganicRowInCoolOff matches a failed row that still covers its head:
+// an organic delivery (not the SynthesizedWebhookDeliveryIDPrefix GUID form)
+// that failed less than WebhookEventFailedCoverageCoolOff ago. The cutoff is
+// measured on the database clock, the same clock that stamped completed_at.
+// Every terminal failure write stamps completed_at; updated_at, which every
+// write stamps, stands in if it is ever unset. Bind one placeholder: the
+// synthesized-GUID LIKE pattern.
+func (s *webhookEventStore) failedOrganicRowInCoolOff() string {
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.WebhookEventFailedCoverageCoolOff.Microseconds())), IntervalMicrosecond)
+	return `(delivery_id NOT LIKE ? AND COALESCE(completed_at, updated_at) > ` + cutoff + `)`
+}
+
 func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
 	repository = storage.CanonicalKey(repository)
 	if provider == "" {
@@ -195,23 +208,26 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 	// only auto-plannable pull_request rows count. Other event types can carry
 	// the same PR + head SHA without planning it — a pull_request.closed row
 	// from before a reopen, or a check_run row — and matching them would mask
-	// the very loss the reconciler exists to recover. A terminally failed
-	// organic row still covers its head: its GitHub Redeliver lever is the
-	// operator's remediation, and synthesizing over it would loop a
-	// deterministically failing head through a fresh claim budget every
-	// pass. Only a plain failed synthesized row (the
-	// SynthesizedWebhookDeliveryIDPrefix GUID form) fails to cover — there
-	// is no Redeliver lever for a synthesized GUID, so the reconciler must
-	// be able to synthesize a fresh recovery delivery, which lands in
-	// Create's duplicate-GUID branch and reopens the failed row. A
-	// permanently failed (dead-lettered) row covers its head in either GUID
-	// form: the driver proved no retry can plan that head, so resurrecting
-	// it would replay the same deterministic failure on every reconcile
-	// pass. A superseded row never covers: its work was discarded on the
-	// promise that a covering successor performs it, so it cannot itself
-	// attest coverage — when the successor's coverage lapses (e.g. it
-	// targeted a different head and the PR reopened on this one), the
-	// reconciler must be free to synthesize.
+	// the very loss the reconciler exists to recover. A plain failed row
+	// exhausted its transient retries, so a later attempt can still plan the
+	// head. An organic one covers its head only for
+	// WebhookEventFailedCoverageCoolOff after it failed: the window leaves
+	// room for the operator's GitHub Redeliver, and once it passes the
+	// reconciler synthesizes a recovery delivery so the PR is planned even
+	// when nobody noticed the failure. A failed synthesized row (the
+	// SynthesizedWebhookDeliveryIDPrefix GUID form) never covers — there is
+	// no Redeliver lever for a synthesized GUID, so the reconciler must be
+	// able to synthesize a fresh recovery delivery, which lands in Create's
+	// duplicate-GUID branch and reopens the failed row. Either way the
+	// reconciler's pass interval paces the retries. A permanently failed
+	// (dead-lettered) row covers its head in either GUID form: the driver
+	// proved no retry can plan that head, so resurrecting it would replay
+	// the same deterministic failure on every reconcile pass. A superseded
+	// row never covers: its work was discarded on the promise that a
+	// covering successor performs it, so it cannot itself attest coverage —
+	// when the successor's coverage lapses (e.g. it targeted a different
+	// head and the PR reopened on this one), the reconciler must be free to
+	// synthesize.
 	args := []any{provider, repository, pullRequest, headSHA}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
 	args = append(args, storage.WebhookEventSuperseded, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
@@ -222,7 +238,7 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
 			AND event = 'pull_request' AND action IN (`+placeholders(len(storage.AutoPlanPullRequestActions))+`)
 			AND state <> ?
-			AND (state <> ? OR delivery_id NOT LIKE ?)
+			AND (state <> ? OR `+s.failedOrganicRowInCoolOff()+`)
 		LIMIT 1
 	`, args...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -651,8 +667,7 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 
 // InboxStats returns a read-only snapshot of the inbox for observability. It
 // runs three cheap aggregates rather than one query: heterogeneous aggregates
-// (grouped counts, a MIN age over a filtered subset, and a filtered count) do
-// not combine into a single index-friendly statement, and each is served by an
+// (grouped counts, claimable count/age, and stuck-processing count) do not combine into a single index-friendly statement, and each is served by an
 // existing index.
 func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInboxStats, error) {
 	stats := &storage.WebhookInboxStats{CountsByState: make(map[string]int64, len(storage.WebhookEventStatesAll))}
@@ -677,7 +692,7 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 		return nil, fmt.Errorf("iterate webhook inbox state counts: %w", err)
 	}
 
-	// Oldest ready-to-claim row, using the exact predicate a driver claims by
+	// Count and oldest age share the exact predicate a driver claims by
 	// (webhookClaimablePredicate) so the backlog gauge and dispatch agree on
 	// what is claimable: a cap-exhausted retryable row is not counted (a driver
 	// won't take it, so it isn't backlog), and an expired-lease processing row a
@@ -691,12 +706,12 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 	// zero age.
 	var oldestClaimableAt, databaseNow sql.NullTime
 	err = s.db.QueryRowContext(ctx, `
-		SELECT MIN(GREATEST(received_at, COALESCE(retry_after, received_at))), `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`
+		SELECT COUNT(*), MIN(GREATEST(received_at, COALESCE(retry_after, received_at))), `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`
 		FROM webhook_events
 		WHERE `+s.webhookClaimablePredicate()+`
-	`, webhookClaimableArgs()...).Scan(&oldestClaimableAt, &databaseNow)
+	`, webhookClaimableArgs()...).Scan(&stats.ClaimableDepth, &oldestClaimableAt, &databaseNow)
 	if err != nil {
-		return nil, fmt.Errorf("measure oldest claimable webhook inbox row: %w", err)
+		return nil, fmt.Errorf("measure claimable webhook inbox rows: %w", err)
 	}
 	if oldestClaimableAt.Valid && databaseNow.Valid && databaseNow.Time.After(oldestClaimableAt.Time) {
 		stats.OldestClaimableAge = databaseNow.Time.Sub(oldestClaimableAt.Time)

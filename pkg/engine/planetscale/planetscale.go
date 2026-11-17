@@ -858,36 +858,41 @@ var retryDelay = func(attempt int, lastErr error) time.Duration {
 	return base + time.Duration(rand.IntN(2000))*time.Millisecond
 }
 
-func deployStateToEngineState(drState string) engine.State {
+// deployStateToEngineState maps a deploy request's deployment state to the
+// engine state, and reports whether SchemaBot recognized it. An unrecognized
+// state maps to running: the apply keeps polling and never settles on an
+// outcome PlanetScale did not report, and the caller logs the state so it can
+// be added here.
+func deployStateToEngineState(drState string) (engine.State, bool) {
 	switch drState {
 	case deployState.Pending, deployState.Ready:
-		return engine.StatePending
+		return engine.StatePending, true
 	case deployState.NoChanges, deployState.Complete:
-		return engine.StateCompleted
+		return engine.StateCompleted, true
 	case deployState.CompletePendingRevert:
-		return engine.StateRevertWindow
+		return engine.StateRevertWindow, true
 	case deployState.Queued, deployState.Submitting, deployState.InProgress, deployState.InProgressVSchema:
-		return engine.StateRunning
+		return engine.StateRunning, true
 	case deployState.PendingCutover:
-		return engine.StateWaitingForCutover
+		return engine.StateWaitingForCutover, true
 	case deployState.InProgressCutover:
-		return engine.StateCuttingOver
+		return engine.StateCuttingOver, true
 	case deployState.CompleteError, deployState.Error, deployState.Failed, deployState.CompleteRevertError:
-		return engine.StateFailed
+		return engine.StateFailed, true
 	case deployState.InProgressCancel:
 		// PlanetScale has accepted the cancel but not confirmed it, and an
 		// unconfirmed cancel can still end the deploy in complete_error. The
 		// deploy request is still in motion, so it reads as running until it
 		// settles on cancelled or failed.
-		return engine.StateRunning
+		return engine.StateRunning, true
 	case deployState.CompleteCancel, deployState.Cancelled:
-		return engine.StateCancelled
+		return engine.StateCancelled, true
 	case deployState.InProgressRevert, deployState.InProgressRevertVSchema:
-		return engine.StateReverting
+		return engine.StateReverting, true
 	case deployState.CompleteRevert:
-		return engine.StateReverted
+		return engine.StateReverted, true
 	default:
-		return engine.StateRunning
+		return engine.StateRunning, false
 	}
 }
 
