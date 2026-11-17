@@ -29,6 +29,17 @@ type Part struct {
 	// standing in for the rows it will copy. Nil once the part reports a
 	// total, or when the plan had no estimate for it.
 	PlannedRows *int64
+	// RunningLabel is the word for the part while it works on its change,
+	// RunningCopying when empty (RunningWord).
+	RunningLabel string
+}
+
+// runningLabel is the word p is named by while it works on its change.
+func (p Part) runningLabel() string {
+	if p.RunningLabel == "" {
+		return RunningCopying
+	}
+	return p.RunningLabel
 }
 
 // PendingQueued and PendingNotStarted name a part still to run: queued while
@@ -38,6 +49,24 @@ const (
 	PendingQueued     = "queued"
 	PendingNotStarted = "not started"
 )
+
+// RunningCopying and RunningApplying name a part working on its change:
+// copying while the change copies the table's rows, and applying while it runs
+// a change that copies none, such as a CREATE TABLE, a DROP TABLE or an
+// instant ALTER, where "copying" would describe work that is not happening.
+const (
+	RunningCopying  = "copying"
+	RunningApplying = "applying"
+)
+
+// RunningWord names a part working on a change that does or does not copy
+// the table's rows.
+func RunningWord(copiesRows bool) string {
+	if copiesRows {
+		return RunningCopying
+	}
+	return RunningApplying
+}
 
 // PendingWord names the parts still to run of a rollout that has or has not
 // settled.
@@ -189,13 +218,14 @@ func OnePhaseSpeaksForParts(statuses []string) bool {
 // the states some target is in, or "" when there are none. Queued targets are
 // waiting on the apply's driver cap or on their turn in order; pendingWord
 // names them, "not started" once the rollout has settled (PendingWord).
-func TargetCoverage(done, running, queued, failed, retrying int, pendingWord string) string {
+// runningWord names the targets working on the change (RunningWord).
+func TargetCoverage(done, running, queued, failed, retrying int, runningWord, pendingWord string) string {
 	var parts []string
 	if done > 0 {
 		parts = append(parts, fmt.Sprintf("%d complete", done))
 	}
 	if running > 0 {
-		parts = append(parts, fmt.Sprintf("%d copying", running))
+		parts = append(parts, fmt.Sprintf("%d %s", running, runningWord))
 	}
 	if queued > 0 {
 		parts = append(parts, fmt.Sprintf("%d %s", queued, pendingWord))
@@ -253,7 +283,7 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 		lines = append(lines, PartListLine{Part: i})
 	}
 	if more := len(copying) - maxCopyingParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, noun.Label(more))})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more %s %s", more, part(copying[0]).runningLabel(), noun.Label(more))})
 	}
 	// A part working through any later phase is as live as a copying one, so
 	// it is named too, in its own order, rather than hidden in the heading.
@@ -342,10 +372,10 @@ func PartDetail(p Part, pendingWord string) string {
 		}
 		return "complete"
 	case state.Task.Running:
-		// A part that has not reported progress yet reads as copying rather
-		// than a misleading 0%.
+		// A part that has not reported progress yet reads as working on its
+		// change rather than a misleading 0%.
 		if !partReported(p) {
-			return "copying"
+			return p.runningLabel()
 		}
 		return partProgress(p)
 	case state.Task.Pending:
@@ -398,6 +428,9 @@ type PartCounts struct {
 	// PendingLabel is the word Phrases counts Queued parts by, PendingQueued
 	// when empty (PendingWord).
 	PendingLabel string
+	// RunningLabel is the word Phrases counts Running parts by,
+	// RunningCopying when empty (RunningWord).
+	RunningLabel string
 	// Other counts every status the fields above do not name, keyed by
 	// status, so a part in any phase stays in the summary.
 	Other map[string]int
@@ -440,7 +473,11 @@ func (c PartCounts) Phrases() []string {
 		parts = append(parts, fmt.Sprintf("%d failed", c.Failed))
 	}
 	if c.Running > 0 {
-		parts = append(parts, fmt.Sprintf("%d copying", c.Running))
+		label := c.RunningLabel
+		if label == "" {
+			label = RunningCopying
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", c.Running, label))
 	}
 	if c.WaitingForCutover > 0 {
 		parts = append(parts, fmt.Sprintf("%d waiting for cutover", c.WaitingForCutover))
