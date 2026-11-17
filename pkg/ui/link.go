@@ -91,6 +91,23 @@ func isControl(r rune) bool {
 	return r < 32 || r == 127
 }
 
+// TerminalSafe removes the control runes from text a server sent, such as an
+// error message, so printing it cannot move the cursor, recolor or clear the
+// screen, set the window title, or plant a hyperlink. Newlines and tabs are
+// kept because multi-line error messages rely on them. The C1 range is removed
+// too, since some terminals act on those runes the way they act on ESC.
+func TerminalSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if isControl(r) || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // terminalEscapePattern matches the zero-width escape sequences this CLI
 // emits: OSC sequences (hyperlinks) terminated by BEL or ST, and SGR color
 // codes.

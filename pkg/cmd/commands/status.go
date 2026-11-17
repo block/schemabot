@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // StatusCmd shows schema change status.
@@ -231,7 +232,7 @@ func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.Acti
 		State:               a.State,
 		Engine:              a.Engine,
 		Caller:              a.Caller,
-		ErrorMessage:        a.ErrorMessage,
+		ErrorMessage:        ui.TerminalSafe(a.ErrorMessage),
 		StartedAt:           a.StartedAt,
 		CompletedAt:         a.CompletedAt,
 		UpdatedAt:           a.UpdatedAt,

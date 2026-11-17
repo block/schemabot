@@ -149,6 +149,29 @@ func TestVisibleWidth(t *testing.T) {
 	})
 }
 
+// Text a server sends, such as a failed apply's error, is printed straight to
+// the operator's terminal. Escape sequences in it would act on the terminal,
+// so every control rune is removed except the newlines and tabs that lay out a
+// multi-line message.
+func TestTerminalSafe(t *testing.T) {
+	cases := map[string]struct {
+		in, want string
+	}{
+		"plain text is unchanged":                                         {"duplicate key name 'idx_orders_source'", "duplicate key name 'idx_orders_source'"},
+		"newlines and tabs are kept":                                      {"deploy request failed\n  [INVALID_VSCHEMA]\tusers", "deploy request failed\n  [INVALID_VSCHEMA]\tusers"},
+		"a screen clear is removed":                                       {"lock wait timeout\x1b[2J\x1b[H", "lock wait timeout[2J[H"},
+		"a window title is removed":                                       {"\x1b]0;owned\x07failed", "]0;ownedfailed"},
+		"a carriage return is removed, so the line cannot be overwritten": {"failed\rcompleted", "failedcompleted"},
+		"a C1 control sequence introducer is removed":                     {"failed\u009b2J", "failed2J"},
+		"printable Unicode is kept":                                       {"table café · ⚠️", "table café · ⚠️"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, TerminalSafe(tc.in))
+		})
+	}
+}
+
 func TestPadVisible(t *testing.T) {
 	t.Run("pads plain text to the requested cell count", func(t *testing.T) {
 		assert.Equal(t, "ab   ", PadVisible("ab", 5))
