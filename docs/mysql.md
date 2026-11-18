@@ -498,11 +498,11 @@ its request latency roughly halved, and commit latency fell from 4.4ms to 1.85ms
   time of low traffic.
 - **Expect a cold cache.** The new writer starts with an empty buffer pool, so queries run slower
   until it warms up.
-- **Stop the change first.** Run `stop` before the failover and `start` once the new writer is
-  serving (see [pausing](engines.md#pausing)). The copy then pauses at a
-  [checkpoint](#checkpointing-and-resuming-a-change) instead of failing partway through a chunk.
-  Spirit reads the vCPU count when the copy starts, so the new thread counts take effect on
-  `start`. Keep binary logs long enough to cover the pause, and do not resize during the cutover.
+- **Leave the change running.** The failover fails the copy, and SchemaBot retries it
+  automatically. Aurora instances in one region share the same storage, so the retry resumes from
+  the last [checkpoint](#checkpointing-and-resuming-a-change) and keeps its progress. Spirit reads
+  the vCPU count when the copy starts, so the retry picks up the new thread counts. Do not resize
+  during the cutover.
 - **Sizing back down is another writer change.** It brings the same outage and cold cache. If the
   writer stays busy after the change finishes, the smaller class would pin its CPU again, so find
   the source of that load first.
