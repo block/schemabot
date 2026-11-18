@@ -873,8 +873,10 @@ database's own provisioning. For the layout above:
 -- for in-place ALTER TABLE.
 GRANT app_owner TO schemabot;
 
--- The owner can create tables in the schema.
+-- The owner can create tables in the schema, and the service roles can
+-- reach objects in it.
 GRANT USAGE, CREATE ON SCHEMA app TO app_owner;
+GRANT USAGE ON SCHEMA app TO app, app_read_only;
 
 -- Tables and sequences app_owner creates are usable by the service roles.
 ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
