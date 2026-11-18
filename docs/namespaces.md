@@ -461,6 +461,30 @@ Upgrade SchemaBot servers and data planes before adding a pattern. An older buil
 
 Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. That includes a pattern that matches a declared table. The refusal ignores case, since some databases fold table names to lower case. Two spellings count as the same table when one lower-cases or Unicode-folds to the other, for plain entries and patterns alike, so a few non-ASCII spellings that were distinct before patterns, such as the long s `ſ` and `s`, now collide. The error names the entries to remove, and for a pattern, the declared tables it matches, so you can narrow it.
 
+### Databases that share a schema
+
+Two databases can split one schema between them. One example is an app whose unsharded tables live in shard 0's schema, next to that shard's copy of the sharded tables. One database holds the unsharded tables, and the other holds the sharded tables in every shard's schema. On the cluster where they meet, each database's plan sees the other's tables as undeclared, so each `schemabot.yaml` lists the other's tables under `ignore_tables`:
+
+```yaml
+# shop/schemabot.yaml           # shop_sharded/schemabot.yaml
+database: shop                  database: shop_sharded
+type: mysql                     type: mysql
+ignore_tables:                  ignore_tables:
+  - orders                        - sequences
+  - order_items
+```
+
+A pull request that adds a table to one database has to add it to the other's `ignore_tables` too. Otherwise its own plan passes, and the missing entry only shows up later, as a `DROP TABLE` in the other database's plan. So SchemaBot checks every plan and apply from a pull request for this.
+
+Two databases share a schema when, in the same environment, both have a target on the same cluster behind the same deployment, and both declare the same namespace there. Only those namespaces are compared. For each table that one database declares there, the other must withhold it, by name or by pattern. If it does not, the environment's check fails. The error names the table, the database whose `ignore_tables` is missing it, and the file to add it to. The other database's files are read from the pull request's head, so a pull request that adds the table and the entry together passes.
+
+- A table that both databases declare in the shared namespace also fails the check, whatever the lists say. Each table belongs to one of them.
+- Entries match case exactly. A target that folds table names stores `Refunds` as `refunds`, so a table declared with capital letters needs an entry for its lower-case spelling as well, or a pattern that matches both. The error names every spelling still missing.
+- The other database's files must come from a directory its own `allowed_dirs` allow, the same source policy its own plans pass. If they do not, or if SchemaBot cannot read them, the environment fails. It does not pass a pair it could not compare.
+- A database whose `schemabot.yaml` is in another repository is managed from there, so it is not compared. SchemaBot skips it only when its search read every config it found; a miss that skipped an unreadable config fails the environment.
+- A plan narrowed with `--target` runs the check too. The disagreement is in the schema files, so it fails the environment's check whichever target the plan named.
+- The CLI plans one database from a local directory and does not run this check.
+
 ### Exclusions are disclosed
 
 Every plan that withheld tables says so: the PR plan comment renders an

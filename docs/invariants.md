@@ -813,6 +813,21 @@ aggregate publishers (`pkg/webhook/pull_request.go`, `pkg/webhook/check_publishe
 fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.go`,
 `pkg/webhook/apply_execute.go`).
 
+### MG-14: Databases that share a schema pass only while each withholds the other's tables
+
+When two databases managed from one repository plan the same namespace on the same rollout member,
+a plan or apply of either passes only while each withholds from its plans every table the other
+declares there, and no table is declared by both. Both databases' schema files are read at the pull
+request's head, so the rule holds before an apply has created a new table, and a pull request that
+adds a table to one database and withholds it from the other in the same change passes. A database
+whose files cannot be read fails the environment rather than passing it. *Breaks if violated:* a
+pull request that adds a table to one database merges green, and once it is applied the other
+database's next plan proposes dropping it. *Enforced:* `CheckSharedSchemaIgnoreLists` in
+`pkg/api/shared_schema.go`, run before the plan by `verifySharedSchemaIgnoreLists`
+(`pkg/webhook/shared_schema.go`) from the single- and multi-environment plans in
+`pkg/webhook/plan.go`, and before an apply or apply-confirm by `enforceSharedSchemaIgnoreLists` in
+`pkg/webhook/apply_handlers.go`.
+
 ## Apply state machine (ST)
 
 Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and
