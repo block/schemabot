@@ -458,6 +458,9 @@ func gitHubResponseStatus(resp *http.Response, operation string) string {
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		return metrics.GitHubRequestStatusSuccess
 	}
+	if resp.StatusCode == http.StatusNotModified {
+		return metrics.GitHubRequestStatusNotModified
+	}
 	// Only read operations get the not_found relabel: reads routinely probe
 	// paths whose expected answer is 404 (schemabot.yaml lookups, deleted
 	// PRs). A 404 on an auth or write operation is a genuine failure — a
