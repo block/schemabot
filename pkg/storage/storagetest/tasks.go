@@ -63,6 +63,64 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, 813, owners[0].PullRequest)
 	})
 
+	// GetNonTerminalByDatabase returns the database's unsettled tasks, newest
+	// first: running, waiting, stopped and unknown states come back; completed,
+	// failed, reverted and cancelled tasks, and other databases' tasks, do not.
+	t.Run("GetNonTerminalByDatabase_ReturnsUnsettledTasksNewestFirst", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_non_terminal_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_non_terminal", 820)
+		otherLock := CreateLock(t, store, "task_non_terminal_other_db", storage.DatabaseTypeMySQL)
+		otherApply := CreateApply(t, store, otherLock, "apply_task_non_terminal_other", 821)
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+		taskStates := []string{
+			state.Task.Pending,
+			state.Task.Completed,
+			state.Task.Running,
+			state.Task.Failed,
+			state.Task.Stopped,
+			state.Task.Reverted,
+			state.Task.WaitingForCutover,
+			state.Task.Cancelled,
+			"state_from_a_newer_build",
+		}
+		for i, taskState := range taskStates {
+			task := newTask(apply, "task_non_terminal_"+taskState, "table_"+taskState, base.Add(time.Duration(i)*time.Minute))
+			task.State = taskState
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+		}
+		other := newTask(otherApply, "task_non_terminal_other_running", "other_table", base.Add(time.Hour))
+		other.State = state.Task.Running
+		_, err := store.Tasks().Create(ctx, other)
+		require.NoError(t, err)
+
+		got, err := store.Tasks().GetNonTerminalByDatabase(ctx, "TASK_NON_TERMINAL_DB")
+		require.NoError(t, err)
+		gotIdentifiers := make([]string, 0, len(got))
+		for _, task := range got {
+			assert.Equal(t, "task_non_terminal_db", task.Database)
+			gotIdentifiers = append(gotIdentifiers, task.TaskIdentifier)
+		}
+		assert.Equal(t, []string{
+			"task_non_terminal_state_from_a_newer_build",
+			"task_non_terminal_" + state.Task.WaitingForCutover,
+			"task_non_terminal_" + state.Task.Stopped,
+			"task_non_terminal_" + state.Task.Running,
+			"task_non_terminal_" + state.Task.Pending,
+		}, gotIdentifiers)
+		// A task read back reports an unknown state as running, so the row
+		// stays visible and keeps blocking rather than reading as settled.
+		require.NotEmpty(t, got)
+		assert.Equal(t, state.Task.Running, got[0].State)
+
+		none, err := store.Tasks().GetNonTerminalByDatabase(ctx, "task_non_terminal_missing_db")
+		require.NoError(t, err)
+		assert.Empty(t, none)
+	})
+
 	// A task's planned table size and row count are written once when the
 	// task is created and read back with it. Progress updates rewrite the
 	// task's live figures but never the plan's estimates, so a drive that does
@@ -590,6 +648,12 @@ func TestTasks(t *testing.T, h Harness) {
 	t.Run("GetByDatabase_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.Tasks().GetByDatabase(t.Context(), "database")
+		require.Error(t, err)
+	})
+
+	t.Run("GetNonTerminalByDatabase_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetNonTerminalByDatabase(t.Context(), "database")
 		require.Error(t, err)
 	})
 

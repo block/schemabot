@@ -1388,6 +1388,13 @@ type TaskStore interface {
 	// GetByDatabase returns all tasks for a database.
 	GetByDatabase(ctx context.Context, database string) ([]*Task, error)
 
+	// GetNonTerminalByDatabase returns the tasks for a database that are not in
+	// a terminal state, newest first: work still running, waiting, or stopped
+	// and resumable. A state outside the terminal set, including an unknown one,
+	// is returned. Callers that act only on unsettled work read this instead of
+	// GetByDatabase, whose cost grows with the database's whole task history.
+	GetNonTerminalByDatabase(ctx context.Context, database string) ([]*Task, error)
+
 	// GetActive returns all tasks in non-terminal states.
 	GetActive(ctx context.Context) ([]*Task, error)
 
