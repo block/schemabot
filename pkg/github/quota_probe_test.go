@@ -34,8 +34,11 @@ func recordingQuotaProbe(t *testing.T, listErr error, ids ...int64) (*QuotaProbe
 	var mu sync.Mutex
 	failing := map[int64]bool{}
 	probe := &QuotaProbe{
-		logger:   slog.New(slog.DiscardHandler),
-		interval: time.Hour,
+		logger:          slog.New(slog.DiscardHandler),
+		interval:        time.Hour,
+		listTimeout:     quotaProbeTestDeadline,
+		readTimeout:     quotaProbeTestDeadline,
+		readConcurrency: 1,
 		listInstallations: func(context.Context) ([]int64, error) {
 			if listErr != nil {
 				return nil, listErr
@@ -92,6 +95,74 @@ func TestQuotaProbeKeepsReadingPastAFailedInstallation(t *testing.T) {
 
 	assert.Equal(t, int64(11), receiveRead(t, reads))
 	assert.Equal(t, int64(22), receiveRead(t, reads))
+}
+
+// An installation whose read hangs costs only its own read: the reads after it
+// in the same pass still run, so a hung installation cannot keep a healthy one
+// unknown pass after pass.
+func TestQuotaProbeHungInstallationDoesNotStarveTheRest(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11, 22, 33)
+	record := probe.readQuota
+	probe.readTimeout = 50 * time.Millisecond
+	probe.readQuota = func(ctx context.Context, id int64) error {
+		if id == 11 {
+			<-ctx.Done()
+			return fmt.Errorf("installation %d did not answer: %w", id, ctx.Err())
+		}
+		return record(ctx, id)
+	}
+	probe.probeOnce(t.Context())
+
+	assert.Equal(t, int64(22), receiveRead(t, reads))
+	assert.Equal(t, int64(33), receiveRead(t, reads))
+}
+
+// A pass reads installations concurrently, so a slow installation does not hold
+// up the ones next to it.
+func TestQuotaProbeReadsInstallationsConcurrently(t *testing.T) {
+	probe, _, _ := recordingQuotaProbe(t, nil, 11, 22)
+	probe.readConcurrency = 2
+	started := make(chan struct{})
+	overlapped := make(chan bool, 1)
+	probe.readQuota = func(ctx context.Context, id int64) error {
+		if id == 22 {
+			close(started)
+			return nil
+		}
+		select {
+		case <-started:
+			overlapped <- true
+			return nil
+		case <-ctx.Done():
+			overlapped <- false
+			return fmt.Errorf("installation 22 was not read while installation 11 was in flight: %w", ctx.Err())
+		}
+	}
+	probe.probeOnce(t.Context())
+
+	assert.True(t, <-overlapped, "installation 22 was read only after installation 11 finished")
+}
+
+// Canceling the context the probe was started with stops it, the same as Stop,
+// so the probe ends with the server's lifecycle.
+func TestQuotaProbeStopsWhenItsContextIsCanceled(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11)
+	ctx, cancel := context.WithCancel(t.Context())
+	probe.Start(ctx)
+	t.Cleanup(probe.Stop)
+	assert.Equal(t, int64(11), receiveRead(t, reads))
+
+	cancel()
+	exited := make(chan struct{})
+	go func() {
+		probe.wg.Wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+	case <-time.After(quotaProbeTestDeadline):
+		require.FailNow(t, "quota probe kept running after its context was canceled")
+	}
 }
 
 // When the installation list cannot be read, the pass reads nothing; the

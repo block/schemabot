@@ -19,9 +19,19 @@ import (
 // the previous reading exported until the next read replaces it.
 const QuotaProbeInterval = metrics.GitHubRateLimitSnapshotMaxAge / 2
 
-// quotaProbeTimeout bounds one probe pass, so a slow GitHub cannot stack
-// passes behind each other.
-const quotaProbeTimeout = QuotaProbeInterval
+// quotaListTimeout bounds listing the App's installations at the start of a
+// pass.
+const quotaListTimeout = QuotaProbeInterval / 2
+
+// quotaReadTimeout bounds one installation's budget read. Each read has its own
+// bound, so an installation that hangs costs only its own read and every other
+// installation is still read in the same pass.
+const quotaReadTimeout = QuotaProbeInterval / 4
+
+// quotaReadConcurrency is how many installations a pass reads at once, so a
+// few slow installations do not hold up the rest while the request rate to
+// GitHub stays bounded.
+const quotaReadConcurrency = 8
 
 // QuotaProbe keeps every installation's GitHub budget observed while the
 // server is idle. Webhook traffic records quota from the headers on each
@@ -34,6 +44,9 @@ const quotaProbeTimeout = QuotaProbeInterval
 type QuotaProbe struct {
 	logger            *slog.Logger
 	interval          time.Duration
+	listTimeout       time.Duration
+	readTimeout       time.Duration
+	readConcurrency   int
 	listInstallations func(ctx context.Context) ([]int64, error)
 	readQuota         func(ctx context.Context, installationID int64) error
 
@@ -48,6 +61,9 @@ func (c *Client) NewQuotaProbe() *QuotaProbe {
 	return &QuotaProbe{
 		logger:            c.logger,
 		interval:          QuotaProbeInterval,
+		listTimeout:       quotaListTimeout,
+		readTimeout:       quotaReadTimeout,
+		readConcurrency:   quotaReadConcurrency,
 		listInstallations: c.listActiveInstallations,
 		readQuota: func(ctx context.Context, installationID int64) error {
 			ic, err := c.ForInstallation(installationID)
@@ -72,7 +88,7 @@ func (p *QuotaProbe) Start(ctx context.Context) {
 		p.logger.Warn("GitHub quota probe already running; ignoring second start")
 		return
 	}
-	ctx, p.cancel = context.WithCancel(context.WithoutCancel(ctx))
+	ctx, p.cancel = context.WithCancel(ctx)
 	p.logger.Info("GitHub quota probe started", "interval", p.interval)
 	p.wg.Go(func() {
 		ticker := time.NewTicker(p.interval)
@@ -89,8 +105,9 @@ func (p *QuotaProbe) Start(ctx context.Context) {
 	})
 }
 
-// Stop cancels the probe and waits for an in-flight pass to return. A pass
-// only reads GitHub and writes nothing, so canceling it loses nothing.
+// Stop cancels the probe and waits for an in-flight pass to return. The wait is
+// bounded by the per-read timeout, since every read observes the cancellation.
+// A pass only reads GitHub and writes nothing, so canceling it loses nothing.
 func (p *QuotaProbe) Stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -103,12 +120,13 @@ func (p *QuotaProbe) Stop() {
 }
 
 // probeOnce reads the budget of every installation once. Installations are
-// independent: one that fails to answer is logged and the rest are still read,
-// and the failed one's budget ages out to unknown on its own.
+// independent: one that fails or hangs is logged once its own read times out,
+// the rest are still read, and the failed one's budget ages out to unknown on
+// its own.
 func (p *QuotaProbe) probeOnce(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, quotaProbeTimeout)
-	defer cancel()
-	ids, err := p.listInstallations(ctx)
+	listCtx, cancel := context.WithTimeout(ctx, p.listTimeout)
+	ids, err := p.listInstallations(listCtx)
+	cancel()
 	if err != nil {
 		p.logger.Warn("GitHub quota probe could not list App installations; installation budgets will age out to unknown until a later pass succeeds",
 			"error", err)
@@ -118,11 +136,30 @@ func (p *QuotaProbe) probeOnce(ctx context.Context) {
 		p.logger.Debug("GitHub quota probe found no active App installations")
 		return
 	}
+	slots := make(chan struct{}, p.readConcurrency)
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	for _, id := range ids {
-		if err := p.readQuota(ctx, id); err != nil {
-			p.logger.Warn("GitHub quota probe could not read installation budget; its budget will age out to unknown until a later pass succeeds",
-				"installation_id", id, "error", err)
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			p.logger.Debug("GitHub quota probe stopped before reading every installation", "error", ctx.Err())
+			return
 		}
+		wg.Go(func() {
+			defer func() { <-slots }()
+			p.readInstallation(ctx, id)
+		})
+	}
+}
+
+// readInstallation reads one installation's budget under its own timeout.
+func (p *QuotaProbe) readInstallation(ctx context.Context, installationID int64) {
+	ctx, cancel := context.WithTimeout(ctx, p.readTimeout)
+	defer cancel()
+	if err := p.readQuota(ctx, installationID); err != nil {
+		p.logger.Warn("GitHub quota probe could not read installation budget; its budget will age out to unknown until a later pass succeeds",
+			"installation_id", installationID, "error", err)
 	}
 }
 
