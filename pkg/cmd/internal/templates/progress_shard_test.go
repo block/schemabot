@@ -70,9 +70,9 @@ func TestFormatShardProgressShowsMostBehindCopyingShardsFirst(t *testing.T) {
 	}
 	out := FormatShardProgress(shards)
 
-	// The three furthest-behind copying shards render individually, in
+	// The four furthest-behind copying shards render individually, in
 	// ascending percent order.
-	shown := []string{"s10", "s20", "s30"}
+	shown := []string{"s10", "s20", "s30", "s50"}
 	lastIdx := -1
 	for _, shard := range shown {
 		idx := strings.Index(out, shard)
@@ -82,5 +82,6 @@ func TestFormatShardProgressShowsMostBehindCopyingShardsFirst(t *testing.T) {
 
 	// The rest are counted in the heading.
 	assert.Contains(t, out, "Shards: 9 (7 copying, 2 complete)")
-	assert.NotContains(t, out, "s50")
+	assert.Contains(t, out, "... 3 more copying shards")
+	assert.NotContains(t, out, "s70")
 }
