@@ -683,6 +683,79 @@ func TestUnverifiedScopedLockAcquireRefusalIsCountedAndLogged(t *testing.T) {
 	assert.Equal(t, "org/payments-service", entry["repository"])
 }
 
+// A lock request body holds one JSON value. Anything after it but white space
+// is refused before anything changes, so a second object carrying "force", or
+// a value followed by stray text, is never acted on as if only its first part
+// had been sent.
+func TestLockRequestsRejectDataAfterTheJSONValue(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+	const ownerRelease = `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop"}`
+
+	release := func(t *testing.T, body string) (*httptest.ResponseRecorder, *memoryLockStore) {
+		t.Helper()
+		locks := &memoryLockStore{lock: paymentsLock(7, "cli:bob@laptop", nil)}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		return scopedDenialRequest(t, svc.handleLockRelease, admin, http.MethodDelete, "/api/locks", body), locks
+	}
+
+	refused := []struct {
+		name string
+		body string
+	}{
+		{name: "a second object", body: ownerRelease + `{"force":true}`},
+		{name: "a second object on its own line", body: ownerRelease + "\n" + `{"force":true}`},
+		{name: "stray text", body: `{"database":"payments","database_type":"mysql","force":true} xx`},
+		{name: "a value that is cut short", body: ownerRelease + `{"force":`},
+	}
+	for _, tt := range refused {
+		t.Run("release followed by "+tt.name+" is refused", func(t *testing.T) {
+			rec, locks := release(t, tt.body)
+
+			assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+			assert.Contains(t, rec.Body.String(), "invalid request body: the body must hold one JSON value, but more data follows it")
+			assert.Equal(t, paymentsLock(7, "cli:bob@laptop", nil), locks.lock, "the lock stays held")
+		})
+	}
+
+	t.Run("release followed by white space is carried out", func(t *testing.T) {
+		rec, locks := release(t, ownerRelease+" \r\n\t")
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Nil(t, locks.lock, "the lock is released")
+	})
+
+	t.Run("acquire followed by a second object is refused", func(t *testing.T) {
+		locks := &memoryLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockAcquire, admin, http.MethodPost, "/api/locks/acquire",
+			`{"database":"payments","database_type":"mysql","owner":"cli:alice@laptop"}{"repository":"org/payments-service"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "more data follows it")
+		assert.Nil(t, locks.lock, "no lock is taken")
+	})
+}
+
+// A body that runs past the request body limit after its JSON value is
+// answered as too large, with the limit, the same as one that runs past it
+// inside the value.
+func TestLockReleaseBodyOverTheLimitAfterItsJSONValueIsTooLarge(t *testing.T) {
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop"}` + strings.Repeat(" ", maxAPIRequestBodyBytes)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodDelete, "/api/locks", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "request body exceeds the 32 MiB limit")
+}
+
 // A misspelt field in a lock request is refused before anything changes. A
 // tolerant decode would drop "forcce" and fall through to an owner release
 // the caller did not ask for, or take a lock without the field they meant.

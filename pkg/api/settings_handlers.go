@@ -2,7 +2,6 @@ package api
 
 import (
 	"cmp"
-	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -68,25 +67,25 @@ func (s *Service) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 
 // handleSettingsSet creates or updates a setting.
 func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
+	// Settings are deployment-wide, so there is no database to scope a grant
+	// to: admin-only. Nothing in the body decides that, so the check runs
+	// before the body is read and a caller who may not write settings gets
+	// the same refusal whatever they sent.
+	if !s.authorizeDirectAdminWrite(w, r, "settings_set") {
+		return
+	}
+
 	var req struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	}
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
 
 	if req.Key == "" {
 		s.writeError(w, http.StatusBadRequest, "key is required")
-		return
-	}
-
-	// Settings are deployment-wide, so there is no database to scope a grant
-	// to: admin-only.
-	if !s.authorizeDirectAdminWrite(w, r, "settings_set") {
 		return
 	}
 

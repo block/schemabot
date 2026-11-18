@@ -141,7 +141,7 @@ func (s *recordingSettingsStore) Set(_ context.Context, key, _ string) error {
 // known fields. A misspelt field would otherwise store an empty value, and a
 // component-state key would overwrite state the webhook reconciler keeps for
 // itself, so both are refused with nothing written. A non-admin is still
-// refused as unauthorized first, whatever the key.
+// refused as unauthorized first, whatever the key or the rest of the body.
 func TestSettingsSetRefusesUnknownFieldsAndComponentStateKeys(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
@@ -167,6 +167,14 @@ func TestSettingsSetRefusesUnknownFieldsAndComponentStateKeys(t *testing.T) {
 
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 		assert.Contains(t, rec.Body.String(), `unknown field \"valeu\"`)
+		assert.Empty(t, store.setKeys, "nothing is written")
+	})
+
+	t.Run("data after the JSON value is refused", func(t *testing.T) {
+		rec, store := set(t, admin, `{"key":"pause_applies","value":"true"}{"value":"false"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "the body must hold one JSON value, but more data follows it")
 		assert.Empty(t, store.setKeys, "nothing is written")
 	})
 
@@ -200,6 +208,21 @@ func TestSettingsSetRefusesUnknownFieldsAndComponentStateKeys(t *testing.T) {
 
 			assert.Equal(t, http.StatusForbidden, rec.Code, key)
 			assert.Empty(t, store.setKeys, key)
+		}
+	})
+
+	t.Run("a non-admin is refused as unauthorized whatever the body", func(t *testing.T) {
+		bodies := []string{
+			`{"key":"pause_applies","valeu":"true"}`,
+			`{"key":"pause_applies","value":"true"}{"value":"false"}`,
+			`{"value":"true"}`,
+			`not json`,
+		}
+		for _, body := range bodies {
+			rec, store := set(t, operator, body)
+
+			assert.Equal(t, http.StatusForbidden, rec.Code, body)
+			assert.Empty(t, store.setKeys, body)
 		}
 	})
 }
