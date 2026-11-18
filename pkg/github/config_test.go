@@ -1641,3 +1641,78 @@ func TestDatabaseNotFoundIsConclusiveOnlyWhenEveryConfigWasRead(t *testing.T) {
 		assert.False(t, notFound.Conclusive())
 	})
 }
+
+// A config in the database's directories that GitHub cannot return is not a
+// rejected config: the lookup fails with the read error, which a caller can
+// retry, and never with ErrInvalidConfig. A config that was read and failed
+// to parse still reports ErrInvalidConfig.
+func TestFindConfigByDatabaseNameInItsDirsKeepsReadFailuresApartFromInvalidConfigs(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	requests := 0
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+	_, _, scoped, err := ic.FindConfigByDatabaseNameInItsDirs(t.Context(), "octocat/hello-world", "abc123", "widgets")
+
+	assert.True(t, scoped)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorIs(t, err, ErrGitHubUnavailable)
+	readErr, ok := errors.AsType[*ConfigReadError](err)
+	require.True(t, ok, "want a *ConfigReadError, got %v", err)
+	assert.Equal(t, "apps/widgets/schema/schemabot.yaml", readErr.Path)
+	assert.Equal(t, githubUnavailableReadRetryMaxAttempts, requests)
+
+	t.Run("a config that does not parse", func(t *testing.T) {
+		client, mux := setupConfigTestGitHubServer(t)
+		registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+			{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+		})
+		registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: [widgets\n")
+		ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		ic.SetConfigDirHints(widgetsConfigDirHints(t, "apps/widgets/schema"))
+
+		_, _, _, err := ic.FindConfigByDatabaseNameInItsDirs(t.Context(), "octocat/hello-world", "abc123", "widgets")
+
+		require.ErrorIs(t, err, ErrInvalidConfig)
+		_, isRead := errors.AsType[*ConfigReadError](err)
+		assert.False(t, isRead)
+	})
+}
+
+// The repository-wide search reads only files named schemabot.yaml. A file
+// whose name merely ends that way, such as a backup copy, is not a config, so
+// it is never read and cannot make a miss inconclusive.
+func TestFindConfigByDatabaseNameInRepoReadsOnlyFilesNamedSchemabotYAML(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerConfigTestPullRequest(t, mux)
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{
+			map[string]any{"path": "apps/widgets/schema/schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+			map[string]any{"path": "apps/widgets/schema/backup-schemabot.yaml", "type": "blob", "sha": "blob-backup", "mode": "100644"},
+		}}))
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/apps/widgets/schema/backup-schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("the backup file is not a config and must not be read")
+		http.Error(w, "unexpected read", http.StatusInternalServerError)
+	})
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "payments")
+
+	var notFound *DatabaseNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.True(t, notFound.Conclusive())
+	assert.Equal(t, []string{"widgets"}, notFound.AvailableDatabases)
+}

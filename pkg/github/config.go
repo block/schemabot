@@ -147,7 +147,25 @@ func (e *DatabaseNotFoundError) Error() string {
 type InvalidConfigInfo struct {
 	Path  string
 	Error string
+	// Err is the error that made the config unusable. A *ConfigReadError
+	// means GitHub could not return the file, which a retry can fix; anything
+	// else is a config that was read and failed to parse or validate.
+	Err error
 }
+
+// ConfigReadError reports that a schemabot.yaml could not be read from GitHub,
+// as opposed to read and found invalid. A retry can succeed, so a caller must
+// not report it as a rejected config.
+type ConfigReadError struct {
+	Path string
+	Err  error
+}
+
+func (e *ConfigReadError) Error() string {
+	return fmt.Sprintf("fetch config at %s: %v", e.Path, e.Err)
+}
+
+func (e *ConfigReadError) Unwrap() error { return e.Err }
 
 // FetchConfig fetches and parses the schemabot.yaml config file from a specific path.
 func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath, ref string) (*SchemabotConfig, error) {
@@ -156,7 +174,7 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		if IsNotFoundError(err) {
 			return nil, ErrNoConfig
 		}
-		return nil, fmt.Errorf("fetch config at %s: %w", configPath, err)
+		return nil, &ConfigReadError{Path: configPath, Err: err}
 	}
 
 	var config SchemabotConfig
@@ -236,7 +254,7 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, ref string, entries []TreeEntry) *FindAllConfigsResult {
 	result := &FindAllConfigsResult{}
 	for _, entry := range entries {
-		if entry.Type != "blob" || !strings.HasSuffix(entry.Path, ConfigFileName) {
+		if entry.Type != "blob" || !isConfigFile(entry.Path) {
 			continue
 		}
 		config, err := ic.FetchConfig(ctx, repo, entry.Path, ref)
@@ -245,6 +263,7 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 			result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
 				Path:  entry.Path,
 				Error: err.Error(),
+				Err:   err,
 			})
 			continue
 		}
@@ -395,6 +414,7 @@ func (ic *InstallationClient) scanHintDirsForConfigs(ctx context.Context, repo, 
 				result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
 					Path:  configPath,
 					Error: err.Error(),
+					Err:   err,
 				})
 				continue
 			}
@@ -431,6 +451,11 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInItsDirs(ctx context.Cont
 	result, err := ic.scanHintDirsForConfigs(ctx, repo, ref, dirs)
 	if err != nil {
 		return nil, "", true, fmt.Errorf("scan the configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, err)
+	}
+	for _, invalid := range result.InvalidConfigs {
+		if readErr, ok := errors.AsType[*ConfigReadError](invalid.Err); ok {
+			return nil, "", true, fmt.Errorf("read the configs in the schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, readErr)
+		}
 	}
 	if len(result.InvalidConfigs) > 0 {
 		return nil, "", true, fmt.Errorf("%w at %s", ErrInvalidConfig, strings.Join(invalidConfigPaths(result.InvalidConfigs), ", "))
