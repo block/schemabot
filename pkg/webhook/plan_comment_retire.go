@@ -76,9 +76,13 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		return
 	}
 	if !decision.Eligible {
+		h.logger.Info("skipping plan comment because PR target is excluded",
+			"repo", repo, "pr", pr, "plan_head_sha", slot.HeadSHA, "current_head_sha", info.HeadSHA, "effective_target", decision.Target)
 		return
 	}
 	if slot.HeadSHA != "" && info.HeadSHA != slot.HeadSHA {
+		h.logger.Info("skipping plan comment because PR head moved",
+			"repo", repo, "pr", pr, "plan_head_sha", slot.HeadSHA, "current_head_sha", info.HeadSHA, "effective_target", decision.Target)
 		return
 	}
 

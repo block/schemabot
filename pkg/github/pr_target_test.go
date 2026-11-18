@@ -96,6 +96,7 @@ func TestEvaluatePRTarget(t *testing.T) {
 		stack       string
 		rules       string
 		classic     string
+		classicRef  string
 		rulesStatus int
 		eligible    bool
 		wantErr     string
@@ -113,6 +114,8 @@ func TestEvaluatePRTarget(t *testing.T) {
 		{name: "rules lookup missing", base: "feature", rulesStatus: http.StatusNotFound, wantErr: "read active branch rules"},
 		{name: "classic permission failure", base: "feature", rules: `[]`, classic: `null`, wantErr: "protection denied"},
 		{name: "prefix is not a match", base: "feature", rules: `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot impersonator"}]}}]`, classic: `null`},
+		{name: "missing closing parenthesis", base: "feature", rules: `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot (production"}]}}]`, classic: `null`},
+		{name: "classic lookup returns a different branch", base: "feature", rules: `[]`, classicRef: "release", classic: `{"requiresStatusChecks":true,"requiredStatusCheckContexts":["SchemaBot (staging)"]}`, wantErr: `classic branch protection query returned branch "release", expected "feature"`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupRateLimitedTestGitHubServer(t)
@@ -143,7 +146,11 @@ func TestEvaluatePRTarget(t *testing.T) {
 					require.NoError(t, err)
 					return
 				}
-				_, err := fmt.Fprintf(w, `{"data":{"repository":{"ref":{"name":%q,"branchProtectionRule":%s}}}}`, target, tt.classic)
+				ref := tt.classicRef
+				if ref == "" {
+					ref = target
+				}
+				_, err := fmt.Fprintf(w, `{"data":{"repository":{"ref":{"name":%q,"branchProtectionRule":%s}}}}`, ref, tt.classic)
 				require.NoError(t, err)
 			})
 			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
