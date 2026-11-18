@@ -815,7 +815,8 @@ fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.
 
 ### MG-14: Databases that share a schema pass only while each withholds the other's tables
 
-When two databases managed from one repository plan the same namespace on the same rollout member,
+When two databases managed from one repository can plan the same tables on the same rollout member,
+because they share a namespace there or because the member may plan their namespaces as one unit,
 a plan or apply of either passes only while each withholds from its plans every table the other
 declares there, and no table is declared by both. Both databases' schema files are read at the pull
 request's head, so the rule holds before an apply has created a new table, and a pull request that
