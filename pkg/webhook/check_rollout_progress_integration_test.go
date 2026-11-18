@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -23,9 +24,11 @@ func (f *stoppedApplyCheckFixture) startRollout(t *testing.T) {
 	f.setStoredState(t, state.Apply.Running)
 	f.apply.State = state.Apply.Running
 	t.Cleanup(func() {
-		_, err := f.db.ExecContext(t.Context(), "DELETE FROM apply_operations WHERE apply_id = ?", f.apply.ID)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), webhookIntegrationPollDeadline)
+		defer cancel()
+		_, err := f.db.ExecContext(cleanupCtx, "DELETE FROM apply_operations WHERE apply_id = ?", f.apply.ID)
 		require.NoError(t, err)
-		_, err = f.db.ExecContext(t.Context(), "DELETE FROM apply_comments WHERE apply_id = ?", f.apply.ID)
+		_, err = f.db.ExecContext(cleanupCtx, "DELETE FROM apply_comments WHERE apply_id = ?", f.apply.ID)
 		require.NoError(t, err)
 	})
 	for target, opState := range map[string]string{
@@ -105,6 +108,24 @@ func TestRolloutCheckRunRefreshWithNothingMovedMakesNoRequest(t *testing.T) {
 	f := newStoppedApplyCheckFixture(t, "octocat/rollout-progress-still", 43, "headsha1", "headsha1")
 	f.startRollout(t)
 	f.fold(t, "the fold")
+	f.takeGitHubRequests()
+
+	f.handler.refreshRolloutCheckRun(t.Context(), f.apply)
+
+	assert.Empty(t, f.takeGitHubRequests())
+	assert.Empty(t, f.published)
+}
+
+// The repository turns its Check Runs off while a rollout runs. A target
+// finishing makes no GitHub request, so a repository that asked for no Check
+// Runs never has one rewritten.
+func TestRolloutCheckRunRefreshSkipsARepositoryWithChecksOff(t *testing.T) {
+	const repo = "octocat/rollout-progress-off"
+	f := newStoppedApplyCheckFixture(t, repo, 45, "headsha1", "headsha1")
+	f.startRollout(t)
+	f.fold(t, "the fold")
+	f.service.Config().Repos = map[string]api.RepoConfig{storage.CanonicalKey(repo): {EnableChecks: new(false)}}
+	f.finishTarget(t, "shop-002")
 	f.takeGitHubRequests()
 
 	f.handler.refreshRolloutCheckRun(t.Context(), f.apply)

@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -37,6 +38,83 @@ type aggregateRender struct {
 	// AwaitingCurrentCommit is set when the fold holds rows recorded for
 	// another commit and nothing is running on the current one.
 	AwaitingCurrentCommit bool
+
+	// Inputs is the stored per-database check state the fold read, keyed by
+	// row ID, so a refresh can tell whether any of it moved since.
+	Inputs map[int64]renderInput
+}
+
+// renderInput is the part of one stored per-database row that the fold's
+// text depends on. A row the fold read as a prior environment's prerequisite
+// was relabeled for the fold, so its stored blocking reason is not recorded
+// or compared.
+type renderInput struct {
+	Prerequisite bool
+
+	Environment  string
+	HeadSHA      string
+	ApplyID      int64
+	Status       string
+	Conclusion   string
+	Blocking     string
+	Change       string
+	RolloutTotal int
+}
+
+func renderInputOf(c *storage.Check) renderInput {
+	return renderInput{
+		Environment: c.Environment, HeadSHA: c.HeadSHA, ApplyID: c.ApplyID,
+		Status: c.Status, Conclusion: c.Conclusion, Blocking: c.BlockingReason,
+		Change: c.ChangeSummary, RolloutTotal: c.RolloutTargets,
+	}
+}
+
+// renderInputsOf records the stored per-database rows among the fold's
+// inputs. Rows a participant reported and the aggregate rows are not stored
+// per-database state, so they are left out.
+func renderInputsOf(checks []*storage.Check) map[int64]renderInput {
+	inputs := map[int64]renderInput{}
+	for _, c := range checks {
+		if c.ID == 0 || c.DatabaseType == aggregateSentinel {
+			continue
+		}
+		input := renderInputOf(c)
+		if c.BlockingReason == prerequisiteContribution {
+			input.Prerequisite = true
+			input.Blocking = ""
+		}
+		inputs[c.ID] = input
+	}
+	return inputs
+}
+
+// inputsMoved reports whether the stored per-database rows a render was
+// folded from have changed: a row it read was rewritten or removed, or a row
+// for its environment appeared.
+func inputsMoved(render aggregateRender, environment string, stored []*storage.Check) bool {
+	seen := 0
+	for _, c := range stored {
+		if c.DatabaseType == aggregateSentinel {
+			continue
+		}
+		input, read := render.Inputs[c.ID]
+		if !read {
+			if environment == aggregateSentinel || c.Environment == environment {
+				return true
+			}
+			continue
+		}
+		seen++
+		current := renderInputOf(c)
+		if input.Prerequisite {
+			current.Prerequisite = true
+			current.Blocking = ""
+		}
+		if input != current {
+			return true
+		}
+	}
+	return seen != len(render.Inputs)
 }
 
 // text renders the Check Run's title and summary.
@@ -74,12 +152,22 @@ const (
 // cannot change what the run gates; it reports rolloutCountsNeedFold whenever
 // the stored render does not match the stored aggregate row or the live run,
 // and the caller folds instead.
+//
+// Another writer can settle a database, stop an apply, or fold the aggregate
+// while the refresh publishes, and the refresh's older text can then land
+// after that writer's. Every such writer stores its state before it
+// publishes, so once the text is sent the refresh reads that state again: if
+// any of it moved since the render was folded, it reports
+// rolloutCountsNeedFold so the caller folds from the current state.
 func (h *Handler) refreshAggregateRolloutCounts(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, environment, checkName string,
 ) (rolloutCountsRefresh, error) {
 	fields := func() []any {
 		return []any{"repo", repo, "pr", pr, "environment", environment, "check_name", checkName}
+	}
+	if !h.shouldPublishChecks(ctx, repo, "aggregate_rollout_counts") {
+		return rolloutCountsUnchanged, nil
 	}
 	checks := h.service.Storage().Checks()
 	row, err := checks.Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
@@ -109,6 +197,11 @@ func (h *Handler) refreshAggregateRolloutCounts(
 	if err := json.Unmarshal(raw, &render); err != nil {
 		h.logger.Warn("rollout counts need a full fold: the stored aggregate render does not decode",
 			append(fields(), "check_run_id", row.CheckRunID, "error", err)...)
+		return rolloutCountsNeedFold, nil
+	}
+	if render.Inputs == nil {
+		h.logger.Info("rollout counts need a full fold: the stored aggregate render does not record the state it was folded from",
+			append(fields(), "check_run_id", row.CheckRunID)...)
 		return rolloutCountsNeedFold, nil
 	}
 	if !renderDescribesRow(render, row) {
@@ -160,7 +253,52 @@ func (h *Handler) refreshAggregateRolloutCounts(
 	}
 	h.logger.Info("aggregate check run rollout counts refreshed",
 		append(fields(), "check_run_id", run.ID, "head_sha", render.HeadSHA)...)
+
+	moved, err := h.renderStateMoved(ctx, repo, pr, environment, raw, render)
+	if err != nil {
+		h.logger.Warn("rollout counts refresh not re-checked against the state it was rendered from; folding the aggregate in full so the run cannot keep older text",
+			append(fields(), "check_run_id", run.ID, "error", err)...)
+		return rolloutCountsNeedFold, nil
+	}
+	if moved {
+		h.logger.Info("rollout counts need a full fold: the aggregate's state moved while the refresh published",
+			append(fields(), "check_run_id", run.ID)...)
+		return rolloutCountsNeedFold, nil
+	}
 	return rolloutCountsPublished, nil
+}
+
+// renderStateMoved reads again everything a render was folded from that a
+// concurrent writer can move: the aggregate row and its render, the stopped
+// applies, and the stored per-database rows.
+func (h *Handler) renderStateMoved(ctx context.Context, repo string, pr int, environment string, raw []byte, render aggregateRender) (bool, error) {
+	checks := h.service.Storage().Checks()
+	current, err := checks.GetAggregateRender(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
+	if err != nil {
+		return false, fmt.Errorf("reload aggregate render for %s#%d (env %s): %w", repo, pr, environment, err)
+	}
+	if !bytes.Equal(current, raw) {
+		return true, nil
+	}
+	row, err := checks.Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
+	if err != nil {
+		return false, fmt.Errorf("reload aggregate check state for %s#%d (env %s): %w", repo, pr, environment, err)
+	}
+	if row == nil || row.BlockingReason != "" || !renderDescribesRow(render, row) {
+		return true, nil
+	}
+	stopped, err := h.loadStoppedApplies(ctx, repo, pr)
+	if err != nil {
+		return false, fmt.Errorf("reload stopped applies for %s#%d: %w", repo, pr, err)
+	}
+	if !maps.Equal(stopped, render.Stopped) {
+		return true, nil
+	}
+	stored, err := checks.GetByPR(ctx, repo, pr)
+	if err != nil {
+		return false, fmt.Errorf("reload stored check state for %s#%d: %w", repo, pr, err)
+	}
+	return inputsMoved(render, environment, stored), nil
 }
 
 // renderDescribesRow reports whether a stored render was published with the

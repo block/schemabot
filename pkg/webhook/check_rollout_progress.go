@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -49,8 +50,9 @@ func (p rolloutProgress) tallyFor(c *storage.Check) (targetTally, bool) {
 	return t, true
 }
 
-// tallyTargets counts an apply's targets from its operations. A target's
-// operations (one per table step, say) settle into one state for the target.
+// tallyTargets counts an apply's targets from its operations. A target is a
+// rollout member, named by its deployment and target together, and its
+// operations (one per table step, say) settle into one state for it.
 // A group finalizer is not a target, and a target whose every operation was
 // settled because it already had the change ran nothing, so neither counts.
 func tallyTargets(ops []*storage.ApplyOperation) targetTally {
@@ -61,10 +63,7 @@ func tallyTargets(ops []*storage.ApplyOperation) targetTally {
 		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
 			continue
 		}
-		key := op.Target
-		if key == "" {
-			key = op.Deployment
-		}
+		key := routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}.MemberID()
 		if _, seen := states[key]; !seen {
 			order = append(order, key)
 			converged[key] = true
@@ -144,9 +143,10 @@ func rolloutStatusLabel(c *storage.Check, progress rolloutProgress) string {
 
 // renderRolloutProgress writes a line under the Database table for each
 // rollout still in progress: its targets counted by where each stands, and a
-// link to the progress comment that names them.
-func renderRolloutProgress(dbChecks []*storage.Check, progress rolloutProgress, stopped stoppedApplyIDs) string {
-	var sb strings.Builder
+// link to the progress comment that names them. The lines stay within limit
+// bytes; rollouts past it are counted on one closing line.
+func renderRolloutProgress(dbChecks []*storage.Check, progress rolloutProgress, stopped stoppedApplyIDs, limit int) string {
+	var lines []string
 	for _, c := range dbChecks {
 		if c.Status != checkStatusInProgress || stopped.holds(c) {
 			continue
@@ -155,16 +155,27 @@ func renderRolloutProgress(dbChecks []*storage.Check, progress rolloutProgress, 
 		if !ok {
 			continue
 		}
-		fmt.Fprintf(&sb, "- `%s` targets: %d (%s)", c.DatabaseName, t.Total, strings.Join(t.phrases(), ", "))
+		line := fmt.Sprintf("- `%s` targets: %d (%s)", c.DatabaseName, t.Total, strings.Join(t.phrases(), ", "))
 		if t.ProgressCommentID != 0 && c.Repository != "" && c.PullRequest != 0 {
-			fmt.Fprintf(&sb, " · [progress](%s#issuecomment-%d)", caller.PullRequestURL(c.Repository, c.PullRequest), t.ProgressCommentID)
+			line += fmt.Sprintf(" · [progress](%s#issuecomment-%d)", caller.PullRequestURL(c.Repository, c.PullRequest), t.ProgressCommentID)
 		}
-		sb.WriteString("\n")
+		lines = append(lines, line+"\n")
 	}
-	if sb.Len() == 0 {
+	if len(lines) == 0 {
 		return ""
 	}
-	return "\n" + sb.String()
+	// The closing line is at most this long, so it always fits once reserved.
+	const omittedReserve = len("- … 1000000 more rollouts in progress\n")
+	var sb strings.Builder
+	sb.WriteString("\n")
+	for i, line := range lines {
+		if sb.Len()+len(line)+omittedReserve > limit {
+			fmt.Fprintf(&sb, "- … %d more rollouts in progress\n", len(lines)-i)
+			break
+		}
+		sb.WriteString(line)
+	}
+	return sb.String()
 }
 
 // rolloutProgressForPR reads how far each in-progress rollout among the
@@ -251,18 +262,12 @@ func (h *Handler) rolloutTargetsFinishedHook() func(*storage.Apply) bool {
 
 // refreshRolloutCheckRun rewrites the aggregate Check Run of a rollout still
 // in progress so it shows how many targets have finished. It renders from what
-// the last fold stored and spends two GitHub requests, however large the PR;
-// when the stored render cannot be trusted for the run, it folds in full
-// instead. The stored check state is not written.
-//
-// The apply can finish while the refresh publishes: the terminal path writes
-// the stored check state, publishes, and then this refresh's text lands last.
-// The refresh sends no status, so the run still gates on the terminal outcome,
-// but its text would describe the rollout as running. To converge, the refresh
-// re-reads the apply's stored check state once it has published and, if it is
-// no longer in progress, folds again. Whoever settled the row wrote it before
-// publishing, so either that publish follows this re-read, or this fold
-// carries the settled state.
+// the last fold stored and spends two GitHub requests, however large the PR.
+// When the stored render cannot be trusted for the run, or the state it was
+// rendered from moved while it published (the apply finished, another
+// database settled, an apply stopped), it folds in full instead, so the run
+// ends on the current state rather than on the refresh's text. The stored
+// check state is not written.
 func (h *Handler) refreshRolloutCheckRun(ctx context.Context, a *storage.Apply) {
 	fields := applyCheckLogFields(a, "rollout target finished")
 	client, err := h.clientForRepo(a.Repository, a.InstallationID)
@@ -278,32 +283,10 @@ func (h *Handler) refreshRolloutCheckRun(ctx context.Context, a *storage.Apply) 
 			append(fields(), "check_name", target.name, "error", err)...)
 		return
 	}
-	switch refresh {
-	case rolloutCountsUnchanged:
-		return
-	case rolloutCountsNeedFold:
-		h.logger.Info("folding the aggregate check in full to show the rollout counts",
-			append(fields(), "check_name", target.name)...)
-		h.publishApplyAggregate(ctx, a, fields, true)
-		return
-	case rolloutCountsPublished:
-	}
-	check, err := h.service.Storage().Checks().Get(ctx, a.Repository, a.PullRequest, a.Environment, a.DatabaseType, a.Database)
-	if err != nil {
-		h.logger.Warn("rollout Check Run refresh not re-checked against stored check state; if the apply finished while it published, the Check Run text shows it in progress until the next fold",
-			append(fields(), "error", err)...)
+	if refresh != rolloutCountsNeedFold {
 		return
 	}
-	if check == nil {
-		h.logger.Warn("rollout Check Run refresh found no stored check state after publishing; the Check Run text shows the apply in progress until the next fold",
-			fields()...)
-		return
-	}
-	if check.Status == checkStatusInProgress {
-		h.logger.Debug("rollout Check Run refreshed; the stored check state is still in progress", fields()...)
-		return
-	}
-	h.logger.Info("republishing aggregate check: the stored check state settled while the rollout counts refresh published",
-		append(fields(), "check_status", check.Status, "check_conclusion", check.Conclusion)...)
+	h.logger.Info("folding the aggregate check in full to show the rollout counts",
+		append(fields(), "check_name", target.name)...)
 	h.publishApplyAggregate(ctx, a, fields, false)
 }

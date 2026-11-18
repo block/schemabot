@@ -549,7 +549,9 @@ func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs, progr
 	}
 
 	tenantSection := renderParticipantSection(participantChecks)
-	progressSection := renderRolloutProgress(dbChecks, progress, stopped)
+	// The progress lines get a quarter of the text limit, so the Database
+	// table always keeps room for its own rows.
+	progressSection := renderRolloutProgress(dbChecks, progress, stopped, maxCheckRunTextLength/4)
 	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection)-len(progressSection), stopped, progress)
 
 	var sb strings.Builder

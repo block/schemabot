@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -163,4 +164,72 @@ func TestAggregateRenderTextSurvivesStorage(t *testing.T) {
 		assert.Equal(t, wantSummary, gotSummary)
 		assert.Contains(t, gotSummary, "1 of 3 done")
 	}
+}
+
+// Two deployments can each address a target of the same name. They are
+// separate rollout members, so a finished us-east/orders is counted as done
+// while us-west/orders still runs.
+func TestTallyTargetsKeepsSameNamedTargetsOfDeploymentsApart(t *testing.T) {
+	east := targetOp("orders", state.ApplyOperation.Completed)
+	east.Deployment = "us-east"
+	west := targetOp("orders", state.ApplyOperation.Running)
+	west.Deployment = "us-west"
+
+	assert.Equal(t, targetTally{Total: 2, Complete: 1, InProgress: 1}, tallyTargets([]*storage.ApplyOperation{east, west}))
+}
+
+// A PR running many rollouts at once keeps the progress lines within their
+// share of the Check Run text, and counts the rollouts left out, so a publish
+// never exceeds GitHub's text limit.
+func TestRolloutProgressLinesStayWithinTheirBudget(t *testing.T) {
+	var checks []*storage.Check
+	progress := rolloutProgress{}
+	for i := range 2000 {
+		id := int64(i + 1)
+		checks = append(checks, &storage.Check{
+			Repository: "octocat/shop", PullRequest: 12, ApplyID: id,
+			DatabaseType: "mysql", DatabaseName: fmt.Sprintf("orders_%04d", i), HasChanges: true, Status: checkStatusInProgress,
+			RolloutTargets: 32, RolloutTargetsWithWork: 32,
+		})
+		progress[id] = targetTally{Total: 32, Complete: 5, InProgress: 4, Queued: 23, ProgressCommentID: 777}
+	}
+
+	section := renderRolloutProgress(checks, progress, nil, maxCheckRunTextLength/4)
+	assert.LessOrEqual(t, len(section), maxCheckRunTextLength/4)
+	assert.Contains(t, section, "- `orders_0000` targets: 32 (4 in progress, 23 queued, 5 complete)")
+	assert.Regexp(t, `- … \d+ more rollouts in progress\n$`, section)
+
+	_, summary := aggregateSummary(checks, "", nil, progress)
+	assert.LessOrEqual(t, len(summary), maxCheckRunTextLength)
+}
+
+// A refresh folds in full when any stored per-database row the render was
+// folded from was rewritten or removed, or a row for its environment
+// appeared. Rows of other environments it never read, and a prerequisite's
+// relabeled reason, do not count as a move.
+func TestRenderInputsMoved(t *testing.T) {
+	orders := &storage.Check{ID: 1, Environment: "production", DatabaseType: "mysql", DatabaseName: "orders", HeadSHA: "h", ApplyID: 3, Status: checkStatusInProgress}
+	staging := &storage.Check{ID: 2, Environment: "staging", DatabaseType: "mysql", DatabaseName: "orders", HeadSHA: "h", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess}
+	prerequisite := *staging
+	prerequisite.BlockingReason = prerequisiteContribution
+	render := aggregateRender{Inputs: renderInputsOf([]*storage.Check{orders, &prerequisite})}
+	clone := func(c *storage.Check) *storage.Check { copied := *c; return &copied }
+
+	assert.False(t, inputsMoved(render, "production", []*storage.Check{orders, staging}), "nothing moved")
+
+	settled := clone(orders)
+	settled.Status, settled.Conclusion = checkStatusCompleted, checkConclusionSuccess
+	assert.True(t, inputsMoved(render, "production", []*storage.Check{settled, staging}), "a row it read settled")
+
+	assert.True(t, inputsMoved(render, "production", []*storage.Check{staging}), "a row it read is gone")
+
+	payments := &storage.Check{ID: 9, Environment: "production", DatabaseType: "mysql", DatabaseName: "payments"}
+	assert.True(t, inputsMoved(render, "production", []*storage.Check{orders, staging, payments}), "a row for its environment appeared")
+
+	sandbox := &storage.Check{ID: 10, Environment: "sandbox", DatabaseType: "mysql", DatabaseName: "payments"}
+	assert.False(t, inputsMoved(render, "production", []*storage.Check{orders, staging, sandbox}), "a row of an environment it did not read")
+
+	rerun := clone(staging)
+	rerun.Status, rerun.Conclusion = checkStatusInProgress, ""
+	assert.True(t, inputsMoved(render, "production", []*storage.Check{orders, rerun}), "a prerequisite it read moved")
 }
