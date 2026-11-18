@@ -36,6 +36,35 @@ func TestCall_ConvertsPanicToError(t *testing.T) {
 	assert.NotEmpty(t, contained.Stack, "the stack must be captured for triage logging")
 }
 
+func TestCatch_SeparatesPanicFromFnError(t *testing.T) {
+	var fnErr error
+	var recovered *Error
+	require.NotPanics(t, func() {
+		recovered, fnErr = Catch(func() error { panic("poisoned metadata") })
+	})
+	require.NotNil(t, recovered)
+	assert.NoError(t, fnErr, "a panicking fn never returned, so it has no error of its own")
+	assert.Equal(t, "poisoned metadata", recovered.Value)
+	assert.NotEmpty(t, recovered.Stack, "the stack must be captured for triage logging")
+}
+
+func TestCatch_PassesThroughFnErrorWithoutRecovering(t *testing.T) {
+	want := errors.New("engine failure")
+	recovered, fnErr := Catch(func() error { return want })
+	require.ErrorIs(t, fnErr, want)
+	assert.Nil(t, recovered, "an ordinary fn error must not be reported as a contained panic")
+}
+
+// A fn error that wraps an *Error is still fn's own error: Catch reports a
+// contained panic only through its recovered result, so error-shape inspection
+// can never misroute it.
+func TestCatch_FnErrorWrappingErrorTypeIsNotARecoveredPanic(t *testing.T) {
+	want := fmt.Errorf("apply already terminal: %w", &Error{Value: "poisoned row"})
+	recovered, fnErr := Catch(func() error { return want })
+	require.ErrorIs(t, fnErr, want)
+	assert.Nil(t, recovered)
+}
+
 func TestCall_ConvertsNonStringPanicToError(t *testing.T) {
 	var err error
 	require.NotPanics(t, func() {

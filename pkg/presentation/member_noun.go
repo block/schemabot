@@ -1,0 +1,43 @@
+package presentation
+
+import "fmt"
+
+// Noun is what the members of a group are called: the shards of a keyspace,
+// the targets of a rollout, or its deployments. Every surface names a group
+// with the same words, so a rollout whose targets need different work reads
+// the way a keyspace whose shards do.
+type Noun struct{ Singular, Plural string }
+
+var (
+	ShardNoun      = Noun{Singular: "shard", Plural: "shards"}
+	TargetNoun     = Noun{Singular: "target", Plural: "targets"}
+	DeploymentNoun = Noun{Singular: "deployment", Plural: "deployments"}
+	TableNoun      = Noun{Singular: "table", Plural: "tables"}
+)
+
+// Label is the noun for count members: "target" for one, "targets" otherwise.
+func (n Noun) Label(count int) string {
+	if count == 1 {
+		return n.Singular
+	}
+	return n.Plural
+}
+
+// Count is n members by name: "1 target" or "3 targets".
+func (n Noun) Count(count int) string {
+	return fmt.Sprintf("%d %s", count, n.Label(count))
+}
+
+// CoveragePhrase states how much of the whole a group of count members
+// covers: "all 32 shards" when it covers every member, "12 of 32 shards" for
+// a subset, or a bare count when the total is unknown — a subset must never
+// read like whole coverage.
+func CoveragePhrase(noun Noun, count, total int) string {
+	if count == total {
+		return fmt.Sprintf("all %d %s", count, noun.Plural)
+	}
+	if total > 0 {
+		return fmt.Sprintf("%d of %d %s", count, total, noun.Plural)
+	}
+	return noun.Count(count)
+}

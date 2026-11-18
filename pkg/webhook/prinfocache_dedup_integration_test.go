@@ -3,8 +3,6 @@
 package webhook
 
 import (
-	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +17,6 @@ import (
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // prFetchCountingTransport counts GET /repos/octocat/hello-world/pulls/1
@@ -36,77 +33,6 @@ func (t *prFetchCountingTransport) RoundTrip(req *http.Request) (*http.Response,
 		t.count.Add(1)
 	}
 	return t.base.RoundTrip(req)
-}
-
-// TestUnlockHandlerDedupesPRFetchAcrossLocks proves that a single
-// "schemabot unlock" invocation collapses every FetchPullRequest call
-// fanned out by updateCheckRunAfterUnlock — one per released lock — to a
-// single upstream GitHub call via the WithPRInfoCache wrap on the
-// handler's ctx. Without that wrap, every released lock would issue its
-// own /pulls fetch.
-func TestUnlockHandlerDedupesPRFetchAcrossLocks(t *testing.T) {
-	dbA := "webhook_unlock_dedup_a"
-	dbB := "webhook_unlock_dedup_b"
-	svc := setupE2EService(t, dbA)
-
-	for _, db := range []string{dbA, dbB} {
-		require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
-			DatabaseName: db,
-			DatabaseType: "mysql",
-			Repository:   "octocat/hello-world",
-			PullRequest:  1,
-			Owner:        "octocat/hello-world#1",
-		}))
-	}
-	t.Cleanup(func() {
-		for _, db := range []string{dbA, dbB} {
-			_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), db, "mysql")
-		}
-	})
-
-	var prFetchCalls atomic.Int32
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
-			User: &gh.User{Login: new("testuser")},
-		})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-
-	httpClient := &http.Client{Transport: &prFetchCountingTransport{base: http.DefaultTransport, count: &prFetchCalls}}
-	client := gh.NewClient(httpClient)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
-	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
-
-	// Call the handler entry point synchronously so every fan-out into
-	// updateCheckRunAfterUnlock resolves within the same WithPRInfoCache
-	// scope before the test asserts.
-	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
-
-	for _, db := range []string{dbA, dbB} {
-		l, err := svc.Storage().Locks().Get(t.Context(), db, "mysql")
-		require.NoError(t, err)
-		assert.Nil(t, l, "lock should be released for %s", db)
-	}
-
-	assert.Equal(t, int32(1), prFetchCalls.Load(),
-		"handleUnlockCommand must dedupe FetchPullRequest across all per-lock check-run cleanups within one invocation")
 }
 
 // TestRollbackConfirmHandlerDoesNotFetchPRForNoLock proves that

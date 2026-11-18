@@ -25,12 +25,14 @@ spec:
           image: mongo:6.0
           command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
           ports: [{ containerPort: 27017 }]
+          # A port check, not a mongosh ping: each ping starts a Node.js shell,
+          # and on a busy node the shells outlive the probe timeout and pile up
+          # until they take the node's memory. The init Job pings Mongo itself
+          # before it initiates the replica set.
           readinessProbe:
-            exec:
-              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            tcpSocket: { port: 27017 }
             initialDelaySeconds: 5
             periodSeconds: 5
-            timeoutSeconds: 5
 ---
 apiVersion: v1
 kind: Service
@@ -121,6 +123,15 @@ spec:
 # LocalScale: fake PlanetScale API with managed Vitess (vtcombo) in-process.
 # Built from source (deploy/local/Dockerfile.localscale) so the e2e always
 # exercises the current LocalScale, not a published image that could drift.
+#
+# Three keyspaces, one per shape the tests need. A declarative apply submits the
+# whole desired state of a namespace, so a test that submits only a VSchema into
+# a keyspace holding tables would be asking to drop them — each shape therefore
+# gets a keyspace no other test writes tables into:
+#
+#   testapp          unsharded, table DDL only
+#   testapp_seq      unsharded, VSchema only (sequence declarations)
+#   testapp_sharded  sharded, a table and the vindex that routes it
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -132,7 +143,11 @@ data:
         "localscale-staging": {
           "databases": {
             "testapp-vitess": {
-              "keyspaces": [{"name": "testapp", "shards": 1}]
+              "keyspaces": [
+                {"name": "testapp", "shards": 1},
+                {"name": "testapp_seq", "shards": 1},
+                {"name": "testapp_sharded", "shards": 2}
+              ]
             }
           }
         }
@@ -189,20 +204,27 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /config, readOnly: true }
             - { name: vtdataroot, mountPath: /vtdataroot }
-          # vtcombo brings up MySQL and the per-shard sidecars before /health
-          # returns 200 — about a minute — so allow a startup window past that.
+          # /health reports 200 only once every shard can accept a DDL
+          # submission. Nothing restarts this pod, so the probe only decides when
+          # it flips to Ready; how long the suite is willing to wait for that is
+          # the rollout wait in e2e-vitess-test.sh, which is what has to outlast
+          # LocalScale's own readiness budget.
           readinessProbe:
             httpGet: { path: /health, port: 8080 }
             initialDelaySeconds: 15
             periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 24
+          # The request is what schedules the pod; the limit has headroom over it
+          # because every shard adds a tablet and a sidecar database to the same
+          # process, and an OOM kill here surfaces as an unexplained apply
+          # failure rather than as a resource problem.
           resources:
             requests:
               cpu: 500m
               memory: 1Gi
             limits:
-              memory: 2Gi
+              memory: 3Gi
       volumes:
         - name: config
           configMap: { name: localscale-config }
@@ -258,13 +280,25 @@ spec:
               done
               for f in /fixtures/*.json; do
                 entity_type=$(basename "$f" .json)
-                if curl -sf "http://etre:8080/api/v1/entities/$entity_type?query=_id!=0" | grep -q '"_id"'; then
+                # Etre entities are flat label maps, so each fixture entity has
+                # exactly one "name" key. A failed lookup fails the Job rather
+                # than reading as an empty collection, and a type holding only
+                # part of its fixture, as a multi-entity POST that failed
+                # partway leaves it, fails rather than counting as seeded.
+                want=$(($(grep -o '"name"' "$f" | wc -l)))
+                existing=$(curl -sf "http://etre:8080/api/v1/entities/$entity_type?query=_id!=0") || { echo "looking up $entity_type failed"; exit 1; }
+                have=$(($(printf '%s' "$existing" | grep -o '"_id"' | wc -l)))
+                if [ "$have" -ge "$want" ]; then
                   echo "$entity_type already seeded, skipping"
                   continue
+                fi
+                if [ "$have" -gt 0 ]; then
+                  echo "$entity_type holds $have of the $want entities in $f; delete the namespace and rerun"
+                  exit 1
                 fi
                 echo "seeding $entity_type from $f"
                 curl -sf -X POST "http://etre:8080/api/v1/entities/$entity_type" \
                   -H "Content-Type: application/json" \
-                  -d @"$f"
+                  -d @"$f" || { echo "seeding $entity_type failed"; exit 1; }
               done
               echo "etre seeded"

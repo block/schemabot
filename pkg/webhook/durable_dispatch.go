@@ -2,21 +2,29 @@ package webhook
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/drain"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
 	durableWebhookRetryDelay = time.Minute
+
+	// durableSupersedeHeadCheckTimeout bounds the live-head fetch that gates
+	// claim-time coalescing. The fetch runs before the delivery's heartbeat
+	// starts, so it must stay well inside the claim lease — on timeout the
+	// delivery simply processes normally instead of coalescing.
+	durableSupersedeHeadCheckTimeout = 10 * time.Second
 
 	// maxDurableWebhookAttempts caps how many times a delivery is claimed
 	// before a retryable failure is recorded as terminal. Attempts increment on
@@ -80,8 +88,20 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 	h.logger.Info("durable webhook dispatch started", "drivers", driverCount, "interval", h.durableWebhookPollInterval)
 }
 
-// StopDurableWebhookDispatch stops the durable webhook driver pool and waits for
-// in-flight claimed deliveries to finish their current drive.
+// durableWebhookDrainTimeout bounds how long StopDurableWebhookDispatch waits
+// for the cancelled deliveries to finish their current drive. A delivery that
+// is between HTTP calls returns as soon as its context ends; the bound is for
+// one that does not return at all.
+//
+// A delivery abandoned here is not lost. Its inbox row stays claimed until the
+// claim goes stale, at which point the next process to run the pool picks it up
+// and delivers it — so the cost of stopping the wait is a delivery that arrives
+// late, against the cost of a process that cannot exit.
+const durableWebhookDrainTimeout = 10 * time.Second
+
+// StopDurableWebhookDispatch stops the durable webhook driver pool and waits up
+// to durableWebhookDrainTimeout for in-flight claimed deliveries to finish
+// their current drive.
 func (h *Handler) StopDurableWebhookDispatch() {
 	h.durableWebhookMu.Lock()
 	if h.durableWebhookStop == nil {
@@ -100,7 +120,16 @@ func (h *Handler) StopDurableWebhookDispatch() {
 	if cancel != nil {
 		cancel()
 	}
-	h.durableWebhookWg.Wait()
+	if !drain.Wait(&h.durableWebhookWg, durableWebhookDrainTimeout) {
+		abandoned := h.durableWebhookClaimsSnapshot()
+		h.logger.Error("durable webhook deliveries did not return within the shutdown drain; their inbox rows stay claimed until the claim goes stale and the next process to run the pool redelivers them",
+			"drain_timeout", durableWebhookDrainTimeout,
+			"abandoned_deliveries", len(abandoned))
+		for _, attrs := range abandoned {
+			h.logger.Error("abandoned a claimed webhook delivery whose driver did not return", attrs...)
+		}
+		return
+	}
 	h.logger.Info("durable webhook dispatch stopped")
 }
 
@@ -193,13 +222,92 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, own
 		"head_sha", event.HeadSHA,
 		"attempts", event.Attempts)
 
+	release := h.registerDurableWebhookClaim(driverID, event)
+	defer release()
+
 	h.driveClaimedDurableWebhook(ctx, driverID, store, event)
 	return true
 }
 
+// registerDurableWebhookClaim records a delivery this process is driving, and
+// returns the function that drops it when the drive returns. What is left in
+// the map when the shutdown drain expires is exactly the set of inbox rows this
+// process walked away from still claimed.
+func (h *Handler) registerDurableWebhookClaim(driverID int, event *storage.WebhookEvent) (release func()) {
+	key := event.Provider + "/" + event.DeliveryID
+	attrs := []any{
+		"driver", driverID,
+		"provider", event.Provider,
+		"delivery_id", event.DeliveryID,
+		"event", event.Event,
+		"action", event.Action,
+		"repo", event.Repository,
+		"pr", event.PullRequest,
+		"head_sha", event.HeadSHA,
+		"attempts", event.Attempts,
+	}
+
+	h.durableWebhookClaimMu.Lock()
+	if h.durableWebhookClaims == nil {
+		h.durableWebhookClaims = make(map[string][]any)
+	}
+	h.durableWebhookClaims[key] = attrs
+	h.durableWebhookClaimMu.Unlock()
+
+	return func() {
+		h.durableWebhookClaimMu.Lock()
+		delete(h.durableWebhookClaims, key)
+		h.durableWebhookClaimMu.Unlock()
+	}
+}
+
+// durableWebhookClaimsSnapshot returns the log attributes of every delivery
+// this process is currently driving.
+func (h *Handler) durableWebhookClaimsSnapshot() [][]any {
+	h.durableWebhookClaimMu.Lock()
+	defer h.durableWebhookClaimMu.Unlock()
+
+	snapshot := make([][]any, 0, len(h.durableWebhookClaims))
+	for _, attrs := range h.durableWebhookClaims {
+		snapshot = append(snapshot, attrs)
+	}
+	return snapshot
+}
+
 // driveClaimedDurableWebhook runs the process → heartbeat → finish lifecycle for
-// a freshly claimed delivery.
+// a freshly claimed delivery. It records the started status when the claim
+// begins and exactly one dispatch outcome when the claim ends, so the two
+// sides ledger against each other: a started claim with no recorded outcome
+// means the driver died mid-claim.
 func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
+	claimedAt := time.Now()
+	appName := h.metricAppForRepo(event.Repository)
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_started")
+	if event.Attempts == 1 {
+		// Only the first claim measures inbox wait: started_at pins to the
+		// first claim, and a retry claim's wait is the retry window, not
+		// backlog latency. A shutdown-released claim refunds its attempt —
+		// the refund means no genuine attempt happened — so the reclaim is
+		// the effective first attempt and records lag again. Lag is measured
+		// from when the row became eligible for dispatch (ClaimableSince):
+		// a row created with a not-before time waits out its grace period by
+		// design, and counting that deferral as lag would saturate the
+		// histogram's upper percentiles and mask real backlog regressions.
+		lagSince := event.ClaimableSince
+		if lagSince.IsZero() {
+			// A store that does not derive ClaimableSince falls back to
+			// receipt — the pre-deferral behavior, never a bogus epoch lag.
+			lagSince = event.ReceivedAt
+		}
+		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(lagSince))
+	}
+
+	if event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) {
+		if h.supersedeCoveredAutoPlan(ctx, driverID, store, event, appName, claimedAt) {
+			return
+		}
+	}
+
 	runCtx, cancelRun := context.WithCancel(ctx)
 	stopHeartbeat := h.startDurableWebhookHeartbeat(runCtx, driverID, event, cancelRun)
 	process := h.processDurableWebhookEvent
@@ -212,6 +320,9 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
+	recordOutcome := func(outcome string) {
+		metrics.RecordWebhookDispatchDuration(finishCtx, appName, event.Event, event.Repository, outcome, time.Since(claimedAt))
+	}
 	if processErr != nil {
 		if heartbeatErr == nil && ctx.Err() != nil {
 			// The driver context is cancelled, so the pool is shutting down and
@@ -225,47 +336,108 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// it, or deploy-churn restarts that each claim-and-cancel the same
 			// delivery would terminally fail it without a single real attempt.
 			if err := store.Release(finishCtx, event.ID, event.LeaseToken); err != nil {
+				if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+					recordOutcome("lease_lost")
+					h.logger.Warn("durable webhook driver lost the delivery lease before releasing the claim on shutdown; another driver owns the delivery or the row is gone",
+						"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+						"repo", event.Repository, "pr", event.PullRequest)
+					return
+				}
+				recordOutcome("finish_error")
 				h.logger.Warn("durable webhook driver could not release delivery claim on shutdown; lease expiry will hand it to another driver",
 					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 					"repo", event.Repository, "pr", event.PullRequest, "error", err)
 				return
 			}
+			recordOutcome("released")
 			h.logger.Info("durable webhook driver released delivery claim on shutdown",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"repo", event.Repository, "pr", event.PullRequest)
 			return
 		}
-		retryAfter := (*time.Time)(nil)
-		if retry && event.Attempts < maxDurableWebhookAttempts {
+		var markErr error
+		var outcome string
+		var failureReason metrics.WebhookFailureReason
+		var notifyTerminalCommand bool
+		switch {
+		case !retry:
+			failureReason = durableFailureReason(processErr)
+			// The processor proved this delivery can never succeed for its head
+			// (a deterministic failure such as GitHub's per-PR file-listing cap
+			// or an undecodable row), so it dead-letters immediately: the
+			// permanently failed row counts as head coverage, which stops the
+			// reconciler from synthesizing a recovery delivery that would replay
+			// the same failure every pass. The operator lever after fixing the
+			// underlying cause depends on the delivery's origin: GitHub
+			// Redeliver re-runs an organic delivery, but a reconciler-
+			// synthesized delivery has no GitHub delivery to redeliver — its
+			// head moves forward only through a fresh delivery, from a new
+			// head push or a re-run of the failing SchemaBot check.
+			markErr = store.MarkFailedPermanent(finishCtx, event.ID, event.LeaseToken, processErr.Error())
+			outcome = "failed_permanent"
+		case event.Attempts < maxDurableWebhookAttempts:
 			due := time.Now().Add(durableWebhookRetryDelay)
-			retryAfter = &due
-		} else if retry {
+			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), &due)
+			outcome = "retrying"
+		default:
 			h.logger.Error("durable webhook delivery exhausted its retry budget and is now terminal",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
 				"attempts", event.Attempts, "error", processErr)
+			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), nil)
+			outcome = "failed"
+			notifyTerminalCommand = true
 		}
-		if err := store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAfter); err != nil {
-			if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
-				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone",
-					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-					"repo", event.Repository, "pr", event.PullRequest)
+		if markErr != nil {
+			failureAttrs := []any{
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest,
+				"error", markErr, "process_error", processErr,
+			}
+			if failureReason != "" {
+				failureAttrs = append(failureAttrs, "failure_reason", string(failureReason))
+			}
+			if errors.Is(markErr, storage.ErrWebhookEventLeaseLost) || errors.Is(markErr, storage.ErrWebhookEventNotFound) {
+				recordOutcome("lease_lost")
+				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone", failureAttrs...)
 				return
 			}
-			h.logger.Error("durable webhook driver failed to record delivery failure",
-				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-				"repo", event.Repository, "pr", event.PullRequest, "error", err)
+			recordOutcome("finish_error")
+			h.logger.Error("durable webhook driver failed to record delivery failure", failureAttrs...)
 			return
 		}
-		status := "durable_dispatch_failed"
-		if retryAfter != nil {
-			status = "durable_dispatch_retrying"
+		recordOutcome(outcome)
+		if outcome == "failed_permanent" {
+			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, event.Repository, failureReason)
+			origin := "organic"
+			if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
+				origin = "synthesized"
+			}
+			deadLetterAttrs := []any{
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+				"attempts", event.Attempts, "failure_reason", string(failureReason), "origin", origin, "error", processErr,
+			}
+			if failureReason == metrics.WebhookFailurePRFileCap {
+				// The PR itself is the cause. A redelivery replays the same
+				// truncated file list, so the fix is a smaller PR, not an
+				// operator retry.
+				h.logger.Warn("durable webhook delivery is dead-lettered because the pull request changes more files than GitHub lists; reduce the PR so SchemaBot can read its full diff",
+					deadLetterAttrs...)
+			} else {
+				h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; re-run it with GitHub Redeliver for an organic delivery, or a new head push / SchemaBot check re-run for a synthesized one",
+					deadLetterAttrs...)
+			}
+		} else {
+			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
 		}
-		metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, status)
+		if notifyTerminalCommand {
+			h.postDurableCommandTerminalComment(event, processErr)
+		}
 		h.logger.Warn("durable webhook driver recorded delivery failure",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
-			"retry", retryAfter != nil, "error", processErr)
+			"disposition", outcome, "error", processErr)
 		return
 	}
 	if heartbeatErr != nil {
@@ -275,6 +447,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		// not mark it completed — leave the row processing so lease expiry
 		// hands it to another driver. Re-processing an already-planned delivery
 		// re-runs auto-plan on the same head SHA, which is safe.
+		recordOutcome("lease_lost")
 		h.logger.Warn("durable webhook driver skipped completion because the delivery lease heartbeat failed; leaving delivery for reclaim",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"repo", event.Repository, "pr", event.PullRequest, "error", heartbeatErr)
@@ -282,20 +455,160 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	}
 	if err := store.MarkCompleted(finishCtx, event.ID, event.LeaseToken); err != nil {
 		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			recordOutcome("lease_lost")
 			h.logger.Warn("durable webhook driver lost the delivery lease before recording completion; another driver owns the delivery or the row is gone",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"repo", event.Repository, "pr", event.PullRequest)
 			return
 		}
+		recordOutcome("finish_error")
 		h.logger.Error("durable webhook driver failed to mark delivery completed",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"repo", event.Repository, "pr", event.PullRequest, "error", err)
 		return
 	}
-	metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_completed")
+	recordOutcome("completed")
+	metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_completed")
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+}
+
+// supersedeCoveredAutoPlan coalesces a freshly claimed auto-plannable
+// pull_request delivery against newer deliveries for the same PR: when a
+// covering successor exists (one that will plan the PR again or close it)
+// and GitHub confirms the claimed head is no longer the PR's current head,
+// the claimed delivery is marked superseded instead of planning a stale head.
+// It reports whether the claim was finished here — superseded, or ownership
+// lost while superseding — so the caller skips processing. A storage or
+// GitHub error keeps the claim alive: coalescing is an optimization, and
+// re-planning a possibly-stale head is idempotent, so the delivery processes
+// normally rather than failing on a coalescing check error.
+func (h *Handler) supersedeCoveredAutoPlan(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent, appName string, claimedAt time.Time) bool {
+	covered, err := store.HasCoveringSuccessor(ctx, event)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not check the delivery for a covering successor; processing it normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return false
+	}
+	if !covered {
+		return false
+	}
+	if !h.claimedAutoPlanHeadConfirmedStale(ctx, driverID, event) {
+		return false
+	}
+	superseded, err := store.SupersedeIfCovered(ctx, event)
+	if err != nil {
+		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "lease_lost", time.Since(claimedAt))
+			h.logger.Warn("durable webhook driver lost the delivery lease while checking for a covering successor; another driver owns the delivery or the row is gone",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest)
+			return true
+		}
+		h.logger.Warn("durable webhook driver could not check the delivery for a covering successor; processing it normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return false
+	}
+	if !superseded {
+		return false
+	}
+	metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "superseded", time.Since(claimedAt))
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_superseded")
+	h.logger.Info("durable webhook driver superseded stale auto-plan delivery; a newer delivery for the same pull request covers it",
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA)
+	return true
+}
+
+// claimedAutoPlanHeadConfirmedStale reports whether GitHub confirms the
+// claimed delivery's head is no longer worth planning: the PR is closed, or
+// its current head has moved past the claimed one. A covering successor's
+// newer received_at proves only arrival recency, not push order — GitHub does
+// not guarantee delivery order, and an operator Redeliver refreshes
+// received_at on an old-head row — so without this confirmation a
+// stale-arriving delivery could supersede the delivery that carries the PR's
+// real current head, and in configurations without reconciler synthesis
+// nothing would ever plan that head again. The live PR is the authority.
+// Every uncertain outcome — missing head SHA, unresolvable installation, a
+// GitHub failure — answers false so the delivery processes normally:
+// re-planning a possibly-stale head is idempotent, discarding the current
+// head's plan is not always recoverable.
+func (h *Handler) claimedAutoPlanHeadConfirmedStale(ctx context.Context, driverID int, event *storage.WebhookEvent) bool {
+	if event.HeadSHA == "" {
+		h.logger.Warn("durable webhook driver cannot verify head currency for a claimed delivery without a head SHA; processing it normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+		return false
+	}
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not resolve the installation to verify head currency; processing the delivery normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return false
+	}
+	client, err := h.clientForRepo(event.Repository, installationID)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not create a GitHub client to verify head currency; processing the delivery normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+			"installation_id", installationID, "error", err)
+		return false
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, durableSupersedeHeadCheckTimeout)
+	defer cancel()
+	// FetchPullRequestNoCache: a cached PR snapshot could predate the push
+	// that made the claimed head stale — or, worse, postdate the claimed
+	// delivery while the claimed head is still current — so only a live
+	// fetch can authorize discarding the claim.
+	prInfo, err := client.FetchPullRequestNoCache(fetchCtx, event.Repository, event.PullRequest)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not fetch the live pull request to verify head currency; processing the delivery normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+			"head_sha", event.HeadSHA, "error", err)
+		return false
+	}
+	if !prInfo.IsClosed() && prInfo.HeadSHA == event.HeadSHA {
+		h.logger.Info("durable webhook driver kept a claimed delivery that carries the pull request's current head; a newer-arriving delivery cannot cover it",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+			"head_sha", event.HeadSHA)
+		return false
+	}
+	return true
+}
+
+// postDurableCommandTerminalComment gives an acknowledged command one final
+// user-visible answer after its retry budget is exhausted. Notification is
+// best-effort: failure is logged by the parsing or comment-posting path and
+// never changes the inbox row's terminal disposition.
+func (h *Handler) postDurableCommandTerminalComment(event *storage.WebhookEvent, processErr error) {
+	if event.Event != "issue_comment" {
+		h.logger.Debug("durable webhook driver skipped the terminal command comment because the exhausted delivery is not a command",
+			"delivery_id", event.DeliveryID, "event", event.Event, "action", event.Action,
+			"repo", event.Repository, "pr", event.PullRequest)
+		return
+	}
+	result, repo, pr, installationID, requestedBy, err := durableIssueCommentCommand(event)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not prepare terminal command comment",
+			"delivery_id", event.DeliveryID, "event", event.Event, "repo", event.Repository,
+			"pr", event.PullRequest, "error", err)
+		return
+	}
+	// The answer carries the wrapped error chain rather than the gates'
+	// curated per-attempt messages. Those messages advise retrying — the
+	// wrong advice once the retry budget is exhausted — while the chain names
+	// what kept failing. postCommandError sanitizes before rendering
+	// (endpoint redaction, control stripping, escaping, clamping), so the
+	// chain is safe for PR markdown even when it carries transport detail.
+	h.postCommandError(repo, pr, installationID, result.Action, result.Environment, requestedBy,
+		"SchemaBot could not complete this command after retrying: "+processErr.Error())
 }
 
 // safeProcessDurableWebhookEvent runs process with panic recovery. The legacy
@@ -412,6 +725,16 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 	switch event.Event {
 	case "pull_request":
 		return h.processDurablePullRequest(ctx, event)
+	case "check_run":
+		return h.processDurableCheckRun(ctx, event)
+	case "check_suite":
+		return h.processDurableCheckSuite(ctx, event)
+	case "merge_group":
+		return h.processDurableMergeGroup(ctx, event)
+	case "push":
+		return h.processDurablePush(ctx, event)
+	case "issue_comment":
+		return h.processDurableIssueComment(ctx, event)
 	default:
 		h.logger.Info("durable webhook delivery ignored because event type is unsupported",
 			"delivery_id", event.DeliveryID, "event", event.Event, "action", event.Action,
@@ -420,53 +743,72 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 	}
 }
 
-// processDurablePullRequest drives the auto-plan flow for a claimed
+// processDurablePullRequest decodes a claimed pull_request delivery and routes
+// it to the processor for its action. It re-validates the action fail-closed —
+// rows can arrive via replay or a future producer — so a replayed action can
+// never reach the wrong flow.
+func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	var payload pullRequestPayload
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
+	}
+
+	switch {
+	case isAutoPlannablePullRequest(payload):
+		return h.processDurablePullRequestAutoPlan(ctx, event, payload)
+	case payload.Action == storage.PullRequestClosedAction:
+		return h.processDurablePullRequestClosed(ctx, event, payload)
+	default:
+		h.logger.Info("durable pull_request delivery ignored because action needs no work",
+			"delivery_id", event.DeliveryID, "action", payload.Action,
+			"repo", event.Repository, "pr", event.PullRequest)
+		return false, nil
+	}
+}
+
+// processDurablePullRequestClosed runs PR-close cleanup for a claimed closed
+// delivery under the delivery lease. runPRCloseCleanup is idempotent, so a
+// retry after a partial cleanup reconciles rather than double-acts.
+func (h *Handler) processDurablePullRequestClosed(ctx context.Context, event *storage.WebhookEvent, payload pullRequestPayload) (retry bool, err error) {
+	repo := storage.CanonicalKey(payload.Repository.FullName)
+	pr := payload.PullRequest.Number
+	if repo == "" || pr == 0 {
+		return false, fmt.Errorf("durable pull_request closed delivery %s missing repo or PR", event.DeliveryID)
+	}
+	// The installation is needed only for the live-state read an unmerged
+	// close makes; a merged close never reads GitHub, so an unresolvable
+	// installation is terminal only when that read is needed.
+	installationID, err := durableInstallationID(event)
+	if err != nil && !payload.PullRequest.Merged {
+		return false, err
+	}
+	ran, err := h.runPRCloseCleanup(ctx, repo, pr, installationID, payload.PullRequest.Merged)
+	if err != nil {
+		return true, fmt.Errorf("pr close cleanup for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, err)
+	}
+	if !ran {
+		h.logger.Info("durable pull_request close delivery completed without cleanup because the PR is open again",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr)
+		return false, nil
+	}
+	h.logger.Info("durable pull_request close cleanup completed",
+		"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "merged", payload.PullRequest.Merged)
+	return false, nil
+}
+
+// processDurablePullRequestAutoPlan drives the auto-plan flow for a claimed
 // pull_request delivery. The durability contract of this slice covers config
 // discovery and plan dispatch: per-database plan execution still runs in
 // detached goroutines (handleMultiEnvPlan via goSafe), exactly as on the
 // request path, and its durability is owned by the applies/tasks layer once
 // plans are created.
-func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
-	var payload pullRequestPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode durable pull_request delivery %s: %w", event.DeliveryID, err)
+func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *storage.WebhookEvent, payload pullRequestPayload) (retry bool, err error) {
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
-	// The HTTP handler only enqueues auto-plannable actions, but rows can also
-	// come from replay or future producers; re-validate so a replayed "closed"
-	// action can never trigger an auto-plan.
-	if !isAutoPlannablePullRequestAction(payload.Action) {
-		h.logger.Info("durable pull_request delivery ignored because action is not auto-plannable",
-			"delivery_id", event.DeliveryID, "action", payload.Action,
-			"repo", event.Repository, "pr", event.PullRequest)
-		return false, nil
-	}
-
-	installationID, parseErr := strconv.ParseInt(event.TenantID, 10, 64)
-	if parseErr != nil {
-		// A non-numeric TenantID is a corrupted/enqueue-side bug, distinct from a
-		// legitimately empty tenant; surface it rather than silently folding it
-		// into the payload fallback below.
-		h.logger.Warn("durable pull_request delivery has an unparseable tenant ID; falling back to the payload installation",
-			"delivery_id", event.DeliveryID, "tenant_id", event.TenantID,
-			"repo", event.Repository, "pr", event.PullRequest, "error", parseErr)
-	}
-	if parseErr != nil || installationID == 0 {
-		// Fallback for rows without a stored tenant. Today the only producer
-		// (enqueueDurablePullRequest) always stores a resolved non-zero
-		// installation ID, so this only matters for replay or future producers.
-		// The payload carries an installation ID only for org/user App installs;
-		// repo-level deliveries have none, so a future producer that synthesizes
-		// such rows (WH-6b) must persist a resolved installation ID in TenantID
-		// rather than relying on this fallback, or repo-level deliveries will
-		// terminally fail here.
-		installationID = h.effectiveInstallationID(ctx, payload.Installation.ID)
-	}
-	if installationID == 0 {
-		return false, fmt.Errorf("durable pull_request delivery %s missing installation ID", event.DeliveryID)
-	}
-
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr := payload.PullRequest.Number
 	headSHA := payload.PullRequest.Head.SHA
 	if repo == "" || pr == 0 || headSHA == "" {
@@ -476,7 +818,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 		h.logger.Warn("durable pull_request delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "action", payload.Action, "repo", repo, "pr", pr,
 			"installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "pull_request", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "pull_request", payload.Action)
 		return false, nil
 	}
 
@@ -494,7 +836,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 
 	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, event.DeliveryID)
 	if planErr != nil {
-		return true, fmt.Errorf("auto-plan for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
+		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
 	}
 	if ctxErr := runCtx.Err(); ctxErr != nil {
 		// The run was cancelled (shutdown or lease loss) — the dispatch may be
@@ -505,36 +847,332 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	}
 	h.logger.Info("durable pull_request auto-plan dispatched",
 		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", headSHA,
-		"delivery_id", event.DeliveryID, "message", message)
+		"delivery_id", event.DeliveryID, "outcome", message)
+	return false, nil
+}
+
+// autoPlanFailureIsPermanent reports whether a failed auto-plan run is
+// deterministic for the delivery's head, so retrying the same head cannot
+// succeed and the delivery must dead-letter instead of burning its retry
+// budget. Discovery failures default to retryable — they are typically
+// transient GitHub API errors. The permanent class is GitHub's per-PR
+// file-listing cap (ErrPRFilesIncomplete): every retry repeats the identical
+// truncated listing, and the head already carries a failing config discovery
+// check telling the author the change is too large to review. The outcome is
+// near-deterministic rather than strictly so: the listing is computed against
+// the merge base, which can move without a new push (for example when a
+// stacked base PR merges) and drop the head back under the cap — but no
+// covered pull_request event fires for that, so recovering such a head still
+// takes a new push, a check re-run, or an explicit redelivery. That is an
+// accepted cost of not burning retry budget on the common case.
+func autoPlanFailureIsPermanent(err error) bool {
+	return errors.Is(err, ghclient.ErrPRFilesIncomplete)
+}
+
+// processDurableCheckRun routes a claimed check_run delivery by action.
+// rerequested re-runs auto-plan; completed re-folds the leader's aggregate. A
+// row with any other action is ignored rather than retried so a replayed or
+// future-producer row cannot wedge the queue.
+func (h *Handler) processDurableCheckRun(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	var payload checkRunPayload
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
+	}
+	switch payload.Action {
+	case "rerequested":
+		return h.processDurableCheckRunRerequest(ctx, event, payload)
+	case "completed":
+		return h.processDurableCheckRunCompleted(ctx, event, payload)
+	default:
+		h.logger.Info("durable check_run delivery ignored because action is unsupported",
+			"delivery_id", event.DeliveryID, "action", payload.Action,
+			"repo", event.Repository, "pr", event.PullRequest)
+		return false, nil
+	}
+}
+
+// processDurableCheckRunCompleted re-folds the aggregate leader's check when a
+// participant deployment's Check Run completes on a repo this deployment leads.
+// It re-validates the same guards the synchronous request path applies, then
+// folds once under the delivery lease via updateAggregateCheckOnce: an
+// operational failure (head fetch, per-environment upsert) keeps the delivery
+// retryable so a transient outage cannot drop the re-fold, while a still-pending
+// participant convergence returns no error and is handed to the in-memory
+// re-fold budget through the shared follow-up, exactly as the wrapper does.
+func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
+	repo := storage.CanonicalKey(payload.Repository.FullName)
+	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
+		h.logger.Info("durable check_run completion ignored because deployment is not the aggregate leader",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name)
+		return false, nil
+	}
+	if h.isSchemaBotAggregateCheckName(repo, payload.CheckRun.Name) {
+		h.logger.Info("durable check_run completion ignored because it is the leader's own aggregate check",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name)
+		return false, nil
+	}
+	if !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable check_run completion from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_run", payload.Action)
+		return false, nil
+	}
+
+	pr, ok := checkRunPullRequestNumber(payload)
+	if !ok {
+		h.logger.Info("durable check_run completion ignored without pull request",
+			"delivery_id", event.DeliveryID, "repo", repo,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name,
+			"head_sha", payload.CheckRun.HeadSHA)
+		return false, nil
+	}
+	if repo == "" || payload.CheckRun.HeadSHA == "" {
+		return false, fmt.Errorf("durable check_run completion %s missing repo or head SHA", event.DeliveryID)
+	}
+
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
+	}
+
+	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a
+	// timeout-bounded work context, and the post-fold cancellation check below
+	// must distinguish "shutdown or lease loss" (runCtx) from "the work outran
+	// its own timeout after already succeeding" (ctx).
+	runCtx := ctx
+	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
+	if err != nil {
+		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(repo), "check_run", payload.Action, repo, "auto_plan_bootstrap_failed")
+		return true, fmt.Errorf("bootstrap durable check_run completion %s for %s#%d: %w", event.DeliveryID, repo, pr, err)
+	}
+	defer cancel()
+
+	// The fold core itself verifies the head is still current (returning a
+	// leader re-fold disposition with no error for a superseded head), so no
+	// separate staleness check is needed here.
+	followUp, foldErr := h.updateAggregateCheckOnce(ctx, client, repo, pr, payload.CheckRun.HeadSHA)
+	if foldErr != nil {
+		// Operational failure (head fetch, per-environment upsert). Keep the
+		// delivery retryable so a transient outage cannot silently drop the
+		// re-fold. Participant read failures are conveyed via the retriable
+		// disposition (not this error), so they don't double-retry here.
+		return true, fmt.Errorf("re-fold aggregate for durable check_run completion %s (%s#%d): %w", event.DeliveryID, repo, pr, foldErr)
+	}
+	if ctxErr := runCtx.Err(); ctxErr != nil {
+		// The run was cancelled (shutdown or lease loss) — keep the delivery
+		// retryable so a later claim re-folds instead of completing a partial run.
+		return true, fmt.Errorf("durable check_run completion %s run cancelled during re-fold: %w", event.DeliveryID, ctxErr)
+	}
+
+	h.applyAggregateFoldFollowUp(ctx, client, repo, pr, payload.CheckRun.HeadSHA, followUp)
+	h.logger.Info("durable check_run completion re-folded aggregate",
+		"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
+		"head_sha", payload.CheckRun.HeadSHA, "check_run_id", payload.CheckRun.ID,
+		"check_name", payload.CheckRun.Name)
+	return false, nil
+}
+
+// processDurableCheckRunRerequest re-runs auto-plan for a claimed check_run
+// rerequest. Config discovery and plan dispatch run under the delivery lease,
+// while per-database plan execution still runs in detached goroutines whose
+// durability is owned by the applies/tasks layer. Like the synchronous request
+// path it stops before discovery when the rerequested head is no longer the
+// PR's current head: planning a stale head would list the current PR's files
+// against a stale config snapshot, and a newer push already enqueued its own
+// delivery. A GitHub failure verifying the head keeps the delivery retryable
+// rather than completing it, so a transient outage cannot drop the re-plan.
+func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
+	repo := storage.CanonicalKey(payload.Repository.FullName)
+	pr, ok := checkRunPullRequestNumber(payload)
+	if !ok {
+		h.logger.Info("durable check_run rerequest ignored without pull request",
+			"delivery_id", event.DeliveryID, "repo", repo,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name,
+			"head_sha", payload.CheckRun.HeadSHA)
+		return false, nil
+	}
+	if repo == "" || payload.CheckRun.HeadSHA == "" {
+		return false, fmt.Errorf("durable check_run rerequest %s missing repo or head SHA", event.DeliveryID)
+	}
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable check_run rerequest from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name,
+			"head_sha", payload.CheckRun.HeadSHA)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_run", payload.Action)
+		return false, nil
+	}
+	if !h.isSchemaBotAggregateCheckName(repo, payload.CheckRun.Name) {
+		h.logger.Info("durable check_run rerequest ignored for non-SchemaBot check",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
+			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name,
+			"head_sha", payload.CheckRun.HeadSHA)
+		return false, nil
+	}
+
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
+	}
+
+	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a
+	// timeout-bounded work context, and the post-run cancellation check below
+	// must distinguish "shutdown or lease loss" (runCtx) from "the work outran
+	// its own timeout after already succeeding" (ctx).
+	runCtx := ctx
+	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
+	if err != nil {
+		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(repo), "check_run", payload.Action, repo, "auto_plan_bootstrap_failed")
+		return true, fmt.Errorf("bootstrap durable check_run rerequest %s for %s#%d: %w", event.DeliveryID, repo, pr, err)
+	}
+	defer cancel()
+
+	// Verify the rerequested head is still the PR's current head before
+	// discovery. A GitHub failure here is uncertainty, not staleness: keep the
+	// delivery retryable so a transient outage cannot silently complete (and
+	// drop) the re-plan. A confirmed newer head means a later push already
+	// enqueued its own delivery, so complete this one without planning a stale
+	// snapshot.
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
+			Operation:  "check_run_rerequest",
+			Repository: repo,
+			Status:     "error",
+		})
+		return true, fmt.Errorf("verify current head for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, err)
+	}
+	if prInfo.HeadSHA != payload.CheckRun.HeadSHA {
+		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
+			Operation:  "check_run_rerequest",
+			Repository: repo,
+			Status:     "stale",
+		})
+		h.logger.Info("durable check_run rerequest ignored because head SHA is no longer current for PR",
+			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
+			"stale_head_sha", payload.CheckRun.HeadSHA, "current_head_sha", prInfo.HeadSHA)
+		return false, nil
+	}
+
+	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "", event.DeliveryID)
+	if planErr != nil {
+		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
+	}
+	if ctxErr := runCtx.Err(); ctxErr != nil {
+		// The run was cancelled (shutdown or lease loss) — the dispatch may be
+		// partial, so keep the delivery retryable instead of completing it.
+		return true, fmt.Errorf("durable check_run rerequest %s run cancelled during auto-plan dispatch: %w", event.DeliveryID, ctxErr)
+	}
+	h.logger.Info("durable check_run rerequest auto-plan dispatched",
+		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+		"delivery_id", event.DeliveryID, "outcome", message)
 	return false, nil
 }
 
 func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullRequestPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
-	store := h.webhookEventStore()
-	if store == nil {
-		return false, fmt.Errorf("webhook event storage is unavailable")
-	}
-	if deliveryID == "" {
-		return false, fmt.Errorf("missing GitHub delivery ID")
-	}
-	inserted, err := store.Create(ctx, &storage.WebhookEvent{
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "pull_request",
 		Action:      payload.Action,
-		Repository:  payload.Repository.FullName,
+		Repository:  storage.CanonicalKey(payload.Repository.FullName),
 		PullRequest: payload.PullRequest.Number,
 		HeadSHA:     payload.PullRequest.Head.SHA,
 		TenantID:    strconv.FormatInt(installationID, 10),
 		Payload:     body,
 	})
+}
+
+func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPayload, body []byte, deliveryID string, pr int, installationID int64) (bool, error) {
+	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  deliveryID,
+		Event:       "check_run",
+		Action:      payload.Action,
+		Repository:  storage.CanonicalKey(payload.Repository.FullName),
+		PullRequest: pr,
+		HeadSHA:     payload.CheckRun.HeadSHA,
+		TenantID:    strconv.FormatInt(installationID, 10),
+		Payload:     body,
+	})
+}
+
+// enqueueDurableWebhookEvent persists a delivery into the durable inbox and
+// wakes the driver pool. It is the shared fast-ACK path behind every durable
+// event type: the caller builds a fully-populated WebhookEvent (Provider,
+// DeliveryID, Event, and the raw Payload the driver re-decodes), and this
+// helper enforces the invariants every producer shares — storage must be
+// available and the GitHub delivery GUID (the dedup key) must be present —
+// before Create. It returns inserted=false when the delivery GUID already
+// exists so callers can treat a redelivery as an idempotent no-op, and only
+// wakes the pool on a genuine insert so a duplicate does not spin a driver
+// for a row that is already queued or terminal.
+//
+// The enqueue is the durability boundary: once the row is inserted, the
+// durable driver owns the delivery. On graceful shutdown the request ctx is
+// cancelled, which would abort the INSERT and 500 the delivery — and GitHub
+// does not auto-retry failed webhook deliveries, so the work would be lost
+// until an operator manually redelivers it. Detach from request cancellation
+// (but keep a bounded deadline so a wedged DB can't stall shutdown) so the
+// row still persists.
+func (h *Handler) enqueueDurableWebhookEvent(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	store := h.webhookEventStore()
+	if store == nil {
+		return false, fmt.Errorf("webhook event storage is unavailable")
+	}
+	if event.DeliveryID == "" {
+		return false, fmt.Errorf("missing GitHub delivery ID")
+	}
+	enqueueCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	inserted, err := store.Create(enqueueCtx, event)
 	if err != nil {
-		return false, fmt.Errorf("store durable pull_request delivery %s: %w", deliveryID, err)
+		return false, fmt.Errorf("store durable %s delivery %s: %w", event.Event, event.DeliveryID, err)
 	}
 	if inserted {
 		h.wakeDurableWebhookDispatch()
 	}
 	return inserted, nil
+}
+
+// durableInstallationID resolves the installation ID for a claimed delivery
+// from the tenant persisted at enqueue. Every producer stores a resolved
+// positive installation ID in TenantID, so a missing, unparseable, or
+// non-positive tenant is a corrupted or hand-crafted row: retrying cannot
+// repair it, and driver work runs outside an HTTP request, so there is no
+// out-of-band resolution to recover with. Callers treat the returned error as
+// terminal. A missing tenant is reported distinctly from an unparseable one so
+// triage can tell an enqueue that stored nothing apart from one that stored
+// garbage.
+func durableInstallationID(event *storage.WebhookEvent) (int64, error) {
+	if event.TenantID == "" {
+		return 0, &durableRouteError{fmt.Errorf("durable %s delivery %s for %s is missing its stored tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event))}
+	}
+	installationID, err := strconv.ParseInt(event.TenantID, 10, 64)
+	if err != nil {
+		return 0, &durableRouteError{fmt.Errorf("durable %s delivery %s for %s has an unparseable tenant ID %q: %w",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), event.TenantID, err)}
+	}
+	if installationID <= 0 {
+		return 0, &durableRouteError{fmt.Errorf("durable %s delivery %s for %s has a non-positive installation ID %d in its tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), installationID)}
+	}
+	return installationID, nil
+}
+
+// durableDeliveryLocation renders the repository location of a durable
+// delivery for error messages: repo#pr when the delivery targets a pull
+// request, or just the repository for PR-less events such as push and
+// merge_group.
+func durableDeliveryLocation(event *storage.WebhookEvent) string {
+	if event.PullRequest > 0 {
+		return fmt.Sprintf("%s#%d", event.Repository, event.PullRequest)
+	}
+	return event.Repository
 }
 
 func (h *Handler) webhookEventStore() storage.WebhookEventStore {

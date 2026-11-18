@@ -1,0 +1,926 @@
+package postgresconn
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"database/sql/driver"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/big"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestConnectionDSN(t *testing.T) {
+	tests := []struct {
+		name       string
+		dsn        string
+		want       string
+		wantErrSub string
+	}{
+		{
+			name: "RDS URL host gets sslmode=require",
+			dsn:  "postgres://schemabot:secret@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", // sadscan:disable np.postgres.1
+			want: "postgres://schemabot:secret@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=require",
+		},
+		{
+			name: "RDS URL host with explicit sslmode is unchanged",
+			dsn:  "postgres://schemabot:secret@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=verify-full",
+			want: "postgres://schemabot:secret@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=verify-full",
+		},
+		{
+			name: "RDS URL host with explicit sslmode=disable is unchanged",
+			dsn:  "postgres://schemabot:secret@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=disable",
+			want: "postgres://schemabot:secret@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=disable",
+		},
+		{
+			name: "RDS keyword host gets sslmode=require",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com port=5432 user=schemabot password=secret dbname=app",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com port=5432 user=schemabot password=secret dbname=app sslmode=require",
+		},
+		{
+			name: "RDS keyword host with explicit sslmode is unchanged",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode=disable",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode=disable",
+		},
+		{
+			name: "RDS keyword host with sslmode = disable (spaces around =) is unchanged",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = disable",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = disable",
+		},
+		{
+			name: "RDS keyword host with sslmode = verify-full (spaces around =) is unchanged",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = verify-full",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = verify-full",
+		},
+		{
+			name: "RDS keyword host with sslmode =disable (space before =) is unchanged",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode =disable",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode =disable",
+		},
+		{
+			name: "non-RDS URL host is unchanged",
+			dsn:  "postgres://schemabot:secret@localhost:5432/app", // sadscan:disable np.postgres.1
+			want: "postgres://schemabot:secret@localhost:5432/app",
+		},
+		{
+			// RDS detection considers only the first host, so a multi-host
+			// DSN whose RDS host is a fallback gets no injection — spell out
+			// sslmode explicitly for multi-host DSNs.
+			name: "multi-host DSN with RDS fallback host gets no injection",
+			dsn:  "postgres://schemabot:secret@localhost:5432,database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app",
+			want: "postgres://schemabot:secret@localhost:5432,database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app",
+		},
+		{
+			name: "non-RDS keyword host is unchanged",
+			dsn:  "host=localhost user=schemabot password=secret dbname=app",
+			want: "host=localhost user=schemabot password=secret dbname=app",
+		},
+		{
+			name:       "invalid DSN returns context",
+			dsn:        "postgres://schemabot:secret@localhost:not-a-port/app", // sadscan:disable np.postgres.1
+			wantErrSub: "parse PostgreSQL DSN",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ConnectionDSN(tt.dsn)
+			if tt.wantErrSub != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrSub)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+
+			// The normalized DSN must itself parse.
+			_, err = pgx.ParseConfig(got)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// A verifying DSN (sslmode=verify-full) against an RDS host names no root
+// bundle of its own, so the connection verifies against the embedded RDS
+// global CA bundle — the ambient system trust store does not carry the
+// private Amazon RDS roots and would fail every handshake.
+func TestConnectionConfigVerifiesRDSHostsWithEmbeddedRoots(t *testing.T) {
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full") // sadscan:disable np.postgres.1
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.False(t, cfg.TLSConfig.InsecureSkipVerify)
+	assert.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	// DNS names are case-insensitive: an uppercase RDS endpoint gets the same
+	// roots.
+	cfg, err = connectionConfig("postgres://schemabot:secret@DB.EXAMPLE.RDS.AMAZONAWS.COM:5432/app?sslmode=verify-full") // sadscan:disable np.postgres.1
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	// sslmode=require encrypts without authenticating (pgx marks it
+	// InsecureSkipVerify); the RDS roots would prove nothing, so the config is
+	// left untouched.
+	cfg, err = connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=require")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.True(t, cfg.TLSConfig.InsecureSkipVerify)
+	assert.Nil(t, cfg.TLSConfig.RootCAs)
+
+	// The embedded bundle holds RDS roots only: a non-RDS host gets no
+	// implicit trust material.
+	cfg, err = connectionConfig("postgres://schemabot:secret@db.internal.example:5432/app?sslmode=verify-full") // sadscan:disable np.postgres.1
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Nil(t, cfg.TLSConfig.RootCAs)
+}
+
+// An explicit sslrootcert in the DSN is the operator's chosen trust root:
+// the connection verifies against the pool pgx built from that file, and the
+// embedded RDS bundle is not layered on top even for an RDS host.
+func TestConnectionConfigExplicitSSLRootCertWins(t *testing.T) {
+	caPath := writeSelfSignedCA(t)
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full&sslrootcert=" + url.QueryEscape(caPath))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.False(t, cfg.TLSConfig.InsecureSkipVerify)
+	require.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	pemBytes, err := os.ReadFile(caPath)
+	require.NoError(t, err)
+	fromFile := x509.NewCertPool()
+	require.True(t, fromFile.AppendCertsFromPEM(pemBytes))
+	assert.True(t, cfg.TLSConfig.RootCAs.Equal(fromFile))
+
+	rds, err := rdsRootPool()
+	require.NoError(t, err)
+	assert.False(t, cfg.TLSConfig.RootCAs.Equal(rds))
+}
+
+// PGSSLROOTCERT in the process environment is the operator's chosen trust
+// root, the same as an sslrootcert in the DSN: a verify-full RDS DSN without
+// one verifies against the named file, not the embedded RDS bundle.
+func TestConnectionConfigEnvironmentSSLRootCertWins(t *testing.T) {
+	caPath := writeSelfSignedCA(t)
+	t.Setenv("PGSSLROOTCERT", caPath)
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.False(t, cfg.TLSConfig.InsecureSkipVerify)
+	require.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	pemBytes, err := os.ReadFile(caPath)
+	require.NoError(t, err)
+	fromFile := x509.NewCertPool()
+	require.True(t, fromFile.AppendCertsFromPEM(pemBytes))
+	assert.True(t, cfg.TLSConfig.RootCAs.Equal(fromFile))
+
+	rds, err := rdsRootPool()
+	require.NoError(t, err)
+	assert.False(t, cfg.TLSConfig.RootCAs.Equal(rds))
+}
+
+// writeSelfSignedCA generates a self-signed CA certificate, writes it in PEM
+// form to a temp file, and returns the file path.
+func writeSelfSignedCA(t *testing.T) string {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "postgresconn test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	return path
+}
+
+// A caller-supplied bundle always wins: WithRootCAs replaces whatever trust
+// the DSN installed, and a DSN that negotiates no TLS has nothing to pin.
+func TestWithRootCAsPinsVerificationTrust(t *testing.T) {
+	roots := x509.NewCertPool()
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.cluster-abc123.eu-west-1.rds.amazonaws.com:5432/app?sslmode=verify-full", WithRootCAs(roots)) // sadscan:disable np.postgres.1
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Same(t, roots, cfg.TLSConfig.RootCAs)
+}
+
+// Pinning trust removes pgx's parse-time fallbacks: under sslmode=prefer a
+// failed TLS handshake would otherwise retry in plaintext, silently bypassing
+// the bundle the caller named.
+func TestWithRootCAsClearsFallbacks(t *testing.T) {
+	roots := x509.NewCertPool()
+	cfg, err := connectionConfig("postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=prefer", WithRootCAs(roots)) // sadscan:disable np.postgres.1
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Same(t, roots, cfg.TLSConfig.RootCAs)
+	assert.Empty(t, cfg.Fallbacks)
+}
+
+const nonVerifyingRDSWarning = "PostgreSQL RDS connection does not authenticate the server; the configured sslmode is honored for compatibility"
+
+// captureWarnings routes the default logger into a buffer for the test and
+// clears the per-process warning set so the test observes the first warning
+// for its endpoints regardless of test order or -count.
+func captureWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	warnedNonVerifyingRDS.Clear()
+	warnedDiscardedTimezone.Clear()
+	t.Cleanup(func() {
+		slog.SetDefault(originalLogger)
+		warnedNonVerifyingRDS.Clear()
+		warnedDiscardedTimezone.Clear()
+	})
+	return &logs
+}
+
+// openWithoutDialing runs a DSN through Open, which resolves the config and
+// builds the pool without dialing, and closes the pool it returns.
+func openWithoutDialing(t *testing.T, dsn string, opts ...Option) {
+	t.Helper()
+	db, err := Open(dsn, opts...)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+}
+
+// A dial against an RDS endpoint that does not authenticate the server is
+// announced once, naming the endpoint, what the transport does prove, and
+// whether the posture came from the DSN or from SchemaBot's own default for
+// an RDS host with no sslmode. Postures that verify the server, and non-RDS
+// hosts in any posture, are dialed silently.
+func TestOpenWarnsWhenRDSConnectionDoesNotVerify(t *testing.T) {
+	caPath := writeSelfSignedCA(t)
+	tests := []struct {
+		name     string
+		dsn      string
+		wantWarn bool
+		wantAttr []string
+	}{
+		{
+			name:     "injected default sslmode=require encrypts without verifying",
+			dsn:      "postgres://schemabot:secret@default.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app",
+			wantWarn: true,
+			wantAttr: []string{
+				`host=default.cluster-abc123.us-west-2.rds.amazonaws.com:5432`,
+				`tls="encrypted, unverified"`,
+				`sslmode_source="schemabot default sslmode=require"`,
+			},
+		},
+		{
+			name:     "explicit sslmode=require is the DSN's posture",
+			dsn:      "postgres://schemabot:secret@explicit.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=require",
+			wantWarn: true,
+			wantAttr: []string{`tls="encrypted, unverified"`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "explicit sslmode=disable negotiates no TLS",
+			dsn:      "postgres://schemabot:secret@plain.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=disable",
+			wantWarn: true,
+			wantAttr: []string{`tls=none`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "sslmode=prefer retains a plaintext fallback",
+			dsn:      "postgres://schemabot:secret@prefer.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=prefer",
+			wantWarn: true,
+			wantAttr: []string{`tls="plaintext fallback"`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "sslmode=allow starts in plaintext",
+			dsn:      "postgres://schemabot:secret@allow.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=allow",
+			wantWarn: true,
+			wantAttr: []string{`tls="plaintext fallback"`, `sslmode_source=dsn`},
+		},
+		{
+			name:     "keyword DSN is judged the same way",
+			dsn:      "host=Keyword.cluster-abc123.us-west-2.rds.amazonaws.com port=5433 user=schemabot password=secret dbname=app",
+			wantWarn: true,
+			wantAttr: []string{`host=keyword.cluster-abc123.us-west-2.rds.amazonaws.com:5433`},
+		},
+		{
+			name: "verify-full authenticates against the embedded roots",
+			dsn:  "postgres://schemabot:secret@full.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=verify-full",
+		},
+		{
+			name: "require with an sslrootcert authenticates through the verifier",
+			dsn:  "postgres://schemabot:secret@rootcert.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app?sslmode=require&sslrootcert=" + url.QueryEscape(caPath),
+		},
+		{
+			name: "a non-RDS host is not SchemaBot's to judge",
+			dsn:  "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=require",
+		},
+		{
+			name: "a GovCloud endpoint is outside the RDS bundle and not recognized",
+			dsn:  "postgres://schemabot:secret@gov.cluster-abc123.us-gov-west-1.rds.amazonaws.com:5432/app",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+			openWithoutDialing(t, tt.dsn)
+			if !tt.wantWarn {
+				assert.NotContains(t, logs.String(), nonVerifyingRDSWarning)
+				return
+			}
+			assert.Contains(t, logs.String(), nonVerifyingRDSWarning)
+			for _, attr := range tt.wantAttr {
+				assert.Contains(t, logs.String(), attr)
+			}
+			openWithoutDialing(t, tt.dsn)
+			assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "the same endpoint and posture warns once")
+		})
+	}
+}
+
+// The warning is keyed on the endpoint and the posture, not the DSN: rotated
+// credentials and another database on the same endpoint share one warning,
+// while a weaker posture on the same endpoint and the same posture on another
+// endpoint each warn on their own. The reloadable storage pool resolves its
+// DSN through the same path, so a reload of the same endpoint is silent and a
+// fresh endpoint is announced.
+func TestNonVerifyingRDSTLSWarningDedupesPerEndpointAndPosture(t *testing.T) {
+	logs := captureWarnings(t)
+	const host = "shared.cluster-abc123.us-west-2.rds.amazonaws.com:5432"
+
+	for _, dsn := range []string{
+		"postgres://schemabot:secret@" + host + "/app",
+		"postgres://schemabot:rotated@" + host + "/app",
+		"postgres://schemabot:secret@" + host + "/other?sslmode=require",
+	} {
+		openWithoutDialing(t, dsn, WithConnectTimeout(5*time.Second))
+	}
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "one endpoint and posture warns once across DSNs")
+
+	openWithoutDialing(t, "postgres://schemabot:secret@"+host+"/app?sslmode=disable")
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a weaker posture on the same endpoint warns again")
+	assert.Contains(t, logs.String(), "tls=none")
+
+	original := getConnector
+	t.Cleanup(func() { getConnector = original })
+	getConnector = func(pgx.ConnConfig) driver.Connector { return nil }
+	_, err := resolveConnector("postgres://schemabot:secret@" + host + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a credential reload of a warned endpoint is silent")
+
+	const other = "other.cluster-abc123.us-west-2.rds.amazonaws.com:5432"
+	_, err = resolveConnector("postgres://schemabot:secret@" + other + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a second endpoint in the same posture warns on its own")
+	assert.Contains(t, logs.String(), "host="+other)
+}
+
+// Judging a DSN is not dialing it: a caller that asks whether the transport
+// verifies, in order to refuse when it does not, must not also be told the
+// connection is weak.
+func TestVerifiesServerCertificateDoesNotWarn(t *testing.T) {
+	logs := captureWarnings(t)
+	verifies, err := VerifiesServerCertificate("postgres://schemabot:secret@judged.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app")
+	require.NoError(t, err)
+	assert.False(t, verifies)
+	assert.Empty(t, logs.String())
+}
+
+// TestVerifiesServerCertificate pins which sslmodes actually authenticate the
+// server: verify-full and verify-ca consult the trust roots, require and
+// prefer encrypt without verifying, and disable negotiates no TLS — except
+// that require with an explicit sslrootcert is upgraded by pgx to verify-ca
+// semantics, matching libpq.
+func TestVerifiesServerCertificate(t *testing.T) {
+	base := "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode="
+	tests := []struct {
+		name string
+		dsn  string
+		want bool
+	}{
+		{name: "verify-full authenticates", dsn: base + "verify-full", want: true},
+		{name: "verify-ca authenticates", dsn: base + "verify-ca", want: true},
+		{name: "require encrypts without verifying", dsn: base + "require", want: false},
+		{name: "prefer encrypts without verifying", dsn: base + "prefer", want: false},
+		{name: "allow does not verify", dsn: base + "allow", want: false},
+		{name: "disable negotiates no TLS", dsn: base + "disable", want: false},
+		{name: "absent sslmode defaults to non-verifying", dsn: "postgres://schemabot:secret@postgres.internal.example:5432/app", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := VerifiesServerCertificate(tt.dsn)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("require with sslrootcert verifies like verify-ca", func(t *testing.T) {
+		caPath := writeSelfSignedCA(t)
+		got, err := VerifiesServerCertificate(base + "require&sslrootcert=" + url.QueryEscape(caPath))
+		require.NoError(t, err)
+		assert.True(t, got)
+	})
+
+	t.Run("unparseable DSN is refused", func(t *testing.T) {
+		_, err := VerifiesServerCertificate("postgres://schemabot@:not-a-port/app")
+		require.Error(t, err)
+	})
+}
+
+func TestWithRootCAsLeavesNonTLSConnectionsUntouched(t *testing.T) {
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app?sslmode=disable", WithRootCAs(x509.NewCertPool()))
+	require.NoError(t, err)
+	assert.Nil(t, cfg.TLSConfig)
+}
+
+// Every SchemaBot-managed connection gets a bounded connect timeout so an
+// unreachable target surfaces as an error instead of a hung dial. A positive
+// timeout carried in the DSN or supplied as an option wins over the package
+// default, while a non-positive value — absent, zero, or negative via a raw
+// option closure — is filled with the default so no managed connection
+// attempt is ever unbounded.
+func TestWithConnectTimeout(t *testing.T) {
+	t.Run("option overrides the default", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(7*time.Second))
+		require.NoError(t, err)
+		assert.Equal(t, 7*time.Second, cfg.ConnectTimeout)
+	})
+
+	t.Run("non-positive timeout falls back to the package default", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(0))
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.ConnectTimeout)
+	})
+
+	t.Run("negative timeout from a raw option closure is replaced by the default", func(t *testing.T) {
+		cfg, err := connectionConfig(
+			"postgres://schemabot:secret@localhost:5432/app",
+			func(c *pgx.ConnConfig) { c.ConnectTimeout = -time.Second },
+		)
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.ConnectTimeout)
+	})
+
+	t.Run("plain DSN gets the default connect timeout", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.ConnectTimeout)
+	})
+
+	t.Run("DSN-carried connect_timeout is preserved", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app?connect_timeout=3")
+		require.NoError(t, err)
+		assert.Equal(t, 3*time.Second, cfg.ConnectTimeout)
+	})
+}
+
+// Sessions are pinned to timezone=UTC so server-side now() is UTC on any
+// server default, keeping storage's timestamp comparisons consistent across
+// pods. Explicit settings are overridden in either DSN form and any GUC-name
+// case so client-bound values and server-side time expressions share a zone.
+func TestConnectionConfigPinsUTCTimezone(t *testing.T) {
+	// PGTZ is a libpq env fallback that pgx maps into RuntimeParams, where the
+	// pin replaces it like any other setting; clear it so the assertions
+	// below reflect the DSN alone.
+	t.Setenv("PGTZ", "")
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("host=localhost user=schemabot password=secret dbname=app")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app?timezone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("host=localhost user=schemabot timezone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	// PostgreSQL matches GUC names case-insensitively, and pgx preserves the
+	// DSN's key case, so the pin must remove conflicting spellings.
+	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app?TimeZone=America/New_York")
+	require.NoError(t, err)
+	assert.NotContains(t, cfg.RuntimeParams, "TimeZone")
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("host=localhost user=schemabot TimeZone=America/New_York")
+	require.NoError(t, err)
+	assert.NotContains(t, cfg.RuntimeParams, "TimeZone")
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+}
+
+// PGTZ follows libpq fallback semantics and reaches RuntimeParams before the
+// storage session pin overrides it.
+func TestConnectionConfigOverridesPGTZ(t *testing.T) {
+	t.Setenv("PGTZ", "America/Los_Angeles")
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+}
+
+const discardedTimezoneWarning = "PostgreSQL session timezone is pinned to UTC; the zone set in the DSN or PGTZ is ignored"
+
+// An operator who set a non-UTC session zone in the DSN or PGTZ is told, on
+// the dial path, that the pin replaced it: the warning names the endpoint,
+// the setting as spelled, and the zone. A DSN that names no zone, or names
+// UTC in any spelling, dials silently because the session it asked for is
+// the one it gets.
+func TestOpenWarnsWhenAConfiguredSessionTimezoneIsReplaced(t *testing.T) {
+	t.Setenv("PGTZ", "")
+	tests := []struct {
+		name     string
+		dsn      string
+		wantWarn bool
+		wantAttr []string
+	}{
+		{
+			name:     "URL DSN naming a zone",
+			dsn:      "postgres://schemabot:secret@url.internal.example:5432/app?timezone=America/New_York",
+			wantWarn: true,
+			wantAttr: []string{`host=url.internal.example:5432`, `setting=timezone`, `timezone=America/New_York`},
+		},
+		{
+			name:     "keyword DSN naming a zone under another spelling",
+			dsn:      "host=keyword.internal.example port=5433 user=schemabot password=secret dbname=app TimeZone=Europe/Berlin",
+			wantWarn: true,
+			wantAttr: []string{`host=keyword.internal.example:5433`, `setting=TimeZone`, `timezone=Europe/Berlin`},
+		},
+		{
+			name: "no zone in the DSN",
+			dsn:  "postgres://schemabot:secret@silent.internal.example:5432/app",
+		},
+		{
+			name: "UTC in the DSN",
+			dsn:  "postgres://schemabot:secret@utc.internal.example:5432/app?timezone=utc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+			openWithoutDialing(t, tt.dsn)
+			if !tt.wantWarn {
+				assert.NotContains(t, logs.String(), discardedTimezoneWarning)
+				return
+			}
+			assert.Contains(t, logs.String(), discardedTimezoneWarning)
+			for _, attr := range tt.wantAttr {
+				assert.Contains(t, logs.String(), attr)
+			}
+		})
+	}
+}
+
+// A zone set through PGTZ reaches every DSN the process resolves, so the
+// warning is keyed on the endpoint and the zone rather than on the DSN: a
+// credential reload of the storage pool and a second database on the same
+// endpoint are silent, while another endpoint announces the replacement on
+// its own. Judging a DSN without dialing it does not warn.
+func TestDiscardedTimezoneWarningDedupesPerEndpointAndZone(t *testing.T) {
+	t.Setenv("PGTZ", "America/Los_Angeles")
+	logs := captureWarnings(t)
+	const host = "storage.internal.example:5432"
+
+	for _, dsn := range []string{
+		"postgres://schemabot:secret@" + host + "/app",
+		"postgres://schemabot:rotated@" + host + "/app",
+		"postgres://schemabot:secret@" + host + "/other",
+	} {
+		openWithoutDialing(t, dsn)
+	}
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "one endpoint and zone warns once across DSNs")
+	assert.Contains(t, logs.String(), "timezone=America/Los_Angeles")
+
+	openWithoutDialing(t, "postgres://schemabot:secret@"+host+"/app?timezone=America/New_York")
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "a different zone on the same endpoint warns again")
+
+	original := getConnector
+	t.Cleanup(func() { getConnector = original })
+	getConnector = func(pgx.ConnConfig) driver.Connector { return nil }
+	_, err := resolveConnector("postgres://schemabot:secret@" + host + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "a credential reload of a warned endpoint is silent")
+
+	const other = "other.internal.example:5432"
+	_, err = resolveConnector("postgres://schemabot:secret@" + other + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "a second endpoint warns on its own")
+	assert.Contains(t, logs.String(), "host="+other)
+
+	verifies, err := VerifiesServerCertificate("postgres://schemabot:secret@judged.internal.example:5432/app")
+	require.NoError(t, err)
+	assert.False(t, verifies)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "judging a DSN without dialing it is silent")
+}
+
+// The scheduling of credential reloads is pkg/connreload's and is tested
+// there. What is tested here is the PostgreSQL-specific half: which error
+// means "the server rejected these credentials", and that a reloaded DSN gets
+// the same normalization and options as the DSN the pool was opened with.
+
+// stubConn is the minimal driver.Conn a fake dial can hand back.
+type stubConn struct{}
+
+func (stubConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not implemented") }
+func (stubConn) Close() error                        { return nil }
+func (stubConn) Begin() (driver.Tx, error)           { return nil, errors.New("not implemented") }
+
+// fakeConnector dials for one resolved config, recording the password of every
+// attempt into the shared log and taking its outcome from results, consumed in
+// order across every generation.
+type fakeConnector struct {
+	t         *testing.T
+	password  string
+	passwords *[]string
+	results   []error
+	mu        *sync.Mutex
+}
+
+func (f *fakeConnector) Connect(context.Context) (driver.Conn, error) {
+	f.mu.Lock()
+	*f.passwords = append(*f.passwords, f.password)
+	i := len(*f.passwords) - 1
+	f.mu.Unlock()
+	// assert (not require): this runs on the dialing goroutine, and testify's
+	// FailNow is only valid on the test goroutine. The error return fails the
+	// dial cleanly instead.
+	if !assert.Less(f.t, i, len(f.results), "unexpected extra dial attempt") {
+		return nil, errors.New("unexpected extra dial attempt")
+	}
+	if err := f.results[i]; err != nil {
+		return nil, err
+	}
+	return stubConn{}, nil
+}
+
+func (f *fakeConnector) Driver() driver.Driver { return stubDriver{} }
+
+type stubDriver struct{}
+
+func (stubDriver) Open(string) (driver.Conn, error) { return nil, errors.New("not implemented") }
+
+// fakeDial replaces the getConnector seam and returns the log recording the
+// password of every dial attempt, in order.
+func fakeDial(t *testing.T, results []error) *[]string {
+	t.Helper()
+	var passwords []string
+	var mu sync.Mutex
+	original := getConnector
+	t.Cleanup(func() { getConnector = original })
+	getConnector = func(cfg pgx.ConnConfig) driver.Connector {
+		return &fakeConnector{t: t, password: cfg.Password, passwords: &passwords, results: results, mu: &mu}
+	}
+	return &passwords
+}
+
+func authError() error {
+	return fmt.Errorf("connect: %w", &pgconn.PgError{Code: "28P01", Message: "password authentication failed"})
+}
+
+func TestIsAuthError(t *testing.T) {
+	assert.True(t, isAuthError(&pgconn.PgError{Code: "28P01"}))
+	assert.True(t, isAuthError(&pgconn.PgError{Code: "28000"}))
+	// database/sql wraps, so recognizing a bare error is not enough.
+	assert.True(t, isAuthError(authError()))
+	assert.False(t, isAuthError(&pgconn.PgError{Code: "55P03"}))
+	assert.False(t, isAuthError(errors.New("connection refused")))
+	assert.False(t, isAuthError(nil))
+}
+
+func TestResolveConnectorAppliesOptionsAndNormalization(t *testing.T) {
+	// A reloaded raw DSN gets the same treatment as the boot DSN, because both
+	// go through resolveConnector: caller options are re-applied and an RDS
+	// host gets sslmode=require injected. The assertions read the config the
+	// seam is handed, which is what the pool will dial with.
+	original := getConnector
+	t.Cleanup(func() { getConnector = original })
+	var got pgx.ConnConfig
+	getConnector = func(cfg pgx.ConnConfig) driver.Connector {
+		got = cfg
+		return nil
+	}
+
+	_, err := resolveConnector(
+		"postgres://schemabot:rotated@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", // sadscan:disable np.postgres.1
+		WithConnectTimeout(7*time.Second),
+		WithStatementTimeout(45*time.Second),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", got.Password)
+	assert.Equal(t, 7*time.Second, got.ConnectTimeout, "options must flow through the resolve path")
+	// The long-lived storage pool is the reloadable one, so an option armed on
+	// the new session rather than written into the config has to survive here
+	// too — a reload that dropped it would leave the pool running unbudgeted
+	// with nothing to read differently.
+	assert.NotNil(t, got.AfterConnect, "the statement budget must survive a credential reload")
+	assert.NotNil(t, got.TLSConfig, "a reloaded RDS DSN must get sslmode=require injected")
+	// sslmode=prefer would also set TLSConfig but keep a plaintext fallback;
+	// require is distinguished by that fallback's absence.
+	assert.Empty(t, got.Fallbacks, "sslmode=require must not leave a plaintext fallback")
+}
+
+// End to end through pkg/connreload: a pool whose first dial is rejected
+// re-resolves its DSN and retries with the rotated password, without the
+// caller doing anything.
+func TestOpenReloadableRotatesCredentialsOnAuthFailure(t *testing.T) {
+	passwords := fakeDial(t, []error{authError(), nil})
+	var reloads atomic.Int32
+
+	db, err := OpenReloadable("postgres://schemabot:old@localhost:5432/app", func() (string, error) { // sadscan:disable np.postgres.1
+		reloads.Add(1)
+		return "postgres://schemabot:rotated@localhost:5432/app", nil // sadscan:disable np.postgres.1
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	require.NoError(t, db.PingContext(t.Context()))
+	assert.Equal(t, []string{"old", "rotated"}, *passwords, "the retry must dial with the reloaded credentials")
+	assert.Equal(t, int32(1), reloads.Load())
+}
+
+func TestDSNParseErrorsRedactCredentials(t *testing.T) {
+	// A DSN whose URL fails to parse must not have its password echoed in the
+	// error: *url.Error reproduces the full URL, password included.
+	const password = "sup3r-secret"
+	badDSN := "postgres://schemabot:" + password + "@localhost:not-a-port/app"
+
+	t.Run("ConnectionDSN", func(t *testing.T) {
+		_, err := ConnectionDSN(badDSN)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), password)
+	})
+
+	t.Run("Open", func(t *testing.T) {
+		_, err := Open(badDSN)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), password)
+	})
+
+	t.Run("OpenReloadable", func(t *testing.T) {
+		_, err := OpenReloadable(badDSN, func() (string, error) { return "", nil })
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), password)
+	})
+
+	t.Run("resolveConnector", func(t *testing.T) {
+		_, err := resolveConnector(badDSN)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), password)
+	})
+}
+
+// The budget is armed on the session, so the startup packet must not also
+// carry one. GUC names are case-insensitive on the server and pgx preserves
+// DSN key case, so a DSN-carried statement_timeout is cleared under whatever
+// spelling it arrived in — left behind, it would set the session's budget
+// before the option's SET and be the value in force for any statement the
+// pooler routes to a connection the SET never reached.
+func TestWithStatementTimeoutClearsCaseVariantDSNValue(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_TIMEOUT=1000", WithStatementTimeout(45*time.Second))
+	require.NoError(t, err)
+
+	for k := range cfg.RuntimeParams {
+		assert.False(t, strings.EqualFold(k, "statement_timeout"),
+			"no spelling of statement_timeout may survive in the startup packet, found %q", k)
+	}
+	assert.NotNil(t, cfg.AfterConnect, "the budget must be armed on the new session")
+}
+
+// A negative duration means "no budget chosen": the option must leave a
+// DSN-carried statement_timeout exactly as it found it, and arm nothing.
+func TestWithStatementTimeoutNegativeLeavesDSNValue(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_timeout=1000", WithStatementTimeout(-1))
+	require.NoError(t, err)
+	assert.Equal(t, "1000", cfg.RuntimeParams["statement_timeout"])
+	assert.Nil(t, cfg.AfterConnect)
+}
+
+// Zero arms the budget rather than skipping it, so the session runs with the
+// budget explicitly disabled instead of inheriting the platform's value.
+func TestWithStatementTimeoutZeroArmsExplicitDisable(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := connectionConfig("postgres://user:pass@host:5432/db", WithStatementTimeout(0))
+	require.NoError(t, err)
+	assert.NotNil(t, cfg.AfterConnect)
+	assert.Equal(t, "SET statement_timeout = 0", statementTimeoutSQL(0))
+}
+
+// statement_timeout is expressed in whole milliseconds, so a finer duration
+// has to round somewhere. It rounds up: truncating would let a sub-millisecond
+// budget reach the server as 0, which disables the budget outright and turns
+// the shortest budget a caller can ask for into no budget at all.
+func TestWithStatementTimeoutRoundsSubMillisecondUp(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		d    time.Duration
+		want string
+	}{
+		{"sub-millisecond never disables", 500 * time.Microsecond, "1"},
+		{"smallest positive duration", time.Nanosecond, "1"},
+		{"partial millisecond rounds up", 1500 * time.Microsecond, "2"},
+		{"whole milliseconds are exact", time.Millisecond, "1"},
+		{"whole seconds are exact", 30 * time.Second, "30000"},
+		{"zero stays an explicit disable", 0, "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, "SET statement_timeout = "+tc.want, statementTimeoutSQL(tc.d))
+		})
+	}
+}
+
+// The budget only exists if the hook sends the caller's duration, and only
+// stays a budget if the statement itself is bounded: pgconn runs the hook on
+// the context the pool opens connections with, which carries no deadline, so
+// an endpoint that authenticates and then goes quiet would wedge the one
+// goroutine that opens connections. Both are asserted against the hook the
+// option actually installs rather than against the helper it calls, so a hook
+// wired to the wrong duration is a failure here and not only against a server.
+func TestWithStatementTimeoutHookSendsTheCallersBudgetUnderABound(t *testing.T) {
+	var (
+		gotStmt     string
+		gotDeadline bool
+		gotWithin   time.Duration
+	)
+	original := execStatementTimeout
+	t.Cleanup(func() { execStatementTimeout = original })
+	execStatementTimeout = func(ctx context.Context, _ *pgconn.PgConn, stmt string) error {
+		gotStmt = stmt
+		deadline, ok := ctx.Deadline()
+		gotDeadline = ok
+		if ok {
+			gotWithin = time.Until(deadline)
+		}
+		return nil
+	}
+
+	cfg, err := connectionConfig("postgres://user:pass@localhost:5432/db", WithStatementTimeout(45*time.Second))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.AfterConnect)
+
+	require.NoError(t, cfg.AfterConnect(t.Context(), nil))
+
+	assert.Equal(t, "SET statement_timeout = 45000", gotStmt,
+		"the hook must arm the duration the caller asked for")
+	assert.True(t, gotDeadline, "the hook's statement must be bounded, or a silent endpoint wedges the connection opener")
+	assert.LessOrEqual(t, gotWithin, defaultConnectTimeout,
+		"the bound must be the connect budget, not something longer")
+}
+
+// A caller that sets its own connect budget bounds the session setup by the
+// same value, since the setup runs on the connection that budget just opened.
+func TestWithStatementTimeoutHookBoundIsTheConfiguredConnectTimeout(t *testing.T) {
+	var gotWithin time.Duration
+	original := execStatementTimeout
+	t.Cleanup(func() { execStatementTimeout = original })
+	execStatementTimeout = func(ctx context.Context, _ *pgconn.PgConn, _ string) error {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		gotWithin = time.Until(deadline)
+		return nil
+	}
+
+	cfg, err := connectionConfig("postgres://user:pass@localhost:5432/db",
+		WithConnectTimeout(3*time.Second), WithStatementTimeout(time.Second))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.AfterConnect)
+
+	require.NoError(t, cfg.AfterConnect(t.Context(), nil))
+
+	assert.Greater(t, gotWithin, 2*time.Second, "the bound must track the configured connect budget")
+	assert.LessOrEqual(t, gotWithin, 3*time.Second, "the bound must not exceed the configured connect budget")
+}

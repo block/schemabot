@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -24,8 +25,12 @@ func TestRenderRollbackMissingEnv(t *testing.T) {
 }
 
 func TestRenderUnsupportedAutoConfirm(t *testing.T) {
-	rendered := RenderUnsupportedAutoConfirm("plan")
-	assert.Equal(t, "The `-y` flag is not supported for `plan`.", rendered)
+	rendered := RenderUnsupportedAutoConfirm("apply")
+	assert.Contains(t, rendered, "The `-y` flag is not supported for `apply`.")
+	assert.Contains(t, rendered, "`-y` belongs to the CLI",
+		"an operator who copied the flag from a CLI example is told where it works")
+	assert.Contains(t, rendered, "reply with the confirm command it posts",
+		"the reply points at the two-step confirm rather than a way around it")
 }
 
 func TestRenderUnsupportedDatabaseFlag(t *testing.T) {
@@ -39,10 +44,19 @@ func TestRenderUnsupportedDatabaseFlagRollbackConfirm(t *testing.T) {
 }
 
 func TestRenderControlMissingApplyID(t *testing.T) {
-	rendered := RenderControlMissingApplyID("stop")
+	rendered := RenderControlMissingApplyID("", "stop", "")
 	assert.Contains(t, rendered, "Missing Apply ID")
-	assert.Contains(t, rendered, "schemabot stop <apply-id> -e <environment>")
-	assert.Contains(t, rendered, "schemabot status")
+	assert.Contains(t, rendered, "Usage: `schemabot stop <apply-id> -e <environment>`")
+	assert.Contains(t, rendered, "Use `schemabot status -e ENVIRONMENT` to find the apply ID.")
+
+	// The status lookup is a CLI command, so it starts with the cli name and
+	// names the environment the command did; the usage line is the PR-comment
+	// command and keeps the bot's trigger word.
+	t.Run("cli name and environment", func(t *testing.T) {
+		rendered := RenderControlMissingApplyID("acme schemabot", "stop", "staging")
+		assert.Contains(t, rendered, "Usage: `schemabot stop <apply-id> -e <environment>`")
+		assert.Contains(t, rendered, "Use `acme schemabot status -e staging` to find the apply ID.")
+	})
 }
 
 func TestRenderStopCommandAccepted(t *testing.T) {
@@ -67,6 +81,36 @@ func TestRenderStopCommandAcceptedAlreadyRequested(t *testing.T) {
 		Status:      apitypes.ControlStatusAlreadyRequested,
 	})
 	assert.Contains(t, rendered, "Stop was already requested")
+}
+
+// A stop that withdraws a start which had not taken effect says the schema
+// change stays stopped and how to resume it, and lists no tasks as stopped,
+// since none were.
+func TestRenderStopCommandAcceptedStartWithdrawn(t *testing.T) {
+	rendered := RenderStopCommandAccepted(StopCommandAcceptedData{
+		ApplyID:      "apply_abc123",
+		Environment:  "staging",
+		RequestedBy:  "alice",
+		Status:       apitypes.ControlStatusStartWithdrawn,
+		StoppedCount: 2,
+	})
+	assert.Contains(t, rendered, "Stop Request Accepted")
+	assert.Contains(t, rendered, "this stop withdrew it. The schema change stays stopped; start it again to resume.")
+	assert.NotContains(t, rendered, "Tasks selected for stop")
+	assert.NotContains(t, rendered, "SchemaBot will stop this schema change")
+}
+
+func TestRenderStartWithdrawn(t *testing.T) {
+	assert.Equal(t, "## Start Withdrawn\n\n"+
+		"**Apply**: `apply_abc123`\n"+
+		"**Environment**: `staging`\n"+
+		"**Stopped by**: @alice\n"+
+		"\nA stop arrived before the start requested earlier took effect, so the start was withdrawn. The schema change stays stopped; start it again to resume.\n",
+		RenderStartWithdrawn(StartWithdrawnData{ApplyID: "apply_abc123", Environment: "staging", StoppedBy: "alice"}))
+
+	anonymous := RenderStartWithdrawn(StartWithdrawnData{ApplyID: "apply_abc123", Environment: "staging"})
+	assert.NotContains(t, anonymous, "Stopped by", "a stop whose caller is not a GitHub user names no one")
+	assert.Contains(t, anonymous, "so the start was withdrawn")
 }
 
 func TestRenderCancelCommandAccepted(t *testing.T) {
@@ -161,61 +205,12 @@ func TestRenderCutoverCommandAcceptedAlreadyInProgress(t *testing.T) {
 	assert.Contains(t, rendered, "Cutover is already in progress")
 }
 
-// TestRenderVolumeCommandAccepted verifies the volume acknowledgement says the
-// speed changes shortly — rather than claiming the change already took effect —
-// and carries the apply id, environment, requester, and requested level.
-func TestRenderVolumeCommandAccepted(t *testing.T) {
-	rendered := RenderVolumeCommandAccepted(VolumeCommandAcceptedData{
-		ApplyID:     "apply_abc123",
-		Environment: "staging",
-		RequestedBy: "alice",
-		Volume:      8,
-	})
-	assert.Contains(t, rendered, "Volume Request Accepted")
-	assert.Contains(t, rendered, "`apply_abc123`")
-	assert.Contains(t, rendered, "`staging`")
-	assert.Contains(t, rendered, "@alice")
-	assert.Contains(t, rendered, "Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly")
-	assert.Contains(t, rendered, "a fresh progress comment will track the schema change at the new volume",
-		"the acknowledgement points the operator at the new comment that appears once the level takes effect")
-}
-
-// TestRenderVolumeInvalidLevel verifies the rejection posted for a missing,
-// non-numeric, or out-of-range -v value tells the user the exact syntax and
-// the valid range.
-func TestRenderVolumeInvalidLevel(t *testing.T) {
-	rendered := RenderVolumeInvalidLevel()
-	assert.Contains(t, rendered, "Missing or Invalid Volume Level")
-	assert.Contains(t, rendered, "`schemabot volume <apply-id> -e <environment> -v <level>`")
-	assert.Contains(t, rendered, "between 1 (slowest) and 11 (fastest)")
-}
-
-// TestRenderVolumeSupersededProgressComment verifies the frozen body written
-// over an old progress comment after a volume change: it names the new level,
-// links the successor comment, and folds the final pre-change progress into a
-// details block so the record stays on the PR without looking live.
-func TestRenderVolumeSupersededProgressComment(t *testing.T) {
-	rendered := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
-		Volume:       8,
-		Repo:         "acme/testapp",
-		PR:           42,
-		NewCommentID: 2222222222,
-		PreviousBody: "## Schema Change Progress\n\nVolume: 3/11",
-	})
-	assert.Contains(t, rendered, "Volume changed to **8/11**")
-	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
-	assert.Contains(t, rendered, "<details>")
-	assert.Contains(t, rendered, "<summary>Progress before the volume change</summary>")
-	assert.Contains(t, rendered, "Volume: 3/11",
-		"the superseded body is preserved inside the fold")
-}
-
 // TestRenderResumeSupersededProgressComment verifies the frozen body written
 // over an old progress comment after a resume: it links the successor comment
 // and folds the final pre-stop progress into a details block so the record
 // stays on the PR without looking live.
 func TestRenderResumeSupersededProgressComment(t *testing.T) {
-	rendered := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+	rendered := RenderResumeSupersededProgressComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
@@ -227,6 +222,23 @@ func TestRenderResumeSupersededProgressComment(t *testing.T) {
 	assert.Contains(t, rendered, "<summary>Progress before the stop</summary>")
 	assert.Contains(t, rendered, "Stopped at 21%",
 		"the superseded body is preserved inside the fold")
+}
+
+// TestRenderCutoverCommandSupersededProgressComment verifies the frozen body
+// written over a deferred apply's progress comment once the operator's cutover
+// takes effect: it links the successor comment and folds the
+// waiting-for-cutover rendering, cutover command and all, into a details block
+// so it stays on the PR as a record without reading as a live prompt.
+func TestRenderCutoverCommandSupersededProgressComment(t *testing.T) {
+	rendered := RenderCutoverCommandSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Status — Production\n\n**Status**: Waiting for Cutover",
+	})
+	assert.True(t, strings.HasPrefix(rendered,
+		"Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"), rendered)
+	assert.Contains(t, rendered, "<details>\n<summary>Progress before the cutover</summary>\n\n## Schema Change Status — Production\n\n**Status**: Waiting for Cutover\n\n</details>\n")
 }
 
 // TestRenderSupersededProgressComment verifies the frozen body written over a
@@ -246,30 +258,48 @@ func TestRenderSupersededProgressComment(t *testing.T) {
 	assert.Contains(t, rendered, "<summary>Earlier progress</summary>")
 	assert.Contains(t, rendered, "Stopped at 21%",
 		"the superseded body is preserved inside the fold")
-	assert.NotContains(t, rendered, "Volume changed",
-		"the generic fold does not claim a volume change caused it")
 	assert.NotContains(t, rendered, "resumed",
 		"the generic fold does not claim a resume caused it")
 }
 
 // TestIsSupersededProgressComment verifies the frozen-body predicate accepts
 // every frozen flavor — so a freeze retry never folds a frozen body inside a
-// second fold — and rejects a live progress body.
+// second fold — and rejects live bodies, including ones that open with the
+// same words as a flavor prefix, so a freeze retry never skips a comment that
+// still needs folding.
 func TestIsSupersededProgressComment(t *testing.T) {
-	volume := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
-		Volume: 8, Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
-	})
-	resume := RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+	shared := SupersededProgressData{
 		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
-	})
-	generic := RenderSupersededProgressComment(SupersededProgressData{
-		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
-	})
-	assert.True(t, IsSupersededProgressComment(volume), "a volume-frozen body is recognized as frozen")
-	assert.True(t, IsSupersededProgressComment(resume), "a resume-frozen body is recognized as frozen")
-	assert.True(t, IsSupersededProgressComment(generic), "a generic-frozen body is recognized as frozen")
-	assert.False(t, IsSupersededProgressComment("## Schema Change Status — Staging"),
-		"a live progress body is not frozen")
+	}
+	frozen := map[string]string{
+		"resume":          RenderResumeSupersededProgressComment(shared),
+		"revert":          RenderRevertSupersededProgressComment(shared),
+		"skip-revert":     RenderSkipRevertSupersededProgressComment(shared),
+		"cutover":         RenderCutoverSupersededComment(shared),
+		"cutover command": RenderCutoverCommandSupersededProgressComment(shared),
+		"generic":         RenderSupersededProgressComment(shared),
+		// A volume-frozen body has no renderer anymore, but bodies written by a
+		// release that had one are still on GitHub and must stay recognizable.
+		"volume": renderSupersededFold(volumeSupersededPrefix+" **8/11** — progress continues in",
+			"Progress before the volume change",
+			shared.Repo, shared.PR, shared.NewCommentID, shared.PreviousBody),
+	}
+	for flavor, body := range frozen {
+		assert.Truef(t, IsSupersededProgressComment(body),
+			"a %s-frozen body is recognized as frozen", flavor)
+	}
+
+	live := map[string]string{
+		"progress body":            "## Schema Change Status — Staging",
+		"cutover-complete wording": "Cutover complete — the schema change is finalizing.",
+		"cutover-started wording":  "Cutover started by the operator.",
+		"reverting wording":        "Schema change reverting — see the table below.",
+		"skip-revert wording":      "Revert skipped by the operator.",
+	}
+	for name, body := range live {
+		assert.Falsef(t, IsSupersededProgressComment(body),
+			"a live %s is not frozen", name)
+	}
 }
 
 func TestRenderRevertCommandAccepted(t *testing.T) {

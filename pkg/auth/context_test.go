@@ -55,3 +55,21 @@ func TestAuthenticatedSubject(t *testing.T) {
 		assert.Empty(t, subject)
 	})
 }
+
+func TestVerifiedSubject(t *testing.T) {
+	user := &auth.User{Subject: "user@example.com"}
+
+	t.Run("verified identity", func(t *testing.T) {
+		ctx := auth.WithVerifiedUser(t.Context(), user)
+		subject, ok := auth.VerifiedSubject(ctx)
+		assert.True(t, ok)
+		assert.Equal(t, "user@example.com", subject)
+	})
+
+	t.Run("unverified identity", func(t *testing.T) {
+		ctx := auth.WithUser(t.Context(), user)
+		subject, ok := auth.VerifiedSubject(ctx)
+		assert.False(t, ok)
+		assert.Empty(t, subject)
+	})
+}

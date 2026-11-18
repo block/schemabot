@@ -3,9 +3,9 @@ package templates
 import (
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -13,40 +13,99 @@ import (
 )
 
 func writeMultiDeploymentProgress(data ProgressData) {
-	model := presentation.Derive(progressOperationsForPresentation(data.Operations, data.Released))
+	model := presentation.Derive(presentation.ResumeClaimed(data.State, ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released)))
+	groups := model.Groups()
+	view := RolloutView{
+		ApplyID:      data.ApplyID,
+		Environment:  data.Environment,
+		Engine:       data.Engine,
+		Model:        model,
+		Tables:       data.Tables,
+		SetupPhase:   state.IsSetupPhase(data.State),
+		DeferCutover: data.Options["defer_cutover"] == "true",
+	}
 
-	writeMultiDeploymentHeader(data, model)
+	writeMultiDeploymentHeader(data, model, groups)
 	writeMultiDeploymentFirstFailure(model.FirstFailure)
-	writeMultiDeploymentNextAction(model.NextAction)
+	if note := RolloutStoppedAtCutoverNote(model, groups); note != "" {
+		fmt.Printf("\n  ⏹️ %s\n", note)
+	}
 	fmt.Println()
 
-	for _, deployment := range model.Deployments {
-		writeDeploymentProgressSection(deployment, data)
+	// A deployment that addresses several targets renders as one rollup
+	// section; any other member keeps a section of its own. Each member names
+	// the row it reads its identifiers from, so each section renders its own
+	// operation's: a keyed apply has many operations on the same deployment
+	// name, so a name-based lookup cannot tell the sections apart.
+	for _, g := range groups {
+		if len(g.Members) > 1 {
+			fmt.Print(FormatTargetRollup(view, g))
+			continue
+		}
+		d := model.Deployments[g.Members[0]]
+		writeDeploymentProgressSection(d, data.Operations[d.Row], data)
 	}
+	fmt.Print(FormatThrottleReference(data.Tables))
+	fmt.Print(FormatRolloutFooter(view))
 }
 
-// progressOperationsForPresentation maps the parsed progress operations to the
-// surface-neutral presentation inputs. released is the apply-level release latch
-// (from ProgressData.Released): a released pause behaves like continue, so the
-// held siblings proceed and the aggregate runs degraded instead of paused.
-func progressOperationsForPresentation(ops []ProgressOperation, released bool) []presentation.Operation {
+// ProgressOperationsForPresentation maps the parsed progress operations to the
+// surface-neutral presentation inputs, for both the progress output and the
+// watch view. released is the apply-level release latch (from
+// ProgressData.Released): a released pause behaves like continue, so the held
+// siblings proceed and the aggregate runs degraded instead of paused. The
+// operation's key, kind and start time carry through, so the header settles
+// exactly as the stored apply state does. tables marks an operation retrying
+// when one of its tables is retrying a failure, which holds a later member's
+// cutover as the claim does.
+func ProgressOperationsForPresentation(ops []ProgressOperation, tables []TableProgress, released bool) []presentation.Operation {
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
-			Deployment:        op.Deployment,
-			State:             op.State,
-			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
-			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
-			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
-			PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
-			Released:          released,
-			Error:             op.ErrorMessage,
+			Deployment:          op.Deployment,
+			Target:              op.Target,
+			State:               op.State,
+			OperationKey:        op.OperationKey,
+			Work:                op.OperationKind == storage.ApplyOperationKindWork,
+			Finalizer:           op.OperationKind == storage.ApplyOperationKindGroupFinalizer,
+			NeverStarted:        op.StartedAt == "",
+			AlreadyConverged:    op.AlreadyConverged,
+			EndedBy:             op.EndedBy,
+			RolloutStep:         op.RolloutStep,
+			Barrier:             op.CutoverPolicy == storage.CutoverPolicyBarrier,
+			Parallel:            op.CutoverPolicy == storage.CutoverPolicyParallel,
+			ContinueOnFailure:   op.OnFailure == storage.OnFailureContinue,
+			PauseOnFailure:      op.OnFailure == storage.OnFailurePause,
+			Released:            released,
+			Retrying:            operationTablesRetrying(op, tables),
+			Error:               op.ErrorMessage,
+			ExternalID:          op.ExternalID,
+			ExternalOperationID: op.ExternalOperationID,
 		})
 	}
 	return presentationOps
 }
 
-func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
+// operationTablesRetrying reports whether a table op runs, or a shard of one,
+// is retrying a failure.
+func operationTablesRetrying(op ProgressOperation, tables []TableProgress) bool {
+	for _, t := range tables {
+		if t.Deployment != op.Deployment || t.Target != op.Target {
+			continue
+		}
+		if state.IsState(t.Status, state.Task.FailedRetryable) {
+			return true
+		}
+		for _, s := range t.Shards {
+			if state.IsState(s.Status, state.Task.FailedRetryable) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply, groups []presentation.Group) {
 	rows := []BoxRow{}
 	if data.ApplyID != "" {
 		rows = append(rows, BoxRow{"Apply ID", data.ApplyID})
@@ -55,12 +114,7 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", model.Label})
-	if data.Caller != "" {
-		rows = append(rows, BoxRow{"Caller", data.Caller})
-	}
-	if data.PullRequestURL != "" {
-		rows = append(rows, BoxRow{"PR", data.PullRequestURL})
-	}
+	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if data.StartedAt != "" {
 		if started, err := time.Parse(time.RFC3339, data.StartedAt); err == nil {
 			rows = append(rows, BoxRow{"Started", started.Format("Jan 2 15:04:05 MST")})
@@ -69,18 +123,10 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
 	if dur := formatApplyDuration(data.StartedAt, data.CompletedAt); dur != "-" {
 		rows = append(rows, BoxRow{"Duration", dur})
 	}
-	if counts := formatDeploymentCounts(model.Counts); counts != "" {
-		rows = append(rows, BoxRow{"Deployments", counts})
+	if label, counts := RolloutCounts(model, groups); counts != "" {
+		rows = append(rows, BoxRow{label, counts})
 	}
 	WriteBox(rows, "State", stateColorFunc(model.State))
-}
-
-func formatDeploymentCounts(counts []presentation.StateCount) string {
-	parts := make([]string, 0, len(counts))
-	for _, count := range counts {
-		parts = append(parts, fmt.Sprintf("%d %s", count.Count, count.Label))
-	}
-	return strings.Join(parts, " · ")
 }
 
 func writeMultiDeploymentFirstFailure(failure *presentation.Deployment) {
@@ -88,38 +134,30 @@ func writeMultiDeploymentFirstFailure(failure *presentation.Deployment) {
 		return
 	}
 	if failure.Error == "" {
-		fmt.Printf("\n  %s⚠ First failure: %s%s\n", ANSIRed, failure.Deployment, ANSIReset)
+		fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s%s\n", ANSIRed, failure.Name, ANSIReset)
 		return
 	}
-	fmt.Printf("\n  %s⚠ First failure: %s — %s%s\n", ANSIRed, failure.Deployment, failure.Error, ANSIReset)
+	fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s — %s%s\n", ANSIRed, failure.Name, failure.Error, ANSIReset)
 }
 
-func writeMultiDeploymentNextAction(next presentation.NextAction) {
-	switch next.Kind {
-	case presentation.NextActionCutover:
-		fmt.Printf("\n  Next: cut over %s\n", next.Deployment)
-	case presentation.NextActionResume:
-		fmt.Println("\n  Next: resume apply")
-	case presentation.NextActionReviewFailure:
-		if next.Deployment == "" {
-			fmt.Println("\n  Next: review failure")
-			return
-		}
-		fmt.Printf("\n  Next: review failure in %s\n", next.Deployment)
-	case presentation.NextActionNone:
+func writeDeploymentProgressSection(deployment presentation.Deployment, op ProgressOperation, data ProgressData) {
+	fmt.Printf("%s %s", deployment.Emoji, deployment.Name)
+	if op.OperationKey != "" {
+		fmt.Printf(" · %s", op.OperationKey)
 	}
-}
-
-func writeDeploymentProgressSection(deployment presentation.Deployment, data ProgressData) {
-	fmt.Printf("%s %s — %s", deployment.Emoji, deployment.Deployment, deployment.Label)
-	if target := targetForDeployment(data.Operations, deployment.Deployment); target != "" {
+	fmt.Printf(" — %s", deployment.Label)
+	// A member whose name already carries its target does not repeat it in the
+	// trailing parenthetical.
+	if target := sectionTarget(op, data.Operations); target != "" && deployment.Name == deployment.Deployment {
 		fmt.Printf(" (%s)", target)
 	}
 	fmt.Println()
-	if externalOperationID := externalOperationIDForDeployment(data.Operations, deployment.Deployment); externalOperationID != "" {
-		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, externalOperationID, ANSIReset)
+	// The external operation ID identifies this operation's own data-plane row,
+	// so it never falls back to a sibling's value.
+	if op.ExternalOperationID != "" {
+		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, op.ExternalOperationID, ANSIReset)
 	}
-	if externalID := externalIDForDeployment(data.Operations, deployment.Deployment); externalID != "" {
+	if externalID := SectionExternalID(op, data.Operations); externalID != "" {
 		fmt.Printf("  %sExternal apply ID: %s%s\n", ANSIDim, externalID, ANSIReset)
 	}
 
@@ -127,7 +165,11 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, data Pro
 		fmt.Printf("  %s%s%s\n", ANSIRed, deployment.Error, ANSIReset)
 	}
 
-	tables := activeTablesForDeployment(data.Tables, deployment.Deployment)
+	// The selector takes the member's recorded target, not the resolved one the
+	// header shows: a table row carries whatever its own operation carried, so
+	// matching an inherited value would look for a target the rows do not have.
+	tables := activeTablesForMember(data.Tables, deployment.Deployment, deployment.Target)
+	MarkResuming(tables, deployment.State)
 	if len(tables) > 0 && !state.IsSetupPhase(data.State) {
 		sortActiveTables(tables)
 		if hasTableNamespaces(tables) {
@@ -142,41 +184,90 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, data Pro
 	fmt.Println()
 }
 
-func targetForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment {
-			return op.Target
-		}
+// sectionTarget resolves the target shown in a section header: the section's
+// own operation when set, falling back to the one its deployment shares.
+func sectionTarget(op ProgressOperation, ops []ProgressOperation) string {
+	if op.Target != "" {
+		return op.Target
 	}
-	return ""
+	target, _ := sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.Target })
+	return target
 }
 
-func externalOperationIDForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalOperationID != "" {
-			return op.ExternalOperationID
-		}
+// SectionExternalID resolves the external apply ID shown for a rollout member:
+// the member's own operation when set, falling back to the one its deployment
+// shares. It is exported because the progress renderer and the watch TUI both
+// label a member with it, and a member must not be told two different apply IDs
+// depending on which surface an operator is reading.
+//
+// The fallback is gated on the deployment addressing a single target, not on
+// the IDs themselves agreeing. A deployment addressing several targets runs a
+// separate data-plane apply per member, so the first member to dispatch is the
+// only one carrying an ID at all: agreement among the IDs present would be
+// vacuously true and would hand that ID to every member still waiting.
+func SectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
+	if op.ExternalID != "" {
+		return op.ExternalID
 	}
-	return ""
+	if _, single := sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.Target }); !single {
+		return ""
+	}
+	externalID, _ := sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.ExternalID })
+	return externalID
 }
 
-func externalIDForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalID != "" {
-			return op.ExternalID
+// sharedAcrossDeployment returns the value every operation of op's deployment
+// agrees on, and reports whether they agree. Operations carrying no value at
+// all agree with anything: a value none of them has recorded yet is not a
+// disagreement.
+//
+// A keyed apply runs several operations of one deployment against one target
+// and through one data-plane apply, so an operation that has not dispatched yet
+// can take its value from a sibling. A deployment that addresses several targets
+// has no such shared value: taking one there would label a member with another
+// target's apply, telling an operator to go look at a member they are not
+// watching. Showing nothing is the honest answer, and it resolves on the next
+// poll once the operation dispatches and carries its own.
+func sharedAcrossDeployment(op ProgressOperation, ops []ProgressOperation, valueOf func(ProgressOperation) string) (shared string, agreed bool) {
+	for _, sibling := range ops {
+		if sibling.Deployment != op.Deployment {
+			continue
 		}
+		value := valueOf(sibling)
+		if value == "" {
+			continue
+		}
+		if shared != "" && shared != value {
+			return "", false
+		}
+		shared = value
 	}
-	return ""
+	return shared, true
 }
 
-func activeTablesForDeployment(tables []TableProgress, deployment string) []TableProgress {
+// activeTablesForMember selects the tables copied by one rollout member. Both
+// halves of the routing pair are matched: two targets of one deployment each
+// copy the same tables, and matching the deployment alone would list both
+// members' copies under each of them.
+func activeTablesForMember(tables []TableProgress, deployment, target string) []TableProgress {
 	activeTables := make([]TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.TableName != "" {
+		if table.Deployment == deployment && table.Target == target && table.TableName != "" {
 			activeTables = append(activeTables, table)
 		}
 	}
 	return activeTables
+}
+
+// MarkResuming marks a member's tables as those of a resuming member
+// (TableProgress.Resuming) when its state, as the rollout reads it
+// (presentation.ResumeClaimed), is resuming, so a section of its own reads
+// the same as the member does in a rollup.
+func MarkResuming(tables []TableProgress, memberState string) {
+	resuming := state.IsState(memberState, state.Apply.Resuming)
+	for i := range tables {
+		tables[i].Resuming = resuming
+	}
 }
 
 func sortActiveTables(tables []TableProgress) {

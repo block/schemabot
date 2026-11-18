@@ -116,6 +116,33 @@ func local_request_Tern_PlanDiff_0(ctx context.Context, marshaler runtime.Marsha
 	return msg, metadata, err
 }
 
+func request_Tern_CompareSchemaFileChange_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq CompareSchemaFileChangeRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	msg, err := client.CompareSchemaFileChange(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+}
+
+func local_request_Tern_CompareSchemaFileChange_0(ctx context.Context, marshaler runtime.Marshaler, server TernServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq CompareSchemaFileChangeRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	msg, err := server.CompareSchemaFileChange(ctx, &protoReq)
+	return msg, metadata, err
+}
+
 func request_Tern_Apply_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
 		protoReq ApplyRequest
@@ -167,6 +194,33 @@ func local_request_Tern_Progress_0(ctx context.Context, marshaler runtime.Marsha
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	msg, err := server.Progress(ctx, &protoReq)
+	return msg, metadata, err
+}
+
+func request_Tern_BatchProgress_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq BatchProgressRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	msg, err := client.BatchProgress(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+}
+
+func local_request_Tern_BatchProgress_0(ctx context.Context, marshaler runtime.Marshaler, server TernServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq BatchProgressRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	msg, err := server.BatchProgress(ctx, &protoReq)
 	return msg, metadata, err
 }
 
@@ -299,6 +353,27 @@ func local_request_Tern_Health_0(ctx context.Context, marshaler runtime.Marshale
 	return msg, metadata, err
 }
 
+func request_Tern_DriverCapacity_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq DriverCapacityRequest
+		metadata runtime.ServerMetadata
+	)
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	msg, err := client.DriverCapacity(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+}
+
+func local_request_Tern_DriverCapacity_0(ctx context.Context, marshaler runtime.Marshaler, server TernServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq DriverCapacityRequest
+		metadata runtime.ServerMetadata
+	)
+	msg, err := server.DriverCapacity(ctx, &protoReq)
+	return msg, metadata, err
+}
+
 func request_Tern_Stop_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
 		protoReq StopRequest
@@ -380,9 +455,9 @@ func local_request_Tern_Start_0(ctx context.Context, marshaler runtime.Marshaler
 	return msg, metadata, err
 }
 
-func request_Tern_Volume_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_Tern_StorageSchemaPlan_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq VolumeRequest
+		protoReq StorageSchemaPlanRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
@@ -391,19 +466,46 @@ func request_Tern_Volume_0(ctx context.Context, marshaler runtime.Marshaler, cli
 	if req.Body != nil {
 		_, _ = io.Copy(io.Discard, req.Body)
 	}
-	msg, err := client.Volume(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	msg, err := client.StorageSchemaPlan(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
 	return msg, metadata, err
 }
 
-func local_request_Tern_Volume_0(ctx context.Context, marshaler runtime.Marshaler, server TernServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_Tern_StorageSchemaPlan_0(ctx context.Context, marshaler runtime.Marshaler, server TernServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq VolumeRequest
+		protoReq StorageSchemaPlanRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	msg, err := server.Volume(ctx, &protoReq)
+	msg, err := server.StorageSchemaPlan(ctx, &protoReq)
+	return msg, metadata, err
+}
+
+func request_Tern_StorageSchemaApply_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq StorageSchemaApplyRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	msg, err := client.StorageSchemaApply(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+}
+
+func local_request_Tern_StorageSchemaApply_0(ctx context.Context, marshaler runtime.Marshaler, server TernServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq StorageSchemaApplyRequest
+		metadata runtime.ServerMetadata
+	)
+	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	msg, err := server.StorageSchemaApply(ctx, &protoReq)
 	return msg, metadata, err
 }
 
@@ -473,6 +575,26 @@ func RegisterTernHandlerServer(ctx context.Context, mux *runtime.ServeMux, serve
 		}
 		forward_Tern_PlanDiff_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodPost, pattern_Tern_CompareSchemaFileChange_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/tern.v1.Tern/CompareSchemaFileChange", runtime.WithHTTPPathPattern("/v1/compare-schema-file-change"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_Tern_CompareSchemaFileChange_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_CompareSchemaFileChange_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_Tern_Apply_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -512,6 +634,26 @@ func RegisterTernHandlerServer(ctx context.Context, mux *runtime.ServeMux, serve
 			return
 		}
 		forward_Tern_Progress_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_Tern_BatchProgress_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/tern.v1.Tern/BatchProgress", runtime.WithHTTPPathPattern("/v1/batch-progress"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_Tern_BatchProgress_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_BatchProgress_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
 	mux.Handle(http.MethodPost, pattern_Tern_Logs_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
@@ -613,6 +755,26 @@ func RegisterTernHandlerServer(ctx context.Context, mux *runtime.ServeMux, serve
 		}
 		forward_Tern_Health_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodGet, pattern_Tern_DriverCapacity_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/tern.v1.Tern/DriverCapacity", runtime.WithHTTPPathPattern("/v1/driver-capacity"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_Tern_DriverCapacity_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_DriverCapacity_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_Tern_Stop_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -673,25 +835,45 @@ func RegisterTernHandlerServer(ctx context.Context, mux *runtime.ServeMux, serve
 		}
 		forward_Tern_Start_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
-	mux.Handle(http.MethodPost, pattern_Tern_Volume_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+	mux.Handle(http.MethodPost, pattern_Tern_StorageSchemaPlan_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
 		var stream runtime.ServerTransportStream
 		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
 		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
-		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/tern.v1.Tern/Volume", runtime.WithHTTPPathPattern("/v1/volume"))
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/tern.v1.Tern/StorageSchemaPlan", runtime.WithHTTPPathPattern("/v1/storage-schema/plan"))
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
 			return
 		}
-		resp, md, err := local_request_Tern_Volume_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		resp, md, err := local_request_Tern_StorageSchemaPlan_0(annotatedContext, inboundMarshaler, server, req, pathParams)
 		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
 		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
 		if err != nil {
 			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
 			return
 		}
-		forward_Tern_Volume_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+		forward_Tern_StorageSchemaPlan_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_Tern_StorageSchemaApply_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/tern.v1.Tern/StorageSchemaApply", runtime.WithHTTPPathPattern("/v1/storage-schema/apply"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_Tern_StorageSchemaApply_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_StorageSchemaApply_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
 
 	return nil
@@ -784,6 +966,23 @@ func RegisterTernHandlerClient(ctx context.Context, mux *runtime.ServeMux, clien
 		}
 		forward_Tern_PlanDiff_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodPost, pattern_Tern_CompareSchemaFileChange_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/tern.v1.Tern/CompareSchemaFileChange", runtime.WithHTTPPathPattern("/v1/compare-schema-file-change"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_Tern_CompareSchemaFileChange_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_CompareSchemaFileChange_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_Tern_Apply_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -817,6 +1016,23 @@ func RegisterTernHandlerClient(ctx context.Context, mux *runtime.ServeMux, clien
 			return
 		}
 		forward_Tern_Progress_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_Tern_BatchProgress_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/tern.v1.Tern/BatchProgress", runtime.WithHTTPPathPattern("/v1/batch-progress"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_Tern_BatchProgress_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_BatchProgress_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
 	mux.Handle(http.MethodPost, pattern_Tern_Logs_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
@@ -903,6 +1119,23 @@ func RegisterTernHandlerClient(ctx context.Context, mux *runtime.ServeMux, clien
 		}
 		forward_Tern_Health_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodGet, pattern_Tern_DriverCapacity_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/tern.v1.Tern/DriverCapacity", runtime.WithHTTPPathPattern("/v1/driver-capacity"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_Tern_DriverCapacity_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_DriverCapacity_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_Tern_Stop_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -954,56 +1187,81 @@ func RegisterTernHandlerClient(ctx context.Context, mux *runtime.ServeMux, clien
 		}
 		forward_Tern_Start_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
-	mux.Handle(http.MethodPost, pattern_Tern_Volume_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+	mux.Handle(http.MethodPost, pattern_Tern_StorageSchemaPlan_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
 		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
-		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/tern.v1.Tern/Volume", runtime.WithHTTPPathPattern("/v1/volume"))
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/tern.v1.Tern/StorageSchemaPlan", runtime.WithHTTPPathPattern("/v1/storage-schema/plan"))
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
 			return
 		}
-		resp, md, err := request_Tern_Volume_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		resp, md, err := request_Tern_StorageSchemaPlan_0(annotatedContext, inboundMarshaler, client, req, pathParams)
 		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
 		if err != nil {
 			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
 			return
 		}
-		forward_Tern_Volume_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+		forward_Tern_StorageSchemaPlan_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_Tern_StorageSchemaApply_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/tern.v1.Tern/StorageSchemaApply", runtime.WithHTTPPathPattern("/v1/storage-schema/apply"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_Tern_StorageSchemaApply_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_StorageSchemaApply_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
 	return nil
 }
 
 var (
-	pattern_Tern_PullSchema_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "pull-schema"}, ""))
-	pattern_Tern_Plan_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "plan"}, ""))
-	pattern_Tern_PlanDiff_0   = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "plan-diff"}, ""))
-	pattern_Tern_Apply_0      = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "apply"}, ""))
-	pattern_Tern_Progress_0   = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "progress"}, ""))
-	pattern_Tern_Logs_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "logs"}, ""))
-	pattern_Tern_Cutover_0    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "cutover"}, ""))
-	pattern_Tern_Revert_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "revert"}, ""))
-	pattern_Tern_SkipRevert_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "skip-revert"}, ""))
-	pattern_Tern_Health_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "health"}, ""))
-	pattern_Tern_Stop_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "stop"}, ""))
-	pattern_Tern_Cancel_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "cancel"}, ""))
-	pattern_Tern_Start_0      = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "start"}, ""))
-	pattern_Tern_Volume_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "volume"}, ""))
+	pattern_Tern_PullSchema_0              = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "pull-schema"}, ""))
+	pattern_Tern_Plan_0                    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "plan"}, ""))
+	pattern_Tern_PlanDiff_0                = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "plan-diff"}, ""))
+	pattern_Tern_CompareSchemaFileChange_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "compare-schema-file-change"}, ""))
+	pattern_Tern_Apply_0                   = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "apply"}, ""))
+	pattern_Tern_Progress_0                = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "progress"}, ""))
+	pattern_Tern_BatchProgress_0           = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "batch-progress"}, ""))
+	pattern_Tern_Logs_0                    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "logs"}, ""))
+	pattern_Tern_Cutover_0                 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "cutover"}, ""))
+	pattern_Tern_Revert_0                  = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "revert"}, ""))
+	pattern_Tern_SkipRevert_0              = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "skip-revert"}, ""))
+	pattern_Tern_Health_0                  = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "health"}, ""))
+	pattern_Tern_DriverCapacity_0          = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "driver-capacity"}, ""))
+	pattern_Tern_Stop_0                    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "stop"}, ""))
+	pattern_Tern_Cancel_0                  = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "cancel"}, ""))
+	pattern_Tern_Start_0                   = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "start"}, ""))
+	pattern_Tern_StorageSchemaPlan_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "storage-schema", "plan"}, ""))
+	pattern_Tern_StorageSchemaApply_0      = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "storage-schema", "apply"}, ""))
 )
 
 var (
-	forward_Tern_PullSchema_0 = runtime.ForwardResponseMessage
-	forward_Tern_Plan_0       = runtime.ForwardResponseMessage
-	forward_Tern_PlanDiff_0   = runtime.ForwardResponseMessage
-	forward_Tern_Apply_0      = runtime.ForwardResponseMessage
-	forward_Tern_Progress_0   = runtime.ForwardResponseMessage
-	forward_Tern_Logs_0       = runtime.ForwardResponseMessage
-	forward_Tern_Cutover_0    = runtime.ForwardResponseMessage
-	forward_Tern_Revert_0     = runtime.ForwardResponseMessage
-	forward_Tern_SkipRevert_0 = runtime.ForwardResponseMessage
-	forward_Tern_Health_0     = runtime.ForwardResponseMessage
-	forward_Tern_Stop_0       = runtime.ForwardResponseMessage
-	forward_Tern_Cancel_0     = runtime.ForwardResponseMessage
-	forward_Tern_Start_0      = runtime.ForwardResponseMessage
-	forward_Tern_Volume_0     = runtime.ForwardResponseMessage
+	forward_Tern_PullSchema_0              = runtime.ForwardResponseMessage
+	forward_Tern_Plan_0                    = runtime.ForwardResponseMessage
+	forward_Tern_PlanDiff_0                = runtime.ForwardResponseMessage
+	forward_Tern_CompareSchemaFileChange_0 = runtime.ForwardResponseMessage
+	forward_Tern_Apply_0                   = runtime.ForwardResponseMessage
+	forward_Tern_Progress_0                = runtime.ForwardResponseMessage
+	forward_Tern_BatchProgress_0           = runtime.ForwardResponseMessage
+	forward_Tern_Logs_0                    = runtime.ForwardResponseMessage
+	forward_Tern_Cutover_0                 = runtime.ForwardResponseMessage
+	forward_Tern_Revert_0                  = runtime.ForwardResponseMessage
+	forward_Tern_SkipRevert_0              = runtime.ForwardResponseMessage
+	forward_Tern_Health_0                  = runtime.ForwardResponseMessage
+	forward_Tern_DriverCapacity_0          = runtime.ForwardResponseMessage
+	forward_Tern_Stop_0                    = runtime.ForwardResponseMessage
+	forward_Tern_Cancel_0                  = runtime.ForwardResponseMessage
+	forward_Tern_Start_0                   = runtime.ForwardResponseMessage
+	forward_Tern_StorageSchemaPlan_0       = runtime.ForwardResponseMessage
+	forward_Tern_StorageSchemaApply_0      = runtime.ForwardResponseMessage
 )

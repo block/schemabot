@@ -5,6 +5,7 @@ package secrets
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -12,10 +13,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/localstack"
 
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -68,10 +69,11 @@ func TestResolve_CustomResolver(t *testing.T) {
 }
 
 func TestResolve_SecretsManager_Integration(t *testing.T) {
-	// Start LocalStack container
-	container, err := localstack.Run(t.Context(),
-		"localstack/localstack:3.0",
-	)
+	// Start MiniStack container
+	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
+		ContainerRequest: testutil.MiniStackContainerRequest(),
+		Started:          true,
+	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		if err := testcontainers.TerminateContainer(container); err != nil {
@@ -79,20 +81,20 @@ func TestResolve_SecretsManager_Integration(t *testing.T) {
 		}
 	})
 
-	// Get LocalStack endpoint (port 4566 is the gateway for all services)
+	// Get MiniStack endpoint (port 4566 is the gateway for all services)
 	host, err := testutil.ContainerHost(t.Context(), container)
 	require.NoError(t, err)
 	port, err := testutil.ContainerPort(t.Context(), container, "4566/tcp")
 	require.NoError(t, err)
 	endpoint := fmt.Sprintf("http://%s:%d", host, port)
 
-	// Set environment for AWS SDK to use LocalStack
+	// Set environment for AWS SDK to use MiniStack
 	t.Setenv("AWS_ENDPOINT_URL", endpoint)
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_REGION", "us-east-1")
 
-	// Create a Secrets Manager client pointing to LocalStack
+	// Create a Secrets Manager client pointing to MiniStack
 	cfg, err := config.LoadDefaultConfig(t.Context(),
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
@@ -104,21 +106,14 @@ func TestResolve_SecretsManager_Integration(t *testing.T) {
 	})
 
 	// Create test secrets
-	_, err = client.CreateSecret(t.Context(), &secretsmanager.CreateSecretInput{
-		Name:         aws.String("test-plain-secret"),
-		SecretString: aws.String("my-secret-value"),
-	})
-	require.NoError(t, err)
+	createTestSecret(t, client, "test-plain-secret", "my-secret-value")
 
-	jsonSecret, _ := json.Marshal(map[string]string{
+	jsonSecret, err := json.Marshal(map[string]string{
 		"username": "admin",
 		"password": "super-secret-password",
 	})
-	_, err = client.CreateSecret(t.Context(), &secretsmanager.CreateSecretInput{
-		Name:         aws.String("test-json-secret"),
-		SecretString: aws.String(string(jsonSecret)),
-	})
 	require.NoError(t, err)
+	createTestSecret(t, client, "test-json-secret", string(jsonSecret))
 
 	t.Run("plain secret", func(t *testing.T) {
 		result, err := Resolve("secretsmanager:test-plain-secret", "")
@@ -157,4 +152,28 @@ func TestResolve_SecretsManager_Integration(t *testing.T) {
 		_, err := ResolveContext(ctx, "secretsmanager:test-plain-secret", "")
 		require.ErrorIs(t, err, context.Canceled)
 	})
+}
+
+// createTestSecret creates a secret in MiniStack. The SDK retries a create
+// whose response it lost under the same client request token, which AWS
+// answers as the original request but MiniStack answers as a duplicate name.
+// A duplicate name is accepted only when the stored secret holds the value
+// this call meant to write, so a retried create passes and a genuine clash
+// still fails.
+func createTestSecret(t *testing.T, client *secretsmanager.Client, name, value string) {
+	t.Helper()
+	_, err := client.CreateSecret(t.Context(), &secretsmanager.CreateSecretInput{
+		Name:         aws.String(name),
+		SecretString: aws.String(value),
+	})
+	var exists *types.ResourceExistsException
+	if !errors.As(err, &exists) {
+		require.NoError(t, err, "create secret %s", name)
+		return
+	}
+	stored, getErr := client.GetSecretValue(t.Context(), &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(name),
+	})
+	require.NoError(t, getErr, "read secret %s after its create reported it already exists", name)
+	require.Equal(t, value, aws.ToString(stored.SecretString), "secret %s already exists with a different value", name)
 }

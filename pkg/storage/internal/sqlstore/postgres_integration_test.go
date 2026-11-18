@@ -1,0 +1,1987 @@
+//go:build integration
+
+package sqlstore
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/postgresconn"
+	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/storage/storagetest"
+	"github.com/block/schemabot/pkg/testutil"
+)
+
+type postgresHarness struct {
+	db  *sql.DB
+	dsn string
+}
+
+func (h postgresHarness) NewStorage(t *testing.T) storage.Storage {
+	t.Helper()
+	clearPostgresTables(t, h.db)
+	return NewPostgres(h.db)
+}
+
+func (h postgresHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
+	t.Helper()
+	db, err := sql.Open("pgx", h.dsn)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	return NewPostgres(db)
+}
+
+func TestPostgresStorageParity(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_parity")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	storagetest.Run(t, h)
+	t.Run("SettingsUpdatedAtAdvances", func(t *testing.T) { testPostgresSettingsUpdatedAtAdvances(t, h) })
+	t.Run("LeaseGuardedApplyLogAppend", func(t *testing.T) { testPostgresLeaseGuardedApplyLogAppend(t, h) })
+	t.Run("DerivedStateProjectionSingleTableGuards", func(t *testing.T) { testPostgresDerivedStateProjectionSingleTableGuards(t, h) })
+	t.Run("MarkMinimizedPreservesStamp", func(t *testing.T) { testPostgresMarkMinimizedPreservesStamp(t, h) })
+	t.Run("MarkDeletedPreservesStamp", func(t *testing.T) { testPostgresMarkDeletedPreservesStamp(t, h) })
+	t.Run("LockUpdatedAtAdvances", func(t *testing.T) { testPostgresLockUpdatedAtAdvances(t, h) })
+	t.Run("LockAcquireSameOwnerConcurrent", func(t *testing.T) { testPostgresLockAcquireSameOwnerConcurrent(t, h) })
+	t.Run("LockAcquireInsertRaceReleasedBeforeReread", func(t *testing.T) {
+		testLockAcquireInsertRaceReleasedBeforeReread(t, func(t *testing.T, b func(binder) binder) *lockStore {
+			t.Helper()
+			return &lockStore{db: newRebindDB(h.db, b(PostgresDialect{})), dialect: PostgresDialect{}, identity: PostgresDialect{}, classifier: NewPostgresErrorClassifier()}
+		}, func(t *testing.T) { clearPostgresTables(t, h.db) })
+	})
+	t.Run("LockAcquireInsertRetryOutcomes", func(t *testing.T) {
+		testLockAcquireInsertRetryOutcomes(t, func(t *testing.T, b func(binder) binder) *lockStore {
+			t.Helper()
+			return &lockStore{db: newRebindDB(h.db, b(PostgresDialect{})), dialect: PostgresDialect{}, identity: PostgresDialect{}, classifier: NewPostgresErrorClassifier()}
+		}, func(t *testing.T) { clearPostgresTables(t, h.db) })
+	})
+	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
+	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
+	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
+	t.Run("ApplyCommentProgressAuthorityStaleTakeover", func(t *testing.T) { testPostgresApplyCommentProgressAuthorityStaleTakeover(t, h) })
+	t.Run("ApplyUpdateRefusesReopenAcrossSnapshotRace", func(t *testing.T) { testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t, h) })
+	t.Run("AttachSeesSuccessorAdmittedWhileWaiting", func(t *testing.T) { testPostgresAttachSeesSuccessorAdmittedWhileWaiting(t, h) })
+	t.Run("LeaseFencedWritesFailClosedAgainstConcurrentSteal", func(t *testing.T) {
+		testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db))
+	})
+	t.Run("StoppedApplyStartRacingItsTakeover", func(t *testing.T) {
+		testStoppedApplyStartRacingItsTakeover(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db), postgresAdvisoryLockWaiter(h.db))
+	})
+	t.Run("ApplyTargetLockPrecedesApplyRowLocks", func(t *testing.T) {
+		testApplyTargetLockPrecedesApplyRowLocks(t, func(t *testing.T, locker namedlock.Locker) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			dialect := PostgresDialect{}
+			return NewWithDependencies(Dependencies{
+				DB: h.db, Binder: dialect, Dialect: dialect, Identity: dialect,
+				Locker: locker, Classifier: NewPostgresErrorClassifier(),
+			})
+		}, namedlock.Postgres{}, postgresApplyRowLocks(h.db))
+	})
+	t.Run("GetLatestByDatabaseOrdersByCreationThenID", func(t *testing.T) {
+		testGetLatestByDatabaseOrdersByCreationThenID(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		})
+	})
+	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
+	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
+}
+
+// testPostgresFindTerminalWithInProgressCheck verifies the stranded-check query
+// runs on Postgres: a failed apply whose stored check state is still in
+// progress is returned, and one whose check completed is not.
+func testPostgresFindTerminalWithInProgressCheck(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	seed := func(name, checkStatus string, planID int64) *storage.Apply {
+		lock := storagetest.CreateLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+		apply := &storage.Apply{
+			ApplyIdentifier: name,
+			LockID:          lock.ID,
+			PlanID:          planID,
+			Database:        lock.DatabaseName,
+			DatabaseType:    lock.DatabaseType,
+			Repository:      lock.Repository,
+			PullRequest:     lock.PullRequest,
+			Environment:     "staging",
+			Caller:          "org/repo#123",
+			InstallationID:  12345,
+			Engine:          storage.EngineSpirit,
+			State:           state.Apply.Failed,
+		}
+		applyID, err := store.Applies().Create(ctx, apply)
+		require.NoError(t, err)
+		apply.ID = applyID
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository:   apply.Repository,
+			PullRequest:  apply.PullRequest,
+			HeadSHA:      "abc123",
+			Environment:  apply.Environment,
+			DatabaseType: apply.DatabaseType,
+			DatabaseName: apply.Database,
+			ApplyID:      apply.ID,
+			HasChanges:   true,
+			Status:       checkStatus,
+		}))
+		return apply
+	}
+	stranded := seed("apply_pg_check_stranded", checkStatusInProgress, 740)
+	seed("apply_pg_check_completed", "completed", 741)
+
+	applies, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, stranded.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
+// testPostgresNonUTCWriterTimesStoreTheirInstant verifies that a driver running
+// in a non-UTC local time zone records the instant it means. The driver stamps
+// started_at and completed_at from its own clock, so the values carry its
+// location; every datetime column is a plain timestamp, which keeps only a
+// wall-clock reading. The stored reading must be the UTC one: the apply reads
+// back at the instant it finished, which is what every now()-relative window
+// over it, such as summary reconciliation's, is measured against.
+func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	// West of UTC, so a local wall-clock reading taken for UTC lands hours in
+	// the past.
+	driverZone := time.FixedZone("UTC-5", -5*60*60)
+	completedAt := time.Now().In(driverZone).Truncate(time.Microsecond)
+	startedAt := completedAt.Add(-time.Minute)
+
+	lock := storagetest.CreateLock(t, store, "non_utc_writer_db", storage.DatabaseTypeMySQL)
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_non_utc_writer",
+		LockID:          lock.ID,
+		PlanID:          730,
+		Database:        lock.DatabaseName,
+		DatabaseType:    lock.DatabaseType,
+		Repository:      lock.Repository,
+		PullRequest:     lock.PullRequest,
+		Environment:     "staging",
+		Caller:          "org/repo#123",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Completed,
+	}
+	applyID, err := store.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	apply.StartedAt = &startedAt
+	apply.CompletedAt = &completedAt
+	require.NoError(t, store.Applies().Update(ctx, apply))
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 1001,
+	}))
+
+	stored, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.NotNil(t, stored.StartedAt)
+	require.NotNil(t, stored.CompletedAt)
+	assert.Equal(t, startedAt.UTC(), *stored.StartedAt, "started_at reads back as the instant the driver wrote, in UTC")
+	assert.Equal(t, completedAt.UTC(), *stored.CompletedAt, "completed_at reads back as the instant the driver wrote, in UTC")
+
+	missing, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
+	require.NoError(t, err)
+	require.Len(t, missing, 1, "an apply that finished moments ago with no summary is inside the reconciliation window")
+	assert.Equal(t, apply.ApplyIdentifier, missing[0].ApplyIdentifier)
+
+	// A completed_at stored at the driver's local wall clock would read hours
+	// old and clear the settle floor; stored at its instant, the apply finished
+	// moments ago and is still its live publisher's.
+	unsettled, err := store.Applies().FindMissingSummaryComment(ctx, storage.SummaryClaimStaleAfter, 100)
+	require.NoError(t, err)
+	assert.Empty(t, unsettled, "an apply that finished moments ago has not settled")
+}
+
+// reopenRaceDeadline bounds each wait in the snapshot race: the update reaching
+// the row lock, and the update returning once the finisher commits.
+const reopenRaceDeadline = 30 * time.Second
+
+// testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace pins the finished-apply guard
+// against a finisher that commits while a stale update waits on the row. The
+// finisher holds the row as completed but has not committed; the stale update
+// takes its snapshot and blocks on the row lock; the finisher commits. Under
+// REPEATABLE READ PostgreSQL rejects the waiting update as a serialization
+// failure rather than matching zero rows, and the caller must still be told the
+// write would have reopened a finished apply, not handed a driver error.
+func testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t *testing.T, h postgresHarness) {
+	for _, staleState := range []string{state.Apply.Running, state.Apply.Stopped} {
+		t.Run(staleState, func(t *testing.T) {
+			ctx := t.Context()
+			store := h.NewStorage(t)
+			lock := storagetest.CreateLock(t, store, "reopen_race_db", storage.DatabaseTypeMySQL)
+			apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_reopen_race", 9101, state.Apply.Running, "staging")
+			staleCopy := *apply
+			staleCopy.State = staleState
+
+			finisher, err := h.db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = finisher.Rollback() })
+			_, err = finisher.ExecContext(ctx, `UPDATE applies SET state = $1, completed_at = NOW() WHERE id = $2`, state.Apply.Completed, apply.ID)
+			require.NoError(t, err)
+
+			updateErr := make(chan error, 1)
+			go func() { updateErr <- store.Applies().Update(ctx, &staleCopy) }()
+
+			waitForPostgresApplyRowLockWaiter(t, h.db)
+			require.NoError(t, finisher.Commit())
+
+			select {
+			case err := <-updateErr:
+				require.ErrorIs(t, err, storage.ErrApplyReopenRefused)
+			case <-time.After(reopenRaceDeadline):
+				require.FailNow(t, "stale update did not return after the finisher committed")
+			}
+			persisted, err := store.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			assert.Equal(t, state.Apply.Completed, persisted.State)
+		})
+	}
+}
+
+// testPostgresAttachSeesSuccessorAdmittedWhileWaiting pins the attach guard
+// against a successor that commits while the attach waits for the apply target
+// lock. An apply is held open for target-001, which never attached, and
+// everything it did attach has settled. A late attach of target-001 waits
+// while the target lock is held; a newer generation's admission commits, with
+// the handoff it records on the held apply, and the lock is released. The
+// attach must see that handoff and refuse, so its snapshot has to be taken
+// after the lock is granted rather than before the wait.
+func testPostgresAttachSeesSuccessorAdmittedWhileWaiting(t *testing.T, h postgresHarness) {
+	ctx := t.Context()
+	store := h.NewStorage(t)
+	lock := storagetest.CreateLock(t, store, "attach_successor_race_db", storage.DatabaseTypeMySQL)
+	held := &storage.Apply{
+		ApplyIdentifier:       "apply_attach_race_held",
+		LockID:                lock.ID,
+		PlanID:                9501,
+		Database:              lock.DatabaseName,
+		DatabaseType:          lock.DatabaseType,
+		Repository:            lock.Repository,
+		PullRequest:           lock.PullRequest,
+		Environment:           "production",
+		Deployment:            "default",
+		Engine:                storage.EngineForType(lock.DatabaseType),
+		State:                 state.Apply.Pending,
+		ExpectedOperationKeys: []string{"target-001", "target-002"},
+	}
+	settledTask := attachRaceTask(held, "task_attach_race_settled")
+	settledTask.State = state.Task.Completed
+	settledOp := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-002", Target: "target-002", State: state.ApplyOperation.Completed}
+	heldID, err := store.Applies().CreateWithTasksAndOperations(ctx, held, []*storage.Task{settledTask}, []*storage.ApplyOperation{settledOp})
+	require.NoError(t, err)
+	held.ID = heldID
+	held.State = state.Apply.Running
+	require.NoError(t, store.Applies().Update(ctx, held))
+
+	lockConn, err := h.db.Conn(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lockConn.Close() })
+	lockName := applyTargetLockName(held.Database, held.DatabaseType, held.Environment)
+	acquired, err := namedlock.Postgres{}.Acquire(ctx, lockConn, lockName, attachRaceDeadline)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	late := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-001", Target: "target-001", State: state.ApplyOperation.Pending}
+	attachErr := make(chan error, 1)
+	go func() {
+		attachErr <- store.Applies().AttachOperationWithTasks(ctx, held, late, []*storage.Task{attachRaceTask(held, "task_attach_race_late")})
+	}()
+	waitForPostgresAdvisoryLockWaiter(t, h.db)
+
+	admission, err := h.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = admission.ExecContext(ctx, `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type, repository, pull_request, environment, deployment, engine, state, options)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '{}')
+	`, "apply_attach_race_successor", lock.ID, 9502, held.Database, held.DatabaseType, held.Repository, held.PullRequest, held.Environment, held.Deployment, held.Engine, state.Apply.Pending)
+	require.NoError(t, err)
+	_, err = admission.ExecContext(ctx, `UPDATE applies SET superseded_by = $1 WHERE id = $2`, "apply_attach_race_successor", held.ID)
+	require.NoError(t, err)
+	require.NoError(t, admission.Commit())
+	released, err := namedlock.Postgres{}.Release(ctx, lockConn, lockName)
+	require.NoError(t, err)
+	require.True(t, released)
+
+	select {
+	case err := <-attachErr:
+		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "the attach must see the handoff that committed while it waited")
+		assert.Contains(t, err.Error(), "apply_attach_race_successor")
+	case <-time.After(attachRaceDeadline):
+		require.FailNow(t, "the attach did not return after the target lock was released")
+	}
+	ops, err := store.ApplyOperations().ListByApply(ctx, held.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the refused attach leaves no operation behind")
+}
+
+// attachRaceDeadline bounds each wait in the attach race: the attach reaching
+// the target lock, and the attach returning once the lock is released.
+const attachRaceDeadline = 30 * time.Second
+
+func attachRaceTask(apply *storage.Apply, identifier string) *storage.Task {
+	now := time.Now()
+	return &storage.Task{
+		TaskIdentifier: identifier,
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         apply.Engine,
+		Repository:     apply.Repository,
+		PullRequest:    apply.PullRequest,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		Namespace:      apply.Database,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:      "alter",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+}
+
+// waitForPostgresAdvisoryLockWaiter blocks until a backend is waiting on an
+// advisory lock, so the test commits the successor only once the attach is
+// waiting for the target lock.
+func waitForPostgresAdvisoryLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(attachRaceDeadline)
+	for {
+		var waiters int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'
+		`).Scan(&waiters))
+		if waiters > 0 {
+			return
+		}
+		require.True(t, time.Now().Before(deadline), "the attach never waited on the apply target lock")
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitForPostgresApplyRowLockWaiter blocks until a backend is waiting on a row
+// lock to update applies, so the test commits the finisher only after the stale
+// update has taken its snapshot.
+func waitForPostgresApplyRowLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(reopenRaceDeadline)
+	for {
+		var waiters int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query ILIKE '%UPDATE applies%'
+		`).Scan(&waiters))
+		if waiters > 0 {
+			return
+		}
+		require.True(t, time.Now().Before(deadline), "stale update never waited on the finisher's row lock")
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// backdatePostgresProgressObserverHeartbeat pushes an apply's progress-comment
+// authority heartbeat past the stale window, simulating an observer that
+// stopped renewing (crashed pod or cleared observer).
+func backdatePostgresProgressObserverHeartbeat(t *testing.T, db *sql.DB, applyID int64) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), `
+		UPDATE apply_comments SET observer_heartbeat_at = now() - make_interval(secs => $1)
+		WHERE apply_id = $2 AND comment_state = $3
+	`, int64(storage.ProgressCommentAuthorityStaleAfter.Seconds())+1, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+}
+
+// testPostgresApplyCommentProgressAuthorityStaleTakeover verifies the
+// crashed-holder handover of the progress-comment authority on PostgreSQL: a
+// recorded owner whose heartbeat is older than the stale window transfers to
+// the next claimant, exactly once — the takeover stamps a fresh heartbeat, so
+// a third claimant loses again. Aging the heartbeat requires backdating
+// observer_heartbeat_at with raw SQL, which the storage interface cannot
+// express, so the scenario lives in each dialect suite; the fresh-row claim
+// decisions run on both dialects through the parity suite.
+func testPostgresApplyCommentProgressAuthorityStaleTakeover(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_authority_stale_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_authority_stale", 723)
+
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 555,
+	}))
+
+	held, err := store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+	require.NoError(t, err)
+	require.True(t, held, "first claim on an unowned progress comment must win")
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+	require.NoError(t, err)
+	require.False(t, held, "a second owner must lose while the holder's heartbeat is fresh")
+
+	backdatePostgresProgressObserverHeartbeat(t, h.db, apply.ID)
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+	require.NoError(t, err)
+	assert.True(t, held, "a stale authority transfers to the next claimant")
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-c/3/comment-observer")
+	require.NoError(t, err)
+	assert.False(t, held, "a just-transferred authority is fresh again; a third owner loses")
+}
+
+// backdatePostgresSummaryClaim pushes an apply's summary marker updated_at
+// past the stale-claim window, simulating a publisher that crashed after
+// claiming.
+func backdatePostgresSummaryClaim(t *testing.T, db *sql.DB, applyID int64) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), `
+		UPDATE apply_comments SET updated_at = now() - make_interval(secs => $1)
+		WHERE apply_id = $2 AND comment_state = $3
+	`, int64(storage.SummaryClaimStaleAfter.Seconds())+1, applyID, state.Comment.Summary)
+	require.NoError(t, err)
+}
+
+// testPostgresApplyCommentReclaimStaleSummaryClaim verifies crashed-publisher
+// takeover on PostgreSQL: a claim sentinel older than the stale window
+// transfers to the reclaimer (bumping updated_at so a second reclaimer
+// loses), while a fresh sentinel, a missing marker, and a recorded real
+// comment are all not reclaimable. Aging the sentinel requires backdating
+// updated_at with raw SQL, which the storage interface cannot express, so
+// the scenario lives in each dialect suite.
+func testPostgresApplyCommentReclaimStaleSummaryClaim(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_reclaim_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_reclaim", 720)
+
+	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "missing marker is not reclaimable")
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "fresh sentinel is an in-flight publish, not reclaimable")
+
+	// Backdate the sentinel past the stale window to simulate a publisher that
+	// crashed between claiming and posting.
+	backdatePostgresSummaryClaim(t, h.db, apply.ID)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, reclaimed, "stale sentinel transfers to the reclaimer")
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a just-reclaimed sentinel is fresh again; a second reclaimer loses")
+
+	// A recorded real comment is never reclaimable, however old.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	backdatePostgresSummaryClaim(t, h.db, apply.ID)
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a posted summary must never be reclaimed")
+}
+
+// testPostgresApplyCommentMutationsStampUpdatedAt verifies that every comment
+// mutation renews the row's updated_at on PostgreSQL. The summary-claim
+// machinery reads the column as its freshness signal, and stamping it is the
+// application's responsibility on every dialect — the PostgreSQL schema has
+// no automatic renewal, so a dropped stamp would leave the backdated value in
+// place. An upsert replay that writes identical values still counts as
+// publisher activity and renews the timestamp.
+func testPostgresApplyCommentMutationsStampUpdatedAt(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_stamp_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_updated_at_stamp", 721)
+
+	frozen := int64(900)
+	comment := &storage.ApplyComment{
+		ApplyID:                apply.ID,
+		CommentState:           state.Comment.Progress,
+		GitHubCommentID:        1001,
+		PendingFreezeCommentID: &frozen,
+	}
+	require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+
+	backdate := func(t *testing.T) time.Time {
+		t.Helper()
+		_, err := h.db.ExecContext(t.Context(), `
+			UPDATE apply_comments SET updated_at = now() - interval '1 hour'
+			WHERE apply_id = $1 AND comment_state = $2
+		`, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		stale, err := store.ApplyComments().Get(t.Context(), apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, stale)
+		return stale.UpdatedAt
+	}
+
+	// The subtests mutate one shared comment row and depend on this order:
+	// "clear pending freeze" only matches because the preceding upserts re-set
+	// the freeze marker, and "supersede" must run last because it retires the
+	// row from further mutation.
+	mutations := []struct {
+		name   string
+		mutate func(t *testing.T)
+	}{
+		{"upsert conflict update", func(t *testing.T) {
+			comment.GitHubCommentID = 1002
+			require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+		}},
+		{"identical-value upsert replay", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+		}},
+		{"increment edit count", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
+		}},
+		{"clear pending freeze", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
+		}},
+		{"supersede", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Progress))
+		}},
+	}
+	for _, m := range mutations {
+		t.Run(m.name, func(t *testing.T) {
+			stale := backdate(t)
+			m.mutate(t)
+			got, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.True(t, got.UpdatedAt.After(stale),
+				"mutation must renew updated_at (stale=%s got=%s)", stale, got.UpdatedAt)
+		})
+	}
+}
+
+// testPostgresApplyCommentClaimConversionRestartsStaleWindow verifies on
+// PostgreSQL that converting a superseded posted summary marker back into a
+// claim sentinel restarts the stale-claim window. The conversion is a
+// brand-new claim, so ReclaimStaleSummaryClaim must not immediately hand the
+// same claim to a second publisher.
+func testPostgresApplyCommentClaimConversionRestartsStaleWindow(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_claim_fresh_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_claim_fresh", 722)
+
+	// A stop's summary was posted and later consumed by a resume rotation,
+	// then the row sat idle long past the stale window.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
+	backdatePostgresSummaryClaim(t, h.db, apply.ID)
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
+	require.NoError(t, err)
+	require.True(t, won, "the superseded posted marker converts back into a claim sentinel")
+
+	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a just-converted sentinel is a fresh in-flight publish, not reclaimable")
+}
+
+// testPostgresMarkMinimizedPreservesStamp reads the raw minimized_at column to
+// prove a repeat mark does not move the original stamp. The row is backdated
+// between marks so the assertion cannot pass on write-clock proximity alone.
+func testPostgresMarkMinimizedPreservesStamp(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	comment := storagetest.InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+
+	require.NoError(t, store.PlanComments().MarkMinimized(ctx, comment.ID))
+
+	var minimizedAt *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&minimizedAt))
+	require.NotNil(t, minimizedAt, "the row is stamped, not deleted")
+
+	_, err := h.db.ExecContext(ctx,
+		`UPDATE plan_comments SET minimized_at = now() - interval '1 hour' WHERE id = $1`, comment.ID)
+	require.NoError(t, err)
+	var backdated *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&backdated))
+	require.NotNil(t, backdated)
+
+	require.NoError(t, store.PlanComments().MarkMinimized(ctx, comment.ID))
+
+	var afterRepeat *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&afterRepeat))
+	require.NotNil(t, afterRepeat)
+	assert.Equal(t, *backdated, *afterRepeat, "a repeat mark must not move the stamp")
+}
+
+// testPostgresMarkDeletedPreservesStamp reads the raw deleted_at column to
+// prove a repeat mark does not move the original stamp. The row is backdated
+// between marks so the assertion cannot pass on write-clock proximity alone.
+func testPostgresMarkDeletedPreservesStamp(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	comment := storagetest.InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+
+	require.NoError(t, store.PlanComments().MarkDeleted(ctx, comment.ID))
+
+	var deletedAt *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&deletedAt))
+	require.NotNil(t, deletedAt, "the row is stamped, not removed")
+
+	_, err := h.db.ExecContext(ctx,
+		`UPDATE plan_comments SET deleted_at = now() - interval '1 hour' WHERE id = $1`, comment.ID)
+	require.NoError(t, err)
+	var backdated *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&backdated))
+	require.NotNil(t, backdated)
+
+	require.NoError(t, store.PlanComments().MarkDeleted(ctx, comment.ID))
+
+	var afterRepeat *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&afterRepeat))
+	require.NotNil(t, afterRepeat)
+	assert.Equal(t, *backdated, *afterRepeat, "a repeat mark must not move the stamp")
+}
+
+// testPostgresSettingsUpdatedAtAdvances proves that a second Set renews
+// updated_at through the upsert's explicit stamp. The row is backdated between
+// writes so the assertion cannot pass on write-clock proximity alone; the
+// PostgreSQL schema has no automatic renewal, so a dropped stamp would leave
+// the backdated value in place.
+func testPostgresSettingsUpdatedAtAdvances(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	require.NoError(t, store.Settings().Set(ctx, "stamp_key", "v1"))
+	_, err := h.db.ExecContext(ctx,
+		`UPDATE settings SET updated_at = now() - interval '1 hour' WHERE setting_key = $1`, "stamp_key")
+	require.NoError(t, err)
+	backdated, err := store.Settings().Get(ctx, "stamp_key")
+	require.NoError(t, err)
+	require.NotNil(t, backdated)
+
+	require.NoError(t, store.Settings().Set(ctx, "stamp_key", "v2"))
+	updated, err := store.Settings().Get(ctx, "stamp_key")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, "v2", updated.Value)
+	assert.True(t, updated.UpdatedAt.After(backdated.UpdatedAt),
+		"second Set must advance updated_at (got %s, was %s)", updated.UpdatedAt, backdated.UpdatedAt)
+	assert.True(t, updated.CreatedAt.Equal(backdated.CreatedAt), "Set must not rewrite created_at")
+}
+
+// testPostgresLeaseGuardedApplyLogAppend pins the guarded-identity insert
+// contract against a real PostgreSQL server: a guarded INSERT ... SELECT whose
+// lease predicate matches must insert and return the generated id, while a
+// stale lease must surface as the lease-lost error rather than a hard failure —
+// the RETURNING row's absence is the only signal distinguishing the two.
+func testPostgresLeaseGuardedApplyLogAppend(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "guarded_logs_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_guarded_logs", 700, state.Apply.Running, "staging")
+
+	_, err := h.db.ExecContext(ctx,
+		`UPDATE applies SET lease_owner = $1, lease_token = $2, lease_acquired_at = now() WHERE id = $3`,
+		"driver-a", "owned-token", apply.ID)
+	require.NoError(t, err)
+
+	ownedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "owned-token"})
+	owned := &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelInfo,
+		EventType: storage.LogEventInfo,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   "owned driver log",
+	}
+	require.NoError(t, store.ApplyLogs().Append(ownedCtx, owned))
+	assert.Positive(t, owned.ID, "guarded insert must return the generated id")
+
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-old", Token: "stale-token"})
+	require.ErrorIs(t, store.ApplyLogs().Append(staleCtx, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelInfo,
+		EventType: storage.LogEventInfo,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   "stale driver log",
+	}), storage.ErrApplyLeaseLost)
+
+	logs, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, logs, 1)
+	assert.Equal(t, "owned driver log", logs[0].Message)
+}
+
+// testPostgresDerivedStateProjectionSingleTableGuards pins the rollout
+// projection's single-table renderings against a real PostgreSQL server. The
+// unguarded write and the apply-lease write share the operation-lease path's
+// SET list and address the row through the same alias, so both must run under
+// the PostgreSQL grammar: a current apply lease advances the parent and stamps
+// started_at once, a later projection keeps that start, and a stale apply
+// lease fails closed without touching the row.
+func testPostgresDerivedStateProjectionSingleTableGuards(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "projection_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_projection", 710, state.Apply.Pending, "staging")
+
+	startedAt := time.Now().UTC().Truncate(time.Second)
+	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Pending, state.Apply.Running, "", &startedAt, nil)
+	require.NoError(t, err)
+	require.True(t, swapped, "an unguarded projection must advance the parent")
+
+	_, err = h.db.ExecContext(ctx,
+		`UPDATE applies SET lease_owner = $1, lease_token = $2, lease_acquired_at = now() WHERE id = $3`,
+		"driver-a", "owned-token", apply.ID)
+	require.NoError(t, err)
+
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-old", Token: "stale-token"})
+	_, err = store.Applies().UpdateDerivedState(staleCtx, apply.ID, state.Apply.Running, state.Apply.Failed, "stale", nil, nil)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, persisted.State, "a stale apply lease must not write the projection")
+	require.NotNil(t, persisted.StartedAt)
+	assert.WithinDuration(t, startedAt, *persisted.StartedAt, time.Second)
+
+	later := startedAt.Add(time.Hour)
+	ownedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "owned-token"})
+	swapped, err = store.Applies().UpdateDerivedState(ownedCtx, apply.ID, state.Apply.Running, state.Apply.Completed, "", &later, &later)
+	require.NoError(t, err)
+	require.True(t, swapped, "a current apply lease must authorize the projection")
+	completed, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, completed.State)
+	require.NotNil(t, completed.StartedAt)
+	assert.WithinDuration(t, startedAt, *completed.StartedAt, time.Second, "started_at must be preserved, not rewound")
+	require.NotNil(t, completed.CompletedAt)
+	assert.WithinDuration(t, later, *completed.CompletedAt, time.Second)
+}
+
+// testPostgresLockUpdatedAtAdvances proves that the liveness touch and the
+// pending-plan refresh each renew updated_at through their explicit stamps.
+// The row is backdated between writes so the assertion cannot pass on
+// write-clock proximity alone; the PostgreSQL schema has no automatic renewal,
+// so a dropped stamp would leave the backdated value in place.
+func testPostgresLockUpdatedAtAdvances(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "stamp_db", storage.DatabaseTypeMySQL)
+
+	backdate := func(t *testing.T) *storage.Lock {
+		t.Helper()
+		_, err := h.db.ExecContext(ctx,
+			`UPDATE locks SET updated_at = now() - interval '1 hour' WHERE database_name = $1 AND database_type = $2`,
+			lock.DatabaseName, lock.DatabaseType)
+		require.NoError(t, err)
+		got, err := store.Locks().Get(ctx, lock.DatabaseName, lock.DatabaseType)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		return got
+	}
+
+	backdated := backdate(t)
+	require.NoError(t, store.Locks().Update(ctx, lock))
+	touched, err := store.Locks().Get(ctx, lock.DatabaseName, lock.DatabaseType)
+	require.NoError(t, err)
+	require.NotNil(t, touched)
+	assert.True(t, touched.UpdatedAt.After(backdated.UpdatedAt),
+		"Update must advance updated_at (got %s, was %s)", touched.UpdatedAt, backdated.UpdatedAt)
+
+	backdated = backdate(t)
+	refresh := &storage.Lock{
+		DatabaseName:  lock.DatabaseName,
+		DatabaseType:  lock.DatabaseType,
+		Repository:    lock.Repository,
+		PullRequest:   lock.PullRequest,
+		Owner:         lock.Owner,
+		PendingPlanID: "plan-refresh",
+	}
+	require.NoError(t, store.Locks().Acquire(ctx, refresh))
+	refreshed, err := store.Locks().Get(ctx, lock.DatabaseName, lock.DatabaseType)
+	require.NoError(t, err)
+	require.NotNil(t, refreshed)
+	assert.Equal(t, "plan-refresh", refreshed.PendingPlanID)
+	assert.True(t, refreshed.UpdatedAt.After(backdated.UpdatedAt),
+		"pending-plan refresh must advance updated_at (got %s, was %s)", refreshed.UpdatedAt, backdated.UpdatedAt)
+	assert.True(t, refreshed.CreatedAt.Equal(backdated.CreatedAt), "refresh must not rewrite created_at")
+}
+
+// testPostgresLockAcquireSameOwnerConcurrent forces the lock INSERT race on a
+// real PostgreSQL server. Concurrent same-owner Acquire calls collide on the
+// UNIQUE(database_name, database_type) constraint; every loser's duplicate-key
+// error must be recognized by the classifier and resolved as a same-owner
+// success rather than surfacing a hard error.
+func testPostgresLockAcquireSameOwnerConcurrent(t *testing.T, h postgresHarness) {
+	clearPostgresTables(t, h.db)
+	ctx := t.Context()
+
+	const drivers = 16
+	stores := make([]*Storage, drivers)
+	for i := range drivers {
+		db, openErr := sql.Open("pgx", h.dsn)
+		require.NoError(t, openErr)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		t.Cleanup(func() {
+			require.NoError(t, db.Close())
+		})
+		require.NoError(t, db.PingContext(ctx))
+		stores[i] = NewPostgres(db)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+
+	for i := range drivers {
+		driverStore := stores[i]
+		planID := fmt.Sprintf("plan-%d", i)
+		wg.Go(func() {
+			<-start
+			err := driverStore.Locks().Acquire(ctx, &storage.Lock{
+				DatabaseName:  "concurrent_db",
+				DatabaseType:  storage.DatabaseTypeMySQL,
+				Repository:    "org/repo",
+				PullRequest:   123,
+				Owner:         "org/repo#123",
+				PendingPlanID: planID,
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, errs, "all same-owner Acquire calls should succeed")
+
+	lock, err := stores[0].Locks().Get(ctx, "concurrent_db", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "org/repo#123", lock.Owner)
+	assert.Contains(t, lock.PendingPlanID, "plan-", "stored plan should be one of the concurrent attempts")
+}
+
+func TestPGXStdlibValueContracts(t *testing.T) {
+	_, db := testutil.StartPostgres(t, "sqlstore_values")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE value_contracts (
+		id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+		flag boolean NOT NULL,
+		payload jsonb NOT NULL,
+		observed_at timestamptz NOT NULL,
+		recorded_at timestamp NOT NULL,
+		label text NOT NULL
+	)`)
+	require.NoError(t, err)
+
+	wantTime := time.Date(2026, time.August, 11, 12, 34, 56, 123456000, time.FixedZone("test", 2*60*60))
+	_, err = db.ExecContext(t.Context(),
+		`INSERT INTO value_contracts (flag, payload, observed_at, recorded_at, label) VALUES ($1, $2, $3, $4, $5)`,
+		true, []byte(`{"enabled":true}`), wantTime, wantTime.UTC(), "same")
+	require.NoError(t, err)
+
+	var gotBool bool
+	var gotJSON []byte
+	var gotTime time.Time
+	var gotPlain time.Time
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT flag, payload, observed_at, recorded_at FROM value_contracts WHERE id = 1`,
+	).Scan(&gotBool, &gotJSON, &gotTime, &gotPlain))
+	assert.True(t, gotBool)
+	assert.JSONEq(t, `{"enabled":true}`, string(gotJSON))
+	assert.Equal(t, wantTime.UTC(), gotTime.UTC())
+	assert.Equal(t, wantTime.Nanosecond(), gotTime.Nanosecond(), "timestamptz retains microsecond precision")
+	// Every datetime column in the PostgreSQL schema is a plain timestamp
+	// (without time zone), which stores a wall-clock reading with no instant
+	// semantics. The stores' portability contract is therefore UTC-in/UTC-out:
+	// a UTC value must round-trip byte-exact, so predicates comparing stored
+	// values against server-side now() (lease expiry, retry windows) hold as
+	// long as the driver is handed UTC times. This is a raw pgx pool; the
+	// postgresconn pools used by storage convert every timestamp parameter to
+	// UTC themselves.
+	assert.Equal(t, wantTime.UTC(), gotPlain.UTC(), "plain timestamp round-trips a UTC write unchanged")
+	assert.Equal(t, wantTime.Nanosecond(), gotPlain.Nanosecond(), "plain timestamp retains microsecond precision")
+
+	result, err := db.ExecContext(t.Context(), `UPDATE value_contracts SET label = $1 WHERE id = $2`, "same", 1)
+	require.NoError(t, err)
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), affected, "PostgreSQL reports matched rows even when values are unchanged")
+}
+
+// TestPostgresApplyOperationLeaseGuards covers PostgreSQL-specific details the
+// cross-dialect suite cannot express: operation-lease heartbeat timestamps,
+// joined deletes, and a lease steal committed concurrently with a guarded
+// write. The lease-token fence must lock the joined applies row, wait out the
+// steal, and re-check the token against the stolen value.
+func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_guards")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+	ops := store.ApplyOperations()
+
+	seedApply := func(t *testing.T, identifier, leaseToken string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+				repository, pull_request, environment, engine, state, options, lease_owner, lease_token)
+			VALUES ($1, 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', 'running', '{}', 'owner', $2)
+			RETURNING id`, identifier, leaseToken).Scan(&id))
+		return id
+	}
+	seedOperation := func(t *testing.T, applyID int64, key, opState, leaseToken string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+			VALUES ($1, 'dep-1', $2, $3, 'owner', $4)
+			RETURNING id`, applyID, key, opState, leaseToken).Scan(&id))
+		return id
+	}
+	operationState := func(t *testing.T, id int64) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM apply_operations WHERE id = $1`, id).Scan(&got))
+		return got
+	}
+
+	t.Run("operation lease guards the single-table update", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-op", "tok-apply")
+		opID := seedOperation(t, applyID, "op-1", "running", "tok-op")
+		_, err := db.ExecContext(t.Context(),
+			`UPDATE apply_operations SET updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, opID)
+		require.NoError(t, err)
+		var before time.Time
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT updated_at FROM apply_operations WHERE id = $1`, opID).Scan(&before))
+
+		staleCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "owner", Token: "stale"})
+		err = ops.Heartbeat(staleCtx, opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+
+		ownerCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "owner", Token: "tok-op"})
+		require.NoError(t, ops.Heartbeat(ownerCtx, opID))
+		var after time.Time
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT updated_at FROM apply_operations WHERE id = $1`, opID).Scan(&after))
+		assert.True(t, after.After(before), "heartbeat must advance updated_at (before=%v after=%v)", before, after)
+	})
+
+	t.Run("apply lease guards the joined delete", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-delete", "tok-apply")
+		opID := seedOperation(t, applyID, "op-1", "pending", "")
+
+		staleCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "stale"})
+		err := ops.DeleteByApply(staleCtx, applyID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		assert.Equal(t, "pending", operationState(t, opID))
+
+		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
+		require.NoError(t, ops.DeleteByApply(ownerCtx, applyID))
+		var remaining int
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT COUNT(*) FROM apply_operations WHERE apply_id = $1`, applyID).Scan(&remaining))
+		assert.Zero(t, remaining)
+	})
+
+	t.Run("apply lease fence fails closed against a concurrent steal", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-steal", "tok-apply")
+		opID := seedOperation(t, applyID, "op-1", "pending", "")
+
+		// A competing driver steals the lease in a transaction that stays open
+		// past the guarded write's start, so the guarded write's statement
+		// snapshot still holds the pre-steal token.
+		steal, err := db.BeginTx(t.Context(), nil)
+		require.NoError(t, err)
+		committed := false
+		t.Cleanup(func() {
+			if !committed {
+				_ = steal.Rollback()
+			}
+		})
+		_, err = steal.ExecContext(t.Context(),
+			`UPDATE applies SET lease_token = 'tok-thief' WHERE id = $1`, applyID)
+		require.NoError(t, err)
+
+		// The displaced driver's guarded write must block on the fence's row
+		// lock instead of passing its token check against the stale snapshot.
+		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
+		result := make(chan error, 1)
+		go func() { result <- ops.MarkStarted(ownerCtx, opID) }()
+
+		require.Eventually(t, func() bool {
+			var waiting int
+			if err := db.QueryRowContext(t.Context(), `
+				SELECT COUNT(*) FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND query LIKE 'UPDATE apply_operations%'`).Scan(&waiting); err != nil {
+				return false
+			}
+			return waiting > 0
+		}, 15*time.Second, 25*time.Millisecond, "guarded write must block on the stolen row's lock")
+
+		require.NoError(t, steal.Commit())
+		committed = true
+
+		select {
+		case err := <-result:
+			require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		case <-time.After(15 * time.Second):
+			t.Fatal("guarded write did not return after the steal committed")
+		}
+		assert.Equal(t, "pending", operationState(t, opID))
+	})
+
+	// A displaced operation driver's rollout projection must not land over the
+	// driver that re-leased its failed_retryable operation. The re-lease rotates
+	// the operation token and then charges the parent apply's retry budget in
+	// the same transaction, so a projection that started before the re-lease
+	// committed waits behind it; once the re-lease commits, the fence must see
+	// the rotated token rather than pass against the projection's snapshot.
+	t.Run("operation lease fence on the rollout projection fails closed against a concurrent re-lease", func(t *testing.T) {
+		applies := store.Applies()
+		applyID := seedApply(t, "apply-guard-projection", "tok-apply")
+		_, err := db.ExecContext(t.Context(),
+			`UPDATE applies SET state = $1, error_message = 'copy failed' WHERE id = $2`, state.Apply.FailedRetryable, applyID)
+		require.NoError(t, err)
+		opID := seedOperation(t, applyID, "op-1", state.ApplyOperation.FailedRetryable, "tok-op")
+		persistedApply := func(t *testing.T) *storage.Apply {
+			t.Helper()
+			persisted, err := applies.Get(t.Context(), applyID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			return persisted
+		}
+
+		// The re-lease stays open past the projection's start, as the claim
+		// transaction in FindNextApplyOperation does between rotating the token
+		// and charging the retry budget.
+		releaseTx, err := db.BeginTx(t.Context(), nil)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			if err := releaseTx.Rollback(); !errors.Is(err, sql.ErrTxDone) {
+				assert.NoError(t, err, "roll back the re-lease transaction")
+			}
+		})
+		_, err = releaseTx.ExecContext(t.Context(),
+			`UPDATE apply_operations SET lease_owner = 'driver-b', lease_token = 'tok-b' WHERE id = $1`, opID)
+		require.NoError(t, err)
+		_, err = releaseTx.ExecContext(t.Context(),
+			`UPDATE applies SET attempt = attempt + 1 WHERE id = $1 AND state = $2`, applyID, state.Apply.FailedRetryable)
+		require.NoError(t, err)
+
+		type projectionOutcome struct {
+			swapped bool
+			err     error
+		}
+		displacedCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "driver-a", Token: "tok-op"})
+		result := make(chan projectionOutcome, 1)
+		go func() {
+			swapped, err := applies.UpdateDerivedState(displacedCtx, applyID, state.Apply.FailedRetryable, state.Apply.Running, "", nil, nil)
+			result <- projectionOutcome{swapped: swapped, err: err}
+		}()
+
+		waitForPostgresApplyRowLockWaiter(t, db)
+		require.NoError(t, releaseTx.Commit())
+
+		select {
+		case got := <-result:
+			require.ErrorIs(t, got.err, storage.ErrApplyLeaseLost)
+			assert.False(t, got.swapped)
+		case <-time.After(reopenRaceDeadline):
+			require.FailNow(t, "displaced projection did not return after the re-lease committed")
+		}
+		displaced := persistedApply(t)
+		assert.Equal(t, state.Apply.FailedRetryable, displaced.State, "a displaced driver must not write the parent projection")
+		assert.Equal(t, "copy failed", displaced.ErrorMessage)
+		assert.Nil(t, displaced.StartedAt)
+
+		// The driver that re-leased the operation still advances the parent.
+		startedAt := time.Now().UTC().Truncate(time.Second)
+		ownerCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "driver-b", Token: "tok-b"})
+		swapped, err := applies.UpdateDerivedState(ownerCtx, applyID, state.Apply.FailedRetryable, state.Apply.Running, "", &startedAt, nil)
+		require.NoError(t, err)
+		assert.True(t, swapped)
+		advanced := persistedApply(t)
+		assert.Equal(t, state.Apply.Running, advanced.State)
+		assert.Empty(t, advanced.ErrorMessage)
+		require.NotNil(t, advanced.StartedAt, "the projection stamps started_at while it is still NULL")
+		assert.WithinDuration(t, startedAt, *advanced.StartedAt, time.Second)
+	})
+}
+
+// ListRecentTargets bounds a data plane's view of the targets it applied to by
+// when each apply was last written on PostgreSQL too: the cutoff is rendered
+// SQL, so it is exercised on each dialect. A target whose applies were all
+// last written before the lookback drops out, while one with any apply written
+// inside the window stays, including one created before the window that
+// settled inside it.
+func TestPostgresListRecentTargetsWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_recent_targets_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	ctx := t.Context()
+	store := NewPostgres(db)
+	lock := storagetest.CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+	seed := func(t *testing.T, applyID string, planID int64, target string, created, updated time.Duration) {
+		t.Helper()
+		apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", Target: target,
+		})
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds', updated_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds' WHERE id = $1`,
+				int(created.Seconds()), int(updated.Seconds())),
+			apply.ID)
+		require.NoError(t, err)
+	}
+	day := 24 * time.Hour
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*day, 40*day)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*day, 40*day)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*day, 2*day)
+	// Created before the window but settled inside it: a branch its drive
+	// failed to delete at settlement must stay reachable for the window.
+	seed(t, "apply_settled_late", 9104, "orders-settled-late", 40*day, 1*day)
+
+	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.AppliedTarget{
+		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+		{Database: "orders", Environment: "staging", Target: "orders-settled-late"},
+	}, targets)
+}
+
+// A failed organic plan delivery covers its head only during the cool-off on
+// PostgreSQL too: the cutoff is rendered SQL, so it is exercised on each
+// dialect.
+func TestPostgresFailedOrganicRowCoversOnlyDuringCoolOff(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_webhook_cool_off")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	assertFailedRowCoverageCoolOff(t, NewPostgres(db), db, PostgresDialect{}, PostgresDialect{}.Rebind)
+}
+
+func applyPostgresTestSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	entries, err := schema.PostgresFS.ReadDir("postgres")
+	require.NoError(t, err)
+	for _, entry := range entries {
+		content, readErr := schema.PostgresFS.ReadFile("postgres/" + entry.Name())
+		require.NoError(t, readErr)
+		_, execErr := db.ExecContext(t.Context(), string(content))
+		require.NoError(t, execErr, "execute %s", entry.Name())
+	}
+}
+
+func clearPostgresTables(t *testing.T, db *sql.DB) {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(), `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`)
+	require.NoError(t, err)
+	var tables []string
+	for rows.Next() {
+		var table string
+		require.NoError(t, rows.Scan(&table))
+		tables = append(tables, table)
+	}
+	require.NoError(t, rows.Close())
+	require.NoError(t, rows.Err())
+	for _, table := range tables {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf(`TRUNCATE TABLE %q RESTART IDENTITY CASCADE`, table))
+		require.NoError(t, err)
+	}
+}
+
+// The stranded-active sweep defers to the operation lease on PostgreSQL exactly
+// as it does on MySQL. The gate is rendered SQL rather than Go, so it has to be
+// exercised on each dialect: the row here is stale by every window the sweep
+// applies, leaving the lease as the only thing that can keep it.
+func TestPostgresReapStrandedActiveDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	// A settled parent, quiet long enough that no window on it protects anything.
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-reap-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'target rejected the schema change', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Failed,
+		int64((strandedActiveParentQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options, updated_at)
+		VALUES ('task-reap-lease', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'users', 'ALTER TABLE users ADD COLUMN email varchar(255)', 'ALTER', '{}',
+			NOW() - make_interval(secs => $4))`,
+		applyID, opID, state.Task.Running,
+		int64((strandedActiveTaskQuiescence + time.Minute).Seconds()))
+	require.NoError(t, err)
+
+	taskState := func(t *testing.T) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = 'task-reap-lease'`).Scan(&got))
+		return got
+	}
+
+	reaped, err := store.Tasks().ReapStrandedActive(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, reaped, "a driver holds the operation, so the row is not the reaper's to write")
+	assert.Equal(t, state.Task.Running, taskState(t))
+
+	// The driver goes away without releasing: its heartbeat ages past the point
+	// where a peer would take the operation from it.
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	reaped, err = store.Tasks().ReapStrandedActive(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assert.Equal(t, state.Task.Failed, taskState(t))
+}
+
+// The stranded-retryable sweep renders the same lease gate, and its own SQL is
+// rendered separately from the active sweep's, so PostgreSQL has to execute it
+// too. A failed_retryable row under a long-settled parent is the reaper's only
+// once no driver holds the operation the retry would run under.
+func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_retry_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-reap-retry-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Completed,
+		int64((strandedRetryableQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options, error_message)
+		VALUES ('task-reap-retry-lease', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'users', 'ALTER TABLE users ADD COLUMN email varchar(255)', 'ALTER', '{}', 'copy failed')`,
+		applyID, opID, state.Task.FailedRetryable)
+	require.NoError(t, err)
+
+	taskState := func(t *testing.T) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = 'task-reap-retry-lease'`).Scan(&got))
+		return got
+	}
+
+	reaped, err := store.Tasks().ReapStrandedRetryable(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, reaped, "a driver holds the operation, so the retry promise is not the reaper's to retire")
+	assert.Equal(t, state.Task.FailedRetryable, taskState(t))
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	reaped, err = store.Tasks().ReapStrandedRetryable(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assert.Equal(t, state.Task.Failed, taskState(t))
+}
+
+// The stranded control-request listing renders the same parent and lease
+// gates, keyed on the request's apply rather than on a task's operation, so
+// PostgreSQL has to execute that rendering too. A pending start on a
+// long-settled apply is the reaper's only once no driver holds an operation of
+// that apply.
+func TestPostgresListStrandedPendingDefersToAFreshOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_stranded_control")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-stranded-control', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Completed,
+		int64((strandedParentQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a sibling driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID: applyID, Operation: storage.ControlOperationStart, RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	listed, err := store.ControlRequests().ListStrandedPending(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, listed, "a driver holds an operation of the apply, so the request is that drive's to answer")
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	listed, err = store.ControlRequests().ListStrandedPending(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "a lease a peer could reclaim no longer speaks for the apply")
+	assert.Equal(t, storage.ControlOperationStart, listed[0].Request.Operation)
+	assert.Equal(t, "apply-stranded-control", listed[0].Apply.ApplyIdentifier)
+}
+
+// Recovering a crashed retry admits one driver per staleness window on
+// PostgreSQL as it does on MySQL. The gate is a rendered interval comparison,
+// not Go, so each dialect has to execute it. Leasing the operation and claiming
+// its parent apply are separate transactions, and the parent stays
+// active-and-stale for the whole gap between them: without the operation's own
+// heartbeat in the predicate, every peer polling inside that gap re-leases the
+// same row and rotates its token. The row must still hand off promptly, so a
+// driver that releases the claim leaves it takeable on the very next poll
+// rather than after another window.
+func TestPostgresFindNextApplyOperationCrashRecoveryAdmitsOneDriverPerWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_crash_recovery_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+	ops := store.ApplyOperations()
+
+	staleSeconds := int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds())
+
+	// A parent apply claimed for a retry, then crashed: active, budget
+	// remaining, and no longer heartbeating.
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, updated_at)
+		VALUES ('apply-crash-recovery-window', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit',
+			$1, $2, '{}', NOW() - make_interval(secs => $3))
+		RETURNING id`, state.Apply.Running, maxRecoveryAttempts-1, staleSeconds).Scan(&applyID))
+
+	// The crashed driver stopped heartbeating the operation too.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state)
+		VALUES ($1, 'region-a', 'op-1', $2)
+		RETURNING id`, applyID, state.ApplyOperation.FailedRetryable).Scan(&opID))
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		staleSeconds, opID)
+	require.NoError(t, err)
+
+	first, err := ops.FindNextApplyOperation(t.Context(), "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, first, "the first driver must recover the crashed retry")
+	require.Equal(t, opID, first.ID)
+
+	// driver-a holds the operation lease but has not reached ClaimApplyByID yet,
+	// so the parent apply is still active and stale.
+	second, err := ops.FindNextApplyOperation(t.Context(), "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, second, "a peer polling between the operation claim and the parent claim must not re-lease the recovering operation")
+
+	persisted, err := ops.Get(t.Context(), opID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "driver-a", persisted.LeaseOwner, "the recovering driver keeps the operation lease")
+	assert.Equal(t, first.LeaseToken, persisted.LeaseToken, "the recovering driver's lease token must not be rotated out from under it")
+
+	// The driver that cannot acquire the parent apply hands the operation back,
+	// and the peer holding the parent takes it without waiting out a window.
+	released, err := ops.ReleaseClaim(t.Context(), first.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+
+	reclaimed, err := ops.FindNextApplyOperation(t.Context(), "parent-holder")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a released crash-recovery row must be claimable on the next poll without aging")
+	assert.Equal(t, opID, reclaimed.ID)
+	assert.Equal(t, "parent-holder", reclaimed.LeaseOwner)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, reclaimed.State, "the handoff must not change the row's state")
+}
+
+// Retryable-apply expiry reads the operation lease the way the reaper's sweeps
+// do, and it renders that read into its own selection, so PostgreSQL has to
+// execute it too. The fan-out shape is the one the gate exists for: one
+// deployment's redispatches spend the rollout's retry budget while a sibling
+// copies under a live operation lease, and only that lease tells a dead
+// deployment from a live one. Expiry settles the apply and its rows together,
+// so one live sibling holds the whole apply until its lease ages out.
+func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_expire_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, error_message)
+		VALUES ('apply-expire-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, $2, '{}', '')
+		RETURNING id`, state.Apply.FailedRetryable, maxRecoveryAttempts).Scan(&applyID))
+
+	// The deployment whose redispatches spent the budget, its lease long stale,
+	// and the sibling a driver is holding right now.
+	insertOperation := func(t *testing.T, deployment, key string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING id`, applyID, deployment, key, state.ApplyOperation.Running,
+			"driver-"+deployment, "token-"+deployment).Scan(&id))
+		return id
+	}
+	abandonedOpID := insertOperation(t, "region-a", "op-1")
+	heldOpID := insertOperation(t, "region-b", "op-2")
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), abandonedOpID)
+	require.NoError(t, err)
+
+	// A third deployment whose redispatches spent its own budget, and whose
+	// drive settled it into failed_retryable and left its lease behind:
+	// indistinguishable from a newly claimed retry, so the gate must defer
+	// until that lease is stale too.
+	settledOpID := insertOperation(t, "region-c", "op-3")
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET state = $1, attempt = $2, updated_at = NOW() WHERE id = $3`,
+		state.ApplyOperation.FailedRetryable, maxRecoveryAttempts, settledOpID)
+	require.NoError(t, err)
+
+	insertTask := func(t *testing.T, identifier, table string, opID int64, taskState string) {
+		t.Helper()
+		_, err := db.ExecContext(t.Context(), `
+			INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+				database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+				ddl_action, options, error_message)
+			VALUES ($1, $2, $3, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $4, $5, $6,
+				'ALTER', '{}', '')`,
+			identifier, applyID, opID, taskState, table,
+			"ALTER TABLE "+table+" ADD COLUMN email varchar(255)")
+		require.NoError(t, err)
+	}
+	insertTask(t, "task-expire-abandoned", "users", abandonedOpID, state.Task.Running)
+	insertTask(t, "task-expire-live", "orders", heldOpID, state.Task.Running)
+	insertTask(t, "task-expire-queued", "products", heldOpID, state.Task.Pending)
+	insertTask(t, "task-expire-settled", "invoices", settledOpID, state.Task.FailedRetryable)
+
+	taskState := func(t *testing.T, identifier string) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = $1`, identifier).Scan(&got))
+		return got
+	}
+
+	expired, err := store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
+	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-abandoned"))
+	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-live"))
+	assert.Equal(t, state.Task.Pending, taskState(t, "task-expire-queued"))
+	assert.Equal(t, state.Task.FailedRetryable, taskState(t, "task-expire-settled"))
+
+	// The driver dies and all remaining leases age out.
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id IN ($2, $3)`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID, settledOpID)
+	require.NoError(t, err)
+
+	expired, err = store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
+	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-abandoned"))
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-live"))
+	assert.Equal(t, state.Task.Cancelled, taskState(t, "task-expire-queued"),
+		"a task that never started is cancelled, not failed")
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-settled"))
+}
+
+// A rollout running degraded keeps running while one of its deployments is
+// paused on a retryable failure; once the rollout's retry budget is spent, the
+// paused deployment is the only thing left to settle. That selection — the
+// budget arms, the paused-deployment EXISTS, and the operation-lease gate — is
+// rendered SQL PostgreSQL has to execute, so the parity test walks the same
+// shape as the apply sweep's: one live sibling defers the whole rollout, and
+// the paused deployment settles alone once that lease ages out, leaving the
+// rollout and its running sibling untouched.
+func TestPostgresExpireRetryableOperationsDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_expire_op_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, error_message)
+		VALUES ('apply-expire-op-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, $2, '{}', '')
+		RETURNING id`, state.Apply.RunningDegraded, maxRecoveryAttempts).Scan(&applyID))
+
+	insertOperation := func(t *testing.T, deployment, key, opState string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING id`, applyID, deployment, key, opState,
+			"driver-"+deployment, "token-"+deployment).Scan(&id))
+		return id
+	}
+	ageLease := func(t *testing.T, opIDs ...int64) {
+		t.Helper()
+		for _, opID := range opIDs {
+			_, err := db.ExecContext(t.Context(),
+				`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+				int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+			require.NoError(t, err)
+		}
+	}
+
+	// The deployment whose redispatches spent its budget, its lease long stale,
+	// and the sibling a driver is copying under right now.
+	pausedOpID := insertOperation(t, "region-b", "op-1", state.ApplyOperation.FailedRetryable)
+	_, err = db.ExecContext(t.Context(), `UPDATE apply_operations SET attempt = $1 WHERE id = $2`, maxRecoveryAttempts, pausedOpID)
+	require.NoError(t, err)
+	ageLease(t, pausedOpID)
+	heldOpID := insertOperation(t, "region-c", "op-2", state.ApplyOperation.Running)
+
+	insertTask := func(t *testing.T, identifier, table string, opID int64, taskState string) {
+		t.Helper()
+		_, err := db.ExecContext(t.Context(), `
+			INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+				database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+				ddl_action, options, error_message)
+			VALUES ($1, $2, $3, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $4, $5, $6,
+				'ALTER', '{}', '')`,
+			identifier, applyID, opID, taskState, table,
+			"ALTER TABLE "+table+" ADD COLUMN email varchar(255)")
+		require.NoError(t, err)
+	}
+	insertTask(t, "task-op-paused", "users", pausedOpID, state.Task.FailedRetryable)
+	insertTask(t, "task-op-queued", "orders", pausedOpID, state.Task.Pending)
+	insertTask(t, "task-op-live", "products", heldOpID, state.Task.Running)
+
+	taskState := func(t *testing.T, identifier string) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = $1`, identifier).Scan(&got))
+		return got
+	}
+	operationState := func(t *testing.T, opID int64) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM apply_operations WHERE id = $1`, opID).Scan(&got))
+		return got
+	}
+
+	expired, err := store.Applies().ExpireRetryableOperations(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired, "one live sibling holds the whole rollout, not just its own rows")
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, operationState(t, pausedOpID))
+	assert.Equal(t, state.Task.FailedRetryable, taskState(t, "task-op-paused"))
+	assert.Equal(t, state.Task.Pending, taskState(t, "task-op-queued"))
+
+	// The driver dies and the sibling's lease ages out.
+	ageLease(t, heldOpID)
+
+	expired, err = store.Applies().ExpireRetryableOperations(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "a deferred rollout is offered again on the next pass")
+	assert.Equal(t, pausedOpID, expired[0].Operation.ID)
+	assert.Equal(t, state.ApplyOperation.Failed, expired[0].Operation.State)
+	assert.Equal(t, state.ApplyOperation.Failed, operationState(t, pausedOpID))
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-op-paused"))
+	assert.Equal(t, state.Task.Cancelled, taskState(t, "task-op-queued"),
+		"a task that never started is cancelled, not failed")
+
+	// The rollout and its running sibling are not this sweep's to settle.
+	var applyState string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT state FROM applies WHERE id = $1`, applyID).Scan(&applyState))
+	assert.Equal(t, state.Apply.RunningDegraded, applyState)
+	assert.Equal(t, state.ApplyOperation.Running, operationState(t, heldOpID))
+	assert.Equal(t, state.Task.Running, taskState(t, "task-op-live"))
+}
+
+// Once expiry fails a paused deployment's work, the group_finalizer queued
+// behind that work is a row nothing will ever start, and the operation
+// projection reads it as settled so the rollout reaches it. The clause that
+// says so is rendered SQL PostgreSQL has to execute, binary collation and all:
+// while the work is still paused the finalizer holds the rollout back, and once
+// the work has failed the rollout is claimable over it.
+func TestPostgresOperationProjectionReadsAnOrphanedFinalizerAsSettled(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_projection_orphan")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, error_message, updated_at)
+		VALUES ('apply-projection-orphan', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, $2, '{}', '',
+			NOW() - make_interval(secs => $3))
+		RETURNING id`, state.Apply.RunningDegraded, maxRecoveryAttempts,
+		int64((2*storage.ApplyLeaseStaleAfter).Seconds())).Scan(&applyID))
+
+	// The budget is each operation's own, so the paused work row is the one
+	// that has spent it.
+	insertOperation := func(t *testing.T, deployment, key, kind, opState string, attempt int) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, operation_kind, state, attempt, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NOW() - make_interval(secs => $7))
+			RETURNING id`, applyID, deployment, key, kind, opState, attempt,
+			int64((storage.ApplyLeaseStaleAfter+time.Minute).Seconds())).Scan(&id))
+		return id
+	}
+	insertOperation(t, "region-a", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Failed, 0)
+	pausedOpID := insertOperation(t, "region-b", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.FailedRetryable, maxRecoveryAttempts)
+	finalizerOpID := insertOperation(t, "region-b", "commerce/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending, 0)
+
+	operationState := func(t *testing.T, opID int64) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM apply_operations WHERE id = $1`, opID).Scan(&got))
+		return got
+	}
+
+	claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+	require.NoError(t, err)
+	require.Nil(t, claimed, "while the work is paused the finalizer is queued behind a retry, not orphaned")
+
+	expired, err := store.Applies().ExpireRetryableOperations(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, pausedOpID, expired[0].Operation.ID)
+	assert.Equal(t, state.ApplyOperation.Pending, operationState(t, finalizerOpID), "the finalizer is left as it was")
+
+	claimed, err = store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a finalizer whose work failed never starts, so it does not hold the rollout from the projection")
+	assert.Equal(t, applyID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Pending, operationState(t, finalizerOpID), "the claim writes the parent's lease, not the orphaned row")
+}
+
+// A queued row no claim will ever start does not hold its parent from the
+// projection: a deployment still pending behind a sibling's terminal failure
+// under a halting policy, and a table step queued behind an earlier step that
+// was reverted, are both read as settled, while a deployment queued under a
+// rollout that continues past the failure still owes a start and holds the
+// parent. The policy and the step order are read from the rows in rendered SQL
+// PostgreSQL has to execute.
+func TestPostgresOperationProjectionReadsAQueuedRowNoClaimWillStartAsSettled(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_projection_queued")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	store := postgresHarness{db: db, dsn: dsn}.NewStorage(t)
+
+	type operationRow struct {
+		deployment, key, opState string
+		step                     int
+	}
+	seedRollout := func(t *testing.T, identifier, onFailure string, rows []operationRow) int64 {
+		t.Helper()
+		var applyID int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+				repository, pull_request, environment, engine, state, options, error_message, updated_at)
+			VALUES ($1, 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $2, '{}', '',
+				NOW() - make_interval(secs => $3))
+			RETURNING id`, identifier, state.Apply.Running,
+			int64((2*storage.ApplyLeaseStaleAfter).Seconds())).Scan(&applyID))
+		for _, row := range rows {
+			_, err := db.ExecContext(t.Context(), `
+				INSERT INTO apply_operations (apply_id, deployment, operation_key, operation_kind, state, on_failure, rollout_step, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() - make_interval(secs => $8))`,
+				applyID, row.deployment, row.key, storage.ApplyOperationKindWork, row.opState, onFailure, row.step,
+				int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()))
+			require.NoError(t, err)
+		}
+		return applyID
+	}
+	claimNext := func(t *testing.T) *storage.Apply {
+		t.Helper()
+		claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+		require.NoError(t, err)
+		return claimed
+	}
+	queuedBehindFailure := []operationRow{
+		{"region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0},
+		{"region-b", "commerce/-80/users", state.ApplyOperation.Pending, 0},
+	}
+
+	haltedID := seedRollout(t, "apply-projection-halted", storage.OnFailureHalt, queuedBehindFailure)
+	claimed := claimNext(t)
+	require.NotNil(t, claimed, "a halting policy keeps the queued deployment from ever starting")
+	assert.Equal(t, haltedID, claimed.ID)
+
+	revertedStepID := seedRollout(t, "apply-projection-reverted-step", storage.OnFailureContinue, []operationRow{
+		{"region-a", "commerce/-80/users", state.ApplyOperation.Reverted, 1},
+		{"region-a", "commerce/-80/orders", state.ApplyOperation.Pending, 2},
+	})
+	claimed = claimNext(t)
+	require.NotNil(t, claimed, "a step queued behind a reverted earlier step can never pass")
+	assert.Equal(t, revertedStepID, claimed.ID)
+
+	seedRollout(t, "apply-projection-continuing", storage.OnFailureContinue, queuedBehindFailure)
+	require.Nil(t, claimNext(t), "a rollout that continues past the failure still starts the queued deployment")
+}
+
+// The conflict check settles an abandoned task only while no drive holds the
+// task's operation, and the guard that decides that is rendered SQL PostgreSQL
+// has to execute: a live operation lease refuses the write, and a lease that
+// has aged past the reclaim window admits it.
+func TestPostgresTaskUpdateHonorsOperationLeaseAbsence(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_task_absence")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	store := postgresHarness{db: db, dsn: dsn}.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options)
+		VALUES ('apply-absence', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}')
+		RETURNING id`, state.Apply.Running).Scan(&applyID))
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options)
+		VALUES ('task-absence', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'events', 'ALTER TABLE events ADD COLUMN c int', 'ALTER', '{}')`,
+		applyID, opID, state.Task.Running)
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	guarded := storage.WithOperationLeaseAbsent(t.Context(), storage.OperationLeaseAbsence{ApplyID: applyID, OperationID: opID})
+
+	task.State = state.Task.Failed
+	require.ErrorIs(t, store.Tasks().Update(guarded, task), storage.ErrOperationLeaseActive,
+		"a drive heartbeating the operation keeps the task")
+	reloaded, err := store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Running, reloaded.State)
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tasks().Update(guarded, task), "a stale operation lease no longer holds the task")
+	reloaded, err = store.Tasks().Get(t.Context(), "task-absence")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
+}
+
+// The engine-value bounds and the rejected-value report hold on PostgreSQL
+// too: an ETA past the integer column's range is stored at its largest value, a
+// throttle reason past its column is cut to fit, and a value the column refuses
+// comes back as storage.ErrValueRejected.
+func TestPostgresTaskUpdateBoundsEngineReportedValuesAndReportsRejectedValues(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_task_eta")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	store := postgresHarness{db: db, dsn: dsn}.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options)
+		VALUES ('apply-eta', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}')
+		RETURNING id`, state.Apply.Running).Scan(&applyID))
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, plan_id, database_name, database_type, engine,
+			repository, pull_request, environment, state, table_name, ddl, ddl_action, options)
+		VALUES ('task-eta', $1, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $2,
+			'events', 'ALTER TABLE events ADD COLUMN c int', 'ALTER', '{}')`,
+		applyID, state.Task.Running)
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(t.Context(), "task-eta")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ETASeconds = math.MaxInt32 + 1_000_000
+	task.ThrottleReason = strings.Repeat("é", 300)
+	require.NoError(t, store.Tasks().Update(t.Context(), task), "engine values past their columns do not refuse the progress write")
+	stored, err := store.Tasks().Get(t.Context(), "task-eta")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+	assert.Equal(t, strings.Repeat("é", 254)+"…", stored.ThrottleReason, "the reason is cut on a character boundary")
+	assert.Equal(t, stored.ThrottleReason, task.ThrottleReason, "the caller's task holds what the row holds")
+
+	stored.ExecutionMode = strings.Repeat("x", 60)
+	require.ErrorIs(t, store.Tasks().Update(t.Context(), stored), storage.ErrValueRejected,
+		"a value the column cannot hold is reported as rejected")
+}

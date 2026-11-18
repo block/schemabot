@@ -1,0 +1,453 @@
+//go:build integration
+
+package webhook
+
+import (
+	"database/sql"
+	"fmt"
+	"net/url"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/testutil"
+)
+
+// A durably queued PostgreSQL apply survives a server restart: the first
+// service instance accepts the apply and stores it without driving it, and a
+// fresh instance — new operator, new engine with empty in-memory progress —
+// claims the queued work and drives the native change to completion on the
+// target. This is the crash-window guarantee operators rely on: an apply
+// acknowledged on the PR is never lost to a pod restart.
+func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	createFixtureUsersTable(t, db)
+
+	// First instance: accept and durably queue the apply, but never drive it —
+	// the process "crashes" before its operator claims the work.
+	svcA := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    dsn,
+		skipOperator: true,
+	})
+	plan, err := svcA.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.False(t, plan.HasBlockedChanges())
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	assert.Empty(t, plan.Changes[0].TableChanges[0].ExecutionMode,
+		"the fixture change must plan as native-safe, never routed to a synchronous execution path")
+
+	_, _, err = svcA.ExecuteApply(t.Context(), api.ApplyRequest{
+		PlanID:      plan.PlanID,
+		Environment: "staging",
+		Caller:      "integration-test",
+	})
+	require.NoError(t, err)
+
+	queued, err := findFixtureApply(t, svcA, fixture.config.Database)
+	require.NoError(t, err)
+	require.NotNil(t, queued, "accepted apply must be durably stored before any driving")
+	assert.True(t, state.IsState(queued.State, state.Apply.Pending),
+		"apply must still be pending when the first instance dies, state=%s", queued.State)
+	assert.False(t, postgresColumnExists(t, db, "users", "email"),
+		"no DDL may reach the target before an operator drives the apply")
+
+	require.NoError(t, svcA.Close())
+
+	// Second instance over the same storage: its operator must find the
+	// queued apply and drive it to completion with no in-memory state from
+	// the first instance.
+	svcB := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType:         string(fixture.config.Type),
+		targetDSN:            dsn,
+		preserveDurableState: true,
+	})
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, err := findFixtureApply(t, svcB, fixture.config.Database)
+		if !assert.NoError(c, err) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		assert.True(c, state.IsState(apply.State, state.Apply.Completed),
+			"recovered apply not completed yet, state=%s", apply.State)
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+
+	assert.True(t, postgresColumnExists(t, db, "users", "email"),
+		"the recovered apply must land the planned column on the target")
+
+	require.NoError(t, svcB.Close())
+}
+
+// A PostgreSQL driver restart while a concurrent index build is parked leaves
+// an invalid catalog entry and a running apply with no live lease, then a
+// fresh driver claims that apply, recovers the abandoned entry, and completes
+// the apply with one valid index and no invalid entry left on the table.
+func TestPostgresConfigFixtureConcurrentIndexBuildSurvivesRestart(t *testing.T) {
+	const indexName = "users_email_idx"
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	fixture.schema += "\nCREATE INDEX " + indexName + " ON users (email);\n"
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+
+	svcA := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    dsn,
+	})
+
+	// An older writer makes CREATE INDEX CONCURRENTLY wait after committing
+	// its invalid catalog entry, giving shutdown a deterministic in-flight
+	// build to halt rather than relying on table size or timing. Its cleanup
+	// is registered after the service's so it runs first: a build still
+	// parked on a failure path is released before the service tears down.
+	writer, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Rollback() })
+	_, err = writer.ExecContext(t.Context(), "INSERT INTO public.users (id, email) VALUES (1, 'held@example.com')")
+	require.NoError(t, err)
+	plan, err := svcA.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.False(t, plan.HasBlockedChanges())
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	assert.Empty(t, plan.Changes[0].TableChanges[0].ExecutionMode,
+		"CREATE INDEX must take the native-safe path, not a blocked or direct one")
+
+	_, _, err = svcA.ExecuteApply(t.Context(), api.ApplyRequest{
+		PlanID:      plan.PlanID,
+		Environment: "staging",
+		Caller:      "integration-test",
+	})
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		count, valid, stateErr := postgresIndexState(t, db, "users", indexName)
+		if !assert.NoError(c, stateErr) {
+			return
+		}
+		assert.Equal(c, 1, count, "the in-flight build must have created exactly one catalog entry")
+		assert.False(c, valid, "the in-flight concurrent build must still be invalid")
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+
+	// Close stops the driver, calls HaltForShutdown on the PostgreSQL engine,
+	// and waits for the parked backend to exit before returning.
+	require.NoError(t, svcA.Close())
+	count, valid, err := postgresIndexState(t, db, "users", indexName)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	assert.False(t, valid, "shutdown must leave the interrupted build's index invalid for recovery")
+	require.NoError(t, writer.Rollback())
+
+	svcB := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType:         string(fixture.config.Type),
+		targetDSN:            dsn,
+		preserveDurableState: true,
+		skipOperator:         true,
+	})
+	interrupted, err := findFixtureApply(t, svcB, fixture.config.Database)
+	require.NoError(t, err)
+	require.NotNil(t, interrupted)
+	// A graceful shutdown leaves the halted apply where the next driver can
+	// claim it: still running, with its lease released rather than settled.
+	assert.True(t, state.IsState(interrupted.State, state.Apply.Running),
+		"a halted build must leave its apply running for re-claim, state=%s", interrupted.State)
+	assert.False(t, interrupted.HasFreshLease(time.Now()),
+		"a stopped driver must not hold a live lease on the apply it halted")
+	svcB.StartOperator(t.Context())
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, getErr := findFixtureApply(t, svcB, fixture.config.Database)
+		if !assert.NoError(c, getErr) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		assert.True(c, state.IsState(apply.State, state.Apply.Completed),
+			"recovered apply not completed yet, state=%s", apply.State)
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+
+	recovered, err := findFixtureApply(t, svcB, fixture.config.Database)
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	assert.Empty(t, recovered.ErrorMessage, "a recovered apply completes without an error message")
+	count, valid, err = postgresIndexState(t, db, "users", indexName)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "the recovered index must exist under its declared name")
+	assert.True(t, valid, "the recovered index must be valid")
+	invalid, err := postgresInvalidIndexCount(t, db, "users")
+	require.NoError(t, err)
+	assert.Zero(t, invalid, "recovery must leave no invalid index on the table under any name")
+	tasks, err := svcB.Storage().Tasks().GetByApplyID(t.Context(), interrupted.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Completed), "task state=%s", tasks[0].State)
+	assert.Empty(t, tasks[0].ErrorMessage, "a recovered build completes without an error message")
+	require.NoError(t, svcB.Close())
+}
+
+// A stop accepted while a PostgreSQL apply is running resolves as a terminal
+// decline once the driver consumes it: the engine's reason is stored for the
+// operator, the request does not remain pending for another claim, and the
+// unsupported stop is never mistaken for a successful stop. The apply remains
+// authoritative and completes its native DDL on the target once its lock clears.
+func TestPostgresConfigFixtureStopDeclineIsTerminalAndApplyCompletes(t *testing.T) {
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	createFixtureUsersTable(t, db)
+
+	svc := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    dsn,
+	})
+	plan, err := svc.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.False(t, plan.HasBlockedChanges())
+
+	// Hold the target table so the native ALTER remains observably running
+	// while the durable stop traverses the public control path.
+	lockTx, err := db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lockTx.Rollback() })
+	_, err = lockTx.ExecContext(t.Context(), "LOCK TABLE public.users IN ACCESS EXCLUSIVE MODE")
+	require.NoError(t, err)
+
+	_, _, err = svc.ExecuteApply(t.Context(), api.ApplyRequest{
+		PlanID:      plan.PlanID,
+		Environment: "staging",
+		Caller:      "integration-test",
+	})
+	require.NoError(t, err)
+	var running *storage.Apply
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, getErr := findFixtureApply(t, svc, fixture.config.Database)
+		if !assert.NoError(c, getErr) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		if assert.True(c, state.IsState(apply.State, state.Apply.Running),
+			"apply not running yet, state=%s", apply.State) {
+			running = apply
+		}
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+
+	stopResp, err := svc.ExecuteStop(t.Context(), apitypes.ControlRequest{
+		ApplyID:     running.ApplyIdentifier,
+		Environment: running.Environment,
+		Caller:      "integration-test",
+	})
+	require.NoError(t, err)
+	require.True(t, stopResp.Accepted)
+	// The driver's progress ticker consumes pending control requests while the
+	// engine change runs, so this read races with that consumption. Durability
+	// is provable without the race: the request row must exist regardless of
+	// status, and its status must be pending (not yet consumed) or the
+	// terminal decline — never a successful stop.
+	stored, err := svc.Storage().ControlRequests().GetByOperation(t.Context(), running.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stored, "accepted stop must be durably recorded")
+	require.Contains(t, []storage.ControlRequestStatus{storage.ControlRequestPending, storage.ControlRequestFailed},
+		stored.Status, "durable stop must be pending or terminally declined, never completed")
+
+	var declined *storage.ApplyControlRequest
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		controlReq, getErr := svc.Storage().ControlRequests().GetByOperation(t.Context(), running.ID, storage.ControlOperationStop)
+		if !assert.NoError(c, getErr) || !assert.NotNil(c, controlReq, "durable stop request disappeared") {
+			return
+		}
+		if !assert.Equal(c, storage.ControlRequestFailed, controlReq.Status,
+			"unsupported stop must resolve terminally, status=%s", controlReq.Status) {
+			return
+		}
+		declined = controlReq
+
+		apply, getErr := findFixtureApply(t, svc, fixture.config.Database)
+		if !assert.NoError(c, getErr) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		assert.False(c, state.IsState(apply.State, state.Apply.Stopped),
+			"a declined stop must not be interpreted as a successful operator stop")
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+	assert.Contains(t, declined.ErrorMessage, "stop is not supported for PostgreSQL schema changes",
+		"the terminal request must carry the engine's typed decline reason")
+	assert.NotNil(t, declined.CompletedAt, "a terminally declined request must be settled")
+	require.NoError(t, lockTx.Rollback())
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, getErr := findFixtureApply(t, svc, fixture.config.Database)
+		if !assert.NoError(c, getErr) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		assert.True(c, state.IsState(apply.State, state.Apply.Completed),
+			"apply did not complete after the stop decline, state=%s", apply.State)
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+	assert.True(t, postgresColumnExists(t, db, "users", "email"),
+		"the apply must land its planned column after the stop is declined")
+}
+
+// A native-safe plan whose privileges are revoked between plan and apply is
+// refused at execution time and lands as a permanent failure, not a retryable
+// one: the plan passed its privilege check, so only the apply-time re-check
+// can catch the revocation. The task is Failed (never FailedRetryable), the
+// stored error carries the exact provisioning GRANT, and no DDL reaches the
+// target. Retrying cannot succeed until the role is re-provisioned, so the
+// drive must not retry.
+func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	createFixtureUsersTable(t, db)
+	// The limited role can plan (CONNECT, USAGE, and CREATE for the diff
+	// planner's scratch schema) and holds inheritable membership in the
+	// owning role, so the plan is executable; the membership is revoked
+	// before apply.
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(`
+		CREATE ROLE app_owner;
+		ALTER TABLE public.users OWNER TO app_owner;
+		CREATE ROLE limited LOGIN PASSWORD 'limited';
+		GRANT CONNECT, CREATE ON DATABASE %s TO limited;
+		GRANT USAGE ON SCHEMA public TO limited;
+		GRANT app_owner TO limited`, fixture.config.Database))
+	require.NoError(t, err)
+
+	limitedDSN, err := url.Parse(dsn)
+	require.NoError(t, err)
+	limitedDSN.User = url.UserPassword("limited", "limited")
+
+	svc := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    limitedDSN.String(),
+	})
+	plan, err := svc.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.False(t, plan.HasBlockedChanges(),
+		"the role held every privilege the change needs at plan time")
+
+	_, err = db.ExecContext(t.Context(), "REVOKE app_owner FROM limited")
+	require.NoError(t, err)
+
+	_, _, err = svc.ExecuteApply(t.Context(), api.ApplyRequest{
+		PlanID:      plan.PlanID,
+		Environment: "staging",
+		Caller:      "integration-test",
+	})
+	require.NoError(t, err)
+
+	var failed *storage.Apply
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, err := findFixtureApply(t, svc, fixture.config.Database)
+		if !assert.NoError(c, err) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		if !assert.True(c, applyIsSettled(apply.State),
+			"apply not settled yet, state=%s", apply.State) {
+			return
+		}
+		failed = apply
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+	assert.True(t, state.IsState(failed.State, state.Apply.Failed),
+		"a privilege refusal must fail the apply, state=%s", failed.State)
+
+	tasks, err := svc.Storage().Tasks().GetByApplyID(t.Context(), failed.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	task := tasks[0]
+	assert.True(t, state.IsState(task.State, state.Task.Failed),
+		"a refusal is permanent and must not be marked retryable, state=%s", task.State)
+	assert.Contains(t, task.ErrorMessage, "lacks access for",
+		"the stored error must be the classified refusal detail built from typed error fields, never wrapped server output")
+	assert.Contains(t, task.ErrorMessage, "provision with:",
+		"the stored error must carry the provisioning instruction")
+	assert.Contains(t, task.ErrorMessage, "GRANT",
+		"the stored error must carry the exact provisioning statement")
+	assert.NotNil(t, task.CompletedAt, "a permanently failed task is settled, not awaiting retry")
+
+	assert.False(t, postgresColumnExists(t, db, "users", "email"),
+		"a refused apply must not execute any DDL on the target")
+}
+
+// createFixtureUsersTable creates the fixture's starting users table on the
+// target: the declared schema minus the email column the plan will add.
+func createFixtureUsersTable(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+}
+
+// postgresColumnExists reports whether the named column exists on a public
+// table of the connected PostgreSQL database.
+func postgresColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+	var exists bool
+	err := db.QueryRowContext(t.Context(), `SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2)`,
+		table, column).Scan(&exists)
+	require.NoError(t, err)
+	return exists
+}
+
+// postgresIndexState reports whether the table carries a catalog entry under
+// the index name and whether it is valid. Index names are unique within a
+// schema, so the count is zero or one. A concurrent build registers its entry
+// as invalid before it starts scanning and marks it valid only on success, so
+// the pair distinguishes a build in flight or abandoned (one invalid entry)
+// from one that completed (one valid entry) and from one that never
+// registered (none). An abandoned entry that recovery renamed but could not
+// drop lives under another name and is invisible here; use
+// postgresInvalidIndexCount to rule that out. The error is returned rather
+// than asserted so callers polling inside EventuallyWithT can report a
+// transient query failure on their collector.
+func postgresIndexState(t *testing.T, db *sql.DB, table, index string) (count int, valid bool, err error) {
+	t.Helper()
+	err = db.QueryRowContext(t.Context(), `SELECT count(*), coalesce(bool_and(i.indisvalid), false)
+		FROM pg_index i
+		JOIN pg_class idx ON idx.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1) AND idx.relname = $2`, "public."+table, index).Scan(&count, &valid)
+	if err != nil {
+		return 0, false, fmt.Errorf("query index %q state on public.%s: %w", index, table, err)
+	}
+	return count, valid, nil
+}
+
+// postgresInvalidIndexCount reports how many invalid index entries the table
+// carries under any name. Recovery quarantines an abandoned concurrent build
+// under a generated name before dropping it, and a drop it could not complete
+// leaves that entry behind beside the rebuilt index, so a zero count is what
+// shows the target needs no operator follow-up.
+func postgresInvalidIndexCount(t *testing.T, db *sql.DB, table string) (int, error) {
+	t.Helper()
+	var count int
+	err := db.QueryRowContext(t.Context(), `SELECT count(*)
+		FROM pg_index i
+		WHERE i.indrelid = to_regclass($1) AND NOT i.indisvalid`, "public."+table).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count invalid indexes on public.%s: %w", table, err)
+	}
+	return count, nil
+}
+
+// applyIsSettled reports whether the drive has finished deciding the apply's
+// outcome: any terminal state, or failed_retryable, which parks the apply
+// awaiting operator recovery. Waits that gate on this instead of terminality
+// let the assertions that follow name a wrongly-retryable outcome directly,
+// rather than reporting it as a timeout.
+func applyIsSettled(s string) bool {
+	return state.IsTerminalApplyState(s) || state.IsState(s, state.Apply.FailedRetryable)
+}
+
+// findFixtureApply returns the fixture database's apply on the fixture PR, or
+// nil when none exists yet.
+func findFixtureApply(t *testing.T, svc *api.Service, database string) (*storage.Apply, error) {
+	t.Helper()
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	if err != nil {
+		return nil, fmt.Errorf("listing applies for fixture PR: %w", err)
+	}
+	for _, apply := range applies {
+		if apply.Database == database {
+			return apply, nil
+		}
+	}
+	return nil, nil
+}

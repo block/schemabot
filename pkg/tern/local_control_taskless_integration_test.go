@@ -28,8 +28,9 @@ import (
 type invocationTrackingEngine struct {
 	engine.Engine
 
-	mu    sync.Mutex
-	calls []string
+	mu        sync.Mutex
+	calls     []string
+	cancelErr error
 }
 
 func (e *invocationTrackingEngine) record(call string) {
@@ -68,6 +69,9 @@ func (e *invocationTrackingEngine) Stop(context.Context, *engine.ControlRequest)
 
 func (e *invocationTrackingEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.record("Cancel")
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -131,6 +135,58 @@ func dispatchQueuedApply(t *testing.T, stor storage.Storage, client *LocalClient
 	return apply
 }
 
+// A stored plan is admitted only when every step is executable; rejection
+// happens before apply or task rows are created.
+func TestLocalClientApplyRejectsWholePlanWithBlockedStepBeforeCreatingWork(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, engineRecorder := newTasklessControlClient(t, dsn, stor)
+	ctx := t.Context()
+	reason := "requires privileges unavailable to the engine"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-blocked-admission-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {Tables: []storage.TableChange{
+				{Table: "users", DDL: "ALTER TABLE users ADD COLUMN name VARCHAR(255)", Operation: "alter"},
+				{Table: "users", DDL: "ALTER TABLE users ADD COLUMN email VARCHAR(255)", Operation: "alter", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: reason},
+			}},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId: plan.PlanIdentifier, Database: "testdb", Type: storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, plan.BlockedApplyError().Error(), resp.ErrorMessage)
+	assert.Empty(t, engineRecorder.recorded())
+	storedApply, err := stor.Applies().GetByPlan(ctx, plan.ID)
+	require.NoError(t, err)
+	assert.Nil(t, storedApply)
+
+	cleanApply := dispatchQueuedApply(t, stor, client, []storage.TableChange{
+		{Table: "accounts", DDL: "ALTER TABLE accounts ADD COLUMN name VARCHAR(255)", Operation: "alter"},
+	})
+	assert.Equal(t, state.Apply.Pending, cleanApply.State)
+}
+
 // requireControlRequestStatus asserts the durable control request for the apply
 // operation reached the given status — the signal that the operator retry loop
 // has stopped re-running the request.
@@ -140,6 +196,21 @@ func requireControlRequestStatus(t *testing.T, stor storage.Storage, applyID int
 	require.NoError(t, err)
 	require.NotNil(t, req, "the %s control request must exist", operation)
 	assert.Equal(t, want, req.Status, "the %s control request must be %s", operation, want)
+}
+
+// requireOutrunCancelSettled asserts a cancel the schema change outran resolved
+// as a command that did not take effect, carrying the reason the PR comment's
+// not-applied notice renders. Resolving it as applied would tell the operator
+// the change was taken back when it is live on the target.
+func requireOutrunCancelSettled(t *testing.T, stor storage.Storage, applyID int64) {
+	t.Helper()
+	req, err := stor.ControlRequests().GetByOperation(t.Context(), applyID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, req, "the cancel control request must exist")
+	assert.Equal(t, storage.ControlRequestFailed, req.Status,
+		"a cancel the schema change outran must not resolve as applied")
+	assert.Contains(t, req.ErrorMessage, "the schema change completed before the cancel could take effect")
+	assert.Contains(t, req.ErrorMessage, "the change is live on the target")
 }
 
 // A queued apply can be claimed by an operator driver before its first drive
@@ -175,7 +246,7 @@ func TestLocalClient_CancelQueuedTasklessApplySettlesCancelled(t *testing.T) {
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
 
 	engineCallsBeforeDrive := eng.recorded()
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -196,7 +267,7 @@ func TestLocalClient_CancelQueuedTasklessApplySettlesCancelled(t *testing.T) {
 	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),
 		"settling a task-less cancel must never invoke the engine")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-reclaim-"+t.Name())
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "a cancelled apply must not be claimable again")
 }
@@ -230,7 +301,7 @@ func TestLocalClient_StopQueuedTasklessApplySettlesStopped(t *testing.T) {
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestPending)
 
 	engineCallsBeforeDrive := eng.recorded()
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -250,9 +321,143 @@ func TestLocalClient_StopQueuedTasklessApplySettlesStopped(t *testing.T) {
 	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),
 		"settling a task-less stop must never invoke the engine")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-reclaim-"+t.Name())
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "a stopped apply with no pending start must not be claimable again")
+}
+
+// A drive consuming a pending cancel for a task-less apply can find itself
+// without a usable apply lease — a peer rotated a stale lease mid-drive, or the
+// drive claimed only the operation row. The settle must still make durable
+// progress under the operation lease alone: it moves the drive's own leased
+// operation row to cancelled, leaves the apply row untouched for the operator's
+// state projection, and leaves the durable cancel request pending so the
+// projection completes it once the stored apply resolves. The engine is never
+// invoked.
+func TestLocalClient_CancelTasklessApplyWithLostApplyLeaseSettlesOperationRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newTasklessControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, nil)
+
+	op, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "op-driver-"+t.Name())
+	require.NoError(t, err)
+	require.NotNil(t, op, "the queued apply's operation row must be claimable")
+	require.Equal(t, apply.ID, op.ApplyID, "the claimed operation row must belong to the dispatched apply")
+
+	cancelResp, err := client.Cancel(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, cancelResp.Accepted)
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
+
+	engineCallsBefore := eng.recorded()
+
+	// The drive holds only its operation lease: the apply lease it once had is
+	// gone, so any direct write of the apply row must be refused.
+	opCtx := storage.WithOperationLease(ctx, op.Lease())
+	reloaded, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	standDown, err := client.processPendingCancelControlRequest(opCtx, reloaded)
+	require.NoError(t, err)
+	require.True(t, standDown, "the drive must consume the pending cancel")
+
+	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settledOp)
+	assert.Equal(t, state.ApplyOperation.Cancelled, settledOp.State,
+		"the leased operation row must settle to cancelled under the operation lease alone")
+	assert.NotNil(t, settledOp.CompletedAt, "a cancelled operation row must carry its completion time")
+
+	parent, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Pending, parent.State,
+		"the apply row belongs to the state projection and must not be written under a lost apply lease")
+
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
+	assert.Equal(t, engineCallsBefore, eng.recorded(),
+		"settling a task-less cancel must never invoke the engine")
+}
+
+// The stop counterpart of the lost-apply-lease settle: under the operation
+// lease alone, the drive's leased operation row moves to stopped — resumable,
+// so completed_at stays nil — the apply row is left to the state projection,
+// and the durable stop request stays pending so unstarted sibling rows remain
+// gated off until the projection completes it. The operation row is claimed
+// before the stop is recorded because a pending stop gates fresh claims of
+// pending rows — the drive in this scenario already owned its row when the
+// stop landed.
+func TestLocalClient_StopTasklessApplyWithLostApplyLeaseSettlesOperationRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newTasklessControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, nil)
+
+	op, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "op-driver-"+t.Name())
+	require.NoError(t, err)
+	require.NotNil(t, op, "the queued apply's operation row must be claimable")
+	require.Equal(t, apply.ID, op.ApplyID, "the claimed operation row must belong to the dispatched apply")
+
+	stopResp, err := client.Stop(ctx, &ternv1.StopRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, stopResp.Accepted)
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestPending)
+
+	engineCallsBefore := eng.recorded()
+
+	opCtx := storage.WithOperationLease(ctx, op.Lease())
+	reloaded, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	standDown, err := client.processPendingStopControlRequest(opCtx, reloaded)
+	require.NoError(t, err)
+	require.True(t, standDown, "the drive must consume the pending stop")
+
+	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settledOp)
+	assert.Equal(t, state.ApplyOperation.Stopped, settledOp.State,
+		"the leased operation row must settle to stopped under the operation lease alone")
+	assert.Nil(t, settledOp.CompletedAt, "a stopped operation row is resumable and must keep completed_at nil")
+
+	parent, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Pending, parent.State,
+		"the apply row belongs to the state projection and must not be written under a lost apply lease")
+
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestPending)
+	assert.Equal(t, engineCallsBefore, eng.recorded(),
+		"settling a task-less stop must never invoke the engine")
 }
 
 // Regression guard for the tasked shape: a cancel that lands on a queued apply
@@ -291,7 +496,7 @@ func TestLocalClient_CancelQueuedApplyWithTasksSettlesViaTaskPath(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, cancelResp.Accepted)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -306,4 +511,177 @@ func TestLocalClient_CancelQueuedApplyWithTasksSettlesViaTaskPath(t *testing.T) 
 		"a cancelled queued apply's task must settle via the task path")
 
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
+}
+
+// A cancel that lands on a stopped apply must terminalize it. The stopped
+// apply is claimed to deliver the cancel — the claim leaves it stopped rather
+// than transitioning toward resume — and the drive cancels its stopped tasks
+// and settles the apply to cancelled without invoking the engine, since a
+// stopped task has no live engine work. This is the operator escape hatch for
+// a stopped copy that must be discarded: without it the pending cancel would
+// never be consumed and the apply would sit stopped, blocking reconciliation
+// of its target, forever.
+func TestLocalClient_CancelStoppedApplySettlesCancelled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newTasklessControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, []storage.TableChange{{
+		Namespace: "testdb",
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN stopped_cancel_note VARCHAR(255)",
+		Operation: "alter",
+	}})
+
+	stopResp, err := client.Stop(ctx, &ternv1.StopRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, stopResp.Accepted)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
+
+	stopped, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stopped)
+	require.Equal(t, state.Apply.Stopped, stopped.State, "the apply must be stopped before the cancel lands")
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestCompleted)
+
+	// A drive that reaches a stopped apply with no pending control request
+	// must exit without resuming it or touching the engine: a stopped copy
+	// never resumes without an operator start.
+	engineCallsBeforeGate := eng.recorded()
+	require.NoError(t, client.ResumeApply(ctx, stopped))
+	afterGate, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, afterGate)
+	assert.Equal(t, state.Apply.Stopped, afterGate.State, "a drive with no pending request must leave the stopped apply stopped")
+	assert.Equal(t, engineCallsBeforeGate, eng.recorded(), "a gated drive must not touch the engine")
+
+	cancelResp, err := client.Cancel(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, cancelResp.Accepted)
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
+
+	engineCallsBeforeDrive := eng.recorded()
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Cancelled, settled.State, "a cancelled stopped apply must settle to cancelled")
+	assert.NotNil(t, settled.CompletedAt, "a cancelled apply must carry its completion time")
+
+	settledTasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, settledTasks, 1)
+	assert.Equal(t, state.Task.Cancelled, settledTasks[0].State,
+		"the stopped task must settle to cancelled alongside its apply")
+
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
+	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),
+		"cancelling a stopped apply must never invoke the engine: a stopped task has no live engine work")
+
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
+	require.NoError(t, err)
+	assert.Nil(t, reclaimed, "a cancelled apply must not be claimable again")
+}
+
+// A stop consumed by a drive that holds only its operation's lease records the
+// stop on the apply's tasks and leaves the apply row alone. Under that lease the
+// apply row belongs to the apply-state projection, so the drive does not
+// attempt a write storage would refuse; it stands down cleanly, and the
+// projection settles the apply and completes the durable request from the
+// operations the drives settle.
+func TestLocalClient_StopUnderOperationLeaseLeavesApplyRowToProjection(t *testing.T) {
+	requireOperationLeaseControlLeavesApplyRow(t, storage.ControlOperationStop, state.Task.Stopped)
+}
+
+// The cancel twin of the stop case above: a cancel consumed under an operation
+// lease alone cancels the apply's tasks and leaves the apply row to the
+// apply-state projection.
+func TestLocalClient_CancelUnderOperationLeaseLeavesApplyRowToProjection(t *testing.T) {
+	requireOperationLeaseControlLeavesApplyRow(t, storage.ControlOperationCancel, state.Task.Cancelled)
+}
+
+func requireOperationLeaseControlLeavesApplyRow(t *testing.T, operation storage.ControlOperation, wantTaskState string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, _ := newTasklessControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, []storage.TableChange{{
+		Namespace: "testdb",
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN operation_lease_note VARCHAR(255)",
+		Operation: "alter",
+	}})
+
+	op, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "op-driver-"+t.Name())
+	require.NoError(t, err)
+	require.NotNil(t, op, "the queued apply's operation row must be claimable")
+	require.Equal(t, apply.ID, op.ApplyID, "the claimed operation row must belong to the dispatched apply")
+
+	switch operation {
+	case storage.ControlOperationStop:
+		resp, err := client.Stop(ctx, &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier, Environment: localClientTestEnvironment})
+		require.NoError(t, err)
+		require.True(t, resp.Accepted)
+	case storage.ControlOperationCancel:
+		resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier, Environment: localClientTestEnvironment})
+		require.NoError(t, err)
+		require.True(t, resp.Accepted)
+	default:
+		require.FailNow(t, "unsupported control operation", "operation=%s", operation)
+	}
+	requireControlRequestStatus(t, stor, apply.ID, operation, storage.ControlRequestPending)
+
+	opCtx := storage.WithOperationLease(ctx, op.Lease())
+	reloaded, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	var standDown bool
+	if operation == storage.ControlOperationStop {
+		standDown, err = client.processPendingStopControlRequest(opCtx, reloaded)
+	} else {
+		standDown, err = client.processPendingCancelControlRequest(opCtx, reloaded)
+	}
+	require.NoError(t, err, "consuming the request under an operation lease must not attempt the apply row write")
+	assert.True(t, standDown, "the drive must stand down after consuming the request")
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, wantTaskState, tasks[0].State, "the request must be recorded on the apply's task")
+
+	parent, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Pending, parent.State,
+		"the apply row belongs to the apply-state projection and must not be written under an operation lease")
+
+	requireControlRequestStatus(t, stor, apply.ID, operation, storage.ControlRequestPending)
 }

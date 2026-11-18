@@ -3,6 +3,7 @@ package inventory
 import (
 	"context"
 	"fmt"
+	"slices"
 )
 
 // TypeRoutingResolver routes a request to the Resolver registered for its
@@ -15,6 +16,7 @@ type TypeRoutingResolver struct {
 }
 
 var _ Resolver = (*TypeRoutingResolver)(nil)
+var _ Enumerator = (*TypeRoutingResolver)(nil)
 
 // NewTypeRoutingResolver builds a resolver that dispatches by database type. The
 // keys are database types (for example "mysql", "vitess"); each value resolves
@@ -50,4 +52,52 @@ func (r *TypeRoutingResolver) ResolveTarget(ctx context.Context, req Request) (*
 		return nil, fmt.Errorf("resolve target %q: no resolver registered for database type %q", req.Target, req.DatabaseType)
 	}
 	return resolver.ResolveTarget(ctx, req)
+}
+
+// Enumerate concatenates targets from child resolvers that support enumeration.
+// Children are visited in database-type order for deterministic results. A
+// child that fails to enumerate fails the whole enumeration, because a partial
+// list would report the failed child's targets as absent rather than unknown.
+func (r *TypeRoutingResolver) Enumerate(ctx context.Context) ([]ProbeRequest, error) {
+	var requests []ProbeRequest
+	for _, databaseType := range r.databaseTypes() {
+		enumerator, ok := r.byType[databaseType].(Enumerator)
+		if !ok {
+			continue
+		}
+		childRequests, err := enumerator.Enumerate(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("enumerate %s targets: %w", databaseType, err)
+		}
+		requests = append(requests, childRequests...)
+	}
+	return requests, nil
+}
+
+// UnenumerableDatabaseTypes returns the database types whose targets no
+// resolver under this one can list: the types registered to a child without
+// the capability, plus whatever an enumerable child reports of its own, so a
+// nested router's gaps reach the outer report. The result is sorted and
+// deduplicated.
+func (r *TypeRoutingResolver) UnenumerableDatabaseTypes() []string {
+	var unenumerable []string
+	for _, databaseType := range r.databaseTypes() {
+		enumerator, ok := r.byType[databaseType].(Enumerator)
+		if !ok {
+			unenumerable = append(unenumerable, databaseType)
+			continue
+		}
+		unenumerable = append(unenumerable, enumerator.UnenumerableDatabaseTypes()...)
+	}
+	slices.Sort(unenumerable)
+	return slices.Compact(unenumerable)
+}
+
+func (r *TypeRoutingResolver) databaseTypes() []string {
+	databaseTypes := make([]string, 0, len(r.byType))
+	for databaseType := range r.byType {
+		databaseTypes = append(databaseTypes, databaseType)
+	}
+	slices.Sort(databaseTypes)
+	return databaseTypes
 }

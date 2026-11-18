@@ -2,17 +2,21 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -21,8 +25,10 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 func TestSetupTelemetry(t *testing.T) {
@@ -34,6 +40,29 @@ func TestSetupTelemetry(t *testing.T) {
 
 	require.NotNil(t, tel.MetricsHandler)
 	assert.Nil(t, tel.tracerProvider, "tracerProvider should be nil without OTLP endpoint")
+}
+
+func TestTelemetryResourceToleratesForeignSchemaURL(t *testing.T) {
+	// A host binary embedding this server builds the base resource with its
+	// own SDK, whose semantic-convention schema URL may differ from the one
+	// this module pins. The service-name override must merge cleanly against
+	// any such base instead of failing on a schema URL conflict.
+	base := resource.NewWithAttributes(
+		"https://opentelemetry.io/schemas/1.99.0",
+		attribute.String("host.attr", "host-value"),
+	)
+
+	res, err := telemetryResource(base)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	attrs := make(map[attribute.Key]string)
+	for _, kv := range res.Attributes() {
+		attrs[kv.Key] = kv.Value.String()
+	}
+	assert.Equal(t, "schemabot", attrs[semconv.ServiceNameKey], "service-name override must survive the merge")
+	assert.Equal(t, "host-value", attrs["host.attr"], "base resource attributes must survive the merge")
+	assert.Equal(t, "https://opentelemetry.io/schemas/1.99.0", res.SchemaURL(), "the base resource's schema URL is authoritative")
 }
 
 func TestSetupTelemetryWithOTLP(t *testing.T) {
@@ -98,6 +127,42 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	body := w.Body.String()
 	assert.Contains(t, body, "target_info")
+}
+
+// A server managing a large fleet records one attribute set per repository on
+// the GitHub rate limit gauges. Every set must reach the exporter: folding the
+// excess into a single otel.metric.overflow series would leave an operator
+// reading remaining budget during an incident with one arbitrary repository's
+// value rather than the repository they asked about.
+func TestMetricsCollectEveryAttributeSet(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	tel, err := SetupTelemetry(logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(t.Context())) })
+
+	const repositories = 2500
+	for i := range repositories {
+		metrics.RecordGitHubRateLimit(t.Context(), metrics.GitHubRateLimitSample{
+			Operation:  metrics.GitHubOperationFetchPullRequest,
+			Resource:   metrics.GitHubRateLimitResourceCore,
+			Repository: "org/repo-" + strconv.Itoa(i),
+			Limit:      5000,
+			Remaining:  int64(i),
+			Used:       5000 - int64(i),
+		})
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), "GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	tel.MetricsHandler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	body := w.Body.String()
+	assert.NotContains(t, body, "otel_metric_overflow",
+		"attribute sets were folded into an overflow series instead of being collected")
+	assert.Equal(t, repositories, strings.Count(body, "schemabot_github_rate_limit_remaining{"),
+		"every repository should collect as its own series")
 }
 
 func TestRecordPlanMetric(t *testing.T) {
@@ -260,7 +325,7 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
 	metrics.RecordOperatorResume(t.Context(), "mydb", "pie", "staging", "running")
 	metrics.RecordOperatorResumeFailure(t.Context(), "mydb", "pie", "staging", "no_client")
-	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
+	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimDuration(t.Context(), time.Second, "mydb", "pie", "staging", "running")
 	metrics.RecordSchemaRequestError(t.Context(), "org/repo", "apply", "mydb", "staging", "invalid_config")
 	metrics.RecordGitHubRequest(t.Context(), metrics.GitHubRequestSample{
@@ -717,23 +782,40 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	metrics.RecordOperatorResume(t.Context(), "testdb", "pie", "staging", "running")
 	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "no_client")
 	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "lease_lost")
-	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "missing_lease_token")
 	metrics.RecordOperatorClaimFailure(t.Context(), "operation_parent_not_claimable")
+	metrics.RecordOperatorClaimFailure(t.Context(), "operation_lease_release_error")
+	metrics.RecordOperatorClaimFailure(t.Context(), "stranded_reaper_error")
 	metrics.RecordOperatorClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
+	metrics.RecordOperatorStrandedOperationReaped(t.Context(), "testdb", "pie", "staging", state.Apply.Completed)
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
 
 	names := make(map[string]bool)
 	var sawExpireRetryableError bool
+	var sawStrandedReaperError bool
 	var sawMissingLeaseToken bool
 	var sawLeaseLost bool
 	var sawOperationParentNotClaimable bool
+	var sawOperationLeaseReleaseError bool
+	var sawStrandedParentState bool
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			names[m.Name] = true
+			if m.Name == "schemabot.operator.stranded_operations_reaped_total" {
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				for _, dp := range sum.DataPoints {
+					parentState, hasParentState := dp.Attributes.Value(attribute.Key("parent_state"))
+					require.True(t, hasParentState, "a reaped stranded operation must say which parent outcome it mirrored")
+					if parentState.AsString() == state.Apply.Completed {
+						sawStrandedParentState = true
+					}
+				}
+				continue
+			}
 			if m.Name != "schemabot.operator.claim_failures_total" && m.Name != "schemabot.operator.resume_failures_total" {
 				continue
 			}
@@ -745,12 +827,16 @@ func TestRecordOperatorMetrics(t *testing.T) {
 				switch reason.AsString() {
 				case "expire_retryable_error":
 					sawExpireRetryableError = true
+				case "stranded_reaper_error":
+					sawStrandedReaperError = true
 				case "missing_lease_token":
 					sawMissingLeaseToken = true
 				case "lease_lost":
 					sawLeaseLost = true
 				case "operation_parent_not_claimable":
 					sawOperationParentNotClaimable = true
+				case "operation_lease_release_error":
+					sawOperationLeaseReleaseError = true
 				}
 			}
 		}
@@ -764,10 +850,14 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected deprecated schemabot.scheduler.resume_failures_total alias")
 	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected deprecated schemabot.scheduler.claim_failures_total alias")
 	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected deprecated schemabot.scheduler.claim_duration_seconds alias")
+	assert.True(t, names["schemabot.operator.stranded_operations_reaped_total"], "expected schemabot.operator.stranded_operations_reaped_total")
+	assert.True(t, sawStrandedParentState, "expected the reaped stranded operation to carry its parent's outcome as parent_state")
 	assert.True(t, sawExpireRetryableError, "expected expire_retryable_error claim failure reason to be preserved")
+	assert.True(t, sawStrandedReaperError, "expected stranded_reaper_error claim failure reason to be preserved")
 	assert.True(t, sawMissingLeaseToken, "expected missing_lease_token claim failure reason to be preserved")
 	assert.True(t, sawLeaseLost, "expected lease_lost resume failure reason to be recorded")
 	assert.True(t, sawOperationParentNotClaimable, "expected operation_parent_not_claimable claim failure reason to be preserved, not collapsed to unknown")
+	assert.True(t, sawOperationLeaseReleaseError, "expected operation_lease_release_error claim failure reason to be preserved, not collapsed to unknown")
 }
 
 func TestRecordRemoteDeploymentHealthMetrics(t *testing.T) {
@@ -854,7 +944,7 @@ func findSpan(spans tracetest.SpanStubs, name string) *tracetest.SpanStub {
 func spanAttrs(s *tracetest.SpanStub) map[string]string {
 	attrs := make(map[string]string)
 	for _, a := range s.Attributes {
-		attrs[string(a.Key)] = a.Value.Emit()
+		attrs[string(a.Key)] = a.Value.String()
 	}
 	return attrs
 }
@@ -892,6 +982,12 @@ func (m *mockPlanStore) GetByLock(context.Context, int64) ([]*storage.Plan, erro
 func (m *mockPlanStore) GetByPR(context.Context, string, int) ([]*storage.Plan, error) {
 	return nil, nil
 }
+func (m *mockPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
+	return nil, nil
+}
+func (m *mockPlanStore) UpdateRoute(context.Context, string, string, string, string) error {
+	return nil
+}
 func (m *mockPlanStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanStore) DeleteByPR(context.Context, string, int) error { return nil }
 
@@ -922,4 +1018,459 @@ func TestExecuteApplyTrace(t *testing.T) {
 	attrs := spanAttrs(s)
 	assert.Equal(t, "nonexistent", attrs["plan_id"])
 	assert.Equal(t, "staging", attrs["environment"])
+}
+
+// A drive that could not record a task's terminal outcome wrote nothing on top
+// of it, and the next claim settles the apply from the stored task rows. The
+// operator counts that exit under its own resume failure reason, so a verdict
+// write storage keeps refusing shows as a rate of task_verdict_refused rather
+// than blending into resume_error. The same refusal caused by a lost lease is
+// the lost lease, and one during shutdown is not counted.
+func TestResumeClaimedApplyCountsARefusedTaskVerdict(t *testing.T) {
+	refused := fmt.Errorf("%w: record cancelled task verdicts for apply apply-42 (database appdb): storage unavailable", tern.ErrTaskVerdictRefused)
+	cases := []struct {
+		name        string
+		resumeErr   error
+		cancelCtx   bool
+		wantReasons []string
+	}{
+		{
+			name:        "a refused task verdict",
+			resumeErr:   refused,
+			wantReasons: []string{"task_verdict_refused"},
+		},
+		{
+			name:        "a refusal caused by a lost lease is counted as the lost lease",
+			resumeErr:   fmt.Errorf("%w: record failed task verdicts for apply apply-42 (database appdb): %w", tern.ErrTaskVerdictRefused, storage.ErrApplyLeaseLost),
+			wantReasons: []string{"lease_lost"},
+		},
+		{
+			name:      "a refusal during shutdown is not counted",
+			resumeErr: refused,
+			cancelCtx: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{resumeErr: tc.resumeErr},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: state.Apply.Running,
+			}
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			resumed, err := svc.resumeClaimedApply(ctx, 1, apply, 0, "")
+
+			require.ErrorIs(t, err, tern.ErrTaskVerdictRefused)
+			assert.False(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var reasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != "schemabot.operator.resume_failures_total" {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+						reasons = append(reasons, reason.AsString())
+					}
+				}
+			}
+			assert.Equal(t, tc.wantReasons, reasons)
+		})
+	}
+}
+
+// A drive whose finalizer paused for a retry stored the pause on the operation
+// row and returned without error, so the operator counts it as a resume of the
+// state it was claimed from and records no resume failure: a pause is the
+// rollout waiting, not the drive failing, and a dashboard must not show a
+// retrying finalizer as a resume_error rate.
+func TestResumeClaimedApplyCountsAStoredFinalizerPauseAsAResume(t *testing.T) {
+	cases := []struct {
+		name          string
+		previousState string
+	}{
+		{name: "first claim of a running rollout", previousState: state.Apply.Running},
+		{name: "retry claim of a paused rollout", previousState: state.Apply.FailedRetryable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: tc.previousState,
+			}
+
+			resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0, "")
+
+			require.NoError(t, err)
+			assert.True(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var resumedPrevious []string
+			var failureReasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					switch m.Name {
+					case "schemabot.operator.resumed_total":
+						sum, ok := m.Data.(metricdata.Sum[int64])
+						require.True(t, ok)
+						for _, dp := range sum.DataPoints {
+							previous, _ := dp.Attributes.Value(attribute.Key("previous_state"))
+							resumedPrevious = append(resumedPrevious, previous.AsString())
+							assert.Equal(t, int64(1), dp.Value)
+						}
+					case "schemabot.operator.resume_failures_total":
+						sum, ok := m.Data.(metricdata.Sum[int64])
+						require.True(t, ok)
+						for _, dp := range sum.DataPoints {
+							reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+							failureReasons = append(failureReasons, reason.AsString())
+						}
+					}
+				}
+			}
+			assert.Equal(t, []string{tc.previousState}, resumedPrevious)
+			assert.Empty(t, failureReasons)
+		})
+	}
+}
+
+// A drive that stored the apply's terminal outcome and then could not answer a
+// request owed after it is counted under its own resume failure reason, so a
+// settlement storage keeps refusing shows as a rate of post_terminal_reconcile
+// rather than blending into resume_error. The same failure caused by a lost
+// lease is the lost lease, and one during shutdown is not counted.
+func TestResumeClaimedApplyCountsAPostTerminalReconcile(t *testing.T) {
+	refused := fmt.Errorf("%w: complete start of apply apply-42: storage unavailable", tern.ErrPostTerminalReconcile)
+	cases := []struct {
+		name        string
+		resumeErr   error
+		cancelCtx   bool
+		wantReasons []string
+	}{
+		{
+			name:        "a refused post-terminal answer",
+			resumeErr:   refused,
+			wantReasons: []string{"post_terminal_reconcile"},
+		},
+		{
+			name:        "a refusal caused by a lost lease is counted as the lost lease",
+			resumeErr:   fmt.Errorf("%w: complete start of apply apply-42: %w", tern.ErrPostTerminalReconcile, storage.ErrApplyLeaseLost),
+			wantReasons: []string{"lease_lost"},
+		},
+		{
+			name:      "a refusal during shutdown is not counted",
+			resumeErr: refused,
+			cancelCtx: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{resumeErr: tc.resumeErr},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: state.Apply.Running,
+			}
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			resumed, err := svc.resumeClaimedApply(ctx, 1, apply, 0, "")
+
+			require.ErrorIs(t, err, tern.ErrPostTerminalReconcile)
+			assert.False(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var reasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != "schemabot.operator.resume_failures_total" {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+						reasons = append(reasons, reason.AsString())
+					}
+				}
+			}
+			assert.Equal(t, tc.wantReasons, reasons)
+		})
+	}
+}
+
+// A drive that re-sent a lost dispatch and got no verdict wrote nothing, and
+// the next claim re-sends the same idempotency key. The operator counts that
+// exit under its own resume failure reason, so a data plane that keeps giving
+// no answer shows as a rate of remote_dispatch_unresolved rather than blending
+// into resume_error. One during shutdown is not counted.
+func TestResumeClaimedApplyCountsAnUnresolvedDispatchReplay(t *testing.T) {
+	unresolved := fmt.Errorf("%w: apply queued gRPC apply apply-42: rpc error: code = Unavailable desc = data plane restarting", tern.ErrRemoteDispatchUnresolved)
+	cases := []struct {
+		name        string
+		cancelCtx   bool
+		wantReasons []string
+	}{
+		{
+			name:        "a replay without a verdict",
+			wantReasons: []string{"remote_dispatch_unresolved"},
+		},
+		{
+			name:      "a replay during shutdown is not counted",
+			cancelCtx: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{resumeErr: unresolved},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: state.Apply.Running,
+			}
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			resumed, err := svc.resumeClaimedApply(ctx, 1, apply, 0, "")
+
+			require.ErrorIs(t, err, tern.ErrRemoteDispatchUnresolved)
+			assert.False(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var reasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != "schemabot.operator.resume_failures_total" {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+						reasons = append(reasons, reason.AsString())
+					}
+				}
+			}
+			assert.Equal(t, tc.wantReasons, reasons)
+		})
+	}
+}
+
+// A resume whose task requeue storage refuses starts nothing, and the next
+// claim repeats it. The operator counts that exit under its own resume failure
+// reason, so a requeue storage keeps refusing shows as a rate of
+// task_requeue_refused rather than blending into resume_error.
+func TestResumeClaimedApplyCountsARefusedTaskRequeue(t *testing.T) {
+	refused := fmt.Errorf("%w: stopped task task_email for start of apply apply-42: storage unavailable", tern.ErrTaskRequeueRefused)
+	cases := []struct {
+		name        string
+		applyState  string
+		resumeErr   error
+		cancelCtx   bool
+		wantReasons []string
+		// wantGaugeSeries asserts that the active-applies gauge has a series
+		// for the apply, which only a retryable claim creates.
+		wantGaugeSeries bool
+	}{
+		{
+			name:        "a stopped apply's refused start requeue",
+			applyState:  state.Apply.Stopped,
+			resumeErr:   refused,
+			wantReasons: []string{"task_requeue_refused"},
+		},
+		{
+			name:            "a retryable apply's refused retry requeue releases the active-applies gauge",
+			applyState:      state.Apply.FailedRetryable,
+			resumeErr:       refused,
+			wantReasons:     []string{"task_requeue_refused"},
+			wantGaugeSeries: true,
+		},
+		{
+			name:        "a refusal caused by a lost lease is counted as the lost lease",
+			applyState:  state.Apply.Stopped,
+			resumeErr:   fmt.Errorf("%w: stopped task task_email for start of apply apply-42: %w", tern.ErrTaskRequeueRefused, storage.ErrApplyLeaseLost),
+			wantReasons: []string{"lease_lost"},
+		},
+		{
+			name:       "a refusal during shutdown is not counted",
+			applyState: state.Apply.Stopped,
+			resumeErr:  refused,
+			cancelCtx:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{resumeErr: tc.resumeErr},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: tc.applyState,
+			}
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			resumed, err := svc.resumeClaimedApply(ctx, 1, apply, 0, "")
+
+			require.ErrorIs(t, err, tern.ErrTaskRequeueRefused)
+			assert.False(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var reasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != "schemabot.operator.resume_failures_total" {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+						reasons = append(reasons, reason.AsString())
+					}
+				}
+			}
+			assert.Equal(t, tc.wantReasons, reasons)
+			active, found := activeAppliesValue(t, reader, "appdb", "east", "staging")
+			assert.Equal(t, tc.wantGaugeSeries, found)
+			assert.Zero(t, active, "a refused requeue must not leave a unit on the active-applies gauge")
+		})
+	}
+}
+
+func (*mockPlanStore) GetListAnchor(context.Context, string) (*storage.PlanListAnchor, error) {
+	return nil, nil
+}
+
+// The real telemetry registry exports counters and histogram sums/counts with
+// units intact, so collectors can map one export path without double counting.
+func TestGitHubThrottlingPrometheusExports(t *testing.T) {
+	previous := otel.GetMeterProvider()
+	tel, err := SetupTelemetry(slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, tel.Shutdown(context.WithoutCancel(t.Context())))
+		otel.SetMeterProvider(previous)
+	})
+	sample := metrics.GitHubClientMetricContext{Operation: metrics.GitHubOperationFetchPullRequest, Resource: metrics.GitHubRateLimitResourceCore, GitHubApp: "test-app", InstallationID: 42}
+	metrics.RecordGitHubPrimaryRateLimitRejection(t.Context(), sample, metrics.GitHubRejectionOriginLocal)
+	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownAccepted)
+	metrics.RecordGitHubSecondaryCooldownReport(t.Context(), sample, metrics.GitHubCooldownSingleSleepLimitExceeded)
+	metrics.RecordGitHubWait(t.Context(), sample, metrics.GitHubWaitLayerReadRetry, metrics.GitHubWaitReasonTransientError, 250*time.Millisecond)
+	recorder := httptest.NewRecorder()
+	tel.MetricsHandler.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	text := recorder.Body.String()
+	for _, expected := range []string{
+		"schemabot_github_primary_rate_limit_rejections_total",
+		"schemabot_github_secondary_rate_limit_cooldown_reports_total",
+		"schemabot_github_wait_duration_seconds_sum",
+		"schemabot_github_wait_duration_seconds_count",
+		`disposition="accepted"`, `disposition="single_sleep_limit_exceeded"`,
+		`origin="local"`, `layer="read_retry"`, `installation_id="42"`,
+	} {
+		assert.Contains(t, text, expected)
+	}
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.HasPrefix(line, "schemabot_github_wait_duration_seconds_sum{") {
+			assert.True(t, strings.HasSuffix(line, " 0.25"), line)
+		}
+		if strings.HasPrefix(line, "schemabot_github_wait_duration_seconds_count{") {
+			assert.True(t, strings.HasSuffix(line, " 1"), line)
+		}
+	}
 }

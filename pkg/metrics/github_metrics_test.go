@@ -1,6 +1,10 @@
 package metrics
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,6 +20,15 @@ import (
 func TestNormalizeGitHubOperation(t *testing.T) {
 	assert.Equal(t, GitHubOperationFetchPullRequest, normalizeGitHubOperation(GitHubOperationFetchPullRequest))
 	assert.Equal(t, gitHubMetricValueUnknown, normalizeGitHubOperation("new_github_operation"))
+}
+
+// The operations the symlink mode reader labels its requests with are known,
+// so they are recorded under their own names rather than as unknown.
+func TestSymlinkModeOperationsAreKnownGitHubOperations(t *testing.T) {
+	assert.Equal(t, "fetch_diff", GitHubOperationFetchDiff)
+	assert.Equal(t, "graphql_tree_entries", GitHubOperationGraphQLTreeEntries)
+	assert.True(t, isKnownGitHubOperation(GitHubOperationFetchDiff))
+	assert.True(t, isKnownGitHubOperation(GitHubOperationGraphQLTreeEntries))
 }
 
 func TestNormalizeGitHubRequestCategory(t *testing.T) {
@@ -51,6 +64,9 @@ func TestUnknownGitHubMetricLabelsAreTrackedOncePerDistinctValue(t *testing.T) {
 	assert.Equal(t, 2, seen)
 }
 
+// Any repository that installs the App can deliver to it, so the counter emits
+// no repository attribute: two ignored deliveries of the same event and action
+// land on one series.
 func TestRecordUnregisteredRepositoryWebhook(t *testing.T) {
 	reader := metric.NewManualReader()
 	mp := metric.NewMeterProvider(metric.WithReader(reader))
@@ -61,7 +77,8 @@ func TestRecordUnregisteredRepositoryWebhook(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	}()
 
-	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "issue_comment", "created", "octocat/hello-world")
+	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "issue_comment", "created")
+	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "issue_comment", "created")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -76,15 +93,48 @@ func TestRecordUnregisteredRepositoryWebhook(t *testing.T) {
 			sum, ok := m.Data.(metricdata.Sum[int64])
 			require.True(t, ok)
 			require.Len(t, sum.DataPoints, 1)
-			assert.Equal(t, int64(1), sum.DataPoints[0].Value)
+			assert.Equal(t, int64(2), sum.DataPoints[0].Value)
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "environment", "unknown")
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "app_name", "default")
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "event_type", "issue_comment")
 			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "action", "created")
-			assertMetricAttribute(t, sum.DataPoints[0].Attributes, "repository", "octocat/hello-world")
+			_, hasRepository := sum.DataPoints[0].Attributes.Value("repository")
+			assert.False(t, hasRepository, "the repository belongs in the caller's log, not a label")
 		}
 	}
 	assert.True(t, found)
+}
+
+// An event type the counter folds to "unknown" is warned about once for the
+// App. The warning has no repo field, because the counter records no
+// repository.
+func TestRecordUnregisteredRepositoryWebhookWarnsOnceWithoutRepo(t *testing.T) {
+	seenUnknownWebhookMetricLabels = sync.Map{}
+	t.Cleanup(func() {
+		seenUnknownWebhookMetricLabels = sync.Map{}
+	})
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "new_event_type", "created")
+	RecordUnregisteredRepositoryWebhook(t.Context(), "default", "new_event_type", "created")
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	require.Len(t, lines, 1, "a value already warned about is not warned about again")
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &entry))
+	assert.Equal(t, "webhook metric label normalized to unknown", entry["msg"])
+	assert.Equal(t, "schemabot.webhook.unregistered_repository_ignored_total", entry["metric"])
+	assert.Equal(t, "event_type", entry["label"])
+	assert.Equal(t, "new_event_type", entry["value"])
+	assert.Equal(t, "default", entry["app_name"])
+	assert.Equal(t, "ignored", entry["event_status"])
+	assert.NotContains(t, entry, "repo", "an empty repository is left out of the warning")
 }
 
 func TestRecordWebhookEventKnownObservedGitHubLabels(t *testing.T) {

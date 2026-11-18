@@ -25,7 +25,7 @@ the stored task rows.
 | ValidatingBranch | `validating_branch` | Branch schema validation in progress after DDL apply (PlanetScale only) |
 | ValidatingDeployRequest | `validating_deploy_request` | PlanetScale is validating the deploy request diff (PlanetScale only) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
-| WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
+| WaitingForCutover | `waiting_for_cutover` | All tasks ready for cutover (atomic mode only — in sequential mode each task runs its own cutover). With `--defer-cutover` the apply holds for an operator; otherwise the drive triggers cutover automatically |
 | Recovering | `recovering` | Restart recovery is reattaching to engine state. Control actions that require a later phase are blocked until the engine proves that phase is safe again. |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
@@ -74,7 +74,7 @@ stateDiagram-v2
 ```
 
 - `waiting_for_deploy`: PlanetScale only. The deploy request is created and ready, but not yet executed. With `--defer-deploy`, the user reviews the deploy request diff on PlanetScale and triggers via `schemabot cutover`. Without `--defer-deploy`, the system auto-advances through this state. For instant DDL, the deploy completes immediately after triggering. `--defer-deploy` and `--defer-cutover` compose: the first pauses before deploy, the second pauses before cutover.
-- `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit). Note: `--defer-cutover` is a no-op for instant DDL (no cutover exists).
+- `waiting_for_cutover`/`cutting_over`: With `--defer-cutover` or atomic mode (Spirit). PlanetScale applies pass through both even without `--defer-cutover`: the deploy request is created with the backend's auto-cutover disabled, so it parks at pending cutover and the drive — the sole cutover actor — triggers cutover automatically. Note: an instant-eligible change deploys with a row copy instead of instant DDL when `--defer-cutover` is set (an instant deploy swaps the schema immediately, leaving no cutover to hold) or when the change is unsafe (the row copy keeps a revert window open to undo the change).
 - `running_degraded`: Projected (not engine-reported) apply state for a multi-deployment rollout that is still in flight after a deployment failed under `on_failure: continue`. It is non-terminal and active — recovery can reclaim a stale degraded parent, and the one-active-apply overlap invariant keeps the whole target set reserved while it holds. It is unreachable for single-operation applies (one failed operation is already terminal, so the apply settles straight to `failed`); it only appears once an apply owns more than one operation. The `continue` policy governs rollout continuation, not the pass/fail verdict, so the apply still settles to `failed` once every sibling reaches a terminal state.
 - `resuming`: A stopped apply that has been claimed to process a queued start. Storage moves the apply to `resuming` at claim time — before the data-plane start is attempted — and holds it there until the data plane reports leaving the stopped state. This keeps `/api/status` and `/api/progress/apply/{id}` consistent for remote (gRPC) engines, where live progress can still report `stopped` for a short window after the start is accepted; both endpoints serve `resuming` from storage instead of one showing `running`. It is non-terminal and active, so the one-active-apply overlap invariant keeps the target reserved and recovery can reclaim a stale resuming apply. It advances to `running` once the data plane leaves stopped; remote-engine resumes fall back to `stopped` if the data plane stays stopped past the start grace window.
 - `recovering`: Temporary restart recovery. Current MySQL/Spirit deferred-cutover recovery enters this state only after durable storage had already reached `waiting_for_cutover`. That stored cutover-ready state is authoritative: recovery must not move durable storage backward to `running` if Spirit reports row-copy progress after reattaching. Row-copy counters can still be displayed while storage remains `recovering`. Recovery exits to `waiting_for_cutover` only after cutover readiness is proven again, or to `completed` when live-schema reconciliation proves the data plane already reached the desired schema. Control operations that require a later phase are blocked while recovery is active.
@@ -108,12 +108,12 @@ Per-table execution state. Mostly mirrors Apply state, with per-table scheduler/
 `failed_retryable` exists at both task and apply levels, but each level answers a different question:
 
 - A **task** in `failed_retryable` means one table's work hit a retryable engine error. The task is not terminal because scheduler recovery may run that table work again.
-- An **apply** in `failed_retryable` means the whole apply is paused and waiting for scheduler recovery. The apply owns the retry attempt counter and retry budget.
+- An **apply** in `failed_retryable` means the whole apply is paused and waiting for scheduler recovery. Each operation owns its retry attempt counter and retry budget; the apply's attempt records the highest of any of its operations.
 - A **pending task** is unfinished work that is not currently running. It remains attached to the apply and is eligible to run the next time the apply is dispatched.
 
 The apply state rolls up from task state: any `failed_retryable` task makes the apply `failed_retryable` unless a permanent `failed` task is present. Atomic execution can also mark the apply `failed_retryable` while updating the affected tasks from the same retryable engine result.
 
-When the scheduler claims a retryable apply, it refreshes the apply heartbeat as a lease, increments the apply attempt, and re-dispatches the apply. That attempt count is the apply-level dispatch count for the whole retry cycle; it is not a per-task counter.
+When the scheduler claims a retryable operation, it refreshes the operation heartbeat as a lease, increments that operation's attempt, raises the apply's attempt to it if it is higher, and re-dispatches the operation. The attempt counts the operation's redispatches; it is not a per-task counter.
 
 The scheduler does not claim tasks directly. It claims the `failed_retryable` apply, reloads that apply's tasks, then prepares the retry by clearing only the tasks in `failed_retryable`. Those tasks move back to `pending`, their error message is cleared, and their task attempt count increments. Completed tasks are left alone because their table work already succeeded.
 
@@ -155,15 +155,25 @@ Next dispatch:
 2. Any task **failed_retryable** → apply `failed_retryable`
 3. Any task **cancelled** → apply `cancelled`
 4. Any task **stopped** → apply `stopped`
-5. Any task **reverted** → apply `reverted`
-6. All tasks **completed** → apply `completed`
-7. Any task **recovering** → apply `recovering`
-8. Any task **cutting_over** → apply `cutting_over`
-9. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
-10. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
-11. Any task **revert_window** → apply `revert_window`
-12. Any task **running** → apply `running`
-13. Otherwise → apply `pending`
+5. Any task **paused** → apply `paused`
+6. Any task **reverting** → apply `reverting`
+7. Any task **reverted** → apply `reverted`
+8. All tasks **completed** → apply `completed`
+9. Any task **recovering** → apply `recovering`
+10. Any task **cutting_over**, with no task still queued, staging its deploy, resuming, copying, or verifying → apply `cutting_over`
+11. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
+12. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
+13. Any task **revert_window** → apply `revert_window`
+14. Any task **skipping_revert** → apply `skipping_revert`
+15. Any task **running_degraded** → apply `running_degraded`
+16. Any task **running** → apply `running`
+17. Any task **resuming** → apply `resuming`
+18. Any task draining, verifying, or cutting over while another has not begun copying → apply `running`
+19. Any task **catching_up**, then **checksumming**, then **post_checksum** → that phase
+20. Any task in a deploy setup phase (`preparing_branch` … `validating_deploy_request`) → the least advanced one
+21. Otherwise → apply `pending`
+
+Every apply state derives to itself when it is the only input; `TestDeriveApplyState_EveryStateDerivesToItself` fails when a new state has no place in this order.
 
 Apply terminal states (`completed`, `failed`, `stopped`, `cancelled`, `reverted`) are checked via `IsTerminalApplyState()`. Note: `failed_retryable` is not terminal because scheduler recovery can retry it, and `stopped` is not terminal at the task level because a stopped task can be resumed via Start.
 
@@ -196,6 +206,7 @@ stateDiagram-v2
     queued --> ready
     ready --> running
     ready --> cancelled
+    queued --> ready_to_complete
     running --> complete
     running --> ready_to_complete
     running --> failed
@@ -209,12 +220,12 @@ stateDiagram-v2
 Each shard executes the same DDL independently via vreplication (or instant DDL). Key behavior:
 
 - **All shards copy independently.** Each shard has its own `rows_copied`, `table_rows`, `progress` (0-100), and `eta_seconds`. Shards progress at different rates.
-- **`ready_to_complete` is a flag, not a state.** A migration stays in `running` state with `ready_to_complete=1` when its row copy is done and vreplication lag is within threshold. SchemaBot normalizes `running + ready_to_complete` to `waiting_for_cutover`.
+- **`ready_to_complete` is a flag, not a state.** A migration stays in `running` state with `ready_to_complete=1` when its row copy is done and vreplication lag is within threshold. Immediate operations (CREATE/DROP TABLE) set the flag while still `queued`, since there is nothing to copy. SchemaBot normalizes any non-terminal status with `ready_to_complete=1` to `waiting_for_cutover`; terminal statuses (`complete`/`failed`/`cancelled`) always win over a stale flag.
 - **Cutover is per-shard.** Each shard attempts cutover independently with its own `cutover_attempts` counter. PlanetScale's deploy request layer coordinates when to trigger cutover across all shards, but the actual table swap happens per-shard.
-- **`postpone_completion` defers cutover.** PlanetScale uses `postpone_completion=1` so shards stay in `running` (with `ready_to_complete=1`) until an explicit `CompleteMigration` operation is performed. PlanetScale's deploy request triggers this automatically when all shards are ready. With `--defer-cutover`, SchemaBot holds here until the user runs `schemabot cutover`.
+- **`postpone_completion` defers cutover.** PlanetScale uses `postpone_completion=1` so shards stay in `running` (with `ready_to_complete=1`) until an explicit `CompleteMigration` operation is performed. SchemaBot creates deploy requests with the deploy-request layer's auto-cutover disabled, so the drive — the sole cutover actor — triggers completion once all shards are ready. With `--defer-cutover`, the drive holds here until the user runs `schemabot cutover`.
 - **Cutover retries with backoff.** When cutover fails (e.g., MDL lock timeout), `cutover_attempts` increments and vreplication restarts. Vitess uses exponential backoff between attempts. `force_cutover` bypasses backoff and kills competing locks.
 - **Instant DDL skips vreplication.** With `--prefer-instant-ddl`, Vitess attempts `ALGORITHM=INSTANT` for eligible ALTER TABLE operations (e.g., adding a nullable column). The ALTER executes as a metadata-only change — no row copy, no cutover. Not all ALTERs support instant; unsupported ones fall back to vreplication. CREATE TABLE and DROP TABLE also execute without vreplication (they're inherently fast), but they are not "instant DDL" in the MySQL sense.
-- **Revert depends on the operation type.** CREATE TABLE can be reverted (Vitess renames the table away, preserving data). DROP TABLE can be reverted (Vitess renames instead of dropping, so the table can be renamed back). ALTER TABLE via VReplication can be reverted near-instantly — Vitess resumes VReplication from the cut-over GTID position, catching up only the changelog since completion. Instant DDL ALTERs cannot be reverted (no shadow table exists). Revert window is controlled by artifact retention (default 24h in Vitess, 30min in PlanetScale's deploy request layer).
+- **Revert depends on the operation type.** CREATE TABLE can be reverted (Vitess renames the table away, preserving data). DROP TABLE can be reverted (Vitess renames instead of dropping, so the table can be renamed back). ALTER TABLE via VReplication can be reverted near-instantly — Vitess resumes VReplication from the cutover GTID position, catching up only the changelog since completion. Instant DDL ALTERs cannot be reverted (no shadow table exists). Revert window is controlled by artifact retention (default 24h in Vitess, 30min in PlanetScale's deploy request layer).
 - **`postpone_completion` behaves differently by operation type.** For ALTER TABLE, the migration reaches `running` with `ready_to_complete=1` but defers cutover. For CREATE/DROP TABLE, the migration stays in `queued` and is never scheduled until `COMPLETE` is issued.
 - **Shard states are cohesive.** Because `postpone_completion` requires all shards to reach `ready_to_complete` before cutover, only a few state combinations appear in practice: (1) all shards `running` at different percentages, (2) some `running` + some `waiting_for_cutover`, (3) all `waiting_for_cutover`, (4) all `cutting_over`, (5) all `complete`. You never see `complete` mixed with `running`, or `cutting_over` mixed with `running`.
 - **Auto-retry on vttablet failure.** If a migration fails due to a vttablet crash (not a DDL error), Vitess auto-retries once per shard. The migration goes back to `queued` and starts fresh — there is no mechanism to resume a broken migration. See [Managed Online Schema Changes: auto-retry](https://vitess.io/docs/user-guides/schema-changes/managed-online-schema-changes/#auto-retry-after-failure).
@@ -223,12 +234,13 @@ Each shard executes the same DDL independently via vreplication (or instant DDL)
 
 | Vitess migration state | `ready_to_complete` | SchemaBot normalized state |
 |---|---|---|
-| `queued` / `ready` | - | `pending` |
+| `requested` / `queued` / `ready` | `0` | `pending` |
+| `requested` / `queued` / `ready` | `1` | `waiting_for_cutover` (immediate operations) |
 | `running` | `0` | `running` (copying rows) |
 | `running` | `1` | `waiting_for_cutover` |
 | `complete` | - | `completed` |
-| `failed` | - | `failed` |
-| `cancelled` | - | `cancelled` |
+| `failed` | - | `failed` (a stale `ready_to_complete=1` is ignored) |
+| `cancelled` | - | `cancelled` (a stale `ready_to_complete=1` is ignored) |
 
 ### PlanetScale deploy request states
 
@@ -276,7 +288,7 @@ Unknown raw engine states normalize to `running`. This keeps unfamiliar in-fligh
 
 ## Progress rendering
 
-The CLI renders progress via `pkg/cmd/templates/`. The data flow:
+The CLI renders progress via `pkg/cmd/internal/templates/`. The data flow:
 
 ```
 Engine (Spirit/Vitess)
@@ -290,7 +302,7 @@ Two normalization layers:
 
 1. **`NormalizeTaskStatus()`** (this package) — maps engine-specific strings to canonical Task constants. Called at the parsing boundary so rendering code can compare against `Task.*` directly.
 
-2. **`NormalizeState()`** (`pkg/cmd/templates/progress_parse.go`) — strips the `STATE_` prefix and lowercases (`STATE_RUNNING` → `running`). The prefix exists because protobuf enums require a common prefix by convention (see `State` enum in `tern.proto`: `STATE_PENDING`, `STATE_RUNNING`, etc.). Applied to the apply-level state and per-table status during `ParseProgressResponse()`.
+2. **`NormalizeState()`** (`pkg/cmd/internal/templates/progress_parse.go`) — strips the `STATE_` prefix and lowercases (`STATE_RUNNING` → `running`). The prefix exists because protobuf enums require a common prefix by convention (see `State` enum in `tern.proto`: `STATE_PENDING`, `STATE_RUNNING`, etc.). Applied to the apply-level state and per-table status during `ParseProgressResponse()`.
 
 The rendering layer (`WriteProgress`) uses normalized states to select progress bar styles and display labels (`StateLabel()`). Each state maps to a color:
 
@@ -298,57 +310,62 @@ The rendering layer (`WriteProgress`) uses normalized states to select progress 
 |-------|-------|---------|
 | Running | Blue | `🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%` |
 | Waiting for cutover | Yellow | `🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover` |
-| Cutting over | Yellow | `🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...` |
+| Cutting over | Blue | `🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...` |
 | Completed | Green | `🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete` |
 | Stopped | Orange | `🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 35%` |
 | Failed | Red | `🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed` |
 
-Bars are 20 squares wide; filled squares represent percent complete. Defined in `pkg/cmd/templates/progress_render.go`.
+Bars are 20 squares wide; filled squares represent percent complete. Defined in `pkg/cmd/internal/templates/progress_render.go`.
 
 ### Shard rendering
 
-For Vitess tables, per-shard progress is rendered below the table progress bar. Each shard has a status symbol and detail line. Implemented in `pkg/cmd/templates/progress_shard.go`.
+For Vitess tables, per-shard progress is rendered below the table progress bar. Each shard has a status symbol and detail line. Implemented in `pkg/cmd/internal/templates/progress_shard.go`.
 
 | Symbol | Color | Shard state | Detail |
 |--------|-------|-------------|--------|
 | ✓ | Green | `completed` | Total rows |
 | ◉ | Cyan | `running` (copying) | Percent, rows copied/total, ETA |
+| ◉ | Cyan | other in-flight phases (`checksumming`, `recovering`, `reverting`, ...) | The phase, with how far a checksum has verified |
 | ● | Yellow | `waiting_for_cutover` | "ready for cutover" |
 | ● | Yellow | `cutting_over` | "cutting over" |
+| ● | Yellow | `revert_window` | The change is applied but not final |
 | ○ | Dim | `pending` | "queued" |
 | ✗ | Red | `failed` | "failed" |
 
-**Collapsed view for large shard counts (>8 shards):**
-- Failed, waiting-for-cutover, and cutting-over shards are always shown
-- Up to 5 copying shards are shown, sorted by lowest percent complete (most behind first)
-- Remaining shards are summarized: "... N more copying shards" and "... N more shards (M complete, K queued)"
+**Order:** up to 8 shards, every shard is named in the parts' own order, so each keeps its line from one update to the next. The PR comment lists a table's shards, and a rollout's targets, the same way. The order and the caps below live in `pkg/presentation/part_listing.go`.
 
-**Cutover attempts:** When shards have `cutover_attempts > 0`, the total is shown in the shard summary (e.g., "cutover attempts: 3"). This indicates previous cutover failures with exponential backoff in progress.
+**Wide listings (>8 shards):** only the failed shards (up to 5, then "... N more failed shards"), the 3 slowest copying shards (then "... N more copying shards"), and the first 3 shards working past the copy (then "... N more shards past copying") are named. The heading already counts every state, so the listing does not repeat the rest.
 
-**Summary line:** `Shards: N (M complete, K copying, J queued)` — uses "copying" not "running" for user clarity.
+**Copying order in wide listings:** copying shards are listed furthest behind first. A shard that has not reported progress yet is not known to be behind, so it follows the shards that have reported.
+
+**Comment size:** the shard lines share the PR comment's size limit with the DDL. The DDL is cut first; when the comment would not fit even with the DDL cut to nothing, each table keeps its heading line and drops the line per shard.
+
+**Heading:** `Shards: N (F failed, C copying, W waiting for cutover, X cutting over, Q queued, M complete)`, naming only the states with a count, in the order the listing follows. It uses "copying" not "running" for user clarity.
 
 ## Comment states
 
-PR comment tracking for applies. Each apply can have up to 3 comments, one per comment state:
+PR comment tracking for applies. Each apply tracks at most one comment per comment state:
 
 | State | Value | Description |
 |-------|-------|-------------|
-| Progress | `progress` | Main progress comment, created on `pending`, edited throughout execution |
-| Cutover | `cutover` | Cutover confirmation comment, created only with `--defer-cutover` when entering `cutting_over` |
+| Progress | `progress` | Progress comment, created on `pending` and edited throughout execution. Rotated to a fresh comment when an operator's control command takes effect on a still-active apply |
+| Cutover | `cutover` | Separate cutover prompt for an apply parked at the deferred-cutover gate. Current builds no longer post one; the row is honored for applies that parked behind a prompt posted by an earlier build |
 | Summary | `summary` | Final summary comment, created when the apply reaches a terminal state |
 
-Stored in the `apply_comments` table with `UNIQUE(apply_id, comment_state)`. Upsert semantics allow Start/resume to replace old comment IDs with fresh ones.
+Stored in the `apply_comments` table with `UNIQUE(apply_id, comment_state)`. Upsert semantics let a rotation or a resume replace the tracked comment ID with a fresh one.
 
 ### How it works
 
-At any point during an apply, exactly one comment is the **active comment** — the one that gets edited on each state change or progress tick. Initially the progress comment is active. If `--defer-cutover` is used, a second cutover comment is created when the apply enters `cutting_over`, and that comment becomes the active one (the progress comment is frozen). When the apply reaches a terminal state, the active comment is edited one last time with the final state, and a separate summary comment is posted.
+At any point during an apply, exactly one comment is the **active comment** — the one that gets edited on each state change or progress tick. The progress comment is active throughout, including through the deferred-cutover gate: when a `--defer-cutover` apply finishes its checksum, the progress comment moves to "Waiting for Cutover" in place and carries the cutover command in its footer.
 
-The `apply_comments` table maps `(apply_id, comment_state)` to a GitHub comment ID. This lets the webhook handler look up which comment to edit without carrying state between requests. The active comment is resolved by checking if a cutover comment exists — if so, it's active; otherwise, the progress comment is active:
+When an operator's command takes effect on a still-active apply — a deferred cutover reaching `cutting_over` (or `revert_window`, when `cutting_over` passed between ticks), a revert, or a skip-revert — the observer posts a fresh progress comment at the bottom of the PR and folds the superseded one into a collapsed details block pointing at its successor. The rotation is gated on the durable control request, so a cutover the apply runs on its own transitions in place. The phase that rotated is recorded on the tracked row (`posted_phase`), along with the rollout member whose cutover the comment tracks (`posted_cutover_operation_id`), so each command rotates at most once across ticks and pods, and each member of an ordered rollout gets its own cutover rotation. A deferred apply that skips its revert window can pass from the cutover straight into `skipping_revert`; the cutover's rotation is still owed there. When the apply reaches a terminal state, the active comment is edited one last time with the final state, and a summary comment is posted.
+
+The `apply_comments` table maps `(apply_id, comment_state)` to a GitHub comment ID. This lets the webhook handler look up which comment to edit without carrying state between requests. A live cutover prompt row, left by an earlier build, is active while it exists; otherwise the progress comment is active:
 
 ```go
 cutover, _ := store.Get(ctx, applyID, state.Comment.Cutover)
 if cutover != nil {
-    return cutover  // cutover is active
+    return cutover  // a prompt posted by an earlier build is active
 }
 return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
 ```
@@ -364,17 +381,18 @@ return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
                     ▼
            ┌──────────────────┐
            │     progress     │   Progress comment being edited
-           │     (active)     │   (edit on: running, waiting_for_cutover,
-           └───────┬──┬───────┘    cutting_over(auto), revert_window(auto))
+           │     (active)     │   (edit on: running, checksumming,
+           └───────┬──┬───────┘    waiting_for_cutover, automatic cutover)
                    │  │
-    on: terminal   │  │ on: cutting_over with defer_cutover
-                   │  │ action: CREATE cutover comment
-                   │  │ (progress frozen, cutover becomes active)
+    on: terminal   │  │ on: operator's cutover, revert, or skip-revert
+                   │  │     takes effect
+                   │  │ action: CREATE fresh progress comment,
+                   │  │         FOLD the superseded one
                    │  ▼
                    │  ┌──────────────────┐
-                   │  │     cutover      │  Cutover comment being edited
-                   │  │     (active)     │  (edit on: revert_window(defer))
-                   │  └────────┬─────────┘
+                   │  │ fresh progress   │  Fresh comment being edited
+                   │  │     (active)     │  (edit on: later phases of the
+                   │  └────────┬─────────┘   same command)
                    │           │ on: terminal
                    │           │
                    ▼           ▼
@@ -393,13 +411,11 @@ return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
 | Active Comment | Apply Event | Comment Actions |
 |----------------|-------------|-----------------|
 | (none) | pending | CREATE progress |
-| progress | running / waiting_for_cutover | EDIT progress |
-| progress | cutting_over (auto) | EDIT progress |
-| progress | cutting_over (defer_cutover) | CREATE cutover (becomes active) |
-| progress | revert_window (auto) | EDIT progress |
+| progress | running / checksumming / waiting_for_cutover | EDIT progress |
+| progress | cutting_over or revert_window (automatic cutover) | EDIT progress |
+| progress | cutting_over or revert_window (operator's deferred cutover) | CREATE fresh progress, FOLD the superseded one |
+| progress | later phase of the same cutover | EDIT progress |
 | progress | terminal | EDIT progress to final, CREATE summary |
-| cutover | revert_window (defer) | EDIT cutover |
-| cutover | terminal | EDIT cutover to final, CREATE summary |
 | (done) | Start (resume from stopped) | UPSERT progress and summary with new IDs |
 
 ### Example: apply with `--defer-cutover`
@@ -407,17 +423,17 @@ return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
 1. User runs `schemabot apply-confirm -e staging` → apply created in `pending`
    - **CREATE** progress comment: "Schema change pending..."
 2. Apply starts → `running`, progress ticks at 10%, 20%, ...
-   - **EDIT** progress comment: "Running... 20% complete"
-3. Row copy finishes → `waiting_for_cutover`
-   - **EDIT** progress comment: "Waiting for cutover"
+   - **EDIT** progress comment: "Copying rows... 20% complete"
+3. Row copy and checksum finish → `waiting_for_cutover`
+   - **EDIT** progress comment: "Waiting for Cutover", with the cutover command in the footer
 4. User runs `schemabot cutover -e staging` → `cutting_over`
-   - **CREATE** cutover comment: "Cutover in progress..." ← cutover is now active
-   - Progress comment is frozen (still shows "Waiting for cutover")
+   - **CREATE** fresh progress comment: "Cutting over..." ← the fresh comment is now active
+   - **EDIT** the earlier progress comment into a fold: "Cutover started — progress continues in a new progress comment", with its waiting-for-cutover rendering collapsed
 5. Cutover completes → `completed`
-   - **EDIT** cutover comment: "Cutover complete"
+   - **EDIT** fresh progress comment: "Applied"
    - **CREATE** summary comment: "Schema change completed successfully"
 
-Result: 3 comments on the PR (progress, cutover, summary). Without `--defer-cutover`, there would be 2 (progress, summary) — the progress comment covers the entire lifecycle including cutover.
+Result: the folded pre-cutover progress comment, the fresh progress comment, and the summary. Without `--defer-cutover` the single progress comment covers the entire lifecycle including cutover, followed by the summary.
 
 ## Engine trust model
 
@@ -442,7 +458,7 @@ In both cases:
   tasks as `stopped` regardless of engine sub-state — even if row copy is 100% done. A schema
   change isn't complete until cutover finishes, so SchemaBot won't promote a task to `completed`
   based on partial engine progress. On resume, SchemaBot re-checks the actual table schema to
-  determine which tables still need changes vs which already cut over before the stop took effect.
+  determine which tables still need changes vs whose cutover already ran before the stop took effect.
 
 ## State representations
 

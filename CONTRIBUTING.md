@@ -33,11 +33,15 @@ Thank you for your interest in contributing to SchemaBot! We welcome bug reports
 
 ```bash
 make setup    # Configure git hooks
-make demo     # Start local services, apply schema, seed data
+make demo-full     # Start local services, apply schema, seed data
 make test     # Run all tests (unit + integration + e2e)
 ```
 
 See [docs/architecture.md](./docs/architecture.md) for an overview of how SchemaBot works.
+
+## Releases
+
+Maintainers cut releases by pushing a `vX.Y.Z` tag. See [docs/release.md](./docs/release.md) for the process and the compatibility checks that run before a tag is published.
 
 ## License
 

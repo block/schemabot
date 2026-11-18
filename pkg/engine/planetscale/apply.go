@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/table"
@@ -26,10 +29,54 @@ import (
 )
 
 // noChangesApplyResult builds the result for a converged apply where the deploy
-// request reported no schema differences. It must be Accepted so the tern layer
-// completes the apply's tasks instead of treating the no-op as a failure.
-func noChangesApplyResult(message string) *engine.ApplyResult {
-	return &engine.ApplyResult{Accepted: true, Message: message}
+// request reported no schema differences. It is Accepted and carries a resume
+// state naming the deploy request, so the drive follows it like any other
+// accepted apply: Progress reads the request's no_changes state as completed and
+// the drive completes the apply's tasks instead of treating the no-op as a
+// failure.
+//
+// A no-changes deploy request never deploys, so nothing tears it or its branch
+// down: the branch's auto-delete fires only when a deploy finishes. SchemaBot
+// leaves both in place and logs where they are so an operator can remove them.
+func (e *Engine) noChangesApplyResult(req *engine.ApplyRequest, org, message, migrationContext string, meta *psMetadata) (*engine.ApplyResult, error) {
+	encoded, err := encodePSMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata for no-changes deploy request #%d: %w", meta.DeployRequestID, err)
+	}
+	e.logNoChangesDeployRequestLeftInPlace(req, org, meta)
+	return &engine.ApplyResult{
+		Accepted: true,
+		Message:  message,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: migrationContext,
+			Metadata:         encoded,
+		},
+	}, nil
+}
+
+// Log messages for a completed no-changes apply, naming what SchemaBot leaves
+// in PlanetScale and what the operator can do about it. A branch SchemaBot
+// created is the operator's to delete; an operator-supplied branch is kept.
+const (
+	noChangesLeftInPlaceMsg = "no-changes deploy request never deploys, so SchemaBot leaves it and its branch in place " +
+		"(the branch's auto-delete does not fire); close the deploy request and delete the branch in PlanetScale"
+	noChangesLeftInPlaceOperatorBranchMsg = "no-changes deploy request never deploys, so SchemaBot leaves it in place " +
+		"and keeps the operator-supplied branch; close the deploy request in PlanetScale"
+)
+
+// logNoChangesDeployRequestLeftInPlace records the deploy request and branch a
+// completed no-changes apply leaves behind in PlanetScale.
+func (e *Engine) logNoChangesDeployRequestLeftInPlace(req *engine.ApplyRequest, org string, meta *psMetadata) {
+	msg := noChangesLeftInPlaceMsg
+	if !deployRequestDeletesBranch(req.Options) {
+		msg = noChangesLeftInPlaceOperatorBranchMsg
+	}
+	e.applyLogger(req).Info(msg,
+		"organization", org,
+		"planetscale_database", req.Database,
+		"deploy_request", meta.DeployRequestID,
+		"branch", meta.BranchName,
+	)
 }
 
 // vschemaDiffsFromChanges extracts the per-keyspace VSchema diffs carried on the
@@ -49,7 +96,11 @@ func vschemaDiffsFromChanges(changes []engine.SchemaChange) []vschemaKeyspaceDif
 // Apply starts executing a schema change plan.
 // Creates a PlanetScale branch, applies DDL via MySQL connection to the branch,
 // then creates and starts a deploy request.
-func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *engine.ApplyResult, retErr error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	e.logger.Info("applying plan",
 		"plan_id", req.PlanID,
 		"database", req.Database,
@@ -80,17 +131,15 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return e.resumeApply(ctx, client, org, req)
 	}
 
-	// emitEvent logs a lifecycle event and sends it to the caller for apply_logs recording.
-	emitEvent := func(event engine.ApplyEvent) {
-		attrs := []any{"database", req.Database}
-		for k, v := range event.Metadata {
-			attrs = append(attrs, k, v)
-		}
-		e.logger.Info(event.Message, attrs...)
-		if req.OnEvent != nil {
-			req.OnEvent(event)
-		}
+	// The tables the plan was reviewed with ignore_tables withholding are
+	// resolved before the branch is created, so an entry that cannot be read
+	// stops the apply before it has anything to clean up.
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("apply plan %s to database %s: %w", req.PlanID, req.Database, err)
 	}
+
+	emitEvent := e.eventEmitter(req)
 
 	// Track in-flight apply metadata for progress queries during setup.
 	migCtx := ""
@@ -102,6 +151,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// persistState is a no-op in this window — if the driver crashes before Apply returns,
 	// there's no ResumeState to recover from. The tern layer handles this by retrying
 	// the full Apply on the next heartbeat recovery cycle.
+	// recordedBranch is the branch the persisted resume state names, if any:
+	// the branch a resuming driver will look for. recordedDeployRequest is the
+	// deploy request it names, if any: the one a resuming driver re-reads.
+	var recordedBranch string
+	var recordedDeployRequest uint64
 	persistState := func(meta *psMetadata) {
 		if migCtx == "" || req.OnStateChange == nil {
 			return
@@ -111,10 +165,20 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			e.logger.Warn("failed to encode apply metadata for persistence", "error", err)
 			return
 		}
-		req.OnStateChange(&engine.ResumeState{
+		if err := req.OnStateChange(&engine.ResumeState{
 			MigrationContext: migCtx,
 			Metadata:         encoded,
-		})
+		}); err != nil {
+			// The apply carries on: a failed save only costs crash recovery.
+			// The branch is not treated as recorded, so a drive that ends
+			// before its deploy request deletes it rather than keeping a
+			// branch no successor can find.
+			e.logger.Warn("resume state was not saved; a resuming driver will not find this branch",
+				"database", req.Database, "branch", meta.BranchName, "error", err)
+			return
+		}
+		recordedBranch = meta.BranchName
+		recordedDeployRequest = meta.DeployRequestID
 	}
 
 	// Capture the per-keyspace VSchema diffs carried on the plan annotations so
@@ -124,9 +188,128 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	vschemaDiffs := vschemaDiffsFromChanges(req.Changes)
 
 	// Create or reuse a branch
-	existingBranch := req.Options["branch"]
+	existingBranch := operatorBranch(req.Options)
 	var branchName string
 	branchStart := time.Now()
+
+	// A branch SchemaBot creates exists only to carry this apply's DDL into a
+	// deploy request. Once that deploy request exists it owns the teardown
+	// (AutoDeleteBranch); until then nothing does, so an apply that fails while
+	// preparing the branch would strand it. Branches are quota'd, and the
+	// failures in this window are the ordinary ones — DDL the engine refuses —
+	// so the strand accumulates until branch creation itself starts failing for
+	// unrelated schema changes. ownedBranch names the branch this apply is
+	// responsible for; it is cleared once the deploy request takes ownership,
+	// and it is never set for an operator-supplied branch, which SchemaBot does
+	// not own.
+	//
+	// A create-deploy-request response lost to a timeout leaves ownedBranch set
+	// even though the deploy request may exist server-side. Deleting the branch
+	// is still the right cleanup there, not a hazard: deploying is a separate,
+	// later call that only runs after the create succeeded client-side, so the
+	// orphan carries no running schema change, and the apply records the deploy
+	// request identifier only after a successful response, so no retry will
+	// ever drive it. Should the API refuse to delete a branch while its deploy
+	// request is open, the refusal surfaces on the cleanup's error path with
+	// the identifiers for manual reclamation.
+	//
+	// A drive whose context ends is usually handing the apply back, not
+	// failing it: the operator cancels a drive when its lease is lost, when it
+	// looks stalled, or when the instance shuts down, and in each case another
+	// driver resumes the apply from its stored state. When that state names
+	// this branch, the branch is the resume's starting point, and after a lost
+	// lease a peer may already be preparing it, so it is kept. A branch the
+	// stored state does not name can never be resumed, so it is deleted like
+	// any other failure's. So is the branch of a drive an operator cancelled
+	// (engine.CancelledByOperator): no driver resumes a cancelled apply, and
+	// no deploy request exists yet to tear the branch down.
+	ownedBranch := ""
+	defer func() {
+		if retErr == nil || ownedBranch == "" {
+			return
+		}
+		cancelledByOperator := engine.CancelledByOperator(ctx)
+		if ctx.Err() != nil && recordedBranch == ownedBranch && !cancelledByOperator {
+			e.applyLogger(req).Info("drive ended before the deploy request was created; keeping the branch for the driver that resumes the apply",
+				"organization", org, "planetscale_database", req.Database, "branch", ownedBranch, "apply_error", retErr)
+			return
+		}
+		// A branch the stored state names stays resumable until the delete
+		// lands, so its delete follows the drive's context; one it does not
+		// name, or one whose apply an operator cancelled, is deleted even
+		// after the drive's context ends.
+		deleteCtx := ctx
+		if recordedBranch != ownedBranch || cancelledByOperator {
+			deleteCtx = context.WithoutCancel(ctx)
+		}
+		e.deleteOwnedBranch(deleteCtx, e.applyLogger(req), client, org, req.Database, ownedBranch, retErr)
+	}()
+
+	// Once the deploy request exists, an apply that fails before its deploy
+	// begins leaves the deploy request open and deployable, and its
+	// auto_delete_branch never fires, so the branch stays against quota. A
+	// failure, as opposed to a drive whose context ended, settles the apply
+	// failed and no driver comes back for it, so the deploy request is closed
+	// and the branch SchemaBot created for it deleted. A drive whose context
+	// ended is handing the apply back (or an operator's cancel is retiring the
+	// deploy request through the engine's Cancel), so the deploy request is
+	// left to whoever takes it over. The apply is not settled failed until this
+	// drive returns, and a drive that loses its lease during the cleanup is
+	// handed back like any other, so the cleanup runs under the drive's context
+	// and stops at the first sign of it ending rather than closing or deleting
+	// what a successor resumes against.
+	//
+	// A deploy whose outcome is unknown (engine.OutcomeUnknownError) is not
+	// retired either: the deploy call failed without a refusal, no read of the
+	// deploy request can show its deploy did not start, and recovery re-reads
+	// this same deploy request, so it and its branch are left in place.
+	//
+	// A drive whose context ends after the close has landed but before the
+	// failure is recorded hands the apply back with stored state naming a
+	// deploy request that is now closed and never deployed. A successor that
+	// reads it as ready reattaches to it as closed before deploying, and
+	// Progress settles the apply as cancelled, not as the failure that caused
+	// the close; one that reads it as refused (error) reports the refusal as
+	// the apply's failure. The closed deploy request deployed nothing, so the
+	// target is safe either way; only the ready case's verdict differs from
+	// the failure that caused the close.
+	//
+	// A deploy whose outcome is unknown is not retired either: the apply pauses
+	// for a recovery that re-reads this deploy request and deploys it only if
+	// it still reads ready, and the deploy may already be starting, so closing
+	// it would undo the recovery and could race the deploy.
+	//
+	// createdDeployRequest names the deploy request; deployRequestBranch is the
+	// branch it took over from ownedBranch, empty for an operator-supplied one.
+	var createdDeployRequest uint64
+	var deployRequestBranch string
+	defer func() {
+		if retErr == nil || createdDeployRequest == 0 {
+			return
+		}
+		if ctx.Err() != nil {
+			// A deploy request no landed save names is still found by a resume
+			// from the branch the stored state names, which adopts the open
+			// deploy request it finds there; nothing else can find it.
+			switch {
+			case recordedDeployRequest == createdDeployRequest:
+				e.applyLogger(req).Info("drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			case recordedBranch == branchName && !engine.CancelledByOperator(ctx):
+				e.applyLogger(req).Info("drive ended after the deploy request was created, but no save naming it landed; the driver that resumes the apply finds it open on the branch and adopts it",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			default:
+				e.applyLogger(req).Warn("drive ended after the deploy request was created, but no save naming it landed and no driver resumes the apply from its branch; close it by hand",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			}
+			return
+		}
+		if engine.IsOutcomeUnknown(retErr) {
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, branchName, retErr)
+			return
+		}
+		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
+	}()
 
 	if existingBranch != "" {
 		// Reuse existing branch: wait for ready, refresh schema from main, wait again
@@ -149,7 +332,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 
 		// Wait for branch to be ready (may be initializing from a prior create)
-		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for branch %s: %w", branchName, err)
 		}
 
@@ -163,7 +346,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 
 		// Wait for sync to complete
-		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for schema refresh %s: %w", branchName, err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
@@ -175,7 +358,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 
 	} else {
 		// Create a new branch
-		branchName = generateBranchName(req.Database, req.PlanID)
+		branchName = GenerateBranchName(req.Database, req.PlanID)
 		persistState(&psMetadata{BranchName: branchName})
 		emitEvent(engine.ApplyEvent{
 			Message:  fmt.Sprintf("Creating branch %s", branchName),
@@ -187,9 +370,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		if err != nil {
 			return nil, fmt.Errorf("create branch: %w", err)
 		}
+		ownedBranch = branchName
 
 		// Wait for branch to be ready
-		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for branch: %w", err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
@@ -209,7 +393,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		Database:     req.Database,
 		Branch:       branchName,
 		Role:         "admin",
-		TTL:          3600,
+		TTL:          branchPasswordTTL(len(req.SchemaFiles)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create branch password: %w", err)
@@ -255,7 +439,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// PlanetScale API which may return stale data after UpdateKeyspaceVSchema.
 	// Retry up to 30s to allow the API to converge.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, password); err != nil {
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, ignored, password); err != nil {
 		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
@@ -275,20 +459,21 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// The server computes the schema diff asynchronously — poll until the deploy
 	// request transitions from "pending" to "ready" (or "no_changes"/"error").
 	drStart := time.Now()
-	autoDeleteBranch := existingBranch == "" // don't delete reused branches
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, !deferCutover, autoDeleteBranch)
+	autoDeleteBranch := deployRequestDeletesBranch(req.Options)
+	e.logger.Info("creating deploy request",
+		"database", req.Database,
+		"branch", branchName,
+		"auto_delete_branch", autoDeleteBranch,
+	)
+	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, autoDeleteBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
-	emitEvent(engine.ApplyEvent{
-		Message: fmt.Sprintf("Deploy request #%d created, validating...", dr.Number),
-		Metadata: map[string]string{
-			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-			"deploy_request_url": dr.HtmlURL,
-			"branch":             branchName,
-		},
-		NewState: state.Apply.ValidatingDeployRequest,
-	})
+	// The deploy request now owns the branch's teardown.
+	createdDeployRequest = dr.Number
+	deployRequestBranch = ownedBranch
+	ownedBranch = ""
+	emitEvent(deployRequestCreatedEvent(dr, branchName))
 	persistState(&psMetadata{
 		BranchName:            branchName,
 		DeployRequestID:       dr.Number,
@@ -296,7 +481,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		VSchemaDiffs:          vschemaDiffs,
 		ExistingMigrationCtxs: existingContexts,
 	})
-	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -313,16 +498,23 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			Message:  fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number),
 			Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
 		})
-		return noChangesApplyResult("no changes detected"), nil
+		return e.noChangesApplyResult(req, org, "no changes detected", migCtx, &psMetadata{
+			BranchName:            branchName,
+			DeployRequestID:       dr.Number,
+			DeployRequestURL:      dr.HtmlURL,
+			VSchemaDiffs:          vschemaDiffs,
+			ExistingMigrationCtxs: existingContexts,
+		})
 	}
 
 	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
 	// it as eligible — instant DDL modifies metadata only (no row copy), so it
 	// completes immediately and has no revert window regardless of skip_revert.
-	// Instant DDL is orthogonal to defer flags — the mechanism (instant vs row copy)
-	// is independent of when the deploy executes.
+	// Because there is no revert window, an unsafe change always takes the
+	// row-copy path instead.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
 
 	// Log the raw deploy request fields for debugging instant DDL detection.
 	if dr.Deployment != nil {
@@ -347,18 +539,24 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		"use_instant", useInstant,
 		"defer_cutover", deferCutover,
 		"defer_deploy", deferDeploy,
+		"unsafe", unsafe,
 		"deploy_state", dr.DeploymentState,
 	)
 
-	// Log when --defer-cutover has no effect for instant DDL
-	if deferCutover && useInstant {
-		e.logger.Info("--defer-cutover has no effect for instant DDL",
-			"database", req.Database,
-			"deploy_request", dr.Number,
-		)
-		emitEvent(engine.ApplyEvent{
-			Message: "Note: --defer-cutover has no effect for instant DDL",
-		})
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+				"reason", unsafeReason,
+			)
+		} else {
+			e.logger.Info("declining instant DDL so the deferred cutover has a gate to hold",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+			)
+		}
+		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
 	}
 
 	drElapsed := time.Since(drStart).Round(time.Second)
@@ -375,13 +573,19 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		},
 	})
 
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
 	// Deferred deploy: don't call DeployDeployRequest yet. The user will review
 	// the deploy request diff on PlanetScale and trigger via `schemabot cutover`.
 	if deferDeploy {
 		e.logger.Info("deferring deploy — user must trigger via cutover",
 			"database", req.Database,
 			"deploy_request", dr.Number,
-			"instant_eligible", useInstant,
+			"use_instant", useInstant,
 		)
 		meta, encErr := encodePSMetadata(&psMetadata{
 			BranchName:            branchName,
@@ -410,38 +614,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Deploy (starts the schema change). PlanetScale may still be validating
-	// the deploy request even after reporting "ready", so retry on transient
-	// validation errors.
-	drNumber := dr.Number
-	var deployErr error
-	for attempt := range maxRetries {
-		if attempt > 0 {
-			delay := retryDelay(attempt, deployErr)
-			e.logger.Warn("retrying deploy request", "deploy_request", drNumber, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", deployErr)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-		dr, deployErr = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-			Organization: org,
-			Database:     req.Database,
-			Number:       drNumber,
-			InstantDDL:   useInstant,
-		})
-		if deployErr == nil {
-			break
-		}
-		if strings.Contains(deployErr.Error(), "approved") {
-			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", drNumber)
-		}
-		if !isRetryablePSError(deployErr) {
-			return nil, fmt.Errorf("deploy deploy request #%d: %w", drNumber, deployErr)
-		}
-	}
-	if deployErr != nil {
-		return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", drNumber, maxRetries, deployErr)
+	// the deploy request even after it leaves the pending state, and transient
+	// API errors may occur; deployDeployRequest absorbs both.
+	deployNumber := dr.Number
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, deployNumber, useInstant, emitEvent)
+	if err != nil {
+		return nil, e.unknownDeployOutcomeNeedsRecord(err, recordedDeployRequest == deployNumber, req.Database, deployNumber)
 	}
 
 	emitEvent(engine.ApplyEvent{
@@ -510,7 +688,7 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 	g.SetLimit(maxConcurrentKeyspaces)
 	for _, sc := range changes {
 		g.Go(func() error {
-			if err := e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
+			if err := e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName, safeEmit); err != nil {
 				return err
 			}
 			n := int(applied.Add(1))
@@ -525,8 +703,13 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 }
 
 // applyKeyspaceChanges applies VSchema and DDL for a single keyspace with retries.
-// Uses longer backoff when PlanetScale reports a schema snapshot is in progress.
-func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
+// A transient failure is retried until maxRetries of them occur in a row. A
+// rejection because PlanetScale is taking a schema snapshot of the branch is
+// retried with a longer backoff for up to snapshotRetryWait from the first such
+// rejection: a snapshot of a large sharded branch can outlast any small attempt
+// count, and it clears on its own. The two budgets are independent, so a
+// snapshot rejection between transient failures starts their count again.
+func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(engine.ApplyEvent)) error {
 	start := time.Now()
 	e.logger.Info(fmt.Sprintf("applying changes to keyspace %s on branch %s", sc.Namespace, branchName),
 		"keyspace", sc.Namespace,
@@ -535,37 +718,76 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		"branch", branchName,
 	)
 
-	maxAttempts := maxRetries
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			delay := retryDelay(attempt, lastErr)
-			e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
+	var snapshotSince time.Time
+	transientFailures := 0
+	for attempt := 1; ; attempt++ {
+		err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName)
+		if err == nil {
+			e.logger.Info(fmt.Sprintf("keyspace %s changes applied (%s)", sc.Namespace, time.Since(start).Round(time.Second)), "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
+			return nil
+		}
+		lastErr = err
+		e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt), "keyspace", sc.Namespace, "database", database, "branch", branchName, "attempt", attempt, "error", err)
+		if !isRetryableEngineError(err) {
+			return engine.NewPermanentError("apply keyspace %s: %w", sc.Namespace, err)
 		}
 
-		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
-			lastErr = err
-			e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt+1), "keyspace", sc.Namespace, "database", database, "branch", branchName, "attempt", attempt+1, "error", err)
-			if !isRetryableEngineError(err) {
-				return engine.NewPermanentError("apply keyspace %s: %w", sc.Namespace, err)
+		delay := retryDelay(attempt, lastErr)
+		var reason string
+		if isSnapshotInProgress(err) {
+			if snapshotSince.IsZero() {
+				snapshotSince = time.Now()
 			}
-			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
-				maxAttempts = maxSnapshotRetries
-				e.logger.Info("schema snapshot in progress, extending retries",
-					"keyspace", sc.Namespace, "max_attempts", maxAttempts)
+			transientFailures = 0
+			left := snapshotRetryWait - time.Since(snapshotSince)
+			if delay > left {
+				return fmt.Errorf("apply keyspace %s: PlanetScale was still taking a schema snapshot of branch %s after %s (%d attempts): %w", sc.Namespace, branchName, snapshotRetryWait, attempt, lastErr)
 			}
-			continue
+			reason = snapshotRetryReason(left)
+		} else {
+			transientFailures++
+			if transientFailures >= maxRetries {
+				return fmt.Errorf("apply keyspace %s (after %d transient failures in a row, %d attempts in all): %w", sc.Namespace, transientFailures, attempt, lastErr)
+			}
+			reason = transientRetryReason(maxRetries - transientFailures)
 		}
-		e.logger.Info(fmt.Sprintf("keyspace %s changes applied (%s)", sc.Namespace, time.Since(start).Round(time.Second)), "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
-		return nil
+
+		e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
+		emitEvent(keyspaceRetryEvent(sc.Namespace, branchName, attempt+1, delay, reason))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
 	}
-	finalErr := fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
-	return finalErr
+}
+
+// keyspaceRetryEvent puts a keyspace retry on the apply's timeline. A schema
+// snapshot can defer a keyspace's changes for minutes, and saying so is what
+// tells an operator, and the driver, that the apply is waiting rather than
+// wedged. The reason is a fixed phrase: the raw error stays in the server log.
+func keyspaceRetryEvent(keyspace, branch string, attempt int, delay time.Duration, reason string) engine.ApplyEvent {
+	return engine.ApplyEvent{
+		Message:  fmt.Sprintf("Retrying keyspace %s on branch %s in %s (attempt %d): %s", keyspace, branch, delay.Round(time.Second), attempt, reason),
+		Metadata: map[string]string{"keyspace": keyspace, "branch": branch},
+	}
+}
+
+// snapshotRetryReason says how much of the snapshot window is left, so a retry
+// late in the window does not read as though the whole window were still ahead.
+func snapshotRetryReason(left time.Duration) string {
+	return fmt.Sprintf("PlanetScale is taking a schema snapshot of the branch, retrying for up to %s more", left.Round(time.Second))
+}
+
+// transientRetryReason says how many more transient failures in a row the
+// keyspace can take before it fails.
+func transientRetryReason(left int) string {
+	retries := "times"
+	if left == 1 {
+		retries = "time"
+	}
+	return fmt.Sprintf("the previous attempt failed with a transient error, retrying up to %d more %s; see server logs", left, retries)
 }
 
 // applyKeyspaceChangesOnce applies VSchema and DDL for a single keyspace in one attempt.
@@ -597,7 +819,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 	}
 	dsn := mysqlCfg.FormatDSN()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("open branch connection for %s: %w", sc.Namespace, err)
 	}
@@ -655,70 +877,198 @@ func (e *Engine) updateBranchVSchema(ctx context.Context, client psclient.PSClie
 	return nil
 }
 
-// diffBranchForResume fetches the working branch's current schema and diffs it
-// against the desired schema to find DDL that wasn't applied before the crash.
-func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClient, org, database, branch string, schemaFiles schema.SchemaFiles) ([]engine.SchemaChange, error) {
-	currentSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branch, sortedKeyspaces(schemaFiles))
-	if err != nil {
-		return nil, fmt.Errorf("fetch branch schema: %w", err)
-	}
-
-	var changes []engine.SchemaChange
+// diffBranchForResume diffs the working branch's current schema against the
+// desired schema, keyed by keyspace. The result is what the branch differs by,
+// not what the resume may run: remainingPlannedChanges bounds it by the plan.
+func (e *Engine) diffBranchForResume(currentSchema map[string][]table.TableSchema, schemaFiles schema.SchemaFiles) (map[string][]engine.TableChange, error) {
+	diff := make(map[string][]engine.TableChange)
 	for _, keyspace := range sortedKeyspaces(schemaFiles) {
-		ns := schemaFiles[keyspace]
-
-		// Build current table schemas from branch
-		var currentTableSchemas []table.TableSchema
-		if tables, ok := currentSchema[keyspace]; ok {
-			currentTableSchemas = append(currentTableSchemas, tables...)
-		}
-
-		// Build desired table schemas from files
-		desiredTableSchemas, err := parseDesiredSchemas(keyspace, ns)
+		desiredTableSchemas, err := parseDesiredSchemas(keyspace, schemaFiles[keyspace])
 		if err != nil {
 			return nil, err
 		}
 
-		// Diff: what DDL is needed to bring branch from current to desired?
-		plan, err := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+		plan, err := lint.PlanChanges(currentSchema[keyspace], desiredTableSchemas, nil, e.linter.SpiritConfig())
 		if err != nil {
 			return nil, fmt.Errorf("diff keyspace %s for resume: %w", keyspace, err)
-		}
-		if !plan.HasChanges() {
-			continue
-		}
-
-		sc := engine.SchemaChange{
-			Namespace: keyspace,
-			Metadata:  make(map[string]string),
 		}
 		for _, pc := range plan.Changes {
 			stmtType, _, classifyErr := ddl.ClassifyStatement(pc.Statement)
 			if classifyErr != nil {
 				return nil, fmt.Errorf("classify statement in keyspace %s: %w", keyspace, classifyErr)
 			}
-			sc.TableChanges = append(sc.TableChanges, engine.TableChange{
+			diff[keyspace] = append(diff[keyspace], engine.TableChange{
 				Table:     pc.TableName,
 				Operation: stmtType,
 				DDL:       pc.Statement,
 			})
 		}
-		changes = append(changes, sc)
 	}
-	return changes, nil
+	return diff, nil
 }
 
-// resumeApply resumes a schema change after restart.
-// Handles two crash scenarios:
-//   - Branch exists, no deploy request: diff branch against desired schema, apply remaining DDL, then create and deploy the deploy request
-//   - Branch exists, deploy request exists: reattach, deploy it when it was created but never started, and rediscover the Vitess migration_context for progress
-func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
-	meta, err := decodePSMetadata(req.ResumeState.Metadata)
+// unknownDeployOutcomeNeedsRecord returns the error a deploy of deploy request
+// number ended with. A deploy whose outcome is unknown can only be recovered by
+// re-reading the deploy request the stored resume state names, so when recorded
+// reports that the resume state does not name it, the error is made permanent:
+// a recovery would start the apply over and could deploy a second request
+// beside one that may be running.
+func (e *Engine) unknownDeployOutcomeNeedsRecord(err error, recorded bool, database string, number uint64) error {
+	if !engine.IsOutcomeUnknown(err) || recorded {
+		return err
+	}
+	e.logger.Error("deploy outcome is unknown and the resume state does not name the deploy request; failing the apply rather than pausing it for a recovery that could not find the deploy request",
+		"database", database, "deploy_request", number, "error", err)
+	return engine.NewPermanentError("deploy request #%d may have started, but the resume state does not name it for recovery: %w", number, err)
+}
+
+// saveResumeState records a resume milestone through OnStateChange, reporting
+// whether the save landed. A save that does not land costs only crash
+// recovery: the apply carries on, and the result it returns carries the same
+// state for the caller to store.
+func (e *Engine) saveResumeState(req *engine.ApplyRequest, rs *engine.ResumeState, milestone string) bool {
+	if req.OnStateChange == nil {
+		return false
+	}
+	if err := req.OnStateChange(rs); err != nil {
+		e.logger.Warn("resume state was not saved; the apply continues and returns the state with its result",
+			"database", req.Database, "milestone", milestone, "error", err)
+		return false
+	}
+	return true
+}
+
+// recordDeployRequestOnResume names the deploy request a resume created or
+// adopted in meta and saves it as the apply's resume state, reporting whether
+// the save landed. adopted is recorded with it, so a later drive that
+// recovers the deploy request knows it was not created by this engine and
+// reads back the settings it would otherwise rely on by construction. The
+// record carries what the fresh drive's does: the plan's VSchema diffs, so
+// the apply renders its VSchema change from stored state, and
+// existingContexts, the baseline of Vitess contexts the deploy's own context
+// is discovered against. A deploy that may already have started is recorded
+// with a nil baseline, since one captured now would hold its own context and
+// hide it from the reattach's discovery, which then selects without one.
+func (e *Engine) recordDeployRequestOnResume(req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, adopted bool, existingContexts map[string]MigrationContextTimestamps) (bool, error) {
+	meta.DeployRequestID = dr.Number
+	meta.DeployRequestURL = dr.HtmlURL
+	meta.DeployRequestAdopted = adopted
+	meta.VSchemaDiffs = vschemaDiffsFromChanges(req.Changes)
+	meta.ExistingMigrationCtxs = existingContexts
+	recordedMeta, err := encodePSMetadata(meta)
 	if err != nil {
-		return nil, fmt.Errorf("decode resume state: %w", err)
+		return false, fmt.Errorf("encode metadata for deploy request #%d on resume: %w", dr.Number, err)
+	}
+	return e.saveResumeState(req, &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         recordedMeta,
+	}, "deploy request opened on resume, before its diff is computed"), nil
+}
+
+// remainingPlannedChanges returns the planned changes a resumed branch still
+// needs: each planned table change whose table the branch still differs on,
+// with the DDL the plan approved, plus each keyspace whose planned VSchema
+// change still has to be written. VSchema writes overwrite the whole VSchema,
+// so re-sending one that already landed is harmless.
+//
+// A branch that differs on a table the plan does not change is refused. The
+// branch was cut from main to carry exactly the planned DDL, so such a
+// difference means main moved or the branch was touched, and running DDL for
+// it would apply a schema change nobody reviewed. For the same reason a
+// planned table is refused when what the branch still lacks on it is not the
+// reviewed DDL: a table change lands whole, so a planned table either already
+// matches or still needs exactly the planned statement, and anything else is a
+// change on that table nobody reviewed.
+func remainingPlannedChanges(planned []engine.SchemaChange, branchDiff map[string][]engine.TableChange, schemaFiles schema.SchemaFiles) ([]engine.SchemaChange, error) {
+	plannedDDL := make(map[string]map[string]string, len(planned))
+	for _, sc := range planned {
+		tables := make(map[string]string, len(sc.TableChanges))
+		for _, tc := range sc.TableChanges {
+			name, err := plannedTableName(sc.Namespace, tc)
+			if err != nil {
+				return nil, err
+			}
+			tables[name] = tc.DDL
+		}
+		plannedDDL[sc.Namespace] = tables
 	}
 
-	emitEvent := func(event engine.ApplyEvent) {
+	var unplanned, unreviewed []string
+	differing := make(map[string]map[string]bool, len(branchDiff))
+	for _, keyspace := range slices.Sorted(maps.Keys(branchDiff)) {
+		differing[keyspace] = make(map[string]bool, len(branchDiff[keyspace]))
+		for _, tc := range branchDiff[keyspace] {
+			reviewed, ok := plannedDDL[keyspace][tc.Table]
+			if !ok {
+				unplanned = append(unplanned, fmt.Sprintf("%s.%s", keyspace, tc.Table))
+				continue
+			}
+			if ddl.Canonicalize(tc.DDL) != ddl.Canonicalize(reviewed) {
+				unreviewed = append(unreviewed, fmt.Sprintf("%s.%s", keyspace, tc.Table))
+				continue
+			}
+			differing[keyspace][tc.Table] = true
+		}
+	}
+	if len(unplanned) > 0 {
+		return nil, engine.NewPermanentError("branch differs from the declared schema on tables the plan does not change (%s); refusing to run DDL outside the plan — re-plan and apply again",
+			strings.Join(unplanned, ", "))
+	}
+	if len(unreviewed) > 0 {
+		return nil, engine.NewPermanentError("branch still needs changes on planned tables that differ from the reviewed DDL (%s); refusing to run DDL outside the plan — re-plan and apply again",
+			strings.Join(unreviewed, ", "))
+	}
+
+	var remaining []engine.SchemaChange
+	for _, sc := range planned {
+		pending := engine.SchemaChange{Namespace: sc.Namespace, Metadata: sc.Metadata}
+		for _, tc := range sc.TableChanges {
+			name, err := plannedTableName(sc.Namespace, tc)
+			if err != nil {
+				return nil, err
+			}
+			if differing[sc.Namespace][name] {
+				pending.TableChanges = append(pending.TableChanges, tc)
+			}
+		}
+		if len(pending.TableChanges) == 0 && getVSchemaContent(sc, schemaFiles) == "" {
+			continue
+		}
+		remaining = append(remaining, pending)
+	}
+	return remaining, nil
+}
+
+// plannedTableName names the table a planned change targets, reading it from
+// the DDL when the change does not carry it.
+func plannedTableName(keyspace string, tc engine.TableChange) (string, error) {
+	if tc.Table != "" {
+		return tc.Table, nil
+	}
+	_, name, err := ddl.ClassifyStatement(tc.DDL)
+	if err != nil {
+		return "", fmt.Errorf("classify planned statement in keyspace %s: %w", keyspace, err)
+	}
+	if name == "" {
+		return "", fmt.Errorf("planned statement in keyspace %s names no table: %s", keyspace, tc.DDL)
+	}
+	return name, nil
+}
+
+// applyLogger returns the logger scoped to this schema change when the caller
+// supplied one, so a line about the apply carries the caller's triage identity
+// (apply id, repo, PR, environment), and the engine logger otherwise.
+func (e *Engine) applyLogger(req *engine.ApplyRequest) *slog.Logger {
+	if req.Logger != nil {
+		return req.Logger
+	}
+	return e.logger
+}
+
+// eventEmitter returns a closure that logs a lifecycle event and sends it to
+// the caller for apply_logs recording.
+func (e *Engine) eventEmitter(req *engine.ApplyRequest) func(engine.ApplyEvent) {
+	return func(event engine.ApplyEvent) {
 		attrs := []any{"database", req.Database}
 		for k, v := range event.Metadata {
 			attrs = append(attrs, k, v)
@@ -728,6 +1078,35 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			req.OnEvent(event)
 		}
 	}
+}
+
+// rowCopyDeclineEvent is the operator-facing event for an instant-eligible
+// change that takes the row-copy path instead. It states the trade the decline
+// bought, since the operator otherwise sees only that an eligible change took
+// the slow path. Unsafety outranks the deferred cutover as the stated reason:
+// it declines instant DDL even when nothing was deferred.
+func rowCopyDeclineEvent(unsafe bool, unsafeReason string) engine.ApplyEvent {
+	if unsafe {
+		return engine.ApplyEvent{
+			Message: fmt.Sprintf("Deploying with a row copy rather than instant DDL: %s. The row copy keeps a revert window open to undo the change.", unsafeReason),
+		}
+	}
+	return engine.ApplyEvent{
+		Message: "Deploying with a row copy rather than instant DDL: instant DDL swaps the schema as soon as the deploy runs, and this cutover was deferred.",
+	}
+}
+
+// resumeApply resumes a schema change after restart.
+// Handles two crash scenarios:
+//   - Branch exists, no deploy request recorded: diff branch against desired schema, apply remaining DDL, then adopt the deploy request already open on the branch or create one, and deploy it; an adopted one whose deploy may have started is reattached instead
+//   - Branch exists, deploy request exists: reattach, deploy it when it was created but never started, and rediscover the Vitess migration_context for progress
+func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest) (_ *engine.ApplyResult, retErr error) {
+	meta, err := decodePSMetadata(req.ResumeState.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("decode resume state: %w", err)
+	}
+
+	emitEvent := e.eventEmitter(req)
 
 	e.logger.Info("resuming apply",
 		"branch", meta.BranchName,
@@ -741,62 +1120,324 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 
 	// No deploy request yet — driver crashed after branch creation but before
 	// the deploy request was created. Diff the branch against desired schema
-	// to find DDL that wasn't applied before the crash, then apply only the
-	// missing changes.
+	// to find which planned changes the branch still lacks, then apply only
+	// those.
 	e.logger.Info("resuming from branch (no deploy request yet)", "branch", meta.BranchName)
 
-	// Check if the branch still exists — it may have been deleted by TTL
-	// between the crash and recovery. If so, start fresh.
-	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName); err != nil {
-		e.logger.Warn("branch no longer available on resume, starting fresh", "branch", meta.BranchName, "error", err)
-		req.ResumeState = nil
-		return e.Apply(ctx, req)
+	// The branch may have been deleted (by TTL, or by an operator) between the
+	// crash and recovery; only then does the resume start fresh. A cancelled
+	// drive or a wait that ran out says nothing about the branch, and starting
+	// fresh on either would create a branch the drive cannot finish preparing.
+	// The fresh drive keeps the apply's MigrationContext, as a first drive
+	// carries it, so the branch and deploy request it creates are saved for the
+	// next resume rather than left for no driver to find.
+	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
+		if ctx.Err() == nil && isNotFound(err) {
+			e.logger.Warn("branch no longer exists on resume, starting fresh", "branch", meta.BranchName, "error", err)
+			req.ResumeState = &engine.ResumeState{MigrationContext: req.ResumeState.MigrationContext}
+			return e.Apply(ctx, req)
+		}
+		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
 	}
 
-	// Diff branch's current state against desired to find un-applied DDL
-	remainingChanges, err := e.diffBranchForResume(ctx, client, org, req.Database, meta.BranchName, req.SchemaFiles)
+	// The branch exists and is ready. An earlier drive of this apply may have
+	// opened a deploy request on it and ended before a save naming it landed,
+	// so the first thing the resume does is find out: until the branch's open
+	// deploy requests have been listed and found empty, the branch may carry a
+	// deploy request whose deploy may be running, and no failure reclaims it.
+	// Once the listing has answered that none is open, nothing else owns the
+	// branch's teardown until the deploy request is created, so every exit
+	// from there to that point reclaims it. Once the deploy request exists it
+	// owns the teardown (auto_delete_branch) and the reclaim is disarmed. A
+	// create response lost to a timeout leaves the reclaim armed; deleting the
+	// branch is still safe there, for the reasons the fresh drive's cleanup in
+	// Apply gives.
+	//
+	// A resume that creates the deploy request and then fails before its
+	// deploy begins leaves it open and deployable exactly as a fresh drive
+	// would, so it retires the deploy request under the same rules as the
+	// fresh drive's cleanup in Apply: only after a failure, never after the
+	// drive's context ended, never after a deploy whose outcome is unknown,
+	// only while the deploy request reads as never deployed, and never deleting
+	// an operator-supplied branch. Only a deploy
+	// request this resume created or adopted is retired; one recovered from
+	// stored state is reattached by resumeExistingDeployRequest, which returns
+	// before this point.
+	//
+	// A deploy request the resume adopts, found open on the branch instead of
+	// created, is held from the moment it is found exactly as a created one:
+	// the branch is never reclaimed from under it. It is retired only when the
+	// branch is one SchemaBot generated for this apply. Even there the deploy
+	// request is not certainly this apply's: GenerateBranchName derives the
+	// name from the database and the plan alone, so another apply of the same
+	// plan, or a person, could have opened it. It is retired all the same,
+	// because the apply is failing on a branch SchemaBot created and the
+	// retirement closes only a deploy request that provably never deployed.
+	// On an operator-supplied branch the operator may have opened it, so it is
+	// left open rather than closed on their behalf. An adopted deploy request
+	// the resume refuses to deploy because it holds auto-cutover is left open
+	// with its branch on either kind of branch: whoever opened it chose that
+	// setting, and the refusal names it for them.
+	//
+	// An adopted deploy request whose deploy may already have started is
+	// handed to resumeExistingDeployRequest once it is recorded, and from then
+	// on that path owns its failure handling, exactly as for a deploy request
+	// recovered from stored state, so this cleanup does nothing for it
+	// (reattachedDeployRequest).
+	//
+	// heldDeployRequest names the deploy request this resume created or
+	// adopted; recordedDeployRequest names the one the stored resume state
+	// carries, once a save naming it has landed. A recorded deploy request is
+	// found by the driver or control operation that takes the apply over; an
+	// unrecorded one is still found by the driver that resumes the apply, which
+	// lists the branch's open deploy requests and adopts it, but not by an
+	// operator's cancel, which reads only the stored state.
+	var heldDeployRequest, recordedDeployRequest uint64
+	var adoptedDeployRequest bool
+	// adoptedDeployRequestRefused is set when the resume refuses to deploy the
+	// adopted deploy request because it holds auto-cutover.
+	var adoptedDeployRequestRefused bool
+	// reattachedDeployRequest is set once the adopted deploy request is handed
+	// to resumeExistingDeployRequest.
+	var reattachedDeployRequest bool
+	// branchMayCarryDeployRequest is cleared once the branch's open deploy
+	// requests have been listed and none was found.
+	branchMayCarryDeployRequest := true
+	// branchCarriesDeployRequests is set when the branch has more open deploy
+	// requests than the resume can choose between; they carry the branch, so it
+	// is not reclaimed.
+	var branchCarriesDeployRequests bool
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if reattachedDeployRequest {
+			e.applyLogger(req).Info("resumed apply failed while reattached to the deploy request it adopted; the reattach handled the failure, so the deploy request and branch are left as it left them",
+				"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		if heldDeployRequest == 0 {
+			if branchCarriesDeployRequests {
+				e.applyLogger(req).Info("resumed apply failed on a branch with several open deploy requests; keeping the branch they carry",
+					"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "apply_error", retErr)
+				return
+			}
+			if branchMayCarryDeployRequest {
+				e.applyLogger(req).Info("resumed apply failed before it could tell whether the branch carries an open deploy request; keeping the branch in case one is deploying from it",
+					"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "apply_error", retErr)
+				return
+			}
+			e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, retErr)
+			return
+		}
+		if ctx.Err() != nil {
+			switch {
+			case recordedDeployRequest == heldDeployRequest:
+				e.applyLogger(req).Info("resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			case engine.CancelledByOperator(ctx):
+				e.applyLogger(req).Warn("resumed apply was cancelled after its deploy request was opened, but no save naming it landed, so the cancel cannot reach it; close it by hand",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			default:
+				e.applyLogger(req).Info("resumed drive ended after its deploy request was opened, but no save naming it landed; the driver that resumes the apply finds it open on the branch and adopts it",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			}
+			return
+		}
+		if engine.IsOutcomeUnknown(retErr) {
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, heldDeployRequest, meta.BranchName, retErr)
+			return
+		}
+		if adoptedDeployRequestRefused {
+			e.applyLogger(req).Warn("resumed apply refused to deploy the open deploy request it adopted because it holds auto-cutover; leaving it open with its branch, since whoever opened it chose that setting; close it in PlanetScale if it should not deploy",
+				"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		if adoptedDeployRequest && !deployRequestDeletesBranch(req.Options) {
+			e.applyLogger(req).Warn("resumed apply failed after adopting an open deploy request on the operator-supplied branch; leaving it open, since the operator may have opened it; close it in PlanetScale if it should not deploy",
+				"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		ownedBranch := ""
+		if deployRequestDeletesBranch(req.Options) {
+			ownedBranch = meta.BranchName
+		}
+		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, heldDeployRequest, ownedBranch, retErr)
+	}()
+
+	main := mainBranch(req.Credentials)
+
+	// An earlier drive of this apply may have opened the deploy request and
+	// ended before a save naming it landed, so the branch's open deploy
+	// requests are listed before any other work touches the branch. One open
+	// deploy request from it into main is adopted rather than joined by a
+	// second one; it is deployed only once the branch has been validated
+	// against the declared schema, as a created one is, and only after its
+	// auto-cutover setting has been read back, since this engine did not
+	// create it. Several open deploy requests are not chosen between, and a
+	// listing that fails does not fall back to creating one: either way the
+	// resume could open a duplicate deploy request on the branch. The failed
+	// listing pauses the apply rather than failing it, so the next drive lists
+	// again instead of leaving a deploy request that may be deploying with
+	// nothing tracking it.
+	open, err := e.openDeployRequests(ctx, client, org, req.Database, meta.BranchName, main)
+	if err != nil {
+		return nil, engine.NewOutcomeUnknownError("check branch %s for an open deploy request on resume: %w", meta.BranchName, err)
+	}
+	var adopted *ps.DeployRequest
+	switch len(open) {
+	case 0:
+		branchMayCarryDeployRequest = false
+	case 1:
+		adopted = open[0]
+		adoptedDeployRequest = true
+		heldDeployRequest = adopted.Number
+		e.logger.Info("adopting the open deploy request found on the branch on resume instead of creating another",
+			"organization", org,
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"deploy_request", adopted.Number,
+		)
+	default:
+		branchCarriesDeployRequests = true
+		numbers := make([]string, len(open))
+		for i, o := range open {
+			numbers[i] = fmt.Sprintf("#%d", o.Number)
+		}
+		e.logger.Warn("refusing to resume: the branch has several open deploy requests and SchemaBot will not choose which one deploys",
+			"organization", org,
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"deploy_requests", numbers,
+		)
+		return nil, engine.NewPermanentError("branch %s has %d open deploy requests into %s (%s), and SchemaBot will not choose which one deploys; close all of them in PlanetScale, then plan and apply again",
+			meta.BranchName, len(open), main, strings.Join(numbers, ", "))
+	}
+
+	// An adopted deploy request whose deploy may already have started is past
+	// what the rest of this path is built for: the branch's DDL is already
+	// being carried to main, so there is nothing left to apply or validate on
+	// the branch, and deploying it again would fail the apply over a schema
+	// change that is running. It is recorded, as a fresh drive records the
+	// deploy request it opens, and then reattached exactly as a recorded one
+	// is.
+	if adopted != nil && deployMayHaveStarted(adopted) {
+		saved, err := e.recordDeployRequestOnResume(req, meta, adopted, true, nil)
+		if err != nil {
+			return nil, err
+		}
+		if saved {
+			recordedDeployRequest = adopted.Number
+		}
+		reattachedDeployRequest = true
+		emitEvent(deployRequestAdoptedEvent(adopted, meta.BranchName, ""))
+		e.logger.Info("the adopted deploy request's deploy may already have started; reattaching to it instead of deploying it",
+			"organization", org,
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"deploy_request", adopted.Number,
+			"deployment_state", adopted.DeploymentState,
+			"deployed_at", formatDeployedAt(adopted.DeployedAt),
+		)
+		return e.resumeExistingDeployRequest(ctx, client, org, req, meta)
+	}
+
+	resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer resumePwCancel()
+	password, err := client.CreateBranchPassword(resumePwCtx, &ps.DatabaseBranchPasswordRequest{
+		Organization: org, Database: req.Database, Branch: meta.BranchName, Role: "admin", TTL: branchPasswordTTL(len(req.SchemaFiles)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create branch password on resume: %w", err)
+	}
+
+	// The branch schema is read over MySQL, not through the PlanetScale schema
+	// API: for a branch that has only just become ready the API can still
+	// report its keyspaces as missing, which would turn every existing table
+	// into a CREATE.
+	// Tables the plan was reviewed with ignore_tables withholding are left out,
+	// as the plan left them out.
+	keyspaces := sortedKeyspaces(req.SchemaFiles)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
+	}
+	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
+	if err != nil {
+		return nil, fmt.Errorf("fetch branch %s schema via MySQL on resume: %w", meta.BranchName, err)
+	}
+	branchDiff, err := e.diffBranchForResume(withoutIgnoredTables(branchSchema, ignored), req.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("diff branch for resume: %w", err)
 	}
+	remainingChanges, err := remainingPlannedChanges(req.Changes, branchDiff, req.SchemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
+	}
 
 	if len(remainingChanges) > 0 {
-		e.logger.Info("applying remaining DDL on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
-		resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer resumePwCancel()
-
-		password, err := client.CreateBranchPassword(resumePwCtx, &ps.DatabaseBranchPasswordRequest{
-			Organization: org, Database: req.Database, Branch: meta.BranchName, Role: "admin", TTL: 3600,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("create branch password on resume: %w", err)
-		}
+		e.applyLogger(req).Info("applying remaining planned changes on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
 		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
-			return nil, fmt.Errorf("apply remaining DDL on resume: %w", err)
+			return nil, fmt.Errorf("apply remaining changes on resume: %w", err)
 		}
 	} else {
-		e.logger.Info("all DDL already applied on branch", "branch", meta.BranchName)
+		e.applyLogger(req).Info("all planned changes already applied on branch", "branch", meta.BranchName)
 	}
 
-	// VSchema may not have been applied before the crash — re-apply
-	// (VSchema updates are idempotent, they overwrite the entire VSchema)
-	for _, sc := range req.Changes {
-		if vschemaContent := getVSchemaContent(sc, req.SchemaFiles); vschemaContent != "" {
-			if err := e.updateBranchVSchema(ctx, client, org, req.Database, meta.BranchName, sc.Namespace, vschemaContent); err != nil {
-				return nil, fmt.Errorf("update vschema for %s on resume: %w", sc.Namespace, err)
-			}
-		}
+	// The resumed branch must match the declared schema before a deploy request
+	// carries it to main, exactly as a fresh apply's branch must.
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, meta.BranchName, keyspaces, req.SchemaFiles, ignored, password); err != nil {
+		return nil, fmt.Errorf("branch validation failed on resume: %w", err)
 	}
+	emitEvent(engine.ApplyEvent{
+		Message:  "Branch schema validated — matches desired state",
+		Metadata: map[string]string{"branch": meta.BranchName},
+	})
 
 	// Create deploy request
-	main := mainBranch(req.Credentials)
-	deferCutover := req.Options["defer_cutover"] == "true"
 	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
 
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, !deferCutover, true)
-	if err != nil {
-		return nil, fmt.Errorf("create deploy request on resume: %w", err)
+	// The baseline of Vitess contexts is captured before the deploy is
+	// started, as the fresh path captures it before the deploy request exists,
+	// so the deploy's own context is never part of it.
+	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
+
+	// The branch has just been validated against the declared schema, so the
+	// deploy request adopted from it carries exactly what this resume would
+	// deploy. With none to adopt, the resume creates the deploy request the
+	// crashed drive never did, and makes the same teardown decision that drive
+	// would have made: a branch the operator supplied is never handed to the
+	// deploy request for deletion.
+	dr := adopted
+	if dr == nil {
+		autoDeleteBranch := deployRequestDeletesBranch(req.Options)
+		e.logger.Info("creating deploy request on resume",
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"auto_delete_branch", autoDeleteBranch,
+		)
+		dr, err = e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, autoDeleteBranch)
+		if err != nil {
+			return nil, fmt.Errorf("create deploy request on resume: %w", err)
+		}
+		heldDeployRequest = dr.Number
+		emitEvent(deployRequestCreatedEvent(dr, meta.BranchName))
 	}
-	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+	// Record the deploy request before waiting on it, as a fresh drive does,
+	// so a drive that ends during the wait leaves its successor resuming this
+	// deploy request rather than opening a second one on the same branch.
+	saved, err := e.recordDeployRequestOnResume(req, meta, dr, adoptedDeployRequest, existingContexts)
+	if err != nil {
+		return nil, err
+	}
+	if saved {
+		recordedDeployRequest = dr.Number
+	}
+	if adoptedDeployRequest {
+		emitEvent(deployRequestAdoptedEvent(dr, meta.BranchName, state.Apply.ValidatingDeployRequest))
+	}
+	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)
 	}
@@ -804,15 +1445,48 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("deploy request #%d failed on resume (state: %s)", dr.Number, dr.DeploymentState)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
-		return noChangesApplyResult("no changes detected on resume"), nil
+		return e.noChangesApplyResult(req, org, "no changes detected on resume", req.ResumeState.MigrationContext, meta)
 	}
 
-	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
-	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	// A deploy request this engine created holds auto-cutover off by
+	// construction; an adopted one was created by someone else, and its
+	// setting is only reported once its diff has settled, so it is read back
+	// here, before anything below can deploy it or record it as deferred.
+	if adoptedDeployRequest {
+		if err := e.verifyAdoptedDeployRequestHoldsCutover(ctx, client, org, req.Database, dr.Number); err != nil {
+			adoptedDeployRequestRefused = true
+			return nil, err
+		}
+	}
 
-	meta.DeployRequestID = dr.Number
-	meta.DeployRequestURL = dr.HtmlURL
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
+	// Deploy — prefer instant when eligible, unless the cutover was deferred or
+	// the change is unsafe, both of which need the row-copy path (the gate to
+	// hold, and the revert window to undo the change).
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL on resume because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+				"reason", unsafeReason,
+			)
+		} else {
+			e.logger.Info("declining instant DDL on resume so the deferred cutover has a gate to hold",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+			)
+		}
+		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
+	}
+
 	meta.IsInstant = useInstant
 
 	// Deferred deploy on resume: don't start the deploy yet.
@@ -822,12 +1496,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		if encErr != nil {
 			return nil, fmt.Errorf("encode metadata for deferred deploy on resume: %w", encErr)
 		}
-		if req.OnStateChange != nil {
-			req.OnStateChange(&engine.ResumeState{
-				MigrationContext: req.ResumeState.MigrationContext,
-				Metadata:         persistMeta,
-			})
-		}
+		e.saveResumeState(req, &engine.ResumeState{
+			MigrationContext: req.ResumeState.MigrationContext,
+			Metadata:         persistMeta,
+		}, "deferred deploy on resume")
 		suffix := ""
 		if useInstant {
 			suffix = " (instant DDL)"
@@ -846,22 +1518,21 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
 	}
-	if req.OnStateChange != nil {
-		req.OnStateChange(&engine.ResumeState{
-			MigrationContext: req.ResumeState.MigrationContext,
-			Metadata:         persistMeta,
-		})
+	if e.saveResumeState(req, &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         persistMeta,
+	}, "deploy request created on resume") {
+		recordedDeployRequest = dr.Number
 	}
 
-	// Capture the migration_context baseline before deploying so the new Vitess
-	// context can be identified once Vitess creates migrations for this deploy.
-	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
-
-	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-		Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: useInstant,
-	})
+	// Either save naming the deploy request lets recovery re-read it, so a
+	// deploy whose outcome is unknown pauses when the first save landed even
+	// if the second did not.
+	deployNumber := dr.Number
+	recorded := recordedDeployRequest == deployNumber
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, deployNumber, useInstant, emitEvent)
 	if err != nil {
-		return nil, fmt.Errorf("deploy on resume: %w", err)
+		return nil, fmt.Errorf("deploy on resume: %w", e.unknownDeployOutcomeNeedsRecord(err, recorded, req.Database, deployNumber))
 	}
 
 	migrationContext := e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts, dr.CreatedAt)
@@ -884,33 +1555,78 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 // resumeExistingDeployRequest resumes an apply whose deploy request was already
 // created before the crash. It reattaches to the recovered deploy request,
 // deploys it when the driver crashed after creation but before the deploy was
-// started, and rediscovers the Vitess migration_context so per-shard progress
-// keeps working for the rest of the apply.
-func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (*engine.ApplyResult, error) {
+// started, records the deferral when the operator deferred the deploy and the
+// driver stopped before recording it, and rediscovers the Vitess
+// migration_context so per-shard progress keeps working for the rest of the
+// apply.
+//
+// A retryable failure is wrapped with engine.ErrReattachFailed: the resume
+// never starts afresh, so the deploy request it failed on is still the one a
+// later resume reattaches to, and the caller pauses the apply on that basis. A
+// permanent failure, such as a deploy request that failed or cannot be found,
+// is the apply's outcome and is returned as it is, since the caller fails the
+// apply on it either way.
+func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (_ *engine.ApplyResult, retErr error) {
+	defer func() {
+		if engine.IsRetryable(retErr) {
+			retErr = fmt.Errorf("%w: %w", engine.ErrReattachFailed, retErr)
+		}
+	}()
 	dr, err := e.getDeployRequest(ctx, client, org, req.Database, meta.DeployRequestID)
 	if err != nil {
-		// Only a genuine not-found means the deploy request was cleaned up and the
-		// apply should start fresh. A transient API error must propagate so resume
-		// retries against the same deploy request — forking a fresh branch and
-		// deploy request here would start a duplicate schema change while the
-		// original is still in flight.
-		var psErr *ps.Error
-		if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
-			e.logger.Warn("deploy request not found on resume, starting fresh",
-				"database", req.Database, "deploy_request", meta.DeployRequestID, "error", err)
-			req.ResumeState = nil
-			return e.Apply(ctx, req)
+		// No error here starts the apply fresh: the deploy request this drive
+		// created may still be deploying, and a fresh apply would run a second
+		// schema change beside it. A not-found fails the apply; any other
+		// error propagates so the resume retries against the same deploy
+		// request.
+		if isDeployRequestNotFound(err) {
+			return nil, e.failRecoveredDeployRequestNotFound(req, meta, err)
 		}
 		return nil, fmt.Errorf("get deploy request #%d on resume: %w", meta.DeployRequestID, err)
 	}
 
-	// If the deploy request failed, start fresh with a new branch rather
-	// than resuming a broken deploy.
-	if dr.DeploymentState == deployState.Error || dr.DeploymentState == deployState.CompleteError {
-		e.logger.Warn("deploy request in error state on resume, starting fresh",
-			"database", req.Database, "deploy_request", meta.DeployRequestID, "state", dr.DeploymentState)
-		req.ResumeState = nil
-		return e.Apply(ctx, req)
+	// The deploy request ID is persisted before PlanetScale finishes computing
+	// the schema diff, so a driver that stopped inside that window recovers a
+	// request still in "pending". Wait it out exactly as the fresh path does:
+	// every decision below is taken against the settled state, and a request
+	// left in "pending" is never deployed by anyone.
+	if dr.DeploymentState == deployState.Pending {
+		e.logger.Info("recovered deploy request is still computing its schema diff, waiting before resuming",
+			"database", req.Database, "deploy_request", dr.Number)
+		dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, e.eventEmitter(req))
+		if err != nil {
+			if isDeployRequestNotFound(err) {
+				return nil, e.failRecoveredDeployRequestNotFound(req, meta, err)
+			}
+			return nil, fmt.Errorf("wait for recovered deploy request #%d on resume: %w", meta.DeployRequestID, err)
+		}
+	}
+
+	// A recovered deploy request that failed is this apply's failure, reported
+	// as the fresh path reports it. Starting fresh would not start clean: the
+	// fresh apply derives the same branch name and reuses the branch the failed
+	// request was cut from, so it would either fail on DDL that branch already
+	// carries, hiding the real failure, or deploy the change again without
+	// anyone asking for it.
+	if dr.DeploymentState == deployState.Error {
+		failure := e.failRecoveredDeployRequest(req, meta, dr, formatDeployRequestError(dr))
+		e.retireRecoveredRefusedDeployRequest(ctx, client, org, req, meta, dr, failure)
+		return nil, failure
+	}
+	if dr.DeploymentState == deployState.CompleteError {
+		return nil, e.failRecoveredDeployRequest(req, meta, dr,
+			fmt.Sprintf("deploy request #%d failed while deploying (state: %s)", dr.Number, dr.DeploymentState))
+	}
+
+	// A recovered request whose diff settled to no changes has nothing to
+	// deploy, reattach to, or record: the schema already matched. Return the
+	// same converged result the fresh and branch-resume paths return, instead of
+	// spending the context-discovery budget on a change that never ran.
+	if dr.DeploymentState == deployState.NoChanges {
+		e.logger.Info("recovered deploy request reports no changes on resume",
+			"database", req.Database, "deploy_request", dr.Number)
+		meta.DeployRequestURL = dr.HtmlURL
+		return e.noChangesApplyResult(req, org, "no changes detected on resume", req.ResumeState.MigrationContext, meta)
 	}
 
 	meta.DeployRequestURL = dr.HtmlURL
@@ -920,6 +1636,28 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	}
 
 	migrationContext := req.ResumeState.MigrationContext
+
+	// A deploy request closed before it was deployed — by a cancel or stop
+	// whose storage write was lost, or by an operator in the PlanetScale UI —
+	// still reads "ready", so without this check a non-deferred recovery would
+	// try to deploy it, be refused, and fail the apply with a message about a
+	// closed deploy request instead of reporting the cancellation. Nothing can
+	// deploy it any more, so reattach without deploying and let Progress report
+	// the cancelled outcome. No schema change ran, so there is no Vitess context
+	// to rediscover.
+	if deployRequestClosedUndeployed(dr) {
+		e.logger.Info("deploy request was closed before it was deployed; reattaching so progress reports the cancellation",
+			"database", req.Database, "deploy_request", dr.Number, "state", dr.DeploymentState,
+			"deferred_deploy", meta.DeferredDeploy)
+		return &engine.ApplyResult{
+			Accepted: true,
+			Message:  fmt.Sprintf("Deploy request #%d was closed before it was deployed", dr.Number),
+			ResumeState: &engine.ResumeState{
+				MigrationContext: migrationContext,
+				Metadata:         updatedMeta,
+			},
+		}, nil
+	}
 
 	// A non-deferred deploy request that crashed after creation but before being
 	// deployed sits in "ready" indefinitely: Progress maps "ready" to pending,
@@ -931,19 +1669,61 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	// resumes racing here could both decide to deploy. That read→call window is
 	// self-correcting: the provider accepts at most one deploy and rejects the
 	// loser, so a duplicate schema change is never started.
-	if deployRequestNeedsResumeDeploy(dr, meta) {
+	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
+
+	if deployRequestNeedsResumeDeploy(dr, meta, deferDeploy) {
+		// A recorded deploy request that an earlier drive adopted rather than
+		// created was opened by someone else, so its auto-cutover setting is
+		// not this engine's choice; it is read back here, as the adopting
+		// drive reads it before deploying.
+		if meta.DeployRequestAdopted {
+			if err := e.verifyAdoptedDeployRequestHoldsCutover(ctx, client, org, req.Database, dr.Number); err != nil {
+				return nil, err
+			}
+		}
+
+		// The cutover setting is settled when the deploy request is created and no
+		// later call can change it, so a recovered request has to be verified here
+		// for the same reason the fresh path verifies before deploying: this drive
+		// cannot know how the request it inherited was created. Deploying one whose
+		// cutover the backend still owns would let the schema swap itself, which is
+		// what the operator deferring the cutover asked to prevent.
+		if deferCutover {
+			if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+				return nil, err
+			}
+		}
+
+		// The instant decision is taken here, from the recovered request's own
+		// eligibility and this drive's inputs, exactly as the fresh path takes it
+		// once the request is ready. The record the stopped driver wrote carries
+		// no decision — the fresh path stores IsInstant only after the deploy
+		// starts — so there is nothing in stored metadata to inherit, and a
+		// decision read from it would always be "row copy". Re-taking it keeps
+		// the two recovered paths and the fresh path on one gate: instant DDL
+		// swaps the schema as the deploy runs, so it is declined while the
+		// operator holds the cutover and for an unsafe change that needs a
+		// revert window.
+		useInstant := e.decideRecoveredInstantDDL(req, dr, deferCutover, "deploy")
+		// Re-encode so stored state carries the decision this drive took:
+		// Progress reads IsInstant to shape per-table reporting, and a later
+		// consumer of the stored value must see what was actually deployed.
+		meta.IsInstant = useInstant
+		if updatedMeta, err = encodePSMetadata(meta); err != nil {
+			return nil, fmt.Errorf("encode metadata with the instant decision for deploy request #%d: %w", dr.Number, err)
+		}
+
 		e.logger.Info("deploying recovered deploy request that was never started",
-			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", meta.IsInstant)
+			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", useInstant)
 
 		// Capture the migration_context baseline before deploying so the new
 		// Vitess context can be identified after Vitess creates migrations.
 		existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-		deployed, deployErr := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-			Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: meta.IsInstant,
-		})
+		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant, e.eventEmitter(req))
 		if deployErr != nil {
-			return nil, fmt.Errorf("deploy recovered deploy request #%d on resume: %w", dr.Number, deployErr)
+			return nil, fmt.Errorf("recovered deploy request on resume: %w", deployErr)
 		}
 		dr = deployed
 
@@ -963,6 +1743,10 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 				Metadata:         updatedMeta,
 			},
 		}, nil
+	}
+
+	if deployRequestAwaitsDeferredDeployRecord(dr, meta, deferDeploy) {
+		return e.recordRecoveredDeferredDeploy(ctx, client, org, req, meta, dr, deferCutover)
 	}
 
 	// Reattach-only path: no deploy was started here. If the stored context is
@@ -1006,14 +1790,183 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	}, nil
 }
 
+// failRecoveredDeployRequest reports a recovered deploy request's failure as
+// the apply's own: it records the failure in the apply's events, as the fresh
+// path does when its deploy request fails, and returns it as a permanent error
+// because the deploy request will not leave its failed state.
+func (e *Engine) failRecoveredDeployRequest(req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, errMsg string) error {
+	e.applyLogger(req).Error("recovered deploy request failed; failing the apply rather than starting the schema change again",
+		"database", req.Database, "branch", meta.BranchName, "deploy_request", dr.Number, "state", dr.DeploymentState)
+	e.eventEmitter(req)(engine.ApplyEvent{
+		Message:  errMsg,
+		Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
+	})
+	return engine.NewPermanentError("%s", errMsg)
+}
+
+// retireRecoveredRefusedDeployRequest cleans up after a recovered deploy
+// request PlanetScale refused before it deployed, as the fresh path's cleanup
+// does when its own deploy request is refused: it closes the deploy request
+// and deletes the branch when SchemaBot owns it. A drive whose context has
+// ended leaves both to the driver that takes over the apply, and the cleanup
+// re-reads the deploy request and leaves it in place if a deploy may have
+// begun. A refused deploy request is the only failed state cleaned up here: a
+// complete_error one deployed, so its deploy request and branch are evidence
+// of a change that ran. A deploy request an earlier drive adopted on an
+// operator-supplied branch is left open, as the adopting drive's cleanup
+// leaves it: the operator may have opened it.
+func (e *Engine) retireRecoveredRefusedDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, failure error) {
+	if ctx.Err() != nil {
+		e.applyLogger(req).Info("resumed drive ended before cleaning up its refused deploy request; leaving the deploy request and branch to the driver that takes over the apply",
+			"organization", org, "planetscale_database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "apply_error", failure)
+		return
+	}
+	if meta.DeployRequestAdopted && !deployRequestDeletesBranch(req.Options) {
+		e.applyLogger(req).Warn("resumed apply failed on a refused deploy request an earlier drive adopted on the operator-supplied branch; leaving it open, since the operator may have opened it; close it in PlanetScale if it should not deploy",
+			"organization", org, "planetscale_database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "apply_error", failure)
+		return
+	}
+	ownedBranch := ""
+	if deployRequestDeletesBranch(req.Options) {
+		ownedBranch = meta.BranchName
+	}
+	e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, dr.Number, ownedBranch, failure)
+}
+
+// isDeployRequestNotFound reports whether err, from any read of a recorded
+// deploy request, is PlanetScale's not-found.
+func isDeployRequestNotFound(err error) bool {
+	var psErr *ps.Error
+	return errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound
+}
+
+// failRecoveredDeployRequestNotFound fails the apply on a recorded deploy
+// request PlanetScale reports as not found. Deploy requests are never
+// deleted, so the most likely cause is credentials that cannot see it, and
+// where the change stands is unknown. Failing rather than pausing is
+// deliberate: it gives the resume the verdict Progress gives a running drive
+// for the same read, so the apply's outcome does not depend on which of the
+// two reads the deploy request first. A credentials problem PlanetScale
+// reports as a permission error still pauses, as every other retryable read
+// does.
+func (e *Engine) failRecoveredDeployRequestNotFound(req *engine.ApplyRequest, meta *psMetadata, err error) error {
+	e.applyLogger(req).Error("deploy request not found on resume; failing the apply rather than starting a second schema change",
+		"database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
+	return engine.NewPermanentError("deploy request #%d not found on resume; check that the credentials can read it, then plan and apply again: %w", meta.DeployRequestID, err)
+}
+
 // deployRequestNeedsResumeDeploy reports whether a recovered deploy request must
 // be deployed during resume. This is the case only for a non-deferred deploy
 // request that finished PlanetScale's diff ("ready") but was never started —
 // the driver crashed between creating the deploy request and deploying it. A
 // deferred deploy is left for the operator-triggered deploy, and a request that
 // already has a DeployedAt timestamp is in flight and must not be re-deployed.
-func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool {
-	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && dr.DeployedAt == nil
+// The deferral is read from both the stored metadata and the operator's request:
+// the metadata flag is persisted only after the deploy request is created, so a
+// crash inside that window leaves a deferred apply whose stored metadata does not
+// yet say so, and the request the operator made is what settles it.
+func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
+	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && !deferDeploy && dr.DeployedAt == nil
+}
+
+// deployMayHaveStarted reports whether a deploy request may be past the states
+// the branch-resume path after creating a deploy request is built for: still
+// computing its diff (pending), ready to deploy, settled to no changes, or
+// refused (error), each with no deploy timestamp. Anything else — a deploy
+// timestamp, a deploy in flight or finished, a revert, or a state not known
+// here — may have started a deploy, and only resumeExistingDeployRequest,
+// which never deploys a request that is not ready, reattaches to it safely.
+func deployMayHaveStarted(dr *ps.DeployRequest) bool {
+	if dr.DeployedAt != nil {
+		return true
+	}
+	switch dr.DeploymentState {
+	case deployState.Pending, deployState.Ready, deployState.NoChanges, deployState.Error:
+		return false
+	default:
+		return true
+	}
+}
+
+// deployRequestAwaitsDeferredDeployRecord reports whether a recovered deploy
+// request belongs to a deferred deploy whose stored metadata does not yet say
+// so. The deferral is recorded only once the deploy request is ready, so a
+// driver that stopped before then leaves a ready, undeployed request the
+// operator asked to hold with metadata that reads as non-deferred. Until the
+// deferral is recorded, progress reports the apply as pending rather than
+// waiting for deploy, and the operator-triggered deploy is refused.
+func deployRequestAwaitsDeferredDeployRecord(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
+	return deferDeploy && !meta.DeferredDeploy && dr.DeploymentState == deployState.Ready && dr.DeployedAt == nil
+}
+
+// decideRecoveredInstantDDL takes the instant DDL decision for a deploy request
+// recovered on resume, through the same gate the fresh path uses once a request
+// is ready (useInstantDDL): instant only when PlanetScale reports the request
+// eligible, the operator did not defer the cutover, and the change is safe. When
+// an eligible request is declined, the reason is logged and announced on the
+// apply's timeline so the operator can see why the deploy took the row-copy
+// path. recoveredAs names the resume path in the log line.
+func (e *Engine) decideRecoveredInstantDDL(req *engine.ApplyRequest, dr *ps.DeployRequest, deferCutover bool, recoveredAs string) bool {
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL on the recovered deploy request because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database, "deploy_request", dr.Number, "recovered_as", recoveredAs, "reason", unsafeReason)
+		} else {
+			e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
+				"database", req.Database, "deploy_request", dr.Number, "recovered_as", recoveredAs)
+		}
+		e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
+	}
+	return useInstant
+}
+
+// recordRecoveredDeferredDeploy finishes what the fresh deferred path does once
+// its deploy request is ready and the driver that created it did not: it
+// verifies a deferred cutover is held, takes the instant DDL decision, and
+// durably records the deferral so progress reports waiting_for_deploy and the
+// operator-triggered deploy is accepted. The deploy itself is left to the
+// operator.
+func (e *Engine) recordRecoveredDeferredDeploy(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, deferCutover bool) (*engine.ApplyResult, error) {
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
+	useInstant := e.decideRecoveredInstantDDL(req, dr, deferCutover, "deferred deploy")
+
+	meta.DeployRequestURL = dr.HtmlURL
+	meta.IsInstant = useInstant
+	meta.DeferredDeploy = true
+	persistMeta, err := encodePSMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata for recovered deferred deploy request #%d: %w", dr.Number, err)
+	}
+	resumeState := &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         persistMeta,
+	}
+	if req.OnStateChange != nil {
+		e.saveResumeState(req, resumeState, fmt.Sprintf("recovered deferred deploy request #%d", dr.Number))
+	} else {
+		e.logger.Warn("recovered deferred deploy recorded only in the returned resume state: no OnStateChange callback",
+			"database", req.Database, "deploy_request", dr.Number)
+	}
+
+	e.logger.Info("recorded deferral on recovered deploy request — operator must trigger the deploy",
+		"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", useInstant)
+	suffix := ""
+	if useInstant {
+		suffix = " (instant DDL)"
+	}
+	return &engine.ApplyResult{
+		Accepted:    true,
+		Message:     fmt.Sprintf("Deploy request #%d ready%s — waiting for deploy", dr.Number, suffix),
+		ResumeState: resumeState,
+	}, nil
 }
 
 // resolveResumeSchemaChangeContext rediscovers the Vitess migration_context after a
@@ -1074,8 +2027,8 @@ func (e *Engine) persistResumeSchemaChangeContext(req *engine.ApplyRequest, migr
 	}
 	e.logger.Info("persisting rediscovered Vitess context on resume",
 		"database", req.Database, "context", migrationContext)
-	req.OnStateChange(&engine.ResumeState{
+	e.saveResumeState(req, &engine.ResumeState{
 		MigrationContext: migrationContext,
 		Metadata:         metadata,
-	})
+	}, "rediscovered Vitess context")
 }

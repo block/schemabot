@@ -214,6 +214,113 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.RevertWindow,
 		},
 		{
+			name: "post-copy phase surfaces when no table is copying",
+			tasks: []*storage.Task{
+				{State: state.Task.Checksumming},
+				{State: state.Task.Completed},
+			},
+			wantState: state.Task.Checksumming,
+		},
+		{
+			name: "queued work holds the apply in running over a sibling's checksum",
+			tasks: []*storage.Task{
+				{State: state.Task.Checksumming},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "queued work holds the apply in running over a sibling's drain",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CatchingUp},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "queued work holds the apply in running over a sibling's post-checksum",
+			tasks: []*storage.Task{
+				{State: state.Task.PostChecksum},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "a copying table dominates a sibling's post-copy phase",
+			tasks: []*storage.Task{
+				{State: state.Task.PostChecksum},
+				{State: state.Task.Running},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "least-advanced phase wins across mixed drains",
+			tasks: []*storage.Task{
+				{State: state.Task.CatchingUp},
+				{State: state.Task.PostChecksum},
+			},
+			wantState: state.Task.CatchingUp,
+		},
+		{
+			name: "a draining table holds the apply out of waiting_for_cutover",
+			tasks: []*storage.Task{
+				{State: state.Task.WaitingForCutover},
+				{State: state.Task.PostChecksum},
+			},
+			wantState: state.Task.PostChecksum,
+		},
+		{
+			name: "a draining sibling holds the apply out of cutting_over",
+			tasks: []*storage.Task{
+				{State: state.Task.CuttingOver},
+				{State: state.Task.CatchingUp},
+			},
+			wantState: state.Task.CatchingUp,
+		},
+		{
+			name: "queued work holds the apply in running over a sibling's cutover",
+			tasks: []*storage.Task{
+				{State: state.Task.CuttingOver},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "a rolling drive stays running while a table cuts over ahead of queued siblings",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CuttingOver},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "a concurrent drive stays running while a table cuts over ahead of a copying sibling",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CuttingOver},
+				{State: state.Task.Running},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "cutover surfaces once it is the least advanced active work",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CuttingOver},
+			},
+			wantState: state.Task.CuttingOver,
+		},
+		{
+			name: "a parked sibling does not hold a cutover back",
+			tasks: []*storage.Task{
+				{State: state.Task.WaitingForCutover},
+				{State: state.Task.CuttingOver},
+			},
+			wantState: state.Task.CuttingOver,
+		},
+		{
 			name: "running takes priority over revert_window",
 			tasks: []*storage.Task{
 				{State: state.Task.Running},

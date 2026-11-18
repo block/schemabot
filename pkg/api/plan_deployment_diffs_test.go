@@ -43,6 +43,13 @@ func twoDeploymentService(t *testing.T, eu, us *mockTernClient) *Service {
 	}, logger)
 }
 
+// productionMember names one rollout member of the testapp/production set. Both
+// deployments address the same target, so the deployment half is what
+// distinguishes them here.
+func productionMember(deployment string) routing.ExecutionTarget {
+	return routing.ExecutionTarget{Deployment: deployment, Target: "testapp"}
+}
+
 // productionTargets resolves the testapp/production deployment set the producer
 // tests exercise, so each PlanDeploymentDiffs call is given the same resolved
 // targets the rollup would pass in.
@@ -80,10 +87,10 @@ func alterUsersDiff(ddl string) *ternv1.PlanDiffResponse {
 	}
 }
 
-// With the reviewed primary plan supplied, the primary member of the rollup is
-// the reviewed plan itself (no redundant live-schema read of the primary), and
+// With the primary plan supplied, the primary member of the rollup is
+// the primary plan itself (no redundant live-schema read of the primary), and
 // only the non-primary deployments run PlanDiff. Results stay in rollout order.
-func TestPlanDeploymentDiffs_PrimaryReusesReviewedPlan(t *testing.T) {
+func TestPlanDeploymentDiffs_PrimaryReusesItsOwnPlan(t *testing.T) {
 	eu := &mockTernClient{}
 	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	svc := twoDeploymentService(t, eu, us)
@@ -102,12 +109,12 @@ func TestPlanDeploymentDiffs_PrimaryReusesReviewedPlan(t *testing.T) {
 		}},
 	}
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, productionMember("eu"), productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
 	assert.Equal(t, "eu", results[0].Deployment)
-	assert.Nil(t, eu.planDiffReq, "primary must reuse the reviewed plan, not re-diff")
+	assert.Nil(t, eu.planDiffReq, "primary must reuse the primary target's plan, not re-diff")
 	require.NoError(t, results[0].Err)
 	assert.Equal(t, primaryPlan.Changes, results[0].Changes)
 
@@ -119,18 +126,18 @@ func TestPlanDeploymentDiffs_PrimaryReusesReviewedPlan(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", results[1].Changes[0].TableChanges[0].Ddl)
 }
 
-// Without a reviewed plan, every deployment (including the primary) is diffed
+// Without the primary plan, every deployment (including the primary) is diffed
 // with PlanDiff.
 func TestPlanDeploymentDiffs_DiffsAllDeploymentsWhenNoPrimary(t *testing.T) {
 	eu := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, routing.ExecutionTarget{}, productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
-	require.NotNil(t, eu.planDiffReq, "primary must be diffed when no reviewed plan is supplied")
+	require.NotNil(t, eu.planDiffReq, "primary must be diffed when no primary target's plan is supplied")
 	require.NotNil(t, us.planDiffReq)
 	require.NoError(t, results[0].Err)
 	require.NoError(t, results[1].Err)
@@ -144,7 +151,7 @@ func TestPlanDeploymentDiffs_PerDeploymentErrorIsCaptured(t *testing.T) {
 	us := &mockTernClient{planDiffErr: errors.New("deployment unreachable")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, routing.ExecutionTarget{}, productionTargets(t, svc))
 	require.NoError(t, err, "a single deployment failure must not abort the rollup")
 	require.Len(t, results, 2)
 
@@ -206,11 +213,11 @@ func TestPlanDeploymentDiffs_PreservesShards(t *testing.T) {
 		}},
 	}
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, productionMember("eu"), productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
-	// The primary reuses the reviewed plan's shard set verbatim.
+	// The primary reuses the primary plan's shard set verbatim.
 	require.NoError(t, results[0].Err)
 	assert.Equal(t, primaryPlan.Shards, results[0].Shards)
 
@@ -223,7 +230,7 @@ func TestPlanDeploymentDiffs_PreservesShards(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `phone` varchar(32)", results[1].Shards[1].Changes[0].Ddl)
 }
 
-// If the reviewed plan's origin deployment no longer matches rollout index 0
+// If the primary plan's origin deployment no longer matches rollout index 0
 // (e.g. deployment_order changed between plan and rollup), reusing that plan as
 // the primary baseline would compare deployments against a plan built for a
 // different deployment. The producer must fail closed instead.
@@ -234,15 +241,15 @@ func TestPlanDeploymentDiffs_PrimaryDeploymentMismatchFailsClosed(t *testing.T) 
 
 	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
 
-	// targets[0] is "eu", but the reviewed plan was created against "us".
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "us", productionTargets(t, svc))
+	// targets[0] is "eu", but the primary plan was created against "us".
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, productionMember("us"), productionTargets(t, svc))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "primary invariant violated")
 	assert.Nil(t, eu.planDiffReq, "must fail before diffing any deployment")
 	assert.Nil(t, us.planDiffReq)
 }
 
-// A reviewed plan supplied without its origin deployment cannot be verified
+// The primary plan supplied without its origin deployment cannot be verified
 // against rollout index 0, so the producer fails closed rather than trusting
 // the positional assumption blindly.
 func TestPlanDeploymentDiffs_PrimaryPlanWithoutOriginFailsClosed(t *testing.T) {
@@ -252,7 +259,7 @@ func TestPlanDeploymentDiffs_PrimaryPlanWithoutOriginFailsClosed(t *testing.T) {
 
 	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
 
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "", productionTargets(t, svc))
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, routing.ExecutionTarget{}, productionTargets(t, svc))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no origin deployment")
 }
@@ -262,7 +269,7 @@ func TestPlanDeploymentDiffs_PrimaryPlanWithoutOriginFailsClosed(t *testing.T) {
 func TestPlanDeploymentDiffs_NoTargetsError(t *testing.T) {
 	svc := twoDeploymentService(t, &mockTernClient{}, &mockTernClient{})
 
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", nil)
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, routing.ExecutionTarget{}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no deployment targets")
 }

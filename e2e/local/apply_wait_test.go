@@ -92,7 +92,7 @@ func applyTimeoutDiagnostics(applyID string) string {
 	if dsn == "" {
 		return "diagnostics: E2E_MYSQL_DSN not set"
 	}
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return fmt.Sprintf("diagnostics: open schemabot db: %v", err)
 	}

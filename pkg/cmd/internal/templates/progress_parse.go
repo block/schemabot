@@ -1,18 +1,15 @@
 package templates
 
 import (
-	"math"
-	"regexp"
-	"strconv"
+	"log/slog"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
-
-// spiritProgressPattern matches the row-copy prefix of a Spirit progress
-// string, e.g. "71436/221193 32.30% copyRows". The ETA is carried separately as
-// a structured field, so it is not parsed out of this string.
-var spiritProgressPattern = regexp.MustCompile(`(\d+)/(\d+)\s+([\d.]+)%\s+(\w+)`)
 
 // ProgressData contains data for rendering schema change progress.
 type ProgressData struct {
@@ -26,6 +23,10 @@ type ProgressData struct {
 	ErrorMessage   string
 	StartedAt      string // RFC3339 format
 	CompletedAt    string // RFC3339 format
+	Step           int
+	StepsTotal     int
+	Statement      string
+	BuildWork      apitypes.BuildWork
 	Operations     []ProgressOperation
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
@@ -34,28 +35,54 @@ type ProgressData struct {
 	// deployment that failed under on_failure=pause no longer holds later
 	// deployments. Apply-level: it applies to every operation of the apply.
 	Released bool
+	// Sharded is true when the apply is one change fanned out across its
+	// keyspaces' shards, its tables already rolled up across them, so it
+	// renders as one change, the way its PR comments do, however many shard
+	// and finalizer rows it has.
+	Sharded bool
+}
+
+// RendersOperationSections reports whether progress renders a section per
+// operation: an apply with more than one operation does, unless it is a
+// sharded apply, which reads as one change.
+func RendersOperationSections(ops []ProgressOperation, sharded bool) bool {
+	return len(ops) > 1 && !sharded
 }
 
 // ProgressOperation represents progress for one deployment operation.
 type ProgressOperation struct {
 	Deployment          string
+	OperationKey        string
 	ExternalID          string
 	ExternalOperationID string
+	OperationKind       string
 	Target              string
 	State               string
 	CutoverPolicy       string
 	OnFailure           string
 	ErrorMessage        string
 	ErrorCode           string
-	StartedAt           string
-	CompletedAt         string
+	AlreadyConverged    bool
+	// EndedBy names the operation whose end stopped this one at the cutover,
+	// when the operation was failed for it rather than on its own.
+	EndedBy *presentation.OperationRef
+	// RolloutStep is the table step the operation runs when the rollout runs
+	// table by table, and 0 otherwise.
+	RolloutStep int
+	StartedAt   string
+	CompletedAt string
 }
 
 // TableProgress represents progress for a single table schema change.
 type TableProgress struct {
-	TableName       string
-	Deployment      string
+	TableName  string
+	Deployment string
+	// Target is the address within Deployment this table's copy ran against. One
+	// deployment can address several targets, each copying the same table
+	// separately, so a section scoped to a deployment alone would merge them.
+	Target          string
 	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
+	Dialect         schema.Dialect
 	ChangeType      string // create, alter, drop
 	DDL             string
 	Status          string
@@ -63,13 +90,50 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
+	// EstimatedRows is the table's row count when it was planned, shown while
+	// the table is queued and before the engine reports RowsTotal. Nil when
+	// the plan had no estimate.
+	EstimatedRows *int64
+	// RowsTotalPlanned marks a RowsTotal rolled up across targets that
+	// includes the plan's estimate for targets that have not reported their
+	// copy yet, so the total renders as approximate.
+	RowsTotalPlanned bool
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
+	PlannedShards int
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	IsInstant           bool
-	ProgressDetail      string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
-	Shards              []ShardProgress
+	// The engine's throttler is pausing this table's active phase (row copy
+	// or checksum verify). ThrottleReason names the signal for display and is
+	// empty when Throttled is false.
+	Throttled      bool
+	ThrottleReason string
+	IsInstant      bool
+	// Shards is the table's per-part progress: one entry per shard, or one per
+	// target when AcrossTargets is set.
+	Shards []ShardProgress
+	// AcrossTargets marks a table that stands for one change across a
+	// rollout's targets, rolled up the way a sharded table rolls up its shards.
+	AcrossTargets bool
+	// OnTargets names the targets a rolled-up table's DDL runs on when they
+	// are only some of the deployment's, shown above the DDL. Empty when the
+	// DDL runs on every target.
+	OnTargets string
+	// RolloutSettled marks a rolled-up table whose rollout has settled with no
+	// target left to run, so a target still pending on it never starts it and
+	// reads as not started rather than queued.
+	RolloutSettled bool
+	// Resuming marks a table of a resuming apply. While no target has moved
+	// it on from where the stop left it (presentation.AwaitingResume), its
+	// stopped progress is from before the stop and whether the copy continues
+	// from its checkpoint is not known yet, so it reads as resuming without a
+	// percent.
+	Resuming bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -81,51 +145,15 @@ type ShardProgress struct {
 	ETASeconds      int64
 	PercentComplete int
 	CutoverAttempts int
-}
-
-// ShardCounts holds aggregated shard status counts.
-type ShardCounts struct {
-	Total             int
-	Complete          int
-	Running           int
-	WaitingForCutover int
-	CuttingOver       int
-	Queued            int
-	Failed            int
-	Cancelled         int
-}
-
-// SpiritProgressInfo contains parsed Spirit progress information.
-type SpiritProgressInfo struct {
-	RowsCopied int64
-	RowsTotal  int64
-	Percent    int
-	State      string // "copyRows", "checksum", etc.
-}
-
-// ParseSpiritProgress parses a Spirit progress string like "71436/221193 32.30% copyRows ETA TBD"
-// Returns nil if the string cannot be parsed.
-func ParseSpiritProgress(progress string) *SpiritProgressInfo {
-	if progress == "" {
-		return nil
-	}
-
-	matches := spiritProgressPattern.FindStringSubmatch(progress)
-	if len(matches) < 5 {
-		return nil
-	}
-
-	rowsCopied, _ := strconv.ParseInt(matches[1], 10, 64)
-	rowsTotal, _ := strconv.ParseInt(matches[2], 10, 64)
-	percentFloat, _ := strconv.ParseFloat(matches[3], 64)
-	state := matches[4]
-
-	return &SpiritProgressInfo{
-		RowsCopied: rowsCopied,
-		RowsTotal:  rowsTotal,
-		Percent:    int(math.Round(percentFloat)),
-		State:      state,
-	}
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// target's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a target in a table rolled up
+	// across targets whose copy is still ahead and has reported no row total,
+	// standing in for its rows in the rolled-up total
+	// (TableProgress.RowsTotalPlanned). Nil otherwise.
+	PlannedRows *int64
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -134,69 +162,144 @@ const (
 	TaskCancelled = "cancelled" // Table was never executed due to earlier failure
 )
 
-// ParseProgressResponse converts a typed ProgressResponse to ProgressData for rendering.
+// ParseProgressResponse converts a typed ProgressResponse to ProgressData for
+// rendering. Failure and throttle text is relayed from the engine and the
+// database, so control runes are removed before it reaches the terminal.
 func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	data := ProgressData{
-		ApplyID:      result.ApplyID,
-		Database:     result.Database,
-		Environment:  result.Environment,
-		Caller:       result.Caller,
-		State:        state.NormalizeState(result.State),
-		Engine:       result.Engine,
-		ErrorMessage: result.ErrorMessage,
-		StartedAt:    result.StartedAt,
-		CompletedAt:  result.CompletedAt,
-		Options:      result.Options,
-		Metadata:     result.Metadata,
-		Released:     result.Released,
+		ApplyID:        result.ApplyID,
+		Database:       result.Database,
+		Environment:    result.Environment,
+		Caller:         result.Caller,
+		PullRequestURL: result.PullRequest,
+		State:          state.NormalizeState(result.State),
+		Engine:         result.Engine,
+		ErrorMessage:   ui.TerminalSafe(result.ErrorMessage),
+		StartedAt:      result.StartedAt,
+		CompletedAt:    result.CompletedAt,
+		Options:        result.Options,
+		Metadata:       result.Metadata,
+		Released:       result.Released,
+		Sharded:        result.Sharded,
 	}
+	if step, err := apitypes.ParseProgressStep(result.Metadata); err != nil {
+		slog.Warn("progress output omits the statement position because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
+	} else {
+		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
+	}
+	if work, err := apitypes.ParseBuildWork(result.Metadata); err != nil {
+		slog.Warn("progress output omits build work because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
+	} else {
+		data.BuildWork = work
+	}
+	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
 	for _, op := range result.Operations {
 		data.Operations = append(data.Operations, ProgressOperation{
 			Deployment:          op.Deployment,
+			OperationKey:        op.OperationKey,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
+			OperationKind:       op.OperationKind,
 			Target:              op.Target,
 			State:               state.NormalizeState(op.State),
 			CutoverPolicy:       op.CutoverPolicy,
 			OnFailure:           op.OnFailure,
-			ErrorMessage:        op.ErrorMessage,
+			ErrorMessage:        ui.TerminalSafe(op.ErrorMessage),
 			ErrorCode:           op.ErrorCode,
+			AlreadyConverged:    op.AlreadyConverged,
+			EndedBy:             progressOperationRef(op.EndedBy),
+			RolloutStep:         op.RolloutStep,
 			StartedAt:           op.StartedAt,
 			CompletedAt:         op.CompletedAt,
 		})
 	}
 
-	for _, tbl := range result.Tables {
+	if data.Sharded && data.ErrorMessage == "" {
+		// A sharded apply shows no operation sections, so a failure only one
+		// of its operations recorded (a failed shard or finalize) is the
+		// apply's.
+		data.ErrorMessage = firstOperationError(data.Operations)
+	}
+
+	for _, tbl := range ddl.FilterInternalTablesTyped(result.Tables) {
 		tp := TableProgress{
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
+			Target:              tbl.Target,
 			Namespace:           tbl.Keyspace,
+			Dialect:             dialect,
 			ChangeType:          tbl.ChangeType,
 			DDL:                 tbl.DDL,
-			Status:              state.NormalizeState(tbl.Status),
+			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
+			EstimatedBytes:      tbl.EstimatedBytes,
+			EstimatedRows:       tbl.EstimatedRows,
+			PlannedShards:       int(tbl.PlannedShards),
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
 			ChecksumRowsTotal:   tbl.ChecksumRowsTotal,
+			Throttled:           tbl.Throttled,
+			ThrottleReason:      ui.TerminalSafe(tbl.ThrottleReason),
 			IsInstant:           tbl.IsInstant,
-			ProgressDetail:      tbl.ProgressDetail,
 		}
 		for _, sh := range tbl.Shards {
+			pct := int(sh.PercentComplete)
+			if pct == 0 && sh.RowsTotal > 0 {
+				pct = int(sh.RowsCopied * 100 / sh.RowsTotal)
+			}
+			// Row totals are estimates, so a nearly finished copy can exceed
+			// them whether the percent arrived from the server or was derived
+			// above; clamp so the rendered percent stays honest.
+			pct = ui.ClampPercent(pct)
 			tp.Shards = append(tp.Shards, ShardProgress{
 				Shard:           sh.Shard,
 				Status:          state.NormalizeShardStatus(sh.Status),
 				RowsCopied:      sh.RowsCopied,
 				RowsTotal:       sh.RowsTotal,
 				ETASeconds:      sh.ETASeconds,
-				PercentComplete: int(sh.PercentComplete),
+				PercentComplete: pct,
 				CutoverAttempts: int(sh.CutoverAttempts),
+
+				ChecksumRowsChecked: sh.ChecksumRowsChecked,
+				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
 			})
+			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
+			// the slowest shard's for a sharded (Vitess) table.
+			if sh.ETASeconds > tp.ETASeconds {
+				tp.ETASeconds = sh.ETASeconds
+			}
 		}
 		data.Tables = append(data.Tables, tp)
 	}
 
 	return data
+}
+
+// firstOperationError returns the error of the first operation, in resolved
+// order, that failed with one, or "" when none did. A shard's error names the
+// shard, as the PR comment's first-failure line does, since the apply shows
+// no section per shard to say where it failed.
+func firstOperationError(ops []ProgressOperation) string {
+	for _, op := range ops {
+		if !state.IsState(op.State, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable) || op.ErrorMessage == "" {
+			continue
+		}
+		if _, shard, _, ok := state.ShardWorkKey(op.OperationKey); ok {
+			return "shard " + shard + ": " + op.ErrorMessage
+		}
+		return op.ErrorMessage
+	}
+	return ""
+}
+
+// progressOperationRef maps the API's reference to an operation of the apply
+// to the presentation's, keeping an absent reference absent.
+func progressOperationRef(ref *apitypes.ProgressOperationRef) *presentation.OperationRef {
+	if ref == nil {
+		return nil
+	}
+	return &presentation.OperationRef{Deployment: ref.Deployment, OperationKey: ref.OperationKey}
 }

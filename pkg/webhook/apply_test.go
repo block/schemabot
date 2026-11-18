@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -42,13 +43,28 @@ func TestFormatProgressComment(t *testing.T) {
 	assert.Contains(t, body, "staging")
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
-	assert.Contains(t, body, "45%")
+	assert.Contains(t, body, "45.00%")
 	assert.Contains(t, body, "Schema Change Status")
 	// The running state is communicated on the always-present Status line.
 	assert.Contains(t, body, "**Status**: In Progress")
 	// Should NOT contain the old table format
 	assert.NotContains(t, body, "| Table |")
 	assert.NotContains(t, body, "|-------|")
+}
+
+// The progress comment reads each table's planned size from its stored task,
+// so the size appears beside the row counts on the comment operators watch.
+func TestFormatProgressComment_ShowsStoredTableSize(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-abc123", Database: "testdb", Environment: "staging", Engine: "spirit", State: state.Apply.Running}
+	bytes := int64(23_400_000_000)
+	tasks := []*storage.Task{{
+		TableName: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_status (status)", State: state.Task.Running,
+		RowsCopied: 1_234_567, RowsTotal: 48_200_000, ProgressPercent: 2, EstimatedBytes: &bytes,
+	}}
+
+	body := formatProgressComment(apply, tasks, nil, "")
+
+	assert.Contains(t, body, "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
 }
 
 func TestFormatProgressComment_NoTasks(t *testing.T) {
@@ -62,7 +78,8 @@ func TestFormatProgressComment_NoTasks(t *testing.T) {
 	body := formatProgressComment(apply, nil, nil, "")
 
 	assert.Contains(t, body, "testdb")
-	assert.Contains(t, body, "Starting")
+	assert.Contains(t, body, "**Status**: Queued")
+	assert.Contains(t, body, "This schema change starts automatically")
 }
 
 func TestFormatProgressComment_WithError(t *testing.T) {
@@ -91,9 +108,9 @@ func TestCommentObserverShouldDeferCutoverUsesPersistedApplyOption(t *testing.T)
 
 // A defer-cutover apply parks its tasks at the cutover barrier with only the
 // task state to show for it — the driver persists no separate readiness flag.
-// The barrier state alone must mark every parked table ready, so the readiness
-// count agrees with the header and the cutover hint instead of telling the
-// operator the apply is still waiting.
+// Each parked table renders a "Waiting for cutover" row, and the readiness
+// summary counts every parked table as ready so the operator can see the
+// cutover is unblocked.
 func TestFormatProgressCommentCutoverState(t *testing.T) {
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-abc123",
@@ -115,10 +132,8 @@ func TestFormatProgressCommentCutoverState(t *testing.T) {
 	assert.Contains(t, body, "`orders`")
 	assert.Contains(t, body, "**2/2** table(s) ready for cutover")
 	assert.NotContains(t, body, "waiting on")
-	assert.Contains(t, body, "✅ Ready for cutover")
-	assert.NotContains(t, body, "Waiting for cutover", "a parked table must render as ready, not waiting")
-	assert.Contains(t, body, "📊 2 ready for cutover", "the progress summary must agree with the per-table rows")
-	assert.NotContains(t, body, "waiting for cutover", "no line on the comment may call a parked table waiting")
+	assert.Contains(t, body, "Waiting for cutover")
+	assert.Contains(t, body, "📊 2 waiting for cutover", "the progress summary must agree with the per-table rows")
 }
 
 // While one table is still copying, the readiness summary counts only the
@@ -140,8 +155,8 @@ func TestFormatProgressCommentCutoverReadinessCountsOnlyParkedTables(t *testing.
 	body := formatProgressComment(apply, tasks, nil, "")
 
 	assert.Contains(t, body, "**1/2** table(s) ready for cutover — waiting on 1")
-	assert.Contains(t, body, "✅ Ready for cutover")
-	assert.Contains(t, body, "1 ready for cutover", "the progress summary must count the parked table as ready")
+	assert.Contains(t, body, "Waiting for cutover")
+	assert.Contains(t, body, "1 waiting for cutover", "the progress summary must count the parked table")
 	assert.Contains(t, body, "1 running", "the progress summary must show the table the cutover is waiting on")
 }
 
@@ -238,4 +253,21 @@ func TestBuildApplyCommentData_DefaultNamespace(t *testing.T) {
 	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil, "")
 
 	assert.Equal(t, "testdb", data.Tables[0].Namespace, "empty namespace should default to database name")
+}
+
+// A task the engine began carries its start into the comment row, so a
+// cancelled table can tell a target the cancel stopped part-way from one it
+// reached while the table was still queued.
+func TestTableProgressFromTasks_CarriesWhetherTheTaskStarted(t *testing.T) {
+	startedAt := time.Now()
+	rows := tableProgressFromTasks("testdb", []*storage.Task{
+		{TableName: "orders", State: state.Task.Cancelled, StartedAt: &startedAt},
+		{TableName: "users", State: state.Task.Cancelled},
+	}, nil)
+
+	assert.Len(t, rows, 2)
+	assert.Equal(t, "orders", rows[0].TableName)
+	assert.True(t, rows[0].Started, "a task with a start time began its table")
+	assert.Equal(t, "users", rows[1].TableName)
+	assert.False(t, rows[1].Started, "a task with no start time never began its table")
 }

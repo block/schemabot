@@ -4,45 +4,139 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"path"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/hmarr/codeowners"
 
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
+	schemadialect "github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // ReviewGateResult contains the outcome of a review gate check.
 type ReviewGateResult struct {
-	Approved          bool
-	RequiredReviewers []string
-	PRAuthor          string
+	Approved bool
+	// OperatorReviewers are the database's own operator principals; the
+	// review-required comment leads with them in their own section.
+	OperatorReviewers []string
+	// OtherReviewers are the broader principals whose approval also satisfies
+	// the gate — global admins, then repo admins, then codeowners.
+	OtherReviewers []string
+	PRAuthor       string
+	// ChangedApprovers are authorized reviewers whose approval was given on
+	// an earlier commit at which the PR's schema change differs from the
+	// head, so the review-required comment can say why an approval visible on
+	// the PR does not count.
+	ChangedApprovers []string
+	// ChangedPaths are the schema inputs whose change differs between those
+	// approvals and the head, so the comment can name what changed.
+	ChangedPaths []string
+	// ChangedBasePaths have identical objects at the approved commit and
+	// head, but different merge-base versions that prevent approval reuse.
+	ChangedBasePaths []string
+	// ChangedStatements are the DDL a changed schema file runs at the
+	// approved commit and at the head, where the gate could work it out, so
+	// the comment can show what changed.
+	ChangedStatements []templates.ChangedStatements
+	// UncomparedApprovers are authorized reviewers whose approval was given
+	// on an earlier commit the gate could not compare with the head. Nothing
+	// proves such an approval still describes the head, so it does not count,
+	// and the gate-error comment names the remedy that needs no comparison.
+	UncomparedApprovers []string
+	// UnauthorizedApprovers approved the PR but are not authorized reviewers
+	// for the database, so the comment can say why an approval visible on the
+	// PR does not count.
+	UnauthorizedApprovers []string
+	// UnauthorizedEarlierApprovers are the UnauthorizedApprovers whose
+	// approval was given on an earlier commit, recorded only when re-approval
+	// is required. Joining a listed team may then not be enough for such an
+	// approval to count, since the schema change may have changed since, so
+	// the comment also asks them to approve the latest commit.
+	UnauthorizedEarlierApprovers []string
+	// BaseRef and DefaultBranch are the PR's base branch and the repository's
+	// default branch. An approval is carried across base branch changes only
+	// when they are the same, so the review-required comment says so when they
+	// differ.
+	BaseRef       string
+	DefaultBranch string
 }
+
+// errApprovalNotComparable marks an approval on an earlier commit that could
+// not be compared with the head: GitHub answered, but what it returned cannot
+// prove the approval still describes the head (no recorded commit, an unknown
+// commit, a tree GitHub cannot list completely, a symlink that cannot be
+// followed). Asking again returns the same answer, so it is a block rather
+// than a retryable evaluation failure; an approval of the head needs no
+// comparison and lifts it.
+var errApprovalNotComparable = errors.New("an approval on an earlier commit cannot be compared with the head")
 
 // enforceReviewGate runs the review gate check and posts the appropriate comment if blocked.
-// Returns true if the apply was blocked (caller should return), false if it may proceed.
-func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string) bool {
-	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath)
+// Returns blocked=true when the gate blocks — the PR lacks an approval from a
+// configured review-policy principal that counts for the head (caller should
+// return). A block in which an approval could not be compared with the head
+// posts a gate-error comment; any other block posts Review Required. Both
+// name the reviewers who can approve the latest commit.
+// A gate evaluation failure (a GitHub read inside checkReviewGate, or a review
+// policy the gate cannot resolve) stops the command (fail closed) and is
+// returned as an error, not a block: the approval state could not be
+// determined, so the outcome is not the command's answer and a durable driver
+// may re-drive it. Policy-shape errors in that class (for example a review
+// policy with no configured reviewers) cannot succeed on a re-drive, but they
+// are bounded by the driver's retry budget, so the gate does not maintain a
+// separate taxonomy for them. suppressRetryComments silences the
+// evaluation-failure comment on durable attempts, where the driver retries
+// and posts the single terminal answer instead; blocks always comment.
+func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
+	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, environment, schemaResult)
 	if err != nil {
-		h.logger.Error("review gate check failed", "error", err)
-		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err))
-		return true
+		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
+			"database", schemaResult.Database, "environment", environment,
+			"command", commandName, "error", err)
+		if !suppressRetryComments {
+			h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err))
+		}
+		return false, fmt.Errorf("review gate check %s#%d: %w", repo, pr, err)
 	}
 	if gateResult != nil && !gateResult.Approved {
-		h.postComment(repo, pr, installationID, templates.RenderReviewRequired(templates.ReviewGateData{
-			Database:    schemaResult.Database,
-			Environment: environment,
-			RequestedBy: requestedBy,
-			Reviewers:   gateResult.RequiredReviewers,
-			PRAuthor:    gateResult.PRAuthor,
-		}))
-		return true
+		data := templates.ReviewGateData{
+			Database:                     schemaResult.Database,
+			Environment:                  environment,
+			RequestedBy:                  requestedBy,
+			OperatorReviewers:            gateResult.OperatorReviewers,
+			OtherReviewers:               gateResult.OtherReviewers,
+			PRAuthor:                     gateResult.PRAuthor,
+			ChangedApprovers:             gateResult.ChangedApprovers,
+			ChangedPaths:                 gateResult.ChangedPaths,
+			ChangedBasePaths:             gateResult.ChangedBasePaths,
+			ChangedStatements:            gateResult.ChangedStatements,
+			UncomparedApprovers:          gateResult.UncomparedApprovers,
+			UnauthorizedApprovers:        gateResult.UnauthorizedApprovers,
+			UnauthorizedEarlierApprovers: gateResult.UnauthorizedEarlierApprovers,
+			BaseRef:                      gateResult.BaseRef,
+			DefaultBranch:                gateResult.DefaultBranch,
+		}
+		if len(gateResult.UncomparedApprovers) > 0 {
+			h.postComment(repo, pr, installationID, templates.RenderReviewGateError(data))
+		} else {
+			h.postComment(repo, pr, installationID, templates.RenderReviewRequired(data))
+		}
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
+// reviewGateErrorDetail builds the PR-facing detail for a review gate
+// evaluation failure. The error is used only to classify the failure — its
+// text is never rendered, because raw GitHub errors can carry internal detail
+// that must not land in PR markdown; operators triage from the server logs.
 func reviewGateErrorDetail(err error) string {
-	detail := "Review gate check failed: " + err.Error()
+	detail := "Review gate check failed; see server logs for details"
 	if errors.Is(err, ghclient.ErrTeamMembershipUnreadable) {
 		detail += ". If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership."
 	}
@@ -53,10 +147,30 @@ func reviewGateErrorDetail(err error) string {
 // Returns nil if review gating is disabled (apply proceeds).
 // Returns a result with Approved=true if gate passes.
 // Returns a result with Approved=false if gate blocks.
-// schemaPath is the repo-relative path to the database's schema directory (e.g. "schema/payments").
-func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, schemaPath string) (*ReviewGateResult, error) {
-	if !h.isReviewGateEnabled(repo) {
+// environment is the one the command targets; a PostgreSQL schema file
+// comparison runs on its primary target.
+// schema identifies the database and where its schema inputs live: the schema
+// directory, the environment symlink it was resolved through (if any), and the
+// config file. schema.HeadSHA is the commit the schema files being applied
+// were read from.
+//
+// By default any authorized approval on the PR counts, on whichever commit it
+// was given. When the review policy requires re-approval for the database, an
+// approval counts only for the schema change it reviewed: it must have been
+// given on HeadSHA, or on an earlier commit at which the PR's change to the
+// database's schema inputs is the same as at HeadSHA (see approvalCoversHead).
+// When GitHub is unavailable while proving that, the approval state is
+// undetermined and the gate returns an evaluation error rather than a block.
+// An approval on an earlier commit that cannot be compared with HeadSHA at all
+// does not count; it is recorded in UncomparedApprovers so the comment can say
+// why it was not counted.
+func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment string, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
+	if !h.isReviewGateEnabled(repo, schema.Database) {
 		return nil, nil
+	}
+	database, schemaPath, headSHA := schema.Database, schema.SchemaPath, schema.HeadSHA
+	if headSHA == "" {
+		return nil, fmt.Errorf("review gate for %s#%d database %q: the commit the schema was read from is unknown", repo, pr, database)
 	}
 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
@@ -69,52 +183,469 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		return nil, fmt.Errorf("fetch PR reviews: %w", err)
 	}
 
-	policy, err := h.loadReviewGatePolicy(ctx, client, repo, prInfo.BaseRef, database, schemaPath)
+	policy, err := h.loadReviewGatePolicy(ctx, client, repo, pr, prInfo.BaseRef, headSHA, database, schemaPath)
 	if err != nil {
 		return nil, err
 	}
-	if len(policy.RequiredReviewers) == 0 {
+	if len(policy.OperatorReviewers) == 0 && len(policy.OtherReviewers) == 0 {
+		if policy.IncludeCodeowners {
+			// CODEOWNERS was the only possible source of reviewers and it
+			// contributed none, so name it and the fix: the generic error
+			// would leave the operator to guess which source was empty.
+			return nil, fmt.Errorf("review policy has no configured reviewers for database %q: no reviewers besides CODEOWNERS are configured, and no CODEOWNERS rule on base branch %q assigns owners to schema directory %q; add a CODEOWNERS rule that owns that directory, or configure admins or database operators in the review policy", database, prInfo.BaseRef, schemaPath)
+		}
 		return nil, fmt.Errorf("review policy has no configured reviewers for database %q", database)
 	}
 
-	approvedReviewers := ghclient.GetApprovedReviewers(reviews)
-	h.logger.Info("review gate: fetched reviews",
-		"repo", repo, "pr", pr, "database", database,
-		"approved_by", approvedReviewers, "pr_author", prInfo.User)
-
-	var validApprovers []string
-	for _, reviewer := range approvedReviewers {
-		if !strings.EqualFold(reviewer, prInfo.User) {
-			validApprovers = append(validApprovers, reviewer)
-		}
+	if prInfo.DefaultBranch == "" {
+		h.logger.Warn("review gate: GitHub reports no default branch for the PR's repository, so approvals on earlier commits will count only where base branch content is unchanged",
+			"repo", repo, "pr", pr, "database", database, "base_ref", prInfo.BaseRef, "head_sha", headSHA)
 	}
 
-	for _, reviewer := range validApprovers {
+	requiresReapproval := h.reviewGateRequiresReapproval(database)
+	approvals := ghclient.GetApprovedReviews(reviews)
+	h.logger.Info("review gate: fetched reviews",
+		"repo", repo, "pr", pr, "database", database,
+		"approved_by", ghclient.GetApprovedReviewers(reviews), "pr_author", prInfo.User,
+		"head_sha", headSHA, "require_reapproval", requiresReapproval)
+
+	// Approvals on the head need no comparison, so they are checked first: a
+	// head approval decides the gate without reading GitHub again.
+	var headApprovals, earlierApprovals []*ghclient.ReviewInfo
+	var validApprovers []string
+	for _, approval := range approvals {
+		if strings.EqualFold(approval.User, prInfo.User) {
+			continue
+		}
+		validApprovers = append(validApprovers, approval.User)
+		if approval.CommitID == headSHA {
+			headApprovals = append(headApprovals, approval)
+		} else {
+			earlierApprovals = append(earlierApprovals, approval)
+		}
+	}
+	validApprovals := slices.Concat(headApprovals, earlierApprovals)
+
+	coverage := approvalCoverage{
+		repo:              repo,
+		pr:                pr,
+		database:          database,
+		baseRef:           prInfo.BaseRef,
+		defaultBranch:     prInfo.DefaultBranch,
+		headSHA:           headSHA,
+		inputPaths:        reviewGateInputPaths(schema),
+		dialect:           schemadialect.DialectForDatabaseType(schema.Type),
+		compareStatements: h.statementComparerFor(repo, pr, database, environment, schema.Type),
+		verdicts:          make(map[string]approvalVerdict),
+	}
+	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers, unauthorizedApprovers, unauthorizedEarlierApprovers []string
+	var staleApprovals []staleApproval
+	for _, approval := range validApprovals {
+		reviewer := approval.User
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
 		if err != nil {
 			return nil, err
 		}
-		if matched {
-			h.logger.Info("review gate: approved",
+		if !matched {
+			h.logger.Debug("review gate: approval does not count because the reviewer is not an authorized reviewer for the database",
+				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer)
+			unauthorizedApprovers = append(unauthorizedApprovers, reviewer)
+			// Without re-approval, joining a team makes any approval count.
+			// With it, whether an earlier approval would still cover the head
+			// is not compared for a reviewer who cannot approve anyway, so no
+			// GitHub request is spent on it; the comment asks for a fresh
+			// approval.
+			if approval.CommitID != headSHA && requiresReapproval {
+				unauthorizedEarlierApprovers = append(unauthorizedEarlierApprovers, reviewer)
+			}
+			continue
+		}
+		if approval.CommitID != headSHA && !requiresReapproval {
+			h.logger.Info("review gate: approved; re-approval is not required, so the approval counts on any commit",
 				"repo", repo, "pr", pr, "database", database,
 				"approved_by", reviewer, "matched_principal", principal,
-				"required_reviewers", policy.RequiredReviewers)
+				"approved_sha", approval.CommitID, "head_sha", headSHA)
 			return &ReviewGateResult{
 				Approved:          true,
-				RequiredReviewers: policy.RequiredReviewers,
+				OperatorReviewers: policy.OperatorReviewers,
+				OtherReviewers:    policy.OtherReviewers,
 				PRAuthor:          prInfo.User,
 			}, nil
 		}
+		verdict, err := h.approvalCoversHead(ctx, client, &coverage, approval)
+		// An approval that cannot be compared does not count, but another
+		// approval may still cover the head, so the rest are still checked.
+		if errors.Is(err, errApprovalNotComparable) {
+			uncomparedApprovers = append(uncomparedApprovers, reviewer)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		// A matching reviewer whose approval does not cover the head is treated
+		// like a reviewer who has not approved.
+		if !verdict.covers {
+			changedApprovers = append(changedApprovers, reviewer)
+			if verdict.differingPathBaseOnly {
+				changedBasePaths = appendUniqueString(changedBasePaths, verdict.differingPath)
+			} else if verdict.differingPath != "" {
+				changedPaths = appendUniqueString(changedPaths, verdict.differingPath)
+				staleApprovals = append(staleApprovals, staleApproval{approval: approval, verdict: verdict})
+			}
+			continue
+		}
+		h.logger.Info("review gate: approved",
+			"repo", repo, "pr", pr, "database", database,
+			"approved_by", reviewer, "matched_principal", principal,
+			"approved_sha", approval.CommitID, "head_sha", headSHA,
+			"operator_reviewers", policy.OperatorReviewers,
+			"other_reviewers", policy.OtherReviewers)
+		return &ReviewGateResult{
+			Approved:          true,
+			OperatorReviewers: policy.OperatorReviewers,
+			OtherReviewers:    policy.OtherReviewers,
+			PRAuthor:          prInfo.User,
+		}, nil
 	}
 
 	h.logger.Info("review gate: blocked",
 		"repo", repo, "pr", pr, "database", database,
-		"valid_approvers", validApprovers, "required_reviewers", policy.RequiredReviewers)
+		"valid_approvers", validApprovers,
+		"changed_approvers", changedApprovers,
+		"uncompared_approvers", uncomparedApprovers,
+		"unauthorized_approvers", unauthorizedApprovers, "head_sha", headSHA,
+		"operator_reviewers", policy.OperatorReviewers,
+		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
-		Approved:          false,
-		RequiredReviewers: policy.RequiredReviewers,
-		PRAuthor:          prInfo.User,
+		Approved:                     false,
+		OperatorReviewers:            policy.OperatorReviewers,
+		OtherReviewers:               policy.OtherReviewers,
+		PRAuthor:                     prInfo.User,
+		ChangedApprovers:             changedApprovers,
+		ChangedPaths:                 changedPaths,
+		ChangedBasePaths:             changedBasePaths,
+		ChangedStatements:            h.changedStatements(ctx, client, &coverage, staleApprovals),
+		UncomparedApprovers:          uncomparedApprovers,
+		UnauthorizedApprovers:        unauthorizedApprovers,
+		UnauthorizedEarlierApprovers: unauthorizedEarlierApprovers,
+		BaseRef:                      prInfo.BaseRef,
+		DefaultBranch:                prInfo.DefaultBranch,
 	}, nil
+}
+
+// approvalVerdict is the cached outcome of comparing one approved commit
+// with the head: whether it covers the head, or why it cannot be compared.
+type approvalVerdict struct {
+	covers bool
+	// differingPath is the first schema input whose change differs, when
+	// the approval does not cover the head.
+	differingPath         string
+	differingPathBaseOnly bool
+	// differingFile names the differing path's blobs when it is a regular
+	// file or absent at every side, so its DDL can be shown.
+	differingFile *ghclient.SchemaFileBlobs
+	notComparable error
+}
+
+// approvalCoverage holds the PR head an approval must cover and caches the
+// verdict per approved commit, so reviewers who approved the same commit share
+// one comparison.
+type approvalCoverage struct {
+	repo     string
+	pr       int
+	database string
+	// baseRef is the PR's base branch, which each commit's change is measured
+	// against.
+	baseRef string
+	// defaultBranch is the repository's default branch. Base branch content
+	// is trusted only when baseRef is the default branch.
+	defaultBranch string
+	headSHA       string
+	// inputPaths are the database's schema inputs: every path whose change at
+	// the approved commit must match the head for the approval to count.
+	inputPaths []string
+	// dialect is the database's schema dialect, which decides whether a
+	// changed schema file's DDL can be worked out to show the reader.
+	dialect schemadialect.Dialect
+	// compareStatements proves a schema file that both the PR and the base
+	// branch edited generates no statement at the head that the approved
+	// commit did not, or is nil when the database's dialect has no such
+	// comparison.
+	compareStatements ghclient.SchemaFileChangeComparer
+	verdicts          map[string]approvalVerdict
+}
+
+// statementComparerFor returns the statement comparison for a database
+// type's schema files, or nil when the dialect has none, so its files are
+// compared by content alone and a file both the PR and the base branch edited
+// always counts as changed.
+//
+// MySQL-family .sql files hold one CREATE TABLE each, which
+// ddl.SameTableChange compares from the files alone, and a Vitess keyspace's
+// vschema.json is compared from the files alone by ddl.SameVSchemaChange.
+// PostgreSQL has no offline model of a schema file, so the environment's
+// primary target runs each version on a scratch schema and compares what it
+// built (see targetStatementComparer); a target that cannot answer within the
+// evaluation's budget leaves the file changed.
+func (h *Handler) statementComparerFor(repo string, pr int, database, environment, databaseType string) ghclient.SchemaFileChangeComparer {
+	switch schemadialect.DialectForDatabaseType(databaseType) {
+	case schemadialect.DialectMySQL:
+		hasVSchema := strings.EqualFold(databaseType, storage.DatabaseTypeVitess)
+		return func(_ context.Context, filePath, approvedBase, approved, headBase, head string) (bool, string, error) {
+			if path.Base(filePath) != storage.VSchemaArtifactName {
+				return ddl.SameTableChange(approvedBase, approved, headBase, head)
+			}
+			if !hasVSchema {
+				return false, fmt.Sprintf("a %s database applies no VSchema, so its %s is not compared", databaseType, storage.VSchemaArtifactName), nil
+			}
+			return ddl.SameVSchemaChange(approvedBase, approved, headBase, head)
+		}
+	case schemadialect.DialectPostgres:
+		if h.service == nil {
+			h.logger.Warn("review gate: no service is wired, so PostgreSQL schema files both the PR and the base branch edited will count as changed",
+				"repo", repo, "pr", pr, "database", database, "environment", environment)
+			return nil
+		}
+		return h.newTargetStatementComparer(repo, pr, database, environment).compare
+	default:
+		return nil
+	}
+}
+
+// approvalCoversHead decides whether an approval still stands for the PR head.
+// An approval on the head commit covers it. An approval on an earlier commit
+// covers it only when GitHub proves the PR's change to every one of the
+// database's schema inputs is the same at that commit and the head (see
+// schemaChangeUnchangedSince). Anything that prevents that comparison (no
+// recorded commit, an unknown commit, a tree GitHub cannot list completely)
+// is returned as an errApprovalNotComparable error. A comparison GitHub could
+// not answer — it was unavailable, or the evaluation was cancelled — is
+// returned as an error too, and never cached as a verdict.
+func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
+	approvedSHA := approval.CommitID
+	if approvedSHA == "" {
+		h.logger.Warn("review gate: cannot compare an approval with the head because GitHub reports no commit for it",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"head_sha", c.headSHA)
+		return approvalVerdict{}, fmt.Errorf("review gate for %s#%d database %q: approval by %s has no commit: %w",
+			c.repo, c.pr, c.database, approval.User, errApprovalNotComparable)
+	}
+	if approvedSHA == c.headSHA {
+		return approvalVerdict{covers: true}, nil
+	}
+	verdict, ok := c.verdicts[approvedSHA]
+	if !ok {
+		var err error
+		verdict, err = h.schemaChangeUnchangedSince(ctx, client, c, approval)
+		if err != nil {
+			return approvalVerdict{}, err
+		}
+		c.verdicts[approvedSHA] = verdict
+	}
+	return verdict, verdict.notComparable
+}
+
+// schemaChangeUnchangedSince compares the PR's change to the database's schema
+// inputs at the approved commit and the head, each measured against the base
+// branch content it was built on. Differences that came from the base branch,
+// such as a rebase onto it or a merge of it, do not count as a change: they
+// are not this PR's change, and they reached the base branch through their
+// own PR and its own review. A change the PR itself makes differently at the
+// head does. A comparison that cannot be completed is recorded as
+// errApprovalNotComparable, and a GitHub outage is returned as a retryable
+// error.
+func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
+	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, c.defaultBranch, approval.CommitID, c.headSHA, c.inputPaths, c.compareStatements)
+	if err != nil {
+		if ghclient.IsUnavailableError(err) {
+			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
+				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: evaluation cancelled: %w",
+				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(ctxErr, err))
+		}
+		h.logger.Warn("review gate: cannot compare the PR's schema change at an approved earlier commit and the head",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "base_ref", c.baseRef,
+			"base_tip_sha", comparison.BaseTipSHA,
+			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
+			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
+			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
+			"input_paths", c.inputPaths, "error", err)
+		return approvalVerdict{notComparable: fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
+			c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(errApprovalNotComparable, err))}, nil
+	}
+	if !comparison.Unchanged {
+		h.logger.Info("review gate: approval on an earlier commit does not count because the PR's schema change differs between it and the head",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "base_ref", c.baseRef,
+			"base_tip_sha", comparison.BaseTipSHA,
+			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
+			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
+			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
+			"statement_compared_paths", comparison.StatementComparedPaths,
+			"differing_path_base_only", comparison.DifferingPathBaseOnly,
+			"differing_path", comparison.DifferingPath)
+		return approvalVerdict{
+			differingPath:         comparison.DifferingPath,
+			differingPathBaseOnly: comparison.DifferingPathBaseOnly,
+			differingFile:         comparison.DifferingFile,
+		}, nil
+	}
+	h.logger.Info("review gate: approval on an earlier commit counts because the PR's schema change is the same at it and the head",
+		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "base_ref", c.baseRef,
+		"base_tip_sha", comparison.BaseTipSHA,
+		"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
+		"head_merge_base_sha", comparison.HeadMergeBaseSHA,
+		"base_moved_forward", comparison.BaseMovedForward,
+		"base_is_default_branch", comparison.BaseIsDefaultBranch,
+		"statement_compared_paths", comparison.StatementComparedPaths,
+		"input_paths", c.inputPaths)
+	return approvalVerdict{covers: true}, nil
+}
+
+// maxChangedStatementFiles bounds how many changed schema files the
+// review-required comment shows the DDL of, so approvals on many earlier
+// commits cannot crowd out the rest of the comment.
+const maxChangedStatementFiles = 3
+
+// changedStatementsTimeout bounds the reads that show a blocked comment's
+// changed DDL. The DDL only explains the block, so running out of time drops
+// it rather than holding up the comment.
+const changedStatementsTimeout = 10 * time.Second
+
+// staleApproval is an approval on an earlier commit whose schema change
+// differs at the head, kept so the comment can show the DDL that changed once
+// the gate has decided to block.
+type staleApproval struct {
+	approval *ghclient.ReviewInfo
+	verdict  approvalVerdict
+}
+
+// changedStatements works out, for a blocked gate, the DDL the approved commit
+// and the head run for each schema file whose change no longer matches an
+// approval. It runs only after every approval has been checked, so it can never
+// hold up or fail an approval that would have let the apply through, and its
+// reads share one short deadline. Each (file, approved commit) is attempted
+// once, whether or not its DDL can be shown.
+func (h *Handler) changedStatements(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, stale []staleApproval) []templates.ChangedStatements {
+	if len(stale) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, changedStatementsTimeout)
+	defer cancel()
+
+	type attempt struct{ path, approvedSHA string }
+	attempted := make(map[attempt]bool)
+	var changes []templates.ChangedStatements
+	for _, s := range stale {
+		key := attempt{s.verdict.differingPath, s.approval.CommitID}
+		if attempted[key] {
+			continue
+		}
+		attempted[key] = true
+		if len(changes) >= maxChangedStatementFiles {
+			h.logger.Debug("review gate: comment already shows the DDL of as many changed files as it holds",
+				"repo", c.repo, "pr", c.pr, "database", c.database, "approved_sha", s.approval.CommitID,
+				"head_sha", c.headSHA, "path", s.verdict.differingPath)
+			break
+		}
+		if change, ok := h.changedStatementsFor(ctx, client, c, s); ok {
+			changes = append(changes, change)
+		}
+	}
+	return changes
+}
+
+// changedStatementsFor works out the DDL the approved commit and the head run
+// for the schema file a stale approval no longer matches, when the gate can
+// work it out from the files alone. Today that is a MySQL-family .sql file.
+// The block it feeds only shows the reader what changed: the approval already
+// does not count, so a file whose DDL cannot be read or worked out is logged
+// and left out, and the comment still names the file.
+func (h *Handler) changedStatementsFor(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, s staleApproval) (templates.ChangedStatements, bool) {
+	verdict := s.verdict
+	logAttrs := []any{"repo", c.repo, "pr", c.pr, "database", c.database,
+		"approved_sha", s.approval.CommitID, "head_sha", c.headSHA, "path", verdict.differingPath}
+	switch {
+	case c.dialect != schemadialect.DialectMySQL:
+		h.logger.Debug("review gate: changed file's DDL is not shown because its dialect has no offline diff", append(logAttrs, "dialect", c.dialect)...)
+		return templates.ChangedStatements{}, false
+	case path.Ext(verdict.differingPath) != ".sql":
+		h.logger.Debug("review gate: changed path is not a .sql schema file, so its DDL is not shown", logAttrs...)
+		return templates.ChangedStatements{}, false
+	case verdict.differingFile == nil:
+		h.logger.Debug("review gate: changed path is a directory or symlink at some commit, so its DDL is not shown", logAttrs...)
+		return templates.ChangedStatements{}, false
+	}
+
+	blobs := verdict.differingFile
+	text := make(map[string]string, len(blobs.Content))
+	maps.Copy(text, blobs.Content)
+	shas := [4]string{blobs.ApprovedBase, blobs.Approved, blobs.HeadBase, blobs.Head}
+	var contents [4]string
+	for i, sha := range shas {
+		if sha == "" {
+			continue
+		}
+		if _, ok := text[sha]; !ok {
+			read, err := client.FetchBlobContent(ctx, c.repo, sha)
+			if err != nil {
+				h.logger.Warn("review gate: cannot read a changed schema file, so the review-required comment names it without its DDL",
+					append(logAttrs, "blob_sha", sha, "error", err)...)
+				return templates.ChangedStatements{}, false
+			}
+			text[sha] = read
+		}
+		contents[i] = text[sha]
+	}
+	approvedDDL, err := ddl.TableChangeStatements(contents[0], contents[1])
+	if err != nil {
+		h.logger.Warn("review gate: cannot work out the DDL the approved commit runs for a changed schema file, so the review-required comment names it without its DDL",
+			append(logAttrs, "error", err)...)
+		return templates.ChangedStatements{}, false
+	}
+	headDDL, err := ddl.TableChangeStatements(contents[2], contents[3])
+	if err != nil {
+		h.logger.Warn("review gate: cannot work out the DDL the head runs for a changed schema file, so the review-required comment names it without its DDL",
+			append(logAttrs, "error", err)...)
+		return templates.ChangedStatements{}, false
+	}
+	if slices.Equal(approvedDDL, headDDL) {
+		// The same DDL on different bases: the difference is in what the base
+		// already runs, which two identical blocks would not show.
+		h.logger.Debug("review gate: changed file runs the same DDL at the approved commit and the head, so its DDL is not shown", logAttrs...)
+		return templates.ChangedStatements{}, false
+	}
+	return templates.ChangedStatements{
+		Path:        verdict.differingPath,
+		Dialect:     c.dialect,
+		ApprovedSHA: s.approval.CommitID,
+		HeadSHA:     c.headSHA,
+		Approved:    approvedDDL,
+		Head:        headDDL,
+	}, true
+}
+
+// reviewGateInputPaths lists the database's schema inputs the gate protects:
+// the schema paths the base schema freshness guard compares, and the config
+// file, which can sit outside them. Symlinks inside them are followed by the
+// comparison. This list is the whole definition of what an approval on an
+// earlier commit must still match, so it must name every repository input
+// that can change the database's plan: an input missing from it can change
+// after an approval without the approval being re-earned, weakening AZ-4.
+func reviewGateInputPaths(schema *ghclient.SchemaRequestResult) []string {
+	var paths []string
+	for _, p := range []string{schema.SchemaPath, schema.SchemaLinkPath, schema.ConfigPath} {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 type reviewGatePolicy struct {
@@ -125,7 +656,17 @@ type reviewGatePolicy struct {
 	OperatorTeams      []string
 	OperatorUsers      []string
 	CodeownerReviewers map[string]struct{}
-	RequiredReviewers  []string
+	// IncludeCodeowners records that CODEOWNERS was consulted, so an empty
+	// reviewer set can name CODEOWNERS as the source that contributed none.
+	IncludeCodeowners bool
+	// OperatorReviewers and OtherReviewers are the PR-facing reviewer lists on
+	// the review-required comment. The database's own operators get their own
+	// leading section — they are the reviewers the author should ping — while
+	// the broader fallbacks follow in order of scope: global admin principals,
+	// then repo admins, then codeowners. A principal configured in more than
+	// one tier is listed once, in its most specific tier.
+	OperatorReviewers []string
+	OtherReviewers    []string
 }
 
 func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.InstallationClient, reviewer string) (bool, string, error) {
@@ -171,7 +712,7 @@ func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.Installa
 	return false, "", nil
 }
 
-func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.InstallationClient, repo, baseRef, database, schemaPath string) (reviewGatePolicy, error) {
+func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, baseRef, headSHA, database, schemaPath string) (reviewGatePolicy, error) {
 	if h.service == nil || h.service.Config() == nil {
 		return reviewGatePolicy{}, fmt.Errorf("server config is unavailable")
 	}
@@ -185,14 +726,25 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		RepoAdminUsers:     repoAdminUsers,
 		CodeownerReviewers: make(map[string]struct{}),
 	}
-	appendRequiredReviewers := func(values ...[]string) {
+	appendOperatorReviewers := func(values ...[]string) {
 		for _, group := range values {
 			for _, value := range group {
-				policy.RequiredReviewers = appendUniqueString(policy.RequiredReviewers, value)
+				policy.OperatorReviewers = appendUniqueString(policy.OperatorReviewers, value)
 			}
 		}
 	}
-	appendRequiredReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
+	// A principal already listed as an operator is not repeated in the
+	// fallback section.
+	appendOtherReviewers := func(values ...[]string) {
+		for _, group := range values {
+			for _, value := range group {
+				if containsFold(policy.OperatorReviewers, value) {
+					continue
+				}
+				policy.OtherReviewers = appendUniqueString(policy.OtherReviewers, value)
+			}
+		}
+	}
 
 	if config.ReviewPolicyIncludesDatabaseOperators() {
 		dbConfig := config.Database(database)
@@ -201,11 +753,14 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		}
 		policy.OperatorTeams = dbConfig.OperatorTeams
 		policy.OperatorUsers = dbConfig.OperatorUsers
-		appendRequiredReviewers(dbConfig.OperatorTeams, dbConfig.OperatorUsers)
+		appendOperatorReviewers(dbConfig.OperatorTeams, dbConfig.OperatorUsers)
 	}
 
+	appendOtherReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
+
 	if reviewPolicy.IncludeCodeowners {
-		owners, err := matchReviewGateCodeowners(ctx, client, repo, baseRef, schemaPath)
+		policy.IncludeCodeowners = true
+		owners, err := h.matchReviewGateCodeowners(ctx, client, repo, pr, baseRef, headSHA, database, schemaPath)
 		if err != nil {
 			return reviewGatePolicy{}, err
 		}
@@ -223,47 +778,86 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 				policy.CodeownerReviewers[strings.ToLower(owner.Value)] = struct{}{}
 			}
 		}
-		appendRequiredReviewers(ghclient.OwnerNames(owners))
+		appendOtherReviewers(ghclient.OwnerNames(owners))
 	}
 
 	return policy, nil
 }
 
-func matchReviewGateCodeowners(ctx context.Context, client *ghclient.InstallationClient, repo, baseRef, schemaPath string) ([]codeowners.Owner, error) {
+// matchReviewGateCodeowners returns the CODEOWNERS owners of the database's
+// schema directory: the owners of the last rule matching the directory path
+// itself, which is matched as one synthetic file directly inside it. A rule
+// that matches only some files (a file glob such as *.sql), a subdirectory,
+// or an environment symlink path does not match it. A directory no rule
+// matches, or one matched by a rule that names no owners, has no code owners,
+// so CODEOWNERS contributes no reviewers for it; the gate then relies on the
+// configured admins and operators alone.
+// An unknown schema directory cannot be matched, so it is treated the same
+// way rather than borrowing owners from unrelated paths.
+func (h *Handler) matchReviewGateCodeowners(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, baseRef, headSHA, database, schemaPath string) ([]codeowners.Owner, error) {
+	if schemaPath == "" {
+		h.logger.Warn("review gate: CODEOWNERS contributes no reviewers because the database's schema directory is unknown",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef)
+		return nil, nil
+	}
 	ruleset, err := client.FetchCodeownersRuleset(ctx, repo, baseRef)
 	if err != nil {
 		return nil, fmt.Errorf("fetch CODEOWNERS: %w", err)
 	}
 	if ruleset == nil {
+		h.logger.Info("review gate: CODEOWNERS contributes no reviewers because the base branch has no CODEOWNERS file",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef)
 		return nil, nil
 	}
 
-	var owners []codeowners.Owner
-	if schemaPath != "" {
-		matchPath := strings.TrimSuffix(schemaPath, "/") + "/.schema"
-		owners, err = ghclient.MatchCodeownersPath(ruleset, matchPath)
-		if err != nil {
-			return nil, fmt.Errorf("match CODEOWNERS for %s: %w", schemaPath, err)
-		}
+	matchPath := path.Join(schemaPath, ".schema")
+	owners, err := ghclient.MatchCodeownersPath(ruleset, matchPath)
+	var unmatchable *ghclient.UnmatchableCodeownersRuleError
+	if errors.As(err, &unmatchable) {
+		// The panic value and stack identify the rule; they stay in the log,
+		// where the triage identifiers are, and never reach the PR.
+		h.logger.Error("review gate: CODEOWNERS holds a rule the parser cannot match; the gate fails closed until the rule is fixed",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef, "schema_path", schemaPath,
+			"panic", unmatchable.Panic.Value, "stack", string(unmatchable.Panic.Stack))
+		return nil, fmt.Errorf("match CODEOWNERS for %s: the CODEOWNERS file on base branch %q holds a rule that cannot be matched; fix the rule on the base branch", schemaPath, baseRef)
 	}
-	if owners == nil {
-		owners = ghclient.OwnersFromRuleset(ruleset)
+	if err != nil {
+		return nil, fmt.Errorf("match CODEOWNERS for %s: %w", schemaPath, err)
+	}
+	if len(owners) == 0 {
+		h.logger.Info("review gate: CODEOWNERS contributes no reviewers because no CODEOWNERS rule assigns owners to the schema directory",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef, "schema_path", schemaPath)
+		return nil, nil
 	}
 	return owners, nil
 }
 
-// isReviewGateEnabled checks server config for the review gate toggle.
-func (h *Handler) isReviewGateEnabled(repo string) bool {
-	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabled()
-	h.logger.Debug("review gate: server config", "repo", repo, "enabled", enabled)
+// isReviewGateEnabled checks server config for the review gate toggle, which
+// is on instance-wide or for the database alone.
+func (h *Handler) isReviewGateEnabled(repo, database string) bool {
+	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabledForDatabase(database)
+	h.logger.Debug("review gate: server config", "repo", repo, "database", database, "enabled", enabled)
 	return enabled
 }
 
+// reviewGateRequiresReapproval returns whether an approval on an earlier
+// commit counts for database only while it covers the head's schema change.
+func (h *Handler) reviewGateRequiresReapproval(database string) bool {
+	return h.service != nil && h.service.Config().ReviewPolicyRequiresReapprovalForDatabase(database)
+}
+
 func appendUniqueString(values []string, value string) []string {
-	for _, existing := range values {
-		if strings.EqualFold(existing, value) {
-			return values
-		}
+	if containsFold(values, value) {
+		return values
 	}
 	return append(values, value)
+}
+
+func containsFold(values []string, value string) bool {
+	for _, existing := range values {
+		if strings.EqualFold(existing, value) {
+			return true
+		}
+	}
+	return false
 }

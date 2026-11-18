@@ -2,8 +2,11 @@ package webhook
 
 import (
 	"context"
+	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -48,7 +51,7 @@ func (o participantCheckOutcome) unresolved() bool {
 // unresolved participant reads as "waiting to report" / "not reported" rather
 // than as a pending or failed apply. Synthesized rows are never persisted, so
 // the marker never reaches stored check state.
-const participantUnresolvedBlockingReason = "participant_unresolved"
+const participantUnresolvedBlockingReason = checkstate.BlockParticipantUnresolved
 
 // synthesizeParticipantCheck maps a resolved participant outcome to a stored
 // Check shape so computeAggregate folds it exactly like a per-database check.
@@ -138,11 +141,114 @@ func (h *Handler) participantCheckOutcomes(
 	checks := make([]*storage.Check, 0, len(expected))
 	retriable := false
 	for _, tenant := range expected {
+		coverageEnvironment := env
+		if env == aggregateSentinel {
+			coverageEnvironment = ""
+		}
+		if !tenant.PublishesEnvironment(coverageEnvironment) {
+			h.logger.Debug("participant does not publish checks for aggregate environment",
+				"repo", repo, "pr", pr, "environment", env, "tenant", tenant.Tenant)
+			continue
+		}
 		outcome := h.resolveParticipantOutcome(ctx, client, repo, pr, env, headSHA, tenant)
 		retriable = retriable || outcome.retriable
 		checks = append(checks, synthesizeParticipantCheck(outcome, repo, pr, headSHA, env, retryPending))
 	}
 	return checks, retriable
+}
+
+// participantsExpectedOnHead returns the participants a leader folds into its
+// aggregate for env on headSHA: every participant the PR's proposed files
+// select, plus every participant only its listed files select that already
+// published a Check Run for env on headSHA which is not completed and
+// successful. env is aggregateSentinel for an unscoped leader.
+//
+// Narrowing the listed files to what the PR proposes against the default
+// branch can drop a participant on the same head commit, when the default
+// branch acquires a change the PR carried. A participant that never reported
+// has nothing to protect and is dropped. One that did report keeps its own
+// verdict on the head: a run still in progress (an apply may be under way) or
+// one that failed must keep blocking the aggregate (MG-1, MG-6), so it stays
+// expected and the fold renders it like any other participant. A participant
+// that publishes no check for env is never read for it, as in the fold. A
+// failed read is returned as an error: the caller cannot tell which case it is
+// in.
+func (h *Handler) participantsExpectedOnHead(
+	ctx context.Context, client checkRunFinder,
+	repo string, pr int, env, headSHA string,
+	listed, proposed []api.ExpectedTenant,
+) ([]api.ExpectedTenant, error) {
+	coverageEnvironment := env
+	if env == aggregateSentinel {
+		coverageEnvironment = ""
+	}
+	expected := slices.Clone(proposed)
+	for _, tenant := range listed {
+		if slices.ContainsFunc(proposed, func(p api.ExpectedTenant) bool { return p.Tenant == tenant.Tenant }) {
+			continue
+		}
+		if !tenant.PublishesEnvironment(coverageEnvironment) {
+			h.logger.Debug("participant the PR no longer proposes work for does not publish checks for the aggregate environment, not reading it",
+				"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA, "tenant", tenant.Tenant)
+			continue
+		}
+		reported, err := h.participantHasNonPassingRunOnHead(ctx, client, repo, pr, env, headSHA, tenant)
+		if err != nil {
+			return nil, err
+		}
+		if reported {
+			expected = append(expected, tenant)
+		}
+	}
+	return expected, nil
+}
+
+// participantHasNonPassingRunOnHead reports whether a participant the proposed
+// files no longer select published a trusted Check Run for env on headSHA that
+// is not completed and successful, or has a same-named run there only from
+// untrusted Apps. It reads the run name the fold reads for env, through the
+// same trusted read, and agrees with the fold on both: each of them blocks the
+// aggregate.
+func (h *Handler) participantHasNonPassingRunOnHead(
+	ctx context.Context, client checkRunFinder,
+	repo string, pr int, env, headSHA string,
+	tenant api.ExpectedTenant,
+) (bool, error) {
+	if tenant.CheckName == "" {
+		// Config validation requires a check name; without one the leader
+		// cannot read the participant's run, so it stays expected and the fold
+		// blocks on it.
+		h.logger.Warn("participant dropped by narrowing has no check name, keeping it expected",
+			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA, "tenant", tenant.Tenant)
+		return true, nil
+	}
+	checkName := participantCheckName(tenant.CheckName, env)
+	result, untrusted, err := client.FindCheckRunByName(ctx, repo, headSHA, checkName)
+	if err != nil {
+		return false, fmt.Errorf("read Check Run %q of participant %s the PR no longer proposes work for on %s@%s: %w", checkName, tenant.Tenant, repo, headSHA, err)
+	}
+	if result == nil && len(untrusted) > 0 {
+		// The fold blocks on a same-named run from an untrusted App, so keep the
+		// participant expected and let the fold render that block.
+		h.logger.Warn("participant the PR no longer proposes work for has a Check Run on the head only from untrusted GitHub Apps, keeping it expected",
+			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA, "tenant", tenant.Tenant,
+			"check_name", checkName, "untrusted_app_slugs", untrusted)
+		return true, nil
+	}
+	if result == nil {
+		h.logger.Info("participant the PR no longer proposes work for has no Check Run on the head, not expecting it",
+			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA, "tenant", tenant.Tenant, "check_name", checkName)
+		return false, nil
+	}
+	if result.Status == checkStatusCompleted && result.Conclusion == checkConclusionSuccess {
+		h.logger.Info("participant the PR no longer proposes work for passed on the head, not expecting it",
+			"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA, "tenant", tenant.Tenant, "check_name", checkName)
+		return false, nil
+	}
+	h.logger.Info("participant the PR no longer proposes work for has a Check Run on the head that is not passing, keeping it expected",
+		"repo", repo, "pr", pr, "environment", env, "head_sha", headSHA, "tenant", tenant.Tenant, "check_name", checkName,
+		"check_status", result.Status, "check_conclusion", result.Conclusion)
+	return true, nil
 }
 
 func (h *Handler) resolveParticipantOutcome(

@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -17,13 +18,137 @@ import (
 // Each RPC delegates to the underlying Client implementation.
 type Server struct {
 	client Client
+	logger *slog.Logger
+	// storageSchema answers the storage-schema RPCs for this instance's own
+	// storage database. It is nil unless the embedder supplies one with
+	// WithStorageSchemaService, and while it is nil those RPCs are refused
+	// rather than answered against something else.
+	storageSchema StorageSchemaService
+	// driverCapacity answers DriverCapacity from this instance's own driver_pools
+	// table. It is nil unless the embedder supplies it with
+	// WithDriverCapacity, and while it is nil the RPC answers Unimplemented,
+	// which tells a caller not to count on this deployment's drivers.
+	driverCapacity *driverCapacitySource
+}
+
+// driverCapacitySource is what DriverCapacity reads: the live operator
+// servers and this instance's per-apply driver cap.
+type driverCapacitySource struct {
+	servers            storage.DriverPoolStore
+	maxDriversPerApply int
 }
 
 var _ ternv1.TernServer = (*Server)(nil)
 
-// NewServer creates a gRPC server wrapping a Client.
-func NewServer(client Client) *Server {
-	return &Server{client: client}
+// ServerOption customizes the gRPC server's capabilities.
+type ServerOption func(*Server)
+
+// WithStorageSchemaService lets this gRPC endpoint answer for the storage
+// database of the instance serving it. An embedder supplies an adapter bound
+// to its own storage DSN and dialect; without one, the storage-schema RPCs
+// report Unimplemented, which is what tells a caller to upgrade this data
+// plane rather than leaving it to read some other database's schema.
+func WithStorageSchemaService(service StorageSchemaService) ServerOption {
+	return func(s *Server) { s.storageSchema = service }
+}
+
+// WithDriverCapacity lets this endpoint report the drivers its operators run,
+// read from driver_pools in this instance's own storage, and
+// how many operations of one apply they run at once. Every operation a control
+// plane sends here runs on one of these drivers, so the control plane refuses
+// a deferred apply that could never have all its operations here waiting at
+// once.
+func WithDriverCapacity(servers storage.DriverPoolStore, maxDriversPerApply int) ServerOption {
+	return func(s *Server) {
+		s.driverCapacity = &driverCapacitySource{servers: servers, maxDriversPerApply: maxDriversPerApply}
+	}
+}
+
+// NewServer creates a gRPC server wrapping a Client. The logger carries the
+// health-check causes the RPC sanitizes out of its response, so an embedder
+// that wires its own logger sees them with the rest of its structured output
+// and can attach its deployment identifiers to them. A nil logger falls back
+// to the default rather than dropping the only record of the cause.
+func NewServer(client Client, logger *slog.Logger, opts ...ServerOption) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	s := &Server{client: client, logger: logger}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// StorageSchemaPlan reports the DDL outstanding on this instance's own storage
+// database. Read-only, and correspondingly cheap to serve: no lock, no DDL.
+func (s *Server) StorageSchemaPlan(ctx context.Context, req *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
+	if s.storageSchema == nil {
+		return nil, s.refuseStorageSchema(ctx, "StorageSchemaPlan")
+	}
+	resp, err := s.storageSchema.StorageSchemaPlan(ctx, req)
+	if err != nil {
+		// The caller sees a sanitized message, so this log is the only place
+		// the cause survives — and a diff that cannot be computed is exactly
+		// what an operator is trying to see during a failed deploy.
+		s.logger.ErrorContext(ctx, "storage schema plan failed", "error", err)
+		return nil, storageSchemaStatus(err, "storage schema plan failed")
+	}
+	return resp, nil
+}
+
+// StorageSchemaApply converges this instance's own storage schema by running
+// its startup bootstrap, under the same advisory lock a boot takes.
+func (s *Server) StorageSchemaApply(ctx context.Context, req *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
+	if s.storageSchema == nil {
+		return nil, s.refuseStorageSchema(ctx, "StorageSchemaApply", "caller", req.GetCaller())
+	}
+	s.logger.InfoContext(ctx, "converging storage schema on control plane request",
+		"allow_destructive", req.GetAllowDestructive(), "caller", req.GetCaller())
+	resp, err := s.storageSchema.StorageSchemaApply(ctx, req)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "storage schema convergence failed",
+			"allow_destructive", req.GetAllowDestructive(), "caller", req.GetCaller(), "error", err)
+		return nil, storageSchemaStatus(err, "storage schema convergence failed")
+	}
+	return resp, nil
+}
+
+// storageSchemaStatus is what the caller gets when a storage schema RPC fails:
+// the code that says whose problem it is, and a message that names no
+// infrastructure.
+//
+// A caller-caused failure is answered InvalidArgument and carries its own
+// reason, because the caller wrote the input the reason is about and can
+// correct it. Everything else is Internal and carries only a pointer to the
+// logs, because the cause is the data plane's own — a DSN, a host, a driver
+// error — and none of it belongs on a wire that reaches an operator's
+// workstation.
+func storageSchemaStatus(err error, summary string) error {
+	if errors.Is(err, ErrInvalidStorageSchemaRequest) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return status.Errorf(codes.Internal, "%s; see data plane logs", summary)
+}
+
+// errStorageSchemaUnsupported is what an endpoint without a storage-schema
+// adapter answers. Unimplemented rather than Internal or FailedPrecondition:
+// the caller's own Unimplemented branch names the upgrade, and an embedder
+// that never wired the adapter is in exactly the same position as one running
+// a release from before the RPC existed.
+var errStorageSchemaUnsupported = status.Error(codes.Unimplemented,
+	"this deployment does not serve storage schema requests; it is running a release that predates them, or its embedder did not register the storage schema service")
+
+// refuseStorageSchema records a storage-schema RPC arriving at an endpoint
+// with no adapter, and returns the refusal. The caller's Unimplemented branch
+// cannot distinguish the two causes the refusal names — an older release, or
+// an embedder that registered nothing — but this deployment's own logs can:
+// a release that predates the RPC never reaches this line, so a record of it
+// here says the binary serves the RPC and the wiring is what is missing.
+func (s *Server) refuseStorageSchema(ctx context.Context, rpc string, attrs ...any) error {
+	s.logger.WarnContext(ctx, "refusing storage schema request: no storage schema service registered on this endpoint",
+		append([]any{"rpc", rpc}, attrs...)...)
+	return errStorageSchemaUnsupported
 }
 
 // Register registers the server on the given grpc.Server.
@@ -33,9 +158,63 @@ func (s *Server) Register(srv *grpc.Server) {
 
 func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1.HealthResponse, error) {
 	if err := s.client.Health(ctx); err != nil {
+		// The caller only ever sees a sanitized Unavailable, so this log is the
+		// only record of why a deployment stopped reporting healthy — without it
+		// the control plane marks the deployment down with no attributable cause.
+		if callerAbandonedHealthCheck(ctx) {
+			s.logger.DebugContext(ctx, "tern health check abandoned by its caller", "error", err)
+		} else {
+			s.logger.WarnContext(ctx, "tern health check failed; reporting deployment unavailable to caller", "error", err)
+		}
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
 	return &ternv1.HealthResponse{Status: "ok"}, nil
+}
+
+// DriverCapacity reports the drivers this instance's live servers
+// run, the ones of them that may hold a deferred cutover, and how many
+// operations of one apply they run at once.
+func (s *Server) DriverCapacity(ctx context.Context, req *ternv1.DriverCapacityRequest) (*ternv1.DriverCapacityResponse, error) {
+	if s.driverCapacity == nil {
+		s.logger.DebugContext(ctx, "driver capacity requested from an endpoint that does not report it")
+		return nil, status.Error(codes.Unimplemented, "this endpoint does not report its driver capacity")
+	}
+	servers, err := s.driverCapacity.servers.ListLive(ctx)
+	if err != nil {
+		s.logger.WarnContext(ctx, "could not read the live servers; deferred applies sent to this deployment will be refused until it answers", "error", err)
+		return nil, status.Error(codes.Unavailable, "driver capacity unavailable")
+	}
+	resp := &ternv1.DriverCapacityResponse{
+		LiveServers:        int32(len(servers)),
+		MaxDriversPerApply: int32(s.driverCapacity.maxDriversPerApply),
+	}
+	for _, server := range servers {
+		resp.Drivers += int32(server.Drivers)
+		resp.DeferredCutoverDrivers += int32(storage.DeferredCutoverDrivers(server.Drivers))
+	}
+	return resp, nil
+}
+
+// callerAbandonedHealthCheck reports whether a failed health check ended because
+// the caller hung up rather than because the deployment is unhealthy. A control
+// plane shutting down or dropping the connection teaches this side nothing, and
+// the caller already records it.
+//
+// The request context is the signal, not the returned error: gRPC cancels the
+// handler context when the client disconnects, so a real hangup always shows up
+// here, while an error merely wrapping context.Canceled can come from a
+// sub-context the check cancelled itself — a genuine failure that must stay at
+// warn.
+//
+// An expired deadline is deliberately excluded: it means the health check itself
+// outran the caller's budget, which is a genuine unhealthy signal, and this side
+// is the only one that knows what the check was waiting on.
+//
+// A hangup landing after the check already failed for a real cause files that
+// cause at debug. The signal is delayed rather than lost: the deployment is
+// still unhealthy on the caller's next poll, which warns then.
+func callerAbandonedHealthCheck(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 func (s *Server) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -57,6 +236,18 @@ func pullSchemaErrorCode(err error) codes.Code {
 		return codes.InvalidArgument
 	}
 	return codes.Internal
+}
+
+func (s *Server) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	resp, err := s.client.CompareSchemaFileChange(ctx, req)
+	if err != nil {
+		code := codes.Internal
+		if errors.Is(err, ErrCompareSchemaFileChangeUnsupported) {
+			code = codes.Unimplemented
+		}
+		return nil, status.Error(code, err.Error())
+	}
+	return resp, nil
 }
 
 func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
@@ -101,10 +292,32 @@ func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*te
 	}
 	resp, err := s.client.Progress(ctx, req)
 	if err != nil {
-		if errors.Is(err, storage.ErrApplyNotFound) || errors.Is(err, storage.ErrTaskNotFound) {
-			return nil, status.Error(codes.NotFound, err.Error())
+		return nil, status.Error(progressErrorCode(err), err.Error())
+	}
+	return resp, nil
+}
+
+// BatchProgress answers Progress for several operations of one apply. A
+// client that cannot batch is reported Unimplemented, which tells the caller
+// to ask Progress once per operation.
+func (s *Server) BatchProgress(ctx context.Context, req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+	if err := requireApplyID(req.GetApplyId()); err != nil {
+		return nil, err
+	}
+	batcher, ok := s.client.(BatchProgressClient)
+	if !ok {
+		s.logger.DebugContext(ctx, "batch progress requested from an endpoint whose client does not batch; the caller will ask once per operation",
+			"apply_id", req.GetApplyId())
+		return nil, status.Error(codes.Unimplemented, "this endpoint does not answer batch progress")
+	}
+	resp, err := batcher.BatchProgress(ctx, req)
+	if err != nil {
+		if errors.Is(err, ErrBatchProgressUnsupported) {
+			s.logger.DebugContext(ctx, "batch progress requested for an apply whose client does not batch; the caller will ask once per operation",
+				"apply_id", req.GetApplyId())
+			return nil, status.Error(codes.Unimplemented, err.Error())
 		}
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(progressErrorCode(err), err.Error())
 	}
 	return resp, nil
 }
@@ -115,12 +328,26 @@ func (s *Server) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.Log
 	}
 	resp, err := s.client.Logs(ctx, req)
 	if err != nil {
-		if errors.Is(err, storage.ErrApplyNotFound) {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(applyLookupErrorCode(err), err.Error())
 	}
 	return resp, nil
+}
+
+// applyLookupErrorCode carries the difference between an apply that does not
+// exist and a storage failure across the gRPC boundary, so a remote caller can
+// branch on the status code the way an in-process caller branches on the
+// sentinel.
+func applyLookupErrorCode(err error) codes.Code {
+	if errors.Is(err, storage.ErrApplyNotFound) {
+		return codes.NotFound
+	}
+	if errors.Is(err, ErrLogsTargetNotInApply) {
+		return codes.NotFound
+	}
+	if errors.Is(err, ErrLogsShardNotInApply) {
+		return codes.NotFound
+	}
+	return codes.Internal
 }
 
 func (s *Server) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
@@ -140,7 +367,7 @@ func (s *Server) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.Sto
 	}
 	resp, err := s.client.Stop(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(applyLookupErrorCode(err), err.Error())
 	}
 	return resp, nil
 }
@@ -162,18 +389,7 @@ func (s *Server) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.S
 	}
 	resp, err := s.client.Start(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	return resp, nil
-}
-
-func (s *Server) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if err := requireApplyID(req.ApplyId); err != nil {
-		return nil, err
-	}
-	resp, err := s.client.Volume(ctx, req)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(applyLookupErrorCode(err), err.Error())
 	}
 	return resp, nil
 }

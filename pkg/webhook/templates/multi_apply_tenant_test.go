@@ -14,14 +14,16 @@ import (
 // single-tenant deployments render the same command unchanged.
 func TestMultiDeploymentApplyHintsCarryTenant(t *testing.T) {
 	cases := []struct {
-		name    string
-		ops     []presentation.Operation
-		command string
+		name         string
+		ops          []presentation.Operation
+		deferCutover bool
+		command      string
 	}{
 		{
-			name:    "cutover next action",
-			ops:     []presentation.Operation{barrierOp("eu", so.WaitingForCutover), barrierOp("us", so.Running)},
-			command: "schemabot cutover apply-123 -e production",
+			name:         "cutover next action",
+			ops:          []presentation.Operation{barrierOp("eu", so.WaitingForCutover), barrierOp("us", so.Running)},
+			deferCutover: true,
+			command:      "schemabot cutover apply-123 -e production",
 		},
 		{
 			name:    "resume next action",
@@ -40,6 +42,9 @@ func TestMultiDeploymentApplyHintsCarryTenant(t *testing.T) {
 				Model:       presentation.Derive(tc.ops),
 				ApplyID:     "apply-123",
 				Environment: "production",
+			}
+			if tc.deferCutover {
+				data.Details = deferredCutoverDetails()
 			}
 
 			untenanted := RenderMultiDeploymentApplyComment(data)
@@ -62,8 +67,8 @@ func TestMultiDeploymentApplyDetailHintsCarryTenant(t *testing.T) {
 		ApplyID:     "apply-123",
 		Environment: "production",
 		Tenant:      "acme",
-		Details: map[string]ApplyStatusCommentData{
-			"eu": {ApplyID: "apply-123", Environment: "production", State: state.Apply.Stopped, Tenant: "acme"},
+		Details: []*ApplyStatusCommentData{
+			{ApplyID: "apply-123", Environment: "production", State: state.Apply.Stopped, Tenant: "acme"},
 		},
 	}
 

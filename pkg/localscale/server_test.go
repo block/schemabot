@@ -100,6 +100,52 @@ func TestDeriveDeployState_InstantDDLRequestedControlsRevertWindow(t *testing.T)
 	require.Equal(t, dr.Complete, deriveDeployState(migrations, true, true))
 }
 
+// An unrecognized Vitess status counts as queued while the flag is unset, so
+// the processor keeps polling until Vitess resolves it. With the authoritative
+// ready_to_complete flag set, the schema change is cutover-ready regardless of
+// how the status reads.
+func TestDeriveDeployState_UnknownVitessStatus(t *testing.T) {
+	notReady := []migrationInfo{{status: "vreplicating"}}
+	require.Equal(t, dr.Queued, deriveDeployState(notReady, false, false))
+
+	ready := []migrationInfo{{status: "vreplicating", readyToComplete: true}}
+	require.Equal(t, dr.PendingCutover, deriveDeployState(ready, false, false))
+	require.Equal(t, dr.InProgressCutover, deriveDeployState(ready, true, false))
+}
+
+// Vitess can leave ready_to_complete set after a failure or cancel; the stale
+// flag must never resurrect a terminal schema change as cutover-ready.
+func TestDeriveDeployState_TerminalStatusWithStaleReadyFlag(t *testing.T) {
+	failed := []migrationInfo{{status: state.Vitess.Failed, readyToComplete: true}}
+	require.Equal(t, dr.CompleteError, deriveDeployState(failed, true, false))
+
+	cancelled := []migrationInfo{{status: state.Vitess.Cancelled, readyToComplete: true}}
+	require.Equal(t, vitessCancelledSignal, deriveDeployState(cancelled, true, false))
+}
+
+// The COMPLETE command is only issued while some schema change is genuinely
+// waiting for cutover. A terminal schema change with a stale ready_to_complete
+// flag must not trigger one, whatever casing Vitess reported the status in.
+func TestAnyWaitingCutover(t *testing.T) {
+	require.True(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Running, readyToComplete: true},
+	}))
+	require.True(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Complete},
+		{status: state.Vitess.Queued, readyToComplete: true},
+	}))
+
+	require.False(t, anyWaitingCutover(nil))
+	require.False(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Running},
+	}))
+	require.False(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Failed, readyToComplete: true},
+		{status: state.Vitess.Cancelled, readyToComplete: true},
+		{status: "COMPLETE", readyToComplete: true},
+	}))
+}
+
 func TestQualifyAlterTableName(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -124,6 +170,43 @@ func TestQualifyAlterTableName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require.Equal(t, tt.want, qualifyAlterTableName(tt.stmt, tt.schema))
+		})
+	}
+}
+
+// A cancelled deploy request settles from what its schema changes did, not from
+// their reaching a terminal status: a schema change can complete before the
+// cancel reaches it, and only a request none of whose DDL landed was cancelled.
+func TestCancelOutcome(t *testing.T) {
+	tests := []struct {
+		name       string
+		migrations []migrationInfo
+		want       cancelSettlement
+	}{
+		{
+			name:       "a schema change still running keeps the cancel pending",
+			migrations: []migrationInfo{{status: "cancelled"}, {status: "running"}},
+			want:       cancelPending,
+		},
+		{
+			name:       "no schema change completed confirms the cancel",
+			migrations: []migrationInfo{{status: "cancelled"}, {status: "failed"}},
+			want:       cancelConfirmed,
+		},
+		{
+			name:       "every schema change completed before the cancel reached it",
+			migrations: []migrationInfo{{status: "complete"}, {status: "COMPLETE"}},
+			want:       cancelLostToCompletion,
+		},
+		{
+			name:       "a completed schema change beside a cancelled one is partially applied",
+			migrations: []migrationInfo{{status: "complete"}, {status: "cancelled"}},
+			want:       cancelPartiallyApplied,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, cancelOutcome(tt.migrations))
 		})
 	}
 }

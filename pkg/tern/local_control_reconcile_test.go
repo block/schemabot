@@ -1,0 +1,582 @@
+package tern
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"testing"
+
+	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAdoptableEngineTerminalStates(t *testing.T) {
+	tests := []struct {
+		name           string
+		engineState    engine.State
+		retryable      bool
+		wantApplyState string
+		wantTaskState  string
+		wantOK         bool
+	}{
+		{
+			name:           "completed adopts completed",
+			engineState:    engine.StateCompleted,
+			wantApplyState: state.Apply.Completed,
+			wantTaskState:  state.Task.Completed,
+			wantOK:         true,
+		},
+		{
+			name:           "non-retryable failed adopts failed",
+			engineState:    engine.StateFailed,
+			wantApplyState: state.Apply.Failed,
+			wantTaskState:  state.Task.Failed,
+			wantOK:         true,
+		},
+		{
+			name:        "retryable failed is not adoptable so the kill command is honored",
+			engineState: engine.StateFailed,
+			retryable:   true,
+			wantOK:      false,
+		},
+		{
+			name:           "cancelled adopts cancelled",
+			engineState:    engine.StateCancelled,
+			wantApplyState: state.Apply.Cancelled,
+			wantTaskState:  state.Task.Cancelled,
+			wantOK:         true,
+		},
+		{
+			name:           "reverted adopts reverted",
+			engineState:    engine.StateReverted,
+			wantApplyState: state.Apply.Reverted,
+			wantTaskState:  state.Task.Reverted,
+			wantOK:         true,
+		},
+		{
+			name:        "stopped is resumable so a pending cancel still has work to kill",
+			engineState: engine.StateStopped,
+			wantOK:      false,
+		},
+		{
+			name:        "running is live work",
+			engineState: engine.StateRunning,
+			wantOK:      false,
+		},
+		{
+			name:        "revert window is owned by the revert and skip-revert paths",
+			engineState: engine.StateRevertWindow,
+			wantOK:      false,
+		},
+		{
+			name:        "pending is not terminal",
+			engineState: engine.StatePending,
+			wantOK:      false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applyState, taskState, ok := adoptableEngineTerminalStates(tt.engineState, tt.retryable)
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.wantApplyState, applyState)
+			assert.Equal(t, tt.wantTaskState, taskState)
+		})
+	}
+}
+
+// reconcileFixture wires a LocalClient over the in-memory control fakes with
+// one apply, one task, and any pending control requests, so each reconcile
+// test only states what differs.
+type reconcileFixture struct {
+	client          *LocalClient
+	apply           *storage.Apply
+	task            *storage.Task
+	engine          *fakeControlEngine
+	storage         *exactProgressStorage
+	controlRequests *testControlRequestStore
+	logs            *mockApplyLogStore
+}
+
+func newReconcileFixture(fakeEngine *fakeControlEngine, requests ...*storage.ApplyControlRequest) *reconcileFixture {
+	apply := &storage.Apply{
+		ID:              321,
+		ApplyIdentifier: "apply-reconcile",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             654,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-reconcile",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: requests}
+	logs := &mockApplyLogStore{}
+	store := &exactProgressStorage{
+		applies:         &exactProgressApplyStore{apply: apply},
+		tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage:      store,
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+	return &reconcileFixture{
+		client:          client,
+		apply:           apply,
+		task:            task,
+		engine:          fakeEngine,
+		storage:         store,
+		controlRequests: controlRequests,
+		logs:            logs,
+	}
+}
+
+func pendingReconcileRequest(applyID int64, op storage.ControlOperation) *storage.ApplyControlRequest {
+	return &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   op,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}
+}
+
+// The core adoption path: the engine's backend already drove the change to
+// completed before the drive consumed the pending cancel. The drive must adopt
+// the engine's outcome — settling the task and apply to completed with full
+// progress — and moot the pending cancel without ever invoking the engine's
+// Cancel, so the operator never re-runs a command the backend would reject
+// forever.
+func TestReconcileEngineTerminalTruth_AdoptsCompletedAndMootsCancel(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	reader := newTernMetricsReader(t)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "adopting the engine's outcome releases the apply from the active-apply gauge")
+	assert.NotNil(t, fx.engine.progressReq, "the drive must read the engine's authoritative state")
+	assert.Equal(t, 0, fx.engine.cancelCount, "the doomed cancel must never reach the engine")
+	assert.Equal(t, 0, fx.engine.stopCount)
+	assert.Equal(t, state.Task.Completed, fx.task.State)
+	assert.Equal(t, 100, fx.task.ProgressPercent, "a completed task reports full progress")
+	require.NotNil(t, fx.task.CompletedAt)
+	assert.Equal(t, state.Apply.Completed, fx.apply.State)
+	require.NotNil(t, fx.apply.CompletedAt)
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "the durable cancel request must complete so the operator stops re-claiming the apply")
+	assert.True(t, hasLogMessageContaining(fx.logs.logs,
+		"Schema change reached completed on the engine before the pending stop/cancel was consumed; apply recorded as completed (1 tasks settled, 0 already terminal) (caller: github:alice)"))
+}
+
+// A pending stop is mooted the same way when the engine's backend reports the
+// change failed non-retryably: the stored state adopts failed (with the
+// engine's error message) instead of recording a dead change as stopped.
+func TestReconcileEngineTerminalTruth_AdoptsFailedAndMootsStop(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult: &engine.ProgressResult{
+				State:        engine.StateFailed,
+				Retryable:    false,
+				ErrorMessage: "deploy request errored during cutover",
+			},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationStop),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 0, fx.engine.stopCount, "the doomed stop must never reach the engine")
+	assert.Equal(t, state.Task.Failed, fx.task.State)
+	assert.Equal(t, "deploy request errored during cutover", fx.task.ErrorMessage)
+	require.NotNil(t, fx.task.CompletedAt)
+	assert.Equal(t, state.Apply.Failed, fx.apply.State)
+	assert.Equal(t, "deploy request errored during cutover", fx.apply.ErrorMessage)
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+}
+
+// The engine's backend already completed the change, but storage refuses the
+// write adopting that outcome onto the task. The apply's outcome is recorded
+// only over task rows that carry it, so the drive returns the error with the
+// apply and the pending cancel as they were, for the next claim to reconcile
+// again, rather than recording the apply completed over a task still waiting.
+func TestReconcileEngineTerminalTruth_RefusedTaskWriteLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	refused := errors.New("storage unavailable")
+	fx.storage.tasks.(*exactProgressTaskStore).updateErr = func(context.Context, *storage.Task) error { return refused }
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+
+	require.ErrorIs(t, err, refused)
+	require.ErrorIs(t, err, ErrTaskVerdictRefused, "the operator reads this to leave an operation drive's row claimable")
+	assert.Contains(t, err.Error(), "task-reconcile", "the error names the task whose outcome did not land")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the task keeps the state storage holds")
+	assert.Nil(t, fx.task.CompletedAt, "the task keeps the completion storage holds")
+	assert.Equal(t, 0, fx.task.ProgressPercent, "the task keeps the progress storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded completed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the cancel stays pending for the claim that reconciles next")
+}
+
+// The engine's backend already completed the change, but the drive is
+// cancelled as it adopts that outcome onto the task and the write fails under
+// the cancelled context. The failure describes the cancellation, not a refused
+// verdict, so the reconcile returns the cancellation rather than
+// ErrTaskVerdictRefused, with the task, the apply, and the pending cancel as
+// storage holds them: the commands the outcome would moot stay pending for the
+// claim that reconciles next.
+func TestReconcileEngineTerminalTruth_CancelledDriveLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	fx.storage.tasks.(*exactProgressTaskStore).updateErr = func(ctx context.Context, _ *storage.Task) error { return ctx.Err() }
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(ctx, fx.apply, []*storage.Task{fx.task})
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrTaskVerdictRefused, "a cancelled drive's write failure is not a refused verdict")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the task keeps the state storage holds")
+	assert.Nil(t, fx.task.CompletedAt, "the task keeps the completion storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded completed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the cancel stays pending for the claim that reconciles next")
+}
+
+// The engine's backend already failed a change with two tasks still waiting.
+// The first task's adopted failure lands and storage refuses the second. The
+// stored failure stays stored, but the drive returns the error before the
+// apply write, with the apply and the pending stop as they were: an operation
+// drive's row derived from this set would read failed over the task whose
+// write never landed, which is why the error carries ErrTaskVerdictRefused.
+func TestReconcileEngineTerminalTruth_PartlyAdoptedTaskSetLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateFailed, ErrorMessage: "engine refused the statement"},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationStop),
+	)
+	second := &storage.Task{
+		ID:             655,
+		ApplyID:        fx.apply.ID,
+		TaskIdentifier: "task-reconcile-2",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "orders",
+		State:          state.Task.WaitingForDeploy,
+	}
+	tasks := fx.storage.tasks.(*exactProgressTaskStore)
+	tasks.tasks = append(tasks.tasks, second)
+	refused := errors.New("storage unavailable")
+	tasks.updateErr = func(_ context.Context, task *storage.Task) error {
+		if task.ID == second.ID {
+			return refused
+		}
+		return nil
+	}
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task, second})
+
+	require.ErrorIs(t, err, refused)
+	require.ErrorIs(t, err, ErrTaskVerdictRefused)
+	assert.Contains(t, err.Error(), "task-reconcile-2", "the error names the task whose outcome did not land")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.Failed, fx.task.State, "the verdict that landed stays stored")
+	assert.Equal(t, state.Task.WaitingForDeploy, second.State, "the refused task keeps the state storage holds")
+	assert.Empty(t, second.ErrorMessage, "the refused task keeps the error message storage holds")
+	assert.Nil(t, second.CompletedAt, "the refused task keeps the completion storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded failed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the stop stays pending for the claim that reconciles next")
+}
+
+// When the engine reports the change still live, the reconcile must step aside
+// so the pending command is consumed exactly as before.
+func TestReconcileEngineTerminalTruth_NonTerminalEngineFallsThroughToCommand(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateRunning},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.NotNil(t, fx.engine.progressReq)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the reconcile must not touch a live task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq, "the pending cancel must remain for the command path to consume")
+	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+}
+
+// An operator's cancel is pending while the engine's backend reports a cancel
+// it accepted but has not confirmed, which reads as running. The first claim
+// must not adopt anything: the cancel stays pending, and the cancel command
+// fails while the engine still has live work, leaving the stored state as it
+// was. The backend then settles the deploy as failed because the cancel never
+// landed, and the next claim adopts that failure and settles the pending
+// cancel with the reason it did not take effect, so the apply records what the
+// backend reports rather than a cancel that never happened.
+func TestReconcileEngineTerminalTruth_InFlightCancelAdoptsTheFailureItSettlesOn(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateRunning, Message: "Cancelling deploy..."},
+			cancelErr:               errors.New(`cancel deploy request #72 rejected in deployment state "in_progress_cancel": The deploy request is closed.`),
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled, "a cancel still in flight is not a settled outcome")
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State)
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State)
+
+	_, err = fx.client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: fx.apply.ApplyIdentifier}, "github:alice")
+	require.ErrorContains(t, err, `rejected in deployment state "in_progress_cancel"`,
+		"a cancel rejected while the engine still has live work surfaces for the drive to retry")
+	assert.Equal(t, 1, fx.engine.cancelCount)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the rejected cancel must not record the task cancelled")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the rejected cancel must not record the apply cancelled")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq, "the cancel stays pending for the next claim")
+
+	fx.engine.progressResult = &engine.ProgressResult{
+		State:        engine.StateFailed,
+		Retryable:    false,
+		ErrorMessage: "Deployment failed",
+	}
+
+	handled, err = fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fx.engine.cancelCount, "the settled failure moots the cancel without sending it again")
+	assert.Equal(t, state.Task.Failed, fx.task.State)
+	assert.Equal(t, "Deployment failed", fx.task.ErrorMessage)
+	assert.Equal(t, state.Apply.Failed, fx.apply.State)
+	assert.Equal(t, "Deployment failed", fx.apply.ErrorMessage)
+	settled, err := fx.controlRequests.GetByOperation(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status, "a cancel the backend never confirmed did not take effect")
+	assert.Equal(t, "the schema change reached Failed before the cancel could take effect", settled.ErrorMessage)
+}
+
+// A failed progress read must fail toward consuming the command, never toward
+// skipping it: an unreadable backend must not delay a kill command that may
+// still be able to act.
+func TestReconcileEngineTerminalTruth_ProgressErrorFallsThroughToCommand(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressErr:             errors.New("planetscale api unavailable"),
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled)
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+}
+
+// Persisted engine resume state is how a change is addressed, on every database
+// type — the progress read that decides whether an already-landed outcome may be
+// adopted must carry it, or it answers for a different change (or for none) and
+// the drive kills work the engine had already finished.
+func TestReconcileEngineTerminalTruth_ProgressReadCarriesPersistedResumeState(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	operationID := int64(77)
+	fx.task.ApplyOperationID = &operationID
+	fx.storage.applyOperations = &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{
+			ApplyOperationID: operationID,
+			MigrationContext: "task-reconcile",
+			Metadata:         `{"deploy_request_id":42}`,
+		},
+	}
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	require.NotNil(t, fx.engine.progressReq)
+	require.NotNil(t, fx.engine.progressReq.ResumeState, "the progress read must address the change through its persisted resume state")
+	assert.Equal(t, "task-reconcile", fx.engine.progressReq.ResumeState.MigrationContext)
+	assert.Equal(t, `{"deploy_request_id":42}`, fx.engine.progressReq.ResumeState.Metadata)
+	assert.Equal(t, state.Apply.Completed, fx.apply.State)
+	assert.Equal(t, state.Task.Completed, fx.task.State)
+}
+
+// An instance-local engine's progress says nothing about work a previous
+// process drove, so the reconcile must not even read it — those engines
+// reconcile completed work through the resume re-plan.
+func TestReconcileEngineTerminalTruth_InstanceLocalEngineIsNotConsulted(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: false,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Nil(t, fx.engine.progressReq, "an instance-local engine's progress must not be read as backend truth")
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State)
+}
+
+// With no pending kill command there is nothing to protect, so the reconcile
+// is a no-op — the drive's own progress polling reconciles engine state.
+func TestReconcileEngineTerminalTruth_NoPendingCommandIsNoOp(t *testing.T) {
+	fx := newReconcileFixture(&fakeControlEngine{
+		externallyAuthoritative: true,
+		progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+	})
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Nil(t, fx.engine.progressReq)
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State)
+}
+
+// A revert-phase apply's outcome is owned by the revert and skip-revert paths,
+// and the command gates permanently reject stop/cancel for it — the reconcile
+// must not race the in-flight revert phase by adopting a terminal state.
+func TestReconcileEngineTerminalTruth_RevertPhaseApplyIsNotReconciled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateReverted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	fx.apply.State = state.Apply.Reverting
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Nil(t, fx.engine.progressReq)
+	assert.Equal(t, state.Apply.Reverting, fx.apply.State)
+}
+
+// With no task addressing live engine work there is no backend change whose
+// terminal truth could contradict the command; the command path owns the
+// terminal and task-less shapes.
+func TestReconcileEngineTerminalTruth_NoLiveEngineWorkIsNotReconciled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	fx.task.State = state.Task.Pending
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Nil(t, fx.engine.progressReq)
+	assert.Equal(t, state.Task.Pending, fx.task.State)
+}
+
+// A stopped engine state is resumable — a pending cancel still has live
+// backend work to kill — so the reconcile must fall through to the command.
+func TestReconcileEngineTerminalTruth_StoppedEngineStateFallsThroughToCommand(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateStopped},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled)
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+}
+
+// When both a stop and a cancel are pending, adopting the engine's terminal
+// truth moots both durable requests in one sweep.
+func TestReconcileEngineTerminalTruth_MootsBothPendingCommands(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationStop),
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	for _, op := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+		controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, op)
+		require.NoError(t, err)
+		assert.Nil(t, controlReq, "pending %s must be mooted by the adopted terminal state", op)
+	}
+}

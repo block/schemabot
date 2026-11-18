@@ -78,7 +78,7 @@ func TestComputeAggregate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			conclusion, status := computeAggregate(tt.checks)
+			conclusion, status := computeAggregate(tt.checks, nil)
 			assert.Equal(t, tt.wantConclusion, conclusion)
 			assert.Equal(t, tt.wantStatus, status)
 		})
@@ -145,7 +145,7 @@ func TestAggregateSummary(t *testing.T) {
 		{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 drop · 2 vschema updates"},
 	}
 
-	title, summary := aggregateSummary(checks, checkConclusionActionRequired)
+	title, summary := aggregateSummary(checks, checkConclusionActionRequired, nil)
 
 	assert.Contains(t, title, "1 apply pending")
 	// The rows span staging and production, so the global aggregate table adds an
@@ -172,7 +172,7 @@ func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 creates"},
 			{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "1 alter"},
 		}
-		section := renderDatabaseSection(checks, maxCheckRunTextLength)
+		section := renderDatabaseSection(checks, maxCheckRunTextLength, nil)
 		assert.Contains(t, section, "| Database | Type | Change | Status |")
 		assert.NotContains(t, section, "Environment")
 	})
@@ -182,7 +182,7 @@ func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 creates"},
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusInProgress, ChangeSummary: "2 creates"},
 		}
-		section := renderDatabaseSection(checks, maxCheckRunTextLength)
+		section := renderDatabaseSection(checks, maxCheckRunTextLength, nil)
 		assert.Contains(t, section, "| Database | Environment | Type | Change | Status |")
 		assert.Contains(t, section, "| `orders` | staging | mysql |")
 		assert.Contains(t, section, "| `orders` | production | mysql |")
@@ -199,7 +199,7 @@ func TestAggregateSummary_WithParticipants(t *testing.T) {
 		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-c", Environment: "production", Status: checkStatusInProgress},
 	}
 
-	_, summary := aggregateSummary(checks, checkConclusionActionRequired)
+	_, summary := aggregateSummary(checks, checkConclusionActionRequired, nil)
 
 	dbSection, tenantSection, found := strings.Cut(summary, "**Tenant deployments**")
 	require.True(t, found, "summary has a Tenant deployments section")
@@ -219,6 +219,203 @@ func TestAggregateSummary_WithParticipants(t *testing.T) {
 	assert.Contains(t, tenantSection, "`tenant-c`")
 }
 
+// When the blocking rows are tenant deployments' folded checks, the leader's
+// title says "tenant applies" — a bare "apply pending" reads as the leader's
+// own work when the pending applies actually belong to the tenants.
+func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
+	tenantPending := func(tenant string) *storage.Check {
+		return &storage.Check{
+			DatabaseType: aggregateSentinel,
+			DatabaseName: tenant,
+			Environment:  "production",
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionActionRequired,
+		}
+	}
+
+	t.Run("all pending rows are tenant folds", func(t *testing.T) {
+		checks := []*storage.Check{
+			tenantPending("tenant-a"),
+			tenantPending("tenant-b"),
+			tenantPending("tenant-c"),
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
+		assert.Equal(t, "3 tenant applies pending", title)
+	})
+
+	t.Run("single tenant fold pending", func(t *testing.T) {
+		checks := []*storage.Check{
+			tenantPending("tenant-a"),
+			{DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
+		assert.Equal(t, "1 tenant apply pending", title)
+	})
+
+	t.Run("own and tenant applies pending", func(t *testing.T) {
+		checks := []*storage.Check{
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 alter"},
+			tenantPending("tenant-a"),
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
+		assert.Equal(t, "2 applies pending (1 tenant)", title)
+	})
+
+	// A participant whose Check Run could not be read blocks the aggregate,
+	// but it is a reporting gap, not a pending apply — the title must surface
+	// it separately instead of folding it into the tenant-apply count.
+	t.Run("unresolved participant is not counted as a pending apply", func(t *testing.T) {
+		unresolvedRow := tenantPending("tenant-b")
+		unresolvedRow.BlockingReason = participantUnresolvedBlockingReason
+		checks := []*storage.Check{
+			tenantPending("tenant-a"),
+			unresolvedRow,
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
+		assert.Equal(t, "1 apply pending, 1 participant has not reported", title)
+	})
+
+	t.Run("own applies and unresolved participants surface both counts", func(t *testing.T) {
+		unresolvedB := tenantPending("tenant-b")
+		unresolvedB.BlockingReason = participantUnresolvedBlockingReason
+		unresolvedC := tenantPending("tenant-c")
+		unresolvedC.BlockingReason = participantUnresolvedBlockingReason
+		checks := []*storage.Check{
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 alter"},
+			tenantPending("tenant-a"),
+			unresolvedB,
+			unresolvedC,
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
+		assert.Equal(t, "2 applies pending, 2 participants have not reported", title)
+	})
+}
+
+// A stopped apply keeps its stored check in progress, but the PR is waiting on
+// an operator to start or cancel it — not on work. When only stopped applies
+// hold the aggregate, it concludes action_required, still blocking merge, and
+// the title says the applies are stopped; a reader shown a running check would
+// watch for progress that will never arrive. A stopped apply alongside running
+// work keeps the aggregate in progress.
+func TestAggregateFold_StoppedApplies(t *testing.T) {
+	running := &storage.Check{
+		DatabaseName: "orders", DatabaseType: "mysql", Environment: "production",
+		ApplyID: 11, Status: checkStatusInProgress, HasChanges: true,
+	}
+	stoppedOrders := &storage.Check{
+		DatabaseName: "orders", DatabaseType: "mysql", Environment: "production",
+		ApplyID: 22, Status: checkStatusInProgress, HasChanges: true,
+	}
+	stoppedLedger := &storage.Check{
+		DatabaseName: "ledger", DatabaseType: "mysql", Environment: "production",
+		ApplyID: 33, Status: checkStatusInProgress, HasChanges: true,
+	}
+	pendingUsers := &storage.Check{
+		DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
+		Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true,
+	}
+	failedUsers := &storage.Check{
+		DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
+		Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true,
+	}
+	stopped := stoppedApplyIDs{22: true, 33: true}
+
+	fold := func(checks ...*storage.Check) (conclusion, status, title, summary string) {
+		conclusion, status = computeAggregate(checks, stopped)
+		title, summary = aggregateSummary(checks, conclusion, stopped)
+		return conclusion, status, title, summary
+	}
+
+	t.Run("the only in-flight apply is stopped", func(t *testing.T) {
+		conclusion, status, title, _ := fold(stoppedOrders)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionActionRequired, conclusion)
+		assert.Equal(t, "1 apply stopped", title)
+	})
+
+	t.Run("every in-flight apply is stopped", func(t *testing.T) {
+		conclusion, status, title, _ := fold(stoppedOrders, stoppedLedger)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionActionRequired, conclusion)
+		assert.Equal(t, "2 applies stopped", title)
+	})
+
+	t.Run("a stopped apply alongside a pending one", func(t *testing.T) {
+		conclusion, status, title, _ := fold(stoppedLedger, pendingUsers)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionActionRequired, conclusion)
+		assert.Equal(t, "1 apply pending (1 stopped)", title)
+	})
+
+	t.Run("a failed apply outranks a stopped one", func(t *testing.T) {
+		conclusion, status, title, _ := fold(stoppedLedger, failedUsers)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionFailure, conclusion)
+		assert.Equal(t, "Apply failed", title)
+	})
+
+	t.Run("a stopped apply alongside one still running", func(t *testing.T) {
+		conclusion, status, title, _ := fold(running, stoppedLedger)
+		assert.Equal(t, checkStatusInProgress, status)
+		assert.Empty(t, conclusion)
+		assert.Equal(t, "Apply in progress (1 stopped)", title)
+	})
+
+	t.Run("the table row agrees with the title", func(t *testing.T) {
+		_, _, _, summary := fold(running, stoppedLedger)
+		assert.Contains(t, summary, "| `ledger` | mysql | — | Stopped |")
+		assert.Contains(t, summary, "| `orders` | mysql | — | In progress |")
+	})
+
+	t.Run("nothing stopped keeps the state-agnostic title", func(t *testing.T) {
+		conclusion, status, title, _ := fold(running)
+		assert.Equal(t, checkStatusInProgress, status)
+		assert.Empty(t, conclusion)
+		assert.Equal(t, "Apply in progress", title)
+	})
+
+	// An unresolvable set (a storage read failed) keeps the aggregate in
+	// progress: it still blocks merge, and nothing claims the apply is stopped.
+	t.Run("unknown apply states keep the aggregate in progress", func(t *testing.T) {
+		checks := []*storage.Check{stoppedOrders, stoppedLedger}
+		conclusion, status := computeAggregate(checks, nil)
+		title, _ := aggregateSummary(checks, conclusion, nil)
+		assert.Equal(t, checkStatusInProgress, status)
+		assert.Empty(t, conclusion)
+		assert.Equal(t, "Apply in progress", title)
+	})
+}
+
+// Resolving stopped applies costs a storage read, and only an in-progress
+// apply-owned row can be held open by one. Folds run on every webhook event, so
+// a fold with no such row must not pay for a set it would never consult.
+func TestAnyApplyOwnedInProgress(t *testing.T) {
+	t.Run("in-progress row owned by an apply", func(t *testing.T) {
+		assert.True(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+			{Status: checkStatusInProgress, ApplyID: 7},
+		}))
+	})
+
+	// A plan-only row waiting on results has no apply to be stopped.
+	t.Run("in-progress row no apply owns", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusInProgress},
+		}))
+	})
+
+	// An apply that has finished cannot be stopped, whatever the row remembers.
+	t.Run("completed row that still names an apply", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ApplyID: 7},
+		}))
+	})
+
+	t.Run("no contributions", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress(nil))
+	})
+}
+
 // Participant gating is the key information, so the Tenant deployments section
 // must survive even when the leader has so many per-database checks that the
 // Database section truncates.
@@ -235,7 +432,7 @@ func TestAggregateSummary_TenantSectionSurvivesDatabaseTruncation(t *testing.T) 
 		Status: checkStatusInProgress,
 	})
 
-	_, summary := aggregateSummary(checks, checkStatusInProgress)
+	_, summary := aggregateSummary(checks, checkStatusInProgress, nil)
 
 	assert.Less(t, len(summary), maxCheckRunTextLength, "summary stays under the Check Run limit")
 	assert.Contains(t, summary, "more check(s)", "the Database section truncates")
@@ -249,7 +446,7 @@ func TestAggregateSummary_AllSuccess(t *testing.T) {
 		{DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
 	}
 
-	title, _ := aggregateSummary(checks, checkConclusionSuccess)
+	title, _ := aggregateSummary(checks, checkConclusionSuccess, nil)
 	assert.Equal(t, "All applies complete", title)
 }
 
@@ -259,7 +456,7 @@ func TestAggregateSummary_AllUpToDate(t *testing.T) {
 		{DatabaseName: "users", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
 	}
 
-	title, summary := aggregateSummary(checks, checkConclusionSuccess)
+	title, summary := aggregateSummary(checks, checkConclusionSuccess, nil)
 
 	assert.Equal(t, "Schema up to date", title)
 	assert.Contains(t, summary, "| Database | Type | Change | Status |")
@@ -356,7 +553,7 @@ func TestNormalizeStaleContributions(t *testing.T) {
 			assert.Equal(t, checkStatusInProgress, c.Status)
 			assert.Empty(t, c.Conclusion)
 		}
-		conclusion, status := computeAggregate(contributions)
+		conclusion, status := computeAggregate(contributions, nil)
 		assert.Empty(t, conclusion)
 		assert.Equal(t, checkStatusInProgress, status)
 	})
@@ -380,4 +577,17 @@ func TestAnyInProgressOnCommit(t *testing.T) {
 
 	checks = append(checks, &storage.Check{HeadSHA: "current", DatabaseName: "billing", Status: checkStatusInProgress})
 	assert.True(t, anyInProgressOnCommit(checks, "current"))
+}
+
+func TestAggregateRequiresRecognizedTerminalSuccess(t *testing.T) {
+	for _, check := range []*storage.Check{
+		{Status: checkStatusCompleted, Conclusion: "neutral"},
+		{Status: checkStatusCompleted, Conclusion: "timed_out"},
+		{Status: checkStatusCompleted},
+		{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, BlockingReason: "reconciliation_required"},
+		{Status: "queued", Conclusion: checkConclusionSuccess},
+	} {
+		conclusion, _ := computeAggregate([]*storage.Check{check}, nil)
+		assert.NotEqual(t, checkConclusionSuccess, conclusion)
+	}
 }

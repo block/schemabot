@@ -2,7 +2,10 @@ package api
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Aggregate-check roles for a repository. In a multi-tenant aggregate check,
@@ -53,6 +56,18 @@ type ExpectedTenant struct {
 	// tenants: the leader cannot gate on a participant whose Check Run name it
 	// cannot resolve, so a missing name is a fail-closed configuration error.
 	CheckName string `yaml:"check_name"`
+
+	// Environments names the environment checks this participant publishes.
+	// Omitted coverage conservatively includes every environment during migration.
+	// An explicit empty list is invalid. Coverage contributes to repository
+	// applicability. Unscoped aggregates retain their legacy contract.
+	Environments []string `yaml:"environments,omitempty"`
+}
+
+// PublishesEnvironment reports whether the leader must read this participant
+// for an environment. An empty environment denotes the legacy unscoped check.
+func (t ExpectedTenant) PublishesEnvironment(environment string) bool {
+	return environment == "" || t.Environments == nil || slices.Contains(t.Environments, environment)
 }
 
 func (a *AggregateConfig) isLeader() bool {
@@ -65,7 +80,7 @@ func (c *ServerConfig) AggregateRoleForRepo(repo string) string {
 	if c == nil {
 		return ""
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || repoConfig.Aggregate == nil {
 		return ""
 	}
@@ -97,7 +112,7 @@ func (c *ServerConfig) ExpectedTenantsForPR(repo string, changedFiles []string) 
 }
 
 // ExpectedParticipantChecksForPR returns the full expected-tenant entries
-// (tenant, paths, and participant check-name base) that the leader must gate on
+// (tenant, paths, environment coverage, and participant check-name base) that the leader must gate on
 // for a PR touching changedFiles: the subset of the repo's expected-tenant set
 // whose managed path prefixes cover at least one changed file. The leader
 // env-scopes each returned CheckName to find the participant's per-environment
@@ -107,7 +122,7 @@ func (c *ServerConfig) ExpectedParticipantChecksForPR(repo string, changedFiles 
 	if c == nil {
 		return nil
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || !repoConfig.Aggregate.isLeader() {
 		return nil
 	}
@@ -118,6 +133,19 @@ func (c *ServerConfig) ExpectedParticipantChecksForPR(repo string, changedFiles 
 		}
 	}
 	return expected
+}
+
+// ExpectedTenantManagesSchemaPath reports whether an expected participant on
+// repo manages schemaPath: whether it falls under one of the path prefixes the
+// leader's expected-tenant set declares for some participant, with the same
+// directory-prefix matching as databases.<db>.allowed_dirs. This is how the
+// leader tells "another deployment owns this schema" from "no deployment
+// does": its own registry covers only its slice of the fleet, and the
+// expected-tenant set is its only view of every other slice. Always false when
+// this deployment is not the leader for repo, since only the leader holds the
+// expected set.
+func (c *ServerConfig) ExpectedTenantManagesSchemaPath(repo, schemaPath string) bool {
+	return len(c.ExpectedParticipantChecksForPR(repo, []string{schemaPath})) > 0
 }
 
 // anyPathCovered reports whether any changed file falls under one of dirs, using
@@ -170,6 +198,22 @@ func validateAggregateConfig(repo string, agg *AggregateConfig) error {
 		seen[name] = struct{}{}
 		if strings.TrimSpace(tenant.CheckName) == "" {
 			return fmt.Errorf("repos.%s.aggregate.expected_tenants[%q].check_name is required for role %q", repo, name, AggregateRoleLeader)
+		}
+		if tenant.Environments != nil {
+			field := fmt.Sprintf("repos.%s.aggregate.expected_tenants[%q].environments", repo, name)
+			if len(tenant.Environments) == 0 {
+				return fmt.Errorf("%s must not be empty when specified", field)
+			}
+			if err := validateIdentifiers(field, tenant.Environments); err != nil {
+				return err
+			}
+			seenEnvironments := make(map[string]bool, len(tenant.Environments))
+			for _, environment := range tenant.Environments {
+				if seenEnvironments[environment] {
+					return fmt.Errorf("%s contains duplicate environment %q", field, environment)
+				}
+				seenEnvironments[environment] = true
+			}
 		}
 		if len(tenant.Paths) == 0 {
 			return fmt.Errorf("repos.%s.aggregate.expected_tenants[%q].paths is empty", repo, name)

@@ -3,9 +3,11 @@
 package pendingdrops
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
@@ -16,11 +18,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/testutil"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 )
 
 var sharedDSN string
@@ -28,57 +30,17 @@ var sharedDSN string
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      "testdb",
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
-	}
-
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", "testdb"),
 		Started:          true,
 	})
 	if err != nil {
 		log.Fatalf("start mysql container: %v", err)
 	}
 
-	host, err := testutil.ContainerHost(ctx, container)
+	sharedDSN, err = testutil.MySQLDSN(ctx, container, "testdb", "parseTime=true")
 	if err != nil {
-		log.Fatalf("get container host: %v", err)
-	}
-	port, err := testutil.ContainerPort(ctx, container, "3306")
-	if err != nil {
-		log.Fatalf("get container port: %v", err)
-	}
-	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true", host, port)
-
-	var db *sql.DB
-	for range 30 {
-		db, err = sql.Open("mysql", sharedDSN)
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if err = db.PingContext(ctx); err == nil {
-			if err := db.Close(); err != nil {
-				log.Fatalf("close mysql readiness connection: %v", err)
-			}
-			break
-		}
-		if closeErr := db.Close(); closeErr != nil {
-			log.Printf("close mysql readiness connection: %v", closeErr)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		log.Fatalf("connect to mysql: %v", err)
+		log.Fatalf("build mysql dsn: %v", err)
 	}
 
 	code := m.Run()
@@ -92,10 +54,10 @@ func TestMain(m *testing.M) {
 func setupCleanerTest(t *testing.T) *sql.DB {
 	t.Helper()
 
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	require.NoError(t, err, "connect to mysql")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
-	require.NoError(t, db.PingContext(t.Context()), "ping mysql")
+	require.NoError(t, testutil.PingMySQL(t.Context(), db), "reach mysql")
 
 	_, err = db.ExecContext(t.Context(), fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", Database))
 	require.NoError(t, err, "reset quarantine database")
@@ -145,9 +107,48 @@ func quarantinedTables(t *testing.T, db *sql.DB) []string {
 
 func testCleaner(t *testing.T, retention time.Duration, dryRun bool) *Cleaner {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	targets := []Target{{Database: "testdb", Environment: "staging", DSN: sharedDSN}}
+	return testCleanerLoggingTo(t, os.Stdout, retention, dryRun)
+}
+
+// testCleanerLoggingTo builds a cleaner over the shared target whose logs go
+// to logs, for tests that assert on what a pass reports.
+func testCleanerLoggingTo(t *testing.T, logs io.Writer, retention time.Duration, dryRun bool) *Cleaner {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	targets := []Target{{Database: "testdb", Environment: "staging", DSN: sharedDSN, Locker: namedlock.MySQL{}}}
 	return NewCleaner(targets, retention, dryRun, logger)
+}
+
+// breakQuarantineLog replaces the quarantine log with a view over a base table
+// that no longer exists, so the log is listed but cannot be read.
+func breakQuarantineLog(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", Database),
+		fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", Database, LogTable),
+		fmt.Sprintf("CREATE TABLE `%s`.`log_base` (quarantine_table varchar(64) NOT NULL)", Database),
+		fmt.Sprintf("CREATE VIEW `%s`.`%s` AS SELECT quarantine_table FROM `%s`.`log_base`", Database, LogTable, Database),
+		fmt.Sprintf("DROP TABLE `%s`.`log_base`", Database),
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+}
+
+// createUndroppableQuarantinedTable creates an expired copy that a child table
+// references, so the cleaner's DROP of it fails.
+func createUndroppableQuarantinedTable(t *testing.T, db *sql.DB, table string, quarantinedAt time.Time) string {
+	t.Helper()
+	expired := createQuarantinedTable(t, db, table, quarantinedAt)
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD PRIMARY KEY (id)", Database, expired))
+	require.NoError(t, err, "add parent primary key")
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s`.`child_table` (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_pending_parent FOREIGN KEY (parent_id) REFERENCES `%s`.`%s` (id))", Database, Database, expired))
+	require.NoError(t, err, "create referencing child table")
+	t.Cleanup(func() {
+		_, cleanupErr := db.ExecContext(context.WithoutCancel(t.Context()), fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`child_table`", Database))
+		require.NoError(t, cleanupErr, "drop child table")
+	})
+	return expired
 }
 
 // The cleaner drops quarantined tables older than the retention period and
@@ -229,32 +230,80 @@ func TestCleaner_CustomRetention(t *testing.T) {
 }
 
 // A table-level cleanup failure is surfaced to the caller while the table
-// remains quarantined for the next cleanup pass.
+// remains quarantined for the next cleanup pass, its quarantine log record
+// with it.
 func TestCleaner_DropFailureReturnsError(t *testing.T) {
 	db := setupCleanerTest(t)
 
-	expired := createQuarantinedTable(t, db, "parent_table", time.Now().Add(-8*24*time.Hour))
-	_, err := db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD PRIMARY KEY (id)", Database, expired))
-	require.NoError(t, err, "add parent primary key")
-	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s`.`child_table` (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_pending_parent FOREIGN KEY (parent_id) REFERENCES `%s`.`%s` (id))", Database, Database, expired))
-	require.NoError(t, err, "create referencing child table")
-	t.Cleanup(func() {
-		_, cleanupErr := db.ExecContext(context.WithoutCancel(t.Context()), fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`child_table`", Database))
-		require.NoError(t, cleanupErr, "drop child table")
-	})
+	quarantinedAt := time.Now().Add(-8 * 24 * time.Hour)
+	expired := createUndroppableQuarantinedTable(t, db, "parent_table", quarantinedAt)
+	require.NoError(t, RecordQuarantines(t.Context(), db, slog.Default(), "apply-a", []QuarantinedTable{
+		{SchemaName: "testdb", TableName: "parent_table", QuarantineSchema: Database, QuarantineTable: expired},
+	}, quarantinedAt))
 
 	cleaner := testCleaner(t, DefaultRetention, false)
 	require.Error(t, cleaner.Run(t.Context()))
 
 	remaining := quarantinedTables(t, db)
 	assert.Contains(t, remaining, expired, "failed drop should remain quarantined")
+	recorded, err := RecordedQuarantines(t.Context(), db, "apply-a", "testdb", "parent_table")
+	require.NoError(t, err)
+	require.Len(t, recorded, 1, "the record of a copy that is still there is kept")
+	assert.Equal(t, expired, recorded[0].QuarantineTable)
+}
+
+// stuckReleaseLocker takes and reports the lock through the real MySQL locker
+// but never answers a release, as a release sent down a half-open connection
+// is never answered. The lock is therefore still held on the pass's session
+// when the release gives up, and only the pass closing its pool frees it.
+type stuckReleaseLocker struct {
+	namedlock.MySQL
+}
+
+func (stuckReleaseLocker) Release(ctx context.Context, _ *sql.Conn, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// A pass whose release is never answered ends at the release bound rather
+// than pinning the cleaner, and the server frees the cleanup lock once the
+// pass has closed its pool, so the next pass on this target can take it.
+func TestCleaner_PassEndsWhenTheReleaseIsNeverAnswered(t *testing.T) {
+	previous := lockReleaseTimeout
+	lockReleaseTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { lockReleaseTimeout = previous })
+	db := setupCleanerTest(t)
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	target := Target{Database: "testdb", Environment: "staging", DSN: sharedDSN, Locker: stuckReleaseLocker{}}
+	cleaner := NewCleaner([]Target{target}, DefaultRetention, false, logger)
+
+	done := make(chan error, 1)
+	go func() { done <- cleaner.Run(t.Context()) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the cleanup pass did not end at the release bound")
+	}
+	assert.Contains(t, logs.String(), "failed to release pending drops cleanup lock")
+	assert.Contains(t, logs.String(), context.DeadlineExceeded.Error())
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	require.Eventually(t, func() bool {
+		acquired, err := namedlock.MySQL{}.Acquire(t.Context(), conn, targetLockName(target), 0)
+		return err == nil && acquired
+	}, 10*time.Second, 100*time.Millisecond, "the cleanup lock must be free once the pass has closed its pool")
 }
 
 // An unreachable target fails the pass with an error but does not panic; the
 // failed target is retried on the next pass.
 func TestCleaner_UnreachableTargetReturnsError(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	targets := []Target{{Database: "downdb", Environment: "staging", DSN: "root:wrong@tcp(127.0.0.1:1)/missing?timeout=2s"}}
+	targets := []Target{{Database: "downdb", Environment: "staging", DSN: "root:wrong@tcp(127.0.0.1:1)/missing?timeout=2s", Locker: namedlock.MySQL{}}}
 	cleaner := NewCleaner(targets, DefaultRetention, false, logger)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

@@ -1,12 +1,15 @@
 package webhook
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -45,19 +48,70 @@ func (h *Handler) isAggregateParticipant(repo string) bool {
 	return config.AggregateRoleForRepo(repo) == api.AggregateRoleParticipant
 }
 
-// leaderExpectsParticipantsForPR reports whether this deployment is the
-// aggregate leader for repo and the PR's changed files touch at least one
-// expected participant's paths. Such a PR carries schema work owned by another
-// deployment even when the leader itself has none, so the leader's aggregate
-// must fold the participants' Check Runs (fail-closed) rather than pass on
-// "no managed schema changes". Returns false for non-leaders — the expected set
-// only exists on the leader.
-func (h *Handler) leaderExpectsParticipantsForPR(repo string, files []ghclient.PRFile) bool {
+// hasAggregateRole reports whether this deployment is the aggregate leader or
+// an aggregate participant for repo.
+func (h *Handler) hasAggregateRole(repo string) bool {
 	config, ok := h.serverConfig()
 	if !ok {
 		return false
 	}
-	return len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0
+	role := config.AggregateRoleForRepo(repo)
+	return role == api.AggregateRoleLeader || role == api.AggregateRoleParticipant
+}
+
+// leaderParticipantsForPR returns the participants this deployment, as the
+// aggregate leader for repo, must fold for the PR at headSHA. A PR that selects
+// any carries schema work owned by another deployment even when the leader
+// itself has none, so the leader's aggregate must fold the participants' Check
+// Runs (fail-closed) rather than pass on "no managed schema changes".
+//
+// listed is the PR's raw changed-file listing and proposed is that listing
+// narrowed to what the PR proposes against the default branch. Every path that
+// decides whether to fold (the fold itself, auto-plan, and the plan command's
+// refresh) asks this one question, so a participant that kept a non-passing run
+// on the head after narrowing dropped it gates all of them alike. Non-leaders
+// get no participants: the expected set only exists on the leader. A failed
+// participant read is returned as an error so the caller publishes nothing.
+//
+// An environment-scoped leader publishes every aggregate through its own fold,
+// which reads the participants it expects under their environment-scoped
+// names, so its callers only use the answer to choose how to describe that
+// fold. It returns every participant the listed files select without reading
+// any Check Run: participants publish no run under the unscoped name there,
+// and selecting too many only ever routes to the fold, which fails closed.
+func (h *Handler) leaderParticipantsForPR(
+	ctx context.Context, client checkRunFinder,
+	repo string, pr int, headSHA string,
+	listed, proposed []ghclient.PRFile,
+) ([]api.ExpectedTenant, error) {
+	config, ok := h.serverConfig()
+	if !ok {
+		return nil, nil
+	}
+	if len(config.AllowedEnvironments) > 0 {
+		h.logger.Debug("environment-scoped leader selects participants from the listed files without reading their Check Runs; its fold reads them per environment",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)), nil
+	}
+	return h.participantsExpectedOnHead(ctx, client, repo, pr, aggregateSentinel, headSHA,
+		config.ExpectedParticipantChecksForPR(repo, prFilePaths(listed)),
+		config.ExpectedParticipantChecksForPR(repo, prFilePaths(proposed)))
+}
+
+// participantPathsTouched reports whether the PR selects this participant's
+// managed directories even though no schema config resolved (for example a
+// documentation-only change inside a participant's paths).
+func (h *Handler) participantPathsTouched(repo string, files []ghclient.PRFile) bool {
+	config, ok := h.serverConfig()
+	if !ok || !config.RepoHasSchemaDirAllowlist(repo) {
+		return false
+	}
+	for _, file := range prFilePaths(files) {
+		if config.SchemaPathAllowedForRepo(repo, file) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) aggregateCheckNameForRepo(repo string) string {
@@ -86,8 +140,9 @@ func (h *Handler) aggregateCheckTargetsForRepo(repo string) []aggregateCheckTarg
 	if !ok || len(config.AllowedEnvironments) == 0 {
 		return []aggregateCheckTarget{{name: base, environment: aggregateSentinel}}
 	}
-	targets := make([]aggregateCheckTarget, 0, len(config.AllowedEnvironments))
-	for _, env := range config.AllowedEnvironments {
+	environments, _ := config.CheckEnvironmentsForRepo(context.Background(), nil, repo, "")
+	targets := make([]aggregateCheckTarget, 0, len(environments))
+	for _, env := range environments {
 		targets = append(targets, aggregateCheckTarget{
 			name:        aggregateCheckNameForEnv(base, env),
 			environment: env,
@@ -134,7 +189,7 @@ func (h *Handler) attachServerEnvironments(schemaResult *ghclient.SchemaRequestR
 		return fmt.Errorf("resolve configured environments for database %q: %w", schemaResult.Database, err)
 	}
 	if environment != "" && !slices.Contains(environments, environment) {
-		return fmt.Errorf("database %q environment %q is not configured on this server", schemaResult.Database, environment)
+		return &environmentNotConfiguredError{Database: schemaResult.Database, Environment: environment}
 	}
 	schemaResult.Environments = environments
 	return nil
@@ -160,8 +215,7 @@ func filterChecksByEnvironment(checks []*storage.Check, env string) []*storage.C
 // The Environment field is either aggregateSentinel (global aggregate) or a real
 // environment name (per-environment aggregate when allowed_environments is configured).
 func isAggregateCheck(c *storage.Check) bool {
-	return c.DatabaseType == aggregateSentinel &&
-		c.DatabaseName == aggregateSentinel
+	return checkstate.IsAggregate(c)
 }
 
 // checkHasStartedApply returns true once work may already have reached, or may
@@ -236,20 +290,43 @@ func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
 	return false
 }
 
-// computeAggregate determines the aggregate conclusion and status from per-database checks.
-func computeAggregate(checks []*storage.Check) (conclusion, status string) {
-	// in_progress takes precedence — the aggregate should show running
+// computeAggregate determines the aggregate conclusion and status from
+// per-database checks. stopped names the applies resting in the stopped state;
+// nil reads as "nothing is stopped".
+func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclusion, status string) {
+	// in_progress takes precedence — the aggregate should show running. A row
+	// held open by a stopped apply is not running work: it waits on an
+	// operator to start or cancel the apply, so it folds as action_required
+	// below, still blocking merge, rather than as a run that never finishes.
+	heldByStoppedApply := false
 	for _, c := range checks {
-		if c.Status == checkStatusInProgress {
-			return "", checkStatusInProgress
+		if c.Status == checkStatusCompleted {
+			continue
 		}
+		if c.Status == checkStatusInProgress && stopped.holds(c) {
+			heldByStoppedApply = true
+			continue
+		}
+		return "", checkStatusInProgress
 	}
 
-	// All checks are completed — compute conclusion
+	// Every remaining check is completed or held by a stopped apply — compute
+	// the conclusion.
 	for _, c := range checks {
-		if c.Conclusion == checkConclusionFailure {
+		if c.Status != checkStatusCompleted {
+			continue
+		}
+		if c.BlockingReason != "" && c.Conclusion == checkConclusionSuccess {
 			return checkConclusionFailure, checkStatusCompleted
 		}
+		switch c.Conclusion {
+		case checkConclusionSuccess, checkConclusionActionRequired:
+		default:
+			return checkConclusionFailure, checkStatusCompleted
+		}
+	}
+	if heldByStoppedApply {
+		return checkConclusionActionRequired, checkStatusCompleted
 	}
 	for _, c := range checks {
 		if c.Conclusion == checkConclusionActionRequired {
@@ -261,7 +338,7 @@ func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 }
 
 // aggregateSummary builds a human-readable title and markdown summary for the aggregate check.
-func aggregateSummary(checks []*storage.Check, conclusion string) (title, summary string) {
+func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
 		if allChecksAreUpToDate(checks) {
@@ -269,23 +346,38 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 		} else {
 			title = "All applies complete"
 		}
-		summary = buildAggregateTable(checks)
+		summary = buildAggregateTable(checks, stopped)
 	case checkConclusionFailure:
 		title = "Apply failed"
-		summary = buildAggregateTable(checks)
+		summary = buildAggregateTable(checks, stopped)
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
+		tenantApplies := 0
+		stoppedApplies := 0
+		var pendingCheck *storage.Check
 		for _, c := range checks {
+			if c.Status == checkStatusInProgress && stopped.holds(c) {
+				stoppedApplies++
+				continue
+			}
 			if c.Conclusion != checkConclusionActionRequired {
 				continue
 			}
 			pending++
-			if isUnresolvedParticipantCheck(c) {
+			pendingCheck = c
+			switch {
+			case isUnresolvedParticipantCheck(c):
 				unresolved++
+			case isParticipantCheck(c):
+				tenantApplies++
 			}
 		}
 		switch {
+		case pending == 0 && stoppedApplies > 0:
+			// Every row holding the aggregate is a stopped apply, so the PR
+			// is waiting on an operator to start or cancel, not on work.
+			title = stoppedAppliesTitle(stoppedApplies)
 		case pending > 0 && unresolved == pending:
 			// Every blocking row is a participant whose Check Run could not be
 			// read; no apply is actually pending, the participants are silent.
@@ -294,26 +386,62 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 			} else {
 				title = fmt.Sprintf("%d participant deployments have not reported", pending)
 			}
+		case unresolved > 0:
+			// Real pending applies alongside participants whose Check Runs
+			// could not be read. Surface both: an unread participant is not a
+			// pending apply, and folding it into the apply count would hide
+			// the reporting gap an operator needs to investigate.
+			applies := pending - unresolved
+			appliesPart := fmt.Sprintf("%d applies pending", applies)
+			if applies == 1 {
+				appliesPart = "1 apply pending"
+			}
+			unresolvedPart := fmt.Sprintf("%d participants have not reported", unresolved)
+			if unresolved == 1 {
+				unresolvedPart = "1 participant has not reported"
+			}
+			title = appliesPart + ", " + unresolvedPart
+		case pending > 0 && tenantApplies == pending:
+			// Every blocking row is a tenant deployment's folded check — say
+			// so, since "apply pending" alone reads as this deployment's own
+			// work when the pending applies belong to the tenants.
+			if pending == 1 {
+				title = "1 tenant apply pending"
+			} else {
+				title = fmt.Sprintf("%d tenant applies pending", pending)
+			}
+		case tenantApplies > 0:
+			title = fmt.Sprintf("%d applies pending (%d tenant)", pending, tenantApplies)
 		case pending == 1:
-			title = "1 apply pending"
+			title = "1 apply pending" + rolloutTargetsPhrase(pendingCheck)
 		default:
 			title = fmt.Sprintf("%d applies pending", pending)
 		}
-		summary = buildAggregateTable(checks)
+		if pending > 0 && stoppedApplies > 0 {
+			title = fmt.Sprintf("%s (%d stopped)", title, stoppedApplies)
+		}
+		summary = buildAggregateTable(checks, stopped)
 	default:
 		// in_progress — conclusion is empty
 		inProgress := 0
 		waiting := 0
+		paused := 0
+		var inProgressCheck *storage.Check
 		for _, c := range checks {
 			if c.Status != checkStatusInProgress {
 				continue
 			}
 			inProgress++
-			if isUnresolvedParticipantCheck(c) {
+			inProgressCheck = c
+			switch {
+			case isUnresolvedParticipantCheck(c):
 				waiting++
+			case stopped.holds(c):
+				paused++
 			}
 		}
-		if inProgress > 0 && waiting == inProgress {
+		switch {
+		case inProgress > 0 && waiting == inProgress:
 			// Nothing is applying; the fold is waiting for participant Check
 			// Runs a scheduled re-fold will re-read shortly.
 			if waiting == 1 {
@@ -321,12 +449,69 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 			} else {
 				title = fmt.Sprintf("Waiting for %d participant deployments to report", waiting)
 			}
-		} else {
+		case paused > 0:
+			title = fmt.Sprintf("Apply in progress (%d stopped)", paused)
+		case inProgress == 1:
+			title = "Apply in progress" + rolloutTargetsPhrase(inProgressCheck)
+		default:
 			title = "Apply in progress"
 		}
-		summary = buildAggregateTable(checks)
+		summary = buildAggregateTable(checks, stopped)
 	}
 	return title, summary
+}
+
+// rolloutTargetsPhrase says how many of a rollout's targets a row's work is on,
+// for a title that speaks for that one row, so the PR's merge box shows how far
+// the change has rolled out. A row that names no rollout of several targets
+// adds nothing. Titles over several rows leave it out: counts from different
+// databases do not add up to anything a reader can act on.
+func rolloutTargetsPhrase(c *storage.Check) string {
+	if c.RolloutTargets <= 1 || c.RolloutTargetsWithWork <= 0 {
+		return ""
+	}
+	if c.RolloutTargetsWithWork >= c.RolloutTargets {
+		return fmt.Sprintf(" on all %d targets", c.RolloutTargets)
+	}
+	return fmt.Sprintf(" on %d of %d targets", c.RolloutTargetsWithWork, c.RolloutTargets)
+}
+
+// stoppedAppliesTitle names the stopped applies holding the aggregate.
+func stoppedAppliesTitle(n int) string {
+	if n == 1 {
+		return "1 apply stopped"
+	}
+	return fmt.Sprintf("%d applies stopped", n)
+}
+
+// isStoppedAppliesAggregate reports whether an aggregate Check Run concluded
+// because stopped applies are all that hold it, the case the fold titles with
+// stoppedAppliesTitle. It is read off the title because that is the only place
+// a deployment that cannot see the applies learns why the run concluded; the
+// conclusion alone is the same as for changes no apply has run yet.
+func isStoppedAppliesAggregate(run *ghclient.CheckRunResult) bool {
+	if run.Status != checkStatusCompleted || run.Conclusion != checkConclusionActionRequired {
+		return false
+	}
+	var n int
+	if _, err := fmt.Sscanf(run.Title, "%d", &n); err != nil {
+		return false
+	}
+	return n > 0 && run.Title == stoppedAppliesTitle(n)
+}
+
+// stoppedApplyIDs is the set of applies resting in the stopped state, so the
+// fold can tell a check held open by a paused apply from one held open by work
+// still running. The distinction is the operator's next move: a stopped apply
+// holds its database until someone starts or cancels it, and calling that
+// "Apply in progress" sends the reader off to watch progress that will never
+// arrive. Resolved per fold rather than stored on the row, so a resume needs no
+// second write to undo it. A nil set reads as "nothing is stopped".
+type stoppedApplyIDs map[int64]bool
+
+// holds reports whether the apply that owns this check is stopped.
+func (s stoppedApplyIDs) holds(c *storage.Check) bool {
+	return c.ApplyID != 0 && s[c.ApplyID]
 }
 
 // isUnresolvedParticipantCheck reports whether a synthesized participant row
@@ -353,7 +538,7 @@ func isParticipantCheck(c *storage.Check) bool {
 // so the Tenant deployments section is rendered first and its size reserved: it
 // is never dropped, even when many per-database rows would otherwise fill the
 // Check Run text limit — those rows truncate instead.
-func buildAggregateTable(checks []*storage.Check) string {
+func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs) string {
 	var dbChecks, participantChecks []*storage.Check
 	for _, c := range checks {
 		if isParticipantCheck(c) {
@@ -364,7 +549,7 @@ func buildAggregateTable(checks []*storage.Check) string {
 	}
 
 	tenantSection := renderParticipantSection(participantChecks)
-	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection))
+	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection), stopped)
 
 	var sb strings.Builder
 	sb.WriteString(dbSection)
@@ -395,7 +580,7 @@ func changeSummaryLabel(c *storage.Check) string {
 // environments into one table, so an Environment column is added when the rows
 // span more than one environment — otherwise staging and production rows for the
 // same database would be indistinguishable.
-func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
+func renderDatabaseSection(dbChecks []*storage.Check, budget int, stopped stoppedApplyIDs) string {
 	if len(dbChecks) == 0 {
 		return ""
 	}
@@ -411,9 +596,9 @@ func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
 	for i, c := range dbChecks {
 		var row string
 		if showEnv {
-			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped))
 		} else {
-			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped))
 		}
 		if sb.Len()+len(row) > budget {
 			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
@@ -449,7 +634,7 @@ func renderParticipantSection(participantChecks []*storage.Check) string {
 	sb.WriteString("| Tenant | Status |\n")
 	sb.WriteString("|--------|--------|\n")
 	for i, c := range participantChecks {
-		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c))
+		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c, nil))
 		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
 			fmt.Fprintf(&sb, "\n... and %d more tenant(s)\n", len(participantChecks)-i)
 			break
@@ -471,9 +656,14 @@ func allChecksAreUpToDate(checks []*storage.Check) bool {
 	return true
 }
 
-func checkStatusLabel(c *storage.Check) string {
+func checkStatusLabel(c *storage.Check, stopped stoppedApplyIDs) string {
 	if c.Status == checkStatusCompleted && c.Conclusion == checkConclusionSuccess && !c.HasChanges {
 		return "Up to date"
+	}
+	// A stopped apply's check is still in progress so merge stays blocked; the
+	// row says which so the table agrees with the title.
+	if c.Status == checkStatusInProgress && stopped.holds(c) {
+		return state.Label(state.Apply.Stopped)
 	}
 	if isUnresolvedParticipantCheck(c) {
 		if c.Status == checkStatusInProgress {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestFilterNonPassingNonSchemaBotChecks(t *testing.T) {
@@ -351,6 +352,47 @@ func TestFilterInProgressNonSchemaBotChecks(t *testing.T) {
 	assert.Equal(t, "pending", inProgress[2].State)
 }
 
+// Any status other than "completed" means the check has not concluded, so the
+// gate treats it as unfinished: "waiting" (an Actions job paused on an
+// environment protection rule), "requested", and statuses GitHub has not
+// defined yet all block apply as in progress, and none of them is evaluated
+// as a non-passing completed check.
+func TestFilterInProgressNonSchemaBotChecks_UnfinishedStatusesFailClosed(t *testing.T) {
+	statuses := []ghclient.PRCheckStatus{
+		{Name: "Deploy / production-approval", Status: "waiting", Conclusion: ""},
+		{Name: "CI / integration", Status: "requested", Conclusion: ""},
+		{Name: "Security scan", Status: "some_future_status", Conclusion: ""},
+		{Name: "CI / lint", Status: "completed", Conclusion: "success"},
+	}
+
+	inProgress := filterInProgressNonSchemaBotChecks(statuses, nil)
+	require.Len(t, inProgress, 3)
+	assert.Equal(t, templates.BlockingCheck{Name: "Deploy / production-approval", State: "waiting"}, inProgress[0])
+	assert.Equal(t, templates.BlockingCheck{Name: "CI / integration", State: "requested"}, inProgress[1])
+	assert.Equal(t, templates.BlockingCheck{Name: "Security scan", State: "some_future_status"}, inProgress[2])
+
+	assert.Empty(t, filterNonPassingNonSchemaBotChecks(statuses, nil),
+		"unfinished checks block as in progress, not as completed checks with a failing conclusion")
+}
+
+// A check whose status is missing entirely (the API returned no status, or a
+// check-run was mapped without one) is not "completed", so it is unfinished and
+// blocks apply like any other status the gate does not recognize. Treating an
+// empty status as finished would let a check pass without ever having reported.
+func TestFilterInProgressNonSchemaBotChecks_MissingStatusFailsClosed(t *testing.T) {
+	statuses := []ghclient.PRCheckStatus{
+		{Name: "CI / tests", Status: "", Conclusion: ""},
+		{Name: "CI / lint", Status: "completed", Conclusion: "success"},
+	}
+
+	inProgress := filterInProgressNonSchemaBotChecks(statuses, nil)
+	require.Len(t, inProgress, 1)
+	assert.Equal(t, templates.BlockingCheck{Name: "CI / tests", State: ""}, inProgress[0])
+
+	assert.Empty(t, filterNonPassingNonSchemaBotChecks(statuses, nil),
+		"a check with no status blocks as unfinished, not as a completed check with a failing conclusion")
+}
+
 func TestFilterInProgressNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -522,7 +564,7 @@ func writeCheckRunsResponse(w http.ResponseWriter, nodes []checkStatusNode) {
 }
 
 func TestEnforcePassingChecks(t *testing.T) {
-	t.Run("permission error blocks with actionable message", func(t *testing.T) {
+	t.Run("permission error returns error with actionable message", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
@@ -558,8 +600,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
-		assert.True(t, blocked, "should block on permission error")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.Error(t, err)
+		assert.False(t, blocked)
 
 		select {
 		case body := <-comments:
@@ -573,7 +616,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 	})
 
-	t.Run("API failure blocks apply (fail-closed)", func(t *testing.T) {
+	t.Run("API failure returns error", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
@@ -602,8 +645,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
-		assert.True(t, blocked, "should block when API fails")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.Error(t, err)
+		assert.False(t, blocked)
 
 		select {
 		case body := <-comments:
@@ -612,6 +656,41 @@ func TestEnforcePassingChecks(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for API failure comment")
 		}
+	})
+
+	t.Run("durable attempt suppresses the read-failure comment", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/status", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", true)
+		require.Error(t, err)
+		assert.False(t, blocked)
+		assert.Empty(t, comments, "a durable attempt must not post per-retry read-failure comments")
 	})
 
 	t.Run("failing checks block apply", func(t *testing.T) {
@@ -644,7 +723,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when checks are failing")
 
 		select {
@@ -689,7 +769,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a check was cancelled")
 
 		select {
@@ -720,7 +801,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.False(t, blocked, "should allow when configured checks pass")
 	})
 
@@ -750,7 +832,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.False(t, blocked, "status-only required gate should pass without reading check runs")
 		assert.False(t, checkRunsCalled, "unrelated check runs should not be fetched once required statuses are found")
 	})
@@ -784,7 +867,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block on all checks when configured checks are absent")
 
 		select {
@@ -829,7 +913,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a required check has not reported")
 
 		select {
@@ -878,7 +963,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when no required check has reported")
 
 		select {
@@ -921,7 +1007,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a required check has not reported")
 
 		logs := logBuf.String()
@@ -966,7 +1053,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when a required check is running and another has not reported")
 
 		select {
@@ -1005,7 +1093,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.False(t, blocked, "should allow when all required checks reported and passed")
 	})
 
@@ -1028,7 +1117,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.False(t, blocked, "should allow when all non-SchemaBot checks pass")
 	})
 
@@ -1061,7 +1151,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.True(t, blocked, "should block when checks are in-progress")
 
 		select {
@@ -1071,6 +1162,54 @@ func TestEnforcePassingChecks(t *testing.T) {
 			t.Fatal("timed out waiting for in-progress-checks comment")
 		}
 	})
+
+	// A check run that is waiting on an environment approval, requested but
+	// not yet queued, or in a status GitHub adds later has not concluded, so
+	// apply must block and name the check with its status rather than proceed.
+	for _, status := range []string{"waiting", "requested", "some_future_status"} {
+		t.Run("unfinished status "+status+" blocks apply", func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 10)
+
+			registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+				{Typename: "CheckRun", Name: "Deploy / production-approval", Status: status, Conclusion: "", AppSlug: "github-actions"},
+				{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "success", AppSlug: "github-actions"},
+			})
+
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Body string `json:"body"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				comments <- body.Body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+			})
+
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			factory := &fakeClientFactory{client: installClient}
+
+			service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
+			h := &Handler{
+				service:   service,
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+				logger:    testLogger(),
+			}
+
+			blocked, err := h.enforcePassingChecks(t.Context(), installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+			require.NoError(t, err)
+			assert.True(t, blocked, "a check in status %q has not concluded and must block apply", status)
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "Cannot apply while PR checks are still running:")
+				assert.Contains(t, body, "| `Deploy / production-approval` | "+status+" |")
+				assert.NotContains(t, body, "CI / tests")
+			case <-time.After(2 * time.Second):
+				require.FailNow(t, "timed out waiting for in-progress-checks comment")
+			}
+		})
+	}
 
 	t.Run("variant app slug excluded from gate", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
@@ -1091,7 +1230,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.False(t, blocked, "should not block on own failed check with variant slug")
 	})
 
@@ -1107,7 +1247,147 @@ func TestEnforcePassingChecks(t *testing.T) {
 		}
 
 		ctx := t.Context()
-		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		blocked, err := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging", false)
+		require.NoError(t, err)
 		assert.False(t, blocked, "should not block when disabled")
+	})
+}
+
+// TestEnforceOpenPR pins the closed-PR gate's three-way disposition: a PR
+// fetch failure is a gate evaluation error (not blocked, error returned so
+// the command is retryable), a closed PR is a merit block (blocked, no
+// error), and an open PR passes. The evaluation-failure comment must carry
+// retry guidance without leaking raw GitHub error text into PR markdown.
+func TestEnforceOpenPR(t *testing.T) {
+	newOpenPRGateHandler := func(t *testing.T) (*Handler, *ghclient.InstallationClient, *http.ServeMux, chan string) {
+		t.Helper()
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+		return h, installClient, mux, comments
+	}
+
+	registerPRStateEndpoint := func(mux *http.ServeMux, state string, merged bool) {
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"state":  state,
+				"merged": merged,
+				"head":   map[string]any{"ref": "feature-branch", "sha": "abc123"},
+				"base":   map[string]any{"ref": "main", "sha": "def456"},
+				"user":   map[string]any{"login": "alice"},
+			})
+		})
+	}
+
+	t.Run("PR fetch failure returns error without blocking and posts retry guidance", func(t *testing.T) {
+		h, installClient, mux, comments := newOpenPRGateHandler(t)
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
+		})
+
+		blocked, err := h.enforceOpenPR(t.Context(), installClient, "octocat/hello-world", 1, 12345, "apply", "staging", "alice", false)
+		require.Error(t, err)
+		assert.False(t, blocked, "evaluation failure must not report a merit block")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Could not verify the pull request state")
+			assert.Contains(t, body, "Retry")
+			assert.NotContains(t, body, "Resource not accessible", "raw GitHub error text must never render in PR markdown")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for evaluation-failure comment")
+		}
+	})
+
+	t.Run("durable attempt suppresses the fetch-failure retry comment", func(t *testing.T) {
+		h, installClient, mux, comments := newOpenPRGateHandler(t)
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
+		})
+
+		blocked, err := h.enforceOpenPR(t.Context(), installClient, "octocat/hello-world", 1, 12345, "apply", "staging", "alice", true)
+		require.Error(t, err)
+		assert.False(t, blocked, "evaluation failure must not report a merit block")
+		assert.Empty(t, comments, "a durable attempt must not post per-retry evaluation-failure comments")
+	})
+
+	t.Run("closed PR blocks on the merits even on a durable attempt", func(t *testing.T) {
+		h, installClient, mux, comments := newOpenPRGateHandler(t)
+		registerPRStateEndpoint(mux, "closed", false)
+
+		blocked, err := h.enforceOpenPR(t.Context(), installClient, "octocat/hello-world", 1, 12345, "apply", "staging", "alice", true)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked: PR Is Closed")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for closed-PR block comment")
+		}
+	})
+
+	t.Run("closed PR blocks on the merits without error", func(t *testing.T) {
+		h, installClient, mux, comments := newOpenPRGateHandler(t)
+		registerPRStateEndpoint(mux, "closed", false)
+
+		blocked, err := h.enforceOpenPR(t.Context(), installClient, "octocat/hello-world", 1, 12345, "apply", "staging", "alice", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked: PR Is Closed")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for closed-PR block comment")
+		}
+	})
+
+	t.Run("merged PR blocks on the merits without error", func(t *testing.T) {
+		h, installClient, mux, comments := newOpenPRGateHandler(t)
+		registerPRStateEndpoint(mux, "closed", true)
+
+		blocked, err := h.enforceOpenPR(t.Context(), installClient, "octocat/hello-world", 1, 12345, "apply", "staging", "alice", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked: PR Is Merged")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for merged-PR block comment")
+		}
+	})
+
+	t.Run("open PR passes without comment", func(t *testing.T) {
+		h, installClient, mux, comments := newOpenPRGateHandler(t)
+		registerPRStateEndpoint(mux, "open", false)
+
+		blocked, err := h.enforceOpenPR(t.Context(), installClient, "octocat/hello-world", 1, 12345, "apply", "staging", "alice", false)
+		require.NoError(t, err)
+		assert.False(t, blocked)
+		assert.Empty(t, comments, "an open PR must not draw a gate comment")
 	})
 }

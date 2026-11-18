@@ -57,7 +57,7 @@ func TestWebhookPushPostsPassingChecksOnDefaultBranch(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "default-branch checks posted")
 
-	got := map[string]createdCheckRun{}
+	got := map[string]checkRunCapture{}
 	for range []int{0, 1} {
 		select {
 		case c := <-created:
@@ -175,6 +175,7 @@ func TestWebhookPushLeaderStillPosts(t *testing.T) {
 // A push on a repository SchemaBot does not manage gets no check: SchemaBot's
 // check is not required there, so there is no check source to maintain.
 func TestWebhookPushRejectsUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	h, created := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"org/allowed-repo": {}},
@@ -191,4 +192,5 @@ func TestWebhookPushRejectsUnregisteredRepo(t *testing.T) {
 		t.Fatalf("unexpected check run created for unregistered repo: %q", c.Name)
 	case <-time.After(100 * time.Millisecond):
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "push", "")
 }

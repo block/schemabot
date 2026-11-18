@@ -2,13 +2,59 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
+
+// enforceOpenPR rejects apply-family commands on closed PRs, merged or not.
+// An abandoned PR's schema changes can never merge, so applying them would
+// push schema to the target database from code with no path to the base
+// branch; a merged PR's timeline is no longer the driving surface for new
+// applies. In both cases the PR's close-time lock cleanup has already run, so
+// a lock acquired by the apply would be orphaned until a manual unlock. The
+// rejection copy distinguishes the two so the operator gets recovery guidance
+// that is actually possible (a merged PR cannot be reopened). Rollback and
+// unlock stay available on closed PRs: they are the recovery paths for an
+// apply that ran while the PR was open.
+//
+// A PR fetch failure stops the command (fail closed) and is returned as an
+// error, not a block: the PR state could not be verified, so the outcome is
+// not the command's answer and a durable driver may re-drive it. blocked is
+// true only for a verified closed PR. suppressRetryComments silences the
+// evaluation-failure comment on durable attempts, where the driver retries
+// and posts the single terminal answer instead; merit blocks always comment
+// because they are the command's answer.
+//
+// This is a safety re-check, so it bypasses the request-scoped PR-info cache:
+// discovery earlier in the same delivery may have cached the PR as open, and a
+// close landing between discovery and this gate must still block the apply.
+func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, requestedBy string, suppressRetryComments bool) (blocked bool, err error) {
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to fetch PR state for the closed-PR apply gate; stopping the command",
+			"repo", repo, "pr", pr, "environment", environment, "command", commandName, "error", err)
+		// The raw error can carry internal detail (hosts, headers, newlines)
+		// that must not render in PR markdown; operators triage from the log
+		// line above.
+		if !suppressRetryComments {
+			h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, "Could not verify the pull request state, so the command was blocked. Retry, and see server logs if it persists.")
+		}
+		return false, fmt.Errorf("closed-PR gate fetch PR %s#%d: %w", repo, pr, err)
+	}
+	if !prInfo.IsClosed() {
+		return false, nil
+	}
+	h.logger.Info("apply command rejected: PR is closed",
+		"repo", repo, "pr", pr, "environment", environment, "command", commandName, "requested_by", requestedBy, "merged", prInfo.Merged)
+	h.postComment(repo, pr, installationID, templates.RenderApplyBlockedClosedPR(environment, requestedBy, prInfo.Merged))
+	return true, nil
+}
 
 // isAggregateCheckName reports whether a check name matches this deployment's
 // configured aggregate Check Run name: the base name itself or the
@@ -38,10 +84,10 @@ func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
-		if s.Status != "completed" {
+		if !checkHasFinished(s.Status) {
 			continue
 		}
-		if isPassingCheckConclusion(s.Conclusion) {
+		if checkstate.ConclusionClearsGate(s.Conclusion) {
 			continue
 		}
 		notPassing = append(notPassing, templates.BlockingCheck{
@@ -52,27 +98,20 @@ func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 	return notPassing
 }
 
-// isPassingCheckConclusion reports whether a completed check's conclusion
-// allows apply to proceed. Only "success", "neutral", and "skipped" pass;
-// every other conclusion blocks apply.
-func isPassingCheckConclusion(conclusion string) bool {
-	switch conclusion {
-	case "success", "neutral", "skipped":
-		return true
-	default:
-		return false
-	}
-}
-
 // enforcePassingChecks verifies that all non-SchemaBot PR checks are passing.
-// Returns true if apply was blocked (caller should return), false if it may proceed.
-// Blocks on both non-passing completed checks and in-progress checks with
-// distinct messages.
-func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string) bool {
+// Returns blocked=true when the checks gate blocks on the merits (caller
+// should return); blocks on both non-passing completed checks and in-progress
+// checks with distinct messages. A check-status read failure stops the command
+// (fail closed) and is returned as an error, not a block: the gate could not
+// evaluate its inputs, so the outcome is not the command's answer and a
+// durable driver may re-drive it. suppressRetryComments silences the
+// read-failure comment on durable attempts, where the driver retries and
+// posts the single terminal answer instead; merit blocks always comment.
+func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string, suppressRetryComments bool) (blocked bool, err error) {
 	config := h.service.Config()
 	if !config.ShouldRequirePassingChecks() {
 		h.logger.Debug("passing checks gate disabled", "repo", repo, "pr", pr)
-		return false
+		return false, nil
 	}
 
 	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA, config.RequiredChecks)
@@ -88,7 +127,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			details.ChecksReadable = diagnostic.ChecksReadable
 			details.CommitStatusesReadable = diagnostic.CommitStatusesReadable
 		}
-		h.logger.Error("failed to fetch PR check statuses, blocking apply",
+		h.logger.Error("failed to fetch PR check statuses, stopping apply",
 			"repo", repo,
 			"pr", pr,
 			"environment", environment,
@@ -103,9 +142,11 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"checks_error", diagnostic.ChecksError,
 			"commit_statuses_error", diagnostic.CommitStatusesError,
 			"error", err)
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
-		return true
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID,
+				templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
+		}
+		return false, fmt.Errorf("checks gate read PR check statuses %s#%d: %w", repo, pr, err)
 	}
 
 	notPassing := filterNonPassingNonSchemaBotChecks(statuses, config)
@@ -119,7 +160,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"not_passing_count", len(notPassing))
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByNonPassingChecks(environment, notPassing))
-		return true
+		return true, nil
 	}
 
 	if len(inProgress) > 0 || len(notReported) > 0 {
@@ -130,10 +171,10 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"missing_required_checks", blockingCheckNames(notReported))
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByInProgressChecks(environment, inProgress, notReported))
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 // blockingCheckNames extracts the check names from a slice of blocking checks
@@ -198,7 +239,15 @@ func (h *Handler) flagUntrustedAggregateNamedChecks(ctx context.Context, statuse
 	}
 }
 
-// filterInProgressNonSchemaBotChecks returns checks that are still running,
+// checkHasFinished reports whether a check has reached its final state. Only
+// "completed" counts: every other status ("in_progress", "queued", "pending",
+// "waiting", "requested", or one GitHub adds later) means the check has not
+// concluded, so an unrecognized status blocks apply instead of passing it.
+func checkHasFinished(status string) bool {
+	return status == "completed"
+}
+
+// filterInProgressNonSchemaBotChecks returns checks that have not finished,
 // excluding checks created by trusted SchemaBot GitHub Apps.
 func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var inProgress []templates.BlockingCheck
@@ -210,13 +259,13 @@ func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
-		switch s.Status {
-		case "in_progress", "queued", "pending":
-			inProgress = append(inProgress, templates.BlockingCheck{
-				Name:  s.Name,
-				State: s.Status,
-			})
+		if checkHasFinished(s.Status) {
+			continue
 		}
+		inProgress = append(inProgress, templates.BlockingCheck{
+			Name:  s.Name,
+			State: s.Status,
+		})
 	}
 	return inProgress
 }

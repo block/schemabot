@@ -2,6 +2,8 @@ package webhook
 
 import (
 	"errors"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -35,12 +38,119 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "per-shard changes are threaded into the keyspace")
 	assert.Equal(t, "-40", data.Changes[0].Shards[0].Shard)
 	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
+}
+
+// An engine's namespace-level metadata reaches the plan comment's keyspace
+// data: the VSchema change and its diff, and the finalize. A VSchema change the
+// engine generates from the DDL and finalizes carries only the finalize, and
+// a namespace that carries only DDL gets neither.
+func TestSetNamespaceWork_CarriesVSchemaAndFinalizeMetadata(t *testing.T) {
+	var generated templates.KeyspaceChangeData
+	setNamespaceWork(&generated, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaChangedMetadataKey:       "true",
+		apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+		apitypes.NeedsFinalizerMetadataKey:       "true",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{Finalize: true}, generated)
+
+	var generatedUnfinalized templates.KeyspaceChangeData
+	setNamespaceWork(&generatedUnfinalized, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaChangedMetadataKey:       "true",
+		apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{VSchemaChanged: true}, generatedUnfinalized, "with no finalize to show, the VSchema change stays visible")
+
+	var diffed templates.KeyspaceChangeData
+	setNamespaceWork(&diffed, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaDiffMetadataKey: "+    \"refunds\": {}",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{VSchemaChanged: true, VSchemaDiff: "+    \"refunds\": {}"}, diffed)
+
+	var ddlOnly templates.KeyspaceChangeData
+	setNamespaceWork(&ddlOnly, &apitypes.SchemaChangeResponse{Namespace: "payments_001"})
+	assert.Equal(t, templates.KeyspaceChangeData{}, ddlOnly)
+}
+
+// A rollback that recreates a table the forward apply dropped also updates the
+// keyspace's VSchema entries from the DDL alone, so the rollback comment
+// carries the keyspace's DDL and finalize with no VSchema change, as the plan
+// comment would.
+func TestRollbackKeyspaceChanges_CarriesNamespaceWork(t *testing.T) {
+	got := rollbackKeyspaceChanges([]*apitypes.SchemaChangeResponse{{
+		Namespace:    "payments_001",
+		TableChanges: []*apitypes.TableChangeResponse{{TableName: "refund_notes", DDL: refundNotesDDL, ChangeType: "CREATE"}},
+		Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey:       "true",
+			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+			apitypes.NeedsFinalizerMetadataKey:       "true",
+		},
+	}})
+	assert.Equal(t, []templates.KeyspaceChangeData{{
+		Keyspace:   "payments_001",
+		Statements: []string{refundNotesDDL},
+		Finalize:   true,
+	}}, got)
+}
+
+// A divergent sharded plan, including a malformed shard row with no DDL,
+// must produce the same UX-6 totals in the CLI and PR comment selections.
+func TestPlanSummarySelectionsAgreeForDivergentShards(t *testing.T) {
+	createUsers := &apitypes.TableChangeResponse{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "CREATE"}
+	alterUsers := &apitypes.TableChangeResponse{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email TEXT", ChangeType: "ALTER"}
+	planResp := &apitypes.PlanResponse{
+		Database: "commerce",
+		Engine:   "planetscale",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "commerce", TableChanges: []*apitypes.TableChangeResponse{createUsers},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*apitypes.TableChangeResponse{createUsers}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*apitypes.TableChangeResponse{alterUsers}},
+			{Namespace: "commerce", Shard: "bad", Changes: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "ALTER"}}},
+		},
+	}
+
+	var cliCounts ui.PlanCounts
+	for _, change := range planResp.RenderedTables() {
+		op := strings.ToLower(strings.TrimPrefix(strings.ToUpper(change.ChangeType), "CHANGE_TYPE_"))
+		cliCounts.AddTable(change.Namespace, op, change.TableName)
+	}
+	cliParts := ui.PlanSummaryParts(cliCounts, len(planResp.RenderedTables()), false)
+	require.Equal(t, []string{"1 table to create", "1 table to alter"}, cliParts)
+
+	schema := &ghclient.SchemaRequestResult{Database: "commerce", Type: "mysql"}
+	commentData := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+	comment := templates.RenderPlanComment(commentData)
+	commentSummary := "📋 **Plan**: " + strings.ReplaceAll(strings.Join(cliParts, ", "), "1 table", "**1** table")
+	assert.Contains(t, comment, commentSummary)
+	assert.Len(t, commentData.Errors, 1)
+}
+
+// Every exempt-table group on the plan response reaches the comment data with
+// its namespace, tables, and reason intact, in response order; a nil entry is
+// skipped rather than rendered as an empty group.
+func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "app", Type: "postgres"}
+	planResp := &apitypes.PlanResponse{
+		ExemptTables: []*apitypes.ExemptTablesResponse{
+			{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
+			nil,
+			{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	assert.Equal(t, []templates.ExemptTablesData{
+		{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
+		{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"},
+	}, data.ExemptTables)
 }
 
 // An unsafe change on a single shard (per-shard plan) is surfaced with its shard,
@@ -62,12 +172,115 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
 	assert.Equal(t, "mutes", data.UnsafeChanges[0].Table)
 	assert.Equal(t, []string{"40-80"}, data.UnsafeChanges[0].Shards, "the unsafe change is scoped to the drifted shard")
+	assert.Equal(t, 2, data.UnsafeChanges[0].TotalShards, "coverage is stated against every planned shard")
+}
+
+// Two drifted shards that drop the same column for the same reason are one
+// unsafe change covering both shards, not two. The rendered header counts one
+// change and the drop guidance names one column, because the shard-level DDL
+// (which differs only in what else the drifted shard rewrites) is carried from
+// the first shard and parsed once per grouped change. The reason deliberately
+// carries no "DROP" words so the count can only come from the parsed DDL.
+func TestBuildPlanCommentData_PerShardUnsafeDriftGroupsOneDrop(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	const reason = "destructive change on a drifted shard"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: "ALTER TABLE `mutes` DROP COLUMN x", ChangeType: "alter"}},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "cdb_resolute_sharded", Shard: "-40", Changes: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` DROP COLUMN x", ChangeType: "alter", IsUnsafe: true, UnsafeReason: reason},
+			}},
+			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN x", ChangeType: "alter", IsUnsafe: true, UnsafeReason: reason},
+			}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.UnsafeChanges, 1, "same table and reason across shards is one unsafe change")
+	assert.Equal(t, []string{"-40", "40-80"}, data.UnsafeChanges[0].Shards)
+	assert.Equal(t, "ALTER TABLE `mutes` DROP COLUMN x", data.UnsafeChanges[0].DDL, "the first shard's DDL is what the guidance classifies")
+
+	rendered := templates.RenderPlanComment(data)
+	assert.Contains(t, rendered, "**Issues**: 1 unsafe change detected")
+	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
+	assert.NotContains(t, rendered, "any dropped columns")
+}
+
+// A Postgres unsafe change whose reason never says "DROP" is still classified
+// as a column drop, because the plan comment carries the change's DDL and the
+// database type through to the guidance, which parses the DDL with the
+// Postgres parser. Dropping either the DDL or the database type on the way
+// through buildPlanCommentData would leave the fallback with nothing to count
+// and the guidance would disappear.
+func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "billing", Type: "postgres"}
+	const ddl = `ALTER TABLE "customers" DROP COLUMN "nickname"`
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:    "customers",
+				DDL:          ddl,
+				ChangeType:   "alter",
+				IsUnsafe:     true,
+				UnsafeReason: `statement removes live structure from table "customers"`,
+			}},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	assert.Equal(t, "postgres", data.DatabaseType)
+	require.Len(t, data.UnsafeChanges, 1)
+	assert.Equal(t, ddl, data.UnsafeChanges[0].DDL, "the DDL is threaded so the guidance can parse it")
+
+	rendered := templates.RenderPlanComment(data)
+	assert.Contains(t, rendered, "1. Deploy application code that no longer reads from or writes to the dropped column.\n")
+}
+
+// The multi-environment comment renders each environment's unsafe section
+// through the same guidance path, so a Postgres drop classified from DDL
+// shows up there too.
+func TestRenderMultiEnvPlanComment_PostgresDropGuidanceClassifiedFromDDL(t *testing.T) {
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "billing",
+		DatabaseType: "postgres",
+		Environments: []string{"staging"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging": {
+				Database:     "billing",
+				Environment:  "staging",
+				DatabaseType: "postgres",
+				Changes: []templates.KeyspaceChangeData{{
+					Keyspace:   "public",
+					Statements: []string{`DROP TABLE "customers"`},
+				}},
+				HasUnsafeChanges: true,
+				UnsafeChanges: []templates.UnsafeChangeData{{
+					Table:      "customers",
+					Reason:     `statement removes live structure from table "customers"`,
+					DDL:        `DROP TABLE "customers"`,
+					ChangeType: "alter",
+				}},
+			},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.Contains(t, rendered, "1. Deploy application code that no longer reads from or writes to the dropped table.\n")
 }
 
 // A shard that already matches the desired schema while siblings change is
@@ -87,7 +300,7 @@ func TestBuildPlanCommentData_CarriesSatisfiedShard(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "the satisfied shard is carried, not dropped")
@@ -116,7 +329,7 @@ func TestBuildPlanCommentData_MalformedShardSurfacesError(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 1, "the malformed shard is not carried into the rendered shards")
@@ -145,14 +358,14 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 			}},
 		}},
 		LintResults: []*apitypes.LintViolationResponse{{
-			Message:  "Index 'idx_status' should be made invisible before dropping",
+			Message:  `Index "idx_status" should be made invisible before dropping`,
 			Table:    "orders",
 			Linter:   "invisible_index_before_drop",
 			Severity: "error",
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan contains unsafe table changes")
 	require.Len(t, data.UnsafeChanges, 1)
@@ -177,12 +390,62 @@ func TestBuildPlanCommentData_TableDropIsUnsafeWithoutEngineFlag(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
 	assert.Equal(t, "users", data.UnsafeChanges[0].Table)
 	assert.Equal(t, "DROP TABLE removes all data", data.UnsafeChanges[0].Reason)
+}
+
+// A namespace whose plan carries recorded VSchema deletions and mutations —
+// with no unsafe table changes at all — must still surface every recorded
+// entry in the PR plan comment's unsafe-changes section, attributed to the
+// namespace's vschema.json, so the operator sees the full blast radius before
+// acknowledging with --allow-unsafe.
+func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{
+		Database: "testdb",
+		Type:     "vitess",
+	}
+
+	deletionsMeta, err := apitypes.EncodeVSchemaDeletions([]apitypes.VSchemaDeletion{{
+		Kind:   "vindex",
+		Name:   "email_lookup",
+		Reason: "removes lookup vindex \"email_lookup\": rows in its backing table go stale",
+	}})
+	require.NoError(t, err)
+	mutationsMeta, err := apitypes.EncodeVSchemaMutations([]apitypes.VSchemaMutation{{
+		Kind:   "vindex_type",
+		Name:   "user_idx",
+		Reason: "vindex \"user_idx\" changes type from \"hash\" to \"xxhash\": every row's keyspace id is computed differently the moment the VSchema is applied",
+	}})
+	require.NoError(t, err)
+
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testapp_sharded",
+			Metadata: map[string]string{
+				apitypes.VSchemaChangedMetadataKey:   "true",
+				apitypes.VSchemaDeletionsMetadataKey: deletionsMeta,
+				apitypes.VSchemaMutationsMetadataKey: mutationsMeta,
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan records VSchema deletions and mutations")
+	require.Len(t, data.UnsafeChanges, 2)
+	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[0].Table)
+	assert.Contains(t, data.UnsafeChanges[0].Reason, "email_lookup")
+	assert.Contains(t, data.UnsafeChanges[0].Reason, "go stale")
+	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[1].Table)
+	assert.Contains(t, data.UnsafeChanges[1].Reason, "user_idx")
+	assert.Contains(t, data.UnsafeChanges[1].Reason, "changes type")
+	for _, uc := range data.UnsafeChanges {
+		assert.Equal(t, "testapp_sharded", uc.VSchemaNamespace, "the apply instruction names a VSchema change by its namespace")
+	}
 }
 
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
@@ -205,7 +468,7 @@ func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.False(t, data.HasUnsafeChanges)
 	assert.Empty(t, data.UnsafeChanges)
@@ -241,7 +504,7 @@ func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -266,7 +529,7 @@ func TestRenderPlanComment_ShowsUnsafeWarning(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "**Issues**: **1** unsafe change detected")
+	assert.Contains(t, rendered, "**Issues**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`orders`")
 	assert.Contains(t, rendered, "DROP INDEX without making invisible first")
 }
@@ -295,9 +558,9 @@ func TestRenderPlanComment_UnsafeWarningSummaryCountsChanges(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "⚠️ **Issues**: **2** unsafe changes detected")
-	assert.Contains(t, rendered, "- `orders`: DROP INDEX without making invisible first")
-	assert.Contains(t, rendered, "- `customers`: DROP COLUMN is destructive")
+	assert.Contains(t, rendered, "⚠️ **Issues**: 2 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `orders`: DROP INDEX without making invisible first")
+	assert.Contains(t, rendered, "2. `customers`: DROP COLUMN is destructive")
 }
 
 func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
@@ -341,12 +604,12 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 
 	t.Run("downgrade hint preserves tenant", func(t *testing.T) {
 		data := templates.PlanCommentData{
-			Database:                   "testdb",
-			Environment:                "staging",
-			Tenant:                     "alpha",
-			IsMySQL:                    true,
-			IsLocked:                   true,
-			AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+			Database:                  "testdb",
+			Environment:               "staging",
+			Tenant:                    "alpha",
+			IsMySQL:                   true,
+			IsLocked:                  true,
+			PendingManualConfirmation: true,
 			Changes: []templates.KeyspaceChangeData{{
 				Keyspace:   "testdb",
 				Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
@@ -356,8 +619,11 @@ func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
 		rendered := templates.RenderPlanComment(data)
 
 		assert.Contains(t, rendered, "**Tenant**: `alpha`")
-		assert.Contains(t, rendered, "Automatic apply paused")
+		assert.Contains(t, rendered, "**Confirmation required**")
 		assert.Contains(t, rendered, "schemabot apply-confirm -e staging --tenant alpha")
+		// The unlock hint is the other half of the same decision, and a tenant
+		// deployment ignores a command that does not name its tenant.
+		assert.Contains(t, rendered, "schemabot unlock --tenant alpha")
 	})
 
 	t.Run("preview shows tenant metadata without putting tenant in title", func(t *testing.T) {
@@ -693,10 +959,11 @@ func TestRenderMultiEnvPlanComment_CollapsesDDL(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testdb",
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
-			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -727,10 +994,11 @@ func TestRenderMultiEnvPlanComment_SingleChangeInline(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testdb",
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
-			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -757,11 +1025,11 @@ func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testks",
 		IsMySQL:      false,
-		DatabaseType: "PlanetScale",
+		DatabaseType: "vitess",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
-			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
+			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "vitess", Changes: changes},
+			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "vitess", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -837,11 +1105,120 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
-	assert.Contains(t, rendered, "⛔ 1 Unsafe Change Detected")
+	assert.Contains(t, rendered, "**⛔ Apply rejected**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
-	assert.Contains(t, rendered, "--allow-unsafe")
-	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
+	assert.Contains(t, rendered, "**🚨 To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add `--allow-unsafe` to confirm 1 unsafe change on `users`:\n   ```\n   schemabot apply -e staging\n   ```\n")
+	assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
+}
+
+// A table can carry several lint violations in one engine-joined reason
+// string. The blocking comment must render each violation as its own nested
+// bullet — not one run-on line — and the header must count the violations
+// the list shows.
+func TestRenderUnsafeChangesBlocked_SplitsJoinedReasonsIntoBullets(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"CREATE TABLE `uploads` (`uid` varchar(64) NOT NULL, PRIMARY KEY(`uid`))"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "uploads",
+			Reason: `Column "expires_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.; Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.; Primary key column "uid" has type "varchar"`,
+		}},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "**⛔ Apply rejected**: 3 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `uploads`: Column `expires_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "2. `uploads`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `uploads`: Primary key column `uid` has type `varchar`\n")
+	assert.NotContains(t, rendered, "instead.; ")
+}
+
+// The plan comment's unsafe-issues section renders the same engine-joined
+// reasons, so it splits them the same way and counts individual violations
+// in its header.
+func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `orders` DROP COLUMN `legacy`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{
+				Table:  "orders",
+				Reason: `[ERROR] unsafe: DROP COLUMN removes data; [ERROR] has_timestamp: Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`,
+			},
+			{Table: "users", Reason: "DROP TABLE removes all data"},
+		},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "3 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `orders`: DROP COLUMN removes data\n")
+	assert.Contains(t, rendered, "2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `users`: DROP TABLE removes all data\n")
+	assert.NotContains(t, rendered, "data; ")
+}
+
+// An engine can report an unsafe change without a parseable reason. The
+// blocking comment still lists the table — with the engine's change type as
+// the explanation, matching the CLI — and the header counts it as one finding.
+func TestRenderUnsafeChangesBlocked_EmptyReasonListsChangeTypeAndCountsOnce(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `users`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{Table: "users", Reason: "", ChangeType: "drop"},
+			{Table: "orders", Reason: "DROP TABLE removes all data"},
+		},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "**⛔ Apply rejected**: 2 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `users`: drop\n")
+	assert.Contains(t, rendered, "2. `orders`: DROP TABLE removes all data\n")
+}
+
+// A change with neither a reason nor a change type still gets a line in the
+// plan comment's unsafe-issues section — a bare table entry, no dangling
+// colon — and still counts once in the header.
+func TestRenderPlanComment_EmptyUnsafeReasonListsBareTableAndCountsOnce(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `users`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []templates.UnsafeChangeData{{Table: "users", Reason: ""}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "1 unsafe change detected")
+	assert.Contains(t, rendered, "1. `users`\n")
+	assert.NotContains(t, rendered, "1. `users`:")
 }
 
 func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
@@ -863,7 +1240,7 @@ func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "## Schema Change Plan")
-	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging")
 }
 
 func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) {
@@ -885,5 +1262,236 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
-	assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
+	assertPasteableCommand(t, rendered, "schemabot apply -e staging --tenant alpha")
+}
+
+// A plan comment's copy-paste commands name a database only where a bare
+// command would not resolve. For an operator's command that database is the -d
+// they typed, echoed back so the follow-up they are offered keeps the scope
+// they chose, and an unscoped command is answered with an unscoped one.
+// An auto-plan names the database its own comment plans when the pull request
+// touches several, because each comment's command would otherwise be the same
+// ambiguous line, and leaves it off when the pull request touches one, because
+// discovery resolves that command on its own.
+func TestPlanCommentDatabaseFlag(t *testing.T) {
+	assert.Equal(t, "payments", planCommentDatabaseFlag("payments", "payments", false, 0), "a command's -d is echoed back")
+	assert.Empty(t, planCommentDatabaseFlag("", "payments", false, 0), "an unscoped command stays unscoped")
+	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true, 2), "an auto-plan on a PR touching several databases names the one its comment plans")
+	assert.Empty(t, planCommentDatabaseFlag("", "payments", true, 1), "an auto-plan on a PR touching one database has nothing to disambiguate")
+}
+
+// Primary-key advice remains reachable for legacy warnings and new-schema
+// errors; the latter still render as Issues and retain their consent gate.
+func TestBuildPlanCommentData_PrimaryKeyGuidance(t *testing.T) {
+	for _, severity := range []string{"warning", "error"} {
+		t.Run(severity, func(t *testing.T) {
+			resp := &apitypes.PlanResponse{
+				Changes:     []*apitypes.SchemaChangeResponse{{Namespace: "app", TableChanges: []*apitypes.TableChangeResponse{{TableName: "customers", DDL: "ALTER TABLE `customers` ADD COLUMN `name` varchar(64)", ChangeType: "alter", IsUnsafe: severity == "error", UnsafeReason: "Primary key uses a discouraged type"}}}},
+				LintResults: []*apitypes.LintViolationResponse{{Table: "customers", Linter: "primary_key", Severity: severity, Message: "Primary key uses a discouraged type"}},
+			}
+			data := buildPlanCommentData(&ghclient.SchemaRequestResult{Database: "app", Type: "mysql"}, resp, "staging", "", "", "", "")
+			assert.Contains(t, data.LintRuleNames, "primary_key")
+			if severity == "warning" {
+				require.Len(t, data.LintViolations, 1)
+				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
+			} else {
+				assert.Empty(t, data.LintViolations)
+				assert.True(t, data.HasUnsafeChanges)
+			}
+			out := templates.RenderPlanComment(data)
+			assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"))
+		})
+	}
+}
+
+// The plan comment carries the stored plan's identifier, so DDL the comment
+// cuts to fit names the command that prints the plan in full.
+func TestBuildPlanCommentData_CarriesPlanID(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "testuser", "", "")
+	assert.Equal(t, "plan_7c41f9", data.PlanID)
+}
+
+// Per-table size estimates on the namespace-level plan changes are threaded
+// into the keyspace's TableSizes for rendering, but only for statements whose
+// cost scales with the table: an index add and a column widening carry size
+// lines, while a metadata-only column add and a table being created (no size
+// to report) are omitted.
+func TestBuildPlanCommentData_TableSizes(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	rows, largest, bytes := int64(48_200_000), int64(13_100_000), int64(23_400_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "widgets", DDL: "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`))", ChangeType: "create"},
+				{TableName: "audits", DDL: "ALTER TABLE `audits` ADD COLUMN `reason` varchar(255)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+				{TableName: "outcomes", DDL: "ALTER TABLE `outcomes` MODIFY COLUMN `note` varchar(500)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Len(t, data.Changes[0].Statements, 4, "all statements still render as DDL")
+	require.Len(t, data.Changes[0].TableSizes, 2,
+		"the index add and the widening carry size lines; the created table and the metadata-only column add are omitted")
+	size := data.Changes[0].TableSizes[0]
+	assert.Equal(t, "mutes", size.Table)
+	assert.Equal(t, 4, size.ShardCount)
+	require.NotNil(t, size.EstimatedBytes)
+	assert.Equal(t, bytes, *size.EstimatedBytes)
+	assert.Equal(t, "outcomes", data.Changes[0].TableSizes[1].Table)
+}
+
+// Every change to a table carries the whole table's estimate, so a table that
+// two size-scaling statements change is listed once, not once per statement.
+func TestBuildPlanCommentData_TableSizesListEachTableOnce(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	bytes := int64(23_400_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)", ChangeType: "alter", EstimatedBytes: &bytes},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `status`(`status`)", ChangeType: "alter", EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Len(t, data.Changes[0].Statements, 2, "both statements still render as DDL")
+	require.Len(t, data.Changes[0].TableSizes, 1)
+	assert.Equal(t, "mutes", data.Changes[0].TableSizes[0].Table)
+}
+
+// A table's DDL can join several statements, as a PostgreSQL change set does.
+// Each statement is inspected on its own, so an index build joined after a
+// metadata-only column add still carries the table's size line.
+func TestBuildPlanCommentData_TableSizesInspectEachJoinedStatement(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "postgres"}
+	bytes := int64(1_130_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email text;\nCREATE INDEX idx_email ON users (email);",
+					ChangeType: "alter", EstimatedBytes: &bytes},
+				{TableName: "accounts", DDL: "ALTER TABLE accounts ADD COLUMN nickname text;\nALTER TABLE accounts DROP COLUMN legacy;",
+					ChangeType: "alter", EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].TableSizes, 1, "only the table whose joined DDL builds an index carries a size line")
+	assert.Equal(t, "users", data.Changes[0].TableSizes[0].Table)
+	require.NotNil(t, data.Changes[0].TableSizes[0].EstimatedBytes)
+	assert.Equal(t, bytes, *data.Changes[0].TableSizes[0].EstimatedBytes)
+}
+
+// A table the plan creates has no data to size, even when its create set
+// builds an index on it.
+func TestBuildPlanCommentData_TableSizesSkipCreatedTables(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "postgres"}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "sessions", DDL: "CREATE TABLE sessions (id bigint PRIMARY KEY, user_id bigint);\nCREATE INDEX idx_user ON sessions (user_id);",
+					ChangeType: "create"},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Empty(t, data.Changes[0].TableSizes)
+}
+
+// A sharded namespace decides a table's size line from every shard's DDL, so
+// an index build that only some shards run still shows the table's size.
+func TestBuildPlanCommentData_TableSizesReadEveryShard(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "testapp", Type: "strata"}
+	bytes := int64(23_400_000_000)
+	addColumn := "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)"
+	addIndex := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testapp_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: addColumn, ChangeType: "alter", ShardCount: 2, EstimatedBytes: &bytes},
+			},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "testapp_sharded", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: addColumn, ChangeType: "alter"}}},
+			{Namespace: "testapp_sharded", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: addIndex, ChangeType: "alter"}}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].TableSizes, 1)
+	size := data.Changes[0].TableSizes[0]
+	assert.Equal(t, "mutes", size.Table)
+	assert.Equal(t, 2, size.ShardCount)
+	require.NotNil(t, size.EstimatedBytes)
+	assert.Equal(t, bytes, *size.EstimatedBytes)
+}
+
+// Every refusal the environment's namespace placement owns stores a failing
+// check for the environment, so a later fold cannot read an older passing row
+// in its place: a namespace no targets entry selects, a plan proposing drops in
+// a namespace the target's entry does not select, and drops that could not be
+// checked. Any other plan failure is not stored as a placement block.
+func TestPlanRefusedByNamespacePlacement(t *testing.T) {
+	coverage := &api.NamespaceCoverageError{Database: "orders", Environment: "production", Uncovered: []string{"ns_1"}}
+	drop := &api.UnselectedTableDropError{Deployment: "eu", Target: "orders-001", Placed: []string{"payments"}, PlacedNamespaces: []string{"ns_1"}}
+	check := &api.UnselectedTableDropCheckError{Database: "orders", Environment: "production", Target: "orders-001", Err: errors.New("split schema file ns_1/payments.sql: syntax error")}
+
+	assert.True(t, planRefusedByNamespacePlacement(coverage), "a namespace no targets entry selects")
+	assert.True(t, planRefusedByNamespacePlacement(fmt.Errorf("plan: %w", drop)), "a drop in an unselected namespace, wrapped")
+	assert.True(t, planRefusedByNamespacePlacement(check), "drops that could not be checked")
+	assert.False(t, planRefusedByNamespacePlacement(errors.New("tern unavailable")), "an unrelated plan failure")
+	assert.False(t, planRefusedByNamespacePlacement(nil), "a plan that succeeded")
+}
+
+// When the source policy refuses any environment of a plan that failed in
+// every environment, each environment's aggregate is held by the refusal. A
+// refused environment shows its own refusal, and an environment that failed
+// some other way shows the refusal of the first refused environment in plan
+// order, never its own failure.
+func TestSourcePolicyRefusalHoldingEachFailure(t *testing.T) {
+	failures := map[string]string{
+		"sandbox":    "no schema files found",
+		"staging":    `schema path "schema/staging" is not authorized for database "orders"`,
+		"production": `schema path "schema/production" is not authorized for database "orders"`,
+	}
+	refused := map[string]bool{"staging": true, "production": true}
+
+	got := sourcePolicyRefusalHoldingEachFailure([]string{"sandbox", "staging", "production"}, failures, refused)
+
+	assert.Equal(t, map[string]string{
+		"sandbox":    `schema path "schema/staging" is not authorized for database "orders"`,
+		"staging":    `schema path "schema/staging" is not authorized for database "orders"`,
+		"production": `schema path "schema/production" is not authorized for database "orders"`,
+	}, got)
+}
+
+// assertPasteableCommand asserts the comment carries cmd as a fenced block of
+// its own, at whatever list indentation the block renders.
+func assertPasteableCommand(t *testing.T, comment, cmd string) {
+	t.Helper()
+	assert.Regexp(t, "(?m)^ *```\n *"+regexp.QuoteMeta(cmd)+"\n *```$", comment)
 }

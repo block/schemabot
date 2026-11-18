@@ -7,11 +7,15 @@ package webhook
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -450,19 +454,28 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	})
 
 	checkRuns := make(chan checkRunCapture, 10)
+	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		checkRuns <- body
+		id := checkRunState.create(body)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		checkRuns <- body
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+		id, err := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid check run id", http.StatusBadRequest)
+			return
+		}
+		checkRunState.update(id, body)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
+	registerCheckStatusRESTHandlersForAnyRef(mux, func() []checkStatusNode { return nil }, checkRunState)
 
 	h := newE2EHandler(t, svc, client)
 
@@ -484,8 +497,8 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 		t.Fatal("timed out waiting for in-progress aggregate check run")
 	}
 
-	installClient := ghclient.NewInstallationClient(client, h.logger)
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222")
+	installClient := ghclient.NewInstallationClientWithSlug(client, h.logger, "schemabot")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222", nil)
 	select {
 	case cr := <-checkRuns:
 		require.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "passing aggregate must not be published while a started apply blocks the PR")
@@ -529,89 +542,173 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 
 // TestE2EPassingAggregateOnNonSchemaPR verifies that when a PR doesn't touch schema
 // files and allowed_environments is configured, passing aggregate checks are posted
-// so branch protection isn't blocked.
+// so branch protection isn't blocked. A one-line edit and a symlink between two
+// documentation files could be symlinks by their line counts, so the listing reads
+// their modes and the link's target, and neither is a schema input. When GitHub
+// cannot build the PR's diff in time, the modes come from listing the changed
+// files' directories instead, and the PR still passes.
 func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
-	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
+	for _, tc := range []struct {
+		name  string
+		files []*gh.CommitFile
+		// root is the head commit's root tree.
+		root []*gh.TreeEntry
+		// diffUnavailable makes GitHub answer the PR's compare diff with
+		// 422 "The diff is taking too long to generate.", the same on
+		// every delivery, so file modes have to come from directory
+		// listings.
+		diffUnavailable bool
+	}{
+		{
+			name:  "multi-line documentation edit",
+			files: []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)}},
+		},
+		{
+			name:  "one-line documentation edit when GitHub cannot build the diff in time",
+			files: []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(1), Deletions: new(1)}},
+			root: []*gh.TreeEntry{
+				{Path: new("README.md"), Mode: new("100644"), Type: new("blob"), SHA: new("readme-blob")},
+			},
+			diffUnavailable: true,
+		},
+		{
+			name: "one-line documentation edit and a documentation symlink",
+			files: []*gh.CommitFile{
+				{Filename: new("README.md"), Status: new("modified"), Additions: new(1), Deletions: new(1)},
+				{Filename: new("CLAUDE.md"), Status: new("added"), Additions: new(1)},
+			},
+			root: []*gh.TreeEntry{
+				{Path: new("README.md"), Mode: new("100644"), Type: new("blob"), SHA: new("readme-blob")},
+				{Path: new("AGENTS.md"), Mode: new("100644"), Type: new("blob"), SHA: new("agents-blob")},
+				{Path: new("CLAUDE.md"), Mode: new("120000"), Type: new("blob"), SHA: new("claude-link-blob")},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
 
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
 
-	client := gh.NewClient(nil)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// PR info
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
-			User: &gh.User{Login: new("testuser")},
+			// PR info
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.PullRequest{
+					Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
+					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+					User: &gh.User{Login: new("testuser")},
+				})
+			})
+
+			// PR changed files — no schema files
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(tc.files)
+			})
+
+			// Git tree — no schemabot.yaml at the head or at the merge base
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new("abc123"), Entries: tc.root, Truncated: new(false)})
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.Reference{Ref: new("refs/heads/main"), Object: &gh.GitObject{Type: new("commit"), SHA: new("tip123")}})
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/compare/tip123...abc123", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"merge_base_commit": map[string]any{"sha": "def456"}})
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456...abc123", func(w http.ResponseWriter, _ *http.Request) {
+				if tc.diffUnavailable {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_, _ = io.WriteString(w, `{"message":"The diff is taking too long to generate.","status":"422"}`)
+					return
+				}
+				writeCommitFilesDiff(t, w, tc.files, "CLAUDE.md")
+			})
+			// Directory listings answer the file modes the diff could not:
+			// every directory asked for, at either commit, is the root.
+			mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+				assert.True(t, tc.diffUnavailable, "file modes come from the diff when GitHub serves it")
+				var body struct {
+					Variables map[string]any `json:"variables"`
+				}
+				assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				ref, _ := body.Variables["ref"].(string)
+				repository := map[string]any{"ref": map[string]any{"oid": ref}}
+				for name := range body.Variables {
+					if !strings.HasPrefix(name, "e") {
+						continue
+					}
+					var entries []map[string]any
+					for _, entry := range tc.root {
+						mode, err := strconv.ParseInt(entry.GetMode(), 8, 0)
+						assert.NoError(t, err)
+						entries = append(entries, map[string]any{"name": entry.GetPath(), "mode": mode})
+					}
+					repository["d"+strings.TrimPrefix(name, "e")] = map[string]any{"entries": entries}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": repository}})
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new("def456"), Entries: []*gh.TreeEntry{
+					{Path: new("README.md"), Mode: new("100644"), Type: new("blob"), SHA: new("old-readme-blob")},
+				}, Truncated: new(false)})
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/claude-link-blob", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.Blob{Content: new("AGENTS.md"), Encoding: new("utf-8")})
+			})
+
+			// Capture check runs
+			checkRuns := make(chan checkRunCapture, 10)
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+				var body checkRunCapture
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				checkRuns <- body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			})
+
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			installClient := ghclient.NewInstallationClient(client, logger)
+			factory := &fakeClientFactory{client: installClient}
+
+			h := NewHandler(svc, factory, nil, logger)
+
+			req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+				action:  "opened",
+				headSHA: "abc123",
+				headRef: "feature-branch",
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+			// Wait for both passing aggregates (staging + production)
+			seen := map[string]bool{}
+			for i := range 2 {
+				select {
+				case cr := <-checkRuns:
+					seen[cr.Name] = true
+					assert.Equal(t, "completed", cr.Status)
+					assert.Equal(t, "success", cr.Conclusion)
+				case <-time.After(10 * time.Second):
+					t.Fatalf("timed out waiting for passing aggregate check run %d/2, seen: %v", i+1, seen)
+				}
+			}
+			assert.True(t, seen["SchemaBot (staging)"], "expected SchemaBot (staging) check")
+			assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
 		})
-	})
-
-	// PR changed files — no schema files
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
-		})
-	})
-
-	// Git tree — no schemabot.yaml
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       new("abc123"),
-			Entries:   []*gh.TreeEntry{},
-			Truncated: new(false),
-		})
-	})
-
-	// Capture check runs
-	checkRuns := make(chan checkRunCapture, 10)
-	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var body checkRunCapture
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		checkRuns <- body
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
-	factory := &fakeClientFactory{client: installClient}
-
-	h := NewHandler(svc, factory, nil, logger)
-
-	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
-		action:  "opened",
-		headSHA: "abc123",
-		headRef: "feature-branch",
-	}, nil)
-
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "auto-plan started")
-
-	// Wait for both passing aggregates (staging + production)
-	seen := map[string]bool{}
-	for i := range 2 {
-		select {
-		case cr := <-checkRuns:
-			seen[cr.Name] = true
-			assert.Equal(t, "completed", cr.Status)
-			assert.Equal(t, "success", cr.Conclusion)
-		case <-time.After(10 * time.Second):
-			t.Fatalf("timed out waiting for passing aggregate check run %d/2, seen: %v", i+1, seen)
-		}
 	}
-	assert.True(t, seen["SchemaBot (staging)"], "expected SchemaBot (staging) check")
-	assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
 }
 
 // An aggregate participant does not own the required check on a repo — the
 // leader does. On a PR that touches none of its schema, a participant posts no
-// check run at all (rather than a passing "No managed schema changes" aggregate
+// check run at all (rather than a passing "No schema files changed" aggregate
 // that would add a per-tenant row near the merge button).
 func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{
@@ -642,7 +739,7 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		filesFetchedOnce.Do(func() { close(filesFetched) })
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -715,7 +812,7 @@ func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
@@ -782,7 +879,7 @@ func TestE2ECheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		fileListCalls.Add(1)
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -845,7 +942,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	// PR changed files — no schema files
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -1028,7 +1125,7 @@ func TestE2EDisabledRepoChecksSkipAggregatePublishing(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, h.logger)
 
 	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "abc123")
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", nil)
 	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
 		"staging": "Plan failed",
 	})
@@ -1074,7 +1171,7 @@ func TestE2EPassingAggregateRequiresGitHubHeadVerification(t *testing.T) {
 
 	h := newE2EHandler(t, svc, client)
 	installClient := ghclient.NewInstallationClient(client, h.logger)
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", nil)
 
 	// Without head verification, SchemaBot must not publish or store a passing
 	// aggregate check that could incorrectly unblock branch protection.
@@ -1119,20 +1216,17 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	})
 
 	// Git tree — has the .sql file but no schemabot.yaml anywhere
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA: new("abc123"),
-			Entries: []*gh.TreeEntry{
-				{
-					Path: new("legacy-service/schema/users.sql"),
-					Mode: new("100644"),
-					Type: new("blob"),
-					SHA:  new("blobsha001"),
-					Size: new(100),
-				},
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA: "abc123",
+		headEntries: []*gh.TreeEntry{
+			{
+				Path: new("legacy-service/schema/users.sql"),
+				Mode: new("100644"),
+				Type: new("blob"),
+				SHA:  new("blobsha001"),
+				Size: new(100),
 			},
-			Truncated: new(false),
-		})
+		},
 	})
 
 	// Capture check runs
@@ -1200,7 +1294,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	// PR changed files — no schema files
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -1255,6 +1349,8 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 // TestE2EFailingAggregateOnPlanError verifies that when a plan fails for all
 // environments (e.g., database not configured), a failing aggregate check is
 // posted so branch protection shows a clear failure instead of waiting forever.
+// The database here is discovered from the PR's own schemabot.yaml, not named
+// by -d, so the failing aggregate, not a registry answer, is what reports it.
 func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 
@@ -1292,8 +1388,8 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	// Should get a comment with the error
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Error")
-		assert.Contains(t, body, "unconfigured-db")
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`unconfigured-db`")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for error comment")
 	}
@@ -1305,6 +1401,41 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "failure", cr.Conclusion)
 	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
+}
+
+// A failing aggregate's summary carries error text that can contain internal
+// endpoints, control sequences, and markup. The publish path must sanitize
+// that text before it reaches the GitHub Check Run, so the visible summary
+// never leaks infrastructure detail, renders injected HTML, or forms Markdown
+// links, images, or code spans that could carry a payload. Emphasis-style
+// formatting is left intact: it can restyle text but not inject content.
+func TestE2EFailingAggregateSanitizesErrorSummary(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+	ctx := t.Context()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "abc123")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
+		"staging": "plan failed:\n\x1b[31mdial tcp db-primary.internal:3306: connect & retry <5s>",
+	})
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, "Plan failed", cr.Output.Title)
+		assert.Equal(t, "plan failed: dial tcp &#91;endpoint redacted&#93;: connect &amp; retry &lt;5s&gt;", cr.Output.Summary)
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for failing aggregate check run")
 	}
 }

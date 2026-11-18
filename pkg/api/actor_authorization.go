@@ -2,6 +2,8 @@ package api
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -37,10 +39,42 @@ func (c *ServerConfig) PRCommandAuthorizationEnabled() bool {
 	return c != nil && c.PRCommandAuthorization.Enabled
 }
 
-// ReviewPolicyEnabled returns true when apply/apply-confirm PR comments must
-// pass the review gate.
+// ReviewPolicyEnabled returns true when the instance-wide review policy is on,
+// so apply/apply-confirm PR comments for every database must pass the review
+// gate. A database can also opt in on its own; ReviewPolicyEnabledForDatabase
+// covers both.
 func (c *ServerConfig) ReviewPolicyEnabled() bool {
 	return c != nil && c.ReviewPolicy.Enabled
+}
+
+// ReviewPolicyEnabledForDatabase returns true when apply/apply-confirm PR
+// comments for database must pass the review gate: the instance-wide review
+// policy is on, or the database opts in with its own review_policy.
+func (c *ServerConfig) ReviewPolicyEnabledForDatabase(database string) bool {
+	if c.ReviewPolicyEnabled() {
+		return true
+	}
+	if c == nil {
+		return false
+	}
+	dbConfig := c.Database(database)
+	return dbConfig != nil && dbConfig.ReviewPolicy.Enabled
+}
+
+// ReviewPolicyRequiresReapprovalForDatabase returns whether an approval on
+// an earlier commit counts for database only while the PR's schema change is
+// the one it reviewed: the database's own review_policy.require_reapproval
+// when set, otherwise the instance-wide one. Unset in both, it is false, and
+// an authorized approval counts until the reviewer withdraws it or GitHub
+// dismisses it.
+func (c *ServerConfig) ReviewPolicyRequiresReapprovalForDatabase(database string) bool {
+	if c == nil {
+		return false
+	}
+	if dbConfig := c.Database(database); dbConfig != nil && dbConfig.ReviewPolicy.RequireReapproval != nil {
+		return *dbConfig.ReviewPolicy.RequireReapproval
+	}
+	return c.ReviewPolicy.RequireReapproval != nil && *c.ReviewPolicy.RequireReapproval
 }
 
 // ReviewPolicyIncludesDatabaseOperators returns whether database-scoped
@@ -79,6 +113,44 @@ func validateReviewPolicy(config ReviewPolicyConfig) error {
 	}
 	if err := validateGitHubUsers("review_policy.admin_users", config.AdminUsers); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateDatabaseReviewPolicy rejects a database that opts into the review
+// gate unless every PR it accepts has a configured principal who can approve
+// it. Without one, the gate fails that PR's every apply with an error instead
+// of asking for a review.
+func (c *ServerConfig) validateDatabaseReviewPolicy(database string, dbConfig DatabaseConfig) error {
+	if dbConfig.ReviewPolicy.RequireReapproval != nil && !c.ReviewPolicyEnabled() && !dbConfig.ReviewPolicy.Enabled {
+		return fmt.Errorf("databases.%s.review_policy.require_reapproval needs the review gate on for the database: set databases.%s.review_policy.enabled or review_policy.enabled", database, database)
+	}
+	if !dbConfig.ReviewPolicy.Enabled {
+		return nil
+	}
+	if c.ReviewPolicyIncludesDatabaseOperators() && (len(dbConfig.OperatorTeams) > 0 || len(dbConfig.OperatorUsers) > 0) {
+		return nil
+	}
+	if len(c.ReviewPolicy.AdminTeams) > 0 || len(c.ReviewPolicy.AdminUsers) > 0 {
+		return nil
+	}
+	// Otherwise each repo the database accepts needs admins of its own: a
+	// repo's admins approve only that repo's PRs, and CODEOWNERS approve only
+	// a PR whose files they own, so neither covers every PR.
+	const fix = "set the database's operator_teams or operator_users (with review_policy.include_database_operators left on), or review_policy.admin_teams or admin_users"
+	repos := dbConfig.AllowedRepos
+	if len(repos) == 0 || slices.Contains(repos, "*") {
+		// The database accepts every repository SchemaBot serves, which is
+		// every repository when none are configured.
+		if len(c.Repos) == 0 {
+			return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve every PR, but the database accepts any repository and no repos are configured: %s", database, fix)
+		}
+		repos = slices.Sorted(maps.Keys(c.Repos))
+	}
+	for _, repo := range repos {
+		if teams, users := c.RepoAdmins(repo); len(teams) == 0 && len(users) == 0 {
+			return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve every PR, but repos.%s, which the database accepts schema changes from, has no admin_teams or admin_users: set them, or %s", database, repo, fix)
+		}
 	}
 	return nil
 }
@@ -142,17 +214,17 @@ func validateGitHubUsers(field string, users []string) error {
 
 // PRCommandAuthorizedPrincipals returns the GitHub principals (teams as
 // "org/team", plain user logins) allowed to run mutating PR commands for
-// database via repo, in the order the authorizer consults them: the
-// deployment-wide admin teams/users, the repository's admin teams/users, then
-// the database's operator teams/users. Rejection comments surface this list so
-// a blocked user knows who to ask instead of guessing.
-func (c *ServerConfig) PRCommandAuthorizedPrincipals(repo, database string) []string {
+// database via repo, split into the database's own operator teams/users and
+// the broader principals (deployment-wide admins, then the repository's
+// admins). Rejection comments surface the two groups so a blocked user pings
+// the database's operators first; a principal configured in both groups is
+// listed only as an operator.
+func (c *ServerConfig) PRCommandAuthorizedPrincipals(repo, database string) (operators, others []string) {
 	if c == nil {
-		return nil
+		return nil, nil
 	}
-	var principals []string
 	seen := map[string]bool{}
-	add := func(items []string) {
+	add := func(dst []string, items []string) []string {
 		for _, item := range items {
 			// GitHub logins and team slugs are case-insensitive, and operators
 			// sometimes configure them with a leading "@" — normalize both so
@@ -162,17 +234,18 @@ func (c *ServerConfig) PRCommandAuthorizedPrincipals(repo, database string) []st
 				continue
 			}
 			seen[strings.ToLower(display)] = true
-			principals = append(principals, display)
+			dst = append(dst, display)
 		}
+		return dst
 	}
-	add(c.PRCommandAuthorization.AdminTeams)
-	add(c.PRCommandAuthorization.AdminUsers)
+	if db, ok := c.DatabaseConfigs()[database]; ok {
+		operators = add(operators, db.OperatorTeams)
+		operators = add(operators, db.OperatorUsers)
+	}
+	others = add(others, c.PRCommandAuthorization.AdminTeams)
+	others = add(others, c.PRCommandAuthorization.AdminUsers)
 	repoAdminTeams, repoAdminUsers := c.RepoAdmins(repo)
-	add(repoAdminTeams)
-	add(repoAdminUsers)
-	if db, ok := c.Databases[database]; ok {
-		add(db.OperatorTeams)
-		add(db.OperatorUsers)
-	}
-	return principals
+	others = add(others, repoAdminTeams)
+	others = add(others, repoAdminUsers)
+	return operators, others
 }

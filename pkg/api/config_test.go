@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -11,14 +12,21 @@ import (
 	"testing"
 	"time"
 
-	gomysql "github.com/go-sql-driver/mysql"
+	gomysql "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
+	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -85,6 +93,53 @@ default_reviewers:
 	assert.Equal(t, "localhost:9090", cfg.TernDeployments["default"]["staging"])
 }
 
+// A Vitess database can be registered under an arbitrary identifier: the
+// per-environment database field names the PlanetScale database the API must
+// address, and the etre resolver can read that name from a configurable entity
+// attribute.
+func TestLoadServerConfig_PlanetScaleDatabaseName(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+databases:
+  commerce:
+    type: vitess
+    environments:
+      staging:
+        target: commerce-staging
+        deployment: default
+        organization: acme
+        database: commerce_main
+        token_secret_ref: "name:value"
+tern_deployments:
+  default:
+    staging: "localhost:9090"
+target_resolver:
+  etre:
+    - addr: https://etre.example
+      database_type: vitess
+      entity_type: planetscale_database
+      target_label: dsid
+      vitess:
+        database_attribute: ps_database
+      credentials:
+        password_ref: env:PS_TOKEN
+repos:
+  org/repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+	t.Setenv("SCHEMABOT_CONFIG_FILE", configPath)
+
+	cfg, err := LoadServerConfig()
+	require.NoError(t, err, "LoadServerConfig")
+
+	envConfig := cfg.Databases["commerce"].Environments["staging"]
+	assert.Equal(t, "acme", envConfig.Organization)
+	assert.Equal(t, "commerce_main", envConfig.Database)
+	require.Len(t, cfg.TargetResolver.Etre, 1)
+	assert.Equal(t, "ps_database", cfg.TargetResolver.Etre[0].Vitess.DatabaseAttribute)
+}
+
 func TestLoadServerConfig_NoEnvVar(t *testing.T) {
 	t.Setenv("SCHEMABOT_CONFIG_FILE", "")
 
@@ -114,7 +169,6 @@ tern_deployments:
 repos:
   org/repo:
     enable_checks: false
-    require_up_to_date_with_base: true
 `
 	err := os.WriteFile(configPath, []byte(content), 0644)
 	require.NoError(t, err, "write config file")
@@ -125,7 +179,55 @@ repos:
 	assert.Equal(t, 2, len(cfg.TernDeployments))
 	assert.Contains(t, cfg.Repos, "org/repo")
 	assert.False(t, cfg.AreChecksEnabled("org/repo"))
-	assert.True(t, cfg.RequiresUpToDateWithBase("org/repo"))
+}
+
+func TestLoadServerConfigFromFileCanonicalizesRepositories(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    allowed_repos:
+      - MixedCase/Sample-Repo
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+tern_deployments:
+  default:
+    staging: tern-staging:9090
+repos:
+  MixedCase/Sample-Repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	assert.Contains(t, cfg.Repos, "mixedcase/sample-repo")
+	assert.NotContains(t, cfg.Repos, "MixedCase/Sample-Repo")
+	assert.Equal(t, []string{"mixedcase/sample-repo"}, cfg.Databases["testapp"].AllowedRepos)
+}
+
+func TestLoadServerConfigFromFileRejectsCanonicalRepositoryCollision(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+repos:
+  MixedCase/Sample-Repo: {}
+  mixedcase/sample-repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+
+	_, err := LoadServerConfigFromFile(configPath)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `"MixedCase/Sample-Repo"`)
+	assert.ErrorContains(t, err, `"mixedcase/sample-repo"`)
 }
 
 func TestLoadServerConfigFromFile_DSNFrom(t *testing.T) {
@@ -192,6 +294,58 @@ target_resolver:
 	assert.Equal(t, "schemabot", target.DSNFrom.Username)
 	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials", target.DSNFrom.ConfigRef)
 	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials#password", target.DSNFrom.PasswordRef)
+}
+
+func TestLoadServerConfigFromFile_PostgresStaticTargetTableOwner(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+storage:
+  dsn: env:MYSQL_DSN
+target_resolver:
+  targets:
+    example-target:
+      type: postgres
+      table_owner: app_owner
+      dsn_from:
+        config_ref: secretsmanager:/example/schemabot/target-credentials
+        password_ref: secretsmanager:/example/schemabot/target-credentials#password
+        username: schemabot
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	target := cfg.TargetResolver.Targets["example-target"]
+	assert.Equal(t, "postgres", target.DatabaseType)
+	assert.Equal(t, "app_owner", target.TableOwner)
+	require.NotNil(t, target.DSNFrom)
+	assert.Equal(t, "schemabot", target.DSNFrom.Username)
+}
+
+// A table_owner on an engine without the setting is rejected at config
+// load whether or not the experimental Strata opt-in is set: the check has
+// nothing to do with Strata, so the flag must not change its answer.
+func TestLoadServerConfigFromFileRejectsTableOwnerForMySQL(t *testing.T) {
+	for _, strata := range []bool{false, true} {
+		t.Run(fmt.Sprintf("experimental-strata-enabled=%t", strata), func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			content := fmt.Sprintf(`
+storage:
+  dsn: env:MYSQL_DSN
+experimental-strata-enabled: %t
+target_resolver:
+  targets:
+    example-target:
+      type: mysql
+      dsn: root@tcp(localhost:3306)/
+      table_owner: app_owner
+`, strata)
+			require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+			_, err := LoadServerConfigFromFile(configPath)
+			require.ErrorContains(t, err, `table_owner is only supported for postgres, not "mysql"`)
+		})
+	}
 }
 
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {
@@ -666,6 +820,217 @@ func TestServerConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestServerConfig_ValidateIdentifiers(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"orders": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {Target: "orders-staging", Deployment: "primary"},
+					},
+				},
+			},
+			TernDeployments: TernConfig{
+				"primary": {"staging": "localhost:9090"},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		mutate    func(*ServerConfig)
+		wantError string
+	}{
+		{
+			name: "database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["Orders"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "Orders" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "environment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.Environments["Staging"] = database.Environments["staging"]
+				delete(database.Environments, "staging")
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "deployment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Deployment = "Primary"
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "top-level environment order",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"Staging"}
+			},
+			wantError: `environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "top-level allowed environments",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"Staging"}
+			},
+			wantError: `allowed_environments environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "per-database environment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.EnvironmentOrder = []string{"Staging"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "per-database deployment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.DeploymentOrder = []string{"Primary"}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment_order deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"Primary": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "tern deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["Primary"] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "tern deployments environment key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["primary"]["Staging"] = "localhost:9090"
+			},
+			wantError: `deployment "primary" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases[""] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty environment order entry",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{""}
+			},
+			wantError: `environment_order environment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty tern deployments name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments[""] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "accented database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["café"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "café" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "leading whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{" staging"}
+			},
+			wantError: `environment_order environment name " staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "trailing whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"staging "}
+			},
+			wantError: `allowed_environments environment name "staging " must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "interior space",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"pre production"}
+			},
+			wantError: `environment_order environment name "pre production" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "repository key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Repos = map[string]RepoConfig{"Org/Repo.Name": {}}
+			},
+			wantError: `repos repository key "Org/Repo.Name" must be canonical`,
+		},
+		{
+			name: "allowed repository",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.AllowedRepos = []string{"Org/Repo.Name"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" allowed_repos repository "Org/Repo.Name" must be canonical`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			require.EqualError(t, err, tt.wantError)
+		})
+	}
+
+	t.Run("valid identifiers with digits hyphens and underscores", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Databases["orders_2-prod"] = cfg.Databases["orders"]
+		delete(cfg.Databases, "orders")
+		require.NoError(t, cfg.Validate())
+	})
+}
+
 // A required_checks entry that names SchemaBot's own aggregate Check Run would
 // be silently unenforced: SchemaBot checks are excluded from the passing-checks
 // gate, so the gate would treat the named check as always satisfied. Config
@@ -821,6 +1186,495 @@ func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.
 			assert.Contains(t, err.Error(), "must be positive")
 		})
 	}
+}
+
+// Enabling direct_execution without a size bound is a startup config error:
+// the size gate must never be accidentally unbounded.
+func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"missing bound": {Enabled: true},
+		"zero bound":    {Enabled: true, MaxTableRows: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution without a size bound (set max_table_rows or max_table_bytes)`)
+		})
+	}
+}
+
+// Setting both size bounds is a startup config error, even on a disabled
+// policy: the bounds differ in strength, and a second limit on a safety policy
+// reads as a ceiling whichever way the two would combine.
+func TestServerConfig_ValidateRejectsBothDirectExecutionBounds(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled":  {Enabled: true, MaxTableRows: 100000, MaxTableBytes: "100MiB"},
+		"disabled": {MaxTableRows: 100000, MaxTableBytes: "100MiB"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution sets both max_table_rows and max_table_bytes (set exactly one`)
+		})
+	}
+}
+
+// A negative row bound is malformed whether or not the policy is enabled,
+// and a byte bound beside it does not excuse it.
+func TestServerConfig_ValidateRejectsNegativeDirectExecutionRowBound(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled":                  {Enabled: true, MaxTableRows: -1},
+		"enabled with bytes":       {Enabled: true, MaxTableRows: -1, MaxTableBytes: "100MiB"},
+		"malformed while disabled": {MaxTableRows: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution: max_table_rows is -1 (must be positive, or omitted to set no row bound)`)
+		})
+	}
+}
+
+// direct_execution on a database whose engine does not route refused
+// statements is a startup config error rather than a silently ignored grant:
+// config that looks like it permits direct execution must either take effect
+// or fail loudly. Every database type SchemaBot recognizes is covered, so a
+// type whose engine adopts direct execution has to be moved deliberately
+// rather than inheriting the grant by resembling MySQL.
+func TestServerConfig_ValidateRejectsDirectExecutionOnEnginesThatDoNotRouteIt(t *testing.T) {
+	for _, dbType := range []string{
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+	} {
+		t.Run(dbType, func(t *testing.T) {
+			cfg := ServerConfig{
+				ExperimentalStrataEnabled: true,
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: dbType,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {
+								DSN:             "root@tcp(localhost)/mydb",
+								DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+							},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
+			assert.Contains(t, err.Error(), "only supported for mysql databases")
+		})
+	}
+}
+
+// The server-wide policy states no database type, so it is what reaches a
+// database that reaches no per-database block. It reaches only the engines
+// that route refused statements — dropping the global default on the rest is
+// how one statement of the policy covers a mixed fleet without granting
+// native DDL to an engine that would never apply its bound.
+func TestServerConfig_ResolveDirectExecutionReachesOnlyEnginesThatRouteIt(t *testing.T) {
+	policy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000}
+	cfg := ServerConfig{DirectExecution: policy}
+
+	assert.Same(t, policy, cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL))
+	for _, dbType := range []string{
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+		"an-embedder-registered-engine",
+	} {
+		assert.Nil(t, cfg.ResolveDirectExecution(nil, dbType), "the server-wide policy must not reach %s", dbType)
+	}
+}
+
+// ResolveDirectExecution returns an environment's own block without passing
+// it through the engine filter, which is safe only because validation refuses
+// that block on every type the filter excludes. The two functions read the
+// same predicate, and this asserts the link directly: for each type a
+// database may be registered as, the filter's answer and validation's answer
+// agree. Relaxing either side alone would let a block validation accepted
+// resolve onto an engine that never applies its bound.
+func TestServerConfig_DirectExecutionEngineFilterAndValidationAgree(t *testing.T) {
+	// The types Validate() admits in databases:. Anything else is rejected
+	// before the direct execution rules are reached.
+	for _, dbType := range []string{
+		storage.DatabaseTypeMySQL,
+		storage.DatabaseTypeVitess,
+		storage.DatabaseTypePostgres,
+		storage.DatabaseTypeStrata,
+	} {
+		t.Run(dbType, func(t *testing.T) {
+			block := &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000}
+			cfg := ServerConfig{
+				ExperimentalStrataEnabled: true,
+				Storage:                   StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: dbType,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: block},
+						},
+					},
+				},
+			}
+			err := cfg.Validate()
+
+			if directExecutionSupported(dbType) {
+				require.NoError(t, err)
+				assert.Same(t, block, cfg.ResolveDirectExecution(&EnvironmentConfig{DirectExecution: block}, dbType))
+				return
+			}
+			require.Error(t, err, "an environment block on %s must be refused, because ResolveDirectExecution will return it unfiltered", dbType)
+			assert.Contains(t, err.Error(), "only supported for mysql databases")
+		})
+	}
+}
+
+// A malformed direct_execution lock_acquisition_timeout is a startup config error —
+// even on a disabled block — so a bad bound is never silently carried until
+// the policy is enabled. MySQL lock timeouts have second granularity, so the
+// value must be a whole number of seconds of at least 1s.
+func TestServerConfig_ValidateRejectsBadDirectExecutionLockAcquisitionTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		direct  *DirectExecutionConfig
+		wantErr string
+	}{
+		"not a duration":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "ten"}, "is not a valid duration"},
+		"sub-second":               {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
+		"negative":                 {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "-5s"}, "must be at least 1s"},
+		"fractional seconds":       {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "1.5s"}, "must be a whole number of seconds"},
+		"malformed while disabled": {&DirectExecutionConfig{Enabled: false, LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: tc.direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// A malformed max_table_bytes is a startup config error, even while the policy
+// is disabled, so it never surfaces for the first time when someone enables
+// direct execution. The value must be a positive whole number with a binary
+// unit: a decimal unit such as MB is rejected rather than guessed at, because
+// readers disagree on whether it means 1000² or 1024² bytes.
+func TestServerConfig_ValidateRejectsBadDirectExecutionMaxTableBytes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		maxTableBytes string
+		enabled       bool
+		wantErr       string
+	}{
+		"no unit":                  {"104857600", true, "must be a whole number followed by a unit"},
+		"decimal unit":             {"100MB", true, `unit "MB" is not one of B, KiB, MiB, GiB, TiB`},
+		"lowercase binary unit":    {"100mib", true, `unit "mib" is not one of B, KiB, MiB, GiB, TiB`},
+		"fractional":               {"1.5GiB", true, "must be a whole number followed by a unit"},
+		"negative":                 {"-100MiB", true, "must be a whole number followed by a unit"},
+		"zero":                     {"0MiB", true, "must be positive"},
+		"overflow":                 {"9999999999TiB", true, "overflows a 64-bit byte count"},
+		"not a size":               {"lots", true, "must be a whole number followed by a unit"},
+		"malformed while disabled": {"100MB", false, `unit "MB" is not one of B, KiB, MiB, GiB, TiB`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			direct := &DirectExecutionConfig{Enabled: tc.enabled, MaxTableBytes: tc.maxTableBytes}
+			if tc.enabled {
+				direct.MaxTableRows = 175000
+			}
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution: max_table_bytes "`+tc.maxTableBytes+`"`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// max_table_bytes accepts a whole number with any binary unit, with or
+// without a space, and resolves to bytes on the policy the rest of the system
+// carries.
+func TestDirectExecutionConfig_PolicyResolvesMaxTableBytes(t *testing.T) {
+	for raw, want := range map[string]int64{
+		"104857600B": 104857600,
+		"512KiB":     512 << 10,
+		"100MiB":     100 << 20,
+		"100 MiB":    100 << 20,
+		"2GiB":       2 << 30,
+		"1TiB":       1 << 40,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			direct := &DirectExecutionConfig{Enabled: true, MaxTableBytes: raw}
+			require.NoError(t, direct.Validate("test"))
+			policy, err := direct.Policy()
+			require.NoError(t, err)
+			assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: want}, policy)
+		})
+	}
+
+	t.Run("unset", func(t *testing.T) {
+		policy, err := (&DirectExecutionConfig{Enabled: true, MaxTableRows: 175000}).Policy()
+		require.NoError(t, err)
+		assert.Zero(t, policy.MaxTableBytes, "a row-bound policy carries no byte bound")
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		policy, err := (&DirectExecutionConfig{Enabled: false, MaxTableBytes: "100MiB"}).Policy()
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy, "an opt-out carries no bounds")
+	})
+}
+
+// A well-formed direct_execution policy on a MySQL database validates, and a
+// disabled block (even without a bound) is accepted as the fail-closed default.
+func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
+		"enabled with byte bound":   {Enabled: true, MaxTableBytes: "100MiB"},
+		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
+		"disabled":                  {Enabled: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			require.NoError(t, cfg.Validate())
+		})
+	}
+}
+
+// The server-wide policy is held to the same shape rules as a per-database
+// block: enabling it without a size bound, or with a lock timeout that cannot
+// be applied with second granularity, fails startup.
+func TestServerConfig_ValidateRejectsMalformedServerDirectExecution(t *testing.T) {
+	for name, tc := range map[string]struct {
+		direct  *DirectExecutionConfig
+		wantErr string
+	}{
+		"enabled without bound":    {&DirectExecutionConfig{Enabled: true}, "enables direct_execution without a size bound"},
+		"negative bound":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: -1}, "max_table_rows is -1 (must be positive"},
+		"sub-second lock timeout":  {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
+		"malformed while disabled": {&DirectExecutionConfig{LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				DirectExecution: tc.direct,
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Contains(t, err.Error(), "server config")
+		})
+	}
+}
+
+// A server-wide policy coexists with databases whose engine cannot honor it.
+// Unlike a per-database block — which is rejected on a non-MySQL database so
+// a deliberate grant is never silently ignored — the server-wide policy
+// states a fleet default and simply never reaches those engines.
+func TestServerConfig_ValidateAcceptsServerDirectExecutionAlongsideOtherEngines(t *testing.T) {
+	cfg := ServerConfig{
+		DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type:         "mysql",
+				Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+			},
+			"shardeddb": {
+				Type:         "vitess",
+				Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/shardeddb"}},
+			},
+		},
+	}
+
+	require.NoError(t, cfg.Validate())
+}
+
+// The server-wide policy reaches every MySQL database the server drives,
+// including one a data plane resolves per request with no registration of its
+// own, and reaches no engine that cannot honor it.
+func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
+	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB", LockAcquisitionTimeout: "10s"}
+	cfg := ServerConfig{DirectExecution: serverPolicy}
+
+	t.Run("registered mysql database", func(t *testing.T) {
+		assert.Same(t, serverPolicy, cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("unregistered database resolved per request", func(t *testing.T) {
+		assert.Same(t, serverPolicy, cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		assert.Nil(t, cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeVitess))
+	})
+
+	t.Run("metadata carries the whole policy", func(t *testing.T) {
+		metadata, err := cfg.DirectExecutionMetadata(nil, storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			engine.MetadataDirectExecution:                              "true",
+			engine.MetadataDirectExecutionMaxTableBytes:                 "104857600",
+			engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds: "10",
+		}, metadata)
+	})
+}
+
+// A database environment's own block replaces the server-wide policy whole
+// rather than merging into it, so an override can neither inherit a size bound
+// it does not state nor be overruled when it opts out.
+func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *testing.T) {
+	cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}}
+
+	t.Run("override states its own bound", func(t *testing.T) {
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 50}}
+
+		metadata, err := cfg.DirectExecutionMetadata(envConfig, storage.DatabaseTypeMySQL)
+
+		require.NoError(t, err)
+		assert.Equal(t, "50", metadata[engine.MetadataDirectExecutionMaxTableRows])
+		assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
+			"the server policy's lock timeout must not leak into an override that states none")
+	})
+
+	// An opt-out states itself rather than rendering nothing. Rendering
+	// nothing would make a deliberate opt-out indistinguishable from an
+	// environment that never mentioned the policy, and every consumer that
+	// layers the server-wide grant over an unstated policy would then
+	// overlay it onto the opt-out too.
+	t.Run("override opts out", func(t *testing.T) {
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+
+		metadata, err := cfg.DirectExecutionMetadata(envConfig, storage.DatabaseTypeMySQL)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "false"}, metadata)
+		assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows,
+			"an opt-out carries no bound: there is nothing for a bound to permit")
+	})
+}
+
+// A server config that states no policy runs MySQL databases under the default
+// one: direct execution enabled, bounded at 100MiB of data and indexes. A
+// server-wide block that disables it opts every database out, and engines that
+// cannot honor it never receive the default.
+func TestServerConfig_ResolveDirectExecutionDefaultsToEnabledAt100MiB(t *testing.T) {
+	t.Run("no policy configured", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB"},
+			cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeMySQL))
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20}, policy)
+	})
+
+	// The default is built in code rather than read from a config file, so
+	// it never passes startup validation on its own. Holding it to the same
+	// validation a stated block gets keeps a malformed default from failing
+	// every MySQL plan at resolve time instead of failing here.
+	t.Run("default passes the validation a stated block gets", func(t *testing.T) {
+		require.NoError(t, defaultDirectExecution().Validate("default direct_execution policy"))
+	})
+
+	t.Run("server-wide opt out", func(t *testing.T) {
+		cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy,
+			"an explicit opt out travels as one rather than falling back to the default")
+	})
+
+	t.Run("environment opt out", func(t *testing.T) {
+		cfg := ServerConfig{}
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: false}, cfg.ResolveDirectExecution(envConfig, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		cfg := ServerConfig{}
+		for _, dbType := range []string{storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
+			assert.Nil(t, cfg.ResolveDirectExecution(&EnvironmentConfig{}, dbType), "the default must not reach %s", dbType)
+		}
+	})
+
+	t.Run("each resolution is its own value", func(t *testing.T) {
+		cfg := ServerConfig{}
+		first := cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL)
+		first.MaxTableBytes = "1GiB"
+		assert.Equal(t, "100MiB", cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL).MaxTableBytes)
+	})
 }
 
 // A well-formed revert_window_duration parses to the configured window.
@@ -1546,8 +2400,8 @@ func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 // validateDeploymentOrder must report an empty deployments map key with the
 // same clear error used elsewhere, rather than the confusing
 // "missing deployment \"\"" that fell out of the permutation check. This guards
-// the Validate() path, which calls validateDeploymentOrder before its own
-// empty-key check.
+// the Validate() path, which calls validateDeploymentOrder before the
+// identifier validation rejects the empty key.
 func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	err := validateDeploymentOrder(
 		map[string]DeploymentTarget{
@@ -1562,28 +2416,53 @@ func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	assert.NotContains(t, err.Error(), `missing deployment ""`)
 }
 
-// TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver:
-// it defaults to rolling (today's serial rollout) when unset or unconfigured,
-// and honours an explicit barrier policy.
+// TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver: an
+// explicit policy always wins; left unset, an environment whose every member
+// comes from a targets list (at the environment level, or in every entry of a
+// deployments map) resolves to parallel, and every other environment,
+// configured or not, resolves to rolling. A deployments map that mixes a
+// targets list with a single target resolves to rolling, since its
+// single-target members are the ones a serial rollout lets an operator watch
+// one region at a time.
 func TestServerConfig_CutoverPolicyFor(t *testing.T) {
+	oneTargetMap := map[string]DeploymentTarget{"payments-a": {Target: "payments"}}
+	targetsList := []TargetEntry{{Target: "payments-001"}, {Target: "payments-002"}}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"payments": {
 				Type: "mysql",
 				Environments: map[string]EnvironmentConfig{
-					"policy-unset":    {Target: "payments", Deployment: "payments-a"},
-					"policy-rolling":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyRolling},
-					"policy-barrier":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyBarrier},
-					"policy-parallel": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyParallel},
+					"policy-unset":               {Target: "payments", Deployment: "payments-a"},
+					"policy-rolling":             {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyRolling},
+					"policy-barrier":             {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyBarrier},
+					"policy-parallel":            {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyParallel},
+					"deployments-unset":          {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}, "payments-b": {Target: "payments"}}},
+					"targets-unset":              {Targets: targetsList, Deployment: "payments-a"},
+					"targets-rolling":            {Targets: targetsList, Deployment: "payments-a", CutoverPolicy: storage.CutoverPolicyRolling},
+					"targets-barrier":            {Targets: targetsList, Deployment: "payments-a", CutoverPolicy: storage.CutoverPolicyBarrier},
+					"deployment-targets-unset":   {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}},
+					"deployment-targets-rolling": {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}, CutoverPolicy: storage.CutoverPolicyRolling},
+					"every-deployment-targets":   {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Targets: []TargetEntry{{Target: "shop-002"}}}}},
+					"mixed-deployments-unset":    {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}},
+					"mixed-deployments-parallel": {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}, CutoverPolicy: storage.CutoverPolicyParallel},
 				},
 			},
 		},
 	}
 
-	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "unset defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "a single target defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-rolling"), "explicit rolling is rolling")
 	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "policy-barrier"), "explicit barrier is barrier")
 	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "policy-parallel"), "explicit parallel is parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "deployments-unset"), "a deployments map of single targets defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "targets-unset"), "a targets list defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "targets-rolling"), "explicit rolling on a targets list is rolling")
+	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "targets-barrier"), "explicit barrier on a targets list is barrier")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "deployment-targets-unset"), "a targets list inside a deployments entry defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "deployment-targets-rolling"), "explicit rolling on a deployment's targets list is rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "every-deployment-targets"), "a deployments map whose every entry is a targets list defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "mixed-deployments-unset"), "a deployments map mixing a targets list with a single target defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "mixed-deployments-parallel"), "explicit parallel on a mixed deployments map is parallel")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "missing-env"), "unconfigured env defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("missing-db", "policy-barrier"), "unconfigured database defaults to rolling")
 }
@@ -1733,7 +2612,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 				CutoverPolicy: storage.CutoverPolicyBarrier,
 			},
 			tern:       baseTern,
-			wantErrSub: "sets cutover_policy without a deployments map",
+			wantErrSub: "sets cutover_policy without a deployments map or targets list",
 		},
 		{
 			name: "invalid cutover_policy value is rejected",
@@ -1777,6 +2656,18 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			tern: baseTern,
 		},
 		{
+			// A large fleet runs its targets in parallel, bounded by the
+			// server's max_drivers_per_apply, and keeps going past a failed one.
+			name: "cutover_policy parallel and on_failure continue with a targets list are accepted",
+			envConfig: EnvironmentConfig{
+				Deployment:    "payments-a",
+				Targets:       targetNames("payments-001", "payments-002"),
+				CutoverPolicy: storage.CutoverPolicyParallel,
+				OnFailure:     storage.OnFailureContinue,
+			},
+			tern: baseTern,
+		},
+		{
 			name: "on_failure without a deployments map is rejected",
 			envConfig: EnvironmentConfig{
 				Target:     "payments",
@@ -1784,7 +2675,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 				OnFailure:  storage.OnFailureContinue,
 			},
 			tern:       baseTern,
-			wantErrSub: "sets on_failure without a deployments map",
+			wantErrSub: "sets on_failure without a deployments map or targets list",
 		},
 		{
 			name: "on_failure halt with a deployments map is accepted",
@@ -1824,6 +2715,138 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 					"payments-a": {Target: "payments"},
 				},
 				OnFailure: storage.OnFailurePause,
+			},
+			tern: baseTern,
+		},
+		{
+			name: "environment targets list is accepted",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    targetNames("payments-001", "payments-002"),
+			},
+			tern: baseTern,
+		},
+		{
+			name: "environment target and targets together are rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Target:     "payments-001",
+				Targets:    targetNames("payments-001", "payments-002"),
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both target and targets",
+		},
+		{
+			name: "environment target and an empty targets list are rejected as a conflict",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Target:     "payments-001",
+				Targets:    targetNames(),
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both target and targets",
+		},
+		{
+			name: "empty environment targets list is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    targetNames(),
+			},
+			tern:       baseTern,
+			wantErrSub: "targets list is empty",
+		},
+		{
+			name: "empty entry in environment targets is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    targetNames("payments-001", ""),
+			},
+			tern:       baseTern,
+			wantErrSub: "targets entry 1 is empty",
+		},
+		{
+			name: "repeated environment target is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    targetNames("payments-001", "payments-001"),
+			},
+			tern:       baseTern,
+			wantErrSub: `lists target "payments-001" more than once`,
+		},
+		{
+			name: "environment target containing the operation key delimiter is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    targetNames("payments-001", "payments/002"),
+			},
+			tern:       baseTern,
+			wantErrSub: `targets entry 1 "payments/002" contains reserved delimiter "/"`,
+		},
+		{
+			name: "environment targets without a deployment is rejected",
+			envConfig: EnvironmentConfig{
+				Targets: targetNames("payments-001", "payments-002"),
+			},
+			tern:       baseTern,
+			wantErrSub: "missing deployment",
+		},
+		{
+			name: "local DSN together with targets is rejected",
+			envConfig: EnvironmentConfig{
+				DSN:        "root@tcp(localhost)/payments",
+				Deployment: "payments-a",
+				Targets:    targetNames("payments-001"),
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both local DSN and target/deployment(s)",
+		},
+		{
+			name: "deployment targets list is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: targetNames("payments-001", "payments-002")},
+					"payments-b": {Target: "payments-003"},
+				},
+			},
+			tern: baseTern,
+		},
+		{
+			name: "deployment target and targets together are rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments-001", Targets: targetNames("payments-002")},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment "payments-a" cannot configure both target and targets`,
+		},
+		{
+			name: "repeated target within one deployment is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: targetNames("payments-001", "payments-001")},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment "payments-a" lists target "payments-001" more than once`,
+		},
+		{
+			name: "deployment target containing the operation key delimiter is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: targetNames("payments/001", "payments-002")},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment "payments-a" targets entry 0 "payments/001" contains reserved delimiter "/"`,
+		},
+		{
+			name: "the same target under different deployments is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: targetNames("payments-001", "payments-002")},
+					"payments-b": {Targets: targetNames("payments-001", "payments-002")},
+				},
 			},
 			tern: baseTern,
 		},
@@ -1946,6 +2969,172 @@ func TestServerConfig_OrderedEnvironments(t *testing.T) {
 	})
 }
 
+// TestServerConfig_PromotionOrderForDatabase covers per-database promotion
+// order resolution: a database's environment_order override replaces the
+// server-wide order for that database only, databases without an override
+// inherit the server order, and databases sharing an instance can promote
+// through disjoint environment sequences.
+func TestServerConfig_PromotionOrderForDatabase(t *testing.T) {
+	t.Run("no override inherits the server order", func(t *testing.T) {
+		cfg := ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {Environments: map[string]EnvironmentConfig{"qa": {}}},
+			},
+		}
+
+		assert.Equal(t, []string{"qa", "staging", "production"}, cfg.PromotionOrderForDatabase("payments"))
+	})
+
+	t.Run("override replaces the server order for that database only", func(t *testing.T) {
+		cfg := ServerConfig{
+			EnvironmentOrder: []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]EnvironmentConfig{"qa": {}, "sandbox": {}},
+				},
+				"orders": {Environments: map[string]EnvironmentConfig{"qa": {}}},
+			},
+		}
+
+		assert.Equal(t, []string{"qa", "sandbox", "production"}, cfg.PromotionOrderForDatabase("payments"))
+		assert.Equal(t, []string{"qa", "staging", "production"}, cfg.PromotionOrderForDatabase("orders"))
+	})
+
+	t.Run("unknown database inherits the server order", func(t *testing.T) {
+		cfg := ServerConfig{EnvironmentOrder: []string{"qa", "production"}}
+
+		assert.Equal(t, []string{"qa", "production"}, cfg.PromotionOrderForDatabase("missing"))
+	})
+
+	t.Run("nil config uses the default order", func(t *testing.T) {
+		var cfg *ServerConfig
+
+		assert.Equal(t, []string{"staging", "production"}, cfg.PromotionOrderForDatabase("payments"))
+	})
+}
+
+func TestServerConfig_OrderedEnvironmentsForDatabase(t *testing.T) {
+	cfg := ServerConfig{
+		EnvironmentOrder: []string{"qa", "staging", "production"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]EnvironmentConfig{"qa": {}, "sandbox": {}},
+			},
+		},
+	}
+
+	t.Run("override orders the enabled environments", func(t *testing.T) {
+		got := cfg.OrderedEnvironmentsForDatabase("payments", []string{"sandbox", "qa"})
+
+		assert.Equal(t, []string{"qa", "sandbox"}, got)
+	})
+
+	t.Run("no override falls back to the server order", func(t *testing.T) {
+		got := cfg.OrderedEnvironmentsForDatabase("orders", []string{"production", "staging"})
+
+		assert.Equal(t, []string{"staging", "production"}, got)
+	})
+}
+
+// TestServerConfig_DatabaseEnvironmentsWithOverride verifies that a database's
+// configured environments are returned in its own promotion order, not the
+// server-wide order, when an environment_order override is set.
+func TestServerConfig_DatabaseEnvironmentsWithOverride(t *testing.T) {
+	cfg := ServerConfig{
+		EnvironmentOrder: []string{"sandbox", "qa", "production"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				EnvironmentOrder: []string{"qa", "sandbox", "production"},
+				Environments:     map[string]EnvironmentConfig{"sandbox": {}, "qa": {}},
+			},
+		},
+	}
+
+	got, err := cfg.DatabaseEnvironments("payments")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"qa", "sandbox"}, got)
+}
+
+// TestValidateDatabaseEnvironmentOrder covers the fail-fast startup validation
+// of a database's environment_order override: each mismatch between the
+// override and the database's configured environments would otherwise
+// silently block applies at runtime.
+func TestValidateDatabaseEnvironmentOrder(t *testing.T) {
+	base := func() ServerConfig {
+		return ServerConfig{
+			AllowedEnvironments: []string{"qa", "sandbox"},
+			EnvironmentOrder:    []string{"qa", "staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:             "mysql",
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments: map[string]EnvironmentConfig{
+						"qa":      {DSN: "root@tcp(localhost)/payments"},
+						"sandbox": {DSN: "root@tcp(localhost)/payments"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("valid override with a remote-owned trailing environment", func(t *testing.T) {
+		cfg := base()
+
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("rejects duplicate environments in the override", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.EnvironmentOrder = []string{"qa", "qa", "production"}
+		db.Environments = map[string]EnvironmentConfig{"qa": {DSN: "root@tcp(localhost)/payments"}}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order contains duplicate value "qa"`)
+	})
+
+	t.Run("rejects a configured environment missing from the override", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.EnvironmentOrder = []string{"qa", "production"}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment "sandbox" is configured but missing from the database environment_order`)
+	})
+
+	t.Run("rejects a locally-owned override environment that is not configured", func(t *testing.T) {
+		cfg := base()
+		db := cfg.Databases["payments"]
+		db.Environments = map[string]EnvironmentConfig{"qa": {DSN: "root@tcp(localhost)/payments"}}
+		cfg.Databases["payments"] = db
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "sandbox" but the database does not configure it`)
+	})
+
+	t.Run("unscoped instance must configure every override environment", func(t *testing.T) {
+		cfg := base()
+		cfg.AllowedEnvironments = nil
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `database "payments" environment_order lists "production" but the database does not configure it`)
+	})
+}
+
 func TestLoadServerConfigFromFile_InvalidConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -1986,7 +3175,7 @@ connections:
 		Params: map[string]string{
 			"parseTime": "true",
 		},
-	}).Resolve()
+	}).Resolve(storage.DatabaseTypeMySQL)
 	require.NoError(t, err)
 
 	cfg, err := gomysql.ParseDSN(dsn)
@@ -2013,7 +3202,7 @@ database: appdb
 		ConfigRef:   "file:" + configPath,
 		Username:    "app_user",
 		PasswordRef: "file:" + passwordPath,
-	}).Resolve()
+	}).Resolve(storage.DatabaseTypeMySQL)
 	require.NoError(t, err)
 
 	cfg, err := gomysql.ParseDSN(dsn)
@@ -2043,7 +3232,7 @@ connection:
 				Host:     "connection.host",
 				Database: "connection.database",
 			},
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "read database config host")
@@ -2064,7 +3253,7 @@ database: appdb
 			ConfigRef:   "file:" + configPath,
 			Username:    "app_user",
 			PasswordRef: "file:" + passwordPath,
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must contain a string")
@@ -2085,10 +3274,497 @@ database: appdb
 			ConfigRef:   "file:" + configPath,
 			Username:    "app_user",
 			PasswordRef: "file:" + passwordPath,
-		}).Resolve()
+		}).Resolve(storage.DatabaseTypeMySQL)
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must contain an integer")
+	})
+}
+
+// The storage dialect selects the database family for the whole storage
+// stack: schema bootstrapping, the connection pool, and the storage
+// implementation. Unset defaults to MySQL, matching is case-insensitive, and
+// unknown values fail closed so a typo cannot run the MySQL storage flow
+// against another database family.
+func TestStorageConfig_ResolveDialect(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect string
+		want    schema.Dialect
+		wantErr string
+	}{
+		{name: "unset defaults to mysql", dialect: "", want: schema.DialectMySQL},
+		{name: "mysql", dialect: "mysql", want: schema.DialectMySQL},
+		{name: "postgres", dialect: "postgres", want: schema.DialectPostgres},
+		{name: "case-insensitive", dialect: "Postgres", want: schema.DialectPostgres},
+		{name: "surrounding whitespace ignored", dialect: " mysql ", want: schema.DialectMySQL},
+		{name: "unknown dialect fails closed", dialect: "oracle", wantErr: `unsupported storage dialect "oracle"`},
+		{name: "near-miss spelling fails closed", dialect: "postgresql", wantErr: `unsupported storage dialect "postgresql"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := StorageConfig{Dialect: tt.dialect}.ResolveDialect()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// dsn_from assembles a Go MySQL driver DSN, so combining it with a
+// non-MySQL storage dialect is rejected at config validation instead of
+// failing at the first connection attempt with an unparseable DSN.
+func TestServerConfig_ValidateRejectsDSNFromWithPostgresDialect(t *testing.T) {
+	cfg := ServerConfig{
+		Storage: StorageConfig{
+			Dialect: "postgres",
+			DSNFrom: &DSNFromConfig{
+				ConfigRef:   "file:/run/secrets/storage-config.yaml",
+				Username:    "schemabot_user",
+				PasswordRef: "file:/run/secrets/storage-password",
+			},
+		},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb"},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dsn_from builds a MySQL DSN")
+}
+
+// A database environment's dsn_from is validated at config load against the
+// rules of the DSN its database type assembles: MySQL-family types keep the
+// MySQL shape, a PostgreSQL database takes config_paths.dbname and only the
+// verify-full sslmode param, and either family's path key is refused on the
+// other so a misread config fails at startup rather than at the first
+// connection attempt. A plain dsn is unaffected.
+func TestServerConfig_ValidateDatabaseDSNFromByType(t *testing.T) {
+	dsnFrom := func(mutate func(*DSNFromConfig)) *DSNFromConfig {
+		c := &DSNFromConfig{
+			ConfigRef:   "file:/run/secrets/orders-config.yaml",
+			Username:    "orders_user",
+			PasswordRef: "file:/run/secrets/orders-password",
+		}
+		if mutate != nil {
+			mutate(c)
+		}
+		return c
+	}
+	tests := []struct {
+		name         string
+		databaseType string
+		env          EnvironmentConfig
+		wantErr      string
+	}{
+		{
+			name:         "postgres with dsn_from validates",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.DBName = "connections.primary.dbname"
+				c.Params = map[string]string{"sslmode": "verify-full"}
+			})},
+		},
+		{
+			name:         "postgres rejects a weaker sslmode",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.Params = map[string]string{"sslmode": "require"}
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from: postgres sslmode must be "verify-full", got "require"`,
+		},
+		{
+			name:         "postgres rejects a param outside the allowlist",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.Params = map[string]string{"sslrootcert": "/etc/ssl/ca.pem"}
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from: postgres connection params support only "sslmode", got "sslrootcert"`,
+		},
+		{
+			name:         "postgres rejects the mysql database path",
+			databaseType: storage.DatabaseTypePostgres,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.Database = "connections.primary.database"
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from config_paths.database is not supported for postgres databases; use config_paths.dbname`,
+		},
+		{
+			name:         "mysql with dsn_from validates",
+			databaseType: storage.DatabaseTypeMySQL,
+			env:          EnvironmentConfig{DSNFrom: dsnFrom(nil)},
+		},
+		{
+			name:         "mysql rejects the postgres dbname path",
+			databaseType: storage.DatabaseTypeMySQL,
+			env: EnvironmentConfig{DSNFrom: dsnFrom(func(c *DSNFromConfig) {
+				c.ConfigPaths.DBName = "connections.primary.dbname"
+			})},
+			wantErr: `database "orders" environment "staging" dsn_from config_paths.dbname is only supported for postgres databases; use config_paths.database`,
+		},
+		{
+			name:         "postgres with dsn validates",
+			databaseType: storage.DatabaseTypePostgres,
+			env:          EnvironmentConfig{DSN: "postgres://orders_user:secret@localhost:5432/orders"},
+		},
+		{
+			name:         "mysql with dsn validates",
+			databaseType: storage.DatabaseTypeMySQL,
+			env:          EnvironmentConfig{DSN: "orders_user:secret@tcp(localhost:3306)/orders"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"orders": {
+						Type:         tt.databaseType,
+						Environments: map[string]EnvironmentConfig{"staging": tt.env},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Equal(t, tt.wantErr, err.Error())
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// A database type with no DSN assembler fails closed rather than falling back
+// to the MySQL shape its driver could not parse.
+func TestDSNFromConfig_ValidateRejectsUnassembledDatabaseType(t *testing.T) {
+	err := (&DSNFromConfig{
+		ConfigRef:   "file:/run/secrets/orders-config.yaml",
+		Username:    "orders_user",
+		PasswordRef: "file:/run/secrets/orders-password",
+	}).Validate(`database "orders" environment "staging"`, "oracle")
+
+	require.Error(t, err)
+	assert.Equal(t, `database "orders" environment "staging" dsn_from is not supported with database type "oracle"; use dsn`, err.Error())
+}
+
+// A PostgreSQL database's dsn_from assembles a libpq URL through the same
+// assembler a target_resolver target uses: every component escaped, the
+// default port 5432, the database name from the dbname path, and
+// sslmode=verify-full. A missing database name or a host with no verified CA
+// fails at resolution instead of producing a DSN that dials the wrong place or
+// trusts the ambient store.
+func TestDSNFromConfig_ResolvePostgres(t *testing.T) {
+	writeSecrets := func(t *testing.T, config string) (configRef, passwordRef string) {
+		t.Helper()
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "database.yaml")
+		passwordPath := filepath.Join(dir, "password")
+		require.NoError(t, os.WriteFile(configPath, []byte(config), 0644))
+		require.NoError(t, os.WriteFile(passwordPath, []byte("p@ss/w:rd?#%\n"), 0600))
+		return "file:" + configPath, "file:" + passwordPath
+	}
+
+	t.Run("default paths", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: Orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: orders
+`)
+		dsn, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.NoError(t, err)
+		assert.Equal(t, "postgresql://orders_user:p%40ss%2Fw%3Ard%3F%23%25@orders.cluster-abc.us-west-2.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
+		verifies, err := postgresconn.VerifiesServerCertificate(dsn)
+		require.NoError(t, err)
+		assert.True(t, verifies, "the connection layer must read the assembled DSN as verify-full")
+	})
+
+	t.Run("custom paths and port", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+connections:
+  primary:
+    host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+    port: 6432
+    dbname: orders_app
+`)
+		dsn, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+			ConfigPaths: DSNFromConfigPaths{
+				Host:   "connections.primary.host",
+				Port:   "connections.primary.port",
+				DBName: "connections.primary.dbname",
+			},
+			Params: map[string]string{"sslmode": "verify-full"},
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.NoError(t, err)
+		assert.Equal(t, "postgresql://orders_user:p%40ss%2Fw%3Ard%3F%23%25@orders.cluster-abc.us-west-2.rds.amazonaws.com:6432/orders_app?sslmode=verify-full", dsn)
+	})
+
+	t.Run("missing dbname fails", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+database: orders
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errPathNotFound)
+		assert.Contains(t, err.Error(), "read database config dbname")
+	})
+
+	t.Run("non-RDS host without a verified CA fails", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: db.example.com
+dbname: orders
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `host "db.example.com" is not an RDS endpoint: dsn_from on a postgres database verifies only RDS hosts, so set dsn for this host instead`)
+	})
+
+	t.Run("empty dbname names the dbname key", func(t *testing.T) {
+		configRef, passwordRef := writeSecrets(t, `
+host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+dbname: ""
+`)
+		_, err := (&DSNFromConfig{
+			ConfigRef:   configRef,
+			Username:    "orders_user",
+			PasswordRef: passwordRef,
+		}).Resolve(storage.DatabaseTypePostgres)
+
+		require.EqualError(t, err, "database config missing dbname")
+	})
+}
+
+// The docs/configuration.md example for a postgres database's dsn_from loads
+// through the strict YAML loader and resolves to a verify-full URL, so the
+// documented spelling, including config_paths.dbname, is the one SchemaBot
+// accepts.
+func TestLoadServerConfigFromFile_PostgresDatabaseDSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	databaseConfigPath := filepath.Join(dir, "orders-config.yaml")
+	passwordPath := filepath.Join(dir, "orders-password")
+	require.NoError(t, os.WriteFile(databaseConfigPath, []byte(`
+connections:
+  primary:
+    host: orders.cluster-abc.us-west-2.rds.amazonaws.com
+    dbname: orders
+`), 0o600))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0o600))
+
+	configPath := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+databases:
+  orders:
+    type: postgres
+    environments:
+      staging:
+        dsn_from:
+          config_ref: "file:`+databaseConfigPath+`"
+          username: "orders_user"
+          password_ref: "file:`+passwordPath+`"
+          config_paths:
+            host: connections.primary.host
+            dbname: connections.primary.dbname
+`), 0o600))
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	dsnFrom := cfg.Databases["orders"].Environments["staging"].DSNFrom
+	require.NotNil(t, dsnFrom)
+	assert.Equal(t, "connections.primary.dbname", dsnFrom.ConfigPaths.DBName)
+
+	dsn, err := dsnFrom.Resolve(storage.DatabaseTypePostgres)
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://orders_user:secret@orders.cluster-abc.us-west-2.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
+}
+
+// An unknown storage dialect is rejected at config validation, before any
+// connection attempt, so a misconfigured server fails fast at load time.
+func TestServerConfig_ValidateRejectsUnknownStorageDialect(t *testing.T) {
+	cfg := ServerConfig{
+		Storage: StorageConfig{Dialect: "oracle"},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb"},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unsupported storage dialect "oracle"`)
+}
+
+// The storage DSN resolves from config first, then the dialect-neutral
+// STORAGE_DSN environment variable, then the legacy MYSQL_DSN name, so a
+// PostgreSQL deployment never has to route its connection string through a
+// variable named for the other family.
+func TestServerConfig_StorageDSNEnvFallback(t *testing.T) {
+	t.Run("config value wins over both env vars", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "env-storage-dsn")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "config-dsn"}}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "config-dsn", dsn)
+	})
+
+	t.Run("STORAGE_DSN wins over MYSQL_DSN when config is unset", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "env-storage-dsn")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "env-storage-dsn", dsn)
+	})
+
+	t.Run("MYSQL_DSN is the legacy fallback", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "env-mysql-dsn", dsn)
+	})
+}
+
+// The schema DSN falls back to the storage DSN, so existing configs converge
+// exactly as before; when set, it resolves its own reference and still lands
+// on the configured storage database.
+func TestServerConfig_StorageSchemaDSN(t *testing.T) {
+	t.Run("falls back to the storage DSN", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(storage:3306)/schemabot"}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "rw:pw@tcp(storage:3306)/schemabot", dsn)
+	})
+
+	t.Run("resolves its own reference and applies the storage database", func(t *testing.T) {
+		t.Setenv("SCHEMA_DSN_UNDER_TEST", "ddl:pw@tcp(storage:3306)/")
+		cfg := ServerConfig{Storage: StorageConfig{
+			DSN:       "rw:pw@tcp(storage:3306)/schemabot",
+			SchemaDSN: "env:SCHEMA_DSN_UNDER_TEST",
+			Database:  "schemabot_tenant",
+		}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		parsed, err := gomysql.ParseDSN(dsn)
+		require.NoError(t, err)
+		assert.Equal(t, "ddl", parsed.User)
+		assert.Equal(t, "schemabot_tenant", parsed.DBName)
+
+		poolDSN, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		parsed, err = gomysql.ParseDSN(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, "rw", parsed.User, "the pool keeps the storage DSN's user")
+	})
+
+	t.Run("refuses a schema DSN naming another server or database", func(t *testing.T) {
+		for name, schemaDSN := range map[string]string{
+			"other database": "ddl:pw@tcp(storage:3306)/other",
+			"other host":     "ddl:pw@tcp(replica:3306)/schemabot",
+			"other port":     "ddl:pw@tcp(storage:3307)/schemabot",
+			"database case":  "ddl:pw@tcp(storage:3306)/SchemaBot",
+		} {
+			t.Run(name, func(t *testing.T) {
+				cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(storage:3306)/schemabot", SchemaDSN: schemaDSN}}
+				_, err := cfg.StorageSchemaDSN()
+				require.ErrorContains(t, err, "both must name the same storage database")
+				assert.NotContains(t, err.Error(), "pw", "the refusal must not echo credentials")
+			})
+		}
+	})
+
+	t.Run("accepts the same server spelled in another case", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "rw:pw@tcp(Storage.Example.com:3306)/schemabot", SchemaDSN: "ddl:pw@tcp(storage.example.com)/schemabot"}}
+		dsn, err := cfg.StorageSchemaDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "ddl:pw@tcp(storage.example.com)/schemabot", dsn)
+	})
+
+	// A file-backed storage DSN is rewritten to another database after the
+	// caller resolved it for its pool. The schema DSN still answers for the
+	// DSN the caller holds, so the schema converged is the pool's own.
+	t.Run("answers for the pool DSN it is given when the reference is rewritten", func(t *testing.T) {
+		const bootDSN = "rw:pw@tcp(storage:3306)/schemabot"
+		const rewrittenDSN = "rw:pw@tcp(storage:3306)/other"
+		dsnFile := filepath.Join(t.TempDir(), "storage-dsn")
+		require.NoError(t, os.WriteFile(dsnFile, []byte(bootDSN), 0o600))
+
+		unset := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile}}
+		poolDSN, err := unset.StorageDSN()
+		require.NoError(t, err)
+		require.Equal(t, bootDSN, poolDSN)
+		require.NoError(t, os.WriteFile(dsnFile, []byte(rewrittenDSN), 0o600))
+
+		dsn, err := unset.StorageSchemaDSNFor(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, bootDSN, dsn, "without schema_dsn the schema converges over the pool's own DSN")
+
+		matchesPool := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile, SchemaDSN: "ddl:pw@tcp(storage:3306)/schemabot"}}
+		dsn, err = matchesPool.StorageSchemaDSNFor(poolDSN)
+		require.NoError(t, err)
+		assert.Equal(t, "ddl:pw@tcp(storage:3306)/schemabot", dsn)
+
+		matchesRewrite := ServerConfig{Storage: StorageConfig{DSN: "file:" + dsnFile, SchemaDSN: "ddl:pw@tcp(storage:3306)/other"}}
+		_, err = matchesRewrite.StorageSchemaDSNFor(poolDSN)
+		require.EqualError(t, err, "storage.schema_dsn names storage:3306/other but storage.dsn names storage:3306/schemabot; both must name the same storage database")
+	})
+
+	t.Run("is rejected with dsn_from", func(t *testing.T) {
+		storageConfig := StorageConfig{
+			DSNFrom: &DSNFromConfig{
+				ConfigRef:   "env:STORAGE_CONFIG",
+				Username:    "rw",
+				PasswordRef: "env:STORAGE_PASSWORD",
+			},
+			SchemaDSN: "ddl:pw@tcp(storage:3306)/schemabot",
+		}
+		require.EqualError(t, storageConfig.validateLocalDSNConfig("storage"),
+			"storage cannot configure schema_dsn with dsn_from; set dsn instead of dsn_from to use schema_dsn")
+	})
+
+	t.Run("is rejected for PostgreSQL storage", func(t *testing.T) {
+		cfg := ServerConfig{Storage: StorageConfig{
+			Dialect:   "postgres",
+			DSN:       "postgres://rw:pw@storage:5432/schemabot",
+			SchemaDSN: "postgres://ddl:pw@storage:5432/schemabot",
+		}, Databases: map[string]DatabaseConfig{
+			"appdb": {Type: "mysql", Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/appdb"}}},
+		}}
+		require.ErrorContains(t, cfg.Validate(), `schema_dsn is only supported with dialect "mysql", not "postgres"`)
 	})
 }
 
@@ -2246,6 +3922,17 @@ func TestGitHubConfig_Configured(t *testing.T) {
 		assert.True(t, g.Configured())
 	})
 
+	t.Run("configured when app id carries a trailing newline", func(t *testing.T) {
+		t.Setenv("CONFIGURED_APP_ID_NEWLINE", "123\n")
+		g := GitHubConfig{AppID: "env:CONFIGURED_APP_ID_NEWLINE", PrivateKey: "some-key"}
+		assert.True(t, g.Configured())
+	})
+
+	t.Run("not configured when app id is malformed", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc", PrivateKey: "some-key"}
+		assert.False(t, g.Configured())
+	})
+
 	t.Run("not configured when file reference does not exist", func(t *testing.T) {
 		nonexistent := filepath.Join(t.TempDir(), "nonexistent-key.pem")
 		g := GitHubConfig{AppID: "123", PrivateKey: "file:" + nonexistent}
@@ -2253,32 +3940,176 @@ func TestGitHubConfig_Configured(t *testing.T) {
 	})
 }
 
+// The app ID resolves from config or the GITHUB_APP_ID fallback with
+// surrounding whitespace trimmed, so a mounted secret's trailing newline still
+// yields the ID. An unset or zero app ID is "not configured" (0, no error),
+// while a value that is not a non-negative integer is a configuration error
+// that names the setting and never echoes the value.
 func TestGitHubConfig_ResolveAppID(t *testing.T) {
 	t.Run("resolves numeric string", func(t *testing.T) {
 		g := GitHubConfig{AppID: "456789"}
-		assert.Equal(t, int64(456789), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(456789), id)
 	})
 
-	t.Run("returns 0 for empty", func(t *testing.T) {
+	t.Run("trims a trailing newline from an env reference", func(t *testing.T) {
+		t.Setenv("RESOLVE_APP_ID_NEWLINE", "12345\n")
+		g := GitHubConfig{AppID: "env:RESOLVE_APP_ID_NEWLINE"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(12345), id)
+	})
+
+	t.Run("trims surrounding whitespace from the env var fallback", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", " 12345\n")
 		g := GitHubConfig{}
-		assert.Equal(t, int64(0), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(12345), id)
 	})
 
-	t.Run("returns 0 for non-numeric", func(t *testing.T) {
-		g := GitHubConfig{AppID: "not-a-number"}
-		assert.Equal(t, int64(0), g.ResolveAppID())
+	t.Run("returns 0 without error when unset", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		g := GitHubConfig{}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("returns 0 without error when an env reference is unset", func(t *testing.T) {
+		t.Setenv("RESOLVE_APP_ID_UNSET", "")
+		g := GitHubConfig{AppID: "env:RESOLVE_APP_ID_UNSET"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("non-numeric value is an error naming the setting", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc"}
+		id, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Equal(t, int64(0), id)
+		assert.Contains(t, err.Error(), "app-id must be a positive integer")
+		assert.Contains(t, err.Error(), "invalid syntax")
+		assert.NotContains(t, err.Error(), "abc", "the resolved value must not appear in the error")
+	})
+
+	t.Run("non-numeric env var fallback is an error naming the env var", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "not-a-number")
+		g := GitHubConfig{}
+		_, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "GITHUB_APP_ID must be a positive integer")
+		assert.NotContains(t, err.Error(), "not-a-number", "the resolved value must not appear in the error")
+	})
+
+	t.Run("zero is not configured, as the deployment templates seed it", func(t *testing.T) {
+		g := GitHubConfig{AppID: "0"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("negative value is an error", func(t *testing.T) {
+		g := GitHubConfig{AppID: "-5"}
+		_, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "app-id must be a positive integer")
+	})
+
+	t.Run("unresolvable secret reference is an error but not an invalid app ID", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		g := GitHubConfig{AppID: "file:" + nonexistent}
+		_, err := g.ResolveAppID()
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "resolve app-id")
 	})
 
 	t.Run("falls back to env var", func(t *testing.T) {
 		t.Setenv("GITHUB_APP_ID", "999")
 		g := GitHubConfig{}
-		assert.Equal(t, int64(999), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(999), id)
 	})
 
 	t.Run("config takes precedence over env var", func(t *testing.T) {
 		t.Setenv("GITHUB_APP_ID", "999")
 		g := GitHubConfig{AppID: "123"}
-		assert.Equal(t, int64(123), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(123), id)
+	})
+}
+
+// ResolveCredentials tells the three unusable shapes apart so the server can
+// start with GitHub off for an App that is not configured or whose credentials
+// have not arrived, and refuse to start for one whose App ID is malformed.
+func TestGitHubConfig_ResolveCredentials(t *testing.T) {
+	t.Run("both resolve", func(t *testing.T) {
+		t.Setenv("RESOLVE_CREDS_PK", "private-key-bytes")
+		g := GitHubConfig{AppID: "123", PrivateKey: "env:RESOLVE_CREDS_PK"}
+		creds, err := g.ResolveCredentials()
+		require.NoError(t, err)
+		assert.Equal(t, GitHubAppCredentials{AppID: 123, PrivateKey: "private-key-bytes"}, creds)
+	})
+
+	t.Run("nothing set is not configured", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		g := GitHubConfig{}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppNotConfigured)
+		assert.NotErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+	})
+
+	t.Run("placeholder zero app-id with a key reference is unavailable, not malformed", func(t *testing.T) {
+		g := GitHubConfig{AppID: "0", PrivateKey: "file:/nonexistent/private-key.pem"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "private-key is set but app-id is empty")
+	})
+
+	t.Run("app-id without a private key is unavailable", func(t *testing.T) {
+		g := GitHubConfig{AppID: "123"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "app-id is set but private-key is missing")
+	})
+
+	t.Run("unresolvable app-id reference is unavailable", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		g := GitHubConfig{AppID: "file:" + nonexistent, PrivateKey: "some-key"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "resolve app-id")
+	})
+
+	t.Run("unresolvable private key reference is unavailable", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-key.pem")
+		g := GitHubConfig{AppID: "123", PrivateKey: "file:" + nonexistent}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "resolve private-key")
+	})
+
+	t.Run("private key that resolves to empty is unavailable", func(t *testing.T) {
+		t.Setenv("RESOLVE_CREDS_EMPTY_PK", "")
+		g := GitHubConfig{AppID: "123", PrivateKey: "env:RESOLVE_CREDS_EMPTY_PK"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "private-key resolved to empty")
+	})
+
+	t.Run("malformed app-id is invalid, not unavailable", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc", PrivateKey: "some-key"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.NotErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrGitHubAppNotConfigured)
 	})
 }
 
@@ -2318,6 +4149,8 @@ func TestServerConfig_IsRepoAllowed(t *testing.T) {
 			},
 		}
 		assert.True(t, cfg.IsRepoAllowed("org/allowed-repo"))
+		assert.True(t, cfg.IsRepoAllowed("ORG/ALLOWED-REPO"))
+		assert.True(t, cfg.IsRepoAllowed("Org/Allowed-Repo"))
 	})
 
 	t.Run("populated repos rejects unlisted repo", func(t *testing.T) {
@@ -2411,23 +4244,33 @@ func TestServerConfig_AreChecksEnabled(t *testing.T) {
 	})
 }
 
-func TestServerConfig_RequiresUpToDateWithBase(t *testing.T) {
-	t.Run("defaults to disabled", func(t *testing.T) {
-		cfg := ServerConfig{Repos: map[string]RepoConfig{"org/repo": {}}}
-		assert.False(t, cfg.RequiresUpToDateWithBase("org/repo"))
-	})
-
-	t.Run("enabled for configured repo only", func(t *testing.T) {
-		cfg := ServerConfig{Repos: map[string]RepoConfig{
-			"org/repo": {RequireUpToDateWithBase: true},
-		}}
-		assert.True(t, cfg.RequiresUpToDateWithBase("org/repo"))
-		assert.False(t, cfg.RequiresUpToDateWithBase("org/other-repo"))
-	})
-
-	t.Run("nil config defaults to disabled", func(t *testing.T) {
+func TestServerConfig_DeletesUnactionedPlanComments(t *testing.T) {
+	t.Run("nil config defaults to delete policy", func(t *testing.T) {
 		var cfg *ServerConfig
-		assert.False(t, cfg.RequiresUpToDateWithBase("org/repo"))
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset defaults to delete policy", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset in YAML defaults to delete policy", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("allowed_environments: [staging]\n"), &cfg))
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit true keeps the delete policy", func(t *testing.T) {
+		deletes := true
+		cfg := ServerConfig{DeleteUnactionedPlanComments: &deletes}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit false opts out to the minimize policy", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("delete_unactioned_plan_comments: false\n"), &cfg))
+		assert.False(t, cfg.DeletesUnactionedPlanComments())
 	})
 }
 
@@ -2607,69 +4450,6 @@ require_passing_checks: false
 	})
 }
 
-func TestServerConfig_ShouldClaimOperations(t *testing.T) {
-	t.Run("nil receiver defaults to true", func(t *testing.T) {
-		var cfg *ServerConfig
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("nil field defaults to true", func(t *testing.T) {
-		cfg := &ServerConfig{}
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("explicitly true", func(t *testing.T) {
-		cfg := &ServerConfig{OperatorClaimOperations: new(true)}
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("explicitly false falls back to apply-level claiming", func(t *testing.T) {
-		cfg := &ServerConfig{OperatorClaimOperations: new(false)}
-		assert.False(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("YAML omits the key and defaults to true", func(t *testing.T) {
-		dir := t.TempDir()
-		configPath := filepath.Join(dir, "config.yaml")
-		content := `
-databases:
-  testapp:
-    type: mysql
-    environments:
-      staging:
-        dsn: "root@tcp(localhost:3306)/testapp"
-`
-		err := os.WriteFile(configPath, []byte(content), 0644)
-		require.NoError(t, err)
-
-		cfg, err := LoadServerConfigFromFile(configPath)
-		require.NoError(t, err)
-
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("YAML can opt back into apply-level claiming", func(t *testing.T) {
-		dir := t.TempDir()
-		configPath := filepath.Join(dir, "config.yaml")
-		content := `
-databases:
-  testapp:
-    type: mysql
-    environments:
-      staging:
-        dsn: "root@tcp(localhost:3306)/testapp"
-operator_claim_operations: false
-`
-		err := os.WriteFile(configPath, []byte(content), 0644)
-		require.NoError(t, err)
-
-		cfg, err := LoadServerConfigFromFile(configPath)
-		require.NoError(t, err)
-
-		assert.False(t, cfg.ShouldClaimOperations())
-	})
-}
-
 func TestServerConfig_ReviewPolicy(t *testing.T) {
 	t.Run("nil receiver defaults to false", func(t *testing.T) {
 		var cfg *ServerConfig
@@ -2732,6 +4512,303 @@ review_policy:
 		assert.False(t, cfg.ReviewPolicyIncludesDatabaseOperators())
 		assert.True(t, cfg.ReviewPolicy.IncludeCodeowners)
 	})
+}
+
+// An instance with the review gate off can turn it on for one database. The
+// opt-in covers only that database, and a database that opts in must name
+// someone who can approve, or every one of its applies would be blocked.
+func TestServerConfig_DatabaseReviewPolicy(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+
+	t.Run("a database that opts in is gated and the others are not", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_teams:
+      - octocat/orders-owners
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("unknown"))
+	})
+
+	t.Run("an instance-wide gate covers every database", func(t *testing.T) {
+		cfg := &ServerConfig{
+			ReviewPolicy: ReviewPolicyConfig{Enabled: true},
+			Databases:    map[string]DatabaseConfig{"payments": {Type: "mysql"}},
+		}
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
+	})
+
+	t.Run("a database that opts in with nobody who can approve is rejected", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("operators excluded from the review policy cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_database_operators: false
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("admins of a repo the database does not allow cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("admins of a repo the database allows can approve an opted-in database", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+  octocat/orders:
+    admin_users:
+      - mona
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+	})
+
+	t.Run("a repo the database accepts with no admins of its own leaves an opted-in database without an approver", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/a:
+    admin_teams:
+      - octocat/maintainers
+  octocat/b: {}
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but repos.octocat/b, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("CODEOWNERS alone cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_codeowners: true
+repos:
+  octocat/orders: {}
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "repos.octocat/orders, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("an opted-in database that accepts any repository needs approvers beyond repo admins when no repos are configured", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but the database accepts any repository and no repos are configured")
+	})
+
+	for name, approvers := range map[string]string{
+		"instance admins":              "review_policy:\n  admin_users:\n    - mona\n",
+		"repo admins":                  "repos:\n  octocat/orders:\n    admin_teams:\n      - octocat/maintainers\n",
+		"admins of every repo":         "repos:\n  octocat/a:\n    admin_teams:\n      - octocat/maintainers\n  octocat/b:\n    admin_users:\n      - mona\n",
+		"operators beside a bare repo": "repos:\n  octocat/orders: {}\n",
+	} {
+		t.Run("an opted-in database approved by "+name+" is accepted", func(t *testing.T) {
+			operators := ""
+			if strings.HasPrefix(name, "operators") {
+				operators = "    operator_users:\n      - mona\n"
+			}
+			cfg, err := loadConfig(t, approvers+`
+databases:
+  orders:
+    type: mysql
+`+operators+`    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+			require.NoError(t, err)
+			assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		})
+	}
+}
+
+// Re-approval follows the PR's base branch unless the instance or the
+// database sets require_reapproval. A database's own value overrides the
+// instance-wide one in either direction and needs the review gate on for the
+// database; another database on the instance keeps the instance-wide rule.
+func TestServerConfig_ReviewPolicyReapproval(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+	config := func(instance, orders string) string {
+		return "review_policy:\n  enabled: true\n" + instance + `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+` + orders + `
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    operator_users:
+      - mona
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`
+	}
+	const (
+		instanceTrue  = "  require_reapproval: true\n"
+		instanceFalse = "  require_reapproval: false\n"
+		ordersTrue    = "      require_reapproval: true"
+		ordersFalse   = "      require_reapproval: false"
+		ordersUnset   = "      enabled: false"
+	)
+
+	for _, tt := range []struct {
+		name             string
+		instance, orders string
+		wantOrders       bool
+		wantPayments     bool
+	}{
+		{"unset everywhere does not require it", "", ordersUnset, false, false},
+		{"instance true covers every database", instanceTrue, ordersUnset, true, true},
+		{"instance false covers every database", instanceFalse, ordersUnset, false, false},
+		{"a database can require it alone", "", ordersTrue, true, false},
+		{"a database can set false alone", "", ordersFalse, false, false},
+		{"a database can require it when the instance does not", instanceFalse, ordersTrue, true, false},
+		{"a database can opt out when the instance requires it", instanceTrue, ordersFalse, false, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadConfig(t, config(tt.instance, tt.orders))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantOrders, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+			assert.Equal(t, tt.wantPayments, cfg.ReviewPolicyRequiresReapprovalForDatabase("payments"))
+		})
+	}
+
+	t.Run("a database that opts into the gate can set it with it", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+      require_reapproval: false
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyRequiresReapprovalForDatabase("orders"))
+	})
+
+	for _, value := range []string{"true", "false"} {
+		t.Run("a database that sets it to "+value+" without the gate is rejected", func(t *testing.T) {
+			_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      require_reapproval: `+value+`
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+			require.ErrorContains(t, err, "databases.orders.review_policy.require_reapproval needs the review gate on for the database")
+		})
+	}
 }
 
 func TestServerConfig_IsCheckRequired(t *testing.T) {
@@ -2994,7 +5071,22 @@ func TestServerConfig_ResolveGitHubAppForRepo(t *testing.T) {
 		}
 		_, err := cfg.ResolveGitHubAppForRepo("org-z/unknown")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not declared in the repos config")
+		assert.ErrorIs(t, err, ErrRepoNotConfigured)
+		assert.Contains(t, err.Error(), `repository "org-z/unknown"`)
+	})
+
+	t.Run("multi-app declared repo with broken app mapping is not ErrRepoNotConfigured", func(t *testing.T) {
+		// Construct directly (bypassing Validate) to exercise the resolver's
+		// defensive path: a declared repo whose App mapping is broken must not
+		// be classified as unmanaged traffic.
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": validApp},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-gone"}},
+		}
+		_, err := cfg.ResolveGitHubAppForRepo("org/repo")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrRepoNotConfigured)
+		assert.Contains(t, err.Error(), `unknown github_app "app-gone"`)
 	})
 
 	t.Run("multi-app errors when repo missing github_app", func(t *testing.T) {
@@ -3084,6 +5176,92 @@ func TestServerConfig_GitHubCheckNameBaseForRepo(t *testing.T) {
 	})
 }
 
+func TestServerConfig_PromotionCheckNameBaseForRepo(t *testing.T) {
+	t.Run("defaults to the app's own check-name base", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{CheckName: "SchemaBot X"}}
+		assert.Equal(t, "SchemaBot X", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("legacy single-app override trims configured name", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "  SchemaBot Shared  ",
+		}}
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("multi-app uses the owning app's override", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {CheckName: "SchemaBot X", PromotionCheckName: "SchemaBot Shared"},
+				"app-b": {CheckName: "SchemaBot Y"},
+			},
+			Repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+				"org-b/repo-y": {GitHubApp: "app-b"},
+			},
+		}
+
+		assert.Equal(t, "SchemaBot Shared", cfg.PromotionCheckNameBaseForRepo("org-a/repo-x"))
+		assert.Equal(t, "SchemaBot Y", cfg.PromotionCheckNameBaseForRepo("org-b/repo-y"))
+	})
+
+	t.Run("multi-app falls back for unknown repository", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": {PromotionCheckName: "SchemaBot Shared"}},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		assert.Equal(t, DefaultGitHubCheckName, cfg.PromotionCheckNameBaseForRepo("org/unknown"))
+	})
+}
+
+// A promotion-check-name that differs from the App's own check-name can only
+// be satisfied by another deployment's Check Run, so configuring it without
+// trusting any sibling App would block every apply. Config load must reject
+// that combination instead of shipping a gate that always fails closed.
+func TestValidatePromotionCheckName(t *testing.T) {
+	t.Run("override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot Shared",
+		}}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+		assert.Contains(t, err.Error(), "trusted-check-app-slugs")
+	})
+
+	t.Run("override with trusted slugs is accepted", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:            "SchemaBot X",
+			PromotionCheckName:   "SchemaBot Shared",
+			TrustedCheckAppSlugs: []string{"schemabot-shared-staging"},
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("override equal to own base needs no trusted slugs", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{
+			CheckName:          "SchemaBot X",
+			PromotionCheckName: "SchemaBot X",
+		}}
+		require.NoError(t, cfg.validateGitHubAppsConfig())
+	})
+
+	t.Run("multi-app override without trusted slugs is rejected", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "1001", PrivateKey: "x", WebhookSecret: "y", PromotionCheckName: "SchemaBot Shared"},
+			},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		err := cfg.validateGitHubAppsConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `app "app-a"`)
+		assert.Contains(t, err.Error(), "promotion-check-name")
+	})
+}
+
 func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 	t.Run("multi-app config resolves each entry's app-id", func(t *testing.T) {
 		cfg := &ServerConfig{
@@ -3125,6 +5303,7 @@ func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 	})
 
 	t.Run("empty app-id fails closed", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
 		cfg := &ServerConfig{
 			Apps: map[string]GitHubAppConfig{
 				"app-a": {AppID: "", PrivateKey: "x", WebhookSecret: "y"},
@@ -3132,7 +5311,31 @@ func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 		}
 		_, err := cfg.ResolveGitHubAppsByID()
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "empty or unparseable app-id")
+		assert.Contains(t, err.Error(), `app "app-a" has no app-id configured (empty or 0)`)
+	})
+
+	t.Run("placeholder zero app-id fails closed", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "0", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), `app "app-a" has no app-id configured (empty or 0)`)
+	})
+
+	t.Run("malformed app-id fails closed naming the App", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "12x45", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), `app "app-a": app-id must be a positive integer`)
+		assert.NotContains(t, err.Error(), "12x45", "the resolved value must not appear in the error")
 	})
 
 	t.Run("nil receiver errors", func(t *testing.T) {
@@ -3204,9 +5407,16 @@ repos:
 func TestPendingDropsConfig(t *testing.T) {
 	boolPtr := func(b bool) *bool { return &b }
 
-	t.Run("enabled by default", func(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
 		cfg := ServerConfig{}
+		assert.False(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
+	})
+
+	t.Run("explicit enable turns on the quarantine and its cleaner together", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Enabled: boolPtr(true)}}
 		assert.True(t, cfg.PendingDropsEnabled())
+		assert.True(t, cfg.PendingDropsCleanupEnabled())
 	})
 
 	t.Run("explicit disable", func(t *testing.T) {
@@ -3215,14 +5425,18 @@ func TestPendingDropsConfig(t *testing.T) {
 		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
-	t.Run("cleanup enabled by default", func(t *testing.T) {
-		cfg := ServerConfig{}
-		assert.True(t, cfg.PendingDropsCleanupEnabled())
+	t.Run("cleanup can be disabled without disabling quarantine", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Enabled: boolPtr(true), CleanupEnabled: boolPtr(false)}}
+		assert.True(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
-	t.Run("cleanup can be disabled without disabling quarantine", func(t *testing.T) {
-		cfg := ServerConfig{PendingDrops: PendingDropsConfig{CleanupEnabled: boolPtr(false)}}
-		assert.True(t, cfg.PendingDropsEnabled())
+	t.Run("cleanup stays off when only the cleaner is enabled", func(t *testing.T) {
+		// Enabling the cleaner without the quarantine would start a reaper for a
+		// deployment that writes no quarantined tables of its own, which is how
+		// one deployment ends up sweeping another's targets.
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{CleanupEnabled: boolPtr(true)}}
+		assert.False(t, cfg.PendingDropsEnabled())
 		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
@@ -3262,7 +5476,7 @@ func TestPendingDropsConfig(t *testing.T) {
 					},
 				},
 			},
-			PendingDrops: PendingDropsConfig{Retention: "not-a-duration"},
+			PendingDrops: PendingDropsConfig{Enabled: boolPtr(true), Retention: "not-a-duration"},
 		}
 		err := cfg.Validate()
 		assert.ErrorContains(t, err, "pending_drops.retention")
@@ -3280,6 +5494,55 @@ func TestPendingDropsConfig(t *testing.T) {
 			},
 			PendingDrops: PendingDropsConfig{Enabled: boolPtr(false), Retention: "not-a-duration"},
 		}
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
+func TestBranchReconcileConfig(t *testing.T) {
+	t.Run("parsed from YAML", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("branch_reconcile:\n  enabled: true\n  delete: true\n  grace: 36h\n"), &cfg))
+		assert.Equal(t, BranchReconcileConfig{Enabled: true, Delete: true, Grace: "36h"}, cfg.BranchReconcile)
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, grace)
+	})
+
+	t.Run("default grace", func(t *testing.T) {
+		cfg := ServerConfig{}
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 24*time.Hour, grace)
+	})
+
+	t.Run("invalid grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "branch_reconcile.grace")
+	})
+
+	t.Run("non-positive grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "0s"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "must be positive")
+	})
+
+	databases := map[string]DatabaseConfig{
+		"orders": {
+			Type: "vitess",
+			Environments: map[string]EnvironmentConfig{
+				"staging": {DSN: "root:pass@tcp(localhost:3306)/orders"},
+			},
+		},
+	}
+
+	t.Run("validate rejects invalid grace when enabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Enabled: true, Grace: "soon"}}
+		assert.ErrorContains(t, cfg.Validate(), "branch_reconcile.grace")
+	})
+
+	t.Run("validate ignores invalid grace when disabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
 		assert.NoError(t, cfg.Validate())
 	})
 }
@@ -3368,6 +5631,133 @@ func TestSupportChannelConfig(t *testing.T) {
 	})
 }
 
+func TestAgentHintConfig(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+		assert.Empty(t, cfg.AgentHint)
+	})
+
+	t.Run("valid hint", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = "Agents: fetch the SchemaBot command reference by commenting `schemabot help`."
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("hint must fit the comment footer reservation", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = strings.Repeat("a", maxAgentHintChars+1)
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint must be at most")
+	})
+
+	t.Run("hint bound counts characters, not bytes", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = strings.Repeat("é", maxAgentHintChars)
+		require.NoError(t, cfg.Validate(), "a hint at the limit is accepted whatever its bytes cost")
+
+		cfg.AgentHint = strings.Repeat("é", maxAgentHintChars+1)
+		assert.ErrorContains(t, cfg.Validate(), "agent_hint must be at most")
+	})
+
+	t.Run("hint must be a single line", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = "line one\nline two"
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint must be a single line")
+	})
+
+	t.Run("hint must not terminate its HTML comment", func(t *testing.T) {
+		// Both forms end a comment in a spec-compliant parser, so a hint
+		// carrying either would render its tail on the PR page.
+		for _, hint := range []string{
+			"install the skill --> then re-read this PR",
+			"install the skill --!> then re-read this PR",
+		} {
+			cfg := validConfig()
+			cfg.AgentHint = hint
+			assert.ErrorContains(t, cfg.Validate(), "agent_hint must not contain", "hint %q", hint)
+		}
+	})
+
+	t.Run("hint must not have surrounding whitespace", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = " padded "
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint contains leading or trailing whitespace")
+	})
+}
+
+// cli_name starts every CLI command hint a PR comment renders, inside inline
+// code, so an unset name renders the CLI's own default and a name that could
+// not render as the start of a pasteable command is refused at startup.
+func TestCLINameConfig(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("defaults to the CLI's own name", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "schemabot", cfg.HintCLIName())
+		assert.Equal(t, cliname.DefaultName, cfg.HintCLIName())
+		assert.Equal(t, "schemabot", (*ServerConfig)(nil).HintCLIName(), "an unwired config renders the default")
+	})
+
+	t.Run("a wrapper name is rendered as configured", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("cli_name: acme schemabot\n"), &cfg))
+		assert.Equal(t, "acme schemabot", cfg.HintCLIName())
+
+		valid := validConfig()
+		valid.CLIName = cfg.CLIName
+		require.NoError(t, valid.Validate())
+	})
+
+	for name, tc := range map[string]struct {
+		value string
+		error string
+	}{
+		"blank":               {"   ", "cli_name must not be blank"},
+		"padded":              {" acme schemabot", "cli_name contains leading or trailing whitespace"},
+		"multi-line":          {"acme\nschemabot", "cli_name must be a single line with no control characters"},
+		"line-separated":      {"acme\u2028schemabot", "cli_name must be a single line with no control characters"},
+		"paragraph-separated": {"acme\u2029schemabot", "cli_name must be a single line with no control characters"},
+		"bidi-overridden":     {"acme \u202eschemabot", "cli_name must not contain format character U+202E"},
+		"zero-width-spaced":   {"acme\u200bschemabot", "cli_name must not contain format character U+200B"},
+		"backtick":            {"acme` schemabot", "cli_name must not contain a backtick"},
+		"longer than the cap": {strings.Repeat("a", maxCLINameChars+1), "cli_name must be at most"},
+	} {
+		t.Run("refuses a "+name+" name", func(t *testing.T) {
+			cfg := validConfig()
+			cfg.CLIName = tc.value
+			assert.ErrorContains(t, cfg.Validate(), tc.error)
+		})
+	}
+}
+
 func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	dsnPath := filepath.Join(t.TempDir(), "target.dsn")
 	cfg := &ServerConfig{
@@ -3393,7 +5783,7 @@ func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	targets, unresolved = svc.pendingDropsTargets(t.Context())
 	require.Len(t, targets, 1)
 	assert.Equal(t, 0, unresolved)
-	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn}, targets[0])
+	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn, Locker: namedlock.MySQL{}}, targets[0])
 }
 
 func TestSchemaDirHintsForRepo(t *testing.T) {
@@ -3500,7 +5890,7 @@ func TestSchemaDirHintsForDatabase(t *testing.T) {
 
 	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "unknown")
 	assert.Empty(t, dirs)
-	assert.True(t, exhaustive, "an unconfigured database has no policy-valid config location")
+	assert.False(t, exhaustive, "a probe of zero directories cannot prove an unconfigured database's config absent; the registry answers for it")
 }
 
 func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
@@ -3541,9 +5931,876 @@ func TestKnownEnvironments(t *testing.T) {
 		assert.False(t, cfg.IsEnvironmentKnown("dev"))
 	})
 
+	t.Run("includes database environment_order overrides", func(t *testing.T) {
+		cfg := &ServerConfig{
+			AllowedEnvironments: []string{"qa"},
+			EnvironmentOrder:    []string{"staging", "production"},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					EnvironmentOrder: []string{"qa", "sandbox", "production"},
+					Environments:     map[string]EnvironmentConfig{"qa": {}},
+				},
+			},
+		}
+		assert.Equal(t, []string{"production", "qa", "sandbox", "staging"}, cfg.KnownEnvironments())
+		assert.True(t, cfg.IsEnvironmentKnown("sandbox"))
+	})
+
 	t.Run("nil config knows no environments", func(t *testing.T) {
 		var cfg *ServerConfig
 		assert.Nil(t, cfg.KnownEnvironments())
 		assert.False(t, cfg.IsEnvironmentKnown("staging"))
 	})
+}
+
+// TestServerConfig_SpiritMetadata verifies that the spirit block translates
+// into engine metadata overrides: an absent block produces no entries (the
+// engine defaults apply), configured values carry through, and a
+// misconfigured duration fails instead of silently running applies with the
+// defaults.
+func TestServerConfig_SpiritMetadata(t *testing.T) {
+	t.Run("absent block produces no overrides", func(t *testing.T) {
+		var cfg ServerConfig
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Empty(t, metadata)
+	})
+
+	t.Run("configured values translate to metadata keys", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte(`
+spirit:
+  checkpoint_max_age: 24h
+`), &cfg))
+		metadata, err := cfg.SpiritMetadata()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			spirit.MetadataCheckpointMaxAge: "24h",
+		}, metadata)
+	})
+
+	// Autoscaling and the checksum algorithm are Spirit's own defaults and no
+	// longer configurable. A config that still sets one of the removed keys
+	// fails to load instead of silently running with a setting the operator
+	// believes they changed, and the error says the key was removed so the
+	// operator knows deleting it is the whole remedy.
+	t.Run("removed keys are rejected", func(t *testing.T) {
+		for key, value := range map[string]string{
+			"enable_experimental_autoscaling":       "false",
+			"enable_experimental_lockless_checksum": "true",
+			"checksum_yield_timeout":                "6h",
+		} {
+			_, err := ParseServerConfig([]byte("spirit:\n  " + key + ": " + value + "\n"))
+			require.ErrorContains(t, err, "spirit."+key+" was removed")
+		}
+	})
+
+	// The server config decodes strictly, so an unknown spirit key that was
+	// never a setting still fails to load.
+	t.Run("unknown keys are rejected", func(t *testing.T) {
+		_, err := ParseServerConfig([]byte("spirit:\n  copy_threads: 8\n"))
+		require.ErrorContains(t, err, "copy_threads")
+	})
+
+	t.Run("invalid duration errors", func(t *testing.T) {
+		cfg := ServerConfig{Spirit: SpiritConfig{CheckpointMaxAge: "3 days"}}
+		_, err := cfg.SpiritMetadata()
+		require.ErrorContains(t, err, "checkpoint_max_age")
+	})
+
+	t.Run("non-positive duration errors", func(t *testing.T) {
+		cfg := ServerConfig{Spirit: SpiritConfig{CheckpointMaxAge: "-1h"}}
+		_, err := cfg.SpiritMetadata()
+		require.ErrorContains(t, err, "must be positive")
+	})
+}
+
+// The planetscale.mtls block always presents a client identity, so a partial
+// block is rejected at config load rather than producing a worker that starts
+// and then fails or degrades on every Vitess connection it opens.
+func TestValidatePlanetScaleMTLS(t *testing.T) {
+	configWith := func(ps PlanetScaleConfig) *ServerConfig {
+		return &ServerConfig{
+			PlanetScale: ps,
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mtls    *PlanetScaleMTLSConfig
+		wantErr string
+	}{
+		{
+			name: "absent block is valid",
+			mtls: nil,
+		},
+		{
+			name: "complete block is valid",
+			mtls: &PlanetScaleMTLSConfig{
+				CABundle:   "/etc/ssl/certs/ca-certificates.crt",
+				ClientCert: "/etc/secrets/pca/tls.crt",
+				ClientKey:  "/etc/secrets/pca/tls.key",
+			},
+		},
+		{
+			name:    "missing ca_bundle",
+			mtls:    &PlanetScaleMTLSConfig{ClientCert: "/c.crt", ClientKey: "/c.key"},
+			wantErr: "planetscale.mtls.ca_bundle is required",
+		},
+		{
+			name:    "missing client_cert",
+			mtls:    &PlanetScaleMTLSConfig{CABundle: "/ca.crt", ClientKey: "/c.key"},
+			wantErr: "planetscale.mtls.client_cert is required",
+		},
+		{
+			name:    "missing client_key",
+			mtls:    &PlanetScaleMTLSConfig{CABundle: "/ca.crt", ClientCert: "/c.crt"},
+			wantErr: "planetscale.mtls.client_key is required",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := configWith(PlanetScaleConfig{MTLS: tt.mtls}).Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+// The planetscale.mtls block from the configuration docs decodes through the
+// strict config loader: the yaml tags on PlanetScaleConfig and
+// PlanetScaleMTLSConfig are what real config files exercise, and the loader's
+// KnownFields decoding rejects any key they fail to cover, so this pins the
+// block's on-disk spelling end to end.
+func TestLoadServerConfigPlanetScaleMTLSFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: mysql
+    environments:
+      staging:
+        dsn: root@tcp(localhost:3306)/mydb
+planetscale:
+  mtls:
+    ca_bundle: /etc/ssl/certs/ca-certificates.crt
+    client_cert: /etc/secrets/pca/tls.crt
+    client_key: /etc/secrets/pca/tls.key
+`), 0o600))
+
+	cfg, err := LoadServerConfigFromFile(path)
+	require.NoError(t, err)
+	require.Equal(t, &PlanetScaleMTLSConfig{
+		CABundle:   "/etc/ssl/certs/ca-certificates.crt",
+		ClientCert: "/etc/secrets/pca/tls.crt",
+		ClientKey:  "/etc/secrets/pca/tls.key",
+	}, cfg.PlanetScale.MTLS)
+}
+
+func TestLoadServerConfigPostgresNativeSafeTableSizeLimit(t *testing.T) {
+	t.Run("unset uses default", func(t *testing.T) {
+		cfg := PostgresConfig{}
+		assert.Equal(t, int64(1<<30), cfg.NativeSafeTableSizeLimit())
+	})
+
+	t.Run("configured bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  native_safe_table_size_limit_bytes: 4294967296
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4<<30), cfg.Postgres.NativeSafeTableSizeLimit())
+	})
+
+	t.Run("non-positive fails validation", func(t *testing.T) {
+		limit := int64(0)
+		cfg := ServerConfig{Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://localhost/mydb"},
+				},
+			},
+		}}
+		cfg.Postgres.NativeSafeTableSizeLimitBytes = &limit
+
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.native_safe_table_size_limit_bytes must be positive")
+	})
+
+	t.Run("unparseable fails config load", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  native_safe_table_size_limit_bytes: 4GiB
+`), 0o600))
+
+		_, err := LoadServerConfigFromFile(path)
+		require.ErrorContains(t, err, "parse config file")
+		require.ErrorContains(t, err, "cannot unmarshal")
+	})
+}
+
+func TestPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	t.Run("unset uses default", func(t *testing.T) {
+		assert.Equal(t, 24*time.Hour, (PostgresConfig{}).ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("configured duration", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  concurrent_index_max_duration: 36h
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, cfg.Postgres.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	for _, value := range []string{"0", "-1s"} {
+		t.Run("refuses "+value, func(t *testing.T) {
+			cfg := PostgresConfig{ConcurrentIndexMaxDuration: value}
+			err := cfg.validate()
+			require.ErrorContains(t, err, "postgres.concurrent_index_max_duration")
+			require.ErrorContains(t, err, "must be positive")
+		})
+	}
+
+	t.Run("refuses invalid duration", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "tomorrow"}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "is not a valid duration")
+	})
+
+	t.Run("accepts the engine minimum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: postgresengine.MinConcurrentIndexMaxDuration.String()}
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, postgresengine.MinConcurrentIndexMaxDuration, cfg.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("refuses duration below the server timer's resolution", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "500us"}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "postgres.concurrent_index_max_duration")
+		require.ErrorContains(t, err, "below the smallest bound the engine can honor (1ms")
+	})
+
+	t.Run("accepts the engine maximum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: postgresengine.MaxConcurrentIndexMaxDuration.String()}
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, postgresengine.MaxConcurrentIndexMaxDuration, cfg.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("refuses duration above engine maximum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: (postgresengine.MaxConcurrentIndexMaxDuration + time.Millisecond).String()}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "exceeds the largest bound the engine can honor")
+	})
+}
+
+// postgres.statement_timeout bounds ordinary storage queries. Unlike the pool
+// durations, zero is a meaningful setting rather than "use the default": it
+// disables the budget explicitly so the connection states that it has no
+// budget instead of inheriting whatever the platform imposed.
+func TestPostgresStatementTimeoutConfig(t *testing.T) {
+	t.Parallel()
+
+	postgresCfg := func(statementTimeout string) ServerConfig {
+		cfg := ServerConfig{Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://localhost/mydb"},
+				},
+			},
+		}}
+		cfg.Postgres.StatementTimeout = statementTimeout
+		return cfg
+	}
+
+	t.Run("unset uses the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, DefaultPostgresStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("explicit value wins over the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("90s")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 90*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("zero disables the budget rather than selecting the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, time.Duration(0), cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("negative fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("-1s")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "must not be negative")
+	})
+
+	t.Run("unparseable fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("soon")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, `postgres.statement_timeout "soon" is not a valid duration`)
+	})
+
+	// A budget that does not clear the apply target lock wait fires before that
+	// lock's own timeout, so an instance waiting its turn reports a statement
+	// timeout instead of a lock conflict and the contention stops looking like
+	// contention. Startup is the last place that is still visible. The floor
+	// sits above the wait rather than at it, so a budget in the band just over
+	// the wait is refused too: it comes out the right way round only because of
+	// how the acquisition is currently written.
+	t.Run("a value below the floor fails validation", func(t *testing.T) {
+		t.Parallel()
+		for _, tooShort := range []string{"1s", "9999ms", "10s", "10001ms", "14999ms"} {
+			cfg := postgresCfg(tooShort)
+			err := cfg.Validate()
+			require.ErrorContains(t, err, "postgres.statement_timeout")
+			require.ErrorContains(t, err, "must be at least 15s")
+			require.ErrorContains(t, err, "10s apply target lock wait")
+		}
+	})
+
+	t.Run("a value at the floor validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("15s")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 15*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	// Disabling the budget outright is not "a very short budget" — nothing can
+	// cut the lock wait short, so the floor does not apply.
+	t.Run("zero is exempt from the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+	})
+
+	// The default has to clear the floor it is validated against, or the
+	// shipped configuration would be one the server rejects.
+	t.Run("the default clears the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		assert.GreaterOrEqual(t, DefaultPostgresStatementTimeout, MinPostgresStatementTimeout)
+		assert.Greater(t, MinPostgresStatementTimeout, storage.ApplyTargetLockWait)
+	})
+
+	// statement_timeout is a millisecond integer GUC, so a budget past the
+	// signed 32-bit maximum is not clamped: the server rejects it when the new
+	// session arms it and every connection fails at dial. Startup validation
+	// is where the value can still be named.
+	t.Run("a value above what PostgreSQL accepts fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("600h")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "exceeds the")
+	})
+
+	t.Run("the largest accepted value validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg(postgresconn.MaxStatementTimeout.String())
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, postgresconn.MaxStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("loads from file", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  statement_timeout: 45s
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 45*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+}
+
+// TestServerConfig_ResolveDatabaseTargets_MultiTarget covers an environment
+// that addresses several targets. A rollout member is a deployment and a target
+// together, so resolution returns one member per target — under a single
+// deployment, under each deployment of a deployments map, and in an order that
+// walks the deployments outermost so a rollout finishes one deployment before
+// moving to the next.
+func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"scalar": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployment: "payments-a",
+						Targets:    targetNames("payments-002", "payments-001"),
+					},
+				},
+			},
+			"mapped": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployments: map[string]DeploymentTarget{
+							"payments-b": {Targets: targetNames("payments-003", "payments-004")},
+							"payments-a": {Target: "payments-001"},
+						},
+						DeploymentOrder: []string{"payments-a", "payments-b"},
+					},
+				},
+			},
+			"broken": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployment: "payments-a",
+						Target:     "payments-001",
+						Targets:    targetNames("payments-002"),
+					},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"payments-a": {"production": "tern-a:9090"},
+			"payments-b": {"production": "tern-b:9090"},
+		},
+	}
+
+	t.Run("one deployment fans out to one member per target in listed order", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTargets("scalar", "production")
+		require.NoError(t, err)
+		assert.Equal(t, []routing.ExecutionTarget{
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments-002"},
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments-001"},
+		}, got, "targets resolve in the order they are listed, not sorted")
+	})
+
+	t.Run("a deployments map fans out deployments outermost", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTargets("mapped", "production")
+		require.NoError(t, err)
+		assert.Equal(t, []routing.ExecutionTarget{
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments-001"},
+			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments-003"},
+			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments-004"},
+		}, got)
+	})
+
+	t.Run("the primary is the first member, not the first deployment", func(t *testing.T) {
+		primary, err := cfg.ResolvePrimaryDatabaseTarget("scalar", "production")
+		require.NoError(t, err)
+		assert.Equal(t, "payments-a", primary.Deployment)
+		assert.Equal(t, "payments-002", primary.Target)
+	})
+
+	t.Run("target and targets together fail closed at resolution too", func(t *testing.T) {
+		_, err := cfg.ResolveDatabaseTargets("broken", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot configure both target and targets")
+	})
+}
+
+// TestServerConfig_MultiTargetIsMySQLOnly covers the engine gate on the targets
+// spelling. A targets list makes an environment address several distinct
+// targets, which only MySQL drives today, so configuring it on another engine
+// fails validation rather than being silently collapsed to one target. A
+// deployments map with several single-target entries is not multi-target and
+// stays available on every engine.
+func TestServerConfig_MultiTargetIsMySQLOnly(t *testing.T) {
+	configFor := func(dbType string, env EnvironmentConfig) ServerConfig {
+		return ServerConfig{
+			// Strata is opt-in, and its gate runs ahead of this one. Enabling it
+			// keeps the Strata case exercising the engine gate under test rather
+			// than stopping at the experimental refusal.
+			ExperimentalStrataEnabled: true,
+			TernDeployments: TernConfig{
+				"payments-a": {"production": "localhost:9090"},
+				"payments-b": {"production": "localhost:9091"},
+			},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:         dbType,
+					Environments: map[string]EnvironmentConfig{"production": env},
+				},
+			},
+		}
+	}
+	envTargets := EnvironmentConfig{Deployment: "payments-a", Targets: targetNames("payments-001", "payments-002")}
+	mapTargets := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+		"payments-a": {Targets: targetNames("payments-001", "payments-002")},
+	}}
+	mirrored := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+		"payments-a": {Target: "payments"},
+		"payments-b": {Target: "payments"},
+	}}
+
+	cases := []struct {
+		name    string
+		dbType  string
+		env     EnvironmentConfig
+		wantErr string
+	}{
+		{name: "mysql env targets", dbType: storage.DatabaseTypeMySQL, env: envTargets},
+		{name: "mysql deployments targets", dbType: storage.DatabaseTypeMySQL, env: mapTargets},
+		{name: "vitess env targets", dbType: storage.DatabaseTypeVitess, env: envTargets, wantErr: `configures targets, which is only supported for mysql databases (type is "vitess")`},
+		{name: "postgres env targets", dbType: storage.DatabaseTypePostgres, env: envTargets, wantErr: `configures targets, which is only supported for mysql databases (type is "postgres")`},
+		{name: "strata deployments targets", dbType: storage.DatabaseTypeStrata, env: mapTargets, wantErr: `configures targets, which is only supported for mysql databases (type is "strata")`},
+		{name: "vitess mirrored deployments", dbType: storage.DatabaseTypeVitess, env: mirrored},
+		{name: "postgres mirrored deployments", dbType: storage.DatabaseTypePostgres, env: mirrored},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := configFor(tc.dbType, tc.env)
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestEnvironmentConfig_UsesTargetsList(t *testing.T) {
+	cases := []struct {
+		name string
+		env  EnvironmentConfig
+		want bool
+	}{
+		{name: "single target", env: EnvironmentConfig{Deployment: "a", Target: "payments"}},
+		{name: "local dsn", env: EnvironmentConfig{DSN: "root@tcp(localhost)/payments"}},
+		{name: "deployments map of single targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"a": {Target: "payments"}, "b": {Target: "payments"},
+		}}},
+		{name: "environment targets", env: EnvironmentConfig{Deployment: "a", Targets: targetNames("payments-001")}, want: true},
+		{name: "deployments entry targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"a": {Target: "payments-001"}, "b": {Targets: targetNames("payments-002")},
+		}}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.env.UsesTargetsList())
+		})
+	}
+}
+
+// TestServerConfig_MemberPlanningFor covers which environments plan their
+// members independently. Spelling any routing as a targets list means the
+// members are distinct targets with no expectation of matching; every other
+// shape, including every shape that predates the targets spelling, stays
+// mirrored so a difference between members keeps blocking the review.
+func TestServerConfig_MemberPlanningFor(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"scalar":       {Deployment: "payments-a", Target: "payments-001"},
+					"local":        {DSN: "root@tcp(localhost)/payments"},
+					"mirrored":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}, "payments-b": {Target: "payments"}}},
+					"targets":      {Deployment: "payments-a", Targets: targetNames("payments-001", "payments-002")},
+					"map-targets":  {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetNames("payments-001", "payments-002")}}},
+					"mixed-shapes": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments-001"}, "payments-b": {Targets: targetNames("payments-002")}}},
+				},
+			},
+		},
+	}
+
+	cases := []struct {
+		environment string
+		want        MemberPlanning
+	}{
+		{"scalar", PlanMirrored},
+		{"local", PlanMirrored},
+		{"mirrored", PlanMirrored},
+		{"targets", PlanIndependent},
+		{"map-targets", PlanIndependent},
+		{"mixed-shapes", PlanIndependent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.environment, func(t *testing.T) {
+			got, err := cfg.MemberPlanningFor("payments", tc.environment)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("unknown database errors", func(t *testing.T) {
+		_, err := cfg.MemberPlanningFor("missing", "scalar")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not configured")
+	})
+
+	t.Run("unknown environment errors", func(t *testing.T) {
+		_, err := cfg.MemberPlanningFor("payments", "missing")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing")
+	})
+}
+
+// A server-wide policy is expected to be partly inert on a mixed fleet, but a
+// policy that reaches no engine at all is one an operator believes is in force
+// and that will never route a statement.
+func TestServerConfig_ValidateRejectsAServerDirectExecutionNoEngineCanHonor(t *testing.T) {
+	policy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000}
+
+	t.Run("no registered database can honor it", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+			},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "which no registered database can honor")
+	})
+
+	t.Run("one database that can honor it is enough", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+				"payments": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/payments"},
+				}},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("a target resolver exempts the policy from the registry", func(t *testing.T) {
+		// A data plane resolves its targets per request and holds no
+		// registration for the databases behind them, so the loop over
+		// registered databases finds nothing to honor the policy. This is the
+		// deployment shape the server-wide policy exists for, and refusing to
+		// start on it would make the policy unusable exactly where it is
+		// needed.
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: policy,
+			TargetResolver: TargetResolverConfig{
+				Targets: map[string]inventory.StaticTarget{
+					"dsid-orders-prod": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(localhost:3306)/"},
+				},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("a disabled policy reaches nothing on purpose", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage:         StorageConfig{DSN: "root@tcp(localhost)/schemabot"},
+			DirectExecution: &DirectExecutionConfig{Enabled: false},
+			Databases: map[string]DatabaseConfig{
+				"analytics": {Type: storage.DatabaseTypePostgres, Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://user@localhost:5432/analytics"},
+				}},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
+// A control plane resolves the policy by database and environment so it can
+// state it on the request. A database it does not register — every target a
+// server reaches through its target resolver — carries the server-wide policy,
+// which is the only policy such a target can have.
+func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
+	cfg := ServerConfig{
+		DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},
+		Databases: map[string]DatabaseConfig{
+			"overridden": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 50}},
+			}},
+			"opted-out": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {DirectExecution: &DirectExecutionConfig{Enabled: false}},
+			}},
+			"inherits": {Type: storage.DatabaseTypeMySQL, Environments: map[string]EnvironmentConfig{
+				"production": {},
+			}},
+		},
+	}
+
+	t.Run("unregistered database carries the server-wide policy", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("resolved-at-request-time", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeoutSeconds: 10}, policy)
+	})
+
+	t.Run("registered database with no block inherits it", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("inherits", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeoutSeconds: 10}, policy)
+	})
+
+	t.Run("override replaces it whole", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("overridden", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableRows: 50}, policy,
+			"the override states its own bound and inherits no lock timeout")
+	})
+
+	t.Run("override that opts out travels as an opt-out", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("opted-out", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy,
+			"stating nothing would let a grant on the server that runs the statement decide instead of the opt-out")
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		policy, err := cfg.DirectExecutionPolicyFor("inherits", "production", storage.DatabaseTypeVitess)
+		require.NoError(t, err)
+		assert.Nil(t, policy)
+	})
+
+}
+
+// targetNames builds a targets list of bare target names, the spelling that
+// selects no namespaces.
+func targetNames(targets ...string) []TargetEntry {
+	entries := make([]TargetEntry, 0, len(targets))
+	for _, target := range targets {
+		entries = append(entries, TargetEntry{Target: target})
+	}
+	return entries
+}
+
+// A listen-only repository loads from YAML, matches case-insensitively, and
+// never publishes Check Runs; repositories beside it are unaffected.
+func TestLoadServerConfigListenOnlyRepository(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+tern_deployments:
+  default:
+    staging: "tern-staging:9090"
+repos:
+  acme/monorepo:
+    listen_only: true
+  acme/onboarded: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0o644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err, "LoadServerConfigFromFile")
+
+	assert.True(t, cfg.IsRepoListenOnly("acme/monorepo"))
+	assert.True(t, cfg.IsRepoListenOnly("ACME/Monorepo"))
+	assert.False(t, cfg.AreChecksEnabled("acme/monorepo"))
+	assert.False(t, cfg.IsRepoListenOnly("acme/onboarded"))
+	assert.True(t, cfg.AreChecksEnabled("acme/onboarded"))
+	assert.False(t, cfg.IsRepoListenOnly("acme/unlisted"))
+	assert.True(t, cfg.HasListenOnlyRepos())
+
+	onboardedOnly := &ServerConfig{Repos: map[string]RepoConfig{"acme/onboarded": {}}}
+	assert.False(t, onboardedOnly.HasListenOnlyRepos())
+
+	var nilCfg *ServerConfig
+	assert.False(t, nilCfg.IsRepoListenOnly("acme/monorepo"))
+	assert.False(t, nilCfg.HasListenOnlyRepos())
+
+	conflicting := strings.Replace(content, "    listen_only: true\n", "    listen_only: true\n    enable_checks: true\n", 1)
+	require.NotEqual(t, content, conflicting)
+	require.NoError(t, os.WriteFile(configPath, []byte(conflicting), 0o644), "write conflicting config file")
+	_, err = LoadServerConfigFromFile(configPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "listen_only cannot be combined with enable_checks: true")
+}
+
+// listen_only cannot be combined with settings that would publish or nudge a
+// check, since a listen-only repository never writes to GitHub.
+func TestValidateListenOnlyRepo(t *testing.T) {
+	enableChecks := true
+	disableChecks := false
+	tests := []struct {
+		name    string
+		config  RepoConfig
+		wantErr string
+	}{
+		{name: "listen-only alone", config: RepoConfig{ListenOnly: true}},
+		{name: "listen-only with checks disabled", config: RepoConfig{ListenOnly: true, EnableChecks: &disableChecks}},
+		{name: "checks enabled without listen-only", config: RepoConfig{EnableChecks: &enableChecks}},
+		{
+			name:    "listen-only with checks enabled",
+			config:  RepoConfig{ListenOnly: true, EnableChecks: &enableChecks},
+			wantErr: `repos "acme/monorepo": listen_only cannot be combined with enable_checks: true`,
+		},
+		{
+			name:    "listen-only aggregate participant",
+			config:  RepoConfig{ListenOnly: true, Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
+			wantErr: `repos "acme/monorepo": listen_only cannot be combined with aggregate`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateListenOnlyRepo("acme/monorepo", tt.config)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
 }

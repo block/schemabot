@@ -2,7 +2,6 @@ package commands
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,11 +13,13 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	cmdclient "github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // ChecksCmd groups SchemaBot Check Run operator commands.
 type ChecksCmd struct {
 	Backfill ChecksBackfillCmd `cmd:"" help:"Find open PRs with missing or stuck SchemaBot Check Runs; recreate the missing ones"`
+	Show     ChecksShowCmd     `cmd:"" help:"Show one PR's stored check state and Check Run, and what each row is waiting on"`
 }
 
 // ChecksBackfillCmd walks open PRs and asks the two questions that matter
@@ -37,9 +38,15 @@ type ChecksCmd struct {
 // Without --last the scan covers every open PR, which is the one-time
 // backfill for a repository that predates check enablement. --dry-run
 // reports without acting.
+//
+// A sweep skips and reports a declared repository the server's GitHub App is
+// not installed on, so one repository mid-onboarding does not hide the rest of
+// the fleet; the skip still makes the run exit nonzero. Every other scan
+// failure stops the sweep, since a repository that could not be read is not
+// one with nothing to backfill.
 type ChecksBackfillCmd struct {
 	Repo           string `arg:"" optional:"" help:"Repository to backfill, in owner/name form; omit with --all-repos"`
-	AllRepos       bool   `help:"Scan every repository declared in the server's repos config"`
+	AllRepos       bool   `help:"Scan every repository declared in the server's repos config, skipping and reporting any the server's GitHub App is not installed on"`
 	Last           string `help:"Only scan PRs updated within this window, for example 1h or 1d; by default every open PR is scanned"`
 	Environment    string `short:"e" help:"Only backfill this environment's SchemaBot Check Run name"`
 	CheckName      string `help:"Override the SchemaBot Check Run name to look for"`
@@ -58,6 +65,55 @@ const checksSynthesizeBatchSize = 10
 // hold works from the scan's own signal — an uncompleted Check Run on the same
 // head — so the PR never even reaches the server, and the operator sees why.
 const checksBackfillHeldStatus = "held: an uncompleted Check Run sits on this head (a started apply may own it); investigate before backfilling"
+
+// checksBackfillUnconfirmedStatus is the outcome of a PR an interrupted run
+// sent for recreation but never heard back about. The request may have
+// reached the server, so it claims neither way whether the Check Run was
+// recreated.
+const checksBackfillUnconfirmedStatus = "not confirmed: interrupted before the server answered"
+
+// checksBackfillNotAttemptedStatus is the outcome of a PR an interrupted run
+// never sent for recreation. The server did not hear of it, so its Check Run
+// is still missing.
+const checksBackfillNotAttemptedStatus = "not attempted: interrupted before this PR was sent"
+
+// checksBackfillInterruptedScanNote is the note under the headline of a
+// report whose scan was interrupted.
+const checksBackfillInterruptedScanNote = "Interrupted during the scan: only the PRs scanned so far are listed, and no Check Run was recreated. Run the command again for a full sweep."
+
+// checksBackfillInterruptedRecreateNote is the note under the headline of a
+// report whose recreation was interrupted. It explains only the interrupted
+// outcomes the report shows.
+func checksBackfillInterruptedRecreateNote(report *checksBackfillReport) string {
+	var unconfirmed, notAttempted bool
+	for _, action := range report.Actions {
+		switch action.Outcome {
+		case checksBackfillUnconfirmedStatus:
+			unconfirmed = true
+		case checksBackfillNotAttemptedStatus:
+			notAttempted = true
+		}
+	}
+	var explained []string
+	if unconfirmed {
+		explained = append(explained, `a PR whose outcome is "not confirmed" may or may not have its Check Run yet`)
+	}
+	if notAttempted {
+		explained = append(explained, `a PR whose outcome is "not attempted" was never sent to the server`)
+	}
+	note := "Interrupted while recreating Check Runs"
+	if len(explained) > 0 {
+		note += ": " + strings.Join(explained, ", and ")
+	}
+	return note + ". Run the command again to finish; it recreates only the Check Runs still missing."
+}
+
+// What stderr says about how far an interrupted run got when its report could
+// not be written to stdout, one per phase the interrupt can land in.
+const (
+	checksBackfillUnwrittenScanReportNote     = "No Check Run was recreated. Run the command again for a full sweep."
+	checksBackfillUnwrittenRecreateReportNote = "Some Check Runs may already be recreated. Run the command again to finish; it recreates only the Check Runs still missing."
+)
 
 // checksBackfillAction is one PR's classification and (after acting) outcome.
 type checksBackfillAction struct {
@@ -79,6 +135,12 @@ type checksBackfillAction struct {
 	Held    bool   `json:"held,omitempty"`
 	Outcome string `json:"outcome,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// sent records that this PR was in a batch handed to the server, and
+	// answered that the server sent its result. An interrupted run uses them
+	// to tell the PRs it heard back about from the batch in flight, and that
+	// batch from the PRs it never sent.
+	sent     bool
+	answered bool
 }
 
 // checksStuckCheck is one existing-but-uncompleted Check Run on an open PR,
@@ -97,6 +159,21 @@ type checksStuckCheck struct {
 	// Age is how long the run has been sitting uncompleted at scan time;
 	// "unknown" when GitHub did not report a start time.
 	Age string `json:"age"`
+	// WaitingOn says whether the stored state behind this run resolves on its
+	// own ("schemabot") or needs a person ("operator").
+	//
+	// Empty means no stored row explains the run, which covers more than an
+	// empty read: rows may exist and none of them block once scoped to this
+	// run's environment, or the only one that does is the aggregate, which
+	// restates the rows beside it rather than naming a cause. Empty also
+	// means unannotated when the scan was given a stuck_after this run is too
+	// young for. A reader that takes it for a failed storage read draws a
+	// conclusion the field does not support.
+	WaitingOn string `json:"waiting_on,omitempty"`
+	// Reasons are the distinct dispositions of the blocking stored rows, in
+	// the order the server reported them. They are what makes a stuck row
+	// triageable from the sweep instead of only from the PR.
+	Reasons []string `json:"reasons,omitempty"`
 }
 
 type checksBackfillReport struct {
@@ -105,15 +182,47 @@ type checksBackfillReport struct {
 	// Check Run publishing is turned off (enable_checks: false) — the server
 	// refuses to create their checks, so every open PR would read as missing.
 	SkippedDisabled []string `json:"skipped_checks_disabled,omitempty"`
-	CheckNames      []string `json:"check_names"`
-	Scanned         int      `json:"scanned"`
+	// SkippedAppNotInstalled are repositories the sweep did not scan because
+	// GitHub has no installation of their configured GitHub App on them, so
+	// the App can neither read nor publish their Check Runs. Unlike a disabled
+	// repository this is a misconfiguration, so it counts toward the run's
+	// nonzero exit.
+	SkippedAppNotInstalled []string `json:"skipped_app_not_installed,omitempty"`
+	CheckNames             []string `json:"check_names"`
+	Scanned                int      `json:"scanned"`
 	// Last echoes the --last window bounding the sweep; empty means every
 	// open PR was scanned.
-	Last       string                 `json:"last,omitempty"`
-	DryRun     bool                   `json:"dry_run"`
-	StuckAfter string                 `json:"stuck_after"`
-	Actions    []checksBackfillAction `json:"actions"`
-	Stuck      []checksStuckCheck     `json:"stuck,omitempty"`
+	Last   string `json:"last,omitempty"`
+	DryRun bool   `json:"dry_run"`
+	// Interrupted says an operator's Ctrl-C or SIGTERM cut the run short, so
+	// the report holds only what the run learned before it. It is always
+	// present, false on a run that finished.
+	Interrupted bool                   `json:"interrupted"`
+	StuckAfter  string                 `json:"stuck_after"`
+	Actions     []checksBackfillAction `json:"actions"`
+	Stuck       []checksStuckCheck     `json:"stuck,omitempty"`
+	// interruptedScan says the interrupt landed before the scan finished, so
+	// nothing was sent for recreation and the table shows what the backfill
+	// would do rather than an outcome.
+	interruptedScan bool
+}
+
+// markUnanswered sets the outcome of every PR an interrupted act phase did
+// not hear back about: unconfirmed when the PR was sent, since the server may
+// have acted on it, and not attempted when it was never sent. Held PRs never
+// reach the server and keep the reason they were held.
+func (r *checksBackfillReport) markUnanswered() {
+	for i := range r.Actions {
+		action := &r.Actions[i]
+		if action.Held || action.answered {
+			continue
+		}
+		if action.sent {
+			action.Outcome = checksBackfillUnconfirmedStatus
+			continue
+		}
+		action.Outcome = checksBackfillNotAttemptedStatus
+	}
 }
 
 func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
@@ -154,7 +263,7 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.AllRepos {
 		updateProgress("listing the repositories declared on the server...")
 		declared, err := cmdclient.ChecksRepos(ctx, endpoint)
-		if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
+		if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
 			return canceled
 		}
 		if err != nil {
@@ -184,11 +293,16 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	checkNamesSeen := map[string]bool{}
 	skippedByServer := map[string]bool{}
 	held := 0
+	// reached counts the leading repositories at least one scan page came back
+	// for, so an interrupted scan reports only the repositories it read.
+	reached := 0
+	var scanCanceled error
 scanning:
 	for i, repo := range repos {
 		page := 1
 		repoScanned := 0
 		repoEstimate := 0
+		repoStart := report.mark()
 		for {
 			chunk, err := cmdclient.ChecksScan(ctx, endpoint, apitypes.ChecksScanRequest{
 				Repo:         repo,
@@ -196,21 +310,49 @@ scanning:
 				CheckName:    cmd.CheckName,
 				Page:         page,
 				UpdatedSince: updatedSince,
+				// Sent normalized, not as typed: this flag accepts operator
+				// spellings the server's own parser does not, so forwarding
+				// "2d" verbatim would fail the first page and abort the
+				// sweep. The report keeps the spelling the operator used.
+				StuckAfter: stuckAfter.String(),
+				// This command handles the not-installed skip below, so the
+				// server may answer with it instead of an error.
+				ReportAppNotInstalled: true,
 			})
-			if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
-				return canceled
+			if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
+				scanCanceled = canceled
+				break scanning
 			}
 			if err != nil {
 				return fmt.Errorf("scan %s open PRs for missing or stuck Check Runs: %w", repo, err)
 			}
 			// The server skips repos whose Check Run publishing is turned
 			// off rather than reporting every open PR as missing; record the
-			// skip for the report and move to the next repo.
+			// skip for the report and move to the next repo. A skip can land
+			// on a later page (the config or installation changed mid-scan),
+			// so it also drops whatever this repo's earlier pages added: a
+			// skipped repo has no findings, and none of them reach synthesis.
 			if chunk.ChecksDisabled {
+				held -= report.rollback(repoStart, checkNamesSeen)
 				skippedByServer[repo] = true
 				report.SkippedDisabled = append(report.SkippedDisabled, repo)
 				continue scanning
 			}
+			// GitHub confirmed the repo's App is not installed on it. A named
+			// repo is the operator asking about that one repo, so say what to
+			// fix; a sweep records the skip and moves on, so one repo whose
+			// onboarding is still in progress does not hide every repo after
+			// it. Any other scan failure stopped the sweep above.
+			if chunk.AppNotInstalled {
+				if !cmd.AllRepos {
+					return appNotInstalledError(repo, chunk.GitHubApp)
+				}
+				held -= report.rollback(repoStart, checkNamesSeen)
+				skippedByServer[repo] = true
+				report.SkippedAppNotInstalled = append(report.SkippedAppNotInstalled, repo)
+				continue scanning
+			}
+			reached = i + 1
 			for _, name := range chunk.CheckNames {
 				if !checkNamesSeen[name] {
 					checkNamesSeen[name] = true
@@ -245,7 +387,7 @@ scanning:
 				}
 				report.Actions = append(report.Actions, action)
 			}
-			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, webhookRedriveNow())...)
+			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, scanObservedAt(chunk))...)
 			updateProgress(checksScanProgressLine(i+1, len(repos), repo, repoScanned, repoEstimate, report.Scanned, len(report.Actions), held, len(report.Stuck)))
 			if cmd.Limit > 0 && report.Scanned >= cmd.Limit {
 				break scanning
@@ -254,8 +396,9 @@ scanning:
 				break
 			}
 			if err := pauseForRateLimit(ctx, chunk.RateLimit, cmd.RateLimitFloor, updateProgress); err != nil {
-				if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
-					return canceled
+				if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
+					scanCanceled = canceled
+					break scanning
 				}
 				return err
 			}
@@ -263,22 +406,42 @@ scanning:
 		}
 	}
 	sort.Strings(report.CheckNames)
+	if scanCanceled != nil {
+		// The repositories after the one the interrupt cut off were never
+		// read, so they are not part of the report.
+		report.Repos = report.Repos[:reached]
+	}
 
-	// The report's scanned-repo list and its skip list stay disjoint: a repo
-	// the server reported as disabled was never scanned, so it belongs only
-	// in the skip list.
+	// The report's scanned-repo list and its skip lists stay disjoint: a repo
+	// the server skipped was never scanned, so it belongs only in a skip list.
 	if len(skippedByServer) > 0 {
 		report.Repos = slices.DeleteFunc(report.Repos, func(r string) bool { return skippedByServer[r] })
+	}
+
+	if scanCanceled != nil {
+		// Every finding came from a scan page the server answered in full, so
+		// each listed PR was fully inspected; the list is partial, and the
+		// report says so. Nothing was sent for recreation. A scan that read
+		// nothing has nothing to report.
+		if reached > 0 || len(skippedByServer) > 0 {
+			report.Interrupted = true
+			report.interruptedScan = true
+			cmd.writeInterrupted(report)
+		}
+		return scanCanceled
 	}
 
 	if !cmd.DryRun {
 		// Act phase: synthesize the missing checks in server-bounded batches
 		// per repository, skipping held PRs.
 		err := cmd.act(ctx, endpoint, report, updateProgress)
-		if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
-			// Print what completed before the interrupt, then exit non-zero.
+		if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
+			// Print what completed before the interrupt, then exit with the
+			// interrupt status.
 			stopProgress()
-			_ = cmd.write(report)
+			report.Interrupted = true
+			report.markUnanswered()
+			cmd.writeInterrupted(report)
 			return canceled
 		}
 		if err != nil {
@@ -286,7 +449,107 @@ scanning:
 		}
 	}
 	stopProgress()
-	return cmd.write(report)
+	if err := cmd.write(report); err != nil {
+		return err
+	}
+	return attentionExitError(report)
+}
+
+// checksScanMark is how much of a report existed before one repository's scan
+// began.
+type checksScanMark struct {
+	actions, stuck, scanned, checkNames int
+}
+
+func (r *checksBackfillReport) mark() checksScanMark {
+	return checksScanMark{actions: len(r.Actions), stuck: len(r.Stuck), scanned: r.Scanned, checkNames: len(r.CheckNames)}
+}
+
+// rollback removes everything added to the report since m, for a repository
+// the server skipped after some of its pages were already scanned, and
+// returns how many held PRs it removed. A repository's findings are appended
+// contiguously, so truncating to the mark removes exactly that repository's.
+func (r *checksBackfillReport) rollback(m checksScanMark, checkNamesSeen map[string]bool) int {
+	held := 0
+	for _, action := range r.Actions[m.actions:] {
+		if action.Held {
+			held++
+		}
+	}
+	for _, name := range r.CheckNames[m.checkNames:] {
+		delete(checkNamesSeen, name)
+	}
+	r.Actions = r.Actions[:m.actions]
+	r.Stuck = r.Stuck[:m.stuck]
+	r.Scanned = m.scanned
+	r.CheckNames = r.CheckNames[:m.checkNames]
+	return held
+}
+
+// appNotInstalledError tells the operator who named repo that its GitHub App
+// is not installed there, and the two ways to resolve it.
+func appNotInstalledError(repo, app string) error {
+	appName := "the server's GitHub App"
+	if app != "" {
+		appName = fmt.Sprintf("GitHub App %q", app)
+	}
+	return fmt.Errorf("%s is not installed on %s, so SchemaBot cannot read or create its Check Runs; install the App on %s, or remove %s from the server's repos config", appName, repo, repo, repo)
+}
+
+// attentionExitError makes the exit code mean "nothing needs an operator
+// after this run": it converts anything the run left unresolved into a
+// nonzero exit, so scheduled sweeps can alert on the exit code instead of
+// parsing the output. In a dry-run nothing was acted on, so every finding
+// remains. After an act phase, successfully recreated checks are resolved;
+// held PRs, failed recreations, and stuck Check Runs remain — the backfill
+// never acts on those. It fires only after the full report has been printed;
+// the report itself is unchanged. A run that leaves nothing behind returns
+// nil.
+func attentionExitError(report *checksBackfillReport) error {
+	var parts []string
+	if report.DryRun {
+		if n := len(report.Actions); n > 0 {
+			part := fmt.Sprintf("%d %s with missing Check Runs", n, ui.Pluralize("PR", n))
+			held := 0
+			for _, action := range report.Actions {
+				if action.Held {
+					held++
+				}
+			}
+			if held > 0 {
+				part += fmt.Sprintf(" (%d held)", held)
+			}
+			parts = append(parts, part)
+		}
+	} else {
+		held, failed := 0, 0
+		for _, action := range report.Actions {
+			switch {
+			case action.Held:
+				held++
+			case action.Error != "":
+				failed++
+			}
+		}
+		if held > 0 {
+			parts = append(parts, fmt.Sprintf("%d held %s", held, ui.Pluralize("PR", held)))
+		}
+		if failed > 0 {
+			parts = append(parts, fmt.Sprintf("%d failed Check Run %s", failed, ui.Pluralize("recreation", failed)))
+		}
+	}
+	if n := len(report.Stuck); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d stuck %s", n, ui.Pluralize("Check Run", n)))
+	}
+	// A repo the App is not installed on was never scanned, so the run cannot
+	// say it has nothing to backfill.
+	if n := len(report.SkippedAppNotInstalled); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s without the GitHub App installed", n, ui.PluralizeLabel("repository", "repositories", n)))
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("checks backfill left %s needing attention", strings.Join(parts, " and "))
 }
 
 // checksScanProgressLine renders one scan progress update. The denominator is
@@ -317,17 +580,17 @@ func checksScanProgressLine(repoIndex, repoCount int, repo string, repoScanned, 
 }
 
 // backfillCanceledError maps an operator cancellation (Ctrl+C) to a clean
-// stop: it clears the progress line, prints a notice, and returns ErrSilent so
-// the CLI exits non-zero without a raw "context canceled" error line. It
-// returns nil for any other error (including none) so the caller handles it
-// normally.
-func backfillCanceledError(err error, stopProgress func()) error {
-	if !errors.Is(err, context.Canceled) {
+// stop: it clears the progress line, prints a notice, and returns a silent
+// error so the CLI exits with the interrupt status without a raw "context
+// canceled" error line. It returns nil for any other error (including none)
+// so the caller handles it normally.
+func backfillCanceledError(ctx context.Context, err error, stopProgress func()) error {
+	if !endedByInterrupt(ctx, err) {
 		return nil
 	}
 	stopProgress()
 	fmt.Fprintln(os.Stderr, "checks backfill canceled")
-	return ErrSilent
+	return interrupted(ctx)
 }
 
 // pauseForRateLimit sleeps until the GitHub budget resets when the remaining
@@ -373,6 +636,31 @@ func rateLimitPauseDuration(rate *apitypes.GitHubRateLimit, floorPct int, now ti
 	return resetAt.Sub(now) + time.Minute, true
 }
 
+// scanObservedAt is the clock this page's runs should be aged against: the
+// server's, when it reported one.
+//
+// The threshold is applied on both sides — the server decides which runs to
+// read stored rows for, this command decides which to render — and a client
+// clock is a round trip ahead of the server's while the start time it reads
+// back is truncated to whole seconds. Both errors point the same way, so a run
+// the server judged just short of the threshold, and therefore left
+// unannotated, is judged past it here and rendered with an empty WAITING ON
+// and REASON. Those columns read as "no stored row was blocking", which is a
+// finding; "the server did not look" is not one.
+//
+// A server reporting no clock is one that does not annotate either, so there
+// the caller's own is all there is and applying the threshold locally is what
+// keeps it applied at all. An unparseable one is treated the same way rather
+// than trusted: the fallback renders more than it should, never less.
+func scanObservedAt(chunk *apitypes.ChecksScanResponse) time.Time {
+	if chunk.ObservedAt != "" {
+		if observed, err := time.Parse(time.RFC3339, chunk.ObservedAt); err == nil {
+			return observed
+		}
+	}
+	return webhookRedriveNow()
+}
+
 // stuckChecksPastThreshold flattens the scan's uncompleted Check Runs to one
 // row per (PR, check), keeping only runs that have been sitting longer than
 // stuckAfter. A run whose start time is missing, unparseable, or in the
@@ -404,10 +692,33 @@ func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAft
 				Status:     check.Status,
 				StartedAt:  check.StartedAt,
 				Age:        age,
+				WaitingOn:  check.WaitingOn,
+				Reasons:    blockingReasons(check.StoredRows),
 			})
 		}
 	}
 	return out
+}
+
+// blockingReasons lists the distinct dispositions of the rows that are
+// holding the gate open, dropping the ones that already resolved. A resolved
+// row explains nothing about why the run is still sitting, and listing it
+// alongside the real cause is what makes a sweep unreadable.
+//
+// The rollup row is dropped for the same reason. It restates the rows beside
+// it, so it adds a reason that names the symptom the operator is already
+// looking at instead of the cause underneath it.
+func blockingReasons(rows []apitypes.InspectedCheck) []string {
+	var reasons []string
+	for _, row := range rows {
+		if row.Aggregate || !row.Blocking || row.Reason == "" {
+			continue
+		}
+		if !slices.Contains(reasons, row.Reason) {
+			reasons = append(reasons, row.Reason)
+		}
+	}
+	return reasons
 }
 
 // repoPR keys a PR within a multi-repo report.
@@ -442,6 +753,11 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 				progressLine += fmt.Sprintf(" (%d failed so far)", failed)
 			}
 			updateProgress(progressLine)
+			// Mark the batch before the request: once it is handed over, an
+			// interrupt cannot tell whether it reached the server.
+			for _, pr := range batch {
+				actionByPR[repoPR{repo: repo, pr: pr}].sent = true
+			}
 			resp, err := cmdclient.ChecksSynthesize(ctx, endpoint, apitypes.ChecksSynthesizeRequest{Repo: repo, PRs: batch})
 			if err != nil {
 				return fmt.Errorf("synthesize Check Runs for %s: %w", repo, err)
@@ -453,6 +769,7 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 				if action, ok := actionByPR[repoPR{repo: repo, pr: result.PR}]; ok {
 					action.Outcome = result.Outcome
 					action.Error = result.Error
+					action.answered = true
 				}
 			}
 			if err := pauseForRateLimit(ctx, resp.RateLimit, cmd.RateLimitFloor, updateProgress); err != nil {
@@ -470,7 +787,37 @@ func (cmd *ChecksBackfillCmd) write(report *checksBackfillReport) error {
 	return writeChecksBackfillReport(os.Stdout, report)
 }
 
+// writeInterrupted prints the report of a run the operator's interrupt cut
+// short. The run ends with the interrupt status whether or not stdout took
+// the report, so a report that was not written is named on stderr, along with
+// what its note would have said about how far the run got.
+func (cmd *ChecksBackfillCmd) writeInterrupted(report *checksBackfillReport) {
+	err := cmd.write(report)
+	if err == nil {
+		return
+	}
+	note := checksBackfillUnwrittenRecreateReportNote
+	if report.interruptedScan {
+		note = checksBackfillUnwrittenScanReportNote
+	}
+	fmt.Fprintf(os.Stderr, "The report could not be written to stdout, so it is missing or incomplete: %v. %s\n", err, note)
+}
+
+// writeChecksBackfillReport prints the text report. Its error means w refused
+// a write. A recreation that failed is a row of the report, and
+// attentionExitError turns it into the exit status.
 func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error {
+	// An interrupted scan that read no repository still names the ones it
+	// skipped, rather than reading as a sweep with nothing to scan.
+	if len(report.Repos) == 0 && (len(report.SkippedAppNotInstalled) > 0 || report.Interrupted) {
+		if _, err := fmt.Fprintln(w, "No repositories scanned."); err != nil {
+			return err
+		}
+		if err := writeChecksInterruptedNote(w, report); err != nil {
+			return err
+		}
+		return writeChecksSkippedRepos(w, report)
+	}
 	if len(report.Repos) == 0 && len(report.SkippedDisabled) > 0 {
 		if len(report.SkippedDisabled) == 1 {
 			_, err := fmt.Fprintf(w, "Repository %s has Check Runs disabled (enable_checks: false); nothing to scan.\n", report.SkippedDisabled[0])
@@ -494,10 +841,11 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s in %s%s.\n", report.Scanned, window, repoScope, checkScope); err != nil {
 		return err
 	}
-	if len(report.SkippedDisabled) > 0 {
-		if _, err := fmt.Fprintf(w, "Skipped repositories with Check Runs disabled (enable_checks: false): %s.\n", strings.Join(report.SkippedDisabled, ", ")); err != nil {
-			return err
-		}
+	if err := writeChecksInterruptedNote(w, report); err != nil {
+		return err
+	}
+	if err := writeChecksSkippedRepos(w, report); err != nil {
+		return err
 	}
 	if err := writeChecksStuckSection(w, report); err != nil {
 		return err
@@ -507,25 +855,26 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		return err
 	}
 
+	// An interrupted scan sent nothing for recreation, so like a dry run it
+	// lists what the backfill would do.
+	acted := !report.DryRun && !report.interruptedScan
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	header := "PR\tMISSING CHECKS\tACTION"
-	if !report.DryRun {
+	if acted {
 		header = "PR\tMISSING CHECKS\tOUTCOME"
 	}
 	if _, err := fmt.Fprintln(tw, header); err != nil {
 		return err
 	}
-	failed := 0
 	for _, action := range report.Actions {
 		status := "synthesize via auto-plan"
 		if action.Held {
 			status = checksBackfillHeldStatus
 		}
-		if !report.DryRun {
+		if acted {
 			status = action.Outcome
 			if action.Error != "" {
 				status = "failed: " + action.Error
-				failed++
 			}
 		}
 		// The status (server outcome/error) is a tab-separated cell: strip
@@ -544,8 +893,35 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 			}
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%d Check Run backfills failed; see the outcomes above", failed)
+	return nil
+}
+
+// writeChecksInterruptedNote says, under the headline, that an interrupt cut
+// the run short and what the report therefore leaves out.
+func writeChecksInterruptedNote(w io.Writer, report *checksBackfillReport) error {
+	if !report.Interrupted {
+		return nil
+	}
+	note := checksBackfillInterruptedRecreateNote(report)
+	if report.interruptedScan {
+		note = checksBackfillInterruptedScanNote
+	}
+	_, err := fmt.Fprintln(w, note)
+	return err
+}
+
+// writeChecksSkippedRepos names the repositories the sweep did not scan, one
+// line per reason.
+func writeChecksSkippedRepos(w io.Writer, report *checksBackfillReport) error {
+	if len(report.SkippedDisabled) > 0 {
+		if _, err := fmt.Fprintf(w, "Skipped repositories with Check Runs disabled (enable_checks: false): %s.\n", strings.Join(report.SkippedDisabled, ", ")); err != nil {
+			return err
+		}
+	}
+	if len(report.SkippedAppNotInstalled) > 0 {
+		if _, err := fmt.Fprintf(w, "Skipped repositories the server's GitHub App is not installed on: %s. Install the App on each, or remove it from the server's repos config.\n", strings.Join(report.SkippedAppNotInstalled, ", ")); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -563,15 +939,20 @@ func writeChecksStuckSection(w io.Writer, report *checksBackfillReport) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "PR\tCHECK\tSTATUS\tAGE"); err != nil {
+	if _, err := fmt.Fprintln(tw, "PR\tCHECK\tSTATUS\tAGE\tWAITING ON\tREASON"); err != nil {
 		return err
 	}
 	for _, stuck := range report.Stuck {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", stuck.URL, stuck.CheckName, stuck.Status, stuck.Age); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			stuck.URL, stuck.CheckName, stuck.Status, stuck.Age,
+			orDash(stuck.WaitingOn), orDash(strings.Join(stuck.Reasons, ","))); err != nil {
 			return err
 		}
 	}
 	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "\nA run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`."); err != nil {
 		return err
 	}
 	_, err := fmt.Fprintln(w)

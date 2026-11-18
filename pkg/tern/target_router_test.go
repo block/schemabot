@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/inventory"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -54,6 +55,8 @@ type targetRouterApplyStore struct {
 	storage.ApplyStore
 	byID         map[int64]*storage.Apply
 	byIdentifier map[string]*storage.Apply
+	// lookupErr, when set, fails every lookup by identifier.
+	lookupErr error
 }
 
 func (s targetRouterApplyStore) Get(_ context.Context, id int64) (*storage.Apply, error) {
@@ -66,6 +69,9 @@ func (s targetRouterApplyStore) Get(_ context.Context, id int64) (*storage.Apply
 }
 
 func (s targetRouterApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
 	apply := s.byIdentifier[applyIdentifier]
 	if apply == nil {
 		return nil, nil
@@ -74,7 +80,23 @@ func (s targetRouterApplyStore) GetByApplyIdentifier(_ context.Context, applyIde
 	return &copy, nil
 }
 
+func (s targetRouterApplyStore) GetInProgress(context.Context) ([]*storage.Apply, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
+	var inProgress []*storage.Apply
+	for _, apply := range s.byIdentifier {
+		if state.IsTerminalApplyState(apply.State) {
+			continue
+		}
+		copy := *apply
+		inProgress = append(inProgress, &copy)
+	}
+	return inProgress, nil
+}
+
 type targetRouterRecordingClient struct {
+	compareReq         *ternv1.CompareSchemaFileChangeRequest
 	pullReq            *ternv1.PullSchemaRequest
 	planReq            *ternv1.PlanRequest
 	planDiffReq        *ternv1.PlanRequest
@@ -84,28 +106,61 @@ type targetRouterRecordingClient struct {
 	resumeApply        *storage.Apply
 	targetDSN          string
 	targetMetadata     map[string]string
+	schemaOverrides    map[string]string
+	tableOwner         string
 	pendingObserverSet bool
 	observerApplyID    int64
 	closed             bool
+	halted             bool
+	// onPlan runs inside Plan, while the router still holds this client for
+	// the request, so a test can observe the router mid-dispatch.
+	onPlan func()
+	// onResume runs inside each resume, standing in for the drive a local
+	// client runs to completion within the call.
+	onResume     func()
+	onPullSchema func() (*ternv1.PullSchemaResponse, error)
+	onPlanResult func() (*ternv1.PlanResponse, error)
+	onPlanDiff   func() (*ternv1.PlanDiffResponse, error)
+	onApply      func() (*ternv1.ApplyResponse, error)
 }
 
 func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	c.pullReq = req
+	if c.onPullSchema != nil {
+		return c.onPullSchema()
+	}
 	return &ternv1.PullSchemaResponse{Database: req.Database, Type: req.Type}, nil
 }
 
 func (c *targetRouterRecordingClient) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	c.planReq = req
+	if c.onPlan != nil {
+		c.onPlan()
+	}
+	if c.onPlanResult != nil {
+		return c.onPlanResult()
+	}
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
+}
+
+func (c *targetRouterRecordingClient) CompareSchemaFileChange(_ context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	c.compareReq = req
+	return &ternv1.CompareSchemaFileChangeResponse{Same: true}, nil
 }
 
 func (c *targetRouterRecordingClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	c.planDiffReq = req
+	if c.onPlanDiff != nil {
+		return c.onPlanDiff()
+	}
 	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_PLANETSCALE}, nil
 }
 
 func (c *targetRouterRecordingClient) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	c.applyReq = req
+	if c.onApply != nil {
+		return c.onApply()
+	}
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: "apply-routed"}, nil
 }
 
@@ -134,10 +189,6 @@ func (c *targetRouterRecordingClient) Start(context.Context, *ternv1.StartReques
 	return &ternv1.StartResponse{Accepted: true}, nil
 }
 
-func (c *targetRouterRecordingClient) Volume(context.Context, *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return &ternv1.VolumeResponse{Accepted: true}, nil
-}
-
 func (c *targetRouterRecordingClient) Revert(context.Context, *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
 	return &ternv1.RevertResponse{Accepted: true}, nil
 }
@@ -149,17 +200,22 @@ func (c *targetRouterRecordingClient) SkipRevert(context.Context, *ternv1.SkipRe
 func (c *targetRouterRecordingClient) Health(context.Context) error { return nil }
 
 func (c *targetRouterRecordingClient) ResumeApply(_ context.Context, apply *storage.Apply) error {
-	c.resumeApply = apply
-	return nil
+	return c.recordResume(apply)
 }
 
 func (c *targetRouterRecordingClient) ResumeApplyOperation(_ context.Context, apply *storage.Apply, _ int64) error {
-	c.resumeApply = apply
-	return nil
+	return c.recordResume(apply)
 }
 
 func (c *targetRouterRecordingClient) ResumeApplyOperationCutover(_ context.Context, apply *storage.Apply, _ int64) error {
+	return c.recordResume(apply)
+}
+
+func (c *targetRouterRecordingClient) recordResume(apply *storage.Apply) error {
 	c.resumeApply = apply
+	if c.onResume != nil {
+		c.onResume()
+	}
 	return nil
 }
 
@@ -177,6 +233,11 @@ func (c *targetRouterRecordingClient) SetObserver(applyID int64, _ ProgressObser
 
 func (c *targetRouterRecordingClient) Close() error {
 	c.closed = true
+	return nil
+}
+
+func (c *targetRouterRecordingClient) HaltForShutdown(context.Context) error {
+	c.halted = true
 	return nil
 }
 
@@ -239,6 +300,35 @@ func TestTargetRouterRoutesPlanDiffThroughStaticTarget(t *testing.T) {
 	assert.Equal(t, "orders-logical", client.planDiffReq.Database)
 	assert.Equal(t, storage.DatabaseTypeMySQL, client.planDiffReq.Type)
 	assert.Equal(t, "dsid-orders-prod", client.planDiffReq.Target)
+	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
+}
+
+// A schema file comparison reaches the resolved target's client with the
+// target's identity and its file versions intact.
+func TestTargetRouterRoutesSchemaFileComparisonThroughStaticTarget(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	resp, err := router.CompareSchemaFileChange(t.Context(), &ternv1.CompareSchemaFileChangeRequest{
+		Database:     "orders-logical",
+		Type:         storage.DatabaseTypeMySQL,
+		Environment:  "production",
+		Target:       "dsid-orders-prod",
+		ApprovedBase: "approved base",
+		Head:         "head",
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.GetSame())
+	client := created["orders-logical"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.compareReq)
+	assert.Equal(t, "orders-logical", client.compareReq.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, client.compareReq.Type)
+	assert.Equal(t, "dsid-orders-prod", client.compareReq.Target)
+	assert.Equal(t, "approved base", client.compareReq.ApprovedBase)
+	assert.Equal(t, "head", client.compareReq.Head)
 	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
 }
 
@@ -589,6 +679,52 @@ func TestTargetRouterCloseClosesCachedClients(t *testing.T) {
 	assert.True(t, created["orders"].closed)
 }
 
+// A resolved target's schema overrides must reach the LocalClient config so
+// the data-plane seam can map the canonical namespace to the physical schema.
+func TestTargetRouterPropagatesSchemaOverridesToLocalConfig(t *testing.T) {
+	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
+		"eu-bikeshare-qa": {
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			DSN:             "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": "bikeshare_eu_qa"},
+		},
+	}})
+	require.NoError(t, err)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err = router.Plan(t.Context(), &ternv1.PlanRequest{
+		Database:    "bikeshare",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "development",
+		Target:      "eu-bikeshare-qa",
+	})
+
+	require.NoError(t, err)
+	client := created["bikeshare"]
+	require.NotNil(t, client)
+	assert.Equal(t, map[string]string{"bikeshare": "bikeshare_eu_qa"}, client.schemaOverrides)
+}
+
+func TestTargetRouterPropagatesTableOwnerToLocalConfig(t *testing.T) {
+	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
+		"bikeshare": {
+			DatabaseType: storage.DatabaseTypePostgres,
+			DSN:          "postgres://engine:secret@localhost:5432/bikeshare?sslmode=disable",
+			TableOwner:   "app_owner",
+		},
+	}})
+	require.NoError(t, err)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err = router.Plan(t.Context(), &ternv1.PlanRequest{Database: "bikeshare", Type: storage.DatabaseTypePostgres, Target: "bikeshare"})
+
+	require.NoError(t, err)
+	require.NotNil(t, created["bikeshare"])
+	assert.Equal(t, "app_owner", created["bikeshare"].tableOwner)
+}
+
 func newStaticResolver(t *testing.T) *inventory.StaticResolver {
 	t.Helper()
 	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
@@ -612,7 +748,7 @@ func newTargetRouterForTest(t *testing.T, resolver inventory.Resolver, applyStor
 		Storage:  targetRouterStorage{applies: applyStore, plans: planStore},
 		Logger:   slog.Default(),
 		LocalClientFactory: func(cfg LocalConfig, _ storage.Storage, _ *slog.Logger) (Client, error) {
-			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata}
+			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata, schemaOverrides: cfg.SchemaOverrides, tableOwner: cfg.TableOwner}
 			key := cfg.Database
 			if existing := created[key]; existing != nil {
 				key = fmt.Sprintf("%s#%d", cfg.Database, len(created)+1)

@@ -45,7 +45,8 @@ type LoginResult struct {
 	IDToken      string
 	AccessToken  string
 	RefreshToken string
-	Expiry       time.Time
+	// Expiry is the ID token expiry, independent of the access token lifetime.
+	Expiry time.Time
 }
 
 // BrowserOpener opens the system browser at the given URL. Login calls it with
@@ -180,11 +181,16 @@ func Login(ctx context.Context, cfg LoginConfig, open BrowserOpener) (*LoginResu
 		return nil, errors.New("token response did not include an id_token")
 	}
 
+	expiry, err := idTokenExpiry(rawID)
+	if err != nil {
+		return nil, fmt.Errorf("read login ID token expiry: %w", err)
+	}
+
 	return &LoginResult{
 		IDToken:      rawID,
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,
-		Expiry:       token.Expiry,
+		Expiry:       expiry,
 	}, nil
 }
 

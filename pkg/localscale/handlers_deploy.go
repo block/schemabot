@@ -71,12 +71,17 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusInternalServerError, "get deploy request id: %v", err)
 	}
 
-	// Read back the assigned number.
+	// Read back the assigned number and creation time.
 	var number uint64
+	var createdAtRaw string
 	if err := s.metadataDB.QueryRowContext(r.Context(),
-		"SELECT number FROM localscale_deploy_requests WHERE id = ?", id,
-	).Scan(&number); err != nil {
+		"SELECT number, created_at FROM localscale_deploy_requests WHERE id = ?", id,
+	).Scan(&number, &createdAtRaw); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "read deploy request number: %v", err)
+	}
+	createdAt, err := deployRequestCreatedAt(createdAtRaw)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 	}
 
 	// Return immediately with "pending" — background goroutine will compute diff
@@ -86,6 +91,7 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		"branch":           body.Branch,
 		"into_branch":      body.IntoBranch,
 		"deployment_state": dr.Pending,
+		"created_at":       createdAt,
 		"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 		"approved":         false,
 		"deployment": map[string]any{
@@ -138,17 +144,26 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Read deploy request
-	var branch, ddlJSON, deployState string
+	var branch, ddlJSON, deployState, createdAtRaw string
 	var vschemaDataSQL sql.NullString
 	var autoCutover, deployed bool
+	var closedAtRaw sql.NullString
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state
+		`SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state, created_at, closed_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		org, database, number,
-	).Scan(&branch, &ddlJSON, &vschemaDataSQL, &autoCutover, &deployed, &deployState)
+	).Scan(&branch, &ddlJSON, &vschemaDataSQL, &autoCutover, &deployed, &deployState, &createdAtRaw, &closedAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
+	}
+	createdAt, err := deployRequestCreatedAt(createdAtRaw)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
+	}
+
+	if deployRequestStateFor(closedAtRaw) == deployRequestClosed {
+		return newHTTPError(http.StatusConflict, "cannot deploy: deploy request %d is closed", number)
 	}
 
 	if deployState == dr.Pending {
@@ -202,26 +217,37 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 
 	if totalDDL == 0 && !hasVSchema {
-		if err := s.execLog(r.Context(),
+		result, err := s.metadataDB.ExecContext(r.Context(),
 			`UPDATE localscale_deploy_requests
 			 SET deployed = TRUE, deployment_state = ?
-			 WHERE org = ? AND database_name = ? AND number = ?`,
+			 WHERE org = ? AND database_name = ? AND number = ?
+			 AND deployed = FALSE AND closed_at IS NULL`,
 			dr.NoChanges, org, database, number,
-		); err != nil {
+		)
+		if err != nil {
 			return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 		}
-		s.writeJSON(w, deployResponse(number, branch, dr.NoChanges))
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return newHTTPError(http.StatusInternalServerError, "read updated deploy rows: %v", err)
+		}
+		if affected == 0 {
+			return newHTTPError(http.StatusConflict, "deploy request already deployed or closed")
+		}
+		s.writeJSON(w, deployResponse(number, branch, dr.NoChanges, createdAt))
 		return nil
 	}
 
-	// Atomically mark as deployed — deployed=FALSE prevents double-deploy races.
+	// Atomically mark as deployed — deployed=FALSE prevents double-deploy races,
+	// and closed_at IS NULL keeps a deploy from landing on a deploy request a
+	// concurrent close already retired.
 	// Include timestamp to ensure uniqueness across reset-state cycles
 	// (which truncate deploy_requests and reset auto-increment numbering).
 	migrationContext := fmt.Sprintf("localscale:%d_%d", number, time.Now().UnixMilli()%1000000)
 	result, err := s.metadataDB.ExecContext(r.Context(),
 		`UPDATE localscale_deploy_requests
 		 SET deployed = TRUE, migration_context = ?, instant_ddl = ?, deployment_state = ?
-		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE`,
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE AND closed_at IS NULL`,
 		migrationContext, body.InstantDDL, dr.Submitting, org, database, number,
 	)
 	if err != nil {
@@ -229,10 +255,10 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
-		return newHTTPError(http.StatusConflict, "deploy request already deployed")
+		return newHTTPError(http.StatusConflict, "deploy request already deployed or closed")
 	}
 
-	resp := deployResponse(number, branch, dr.Submitting)
+	resp := deployResponse(number, branch, dr.Submitting, createdAt)
 	resp["approved"] = true
 	resp["html_url"] = fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number)
 
@@ -262,7 +288,9 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			s.logger.Error("deploy execution failed", "number", number, "error", err)
-			if stateErr := s.updateDeployState(s.shutdownCtx, params.ref, dr.Error); stateErr != nil {
+			// A cancel recorded while the deploy was submitting owns the
+			// outcome; the processor settles it.
+			if _, stateErr := s.advanceDeployState(s.shutdownCtx, params.ref, dr.Submitting, dr.Error); stateErr != nil {
 				s.logger.Error("failed to set error state", "number", number, "error", stateErr)
 			}
 		}
@@ -271,16 +299,40 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	return nil
 }
 
+// handleListDeployRequests serves GET /deploy-requests. It honors the branch,
+// into_branch and state query filters PlanetScale accepts, so a client that
+// asks for the open deploy requests from one branch into another gets exactly
+// those: the engine lists that way to find a deploy request an earlier drive
+// opened before creating a second one on the same branch. state is "open" or
+// "closed", as for a single deploy request.
 func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request) error {
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 
-	rows, err := s.metadataDB.QueryContext(r.Context(),
-		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible
+	query := `SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at, closed_at
 		 FROM localscale_deploy_requests
-		 WHERE org = ? AND database_name = ?
-		 ORDER BY number DESC`,
-		org, database)
+		 WHERE org = ? AND database_name = ?`
+	args := []any{org, database}
+	if branch := r.URL.Query().Get("branch"); branch != "" {
+		query += " AND branch = ?"
+		args = append(args, branch)
+	}
+	if intoBranch := r.URL.Query().Get("into_branch"); intoBranch != "" {
+		query += " AND into_branch = ?"
+		args = append(args, intoBranch)
+	}
+	switch state := r.URL.Query().Get("state"); state {
+	case "":
+	case deployRequestOpen:
+		query += " AND closed_at IS NULL"
+	case deployRequestClosed:
+		query += " AND closed_at IS NOT NULL"
+	default:
+		return newHTTPError(http.StatusBadRequest, "unknown deploy request state %q: expected %q or %q", state, deployRequestOpen, deployRequestClosed)
+	}
+	query += " ORDER BY number DESC"
+
+	rows, err := s.metadataDB.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "query deploy requests: %v", err)
 	}
@@ -289,19 +341,28 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 	var results []map[string]any
 	for rows.Next() {
 		var number int64
-		var branch, intoBranch, state string
-		var instantEligible bool
-		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible); err != nil {
+		var branch, intoBranch, state, createdAtRaw string
+		var instantEligible, instantDDL, autoCutover bool
+		var closedAtRaw sql.NullString
+		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw, &closedAtRaw); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "scan deploy request: %v", err)
+		}
+		createdAt, err := deployRequestCreatedAt(createdAtRaw)
+		if err != nil {
+			return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 		}
 		results = append(results, map[string]any{
 			"number":           number,
 			"branch":           branch,
 			"into_branch":      intoBranch,
+			"state":            deployRequestStateFor(closedAtRaw),
 			"deployment_state": state,
+			"created_at":       createdAt,
 			"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 			"deployment": map[string]any{
 				"instant_ddl_eligible": instantEligible,
+				"instant_ddl":          instantDDL,
+				"auto_cutover":         autoCutover,
 			},
 		})
 	}
@@ -321,27 +382,43 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 
-	var branch, intoBranch, state string
-	var instantEligible bool
+	var branch, intoBranch, state, createdAtRaw string
+	var instantEligible, instantDDL, autoCutover bool
+	var closedAtRaw sql.NullString
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible
+		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at, closed_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		org, database, number,
-	).Scan(&branch, &intoBranch, &state, &instantEligible)
+	).Scan(&branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw, &closedAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
+	}
+	createdAt, err := deployRequestCreatedAt(createdAtRaw)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 	}
 
 	resp := map[string]any{
 		"number":           number,
 		"branch":           branch,
 		"into_branch":      intoBranch,
+		"state":            deployRequestStateFor(closedAtRaw),
 		"deployment_state": state,
+		"created_at":       createdAt,
 		"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 		"deployment": map[string]any{
 			"instant_ddl_eligible": instantEligible,
+			"instant_ddl":          instantDDL,
+			"auto_cutover":         autoCutover,
 		},
+	}
+	if closedAtRaw.Valid && closedAtRaw.String != "" {
+		closedAt, err := time.Parse(storedTimestampLayout, closedAtRaw.String)
+		if err != nil {
+			return newHTTPError(http.StatusInternalServerError, "parse deploy request %d closed_at %q: %v", number, closedAtRaw.String, err)
+		}
+		resp["closed_at"] = closedAt.UTC().Format(time.RFC3339)
 	}
 	s.writeJSON(w, resp)
 	return nil
@@ -540,8 +617,17 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 	if p.totalDDL == 0 {
 		initialState = dr.CompletePendingRevert
 	}
-	if err := s.updateDeployState(ctx, p.ref, initialState); err != nil {
-		return fmt.Errorf("update deploy state to %s for deploy request %d: %w", initialState, p.ref.number, err)
+	// A cancel recorded while the deploy was submitting keeps its state: the
+	// processor re-issues CANCEL for the schema changes just submitted and
+	// settles the request from what they did.
+	advanced, err := s.advanceDeployState(ctx, p.ref, dr.Submitting, initialState)
+	if err != nil {
+		return fmt.Errorf("advance deploy request %d from %s to %s: %w", p.ref.number, dr.Submitting, initialState, err)
+	}
+	if !advanced {
+		s.logger.Info("deploy request changed state while its deploy was submitting; leaving it to the processor",
+			"number", p.ref.number, "migration_context", p.migrationContext)
+		return nil
 	}
 
 	s.logger.Info("deployed deploy request",

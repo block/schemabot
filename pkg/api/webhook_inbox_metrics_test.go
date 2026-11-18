@@ -53,11 +53,23 @@ func (f *fakeWebhookEventStore) MarkFailed(context.Context, int64, string, strin
 	return errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) MarkFailedPermanent(context.Context, int64, string, string) error {
+	return errors.New("unused")
+}
+
 func (f *fakeWebhookEventStore) Release(context.Context, int64, string) error {
 	return errors.New("unused")
 }
 
 func (f *fakeWebhookEventStore) HasEventForHead(context.Context, string, string, int, string) (bool, error) {
+	return false, errors.New("unused")
+}
+
+func (f *fakeWebhookEventStore) HasCoveringSuccessor(context.Context, *storage.WebhookEvent) (bool, error) {
+	return false, errors.New("unused")
+}
+
+func (f *fakeWebhookEventStore) SupersedeIfCovered(context.Context, *storage.WebhookEvent) (bool, error) {
 	return false, errors.New("unused")
 }
 
@@ -91,6 +103,7 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 			storage.WebhookEventFailedRetryable: 2,
 			storage.WebhookEventCompleted:       10,
 			storage.WebhookEventFailed:          4,
+			storage.WebhookEventFailedPermanent: 5,
 		},
 		OldestClaimableAge: 90 * time.Second,
 		StuckProcessing:    2,
@@ -138,6 +151,8 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 		"failed_retryable": 2,
 		"completed":        10,
 		"failed":           4,
+		"failed_permanent": 5,
+		"superseded":       0,
 		"unknown":          0,
 	}, depthByState)
 	assert.True(t, oldestFound)
@@ -235,6 +250,7 @@ func TestCollectWebhookInboxMetricsSkipsGaugesAndCountsFailureOnStoreError(t *te
 		}
 	}
 	assert.NotContains(t, names, "schemabot.webhook.inbox_depth", "gauges must not be re-emitted on error")
+	assert.NotContains(t, names, "schemabot.webhook.inbox_claimable_depth")
 	assert.NotContains(t, names, "schemabot.webhook.inbox_oldest_claimable_age_seconds")
 	assert.NotContains(t, names, "schemabot.webhook.inbox_stuck_processing")
 	assert.Contains(t, names, "schemabot.webhook.inbox_stats_collection_failures", "a failed snapshot must increment the failure counter")

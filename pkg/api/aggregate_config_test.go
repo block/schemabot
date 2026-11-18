@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func leaderConfig() *ServerConfig {
@@ -78,6 +79,27 @@ func TestExpectedTenantsForPR(t *testing.T) {
 		plain := &ServerConfig{Repos: map[string]RepoConfig{"octocat/shared-repo": {}}}
 		assert.Nil(t, plain.ExpectedTenantsForPR("octocat/shared-repo", []string{"services/b/x.sql"}))
 	})
+}
+
+// The leader decides whether a schema directory is some participant's to
+// manage from the expected-tenant path prefixes alone: a directory under one
+// of them belongs to that participant, a directory under none of them (the
+// repository root included) belongs to no participant, and a deployment that
+// is not the leader has no expected set to decide from.
+func TestExpectedTenantManagesSchemaPath(t *testing.T) {
+	c := leaderConfig()
+
+	assert.True(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/b/schema"))
+	assert.True(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/a"), "the prefix itself is managed")
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/d/schema"))
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "."), "a root config is under no participant prefix")
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/bb/schema"), "prefix matching is per directory, not per character")
+
+	participant := &ServerConfig{Repos: map[string]RepoConfig{
+		"octocat/shared-repo": {Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
+	}}
+	assert.False(t, participant.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/b/schema"), "only the leader holds the expected set")
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/unknown", "services/b/schema"))
 }
 
 // The leader resolves each expected participant's Check Run name from the
@@ -178,6 +200,59 @@ func TestValidateAggregateConfig(t *testing.T) {
 			err := validateAggregateConfig("octocat/r", tc.agg)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestExpectedTenantEnvironmentCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		coverage  []string
+		wantError string
+	}{
+		{name: "omitted"},
+		{name: "production only", coverage: []string{"production"}},
+		{name: "sandbox and production", coverage: []string{"sandbox", "production"}},
+		{name: "explicit empty", coverage: []string{}, wantError: "must not be empty"},
+		{name: "duplicate", coverage: []string{"sandbox", "sandbox"}, wantError: "duplicate environment"},
+		{name: "invalid", coverage: []string{"sand box"}, wantError: "must match"},
+		{name: "blank", coverage: []string{""}, wantError: "must match"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tenant := ExpectedTenant{Tenant: "tenant-a", Paths: []string{"services/a"}, CheckName: "SchemaBot A", Environments: tc.coverage}
+			err := validateAggregateConfig("octocat/repo", &AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{tenant}})
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, tenant.PublishesEnvironment("production"))
+			assert.Equal(t, tc.coverage == nil || len(tc.coverage) == 2, tenant.PublishesEnvironment("sandbox"))
+			assert.True(t, tenant.PublishesEnvironment(""), "legacy unscoped publication stays conservative")
+		})
+	}
+}
+
+func TestExpectedTenantCoverageYAML(t *testing.T) {
+	for _, tc := range []struct {
+		name, declaration string
+		want              []string
+		wantError         bool
+	}{
+		{name: "omitted"},
+		{name: "declared", declaration: "environments: [sandbox, production]", want: []string{"sandbox", "production"}},
+		{name: "empty", declaration: "environments: []", want: []string{}, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var tenant ExpectedTenant
+			require.NoError(t, yaml.Unmarshal([]byte("tenant: a\npaths: [services/a]\ncheck_name: SchemaBot A\n"+tc.declaration), &tenant))
+			assert.Equal(t, tc.want, tenant.Environments)
+			err := validateAggregateConfig("octocat/repo", &AggregateConfig{Role: AggregateRoleLeader, ExpectedTenants: []ExpectedTenant{tenant}})
+			if tc.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }

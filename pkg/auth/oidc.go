@@ -98,7 +98,7 @@ func (a *OIDCAuthorizer) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		tier := tierForRequest(r.Method, r.URL.Path)
+		tier := TierForRequest(r.Method, r.URL.Path)
 
 		user, err := a.authenticate(r.Context(), r)
 		if err != nil {
@@ -117,7 +117,7 @@ func (a *OIDCAuthorizer) Middleware(next http.Handler) http.Handler {
 		}
 
 		authDecision(r, tier, "allow", "")
-		ctx := WithUser(r.Context(), user)
+		ctx := WithVerifiedUser(r.Context(), user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

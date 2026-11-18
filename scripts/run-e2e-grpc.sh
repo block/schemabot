@@ -7,6 +7,10 @@
 
 set -e
 
+# Disable Buildx Bake on compose builds (needed when run directly, outside
+# make); see the COMPOSE_BAKE export comment in the Makefile.
+export COMPOSE_BAKE=false
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 

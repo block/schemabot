@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/metrics"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/hmarr/codeowners"
+
+	"github.com/block/schemabot/pkg/panicsafe"
 )
 
 // Review states returned by the GitHub API.
@@ -28,6 +32,9 @@ type ReviewInfo struct {
 	User        string
 	State       string // One of the Review* constants.
 	SubmittedAt time.Time
+	// CommitID is the PR head commit the review was submitted on. It is empty
+	// when GitHub reports no commit for the review.
+	CommitID string
 }
 
 // ListReviews fetches all reviews for a PR (paginated).
@@ -38,7 +45,7 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 
 	for {
 		var resp *gh.Response
-		reviews, err := retryGitHubUnavailableRead(ctx, ic.logger, "list PR reviews", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.PullRequestReview, error) {
+		reviews, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListReviews, "list PR reviews", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.PullRequestReview, error) {
 			list, listResp, listErr := ic.client.PullRequests.ListReviews(ctx, owner, repoName, pr, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -54,6 +61,7 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 				User:        r.GetUser().GetLogin(),
 				State:       r.GetState(),
 				SubmittedAt: r.GetSubmittedAt().Time,
+				CommitID:    r.GetCommitID(),
 			})
 		}
 		if resp.NextPage == 0 {
@@ -72,11 +80,21 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 // when determining the latest decisive review. On equal timestamps the later
 // entry wins, matching GitHub's chronological ordering.
 func GetApprovedReviewers(reviews []*ReviewInfo) []string {
-	type latestReview struct {
-		State       string
-		SubmittedAt time.Time
+	approvals := GetApprovedReviews(reviews)
+	approved := make([]string, 0, len(approvals))
+	for _, r := range approvals {
+		approved = append(approved, strings.ToLower(r.User))
 	}
-	latest := make(map[string]latestReview)
+	return approved
+}
+
+// GetApprovedReviews returns, for each user whose latest decisive review is
+// APPROVED, that approving review, so callers can see which commit each
+// approval was given on. Latest-decisive-review semantics match
+// GetApprovedReviewers. Approvals come in the order they were given, so
+// comments that name approvers name them the same way every time.
+func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
+	latest := make(map[string]*ReviewInfo)
 	for _, r := range reviews {
 		if r.User == "" {
 			continue
@@ -86,16 +104,22 @@ func GetApprovedReviewers(reviews []*ReviewInfo) []string {
 		}
 		key := strings.ToLower(r.User)
 		if cur, ok := latest[key]; !ok || !r.SubmittedAt.Before(cur.SubmittedAt) {
-			latest[key] = latestReview{State: r.State, SubmittedAt: r.SubmittedAt}
+			latest[key] = r
 		}
 	}
 
-	var approved []string
-	for user, info := range latest {
-		if strings.EqualFold(info.State, ReviewApproved) {
-			approved = append(approved, user)
+	var approved []*ReviewInfo
+	for _, r := range latest {
+		if strings.EqualFold(r.State, ReviewApproved) {
+			approved = append(approved, r)
 		}
 	}
+	slices.SortFunc(approved, func(a, b *ReviewInfo) int {
+		if c := a.SubmittedAt.Compare(b.SubmittedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(strings.ToLower(a.User), strings.ToLower(b.User))
+	})
 	return approved
 }
 
@@ -127,25 +151,41 @@ func (ic *InstallationClient) FetchCodeownersRuleset(ctx context.Context, repo, 
 	return nil, nil
 }
 
-// FetchCodeowners fetches CODEOWNERS from standard locations in the repo.
-// Returns all owners across all rules (not path-scoped).
-// Returns empty slice (not error) if no CODEOWNERS file exists.
-func (ic *InstallationClient) FetchCodeowners(ctx context.Context, repo, ref string) ([]string, error) {
-	ruleset, err := ic.FetchCodeownersRuleset(ctx, repo, ref)
-	if err != nil {
-		return nil, err
-	}
-	if ruleset == nil {
-		return nil, nil
-	}
-	return OwnerNames(OwnersFromRuleset(ruleset)), nil
+// UnmatchableCodeownersRuleError reports a CODEOWNERS rule the parser accepts
+// but cannot match. Error() names only the path being matched, so it can reach
+// a PR comment; Panic carries the recovered value and stack for server-side
+// logs, where the identifiers needed to triage it live.
+type UnmatchableCodeownersRuleError struct {
+	Path  string
+	Panic *panicsafe.Error
+}
+
+func (e *UnmatchableCodeownersRuleError) Error() string {
+	return fmt.Sprintf("match CODEOWNERS path %s: the CODEOWNERS file holds a rule that cannot be matched; fix the rule on the base branch", e.Path)
+}
+
+func (e *UnmatchableCodeownersRuleError) Unwrap() error {
+	return e.Panic
 }
 
 // MatchCodeownersPath finds the owners for a specific file path using CODEOWNERS rules.
 // Last matching rule wins (standard CODEOWNERS semantics).
 // Returns nil, nil if no rule matches. Returns an error if pattern matching fails.
+//
+// The parser panics on some rules it accepts, such as a bare `/ @owner`, and
+// CODEOWNERS is repository content, so a panic is returned as an
+// *UnmatchableCodeownersRuleError: the review gate then fails closed with a
+// reason instead of never answering.
 func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeowners.Owner, error) {
-	rule, err := ruleset.Match(filePath)
+	var rule *codeowners.Rule
+	recovered, err := panicsafe.Catch(func() error {
+		var matchErr error
+		rule, matchErr = ruleset.Match(filePath)
+		return matchErr
+	})
+	if recovered != nil {
+		return nil, &UnmatchableCodeownersRuleError{Path: filePath, Panic: recovered}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("match CODEOWNERS path %s: %w", filePath, err)
 	}
@@ -153,22 +193,6 @@ func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeown
 		return nil, nil
 	}
 	return rule.Owners, nil
-}
-
-// OwnersFromRuleset extracts all unique owners from a ruleset.
-func OwnersFromRuleset(ruleset codeowners.Ruleset) []codeowners.Owner {
-	seen := make(map[string]bool)
-	var owners []codeowners.Owner
-	for _, rule := range ruleset {
-		for _, o := range rule.Owners {
-			key := strings.ToLower(o.String())
-			if !seen[key] {
-				seen[key] = true
-				owners = append(owners, o)
-			}
-		}
-	}
-	return owners
 }
 
 // IsTeamOwner returns true if the owner is a GitHub team (org/team format).
@@ -190,15 +214,6 @@ func TeamParts(o codeowners.Owner) (org, slug string) {
 	return o.Value, ""
 }
 
-// ParseCodeowners parses CODEOWNERS content and returns unique owner names without @ prefix.
-func ParseCodeowners(content string) []string {
-	ruleset, err := codeowners.ParseFile(bytes.NewBufferString(content))
-	if err != nil {
-		return nil
-	}
-	return OwnerNames(OwnersFromRuleset(ruleset))
-}
-
 // OwnerNames converts a slice of codeowners.Owner to string names without @ prefix.
 func OwnerNames(owners []codeowners.Owner) []string {
 	result := make([]string, len(owners))
@@ -217,7 +232,7 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 
 	for {
 		var resp *gh.Response
-		users, err := retryGitHubUnavailableRead(ctx, ic.logger, "list team members", []any{"org", org, "team_slug", slug}, func(ctx context.Context) ([]*gh.User, error) {
+		users, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListTeamMembers, "list team members", []any{"org", org, "team_slug", slug}, func(ctx context.Context) ([]*gh.User, error) {
 			list, listResp, listErr := ic.client.Teams.ListTeamMembersBySlug(ctx, org, slug, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -240,18 +255,57 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 	return members, nil
 }
 
-// IsTeamMember returns true when login is a member of org/slug. It relies on
-// the same team-member listing used by CODEOWNERS review checks so the only
-// negative result is a readable team list that does not contain the actor.
+// IsTeamMember returns true when login is an active member of org/slug,
+// including through a child team. It reads the one membership instead of
+// listing the team, so its cost does not grow with the team's size.
+//
+// GitHub answers 404 both for a user with no membership and for a team the
+// App cannot see, so a 404 is a negative result only once the team itself
+// reads back. A team that cannot be read returns ErrTeamMembershipUnreadable,
+// never a negative result. A pending invitation is not a membership.
+//
+// Within a scope carrying the request-scoped cache (WithPRInfoCache), a
+// membership already read is answered from the cache.
 func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
-	members, err := ic.ListTeamMembers(ctx, org, slug)
-	if err != nil {
-		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, err)
-	}
-	for _, member := range members {
-		if strings.EqualFold(member, login) {
-			return true, nil
+	cache := prInfoCacheFromContext(ctx)
+	if cache != nil {
+		if member, ok := cache.getMembership(org, slug, login); ok {
+			return member, nil
 		}
+	}
+	member, err := ic.isTeamMember(ctx, org, slug, login)
+	if err != nil {
+		return false, err
+	}
+	if cache != nil {
+		cache.setMembership(org, slug, login, member)
+	}
+	return member, nil
+}
+
+func (ic *InstallationClient) isTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
+	logAttrs := []any{"org", org, "team_slug", slug, "login", login}
+	membership, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeamMembership, "get team membership", logAttrs, func(ctx context.Context) (*gh.Membership, error) {
+		m, _, getErr := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)
+		if getErr != nil {
+			return nil, classifyGitHubAPIError(getErr)
+		}
+		return m, nil
+	})
+	if err == nil {
+		return membership.GetState() == "active", nil
+	}
+	if !IsNotFoundError(err) {
+		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team membership", org, slug, err))
+	}
+	if _, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetTeam, "get team", logAttrs, func(ctx context.Context) (*gh.Team, error) {
+		team, _, getErr := ic.client.Teams.GetTeamBySlug(ctx, org, slug)
+		if getErr != nil {
+			return nil, classifyGitHubAPIError(getErr)
+		}
+		return team, nil
+	}); err != nil {
+		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, teamMembershipReadError("get team", org, slug, err))
 	}
 	return false, nil
 }

@@ -2,16 +2,61 @@
 
 SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /metrics` (Prometheus format) and optionally pushed via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
+## Process heartbeat and permanent webhook failures
+
+`schemabot.telemetry.heartbeat` is registered once during telemetry setup and
+observes `1` on every collection, without storage access or event traffic. Its
+Prometheus name is `schemabot_telemetry_heartbeat_ratio`: the exporter adds
+`_ratio` to gauges with unit `1`. Alert on its absence using
+deployment identity from infrastructure tags such as service, deployment `env`,
+tenant, and cluster. `environment="unknown"` remains a process metric attribute;
+apply and command `environment` labels continue to describe the schema target.
+The heartbeat proves metric collection for a live process, not storage, webhook
+processing, every replica, or log ingestion. Inbox snapshot failures retain their
+own counter. Verify the actual exporter names and infrastructure tags before
+activating monitors; do not sum OTLP and OpenMetrics aliases of the same data.
+
+Permanent dispatch failures use the existing `schemabot.webhook.events_total`
+counter with `status="durable_dispatch_failed_permanent"` and `failure_reason`:
+
+| Reason | Meaning |
+| --- | --- |
+| `pr_file_cap` | Typed incomplete PR-file listing; split the PR to make discovery complete |
+| `invalid_payload` | Stored delivery could not be decoded |
+| `unresolved_route` | Stored installation identity is permanently unresolvable |
+| `other` | Any unclassified permanent processing failure |
+
+The reason is emitted only after the lease-guarded permanent-failure write
+succeeds, replacing the prior event increment. Failed writes, lease loss, and
+retries emit no permanent event. Aggregate consumers retain the same metric and
+status; reason labels add no dimensions to the dispatch-duration histogram.
+Exclude only `pr_file_cap` from actionable alerts. Unknown and legacy unlabeled
+failures remain actionable during mixed-version rollout. Metrics are best-effort:
+a crash after persistence can miss a sample; stored deliveries remain authoritative.
+
+The built-in Prometheus exporter retains the counter name
+`schemabot_webhook_events_total`. It exposes the existing remote-command counters
+as `schemabot_remote_control_requests_rejected_total` and
+`schemabot_remote_control_requests_stale_resends_total`. These exceptional counters
+remain absent until an event occurs; absence is not a health signal. Confirm their
+Datadog names after collection mapping before activating alerts.
+
+The paired structured log carries `failure_reason`, delivery `origin`, and the
+existing delivery/repository/PR identifiers. For `origin="organic"`, fix the cause
+and use GitHub Redeliver. For `origin="synthesized"`, use a new head push or re-run
+the SchemaBot check to create fresh work. Origin stays out of the counter labels.
+
 ## Custom Metrics
 
 Every SchemaBot-owned metric emits a non-empty `environment` attribute. Metrics
-that are not scoped to one schema-change environment use `environment="unknown"`.
+that are not scoped to one schema change environment use `environment="unknown"`.
 Some attributes listed below are optional and only appear when that context is
 available, such as `repository`, `github_app`, and `installation_id`.
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
-| `schemabot.plans.total` | Counter | repository, database, environment, status | Total plan operations |
+| `schemabot.telemetry.heartbeat` | Observable gauge | environment | Constant `1` on every collection, including idle processes and storage outages; unit `1` |
+| `schemabot.plans.total` | Counter | repository, database, deployment, environment, status | Plan attempts, each counted once by the API; `success` only once the plan is stored |
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
 | `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
 | `schemabot.apply.duration_seconds` | Histogram | repository, database, environment, status | Apply API call time |
@@ -21,22 +66,54 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.source_policy.blocks_total` | Counter | operation, database, environment, reason | Trusted-source plan/apply requests blocked by source policy |
 | `schemabot.pr_command_actor_authorization.total` | Counter | command, database, environment, repository, status, reason | GitHub PR command actor authorization decisions |
 | `schemabot.schema_request.errors_total` | Counter | repository, command, database, environment, reason | Schema request errors by reason |
-| `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
+| `schemabot.active_applies` | UpDownCounter | database, deployment, environment | Applies holding their database: counted from acceptance until the apply settles. A stopped apply stays counted, so a value that stays non-zero can be applies parked on an operator's start or cancel rather than work in flight; a retryable pause is not counted |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
-| `schemabot.webhook.events_total` | Counter | environment, event_type, action, repository, status | GitHub webhook events |
-| `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
-| `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API responses observed by SchemaBot |
-| `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
-| `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
-| `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
+| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
+| `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action | Webhook events ignored because the repository is not configured (`action` is omitted for events that carry none, such as `push`; no `repository` label: any repository that installs the App can deliver, so the log line for each ignored event names it instead, at warn level, or at debug level for a `push` handled on the request path) |
+| `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
+| `schemabot.webhook.inbox_claimable_depth` | Gauge | environment | Rows ready to claim now; excludes scheduled work, active leases and exhausted retries. Use max across replicas sharing an inbox. |
+| `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
+| `schemabot.webhook.inbox_stuck_processing` | Gauge | environment | Durable webhook inbox rows stuck in processing past the attempt cap |
+| `schemabot.webhook.inbox_stats_collection_failures` | Counter | environment | Failed durable webhook inbox metric snapshots (liveness signal for the inbox gauges) |
+| `schemabot.webhook.check_suite_recovery_total` | Counter | environment, repository, outcome | Durable check_suite recovery outcomes (`covered`, `synthesized`, `resynthesized`, `already_queued` per candidate PR; `no_pr_at_ingress`, `no_open_pr`, `truncated` per delivery) |
+| `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
+| `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
+| `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
+| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP or local prevention; investigate shared quota usage and blocked work (see guidance below) |
+| `schemabot.github.secondary_rate_limit_cooldown_reports_total` | Counter | environment, operation, resource, github_app, installation_id, disposition | Parsed secondary cooldown decisions, including accepted and exceeded allowances |
+| `schemabot.github.wait_duration_seconds` | Histogram (seconds) | environment, operation, resource, github_app, installation_id, layer, reason | Actual elapsed outer read-retry waits, including cancellation/deadline interruptions |
+| `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
+| `schemabot.github.symlink_modes_unread_total` | Counter | environment, repository | Changed paths treated as not symlinks because GitHub refused the diff (or gave no mode for a pure rename), truncated the tree listing, and no configured schema directories bound the paths. Reading them would cost requests per non-schema file (AV-15). A nonzero rate means a symlink-only schema change in that repository may go unplanned; set `allowed_dirs` on every database the repository serves |
+| `schemabot.github.rate_limit.limit` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
+| `schemabot.github.rate_limit.remaining` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
+| `schemabot.github.rate_limit.observation_age_seconds` | Observable gauge | environment, operation, resource, github_app, installation_id | Age of the latest trustworthy installation snapshot; continues increasing during idle periods |
+| `schemabot.github.rate_limit.used` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
+| `schemabot.target.probe.total` | Counter | database_type, environment, outcome | Startup connectivity probes of enumerated targets, by outcome. This counter sits below the volume bar in [Does it belong in a metric?](#does-it-belong-in-a-metric) — one observation per target per process start — and earns its place as a deploy-time alert instead: a fleet-wide rollout produces a burst of observations at once, and any non-`success` outcome in that burst is a rotated credential, dropped grant, or unreachable target found before the first schema change reaches it. Alert on `outcome != success` per environment after each deploy. Target is omitted to bound cardinality; the paired warn log names it |
+| `schemabot.remote_control_requests.rejected_total` | Counter | operation, engine, database, deployment, environment | Control requests a remote data plane accepted and its own driver then failed, mirrored back so the operator learns the command never took effect — see [Control Operations](#control-operations) |
+| `schemabot.remote_control_requests.stale_resends_total` | Counter | operation, database, deployment, environment | Retransmissions of a stop/cancel request the data plane accepted but has not consumed past the stale threshold — see [Control Operations](#control-operations) |
+| `schemabot.target.client_evictions.total` | Counter | database_type, environment, reason | Data-plane client generations the target router replaced. `dsn_changed` is a resolver returning a new connection identity for a route (a credential rotation under `dsn_from`); a rate well above the rotation cadence means the resolver's DSN is unstable and clients are being rebuilt per request. `auth_invalid_credentials`, `auth_no_access`, and `auth_no_database` are a routed read failing target authentication on the generation, which the router evicts before its single retry; alert on these as well as `dsn_changed` to see credential failures. Target is omitted to bound cardinality; the paired info log names it |
+| `schemabot.target.auth_retries.total` | Counter | operation, database_type, environment, classification, outcome | Single automatic retries of routed reads after an authentication-classified target failure, by outcome: `success`, `failed`, `resolve_error` (the target could not be re-resolved or its client rebuilt), or `suppressed` (a failed retry armed the route's cooldown and this read returned the failure without retrying). A sustained `failed` or `suppressed` rate means target credentials or grants are unstable; target is omitted to bound cardinality and the paired log names it |
+| `schemabot.remote_apply_dedup_total` | Counter | database, environment, outcome | Idempotency-keyed dispatches replayed against their existing operation on the keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
+| `schemabot.remote_apply_attach_total` | Counter | database, environment, outcome | Sibling dispatches resolved into an existing deployment-keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
+| `schemabot.remote_apply_key_echo_mismatch_total` | Counter | database, environment | Remote dispatches refused fail-closed because the data plane's accepted response echoed a different operation key than the dispatch derives — see [Remote Apply Attaches](#remote-apply-attaches) |
+| `schemabot.remote_apply_deployment_id_conflict_total` | Counter | database, environment, deployment | Remote dispatch results refused fail-closed because the deployment already correlates to a different remote apply id — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
+| `schemabot.auth_decisions.total` | Counter | tier, decision, reason | Every `/api` request's admission decision at the auth middleware. See [API Auth Decisions](#api-auth-decisions) |
+| `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
+| `schemabot.rate_limit_decisions.total` | Counter | endpoint, scope, environment, decision | API request-budget decisions on rate-limited endpoints. `scope` is which budget was consulted (`caller` or `target`) and `decision` is `allow` or `limit`, so the limited rate has a denominator and a client approaching its budget is visible before it is turned away. The caller identity and target database are deliberately absent (hundreds of each); a limited request logs both — see [Rate Limits](#rate-limits) |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
 | `schemabot.operator.claim_duration_seconds` | Histogram | database, environment, previous_state | Operator claim and resume duration |
+| `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed (sampled; capped at 500, so a value of 500 means "at least 500") |
+| `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
+| `schemabot.operator.stranded_operations_reaped_total` | Counter | database, deployment, environment, parent_state | Pending apply operations the reaper settled from an already-settled parent apply. `deployment` is the reaped operation's own. A one-time burst is the historical backlog draining; a climbing rate means a producer is terminalizing parents without settling their children |
+| `schemabot.engine.unrecognized_task_status_total` | Counter | database, database_type, engine, environment | Engine- or data-plane-reported task statuses with no task-state mapping. The fail-open default renders the affected work as Running, so any sustained rate means an engine or data-plane version introduced a status SchemaBot cannot classify — add an explicit mapping in `pkg/state`. The status itself is not an attribute: it is engine-controlled text with no bound on distinct values, and this counter fires only during a mapping gap. The paired drive warn carries the raw status with the task identifiers |
+| `schemabot.storage_schema.destructive_refusals_total` | Counter | table, operation, environment | Destructive storage-schema DDL statements the startup bootstrap (`EnsureSchema`) refused to execute. A refused statement does not run at all, so this counts statements the storage schema is still missing. A nonzero rate means a starting binary's embedded schema no longer declares a table, column, index, or constraint that exists in the storage database — expected briefly from older pods during a rolling deploy or rollback. `environment` is always `unknown`: the bootstrap precedes any schema change environment |
+| `schemabot.drop_table.already_absent_total` | Counter | database, environment | DROP TABLE targets that were already absent when the apply reached them |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
 | `schemabot.pending_drops.cleanup_dropped_total` | Counter | database, environment | Expired quarantined tables permanently dropped by the cleaner |
 | `schemabot.pending_drops.cleanup_skipped_total` | Counter | database, environment | Quarantined tables skipped by the cleaner due to unparseable names |
@@ -44,6 +121,17 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.pending_drops.cleanup_errors_total` | Counter | database, environment, reason | Pending drops cleanup failures (retried on the next pass) |
 
 > **Deprecated aliases:** the `schemabot.scheduler.*` series (`resumed_total`, `resume_failures_total`, `claim_failures_total`, `claim_duration_seconds`) is still emitted alongside the `schemabot.operator.*` series for one release so dashboards and alerts can migrate. The scheduler-named series will be removed afterward.
+
+> **Dispatch started-vs-outcomes ledger:** every durable dispatch claim records the `durable_dispatch_started` status on `schemabot.webhook.events_total` and exactly one outcome on `schemabot.webhook.dispatch_duration_seconds`, so a sustained gap between the two means drivers are dying mid-claim without recording anything. The two instruments only share the `event_type` dimension (`events_total` additionally carries `app_name`, `action`, and `repository`; the duration histogram deliberately carries none of those — a histogram costs an order of magnitude more series per attribute combination than a counter), so the subtraction is only valid after aggregating both sides down to `event_type`. In Datadog:
+>
+> ```
+> sum:schemabot.webhook.events_total{status:durable_dispatch_started} by {event_type}.as_count()
+>   - sum:schemabot.webhook.dispatch_duration_seconds.count{*} by {event_type}.as_count()
+> ```
+>
+> The ledger cannot be sliced by app, action, or repository — the started side has those dimensions but the outcome side does not. To attribute a gap to a repo or PR, pivot to the driver logs: every dispatch outcome path logs `delivery_id`, `repo`, and `pr`.
+
+> **`stuck_pending_applies` is per-pod, not fleet-wide:** every pod running the server runs the stuck-pending monitor (there is no leader election, matching the inbox-depth and health monitors), so each pod reports the same DB-wide count as its own series. Aggregate with `max()`/`avg()`, not `sum()`, and expect the paired WARN log to fire from every pod each scan while anything is stuck.
 
 ### Attribute Values
 
@@ -61,43 +149,73 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **reason** (source policy): `missing_server_config`, `missing_database_config`, `missing_repository`, `missing_pull_request`, `missing_schema_path`, `unauthorized_repo`, `unauthorized_schema_dir`, `unknown`
 
-**command** (PR command actor authorization): `apply`, `apply_confirm`, `rollback`, `rollback_confirm`, `unlock`, `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `unknown`
+**command** (PR command actor authorization): `apply`, `apply_confirm`, `rollback`, `rollback_confirm`, `unlock`, `cutover`, `stop`, `start`, `revert`, `skip_revert`, `unknown`
 
 **status** (PR command actor authorization): `allowed`, `denied`, `error`, `skipped`, `unknown`
 
-**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
+**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_repo_admin_team`, `allowed_repo_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
 
-**operation** (check ownership): `apply_finished`, `rollback_finished`
+**operation** (check ownership): `apply_finished`, `apply_cancelled_finished`, `rollback_finished`
 
-**operation** (status checks): `plan_check_recorded`, `apply_started`, `apply_finished`, `rollback_finished`, `aggregate_check_sync`, `stale_check_cleanup`, `stale_check_reconciliation`, `schema_config_discovery`, `schema_config_source_policy`, `schema_config_environment_validation`
+**operation** (status checks): `plan_check_recorded`, `apply_started`, `apply_finished`, `apply_cancelled_finished`, `rollback_finished`, `aggregate_check_sync`, `stale_check_cleanup`, `stale_check_reconciliation`, `schema_config_discovery`, `schema_config_source_policy`, `schema_config_environment_validation`
 
 **status** (status checks): `success`, `error`, `skipped`, `stale`, `noop`, `blocked` (operation outcome, not GitHub Check Run conclusion)
 
-**operation** (control): `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `rollback_plan`
+**operation** (control): `cutover`, `stop`, `start`, `revert`, `skip_revert`, `release`, `rollback_plan`
 
 **status** (control): `success`, `error`, `rejected`
 
+**engine** (control): the engine that rejected the command, as recorded on the apply (for example `spirit`, `planetscale`)
+
 **operation** (locks): `acquire`, `release`
 
-**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `error`
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `error`
 
-**event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `ping`, `push`
+**event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 
 **action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 
-**status** (webhooks): `processed`, `invalid_signature`, `ignored`
+**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team_membership`, `graphql_status_check_rollup`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**state** (webhook inbox): `pending`, `processing`, `failed_retryable`, `completed`, `failed`, `failed_permanent`, `superseded`, `unknown`
+
+**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
+
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
 **resource** (GitHub API): `core`, `graphql`, `search`, `code_search`, `integration_manifest`, `source_import`, `code_scanning_upload`, `actions_runner_registration`, `scim`, `dependency_snapshots`, `dependency_sbom`, `audit_log`
 
-**status** (GitHub API): `success`, `error`, `unknown`
+**status** (GitHub API): `success`, `error`, `not_found` (a 404 answer to a read operation — an expected "no" from probes like schemabot.yaml lookups; 404s on auth and write operations stay `error`), `transport_error` (no HTTP response: dial/TLS failure or deadline — the signature of GitHub being unreachable), `cancelled` (SchemaBot cancelled the request itself, e.g. during shutdown), `suppressed` (a write SchemaBot refused to send because the repository is `listen_only`; it never reached GitHub), `unknown`
 
-**reason** (operator claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `unknown`
+**reason** (operator claim failures): `expire_retryable_error`, `expire_degraded_retry_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `stranded_active_task_reaper_error`, `stranded_control_request_reaper_error`, `branch_reconcile_error`, `unknown`
 
-**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
+**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `lease_presumed_lost`, `retry_budget_exhausted`, `recovery_window_expired`, `drive_panic`, `drive_stalled`, `operation_no_tasks`, `apply_tasks_not_loaded`, `apply_task_row_missing`, `task_requeue_refused` (storage refused the write putting a task back to `pending` for a retry or a start; the task row stays at rest and the next claim retries the requeue), `task_verdict_refused` (storage refused the write recording a task's terminal outcome; the apply stays active, an operation drive's row is left claimable, and the next claim settles the apply from the stored task rows), `remote_operation_never_starts` (the data plane settled the remote apply a rollout member belongs to before that member started, so it will never run there; the drive settled the member's tasks the way the remote apply settled and the rollout derives its verdict from them), `remote_dispatch_unresolved` (a drive re-sent the dispatch of active work whose remote apply id never reached storage, and the data plane gave no verdict; the apply stays active with its attempt unchanged and the next claim, about once per lease staleness window, re-sends the same idempotency key, so a sustained rate means a data plane that is not answering), `post_terminal_reconcile` (the drive stored the apply's terminal outcome but an answer owed after it, such as completing the pending start, did not land; the operator's post-drive settlement retries it, and the reaper's stranded control-request sweep answers what that settlement could not once the apply is quiescent)
+
+**operation** (storage schema refusals): `alter`, `drop` — the statement types the plan's linters can flag as unsafe
+
+### Webhook Ownership Rejections
+
+A webhook whose signing App does not own the target repository is rejected with
+401 and counted on `schemabot.webhook.events_total` under one of two statuses.
+They separate routine traffic from an actionable trust-boundary signal, so alert
+on the second and never on the first:
+
+| Status | Meaning | Operator action |
+|---|---|---|
+| `repo_not_configured` | The repository has no entry in `repos:` at all. A shared App forwards deliveries for every repository it is installed on, so this is expected background traffic. | None. Onboard the repository if the deliveries were meant to be handled. |
+| `app_repo_mismatch` | The repository *is* declared, but the App that signed the delivery is not the App configured to own it. This is config drift or a hostile install. | Investigate: compare the delivery's `app_name` against the repository's `github_app:` mapping. |
+
+`repo_not_configured` deliberately carries **no `repository` attribute** —
+unmanaged repository names are unbounded and would blow up the metric's
+cardinality. Do not build a query that facets `repo_not_configured` by
+repository; the rejection's debug log line carries the repository name for
+one-off triage. `app_repo_mismatch` does carry `repository`, because a declared
+repository is a bounded set.
+
+Both statuses are rejections: the request fails closed with 401 either way, and
+the severity split exists only so a warn-level triage scan stays actionable.
 
 ### Check Ownership Misses
 
@@ -114,6 +232,7 @@ Operation values:
 | Operation | Meaning |
 |---|---|
 | `apply_finished` | A driver tried to record a terminal apply result, but the stored check state no longer belonged to that apply. |
+| `apply_cancelled_finished` | A driver tried to record a cancelled forward apply result, but a newer apply superseded the cancellation. |
 | `rollback_finished` | A rollback driver tried to mark the check `action_required`, but the stored check state no longer belonged to that rollback apply. |
 
 A spike is still dangerous because the live database can keep changing after the
@@ -166,11 +285,12 @@ Operation values:
 | `plan_check_recorded` | SchemaBot stored per-database check state for a plan result. This is the internal state later rolled into the aggregate GitHub Check Run. |
 | `apply_started` | SchemaBot marked stored check state as owned by an accepted apply and set it to `in_progress`. This is a check lifecycle event, not proof that the engine has started copying rows. |
 | `apply_finished` | SchemaBot updated stored check state after an apply reached a terminal state, such as success or failure. |
+| `apply_cancelled_finished` | SchemaBot finalized a cancelled forward apply, either releasing ownership when no task completed or retaining a terminal failure when part of the schema change reached the target. |
 | `rollback_finished` | SchemaBot marked stored check state `action_required` after a rollback succeeded because the PR's desired schema is no longer present in that environment. |
 | `aggregate_check_sync` | SchemaBot tried to make the visible aggregate GitHub Check Run match stored per-database check state. The status label says whether it created/updated, skipped, blocked, or failed. |
 | `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |
 | `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a driver restart, crash, or race. |
-| `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. |
+| `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. `status="blocked"` means discovery could not run against a complete changed-file list — today that is a PR over GitHub's per-PR file cap — so the aggregate fails closed instead of planning from a partial diff. |
 | `schema_config_source_policy` | SchemaBot evaluated whether a discovered `schemabot.yaml` path is inside this repository's server-owned `allowed_dirs` boundary. `status="skipped"` means the config is outside the managed paths and was ignored; `status="error"` means the config is in a managed path but cannot be routed safely. |
 | `schema_config_environment_validation` | SchemaBot found schema changes but none of the database's server-configured environments are allowed for this deployment, so it failed the aggregate check closed. |
 
@@ -181,17 +301,44 @@ still matters. For example, commit A can add a schema change and start an apply,
 then commit B can remove that schema change before the apply finishes. SchemaBot
 blocks the aggregate Check Run for commit B until an operator decides whether
 the target environment needs another apply, a rollback, or manual reconciliation.
+
+`status="blocked"` for `operation="schema_config_discovery"` is a different
+signal: it counts PRs so large that GitHub will not report their full
+changed-file list, so it tracks PR size rather than stored-state trouble. It is
+deterministic per PR — the same PR blocks on every delivery until it is split —
+and the author is told to split the PR, so no operator action is needed unless
+the rate is high enough to suggest a repository routinely opening PRs SchemaBot
+cannot plan. Pair it with `schemabot.github.pr_file_cap_exceeded_total`, whose
+`schema_visible` label says how many of those PRs looked schema-related.
+
 A spike in `status="error"` usually points to storage or GitHub API failures and
 should be investigated before relying on branch-protection state.
 
 ### GitHub API Usage
 
-`schemabot.github.rate_limit.remaining` is the most direct primary-rate-limit
-signal. Group it by `github_app`, `installation_id`, and `resource` to see which
-GitHub App deployment, installation, and rate-limit bucket is closest to
-exhaustion. The same labels on `schemabot.github.rate_limit.limit` and
-`schemabot.github.rate_limit.used` show the observed budget size and consumption
-for the latest response.
+`schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}`
+reports the latest trustworthy installation budget, without a repository label.
+Group by `github_app`, `installation_id`, and `resource`, taking the minimum
+across replicas. Snapshots require a named App, positive installation ID, valid
+remaining/limit headers, and a future reset time. They disappear from collection
+when older than 120 seconds or when their reset time passes. Repeated scrapes,
+local quota refusals and secondary cooldown waits do not refresh observation age.
+Older reset windows and delayed larger allowances within a window cannot replace
+a depleted snapshot. Within one window, a lower allowance wins even when it is
+recorded out of receipt order; its original receipt time still controls expiry.
+A new window can increase the allowance.
+
+`schemabot.github.rate_limit.observation_age_seconds` continues increasing after
+snapshot expiry. Above 120 seconds the budget is unknown; idle installations
+legitimately reach this state. Endpoint heartbeat monitoring independently covers
+missing scrapes. Missing quota must not be interpreted as zero or recovery.
+
+The other operation/repository series on `remaining`, `limit` and `used` retain
+the latest diagnostic response values; they can be stale and must not enter a
+quota paging query. All three are observable gauges, registered once with
+`RegisterGitHubRateLimitMetrics` when installing the global metrics provider;
+provider callbacks own the collection state. Server telemetry registers them
+automatically. Embedders configuring their own provider must register them too.
 
 `schemabot.github.requests_total` is the request-volume signal. Group it by
 `category` to separate ordinary reads from content-generating writes. The
@@ -200,9 +347,16 @@ content-generation limits, because those limits are enforced separately from
 the primary hourly remaining count and are not exposed as a remaining-budget
 header.
 
+For error alerting, `status:error` covers HTTP failure responses (including
+404s on auth and write operations, such as token exchanges against a suspended
+App installation) and `status:transport_error` covers GitHub being unreachable.
+Alert on both. `not_found` and `cancelled` are expected in routine operation
+and should stay out of error-rate alerts; the `operation` label disaggregates
+when a `not_found` rate looks anomalous.
+
 Useful dashboard views:
 
-1. Minimum `schemabot.github.rate_limit.remaining` by `github_app`,
+1. Minimum `schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}` by `github_app`,
    `installation_id`, and `resource`.
 2. Request rate from `schemabot.github.requests_total` by `category`,
    `operation`, and `status`.
@@ -222,12 +376,67 @@ Operation values:
 | `cutover` | Trigger cutover for an apply that is waiting for cutover confirmation. |
 | `stop` | Request that the engine stop an apply. |
 | `start` | Request that the engine start or resume an apply. |
-| `volume` | Change the engine's throttling or volume setting for an apply. |
 | `revert` | Request that the engine revert an apply. |
 | `skip_revert` | Skip the post-deploy revert window for an apply. |
+| `release` | Release a rollout paused after a failure so the remaining work proceeds. |
 | `rollback_plan` | Generate a rollback plan from a previous completed apply. |
 
-### Lock Operations
+`schemabot.remote_control_requests.rejected_total` counts the same operations
+from the other side: a control request the data plane acknowledged and its own
+driver then failed. Acceptance only means the request was queued, so without
+this mirror the operator is told the command succeeded and never learns the
+effect did not land. A non-zero rate names the operation and `engine` that is
+refusing operator commands — chart it by operation to see which control surface
+is unsupported or broken on that engine, and read the apply log entry recorded
+alongside it for the engine's own reason.
+
+`schemabot.remote_control_requests.stale_resends_total` counts the case in
+between: the data plane accepted a stop or cancel and has neither consumed nor
+failed it past the stale threshold, so the control plane retransmits it. A
+rejection is an answer; this is silence. A non-zero rate means an accepted
+operator command is not taking effect and the apply will not converge until the
+data plane's own driver can consume it — its logs carry the failing consume
+error.
+
+### Remote Apply Attaches
+
+When a dispatch's idempotency key already maps to an apply, the data plane
+resolves the dispatch by its derived operation key: a matching operation row is
+an idempotent replay (counted on `schemabot.remote_apply_dedup_total`, with
+`outcome` naming the path that resolved the key — `hit`, `conflict_race`,
+`create_race`, or `key_collision_refused`; `create_race` covers a winner found
+at the create itself and one found after this dispatch's drift check failed
+because the winner had already run the change), and a missing row attaches the
+dispatch as a new sibling
+operation, counted on `schemabot.remote_apply_attach_total`:
+
+| Outcome | Meaning | Operator action |
+|---|---|---|
+| `attached` | A sibling dispatch added its operation and tasks to the deployment's shared keyed apply. | None — this is the normal fan-out event; its rate tracks sharded dispatch volume. |
+| `attach_race` | A concurrent same-operation attach won, found either at the unique-index insert or after this dispatch's drift check failed, and the dispatch was resolved to the winner's row. | None in isolation — the dispatch replayed the winner. A sustained rate means a caller is double-dispatching the same operation; the paired info log carries the apply and operation key. |
+| `terminal_refused` | The shared apply was already terminal, so the attach was refused fail-closed. | Investigate: the deployment's remaining operations cannot join a finished apply. The caller must re-dispatch under a fresh generation; the paired warn log names the apply, its state, and the refused operation key. |
+
+On the control plane, `schemabot.remote_apply_key_echo_mismatch_total` counts
+dispatches whose accepted response echoed a different operation key than the
+request's shape derives to, so the control plane refused the response's remote
+ids and failed the dispatch closed. A non-zero rate means a data plane is
+answering deployment-keyed dispatches without resolving them by operation key —
+most often a data plane running a version that predates sibling-operation
+attach. The operator action is to upgrade (or roll back) the named database's
+data plane so both planes derive the same key, then retry the blocked applies;
+the paired error log carries the apply, the dispatched operation key, and the
+echoed key.
+
+`schemabot.remote_apply_deployment_id_conflict_total` counts dispatch results
+the control plane refused because storing them would correlate one deployment
+to two remote applies. All operations of a deployment attach into the
+deployment's single data-plane apply and record the same remote apply id, so a
+second id means the planes diverged — an in-flight apply spanning a
+dispatch-key rollout, or a data plane that lost its keyed apply and minted a
+fresh one. The operator action is to inspect the named database's apply
+operations (the paired error log carries the recorded and refused ids), decide
+which remote apply is authoritative, and re-dispatch under a fresh generation
+once the planes agree.
 
 `schemabot.lock_operations_total` tracks database-level lock acquisition and
 release attempts.
@@ -239,21 +448,159 @@ Operation values:
 | `acquire` | Try to acquire the database lock for a plan/apply workflow. |
 | `release` | Try to release the database lock, either by owner or administrative override. |
 
+### API Auth Decisions
+
+`schemabot.auth_decisions.total` records the auth middleware's decision for
+every `/api` request, before any handler runs. It is the top of the funnel:
+[Direct Write Authorization](#direct-write-authorization) below only sees the
+write-tier requests this counter has already admitted. Exempt paths (`/livez`,
+`/health`, `/tern-health/*`, `/webhook`) are not counted.
+
+`tier` is `read` or `write` (see [auth.md](../../docs/auth.md#the-two-tier-api-model)
+for how a route is classified), `decision` is `allow` or `deny`, and `reason`
+says why. Allows carry an empty reason on a normally authenticated request;
+the two named allow reasons are the ones an operator should watch:
+
+| Reason | Decision | Meaning |
+|---|---|---|
+| `auth_disabled` | allow | `auth.type` is `none`. A non-zero `tier=write` rate here is unauthenticated mutation. |
+| `loopback_source` | allow | A forward-auth request whose trust anchor was satisfied from a loopback address, so the identity headers were caller-supplied. The break-glass path. |
+| `unauthenticated` | deny | No usable credential (OIDC: missing or invalid token). |
+| `not_admin` | deny | Write-tier request whose groups grant no write access: under OIDC no admin team, under forward-auth neither `write_groups` nor any database's `operator_groups`. |
+| `untrusted_proxy` | deny | Forward-auth request that did not arrive through a trusted proxy. |
+| `no_identity` | deny | Trusted proxy, but the user header was empty. |
+| `not_authorized` | deny | Forward-auth read-tier request from a caller in none of `read_groups`, `write_groups`, or `operator_groups` while `read_groups` narrows reads. |
+| `no_service_identity` | deny | Gateway lane: a listed gateway forwarded no caller SPIFFE ID. |
+| `service_not_authorized` | deny | Gateway lane: the forwarded caller is not in `read_service_spiffe`. |
+| `service_caller_write` | deny | Gateway lane: a service caller attempted a write-tier request. |
+
+A rising `deny` rate under one reason is either a probe or a missing grant.
+Every deny is also logged with the subject and path, so a single denied
+request is triaged from the log line, not from the counter.
+
+### Direct Write Authorization
+
+`schemabot.direct_write_authorization.total` tracks per-database direct-write
+(CLI/API) authorization decisions made at the handler layer, after the
+forward-auth middleware has admitted the caller to the write tier. A spike in
+`status=denied` means scoped operators are attempting operations outside their
+grant — the `reason` attribute says whether the target database, the
+environment, or the group membership mismatched.
+
+Status values: `allowed`, `denied`, and `skipped`. A `skipped` decision made no
+per-database ruling: either the scoped lane is disabled and the plain admin gate
+applied (`scoped_lane_disabled`), or the target database could not be resolved
+and the request was rejected by the operation's own error path instead
+(`target_unresolved`). A sustained `target_unresolved` rate means stored-plan
+lookups are failing on the authorization path. The paired log names the plan id
+in both cases: an ERROR carrying the storage error when the lookup failed, or a
+WARN when the plan does not exist.
+
+Reason values:
+
+| Reason | Meaning |
+|---|---|
+| `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `target_unresolved` | The stored plan named by the request failed to load or does not exist, so no target database was available to authorize against. |
+| `admin_allow` | Allowed via deployment `write_groups` membership. |
+| `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
+| `missing_identity` | No authenticated user in the request context. |
+| `not_admin` | Caller is not in `write_groups` (and, for admin-only operations, has no other path). |
+| `not_database_operator` | Caller's groups do not match the target database's `operator_groups`. |
+| `environment_not_allowed` | Target environment is outside `operator_environments`. |
+| `missing_database_config` | The target database is not configured. |
+
+Operation names mirror the mutating endpoints (`plan`, `apply`, control
+operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
+admin-only `checks_*`, `webhook_redrive`, `settings_set`). Unrecognized
+operation, status, or reason values are recorded as `unknown` to keep
+cardinality bounded. `database` and `environment` use the `unknown` sentinel
+when the operation has no such dimension (admin-only operations have no single
+target database; lock operations have no environment) or when the request
+failed before the target resolved.
+
+### Rate Limits
+
+`schemabot.rate_limit_decisions.total` tracks the request-budget decisions made
+by `POST /api/pull` and `GET /api/checks/inspect`. Both outcomes are counted, so
+`decision=limit` has a denominator and a client approaching its budget shows up
+as a rising share of one endpoint's traffic before any request is refused.
+
+`scope` says which budget was consulted. Pull requests consult both scopes;
+check inspection has only a caller budget.
+
+| Scope | Keyed on | A sustained `limit` rate means |
+|---|---|---|
+| `caller` | The authenticated subject (an operator's identity, or a service caller's SPIFFE ID) | One client is looping. Find it in the paired WARN log's `caller` attribute before raising the budget. |
+| `target` | The database and environment being read | A database is absorbing more schema reads than the budget allows, from any number of clients. Check whether the reads are legitimate before raising it. |
+
+The caller identity and target database are deliberately not metric
+attributes — there are hundreds of each, and the counter would carry a series
+per client per database. Every limited request logs both alongside the
+advertised retry delay, so a spike on this counter is triaged from the WARN
+logs, not by slicing the metric.
+
+`environment` is clamped to a configured environment before it is recorded and
+appears as `unconfigured` otherwise. Pull budgets are still keyed on the
+environment the request named, so a rising `unconfigured` share on that
+endpoint means clients are asking for environments this server does not serve.
+Check inspection validates the environment before recording or spending its
+budget. The unclamped name is in the log.
+
+Budgets are enforced per server process, so a fleet-wide `limit` rate is the sum
+across replicas and the effective ceiling is `replicas ×` the configured rate.
+See [Rate Limits](../../docs/configuration.md#rate-limits) for the config.
+
 ## HTTP Server Metrics
 
 The `otelhttp` middleware automatically produces standard HTTP metrics for every endpoint:
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
-| `http.server.request.duration` | Histogram | environment, http.request.method, http.response.status_code | Request latency by method and status code |
+| `http.server.request.duration` | Histogram | environment, http.request.method, http.response.status_code, http.route | Request latency by method, status code, and route |
 | `http.server.request.body.size` | Histogram | environment | Request body sizes |
 | `http.server.response.body.size` | Histogram | environment | Response body sizes |
 
 SchemaBot attaches `environment="unknown"` to these process-wide HTTP metrics
-because routing-level request metrics do not belong to one schema-change
+because routing-level request metrics do not belong to one schema change
 environment. Environment-specific operation metrics use the real environment.
 
+`http.route` is the route pattern the request matched, such as
+`/api/history/{database}`, never the request path, so its values are bounded by
+the route table. It is set for requests the auth middleware rejects as well as
+ones it lets through. A request that matches no route omits it.
+
 ## Adding New Metrics
+
+### Does it belong in a metric?
+
+Metrics earn their place on volume. A rate, a trend, or a threshold only means
+something when the underlying event happens often enough to have a baseline:
+retry storms, claim contention, throttling, error rates on a hot path. A counter
+for a rare dangerous branch reads zero for weeks, so there is nothing to alert
+against, and an increment tells an operator far less than the `slog.Warn` or
+`slog.Error` beside it, which already carries the identifiers, the affected
+objects, and the reason. Log the rare branch well and leave it there — a
+log-based monitor can still count it if that day arrives.
+
+Adding a status, reason, or outcome value to an existing counter is a different
+decision from adding an instrument, and is usually the right one. The hot-path
+counter already has the baseline, so the rare case becomes an alertable slice of
+it instead of a series that is almost always zero: `app_repo_mismatch` on
+`schemabot.webhook.events_total` is the shape to copy — it shares a series with
+every other webhook outcome, which is what makes "the second one, never the
+first" expressible as an alert.
+
+Several counters here predate this bar and would not be added today —
+`schemabot.check_ownership_misses_total` and
+`schemabot.promotion.config_error_blocks_total` among them. They stay because
+removing an emitted series breaks whatever consumes it, not because they are the
+pattern to follow.
+
+This is the reasoning behind the *Metrics are for what can go haywire* item in
+[AGENTS.md](../../AGENTS.md) § PR Self-Review Bar.
+
+### The recipe
 
 Define recording functions in `metrics.go` following the existing pattern:
 
@@ -277,3 +624,63 @@ func RecordXxx(ctx context.Context, database, environment, status string) {
 ```
 
 The OTel SDK deduplicates instruments with the same name, so calling `Int64Counter` on every invocation is safe and cheap after the first registration.
+
+## GitHub quota, cooldown reports and retry waiting
+
+HTTP attempt metrics remain unchanged. A primary quota rejection increments
+`primary_rate_limit_rejections_total` once at its producing layer, with
+`origin=http` for an actual quota response and `origin=local` for a prevented
+request. A bypass advisory is not a local rejection. Generic permission failures
+remain HTTP errors. HTTP-origin quota rejections intentionally overlap HTTP
+errors; never add these counters together into one error total.
+Quota refusals with a missing or unrecognized resource header still count as
+HTTP-origin rejections with `resource=unknown`; their response handling is unchanged.
+
+Each HTTP-origin primary quota detection also emits a `GitHub primary quota exhausted`
+warning with `repo`, `operation`, `github_app`, `installation_id`, `resource`, and
+`reset_time` (UTC). Local refusals do not emit this warning. Missing or unfamiliar
+resources use `unknown`; requests without repository attribution use `repo=unknown`.
+Repeated HTTP detections can still produce repeated warnings, including for
+unknown buckets that the limiter cannot cache.
+
+On a quota alert, find this warning for the installation/resource and check the
+reset time. The logged repository encountered exhaustion; it is not necessarily
+the repository that consumed the shared budget. Compare `requests_total` volume
+by repository and operation for that installation/resource before exhaustion to
+locate excess traffic, then reduce avoidable requests or repeated redrives. After
+reset, verify fresh successful checks for affected repositories before declaring
+recovery. Keep the rejection counter as the direct alert signal, including
+locally blocked calls; use the warning for investigation context.
+
+Secondary limiter callbacks emit one report with disposition: `accepted`,
+`single_sleep_limit_exceeded`, or `total_sleep_limit_exceeded`. The existing
+five-second per-sleep allowance is unchanged. No total allowance is enabled in
+production; the internal constructor registers its callback together with any
+explicit total allowance. Callers supplying dependency context overrides must
+retain the instrumentation callbacks when overriding allowances.
+
+These are limiter decisions before any sleep. One accepted report can delay
+many callers; shared waiters and cancelled inner sleeps add no reports. Declined
+cooldowns can report repeatedly during one throttling episode. Display report
+counts separately by disposition. Alert tuning initially selects only repeated
+`single_sleep_limit_exceeded` reports; accepted reports stay diagnostic.
+
+`wait_duration_seconds` observes only positive outer waits at `layer=read_retry`,
+with `reason=secondary_rate_limit` for typed secondary errors or
+`reason=transient_error` otherwise. Its count/distribution describe individual
+waits; its sum is aggregate actual caller-seconds and includes interrupted waits.
+A killed process can lose an in-flight observation. Do not infer final logical
+operation failure rates from cooldown reports or outer waits. Retry policy and
+dependency versions are unchanged.
+
+All three instruments omit repository, PR, SHA, reset timestamps and error text.
+Unavailable App/installation/resource/operation identities use explicit `unknown`.
+The Prometheus registry exports the counter names with dots replaced by
+underscores (retaining `_total`), and the histogram as
+`schemabot_github_wait_duration_seconds_{bucket,sum,count}`. Datadog collection
+can rename these; verify each org's counter, sum and count mappings in staging.
+Never sum dotted OTLP and OpenMetrics aliases. Event-driven absence is not a
+health signal; retain heartbeat coverage. Baseline cooldown reports and outer
+waiting separately before choosing warning thresholds. Quota silence alone does
+not prove blocked checks recovered: verify fresh successful work for the same
+installation/resource.

@@ -3,10 +3,17 @@ package schema
 import (
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 )
 
+// EmptyNamespaceDeclaration keeps an explicitly empty namespace in version
+// control. It is metadata for grouping, not a SQL statement sent to an engine.
+const EmptyNamespaceDeclaration = "-- This namespace is empty. Add CREATE TABLE declarations here.\n"
+
 // GroupFilesByNamespace groups schema files by namespace using their relative paths.
+// An explicit empty-namespace marker retains the namespace with an empty Files map;
+// the marker itself is metadata and is not sent to an engine.
 // Two layouts are supported:
 //
 //  1. Flat layout — SQL files directly in the schema directory. The namespace
@@ -38,14 +45,30 @@ import (
 // and values are file contents. Only .sql files and vschema.json are included;
 // other files (like schemabot.yaml) are skipped.
 //
-// The environment parameter enables $ENV substitution in namespace names.
-// If environment is non-empty, any literal "$ENV" in namespace keys (from
-// directory names or defaultNamespace) is replaced with the environment value.
-// This allows a single directory like "bikeshare_$ENV/" to resolve to
+// The environment parameter enables {env} and legacy $ENV substitution in
+// namespace names. If environment is non-empty, either token in namespace keys
+// (from directory names or defaultNamespace) is replaced with the environment.
+// This allows a single directory like "bikeshare_{env}/" to resolve to
 // "bikeshare_staging" or "bikeshare_production" depending on the target.
-// If environment is empty, "$ENV" is left as-is.
-func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string) (SchemaFiles, error) {
+// If environment is empty, both tokens are left as-is.
+//
+// ignoreNamespaces lists namespaces to exclude from the result — schema
+// directories that exist in the repository but must not be reconciled against
+// the live database (for example a keyspace only used by local test
+// infrastructure). Entries receive the same substitution as directory
+// names and are matched against the post-substitution namespace keys. Layout
+// validation still sees ignored directories: a mixed flat/subdirectory layout
+// is rejected even when the subdirectories are all ignored.
+//
+// The second return value lists the namespace keys that were actually removed
+// by ignoreNamespaces, sorted. An entry that matches no namespace removes
+// nothing (matching is exact and case-sensitive); callers that report
+// exclusions must report the removed keys, and should warn when a configured
+// entry is absent from them so a typo or stale entry is visible instead of
+// silently reconciling the namespace it was meant to exclude.
+func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string, ignoreNamespaces []string) (SchemaFiles, []string, error) {
 	result := make(SchemaFiles)
+	resolvedSources := make(map[string]string)
 	var hasFlatFile, hasNamespacedFile bool
 
 	for relativePath, content := range files {
@@ -56,37 +79,131 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 			continue
 		}
 
-		namespace := path.Dir(relativePath)
-		if namespace == "." || namespace == "" {
-			namespace = defaultNamespace
+		sourceNamespace := path.Dir(relativePath)
+		if sourceNamespace == "." || sourceNamespace == "" {
+			sourceNamespace = defaultNamespace
+		}
+		namespace, namespaced := NamespaceForRelativePath(relativePath, defaultNamespace, environment)
+		if previous, ok := resolvedSources[namespace]; ok && previous != sourceNamespace {
+			return nil, nil, fmt.Errorf("schema directories %q and %q both resolve to namespace %q", previous, sourceNamespace, namespace)
+		}
+		resolvedSources[namespace] = sourceNamespace
+		if !namespaced {
 			hasFlatFile = true
 		} else {
 			hasNamespacedFile = true
 		}
 
-		// Replace $ENV in namespace keys when environment is known.
-		if environment != "" {
-			namespace = strings.ReplaceAll(namespace, "$ENV", environment)
-		}
-
 		if result[namespace] == nil {
 			result[namespace] = &Namespace{Files: make(map[string]string)}
+		}
+		if strings.TrimSpace(content) == strings.TrimSpace(EmptyNamespaceDeclaration) {
+			continue
 		}
 		result[namespace].Files[filename] = content
 	}
 
 	// Reject mixed flat + namespaced files
 	if hasFlatFile && hasNamespacedFile {
-		return nil, fmt.Errorf("schema directory has both flat files and namespace subdirectories — use one layout or the other")
+		return nil, nil, fmt.Errorf("schema directory has both flat files and namespace subdirectories — use one layout or the other")
 	}
 
-	return result, nil
+	var removed []string
+	for _, ignored := range ResolveIgnoreNamespaces(ignoreNamespaces, environment) {
+		if _, ok := result[ignored]; !ok {
+			continue
+		}
+		delete(result, ignored)
+		removed = append(removed, ignored)
+	}
+	sort.Strings(removed)
+
+	return result, removed, nil
 }
 
-// IsReservedPullNamespace reports whether a live namespace should be excluded
-// from schema pull discovery and rejected for explicit pull requests, using the
-// MySQL dialect. Callers that know the target dialect should use
-// IsReservedPullNamespaceForDialect.
-func IsReservedPullNamespace(namespace string) bool {
-	return IsReservedPullNamespaceForDialect(DialectMySQL, namespace)
+// NamespaceForRelativePath derives the namespace key used when grouping a
+// schema file. The bool reports whether the file is in a namespace directory.
+func NamespaceForRelativePath(relativePath, defaultNamespace, environment string) (string, bool) {
+	namespace := path.Dir(relativePath)
+	namespaced := namespace != "." && namespace != ""
+	if !namespaced {
+		namespace = defaultNamespace
+	}
+	if environment != "" {
+		namespace = ResolveNamespaceEnvironment(namespace, environment)
+	}
+	return namespace, namespaced
+}
+
+// HasNamespaceEnvironmentPlaceholder reports whether a name contains either
+// supported namespace-directory placeholder. Schema-pull and onboarding
+// namespace arguments require concrete names; repository paths may use tokens.
+func HasNamespaceEnvironmentPlaceholder(namespace string) bool {
+	return strings.Contains(namespace, "{env}") || strings.Contains(namespace, "$ENV")
+}
+
+// ResolveNamespaceEnvironment substitutes both the preferred {env} token and
+// the legacy $ENV token in a namespace name. With no environment, it leaves
+// the name unchanged.
+func ResolveNamespaceEnvironment(namespace, environment string) string {
+	if environment == "" {
+		return namespace
+	}
+	replacer := strings.NewReplacer("{env}", environment, "$ENV", environment)
+	return replacer.Replace(namespace)
+}
+
+// ResolveIgnoreNamespaces applies the same placeholder substitution to
+// ignore_namespaces entries that GroupFilesByNamespace applies to namespace
+// directory names, returning the configured entries as they will be matched
+// against namespace keys for the environment. Resolution does not check
+// existence — an entry may match no namespace; GroupFilesByNamespace reports
+// which entries actually removed one.
+func ResolveIgnoreNamespaces(namespaces []string, environment string) []string {
+	if len(namespaces) == 0 {
+		return nil
+	}
+	resolved := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		resolved[i] = ResolveNamespaceEnvironment(ns, environment)
+	}
+	return resolved
+}
+
+// UnmatchedIgnoreEntries returns the resolved ignore_namespaces entries that
+// removed no namespace during grouping — a typo, a case mismatch, or a stale
+// entry for a directory that no longer exists. The namespaces such entries
+// name are fully reconciled, so callers should warn with the returned values
+// rather than letting the config imply an exclusion that is not happening.
+func UnmatchedIgnoreEntries(configured []string, environment string, removed []string) []string {
+	removedSet := make(map[string]bool, len(removed))
+	for _, ns := range removed {
+		removedSet[ns] = true
+	}
+	var unmatched []string
+	for _, ns := range ResolveIgnoreNamespaces(configured, environment) {
+		if !removedSet[ns] {
+			unmatched = append(unmatched, ns)
+		}
+	}
+	return unmatched
+}
+
+// ValidateIgnoreNamespaces rejects ignore_namespaces entries that cannot match
+// a namespace subdirectory of the schema root: blank entries, entries padded
+// with whitespace (namespace keys are never padded, so such an entry would
+// silently exclude nothing), and entries with path separators.
+func ValidateIgnoreNamespaces(namespaces []string) error {
+	for _, ns := range namespaces {
+		if strings.TrimSpace(ns) == "" {
+			return fmt.Errorf("ignore_namespaces entries must not be blank")
+		}
+		if ns != strings.TrimSpace(ns) {
+			return fmt.Errorf("ignore_namespaces entry %q must not have leading or trailing whitespace", ns)
+		}
+		if strings.ContainsAny(ns, `/\`) {
+			return fmt.Errorf("ignore_namespaces entry %q must be a namespace name, not a path", ns)
+		}
+	}
+	return nil
 }

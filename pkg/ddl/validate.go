@@ -13,11 +13,31 @@ import (
 // These checks run after parsing but before diffing, providing clear error
 // messages at plan time rather than failing during schema change execution.
 func ValidateCreateTable(ct *statement.CreateTable) error {
+	if err := ValidateUnqualifiedTableName(ct); err != nil {
+		return err
+	}
 	if err := ValidateDuplicateColumns(ct); err != nil {
 		return err
 	}
 	if err := ValidateIndexColumns(ct); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ValidateUnqualifiedTableName rejects a CREATE TABLE statement whose table
+// name carries a schema qualifier (CREATE TABLE db.users ...). SchemaBot
+// selects the schema through the connection — the namespace on the request,
+// optionally remapped to a physical schema by per-target overrides — so a
+// desired statement is emitted verbatim for a new table and a qualifier would
+// silently address a different schema than the one the plan and apply run
+// against.
+func ValidateUnqualifiedTableName(ct *statement.CreateTable) error {
+	if ct.Raw == nil || ct.Raw.Table == nil {
+		return nil
+	}
+	if schemaName := ct.Raw.Table.Schema.String(); schemaName != "" {
+		return fmt.Errorf("table %q: schema-qualified table name %q.%q is not supported; the connection selects the schema, so remove the qualifier", ct.TableName, schemaName, ct.TableName)
 	}
 	return nil
 }

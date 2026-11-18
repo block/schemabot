@@ -64,6 +64,7 @@ func TestE2EParticipantCommentNudgeRefoldsAggregate(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
 	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
 	mockParticipantCheckRuns(mux, map[string]map[string]any{
@@ -203,6 +204,7 @@ func TestE2EParticipantCommentNudgeFailClosedThroughRollback(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
 	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
 	// The participant completed a rollback: its check is action_required.
@@ -270,6 +272,7 @@ func TestE2EParticipantCommentNudgeBlocksOnInProgressParticipant(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
 	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
 	mockParticipantCheckRuns(mux, map[string]map[string]any{

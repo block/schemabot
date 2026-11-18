@@ -67,9 +67,16 @@ GitHub sends POST /webhook
   |     |
   |     +-- Release locks held by the PR and delete stored check state
   |
-  +-- check_run
+  +-- check_run.rerequested
+  |     |
+  |     +-- Re-plan the PR head when a human clicks "Re-run" on a
+  |         SchemaBot check
+  |
+  +-- check_suite.requested
         |
-        +-- Accepted by the webhook but not implemented today
+        +-- Enqueue a grace-deferred recovery pass that synthesizes the
+            auto-plan delivery for open PR heads whose pull_request
+            delivery was lost
 ```
 
 ## GitHub App Authentication
@@ -108,7 +115,7 @@ Three discovery strategies, tried in order:
 
 1. **`-d` flag specified** → `FindConfigByDatabaseName()`: Tree API scan for all `schemabot.yaml` files, match by `database` field (case-insensitive).
 
-2. **Changed schema files in PR** → `FindConfigForPR()`: List PR files, filter to `.sql`/`vschema.json`, search parent directories for `schemabot.yaml`.
+2. **Changed schema files in PR** → `FindConfigForPR()`: List PR files, keep schema files (`.sql`, `vschema.json`), changed `schemabot.yaml` files, and environment or namespace symlinks, and search parent directories for `schemabot.yaml`.
 
 3. **Fallback** → `FindConfigInRepo()`: Full Tree API scan. Returns single config or `ErrMultipleConfigs` if ambiguous.
 
@@ -189,7 +196,10 @@ Schema request errors are mapped to specific GitHub comment templates:
 | `ErrNoConfig` | "No Schema Changes Detected" | Add `schemabot.yaml` file or use `-d` |
 | `ErrInvalidConfig` | "No Valid Configuration Found" | Fix `schemabot.yaml` fields |
 | `ErrMultipleConfigs` | "Multiple Databases Detected" | Use `-d <database>` |
-| `DatabaseNotFoundError` | "Database Not Found" | Check database name |
+| `DatabaseNotFoundError` | "Database Not Found" | Check database name; on a repository too large to search in full, the comment lists the configured directories that were searched |
+| `DatabaseNotFoundError` (`RepositoryNotAccepted`) | "Database Not Available to This Repository" | Add the repository to the database's `allowed_repos` if it should manage the database |
+| `api.DatabaseNotConfiguredError` | "Database Not Configured" | Ask an operator to configure the database on the server |
+| `ErrConfigDiscoveryTruncated` | "Repository Too Large to Search" | Ask an operator to bound the database's config location with `allowed_dirs` |
 | Other | "Plan Failed" | Check error details |
 
 ## Not Implemented In Webhooks

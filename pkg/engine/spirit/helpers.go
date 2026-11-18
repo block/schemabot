@@ -1,16 +1,35 @@
 package spirit
 
 import (
-	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
-	"github.com/block/spirit/pkg/statement"
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/table"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 )
+
+// uniqueTableList joins table names into a comma-separated list, dropping
+// duplicates while preserving order. A combined ALTER statement can carry
+// several statements against the same table; the runner logger's table attr
+// should name each table once.
+func uniqueTableList(tables []string) string {
+	seen := make(map[string]bool, len(tables))
+	unique := make([]string, 0, len(tables))
+	for _, t := range tables {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		unique = append(unique, t)
+	}
+	return strings.Join(unique, ", ")
+}
 
 // parseDSN extracts connection info from a MySQL DSN using the mysql driver's parser.
 func parseDSN(dsn string) (host, username, password, database string, err error) {
@@ -21,64 +40,87 @@ func parseDSN(dsn string) (host, username, password, database string, err error)
 	return cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, nil
 }
 
-// namespaceForTable finds which namespace a table belongs to by checking
-// which namespace's schema files define it. Uses Spirit's parser for accurate
-// table name extraction across every statement in each file.
-//
-// The namespace is the per-table progress-matching key, so it must be
-// deterministic. When the table's CREATE TABLE cannot be located — for example
-// a DROP TABLE plan, where the table no longer has a defining statement — the
-// namespace can only be inferred when exactly one namespace exists. With two or
-// more namespaces and no match, the table cannot be attributed to a single
-// namespace, so this returns an error rather than an arbitrary map key.
-func namespaceForTable(table string, sf schema.SchemaFiles) (string, error) {
-	for nsName, ns := range sf {
-		for filename, content := range ns.Files {
-			// Check filename match first (fast path)
-			baseName := strings.TrimSuffix(filename, ".sql")
-			if baseName == table {
-				return nsName, nil
-			}
-			// Match the table's CREATE TABLE (the defining statement) in any
-			// statement of the file, not only the first one.
-			defines, err := fileDefinesTable(content, table)
-			if err != nil {
-				return "", fmt.Errorf("classify schema file %q in namespace %q for table %q: %w", filename, nsName, table, err)
-			}
-			if defines {
-				return nsName, nil
-			}
+// groupChangesByNamespace builds the plan's per-namespace SchemaChanges.
+// Spirit operates on a single database, but table changes are grouped by the
+// namespace they belong to (from SchemaFiles keys) for consistency with
+// multi-namespace engines like PlanetScale. declaredIn maps each desired
+// table to the namespace whose schema file declares it. The result is in
+// namespace order, so the same input yields the same plan. A namespace with
+// no table change gets no SchemaChange, so an empty change list yields an
+// empty result. database names the database the request is diffed against,
+// for the error when a dropped table cannot be attributed.
+func groupChangesByNamespace(changes []engine.TableChange, currentSchema []table.TableSchema, declaredIn map[string]string, sf schema.SchemaFiles, database string) ([]engine.SchemaChange, error) {
+	changesByNS := make(map[string][]engine.TableChange)
+	for _, tc := range changes {
+		ns, err := namespaceForTable(tc.Table, declaredIn, sf, database)
+		if err != nil {
+			// The refusal already names the table, the database and the
+			// namespaces, and the plan comment renders it verbatim, so a
+			// wrap here would only repeat the table name in front of it.
+			return nil, err
+		}
+		changesByNS[ns] = append(changesByNS[ns], tc)
+	}
+	originalFilesByNS := make(map[string]map[string]string, len(changesByNS))
+	for ns := range changesByNS {
+		originalFilesByNS[ns] = map[string]string{}
+	}
+	// Originals are captured only for the namespaces that have a SchemaChange;
+	// a live table in a namespace the plan does not change has no SchemaChange
+	// to carry it.
+	for _, ts := range currentSchema {
+		ns, err := namespaceForTable(ts.Name, declaredIn, sf, database)
+		if err != nil {
+			return nil, fmt.Errorf("capture original table definitions: %w", err)
+		}
+		if files, ok := originalFilesByNS[ns]; ok {
+			files[ts.Name+".sql"] = ts.Schema
 		}
 	}
-	// When the defining statement is absent, the namespace can only be inferred
-	// when there is exactly one namespace to attribute the table to.
-	if len(sf) == 1 {
+	schemaChanges := make([]engine.SchemaChange, 0, len(changesByNS))
+	for _, ns := range slices.Sorted(maps.Keys(changesByNS)) {
+		schemaChanges = append(schemaChanges, engine.SchemaChange{
+			Namespace:             ns,
+			TableChanges:          changesByNS[ns],
+			OriginalFiles:         originalFilesByNS[ns],
+			OriginalFilesCaptured: true,
+		})
+	}
+	return schemaChanges, nil
+}
+
+// namespaceForTable returns the namespace a table belongs to: the namespace
+// whose schema file declares it, as recorded in declaredIn while the desired
+// schema was parsed. A table is declared by at most one schema file, so the
+// recorded namespace is the only candidate, and the answer depends on the
+// declarations alone, never on the order a map is walked or on a file's name.
+//
+// The namespace is the per-table progress-matching key, so it must be
+// deterministic. A table no schema file declares is one the plan drops: its
+// declaring file was removed or emptied. With exactly one namespace the
+// request is that namespace's database, so the drop belongs to it. With two
+// or more, every namespace is diffed against the same database, so the live
+// table is in all of their schemas at once, and the request no longer carries
+// the removed file that said which namespace held it. No namespace can be
+// proven to own the drop, so this refuses with the remedy rather than picking
+// one. A namespace-free target DSN plans each namespace against its own
+// database, which attributes every drop exactly.
+func namespaceForTable(table string, declaredIn map[string]string, sf schema.SchemaFiles, database string) (string, error) {
+	if nsName, ok := declaredIn[table]; ok {
+		return nsName, nil
+	}
+	switch len(sf) {
+	case 0:
+		// SchemaBot's own callers reject a request with no schema files before
+		// it plans, so only a direct Tern Plan call with an empty map lands
+		// here. Every live table would be a drop, so refuse with the way out.
+		return "", fmt.Errorf("DROP TABLE %q cannot be placed: the request carries no schema files for database %q. Restore this database's schema files, or remove the database from the SchemaBot config", table, database)
+	case 1:
 		for nsName := range sf {
 			return nsName, nil
 		}
 	}
-	return "", fmt.Errorf("no namespace defines table %q among %d schema namespaces %v", table, len(sf), namespaceNames(sf))
-}
-
-// fileDefinesTable reports whether the file content contains a CREATE TABLE
-// statement for the given table. It classifies every statement in the file so
-// that multi-statement files map all of the tables they define. A file with no
-// parseable statements (empty or comment-only) defines no table and is not an
-// error.
-func fileDefinesTable(content, table string) (bool, error) {
-	results, err := statement.Classify(content)
-	if errors.Is(err, statement.ErrNoStatements) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("classify content: %w", err)
-	}
-	for _, c := range results {
-		if c.Type == statement.StatementCreateTable && c.Table == table {
-			return true, nil
-		}
-	}
-	return false, nil
+	return "", fmt.Errorf("DROP TABLE %q cannot be placed: namespaces %v all diff against database %q. Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN", table, namespaceNames(sf), database)
 }
 
 // namespaceNames returns the sorted namespace keys for inclusion in error

@@ -1,0 +1,685 @@
+// Package postgresconn opens SchemaBot-managed PostgreSQL connections:
+// centralized DSN normalization (required TLS for RDS targets, mirroring the
+// TLS mode mysqlconn injects for RDS MySQL), a session timezone pinned to UTC
+// on every connection whatever the DSN or PGTZ names, plain timestamp
+// parameters written as their UTC reading, and a storage pool whose
+// credentials survive secret rotation. Use Open for target-database
+// connections and OpenReloadable for the single long-lived storage pool.
+package postgresconn
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"math"
+	"net"
+	"net/url"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/block/mysql"
+	"github.com/block/schemabot/pkg/connreload"
+	"github.com/block/spirit/pkg/dbconn"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+// getConnector returns the connector that dials physical connections for the
+// given config. It is a seam so tests can exercise the credential-reload path
+// without a server. It is narrower than stdlib.GetConnector on purpose: the
+// variadic options are not used here, and a seam whose signature is exactly
+// what the package needs is one a fake cannot get subtly wrong.
+var getConnector func(pgx.ConnConfig) driver.Connector = defaultConnector
+
+// defaultConnector is the connector behind every pool this package opens. Each
+// connection it dials writes plain timestamp parameters as their UTC reading
+// (see utcTimestampCodec).
+func defaultConnector(cfg pgx.ConnConfig) driver.Connector {
+	return stdlib.GetConnector(cfg, stdlib.OptionAfterConnect(registerUTCTimestamps))
+}
+
+// nonVerifyingRDSKey identifies one RDS endpoint dialed under one
+// non-verifying TLS posture. The warning is deduplicated on this pair rather
+// than on the DSN so that credential rotation, a different database name, or
+// a different option set against the same endpoint does not re-warn, and so
+// the set holds no credentials and is bounded by the number of endpoints
+// rather than by the number of distinct DSNs a process resolves.
+type nonVerifyingRDSKey struct {
+	addr    string
+	posture string
+}
+
+var warnedNonVerifyingRDS sync.Map
+
+// TLS postures a dialed config can hold without authenticating the server.
+// They are derived from the resolved config rather than from the sslmode's
+// spelling: pgx folds sslmode, sslrootcert, and the libpq environment into
+// one TLS config, and that config is what the dial proves.
+const (
+	tlsPostureNone              = "none"
+	tlsPostureUnverified        = "encrypted, unverified"
+	tlsPosturePlaintextFallback = "plaintext fallback"
+)
+
+// Option customizes the parsed PostgreSQL config before the pool is opened.
+// Options are applied in connectionConfig, so they flow through Open,
+// OpenReloadable, and the credential-reload path alike.
+type Option func(*pgx.ConnConfig)
+
+// defaultConnectTimeout bounds a single connection attempt for every
+// SchemaBot-managed PostgreSQL connection whose parsed connect timeout is not
+// positive — the DSN or an option must set a positive connect_timeout to
+// override it, and the zero "wait indefinitely" value is deliberately
+// replaced — so an attempt against an unreachable or half-open endpoint fails
+// and is retried instead of blocking its caller indefinitely. pgconn applies
+// it to dial, TLS, startup and auth; this package applies the same budget to
+// the session setup it runs on the new connection afterwards, which pgconn
+// leaves on the caller's context.
+const defaultConnectTimeout = 30 * time.Second
+
+// WithConnectTimeout bounds a single connection attempt — pgconn applies it
+// to the whole connection process: dial, TLS, startup, and auth. A
+// non-positive duration is ignored, leaving any DSN-carried value, or the
+// package default, in place. It does not bound query execution — use context
+// deadlines for that.
+func WithConnectTimeout(d time.Duration) Option {
+	return func(cfg *pgx.ConnConfig) {
+		if d > 0 {
+			cfg.ConnectTimeout = d
+		}
+	}
+}
+
+// MaxStatementTimeout is the largest budget PostgreSQL accepts, since
+// statement_timeout is a millisecond integer GUC and the server rejects
+// anything above the signed 32-bit maximum. Exceeding it is not a clamp but an
+// error the server raises when the budget is set, and that happens as the
+// connection is established, so every connection fails at dial rather than one
+// statement failing late. Exported so config validation can refuse the value
+// where an operator can still see it.
+const MaxStatementTimeout = time.Duration(math.MaxInt32) * time.Millisecond
+
+// WithStatementTimeout bounds how long the server lets a single statement run
+// on every connection the pool opens, as a session statement_timeout set on
+// the new session. A zero duration disables the budget explicitly
+// (statement_timeout=0), which is not the same as omitting the option: the
+// option always sets the parameter, so the connection runs under SchemaBot's
+// stated budget rather than whatever the platform set at the role or database
+// level. Omitting it inherits that ambient value.
+//
+// A negative duration leaves the parameter untouched, so a DSN-carried
+// statement_timeout keeps whatever it set. A positive duration finer than the
+// millisecond statement_timeout is expressed in rounds up, never down to the
+// zero that would disable it.
+//
+// There is deliberately no package-level default. statement_timeout bounds
+// *any* statement, including one that is legitimately blocking: the
+// EnsureSchema advisory lock waits inside SELECT pg_advisory_lock() for as
+// long as its lock_timeout allows, and a default budget below that wait would
+// cancel a trailing pod's legitimate queue for the leader's bootstrap. Callers
+// opt in with a budget they can justify for the statements they run.
+func WithStatementTimeout(d time.Duration) Option {
+	return func(cfg *pgx.ConnConfig) {
+		if d < 0 {
+			return
+		}
+		// Applied with SET on the new session rather than carried in the startup
+		// packet. A connection pooler in front of storage passes through only the
+		// startup parameters it knows, and statement_timeout is not one of them:
+		// stock PgBouncer answers an unknown parameter with a FATAL, so every dial
+		// fails rather than one statement running unbudgeted. SET reaches the same
+		// session GUC over a protocol the pooler does forward. Any DSN-carried
+		// statement_timeout stays in the startup packet, so it is cleared here to
+		// keep this option the single source of the budget.
+		//
+		// The reach that makes SET work is also its cost. Against a
+		// transaction-mode pooler the GUC lands on a shared server backend and
+		// outlives the client connection, so a storage endpoint that is refused
+		// for lacking session affinity can leave the budget behind on a backend
+		// in its own (database, user) pool. That residue is the price of
+		// connecting at all: the startup-packet form fails every dial through
+		// such a pooler, whatever its pool mode.
+		stmt := statementTimeoutSQL(d)
+		clearRuntimeParam(cfg, "statement_timeout")
+		cfg.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
+			// pgconn applies ConnectTimeout to the dial, TLS, startup and auth
+			// and then runs this hook on the caller's context, which the pool
+			// supplies with no deadline of its own. An endpoint that finishes
+			// auth and then stops answering — a half-open path, a wedged
+			// pooler backend — would leave this statement waiting forever on
+			// the single goroutine connections are opened on, stalling every
+			// caller queued behind it. Reading the budget here rather than at
+			// option time picks up the package default, which is filled in
+			// after every option has run.
+			if timeout := cfg.ConnectTimeout; timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+			if err := execStatementTimeout(ctx, conn, stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+			return nil
+		}
+	}
+}
+
+// execStatementTimeout runs the budget statement on a newly connected session.
+// It is a variable so a unit test can observe the statement the hook actually
+// sends: pgconn's AfterConnect takes a concrete *pgconn.PgConn, so without a
+// seam here the only assertion available off a live server is that some hook
+// was installed — which stays true no matter which statement it carries.
+var execStatementTimeout = func(ctx context.Context, conn *pgconn.PgConn, stmt string) error {
+	_, err := conn.Exec(ctx, stmt).ReadAll()
+	return err
+}
+
+// statementTimeoutSQL is the statement the option runs on each new session to
+// arm the budget. The value is an integer this package derives, never caller
+// text, so it is safe to interpolate — and it has to be, since SET does not
+// take a bind parameter.
+func statementTimeoutSQL(d time.Duration) string {
+	return "SET statement_timeout = " + strconv.FormatInt(statementTimeoutMillis(d), 10)
+}
+
+// statementTimeoutMillis converts d to the whole milliseconds
+// statement_timeout is expressed in, rounding a positive duration up.
+// Truncating instead would let a sub-millisecond budget land on 0, which the
+// server reads as no budget at all — turning the shortest budget a caller can
+// ask for into its absence, the one direction this option exists to rule out.
+// Zero is passed through, because there it is the caller's explicit disable
+// rather than a rounding artifact.
+func statementTimeoutMillis(d time.Duration) int64 {
+	if d == 0 {
+		return 0
+	}
+	// (d-1)/ms + 1 rounds up without the overflow that (d+ms-1)/ms risks near
+	// the maximum duration.
+	return int64((d-1)/time.Millisecond) + 1
+}
+
+// clearRuntimeParam removes a startup-packet parameter under every spelling
+// of its name. GUC names are case-insensitive on the server and pgx preserves
+// DSN key case in RuntimeParams, so deleting only the canonical spelling could
+// leave a differently-cased one behind and still in force.
+func clearRuntimeParam(cfg *pgx.ConnConfig, key string) {
+	for k := range cfg.RuntimeParams {
+		if strings.EqualFold(k, key) {
+			delete(cfg.RuntimeParams, k)
+		}
+	}
+}
+
+// WithRootCAs pins the certificate authorities the connection trusts when the
+// DSN requests certificate verification, replacing the trust the DSN or the
+// RDS default would otherwise install. The caller parses the bundle, so a
+// missing or malformed bundle fails closed where it is resolved rather than
+// inside a later dial. A DSN that does not negotiate TLS carries no trust to
+// pin, so the option leaves it untouched. Pinning also removes pgx's
+// parse-time fallbacks (a plaintext retry under sslmode=prefer, a weaker TLS
+// retry under allow): a fallback would bypass the pinned bundle entirely, so
+// the connection either verifies against it or fails. The pin only takes
+// effect when the DSN verifies the server certificate (sslmode=verify-full or
+// verify-ca): require and prefer negotiate TLS without verification, so roots
+// pinned onto those modes are never consulted, just as a disable DSN
+// negotiates no TLS at all. Callers that must enforce the pin should gate on
+// VerifiesServerCertificate and refuse the other modes.
+func WithRootCAs(roots *x509.CertPool) Option {
+	return func(cfg *pgx.ConnConfig) {
+		if cfg.TLSConfig == nil {
+			return
+		}
+		cfg.TLSConfig.RootCAs = roots
+		cfg.Fallbacks = nil
+	}
+}
+
+// Open returns a PostgreSQL connection pool with SchemaBot's required
+// transport settings applied (see ConnectionDSN). A DSN that requests
+// certificate verification against an RDS host without naming a root bundle
+// (sslmode=verify-full, no sslrootcert) verifies against the embedded RDS
+// global CA bundle. Options customize the parsed config (for example
+// WithConnectTimeout) before the pool is opened.
+func Open(dsn string, opts ...Option) (*sql.DB, error) {
+	cfg, err := dialConfig(dsn, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return sql.OpenDB(defaultConnector(*cfg)), nil
+}
+
+// dialConfig resolves the config a SchemaBot-managed connection dials with
+// and announces a non-verifying RDS posture on the way. It is the config
+// behind every dial path, and only the dial paths: VerifiesServerCertificate
+// judges a DSN without dialing it, and a caller that judges in order to
+// refuse must not be told the connection is weak as well.
+func dialConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
+	cfg, discardedTimezone, err := parseConnectionConfig(dsn, opts...)
+	if err != nil {
+		return nil, err
+	}
+	warnNonVerifyingRDSTLS(cfg, dsn)
+	warnDiscardedSessionTimezone(cfg, discardedTimezone)
+	return cfg, nil
+}
+
+// WarnNonVerifyingRDSTLS judges and announces the resolved transport posture
+// without dialing. It is for connection paths that consume ConnectionDSN but
+// build their own pool.
+func WarnNonVerifyingRDSTLS(dsn string) error {
+	cfg, err := connectionConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("judge PostgreSQL RDS TLS posture: %w", err)
+	}
+	warnNonVerifyingRDSTLS(cfg, dsn)
+	return nil
+}
+
+// warnNonVerifyingRDSTLS logs once per RDS endpoint and TLS posture when the
+// config about to be dialed does not authenticate the server certificate.
+// The judgement is made on the resolved TLS config, the same predicate
+// VerifiesServerCertificate applies: verify-full and chain-only modes such as
+// verify-ca count as authentication for this warning, while require, prefer,
+// allow, and disable do not. The posture is honored rather
+// than refused. An explicit sslmode against an RDS host was asked for, and
+// SchemaBot's own default for an RDS host with no sslmode is require, so
+// refusing either would turn a compatibility setting into an outage; the
+// warning names which of the two produced the posture so the remedy — an
+// explicit sslmode=verify-full — is aimed at the right place.
+func warnNonVerifyingRDSTLS(cfg *pgx.ConnConfig, dsn string) {
+	host := strings.ToLower(cfg.Host)
+	if !dbconn.IsRDSHost(host) || resolvedConfigVerifiesServer(cfg) {
+		return
+	}
+	key := nonVerifyingRDSKey{
+		addr:    net.JoinHostPort(host, strconv.Itoa(int(cfg.Port))),
+		posture: tlsPosture(cfg),
+	}
+	if _, loaded := warnedNonVerifyingRDS.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	source := "dsn"
+	if sslmodeInjected(dsn) {
+		source = "schemabot default sslmode=require"
+	}
+	slog.Warn("PostgreSQL RDS connection does not authenticate the server; the configured sslmode is honored for compatibility",
+		"host", key.addr,
+		"tls", key.posture,
+		"sslmode_source", source,
+	)
+}
+
+// sslmodeInjected reports whether normalizing dsn added the RDS default
+// sslmode, so the DSN itself named no sslmode for the host it dials.
+func sslmodeInjected(dsn string) bool {
+	normalized, err := ConnectionDSN(dsn)
+	return err == nil && normalized != dsn
+}
+
+// tlsPosture names what a non-verifying resolved config proves. Any plaintext
+// fallback takes precedence because the eventual channel may be unencrypted.
+func tlsPosture(cfg *pgx.ConnConfig) string {
+	hasTLS := cfg.TLSConfig != nil
+	hasPlaintext := cfg.TLSConfig == nil
+	for _, fallback := range cfg.Fallbacks {
+		if fallback.TLSConfig == nil {
+			hasPlaintext = true
+		} else {
+			hasTLS = true
+		}
+	}
+	if hasPlaintext && hasTLS {
+		return tlsPosturePlaintextFallback
+	}
+	if !hasTLS {
+		return tlsPostureNone
+	}
+	return tlsPostureUnverified
+}
+
+// resolvedConfigVerifiesServer reports whether every connection attempt the
+// config can make authenticates the server. pgx expresses sslmode=prefer and
+// sslmode=allow as a primary TLS config plus fallbacks that swap TLS for
+// plaintext or the reverse, so a config authenticates only when the primary
+// and each fallback do.
+func resolvedConfigVerifiesServer(cfg *pgx.ConnConfig) bool {
+	if !verifiesServerCertificate(cfg.TLSConfig) {
+		return false
+	}
+	for _, fallback := range cfg.Fallbacks {
+		if !verifiesServerCertificate(fallback.TLSConfig) {
+			return false
+		}
+	}
+	return true
+}
+
+// verifiesServerCertificate reports whether a resolved TLS config
+// authenticates the server: the standard chain-and-hostname verification is
+// on, or pgx installed its own verifier in place of it (sslmode=verify-ca,
+// and require with an sslrootcert). No TLS config is no authentication.
+func verifiesServerCertificate(tc *tls.Config) bool {
+	if tc == nil {
+		return false
+	}
+	return !tc.InsecureSkipVerify || tc.VerifyPeerCertificate != nil
+}
+
+// OpenReloadable opens a connection pool whose credentials survive rotation
+// of the underlying secret. When a new connection is rejected with an
+// authentication error (SQLSTATE 28P01/28000) — the signature of a password
+// that was rotated out from under a running pod — the pool calls reload to
+// fetch a freshly resolved DSN (re-reading the mounted secret) and retries
+// once, so rotation is transparent and does not require a restart. reload
+// returns the raw DSN; transport settings and options are re-applied here. A
+// reload error keeps the current credentials so a transient resolve failure
+// cannot wedge the pool, and starts a short cooldown during which further
+// failed dials skip the reload — the DSN may resolve through a remote secrets
+// backend, and an outage there must not turn every rejected dial into a
+// resolve call.
+//
+//	secret rotated ──► new conn ──► 28P01 invalid password
+//	                                      │
+//	                                      ▼
+//	                    reload: re-resolve DSN (re-read secret)
+//	                                      │ (on error: keep current config)
+//	                                      ▼
+//	                    retry with fresh credentials ──► success
+//
+// Established connections authenticated before the rotation keep working;
+// only new physical connections take the reload path. reload runs only after
+// an authentication failure — never per connection — so a DSN resolved
+// through a remote secrets backend is not re-fetched on every dial. Reserve
+// OpenReloadable for the single long-lived storage pool; target-database
+// connections use Open, whose credentials come from the apply request rather
+// than the storage secret.
+// The scheduling — how many reloads a burst of rejected dials costs, and how a
+// failing secrets backend is backed off — is pkg/connreload's and is shared
+// with the MySQL storage pool; see reloadConfig for the PostgreSQL-specific
+// half.
+func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (*sql.DB, error) {
+	connector, err := connreload.New(dsn, reloadConfig(reload, opts))
+	if err != nil {
+		return nil, err
+	}
+	return sql.OpenDB(connector), nil
+}
+
+// resolveConnector normalizes a raw DSN the way every SchemaBot-managed
+// PostgreSQL connection is normalized (see connectionConfig), applies the
+// caller's options, and returns the connector that dials it. It is the Resolve
+// half of the reloadable pool: it runs once at open and once per reload, never
+// per dial.
+func resolveConnector(dsn string, opts ...Option) (driver.Connector, error) {
+	cfg, err := dialConfig(dsn, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return getConnector(*cfg), nil
+}
+
+// reloadConfig describes the PostgreSQL storage pool to pkg/connreload.
+// Everything about *when* to reload lives there and is shared with the MySQL
+// pool. What is PostgreSQL's, and all that is PostgreSQL's, is the two
+// functions below.
+func reloadConfig(reload func() (string, error), opts []Option) connreload.Config {
+	return connreload.Config{
+		Resolve: func(dsn string) (driver.Connector, error) { return resolveConnector(dsn, opts...) },
+		Refused: isAuthError,
+		Reload:  reload,
+		Driver:  stdlib.GetDefaultDriver(),
+		Name:    "postgres-storage",
+	}
+}
+
+// isAuthError reports whether err is the server rejecting the connection's
+// credentials: 28P01 (invalid_password) is the rotation signature, and 28000
+// (invalid_authorization_specification) covers rotation strategies that swap
+// the role itself. A spurious reload on a non-rotation 28000 is harmless —
+// the reload either resolves the same DSN or fails and keeps the current one.
+func isAuthError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "28P01" || pgErr.Code == "28000"
+}
+
+// dsnParseError wraps a DSN parse failure without echoing the DSN itself.
+// A *url.Error in the chain reproduces the full URL — password included — in
+// its message, so only its underlying cause is kept; pgx's own
+// *pgconn.ParseConfigError already redacts the password in its message but
+// can carry a *url.Error inside, so the chain is checked either way.
+func dsnParseError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("parse PostgreSQL DSN: %w", ue.Err)
+	}
+	return fmt.Errorf("parse PostgreSQL DSN: %w", err)
+}
+
+// connectionConfig parses a normalized DSN (see ConnectionDSN), pins the
+// session timezone to UTC, and applies caller-supplied options to the
+// resulting config.
+func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
+	cfg, _, err := parseConnectionConfig(dsn, opts...)
+	return cfg, err
+}
+
+// parseConnectionConfig is connectionConfig plus the explicit session
+// timezone settings the UTC pin discarded, keyed by their spelling in the DSN,
+// so a dial path can announce them. Judging paths drop them.
+func parseConnectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, map[string]string, error) {
+	normalized, err := ConnectionDSN(dsn)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg, err := pgx.ParseConfig(normalized)
+	if err != nil {
+		return nil, nil, dsnParseError(err)
+	}
+	discarded := pinUTCSession(cfg)
+	// A verifying TLS config (sslmode=verify-full) against an RDS host with no
+	// explicit sslrootcert would fall back to the ambient system trust store,
+	// which does not carry the private Amazon RDS roots — every handshake would
+	// fail with an unknown-authority error. Verify against the embedded RDS
+	// global bundle instead, matching the root pool pg-sprite's data-plane
+	// pools use, so both layers trust the same roots. sslmode=require is left
+	// untouched: pgx marks it InsecureSkipVerify (encrypted, unauthenticated),
+	// and injecting roots there would not change what it proves.
+	if tc := cfg.TLSConfig; tc != nil && !tc.InsecureSkipVerify && tc.RootCAs == nil && dbconn.IsRDSHost(strings.ToLower(cfg.Host)) {
+		roots, err := rdsRootPool()
+		if err != nil {
+			return nil, nil, err
+		}
+		tc.RootCAs = roots
+	}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	// The default fills non-positive values, so a positive DSN connect_timeout
+	// or WithConnectTimeout option wins while zero ("wait indefinitely") and
+	// negative values — which pgconn would silently treat as unbounded — are
+	// replaced: a managed connection attempt is never unbounded.
+	if cfg.ConnectTimeout <= 0 {
+		cfg.ConnectTimeout = defaultConnectTimeout
+	}
+	return cfg, discarded, nil
+}
+
+// pinUTCSession sets timezone=UTC on every session this package opens and
+// returns the explicit settings it replaced, keyed by their spelling.
+//
+// The pin is unconditional, on target connections as much as on the storage
+// pool, because it is one half of a client-side contract: utcTimestampCodec
+// writes every plain timestamp parameter as its UTC reading, and storage
+// compares those columns against the session's now() in lease-expiry and
+// staleness predicates, so the two sides have to share a zone whatever the
+// DSN, PGTZ, or the server's TimeZone setting says. On a target it is safe
+// because the sessions this package opens there only read the catalog and
+// validate; the sessions that run DDL are pg-sprite's, built from
+// ConnectionDSN, which leaves the zone alone. GUC names are case-insensitive
+// on the server, while pgx preserves their spelling, so every explicit
+// spelling is removed before the canonical setting is added.
+func pinUTCSession(cfg *pgx.ConnConfig) map[string]string {
+	discarded := map[string]string{}
+	for key, zone := range cfg.RuntimeParams {
+		if strings.EqualFold(key, "timezone") {
+			discarded[key] = zone
+			delete(cfg.RuntimeParams, key)
+		}
+	}
+	cfg.RuntimeParams["timezone"] = "UTC"
+	return discarded
+}
+
+// discardedTimezoneKey identifies one endpoint whose configured session zone
+// the UTC pin replaced. The warning is deduplicated on it for the same reasons
+// warnNonVerifyingRDSTLS deduplicates on the endpoint: a credential reload,
+// another database on the same endpoint, and a PGTZ that reaches every DSN
+// the process resolves each announce the replacement once per endpoint and
+// zone rather than once per dial.
+type discardedTimezoneKey struct {
+	addr    string
+	setting string
+	zone    string
+}
+
+var warnedDiscardedTimezone sync.Map
+
+// warnDiscardedSessionTimezone announces, once per endpoint and zone, that a
+// configured non-UTC session timezone was replaced by the pin, so an operator
+// who set one in the DSN or PGTZ can see that it has no effect. A setting
+// that already named UTC is silent: nothing about the session changed.
+func warnDiscardedSessionTimezone(cfg *pgx.ConnConfig, discarded map[string]string) {
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(int(cfg.Port)))
+	for _, setting := range slices.Sorted(maps.Keys(discarded)) {
+		zone := discarded[setting]
+		if strings.EqualFold(zone, "UTC") {
+			continue
+		}
+		key := discardedTimezoneKey{addr: addr, setting: setting, zone: zone}
+		if _, loaded := warnedDiscardedTimezone.LoadOrStore(key, struct{}{}); loaded {
+			continue
+		}
+		slog.Warn("PostgreSQL session timezone is pinned to UTC; the zone set in the DSN or PGTZ is ignored",
+			"host", addr,
+			"setting", setting,
+			"timezone", zone,
+		)
+	}
+}
+
+// rdsRootPool returns the certificate pool holding the embedded AWS RDS global
+// CA bundle. RDS server certificates chain to private Amazon roots that no
+// system trust store carries, so verifying an RDS connection requires this
+// pool explicitly. The pool is built once and shared: it is read-only after
+// construction.
+//
+// The bundle comes from block/mysql, which is now the one copy of it in the
+// dependency graph — spirit used to embed its own and expose the bytes, and
+// dropped both when it started delegating to the driver. The pool is Postgres's
+// here, but the roots are the same: RDS issues from the same private Amazon
+// CAs regardless of engine.
+//
+// RDSTLSConfig clones its pool per call, so taking RootCAs off it does not
+// alias anything the MySQL side is using — appending here could not widen trust
+// for MySQL connections even if a caller tried.
+var rdsRootPool = sync.OnceValues(func() (*x509.CertPool, error) {
+	pool := mysql.RDSTLSConfig().RootCAs
+	if pool == nil {
+		return nil, fmt.Errorf("embedded RDS global CA bundle contains no usable certificates")
+	}
+	return pool, nil
+})
+
+// VerifiesServerCertificate reports whether the DSN's transport settings
+// authenticate the server certificate: sslmode=verify-full checks the chain
+// and hostname, and sslmode=verify-ca checks the chain through pgx's custom
+// verification callback (which pgx also applies to sslmode=require when the
+// DSN names an sslrootcert, matching libpq). require and prefer otherwise
+// encrypt without authenticating, allow's first attempt and disable carry no
+// TLS at all — trust pinned onto any of those modes is never consulted. The
+// DSN is normalized the same way Open normalizes it, so an RDS host with no
+// explicit sslmode is judged by the injected mode.
+func VerifiesServerCertificate(dsn string) (bool, error) {
+	cfg, err := connectionConfig(dsn)
+	if err != nil {
+		return false, err
+	}
+	return verifiesServerCertificate(cfg.TLSConfig), nil
+}
+
+// ConnectionDSN returns a PostgreSQL DSN with required transport settings
+// applied: an RDS host with no explicit sslmode gets sslmode=require, the
+// counterpart of the TLS mode mysqlconn injects for RDS MySQL targets. An
+// explicit sslmode — including disable — always wins, and non-RDS hosts are
+// left untouched. Both DSN forms are handled: URL
+// (postgres://user:pass@host/db) and keyword/value (host=... user=...). sadscan:disable np.postgres.1
+// RDS detection considers only the DSN's first host: a multi-host DSN whose
+// RDS host is a fallback gets no injection, so spell out sslmode explicitly
+// in multi-host DSNs.
+func ConnectionDSN(dsn string) (string, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", dsnParseError(err)
+	}
+	// DNS names are case-insensitive, so an uppercase RDS endpoint must get
+	// the same injection.
+	if !dbconn.IsRDSHost(strings.ToLower(cfg.Host)) {
+		return dsn, nil
+	}
+	if isURLForm(dsn) {
+		return enhanceURLDSN(dsn)
+	}
+	return enhanceKeywordDSN(dsn), nil
+}
+
+func isURLForm(dsn string) bool {
+	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
+}
+
+// enhanceURLDSN sets sslmode=require in the query string of a URL-form DSN
+// unless the DSN already carries an explicit sslmode.
+func enhanceURLDSN(dsn string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", dsnParseError(err)
+	}
+	q := u.Query()
+	if q.Has("sslmode") {
+		return dsn, nil
+	}
+	q.Set("sslmode", "require")
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+// keywordSSLMode matches an sslmode keyword in a keyword/value DSN. The
+// keyword parser accepts whitespace around '=', so `sslmode = disable` is a
+// legal, explicit setting and must be detected as such.
+var keywordSSLMode = regexp.MustCompile(`(^|\s)sslmode\s*=`)
+
+// enhanceKeywordDSN appends sslmode=require to a keyword/value DSN unless a
+// sslmode keyword is already present. In the keyword form a repeated keyword's
+// last occurrence wins, so appending is only safe when absent — an explicit
+// sslmode is never overridden. A quoted value that itself contains " sslmode="
+// would be a false positive, which fails open to pgx's own defaults rather
+// than overriding the caller.
+func enhanceKeywordDSN(dsn string) string {
+	if keywordSSLMode.MatchString(dsn) {
+		return dsn
+	}
+	return dsn + " sslmode=require"
+}

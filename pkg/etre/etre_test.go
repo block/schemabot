@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/square/etre"
 	"github.com/stretchr/testify/assert"
@@ -222,4 +223,103 @@ func TestNewDialsUnixSocket(t *testing.T) {
 	}
 	assert.Equal(t, "etre.invalid", got.host, "request Host (from Addr) is preserved for proxy routing")
 	assert.Equal(t, "production", got.headers.Get("X-Env-Override"))
+}
+
+func TestQueryReturnsEveryMatch(t *testing.T) {
+	var gotQuery string
+	c := newClient(mockClient(&gotQuery, []etre.Entity{{"name": "orders"}, {"name": "orders-green"}}, nil), "cluster", nil)
+
+	got, err := c.Query(t.Context(), map[string]string{"dsid": "orders", "env": "staging"})
+	require.NoError(t, err)
+	assert.Equal(t, "dsid=orders,env=staging", gotQuery)
+	require.Len(t, got, 2)
+	assert.Equal(t, "orders", got[0]["name"])
+	assert.Equal(t, "orders-green", got[1]["name"])
+}
+
+func TestQueryNotFoundIsErrNotFound(t *testing.T) {
+	c := newClient(mockClient(nil, nil, nil), "cluster", nil)
+
+	_, err := c.Query(t.Context(), map[string]string{"name": "orders"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// A registry that accepts the request and never answers must not hold the
+// lookup past the client's query timeout. This drives the real Etre client over
+// HTTP, so it proves the timeout reaches the request itself.
+func TestQueryGivesUpOnARegistryThatNeverAnswers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	entities := etre.NewEntityClientWithConfig(etre.EntityClientConfig{
+		EntityType: "cluster",
+		Addr:       srv.URL,
+		HTTPClient: http.DefaultClient,
+	})
+	c := newClient(entities, "cluster", nil)
+	c.queryTimeout = 50 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := c.QueryOne(ctx, map[string]string{"name": "orders"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, etre.ErrClientTimeout)
+	assert.Contains(t, err.Error(), `query etre "cluster" entities matching "name=orders": no answer within 50ms`)
+	assert.NoError(t, ctx.Err(), "the lookup must end on its own timeout, not the test's")
+	assert.NotErrorIs(t, err, context.DeadlineExceeded,
+		"callers read a deadline error as their own context ending, which a registry that did not answer is not")
+}
+
+// A caller whose own deadline is shorter than the client's query timeout is
+// told the lookup failed, not that the registry was given the client's full
+// timeout and did not answer.
+func TestQueryCallerDeadlineIsNotBlamedOnTheRegistry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	entities := etre.NewEntityClientWithConfig(etre.EntityClientConfig{
+		EntityType: "cluster",
+		Addr:       srv.URL,
+		HTTPClient: http.DefaultClient,
+	})
+	c := newClient(entities, "cluster", nil)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err := c.QueryOne(ctx, map[string]string{"name": "orders"})
+	require.Error(t, err)
+	assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded, "the caller's deadline ended the lookup")
+	assert.Contains(t, err.Error(), `query etre "cluster" entities matching "name=orders"`)
+	assert.NotContains(t, err.Error(), "no answer within")
+}
+
+// When the caller's own context ends first, the error says so rather than
+// blaming the registry for not answering in time.
+func TestQueryReportsCallerCancellationAsItIs(t *testing.T) {
+	c := newClient(etre.MockEntityClient{
+		QueryFunc: func(ctx context.Context, _ string, _ etre.QueryFilter) ([]etre.Entity, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}, "cluster", nil)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := c.Query(ctx, map[string]string{"name": "orders"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "no answer within")
+}
+
+func TestQueryRequiresSelector(t *testing.T) {
+	c := newClient(mockClient(nil, nil, nil), "cluster", nil)
+
+	_, err := c.Query(t.Context(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selector is required")
 }

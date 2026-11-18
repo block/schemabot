@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -33,11 +34,94 @@ func TestRenderRollbackPlanComment_WithChanges(t *testing.T) {
 	assert.Contains(t, rendered, "— Staging")
 	assert.Contains(t, rendered, "DROP INDEX")
 	assert.Contains(t, rendered, "DROP COLUMN")
-	assert.Contains(t, rendered, "destructive changes")
-	assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging\n```")
+	assert.Contains(t, rendered, "To confirm this rollback, comment:\n```\nschemabot rollback-confirm -e staging\n```")
 	assert.NotContains(t, rendered, "schemabot rollback-confirm -e staging -d")
 	assert.NotContains(t, rendered, "--tenant")
 	assert.Contains(t, rendered, "```\nschemabot unlock\n```")
+	assert.NotContains(t, rendered, "unsafe", "a rollback plan with no unsafe changes carries no unsafe warning")
+}
+
+// A rollback plan that drops a table, plus a column drop on only one shard of
+// a sharded keyspace, names both unsafe changes — the shard-only one with the
+// shard that carries it — and tells the operator that confirming takes
+// --allow-unsafe, while keeping the flag out of the pasteable command.
+func TestRenderRollbackPlanComment_ListsUnsafeChanges(t *testing.T) {
+	data := PlanCommentData{
+		Database:     "shop",
+		Environment:  "staging",
+		RequestedBy:  "testuser",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		ApplyID:      "apply_abc123",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "shop",
+			Statements: []string{"DROP TABLE `audit_log`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "audit_log", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `audit_log`", ChangeType: "drop"},
+			{Table: "orders", Reason: `Column "legacy" is dropped`, DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`", ChangeType: "alter", Shards: []string{"80-"}, TotalShards: 2},
+		},
+	}
+
+	rendered := RenderRollbackPlanComment(data)
+	assert.Contains(t, rendered, "**Issues**: 2 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `audit_log`: DROP TABLE removes all data")
+	assert.Contains(t, rendered, "2. `orders` (shard `80-`)")
+	assert.Contains(t, rendered, "`legacy`")
+	assert.Contains(t, rendered, "To confirm this rollback:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes")
+	assert.Contains(t, fencedCommands(t, rendered), "schemabot rollback-confirm -e staging")
+	assert.NotContains(t, rendered, glyph.Tip+" Before allowing", "the confirm footer carries the drop steps")
+}
+
+// rollback-confirm without --allow-unsafe on a rollback plan with unsafe
+// changes is refused with the plan, each unsafe change, the rollback-confirm
+// command to re-issue with --allow-unsafe, and the unlock that cancels the
+// still-pinned rollback.
+func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
+	data := PlanCommentData{
+		Database:     "shop",
+		Environment:  "staging",
+		RequestedBy:  "testuser",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "shop",
+			Statements: []string{"DROP TABLE `audit_log`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "audit_log", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `audit_log`", ChangeType: "drop"},
+		},
+	}
+
+	t.Run("names the change and the re-issue command", func(t *testing.T) {
+		rendered := RenderRollbackUnsafeChangesBlocked(data)
+		assert.Contains(t, rendered, "## Schema Rollback Plan — Staging")
+		assert.Contains(t, rendered, "DROP TABLE `audit_log`")
+		assert.Contains(t, rendered, "**⛔ Rollback rejected**: 1 unsafe change detected")
+		assert.Contains(t, rendered, "1. `audit_log`: DROP TABLE removes all data")
+		assert.Contains(t, rendered, "Add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:\n   ```\n   schemabot rollback-confirm -e staging\n   ```")
+		assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
+		assert.Contains(t, rendered, "The lock still pins this rollback plan")
+		assert.Contains(t, rendered, "```\nschemabot unlock\n```")
+		assert.NotContains(t, rendered, "schemabot apply")
+	})
+
+	t.Run("tenant deployment carries the tenant on both commands", func(t *testing.T) {
+		tenantData := data
+		tenantData.Tenant = "acme"
+		rendered := RenderRollbackUnsafeChangesBlocked(tenantData)
+		assert.Contains(t, fencedCommands(t, rendered), "schemabot rollback-confirm -e staging --tenant acme")
+		assert.Contains(t, rendered, "```\nschemabot unlock --tenant acme\n```")
+	})
+
+	t.Run("a deferred cutover stays deferred in the re-issue command", func(t *testing.T) {
+		deferredData := data
+		deferredData.DeferCutover = true
+		rendered := RenderRollbackUnsafeChangesBlocked(deferredData)
+		assert.Contains(t, fencedCommands(t, rendered), "schemabot rollback-confirm -e staging --defer-cutover")
+	})
 }
 
 // A rollback plan posted by a tenant deployment must render confirm/cancel
@@ -147,15 +231,7 @@ func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
 
 	rendered := RenderRollbackPlanComment(data)
 	assert.Contains(t, rendered, "Lint Warnings")
-	assert.Contains(t, rendered, "[users] Dropping index may impact queries")
-}
-
-func TestRenderRollbackNoCompletedApply(t *testing.T) {
-	rendered := RenderRollbackNoCompletedApply("testapp", "staging")
-	assert.Contains(t, rendered, "## ℹ️ No Completed Schema Change to Rollback")
-	assert.Contains(t, rendered, "`testapp`")
-	assert.Contains(t, rendered, "`staging`")
-	assert.Contains(t, rendered, "no completed schema change")
+	assert.Contains(t, rendered, "- `users`: Dropping index may impact queries")
 }
 
 func TestRenderRollbackConfirmNoLock(t *testing.T) {
@@ -186,21 +262,35 @@ func TestRenderRollbackConfirmNoLockTenant(t *testing.T) {
 }
 
 func TestRenderRollbackMissingApplyID(t *testing.T) {
-	rendered := RenderRollbackMissingApplyID("")
+	rendered := RenderRollbackMissingApplyID("", "", "")
 	assert.Contains(t, rendered, "## Missing Apply ID")
 	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment>`")
 	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment>`")
-	assert.Contains(t, rendered, "`schemabot status`")
+	assert.Contains(t, rendered, "`schemabot status -e ENVIRONMENT`")
 	assert.NotContains(t, rendered, "--tenant")
 }
 
-// On a tenant deployment, the missing-apply-ID usage hints must carry the
-// deployment's tenant so pasting them addresses this deployment.
+// The status lookup is a CLI command, so it starts with the cli name and
+// names the environment the rollback did; the rollback usage lines are
+// PR-comment commands and keep the bot's trigger word.
+func TestRenderRollbackMissingApplyIDCLIName(t *testing.T) {
+	rendered := RenderRollbackMissingApplyID("acme schemabot", "staging", "")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment>`")
+	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment>`")
+	assert.Contains(t, rendered, "`acme schemabot status -e staging`")
+	assert.NotContains(t, rendered, "acme schemabot rollback")
+}
+
+// On a tenant deployment, the missing-apply-ID rollback usage hints must carry
+// the deployment's tenant so pasting them addresses this deployment. The status
+// lookup is a CLI command, and the CLI has no --tenant flag, so it must not
+// carry one or the pasted command is rejected.
 func TestRenderRollbackMissingApplyIDTenant(t *testing.T) {
-	rendered := RenderRollbackMissingApplyID("acme")
+	rendered := RenderRollbackMissingApplyID("", "", "acme")
 	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> --tenant acme`")
 	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment> --tenant acme`")
-	assert.Contains(t, rendered, "`schemabot status --tenant acme`")
+	assert.Contains(t, rendered, "or by running `schemabot status -e ENVIRONMENT`.")
+	assert.NotContains(t, rendered, "status -e ENVIRONMENT --tenant")
 }
 
 func TestRenderRollbackApplyNotFound(t *testing.T) {
@@ -236,28 +326,37 @@ func TestRenderRollbackRejectedSanitizesReason(t *testing.T) {
 
 func TestRenderRollbackBlockedByLock(t *testing.T) {
 	t.Run("PR-owned lock renders as link", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42, "")
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42, "", LockedDatabaseApply{Checked: true})
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
 		assert.Contains(t, rendered, "`testapp`")
 		assert.Contains(t, rendered, "`staging`")
 		assert.Contains(t, rendered, "[block/myapp#42](https://github.com/block/myapp/pull/42)")
-		assert.Contains(t, rendered, "`schemabot unlock`")
+		assert.Contains(t, rendered, "The lock is released when that PR is merged or closed, or when `schemabot unlock` is commented on it.")
+		assert.NotContains(t, rendered, "to complete")
 		assert.NotContains(t, rendered, "--tenant")
 		assert.NotContains(t, rendered, "`block/myapp#42`",
 			"PR-link variant should not render the owner as a bare backticked string")
 	})
 
 	t.Run("PR-owned lock on tenant deployment hints tenant-scoped unlock", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "production", "block/myapp#42", "block/myapp", 42, "acme")
-		assert.Contains(t, rendered, "`schemabot unlock --tenant acme`")
+		rendered := RenderRollbackBlockedByLock("testapp", "production", "block/myapp#42", "block/myapp", 42, "acme", LockedDatabaseApply{Checked: true})
+		assert.Contains(t, rendered, "or when `schemabot unlock --tenant acme` is commented on it.")
 	})
 
-	t.Run("non-PR lock renders bare owner", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0, "")
+	t.Run("PR-owned lock with a running apply says to wait for it", func(t *testing.T) {
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42, "", LockedDatabaseApply{Checked: true, RunningApplyID: "apply-a1b2", RunningIsLockHolders: true})
+		assert.Contains(t, rendered, "That PR's apply `apply-a1b2` is still running. Once it finishes, the lock is released "+
+			"when that PR is merged or closed, or when `schemabot unlock` is commented on it.")
+	})
+
+	t.Run("non-PR lock renders the owner without its hostname", func(t *testing.T) {
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0, "", LockedDatabaseApply{})
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
-		assert.Contains(t, rendered, "`cli:alice@laptop`")
+		assert.Contains(t, rendered, "`cli:alice`")
+		assert.NotContains(t, rendered, "laptop",
+			"the lock owner's machine is internal detail and stays out of PR markdown")
 		assert.Contains(t, rendered, "ask the lock owner to release it")
 		assert.NotContains(t, rendered, "github.com",
 			"bare-owner variant should not include any github.com link")
@@ -266,7 +365,7 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 	})
 
 	t.Run("missing repo falls back to bare owner even with PR > 0", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "stale-owner", "", 99, "")
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "stale-owner", "", 99, "", LockedDatabaseApply{})
 		assert.Contains(t, rendered, "`stale-owner`")
 		assert.NotContains(t, rendered, "github.com")
 	})
@@ -328,11 +427,11 @@ func TestRenderRollbackNotAccepted(t *testing.T) {
 
 func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 	for name, body := range map[string]string{
-		"MissingApplyID":            RenderRollbackMissingApplyID(""),
+		"MissingApplyID":            RenderRollbackMissingApplyID("", "", ""),
 		"ApplyNotFound":             RenderRollbackApplyNotFound("a"),
 		"Rejected":                  RenderRollbackRejected(RollbackRejectedData{ApplyID: "a", Database: "d", Environment: "e", Reason: "r"}),
-		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1, ""),
-		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0, ""),
+		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1, "", LockedDatabaseApply{}),
+		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0, "", LockedDatabaseApply{}),
 		"NothingToDo":               RenderRollbackNothingToDo("d", "e", "a"),
 		"LockNotOwned":              RenderRollbackLockNotOwned("d", "e", "o"),
 		"AlreadyRolledBack":         RenderRollbackAlreadyRolledBack("d", "e"),
@@ -342,4 +441,112 @@ func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 		assert.False(t, strings.HasPrefix(body, " ") || strings.HasPrefix(body, "\n"),
 			"%s body should not start with whitespace", name)
 	}
+}
+
+// The rollback-rejection reason can carry raw engine error text with internal
+// endpoints and newlines; the rendered comment must redact endpoints and keep
+// the reason on one line.
+func TestRenderRollbackNotAcceptedSanitizesError(t *testing.T) {
+	rendered := RenderRollbackNotAccepted("testapp", "staging",
+		"dial tcp db-primary.internal:3306: refused\nsecond line")
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "The rollback was not accepted: dial tcp [endpoint redacted]: refused second line")
+}
+
+// A rejection reason that sanitizes to nothing renders the short form instead
+// of a dangling "not accepted: " suffix, and HTML in the reason is escaped so
+// it cannot inject markup into the comment.
+func TestRenderRollbackNotAcceptedEmptyAndHTMLError(t *testing.T) {
+	rendered := RenderRollbackNotAccepted("testapp", "staging", " \n\t ")
+	assert.Contains(t, rendered, "The rollback was not accepted.")
+	assert.NotContains(t, rendered, "not accepted: ")
+
+	rendered = RenderRollbackNotAccepted("testapp", "staging", "boom <details> & more")
+	assert.Contains(t, rendered, "The rollback was not accepted: boom &lt;details&gt; &amp; more")
+}
+
+// The rollback-not-allowed reason renders inside a code span; endpoints in the
+// reason are redacted like every other rendered error.
+func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
+	rendered := RenderRollbackRejected(RollbackRejectedData{
+		ApplyID: "apply-abc123",
+		Reason:  "dial tcp db-primary.internal:3306: connection refused",
+	})
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "**Reason**: `dial tcp [endpoint redacted]: connection refused`")
+}
+
+// A rollback of a schema change across multiple targets is refused, and the
+// comment says so in one sentence. It then names where schema files
+// without the change can be applied from, which depends on the PR: an open PR
+// reverts the change and toggles a nonce so its directory is still planned, a
+// merged one needs a reverting PR, and a closed one needs a PR that plans the
+// default branch's schema files. A PR whose state could not be read gets each
+// state's step. The command names the apply's database, so it runs in a PR
+// that changes several databases. Targets the environment no longer
+// routes to are named, since the apply that undoes the change would not reach
+// them.
+func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
+	data := RollbackOfRolloutUnsupportedData{
+		Environment:    "staging",
+		Database:       "payments",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RoutingChecked: true,
+		PR:             PRStateOpen,
+	}
+	assert.Equal(t, "## Rollback Not Supported — Staging\n\n"+
+		"Rollback isn't currently supported for schema changes across multiple targets.\n\n"+
+		"To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:\n"+
+		"```\nschemabot apply -e staging -d payments\n```\n", RenderRollbackOfRolloutUnsupported(data))
+
+	t.Run("merged PR", func(t *testing.T) {
+		merged := data
+		merged.PR = PRStateMerged
+		out := RenderRollbackOfRolloutUnsupported(merged)
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that reverts the change in the schema files, then run there:\n```\nschemabot apply -e staging -d payments\n```\n")
+		assert.NotContains(t, out, "this PR's schema files")
+		assert.NotContains(t, out, "nonce")
+	})
+
+	t.Run("closed PR", func(t *testing.T) {
+		closed := data
+		closed.PR = PRStateClosed
+		out := RenderRollbackOfRolloutUnsupported(closed)
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. Its plan brings the database back to the default branch's schema files. Then run there:\n")
+		assert.NotContains(t, out, "this PR's schema files")
+	})
+
+	t.Run("PR state unknown", func(t *testing.T) {
+		unknown := data
+		unknown.PR = PRStateUnknown
+		out := RenderRollbackOfRolloutUnsupported(unknown)
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, apply schema files without the change:\n"+
+			"- If this PR is open, revert the change here and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned.\n"+
+			"- If it merged, revert the change in a new PR.\n"+
+			"- If it closed without merging, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`.\n\n"+
+			"Then run:\n```\nschemabot apply -e staging -d payments\n```\n")
+	})
+
+	t.Run("targets no longer routed", func(t *testing.T) {
+		unrouted := data
+		unrouted.Unrouted = []string{"default/payments-002", "default/payments-003"}
+		out := RenderRollbackOfRolloutUnsupported(unrouted)
+		assert.Contains(t, out, "`default/payments-002` and `default/payments-003` are no longer routed in this environment, so an apply would not reach them. Add them back to the server config first.\n\n")
+
+		unrouted.Unrouted = []string{"default/payments-002"}
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(unrouted), "`default/payments-002` is no longer routed in this environment, so an apply would not reach it. Add it back to the server config first.\n\n")
+	})
+
+	t.Run("routing not compared", func(t *testing.T) {
+		unchecked := data
+		unchecked.RoutingChecked = false
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(unchecked), "An apply reaches only the targets this environment routes to now, so add back any target it ran on that is no longer routed.\n\n")
+	})
+
+	t.Run("tenant", func(t *testing.T) {
+		withTenant := data
+		withTenant.Environment = "production"
+		withTenant.Tenant = "payments"
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(withTenant), "```\nschemabot apply -e production -d payments --tenant payments\n```\n")
+	})
 }

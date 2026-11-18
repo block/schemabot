@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // loginTimeout bounds the whole interactive login, including the wait for the
@@ -51,10 +53,10 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	profileName := client.ResolveProfileName(cfg, g.Profile)
 	profile, ok := cfg.Profiles[profileName]
 	if !ok {
-		return fmt.Errorf("profile %q is not configured; run `schemabot configure` to set its endpoint before logging in", profileName)
+		return fmt.Errorf("profile %q is not configured; run `%s configure` to set its endpoint before logging in", profileName, cliname.Name())
 	}
 	if profile.Endpoint == "" {
-		return fmt.Errorf("profile %q has no endpoint; run `schemabot configure` to set it before logging in", profileName)
+		return fmt.Errorf("profile %q has no endpoint; run `%s configure` to set it before logging in", profileName, cliname.Name())
 	}
 
 	loginCfg, err := resolveLoginConfig(cmd.Issuer, cmd.ClientID, cmd.RedirectPort, &profile)
@@ -94,8 +96,20 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	if !result.Expiry.IsZero() {
 		profile.TokenExpiry = result.Expiry.Unix()
 	}
-	cfg.Profiles[profileName] = profile
-	if err := client.SaveConfig(cfg); err != nil {
+	// Record the issuer and client ID the tokens came from, which --issuer and
+	// --client-id may have overridden: the refresh token is valid only there, so
+	// later commands renew against this pair rather than the oidc settings.
+	profile.TokenIssuer, profile.TokenClientID = loginCfg.Issuer, loginCfg.ClientID
+	if err := client.UpdateConfig(context.WithoutCancel(ctx), func(latest *client.Config) error {
+		current, exists := latest.Profiles[profileName]
+		if !exists || !sameEndpoint(current.Endpoint, profile.Endpoint) || current.LocalRuntime != profile.LocalRuntime || !reflect.DeepEqual(current.OIDC, profile.OIDC) {
+			return fmt.Errorf("profile %q changed its connection during login; the token was not saved to a different server", profileName)
+		}
+		current.Token, current.RefreshToken, current.TokenExpiry = profile.Token, profile.RefreshToken, profile.TokenExpiry
+		current.TokenIssuer, current.TokenClientID = profile.TokenIssuer, profile.TokenClientID
+		latest.Profiles[profileName] = current
+		return nil
+	}); err != nil {
 		return fmt.Errorf("save token to profile %q: %w", profileName, err)
 	}
 

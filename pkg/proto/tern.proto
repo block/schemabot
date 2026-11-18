@@ -14,7 +14,7 @@ option go_package = "github.com/block/schemabot/pkg/proto/ternv1";
 // rather than silently returning "unimplemented".
 //
 // Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
-// Control:   Stop, Start, Volume (can be called during Apply execution)
+// Control:   Stop, Start (can be called during Apply execution)
 //
 // State machine (per apply):
 //   pending -> running -> waiting_for_cutover -> cutting_over -> completed
@@ -71,6 +71,24 @@ service Tern {
     };
   }
 
+  // CompareSchemaFileChange reports whether a pull request's edit to one
+  // schema file generates the same schema change on two different bases. The
+  // review gate asks it when a rebase combined the pull request's edit with a
+  // default branch edit to the same file, for a database type whose schema
+  // files can only be understood by running them, so an approval given before
+  // the rebase can keep counting.
+  //
+  // It is read-only: each version of the file is run inside a transaction
+  // that is always rolled back, so nothing persists on the target. An engine
+  // that cannot compare files returns UNIMPLEMENTED, and the caller treats the
+  // file as changed.
+  rpc CompareSchemaFileChange(CompareSchemaFileChangeRequest) returns (CompareSchemaFileChangeResponse) {
+    option (google.api.http) = {
+      post: "/v1/compare-schema-file-change"
+      body: "*"
+    };
+  }
+
   // Apply executes a previously generated plan. Returns immediately with an
   // apply_id; execution happens asynchronously. Use Progress to track status.
   //
@@ -110,6 +128,25 @@ service Tern {
   rpc Progress(ProgressRequest) returns (ProgressResponse) {
     option (google.api.http) = {
       post: "/v1/progress"
+      body: "*"
+    };
+  }
+
+  // BatchProgress answers Progress for several operations of one apply in a
+  // single call. The rollout members of one deployment share its apply, each
+  // with its own operation, so a caller driving many of them asks once per
+  // poll instead of once per member, and the apply, its tasks, and its
+  // operations are read once for all of them.
+  //
+  // Each entry of the answer is what Progress scoped to that operation would
+  // return, or the error it would fail with. An error that concerns the whole
+  // apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+  //
+  // A deployment that answers Unimplemented predates the RPC, and the caller
+  // asks Progress once per operation.
+  rpc BatchProgress(BatchProgressRequest) returns (BatchProgressResponse) {
+    option (google.api.http) = {
+      post: "/v1/batch-progress"
       body: "*"
     };
   }
@@ -171,6 +208,20 @@ service Tern {
     };
   }
 
+  // DriverCapacity reports the drivers this deployment's operators run, so a
+  // caller can refuse up front an apply that could never have all its
+  // operations here waiting at a deferred cutover at once.
+  //
+  // A deployment that answers also runs the cutover of every operation a
+  // CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+  // must not send an apply started with defer_cutover to a deployment that
+  // answers Unimplemented.
+  rpc DriverCapacity(DriverCapacityRequest) returns (DriverCapacityResponse) {
+    option (google.api.http) = {
+      get: "/v1/driver-capacity"
+    };
+  }
+
   // Stop pauses all non-terminal tasks for a schema change.
   //
   // Transitions: any non-terminal state -> stopped.
@@ -217,24 +268,43 @@ service Tern {
     };
   }
 
-  // Volume adjusts the schema change speed/concurrency while running.
+  // StorageSchemaPlan reports the DDL outstanding between the embedded storage
+  // schema of the binary serving this RPC and the live storage database that
+  // binary uses. Unlike every other RPC here, it is about the serving
+  // instance's own bookkeeping database rather than a target database an
+  // operator asked to change.
   //
-  // Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
-  // throughput). Affects chunk size, lock hold time, and throttle parameters.
+  // It is strictly read-only: it reads the live catalog and computes a diff,
+  // executing no DDL and taking no lock, so it is safe to call at any time,
+  // including while the same storage is being converged.
   //
-  // Can be called multiple times during a running schema change. The engine
-  // is stopped and restarted internally to apply the new settings.
-  //
-  // Preconditions:
-  //   - Active schema change must exist for the database.
-  //   - Volume must be 1-11 inclusive.
-  rpc Volume(VolumeRequest) returns (VolumeResponse) {
+  // The answer comes from the serving binary's own embedded files, which is the
+  // whole point of routing it here rather than computing it from a release pin
+  // on the caller's side: a caller's pin says which release it was built
+  // against, not what this storage converged to, and those diverge exactly when
+  // a deploy has failed to converge.
+  rpc StorageSchemaPlan(StorageSchemaPlanRequest) returns (StorageSchemaPlanResponse) {
     option (google.api.http) = {
-      post: "/v1/volume"
+      post: "/v1/storage-schema/plan"
       body: "*"
     };
   }
 
+  // StorageSchemaApply converges the serving instance's own storage schema and
+  // reports what it found and what it left behind.
+  //
+  // The convergence is the serving binary's startup bootstrap, called
+  // unchanged: the same differ, the same destructive-statement refusal, and the
+  // same advisory lock that serializes it against every other instance of that
+  // deployment. Destructive statements are refused unless the serving
+  // instance's storage config allows them or allow_destructive opts in for this
+  // call.
+  rpc StorageSchemaApply(StorageSchemaApplyRequest) returns (StorageSchemaApplyResponse) {
+    option (google.api.http) = {
+      post: "/v1/storage-schema/apply"
+      body: "*"
+    };
+  }
 }
 
 // Engine represents the schema change engine type.
@@ -242,6 +312,7 @@ enum Engine {
   ENGINE_SPIRIT = 0;
   ENGINE_PLANETSCALE = 1;
   ENGINE_STRATA = 2;
+  ENGINE_POSTGRES = 3;
 }
 
 // State represents the state of a schema change task.
@@ -268,6 +339,19 @@ enum State {
   // reverting -> reverted). Distinct from running so a multi-minute revert is
   // not surfaced as an ordinary in-progress apply.
   STATE_REVERTING = 18;
+  // Post-copy phases: the row copy is done and the engine is draining its
+  // accumulated changeset or verifying the copied data. Running-family —
+  // distinct from STATE_RUNNING so operators see which phase an unbounded
+  // drain or verify is actually in.
+  STATE_CATCHING_UP = 19;
+  STATE_CHECKSUMMING = 20;
+  STATE_POST_CHECKSUM = 21;
+  // The apply failed but is parked for the serving plane's own retry: a later
+  // recovery attempt will claim it, so this is a pause, not a verdict. Clients
+  // must keep polling and must not treat it as terminal. Distinct from
+  // STATE_FAILED, which means the failure settled (retries exhausted or the
+  // failure is not retryable).
+  STATE_FAILED_RETRYABLE = 22;
 }
 
 // ChangeType represents the type of schema change.
@@ -277,12 +361,47 @@ enum ChangeType {
   CHANGE_TYPE_ALTER = 2;
   CHANGE_TYPE_DROP = 3;
   CHANGE_TYPE_VSCHEMA = 4;
+  CHANGE_TYPE_CREATE_INDEX = 5;
+  CHANGE_TYPE_DROP_INDEX = 6;
+  CHANGE_TYPE_RENAME = 7;
+  CHANGE_TYPE_TRUNCATE = 8;
+  CHANGE_TYPE_CREATE_VIEW = 9;
 }
 
 // SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).
 message SchemaFiles {
   // Filename → content mapping (e.g., "users.sql" → CREATE TABLE, "vschema.json" → VSchema JSON).
   map<string, string> files = 1;
+}
+
+// CompareSchemaFileChangeRequest carries one schema file at the four commits
+// the review gate compares.
+message CompareSchemaFileChangeRequest {
+  // Database name from server-side config.
+  string database = 1;
+  // Database type, e.g. "postgres".
+  string type = 2;
+  // Environment whose target runs the comparison.
+  string environment = 3;
+  // Opaque identifier for endpoint discovery. Defaults to database if empty.
+  string target = 4;
+  // The file at the approved commit's merge base.
+  string approved_base = 5;
+  // The file at the approved commit.
+  string approved = 6;
+  // The file at the head's merge base.
+  string head_base = 7;
+  // The file at the head.
+  string head = 8;
+}
+
+// CompareSchemaFileChangeResponse is the comparison's verdict.
+message CompareSchemaFileChangeResponse {
+  // True when the head generates exactly the schema change the approved
+  // commit did.
+  bool same = 1;
+  // Why the change is not the same, for operator logs. Empty when same.
+  string reason = 2;
 }
 
 // PullSchemaRequest requests a live schema export for a database route.
@@ -425,6 +544,68 @@ message PlanRequest {
   string head_sha = 9;
   // Repo-relative schema directory discovered by SchemaBot from the PR.
   string schema_path = 10;
+  // Namespaces the caller removed from schema_files per the config's
+  // ignore_namespaces, resolved for the environment. The data plane refuses
+  // engine shapes that diff the whole target as one unit (a database-scoped
+  // MySQL DSN), where a withheld namespace's live tables would otherwise be
+  // planned as drops.
+  repeated string ignored_namespaces = 11;
+  // Whether an apply of this plan hands the engine every ALTER at once or one
+  // table at a time. An engine that predicts what applying will do to work
+  // already on the target needs the same statement grouping the apply will use,
+  // because that grouping is what decides which stored progress it can resume.
+  //
+  // Optional so that a caller that predates statement grouping in this contract
+  // is distinguishable from one that chose the ungrouped shape: when the field
+  // is absent, the engine predicts the joined batch, which errs toward
+  // disclosing a discard rather than promising a resume the apply will not
+  // perform.
+  optional bool grouped_execution = 12;
+  // Live tables the repository's ignore_tables config withholds from the
+  // planner, so a table no schema file declares is not proposed for
+  // DROP TABLE. Matched against the target's own catalog, in every namespace
+  // the plan covers: a plain entry exactly and case-sensitively, and an entry
+  // wrapped in slashes as a regular expression over the whole name. The
+  // engine discloses what it actually withheld through exempt_tables on the
+  // response, and refuses a table the config withholds that a schema file
+  // also declares.
+  repeated string ignore_tables = 13;
+  // The caller's resolved direct execution policy for this database and
+  // environment. A control plane forwards it so the target that runs the
+  // statement judges it under the policy the control plane's config states.
+  // Absent means the caller states no policy and the executing server's own
+  // configuration decides, which with none configured is the default policy.
+  DirectExecutionPolicy direct_execution = 14;
+  // Declared namespaces the caller left out of schema_files because the
+  // target's entry in its database's targets list selects only other
+  // namespaces. Like ignored_namespaces, they are withheld rather than
+  // removed, so the data plane refuses engine shapes that diff the whole target
+  // as one unit (a database-scoped MySQL DSN), where an unselected namespace's
+  // live tables would otherwise be planned as drops.
+  repeated string unselected_namespaces = 15;
+}
+
+// DirectExecutionPolicy permits statements an engine deterministically refuses
+// to run verbatim as native DDL, bounded by the target table's size in rows
+// or in bytes. Engines that do not implement direct execution
+// ignore it.
+message DirectExecutionPolicy {
+  // Whether refused statements may run directly at all.
+  bool enabled = 1;
+  // A size bound on the target table's row count; zero states no row bound.
+  // An enabled policy carries exactly one of this bound and max_table_bytes —
+  // a grant carrying no bound is refused, never treated as unbounded — and a
+  // table whose size cannot be measured is blocked. A negative value is an
+  // unusable bound, which the engine refuses.
+  int64 max_table_rows = 2;
+  // How long each direct statement waits to acquire its locks before failing
+  // with a retryable busy-table error. Zero leaves the engine's own default.
+  int64 lock_acquisition_timeout_seconds = 3;
+  // A size bound on the target table's data plus index footprint, in bytes;
+  // zero states no byte bound. A refused statement runs directly when the
+  // table is within the policy's bound. A negative value is an unusable
+  // bound, which the engine refuses.
+  int64 max_table_bytes = 4;
 }
 
 // TableChange represents a DDL change to a table.
@@ -436,6 +617,64 @@ message TableChange {
   // Unsafe change tracking
   bool is_unsafe = 5;
   string unsafe_reason = 6;
+  // Execution-mode verdict: how the engine will run this statement at apply
+  // time. Empty means the engine's default path; "blocked" means the engine
+  // deterministically refuses the statement and the apply will fail.
+  string execution_mode = 7;
+  string mode_reason = 8;
+  // Engine-agnostic annotations about this change. A VSchema change carries
+  // the namespace's persisted VSchema change-metadata here so a deployment
+  // that materializes the plan from a dispatch request runs the same
+  // apply-time safety gates as one reading its own stored plan.
+  map<string, string> metadata = 9;
+  // Approximate number of rows in the table at plan time, for display only.
+  // Sourced from engine statistics (e.g. information_schema TABLE_ROWS), which
+  // may be stale — never treat it as an exact count or use it as a gate input.
+  // For sharded targets this is the sum across shards. Unset when no estimate
+  // is available (e.g. the table is being created, or statistics could not be
+  // read).
+  optional int64 estimated_rows = 10;
+  // Number of shards this table change spans. Zero when the target is not
+  // sharded or the shard topology is unknown.
+  int32 shard_count = 11;
+  // Approximate row count of the largest single shard — the biggest chunk a
+  // shard-at-a-time apply works through at once. Unset when the target is not
+  // sharded or no estimate is available. Approximate like estimated_rows.
+  optional int64 largest_shard_rows = 12;
+  // Approximate on-disk footprint of the table (data plus indexes), summed
+  // across shards for sharded targets. Unset when no estimate was available.
+  // Approximate like estimated_rows.
+  optional int64 estimated_bytes = 13;
+  // Existing columns whose collation this change moves, so a reviewer can see
+  // what it does to how values sort and compare equal. Empty when the change
+  // re-collates no column, and for an engine that does not report it.
+  repeated CollationChange collation_changes = 14;
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+message CollationChange {
+  string column = 1;
+  // The collation the column compares under now.
+  string from_collation = 2;
+  // The collation it compares under once the change applies. Empty when the
+  // change leaves it to a server default the plan cannot read.
+  string to_collation = 3;
+  // How the comparison of values differing only in letter case, and only in
+  // trailing spaces, moves: "unchanged", "becomes_sensitive",
+  // "becomes_insensitive", or "unknown" when either collation's properties
+  // are not known. Consumers treat "unknown" as a possible change.
+  string case_comparison = 4;
+  string trailing_space_comparison = 5;
+  // Primary key and unique indexes that cover the column when
+  // can_merge_values, since those are the indexes that reject values once
+  // they compare equal.
+  repeated string unique_indexes = 6;
+  // Whether values that compare unequal now can compare equal after the
+  // move, whether or not the two comparisons above name the reason. False
+  // only for a move onto a binary collation of the same charset that does not
+  // start ignoring trailing spaces.
+  bool can_merge_values = 7;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -466,6 +705,52 @@ message LintViolation {
   string severity = 6; // "error", "warning", or "info"
 }
 
+// ExistingCopy is unfinished work an earlier schema change left on the target
+// that applying this plan will either continue or destroy. A plan reports one
+// per namespace that holds any, and none at all when nothing is at stake.
+message ExistingCopy {
+  // Where the work sits, so a plan spanning several namespaces says which
+  // target each disclosure is about.
+  string namespace = 1;
+  // What applying will do with it: "adopt" continues the work, "discard"
+  // destroys it and starts the affected tables over.
+  string disposition = 2;
+  // Why a discard cannot be avoided by applying as planned:
+  // "statement_differs" or "checkpoint_expired". Empty for an adopt.
+  string reason = 3;
+  // The tables in this plan that already hold unfinished work.
+  repeated string tables = 4;
+  // How long ago the engine last recorded progress on the work. Zero when the
+  // engine has no record to resume from, which is itself a discard.
+  int64 age_seconds = 5;
+  // The schema change the work was started for, verbatim as the engine
+  // recorded it. Empty when the engine has no record of it. This is what lets
+  // a surface show what a drifted schema change differs *from*, rather than
+  // only that it differs; for an adopt it repeats the plan.
+  string statement = 6;
+  // Whether the work is still running right now rather than left behind by an
+  // apply that is over. A running copy is checkpointing continuously, so its
+  // age_seconds is a heartbeat rather than staleness, and applying joins it
+  // instead of restarting it. Set from the deployment's own apply records, so
+  // it is engine-agnostic.
+  //
+  // It reports stored state, not a live probe of the engine: a producer sets it
+  // from its own task rows without reconciling them, because a plan decides
+  // nothing and must not rewrite the records it reads. A row left in flight by
+  // a crashed server therefore reads as running until recovery clears it, so a
+  // consumer must not treat this as proof that work is live — it is why the
+  // copy's disposition, never this field, decides whether applying destroys
+  // anything.
+  bool running = 7;
+}
+
+// ExemptTables lists live tables intentionally excluded from a plan verdict.
+message ExemptTables {
+  string namespace = 1;
+  repeated string tables = 2;
+  string reason = 3;
+}
+
 // ShardPlan reports a shard's own changes for a namespace. A shard is changing
 // when changes is non-empty; carrying the changes (rather than a separate
 // needs_change flag) means a keyspace whose shards diverge — drift, or a
@@ -492,6 +777,11 @@ message PlanResponse {
   // Per-shard membership and drift, populated for sharded engines. Empty for
   // single-endpoint engines.
   repeated ShardPlan shards = 6;
+  // Unfinished work already on the target that applying this plan will
+  // continue or destroy. Empty when nothing is at stake.
+  repeated ExistingCopy existing_copies = 7;
+  // Live tables intentionally excluded from a plan verdict, grouped by namespace.
+  repeated ExemptTables exempt_tables = 8;
 }
 
 // PlanDiffResponse contains a deployment's desired-vs-live diff. It mirrors
@@ -506,6 +796,13 @@ message PlanDiffResponse {
   // Per-shard membership and drift, populated for sharded engines. Empty for
   // single-endpoint engines.
   repeated ShardPlan shards = 5;
+  // Unfinished work already on the target that applying this diff's changes
+  // would continue or destroy, the same disclosures PlanResponse carries.
+  repeated ExistingCopy existing_copies = 6;
+  // Set by a data plane that read the target for every copy applying this
+  // diff could meet, so a caller can tell a clean target from a data plane
+  // that never looked or whose lookup failed.
+  bool existing_copies_reported = 7;
 }
 
 // ApplyRequest requests execution of a previously generated plan.
@@ -535,6 +832,76 @@ message ApplyRequest {
   // duplicate, so a re-dispatch after a lost response does not re-run the
   // schema change. Empty preserves the non-deduplicated behavior.
   string idempotency_key = 11;
+  // The generation manifest for a deployment-keyed dispatch: every operation
+  // key the dispatcher will send to this deployment's shared apply under the
+  // idempotency key, this dispatch's own key included. The data plane stores
+  // it on the keyed apply at creation and completes the apply only when every
+  // listed operation has attached and reached a terminal state, so a fast
+  // first operation can never terminalize the apply while sibling dispatches
+  // are still on their way. Empty means this dispatch is the whole generation.
+  repeated string generation_operation_keys = 12;
+  // The ignore_tables config the reviewed plan was planned under, as the plan
+  // recorded it: every entry the planner was asked to withhold, not the subset
+  // that matched a live table where the plan was made. A deployment that
+  // materializes this dispatch re-plans against its own live schema to prove
+  // the reviewed DDL is what it would independently produce; without the same
+  // entries that re-plan sees a withheld table again and proposes dropping it,
+  // so it would refuse an apply that matches the plan exactly. The whole list
+  // travels because a member holds tables the planning target does not: an
+  // entry that matched nothing there still has to withhold here. The plan's
+  // own record travels rather than the current config, so the comparison is
+  // against what was reviewed.
+  repeated string ignore_tables = 13;
+  // The caller's resolved direct execution policy, as for PlanRequest. The
+  // data plane records it on the apply it creates, so the drive that picks
+  // the apply up later — on another pod, or after a restart — routes under
+  // the policy the dispatch was admitted under rather than re-deriving one.
+  DirectExecutionPolicy direct_execution = 14;
+  // Every change of the plan a table step's dispatch runs part of. A step's
+  // ddl_changes name only its own table, so a deployment that has not stored
+  // the plan builds it from these instead: it verifies the whole plan against
+  // its live schema, stores it once, and runs the step's table from it, so
+  // every later step of the same target finds the plan its own target was
+  // planned with. Empty on a dispatch that is not a table step, whose
+  // ddl_changes already carry its whole plan.
+  repeated TableChange plan_ddl_changes = 15;
+}
+
+// ApplyConflict names the active work that refused an apply, in the terms a
+// caller needs to explain the refusal on its own surfaces.
+//
+// error_message is the engine's own prose and is not safe to render: it can
+// carry dial failures, hostnames, and driver internals into a public pull
+// request. These fields are the sanitized alternative — facts the engine
+// derived rather than text it caught — so a caller can tell an operator what
+// holds the database without leaking what went wrong underneath.
+//
+// The engine's own identifiers are never rendered. They resolve only inside the
+// engine, so an operator who pastes one into the control-plane CLI is refused.
+// holder_external_id crosses for the opposite purpose: it is the key a caller
+// joins against its own record of what it dispatched, so it can name the
+// holding change by an identifier that resolves on the operator's side.
+message ApplyConflict {
+  // The table the blocking work is changing. Empty for a multi-table atomic
+  // change, which holds the database without naming a single table.
+  string table = 1;
+  // The shard held, for sharded engines. Empty when the whole database is held.
+  string shard = 2;
+  // The canonical state of the schema change holding the database, which is
+  // what decides whether an operator must act or can wait.
+  string blocking_state = 3;
+  // The pull request that owns the holding change, when one does.
+  string repository = 4;
+  int32 pull_request = 5;
+  // Who started the holding change (e.g. "cli:user@host"). Set when no pull
+  // request owns it.
+  string caller = 6;
+  // The engine's identifier for the holding change, for lookup only. A caller
+  // that dispatched the holding change recorded this identifier against its own
+  // apply, so it can resolve the handle an operator can actually use. A caller
+  // that finds no match did not start this work and has no handle to offer —
+  // this field is never the one rendered.
+  string holder_external_id = 7;
 }
 
 // ApplyResponse indicates whether the apply was accepted.
@@ -545,6 +912,16 @@ message ApplyResponse {
   string apply_id = 3;
   // The apply_operation identifier for operation-scoped callers.
   string apply_operation_id = 4;
+  // The operation key the data plane derived from this dispatch's shape,
+  // echoed so a caller can verify the response addresses its own operation —
+  // an apply shared by a deployment's operations answers many keys, and a
+  // response without the caller's key must not be treated as that
+  // operation's dispatch.
+  string operation_key = 5;
+  // Set when the apply was refused because other work already holds the
+  // database, so the caller can render the refusal instead of the engine's
+  // unsafe error text. Absent for every other rejection.
+  ApplyConflict conflict = 6;
 }
 
 // ProgressRequest requests detailed progress for an active schema change.
@@ -553,6 +930,42 @@ message ProgressRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // When set, scopes the answer to one operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, each with its own operation,
+  // so a member's progress is its operation's state and tables rather than
+  // the whole apply's. Empty asks about the whole apply.
+  string apply_operation_id = 3;
+}
+
+message BatchProgressRequest {
+  // Apply ID for the schema change to inspect.
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
+  // The operations to answer for: apply_operation_id values a dispatch
+  // returned in ApplyResponse. Each is answered as a ProgressRequest scoped
+  // to it would be.
+  repeated string apply_operation_ids = 3;
+}
+
+message BatchProgressResponse {
+  string apply_id = 1;
+  // One entry per requested operation, in request order.
+  repeated OperationProgress operations = 2;
+}
+
+// OperationProgress is the answer for one operation of a BatchProgress call.
+message OperationProgress {
+  // The apply_operation_id this entry answers for, echoed from the request.
+  string apply_operation_id = 1;
+  // What Progress scoped to this operation returns. Unset when error_code is.
+  ProgressResponse progress = 2;
+  // The gRPC status code Progress scoped to this operation fails with, or 0
+  // (OK) when progress is set.
+  int32 error_code = 3;
+  // The message of that failure.
+  string error_message = 4;
 }
 
 message LogsRequest {
@@ -562,6 +975,11 @@ message LogsRequest {
   string type = 4;
   string environment = 5;
   int32 limit = 6;
+  // Optional shard of a sharded apply to read: only the operations whose work
+  // runs on that shard contribute their entries, alongside the entries that
+  // apply to the whole apply. Composes with target, since a shard name repeats
+  // across targets. Empty reads every shard.
+  string shard = 7;
 }
 
 message ApplyLog {
@@ -580,6 +998,16 @@ message ApplyLog {
 message LogsResponse {
   string apply_id = 1;
   repeated ApplyLog logs = 2;
+  // The target the read was narrowed to, echoing LogsRequest.target; empty
+  // when the read covers every target. A data plane that predates target log
+  // reads ignores the field and leaves this empty, so a caller that asked for
+  // one target must treat a missing or different echo as an unnarrowed read.
+  string target = 3;
+  // The shard the read was narrowed to, echoing LogsRequest.shard; empty when
+  // the read covers every shard. A data plane that predates LogsRequest.shard
+  // ignores the field and leaves this empty, so a caller that asked for one
+  // shard must treat a missing or different echo as an unnarrowed read.
+  string shard = 4;
 }
 
 // ShardProgress contains progress information for a single Vitess shard.
@@ -591,7 +1019,8 @@ message ShardProgress {
   int64 eta_seconds = 5;
   int32 cutover_attempts = 6;
   string last_cutover_attempt = 7;
-  bool ready_to_complete = 8;
+  reserved 8;
+  reserved "ready_to_complete";
 }
 
 // TableProgress contains progress information for a single table.
@@ -613,6 +1042,43 @@ message TableProgress {
   // Populated while the table is checksumming (verifying copied data), 0 otherwise.
   int64 checksum_rows_checked = 14;
   int64 checksum_rows_total = 15;
+  // The table's own failure reason (for example an engine preflight
+  // rejection), distinct from the apply-level error_message on
+  // ProgressResponse. Empty when the table has not failed.
+  string error_message = 16;
+  // The engine's throttler is pausing this table's active phase (row copy or
+  // checksum verify), so stalled row counts read as a deliberate pause rather
+  // than a hang. Cleared when the pause lifts.
+  bool throttled = 17;
+  // Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
+  // 2s"). Empty when throttled is false.
+  string throttle_reason = 18;
+  // The plan's approximate on-disk footprint of the table (data plus indexes),
+  // for display beside the row counts. Unset when the plan had no estimate and
+  // for a task scoped to one shard, since the estimate covers the whole table.
+  optional int64 estimated_bytes = 19;
+  // The plan's approximate row count for the table, so a table that has not
+  // started copying can show how much it will copy. rows_total replaces it
+  // once the engine reports. Unset under the same rules as estimated_bytes.
+  optional int64 estimated_rows = 20;
+}
+
+// SettledControlRequest reports the fate of a durable control request the
+// serving plane consumed. Accepting a control RPC only means the request was
+// queued, so the plane that accepted it learns here whether the operation
+// actually took effect.
+message SettledControlRequest {
+  // The control operation: "stop", "start", "cutover", "cancel", "revert", or
+  // "skip_revert".
+  string operation = 1;
+  // Terminal status of the request: "completed" or "failed".
+  string status = 2;
+  // Operator-facing reason the request failed. Empty when it completed.
+  string error_message = 3;
+  // RFC3339 timestamp of when the request reached its terminal status.
+  string settled_at = 4;
+  // Who issued the request, as recorded by the plane that queued it.
+  string requested_by = 5;
 }
 
 // ProgressResponse contains detailed progress information.
@@ -625,8 +1091,25 @@ message ProgressResponse {
   repeated TableProgress tables = 6;
   string started_at = 7;
   string completed_at = 8;
-  int32 volume = 9;
+  // Field 9 carried the operator-set volume level before the volume control
+  // operation was removed. Reserved so a future field cannot reuse the number
+  // while an embedded pre-removal data plane still emits it.
+  reserved 9;
+  reserved "volume";
   map<string, string> metadata = 10;
+  // Control requests on this apply that have reached a terminal status.
+  repeated SettledControlRequest settled_control_requests = 11;
+  // The apply_operation_id the answer is scoped to, echoed from the request.
+  // A caller that asked about one operation must refuse an answer without its
+  // id: a data plane that ignores the scope answers for the whole apply, and
+  // reading that as one member's state reports its siblings' work as its own.
+  string apply_operation_id = 12;
+  // The state of the whole apply, set on an answer scoped to one operation.
+  State apply_state = 13;
+  // Set on an answer scoped to one operation when that operation will never
+  // run: no driver has claimed it and its apply has settled, so nothing will
+  // claim it again. The caller settles the operation rather than wait on it.
+  bool operation_never_starts = 14;
 }
 
 // CutoverRequest triggers the cutover phase.
@@ -635,12 +1118,42 @@ message CutoverRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
+  // When set, cuts over only this operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, and one member's turn to cut
+  // over is not its siblings' turn. Empty cuts over the apply's parked work.
+  string apply_operation_id = 4;
+  // When set, one cutover command for every operation listed: each is cut
+  // over by its own drive once it waits at its cutover, and the request
+  // settles once none of them can still cut over on it. apply_operation_id
+  // names one of them, so a data plane that reads only that field cuts over
+  // that operation alone.
+  repeated string apply_operation_ids = 5;
+  // When set, identifies the operator command this request carries, the same
+  // on every send of it. A data plane that already settled the command
+  // answers a re-send with that outcome instead of recording the command
+  // again, so a re-send never retries a command the data plane failed. A
+  // new operator command carries a new id. An id of the form
+  // "<origin>.<sequence>" orders the commands of one origin: a data plane that
+  // settled a later command answers a send of an earlier one with that
+  // outcome too, since only a delayed re-send can carry it.
+  string command_id = 6;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
 message CutoverResponse {
   bool accepted = 1;
   string error_message = 2;
+  // The command_id the data plane recorded the request under, echoed back.
+  // Empty from a data plane that predates command ids, which records every
+  // send as a new command, so a caller sends such a data plane each command
+  // only once.
+  string command_id = 3;
 }
 
 // RevertRequest reverts a completed schema change.
@@ -679,12 +1192,40 @@ message HealthResponse {
   string status = 1;
 }
 
+// DriverCapacityRequest asks a deployment for the drivers its operators run.
+message DriverCapacityRequest {}
+
+// DriverCapacityResponse is the drivers a deployment's live servers
+// run, counted from the servers that reported within the live window.
+message DriverCapacityResponse {
+  // live_servers is how many of the deployment's servers reported their
+  // drivers within the live window.
+  int32 live_servers = 1;
+  // drivers is how many drivers those servers run, together.
+  int32 drivers = 2;
+  // deferred_cutover_drivers is how many of those drivers may hold an
+  // operation waiting at a deferred cutover: each server's drivers less the
+  // one it keeps for other work. A waiting operation keeps its driver until
+  // its cutover runs.
+  int32 deferred_cutover_drivers = 3;
+  // max_drivers_per_apply is how many operations of one apply the deployment
+  // runs at once. An operation waiting at its cutover keeps counting, so an
+  // apply that sends the deployment more operations than this can never have
+  // all of them waiting together.
+  int32 max_drivers_per_apply = 4;
+}
+
 // StopRequest pauses an in-progress schema change by apply ID.
 message StopRequest {
   // Apply ID for the schema change to stop.
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
 }
 
 // StopResponse indicates whether the stop was accepted.
@@ -705,11 +1246,21 @@ message CancelRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
 }
 
 // CancelResponse indicates whether the cancel was accepted.
 message CancelResponse {
   bool accepted = 1;
+  // error_message explains a refusal when accepted is false. When accepted is
+  // true it may still be set, to say what actually happened: a cancel that
+  // arrived after the schema change settled is accepted with
+  // "Schema change already <state>". Branch on accepted, not on whether
+  // error_message is empty.
   string error_message = 2;
   // Number of tasks that were cancelled.
   int64 cancelled_count = 3;
@@ -723,6 +1274,11 @@ message StartRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
 }
 
 // StartResponse indicates whether the start was accepted.
@@ -735,22 +1291,186 @@ message StartResponse {
   int64 skipped_count = 4;
 }
 
-// VolumeRequest modifies the schema change speed/concurrency.
-message VolumeRequest {
-  // Apply ID for the schema change to adjust.
-  string apply_id = 1;
-  // Environment: "staging" or "production".
-  string environment = 2;
-  // Volume level 1-11 (1=conservative, 11=aggressive).
-  int32 volume = 3;
+// StorageSchemaPlanRequest asks the serving instance for the DDL outstanding
+// on its own storage database. It deliberately carries no target: the instance
+// answers for the storage it uses, and nothing a caller sends can point it at
+// a different database.
+//
+// The live side of the diff is therefore fixed. The desired side is not: a
+// caller deploying a later release asks what this storage needs in order to
+// match that release, which the serving binary cannot answer from files it does
+// not have. Sending the files is the only way to ask the question, and it is
+// safe to ask because a diff executes nothing. The apply RPC takes the same
+// field, so the schema an operator previewed here is the schema they converge.
+message StorageSchemaPlanRequest {
+  // AllowDestructive reports the destructive statements as allowed rather than
+  // refused, matching what an apply carrying the same flag would run. It does
+  // not execute anything — a diff never does — and it does not change which
+  // statements are classified destructive, only whether the report says they
+  // would run.
+  bool allow_destructive = 1;
+  // SchemaFiles is the desired schema, as file name → file contents (for
+  // example "applies.sql" → "CREATE TABLE ..."). Empty diffs against the
+  // serving binary's own embedded files. The serving instance's dialect selects
+  // how they are read, exactly as it does for the embedded ones.
+  map<string, string> schema_files = 2;
+  // SchemaSource says where schema_files came from, in words, for the report to
+  // carry back. It is required with schema_files and never inferred: a report
+  // that does not say whose schema it was diffed against is one a caller can
+  // misattribute to the serving binary.
+  string schema_source = 3;
 }
 
-// VolumeResponse indicates whether the volume change was accepted.
-message VolumeResponse {
-  bool accepted = 1;
-  string error_message = 2;
-  // Previous volume level.
-  int32 previous_volume = 3;
-  // New volume level.
-  int32 new_volume = 4;
+// StorageSchemaStatement is one outstanding storage-schema statement.
+message StorageSchemaStatement {
+  // Storage table the statement acts on.
+  string table = 1;
+  // Statement kind in the storage layer's own vocabulary (create_table,
+  // alter_table, add_column, create_index, ...).
+  string operation = 2;
+  // The statement itself, runnable as printed.
+  string ddl = 3;
+  // Why the statement is classified destructive, or why it needs manual
+  // remediation. Empty for a statement that runs automatically.
+  string reason = 4;
+}
+
+// StorageSchemaReport is what one storage database needs to match the embedded
+// schema of the binary that produced the report. The three statement sets are
+// disjoint and have different dispositions, so a caller never has to work out
+// which statements would actually run.
+message StorageSchemaReport {
+  // Storage database family: "mysql" or "postgres".
+  string dialect = 1;
+  // The live database the diff read, as the server reports it.
+  string database = 2;
+  // SchemaBot version of the binary that answered. Reported for attribution
+  // only; the diff itself is computed from schema files, never from a version.
+  string version = 3;
+  // Statements that converge the schema and run automatically, in the order
+  // the convergence would run them.
+  repeated StorageSchemaStatement outstanding = 4;
+  // Statements classified as destroying data. Refused unless destructive
+  // changes are allowed.
+  repeated StorageSchemaStatement destructive = 5;
+  // Whether the destructive statements would actually run on this call. It is
+  // the effective policy: the deployment's standing one, widened by an opt-in
+  // this caller sent. Use boot_removal_policy to reason about what some other
+  // process does, which a caller's opt-in never moves.
+  bool destructive_allowed = 6;
+  // Changes that cannot run automatically, each naming the situation and its
+  // remediation. Any entry aborts the whole convergence before a single
+  // statement executes.
+  repeated StorageSchemaStatement manual = 7;
+  // The database server as it names itself, so a report names the machine it
+  // read and not only the database on it. Empty when the server does not
+  // report one.
+  string host = 8;
+  // Where the desired side of the diff came from, in words — the serving
+  // binary's embedded files, a directory, or a release. A report always says
+  // this, because the same live database yields different answers against
+  // different releases.
+  string schema_source = 9;
+  // Whether some instance held the storage bootstrap lock when the diff was
+  // taken — a pod booting, or another operator's apply. It is what separates
+  // "this DDL is outstanding" from "this DDL is being run right now", which
+  // the statement sets cannot say on their own: a convergence's work lands on
+  // a shadow table until it cuts over. Only true is a finding; false is the
+  // absence of evidence, not a claim that the database is idle.
+  bool convergence_in_flight = 10;
+  // What the next pod to start does to storage state its own schema does not
+  // declare, which is what says whether state converged ahead of a deploy
+  // survives until that deploy.
+  //
+  // This is a property of the deployment and its dialect, never of the call
+  // that asked. A caller opting in to destructive statements moves
+  // destructive_allowed and leaves this alone, because a boot reads the
+  // deployment's config and has never heard of the request.
+  BootRemovalPolicy boot_removal_policy = 11;
+}
+
+// BootRemovalPolicy is what a boot of the answering deployment does to storage
+// state its own schema does not declare.
+//
+// UNSPECIFIED is a real answer and the reason this is not a bool. A release
+// that predates this field leaves it unset, and so does a caller holding a DSN
+// rather than a deployment's config, so an unset value means the answering side
+// could not say — never that the state is safe. Reading it as "preserved" is
+// how an operator is told to pre-apply storage the next pod will drop.
+enum BootRemovalPolicy {
+  // The answering side did not say. Older releases do not set this field, and
+  // a convergence addressed by DSN alone has no deployment config to read.
+  BOOT_REMOVAL_POLICY_UNSPECIFIED = 0;
+  // A boot leaves surplus storage state in place: it either refuses the
+  // removals, or never computes one.
+  BOOT_REMOVAL_POLICY_PRESERVES = 1;
+  // A boot drops the tables, columns and indexes its own schema does not
+  // declare.
+  BOOT_REMOVAL_POLICY_REMOVES = 2;
+}
+
+// StorageSchemaPlanResponse carries the outstanding storage DDL.
+message StorageSchemaPlanResponse {
+  StorageSchemaReport report = 1;
+}
+
+// StorageSchemaApplyRequest converges the serving instance's own storage
+// schema. Like the diff, it carries no target: the instance converges the
+// storage it uses, and nothing a caller sends can point it at a different
+// database.
+//
+// What a caller may send is the schema to converge *to*. An operator rolling a
+// later release converges the storage to that release before its first pod
+// starts, and the serving binary cannot do that from files it does not have.
+// Sending the files moves which schema runs and nothing else: the destructive
+// refusal and the manual-remediation gate decide exactly as they decide for a
+// boot.
+message StorageSchemaApplyRequest {
+  // AllowDestructive permits the destructive statements this call would
+  // otherwise refuse. It is an addition to the serving instance's storage
+  // config, never a restriction of it: a deployment whose config already
+  // allows destructive storage changes converges the same way a boot would,
+  // with or without this flag.
+  bool allow_destructive = 1;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it, so the data plane's logs attribute the
+  // convergence to a person rather than to a control plane.
+  string caller = 2;
+  // TimeoutSeconds bounds the whole convergence: the advisory-lock wait, the
+  // diff taken under it, and the DDL. Zero means the caller named no budget,
+  // and the serving instance then runs the convergence under the budget it
+  // boots with rather than under an operator's: a caller that could not name
+  // a budget is one whose wait the serving instance cannot know, and the boot
+  // budget is the one every such caller has always waited out. A control
+  // plane names the budget it resolved on every request, so a convergence
+  // runs under the far larger operator default only because a caller asked
+  // for it and is waiting that long. Raise it only to finish work a boot cannot,
+  // such as an index build over a storage table with a long history: the
+  // convergence holds the bootstrap advisory lock for its whole budget, and a
+  // pod booting in that window fails its own lock wait and does not come up.
+  // A value above the serving instance's maximum is refused rather than
+  // clamped, so a caller is never told a budget it did not get.
+  int64 timeout_seconds = 3;
+  // SchemaFiles is the schema to converge to, as file name → file contents
+  // (for example "applies.sql" → "CREATE TABLE ..."). Empty converges the
+  // serving binary's own embedded files, which is what its next boot would
+  // converge.
+  map<string, string> schema_files = 4;
+  // SchemaSource says where schema_files came from, in words, for the reports
+  // to carry back and for the converging instance's logs to name. It is
+  // required with schema_files and never inferred: a convergence attributed to
+  // a release whose files it did not run is worse than one that names nothing.
+  string schema_source = 5;
+}
+
+// StorageSchemaApplyResponse brackets the convergence with the report from
+// before it and the report from after it.
+message StorageSchemaApplyResponse {
+  // What was outstanding before the convergence ran.
+  StorageSchemaReport planned = 1;
+  // What is still outstanding after it. Empty on a clean convergence; it
+  // carries the refused destructive statements when the live database holds
+  // state the serving binary's schema does not declare, which is the expected
+  // steady state during a rollback rather than a failure.
+  StorageSchemaReport remaining = 2;
 }

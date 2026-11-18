@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/presentation"
@@ -37,17 +38,24 @@ func releasedForApply(ctx context.Context, stor storage.Storage, apply *storage.
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) string {
-	// A sharded apply fans out across the shards of one keyspace within a single
-	// deployment, so it gets the shard-unit layout rather than the deployment-unit
-	// one — its operations differ by shard, not deployment.
+// view is what the stored plan says about the apply's finalizers and table
+// sizes (see resolveShardedPlanView), consumed only by sharded applies.
+func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, view *shardedPlanView, tenant, cliName string) string {
+	// A sharded apply fans out across the shards of one or more keyspaces within
+	// a single deployment, so it gets the shard-unit layout rather than the
+	// deployment-unit one — its operations differ by shard, not deployment. One
+	// that runs on a single shard per keyspace with no VSchema change reads as
+	// one change on one database, so it takes the single-deployment layout.
 	if isShardedApply(ops) {
-		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, tenant))
+		if rendersAsSingleShard(apply, ops, view) {
+			return templates.RenderApplyStatusComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, view, tenant))
+		}
+		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, view, tenant))
 	}
 	if len(ops) <= 1 {
 		return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant))
 	}
-	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant))
+	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant, cliName))
 }
 
 // formatApplySummaryComment renders the terminal summary PR comment for an apply,
@@ -60,17 +68,23 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 // ops must be in resolved deployment order (as returned by
 // ApplyOperations().ListByApply); tasks are the apply's tasks across all
 // deployments, regrouped per operation for the multi-deployment layout.
-func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) string {
-	// The sharded layout is terminal-aware (header, footer, no last-updated line),
-	// so the same renderer serves the terminal summary; only the deployment-unit
-	// path has a distinct summary renderer.
+// view is what the stored plan says about the apply's finalizers and table
+// sizes (see resolveShardedPlanView), consumed only by sharded applies.
+func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, view *shardedPlanView, tenant, cliName string) string {
+	// A sharded apply renders the shard-unit terminal summary: the same shard
+	// rollup as its status comment, under the state-specific verdict header the
+	// other apply shapes' summaries lead with. One that rendersAsSingleShard
+	// takes the single-deployment summary, as its status comment does.
 	if isShardedApply(ops) {
-		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, tenant))
+		if rendersAsSingleShard(apply, ops, view) {
+			return templates.RenderApplySummaryComment(buildSingleShardApplyCommentData(apply, ops, tasks, displayByOp, view, tenant))
+		}
+		return templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, released, tasks, view, tenant))
 	}
 	if len(ops) <= 1 {
 		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, singleOpDisplay(ops, displayByOp), shardsByTable, tenant))
 	}
-	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant))
+	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, released, tasks, displayByOp, shardsByTable, tenant, cliName))
 }
 
 // singleOpDisplay returns the engine display projection for a zero/one-operation
@@ -86,13 +100,26 @@ func singleOpDisplay(ops []*storage.ApplyOperation, displayByOp map[int64]operat
 // buildMultiApplyData assembles the multi-deployment comment input: the derived
 // rollup plus each deployment's own single-deployment comment data, so each
 // deployment's section reuses the existing per-table renderer.
-func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) templates.MultiDeploymentApplyData {
+func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant, cliName string) templates.MultiDeploymentApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 
-	model := deriveApplyPresentation(ops, released)
-	details := make(map[string]templates.ApplyStatusCommentData, len(ops))
-	for _, op := range ops {
-		details[op.Deployment] = buildDeploymentDetail(apply, op, tasksByOp[op.ID], displayByOp[op.ID], shardsByTable, tenant)
+	model := deriveApplyPresentation(apply.State, ops, tasksByOp, released)
+	// Derive returns one presentation per rollout member, so the details are
+	// built member by member and consumed positionally. A deployment can own
+	// several members, which a name-keyed map could not tell apart. A
+	// member whose work spans several rows, a target run table by table,
+	// shows every row's tables in row order, under its lead row's state,
+	// error and engine detail.
+	details := make([]*templates.ApplyStatusCommentData, 0, len(model.Deployments))
+	for _, d := range model.Deployments {
+		lead := ops[d.Row]
+		var memberTasks []*storage.Task
+		for _, i := range d.Rows {
+			memberTasks = append(memberTasks, tasksByOp[ops[i].ID]...)
+		}
+		detail := buildDeploymentDetail(apply, lead, memberTasks, displayByOp[lead.ID], shardsByTable, tenant, cliName)
+		detail.State = d.State
+		details = append(details, &detail)
 	}
 
 	data := templates.MultiDeploymentApplyData{
@@ -115,12 +142,47 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 // deriveApplyPresentation maps the apply's operation rows to the surface-neutral
 // presentation inputs and derives the rollup. Rows are already in resolved order.
 // released is the apply-level release latch applied to every operation.
-func deriveApplyPresentation(ops []*storage.ApplyOperation, released bool) presentation.Apply {
+// tasksByOp marks a row retrying while one of its tasks retries a failure, the
+// task evidence the cutover claim holds a later member on. applyState is the
+// apply's own state, so a resuming apply's still-stopped rows read as the
+// start under way (presentation.ResumeClaimed).
+func deriveApplyPresentation(applyState string, ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, released bool) presentation.Apply {
 	inputs := make([]presentation.Operation, 0, len(ops))
+	endedBy := endedByRefs(ops)
 	for _, op := range ops {
-		inputs = append(inputs, applyOperationToPresentation(op, released))
+		input := applyOperationToPresentation(op, released)
+		input.Retrying = storage.TasksRetrying(tasksByOp[op.ID])
+		input.EndedBy = endedBy[op.ID]
+		inputs = append(inputs, input)
 	}
-	return presentation.Derive(inputs)
+	return presentation.Derive(presentation.ResumeClaimed(applyState, inputs))
+}
+
+// endedByRefs maps each row failed for another row of the apply
+// (ended_by_operation_id) to that row's deployment and operation key, the
+// reference presentation resolves to a member name. A row the apply does not
+// list maps to an empty reference, which still reads as stopped at the
+// cutover without naming the row that ended.
+func endedByRefs(ops []*storage.ApplyOperation) map[int64]*presentation.OperationRef {
+	byID := make(map[int64]*storage.ApplyOperation, len(ops))
+	for _, op := range ops {
+		byID[op.ID] = op
+	}
+	refs := make(map[int64]*presentation.OperationRef)
+	for _, op := range ops {
+		if op.EndedByOperationID == 0 {
+			continue
+		}
+		ended, ok := byID[op.EndedByOperationID]
+		if !ok {
+			slog.Warn("apply comment names no operation for a row failed for another: the ended operation is not listed",
+				append(op.LogAttrs(), "ended_by_operation_id", op.EndedByOperationID)...)
+			refs[op.ID] = &presentation.OperationRef{}
+			continue
+		}
+		refs[op.ID] = &presentation.OperationRef{Deployment: ended.Deployment, OperationKey: ended.OperationKey}
+	}
+	return refs
 }
 
 // applyOperationToPresentation maps one storage operation row to the neutral
@@ -134,9 +196,19 @@ func deriveApplyPresentation(ops []*storage.ApplyOperation, released bool) prese
 // released pause behaves like continue, so the held siblings run degraded
 // instead of paused.
 func applyOperationToPresentation(op *storage.ApplyOperation, released bool) presentation.Operation {
+	// The row's key, kind and start come through the same mapping the stored
+	// derivation reads, so the header settles exactly as applies.state does.
+	rollout := op.RolloutOperation(released)
 	return presentation.Operation{
 		Deployment:        op.Deployment,
+		Target:            op.Target,
 		State:             op.State,
+		OperationKey:      rollout.OperationKey,
+		Work:              rollout.Work,
+		Finalizer:         rollout.Finalizer,
+		NeverStarted:      rollout.NeverStarted,
+		AlreadyConverged:  op.AlreadyConverged,
+		RolloutStep:       op.RolloutStep,
 		Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 		Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
 		ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
@@ -151,7 +223,9 @@ func applyOperationToPresentation(op *storage.ApplyOperation, released bool) pre
 // identity and timing, and the deployment's own tasks. The deployment's database
 // target is shown via the section's deployment name; the per-table rows fall back
 // to the apply database for namespace, matching the single-deployment renderer.
-func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) templates.ApplyStatusCommentData {
+// cliName starts the command that prints the deployment's stored plan, which
+// DDL cut to fit points at when the deployment names its plan.
+func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task, tenant, cliName string) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
 		ApplyID:          apply.ApplyIdentifier,
 		Database:         apply.Database,
@@ -164,8 +238,16 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
+		Step:             display.Step.Step,
+		StepsTotal:       display.Step.StepsTotal,
+		Statement:        display.Step.Statement,
+		BuildWork:        display.BuildWork,
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
+		DeferCutover:     apply.GetOptions().DeferCutover,
+		SkipRevert:       apply.GetOptions().SkipRevert,
+		PlanID:           display.PlanIdentifier,
+		CLIName:          cliName,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

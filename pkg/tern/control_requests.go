@@ -3,8 +3,10 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -26,9 +28,109 @@ func pendingControlRequest(ctx context.Context, store storage.Storage, apply *st
 	return controlReq, nil
 }
 
+// pendingControlOperations is the set of control operations pending for an
+// apply as of one read. A drive's poll consults several operations, and nearly
+// always none is pending, so it reads them all in one query and runs only the
+// processors whose operation is in the set. The set only gates: a processor it
+// lets through loads its own request again, so it acts on the stored row and
+// never on this snapshot. A request recorded after the read is answered on the
+// next poll.
+type pendingControlOperations map[storage.ControlOperation]struct{}
+
+// loadPendingControlOperations reads the operations pending for an apply.
+func loadPendingControlOperations(ctx context.Context, store storage.Storage, apply *storage.Apply) (pendingControlOperations, error) {
+	if store == nil {
+		return nil, fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	requests, err := controlStore.ListPending(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list pending control requests for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	pending := make(pendingControlOperations, len(requests))
+	for _, req := range requests {
+		pending[req.Operation] = struct{}{}
+	}
+	return pending, nil
+}
+
+// has reports whether any of the operations is pending.
+func (p pendingControlOperations) has(operations ...storage.ControlOperation) bool {
+	for _, operation := range operations {
+		if _, ok := p[operation]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// controlRequestAccepted reports whether the engine has accepted a control
+// request of the given operation for an apply: its durable request row is
+// completed. The row is completed by whichever process carried the request
+// out, whether the API's immediate attempt or a drive, so this is the answer a
+// drive that never saw the acceptance itself must read.
+func controlRequestAccepted(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (bool, error) {
+	if store == nil {
+		return false, fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	controlReq, err := controlStore.GetByOperation(ctx, apply.ID, operation)
+	if err != nil {
+		return false, fmt.Errorf("load %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
+	}
+	return controlReq != nil && controlReq.Status == storage.ControlRequestCompleted, nil
+}
+
 // completePendingControlRequests marks the pending control request of the given
-// operation completed, after verifying the apply lease still holds.
+// operation completed, after verifying the apply lease still holds. A stop is
+// refused here: it completes through completePendingStopControlRequest, which
+// first answers the cutover the stop superseded.
 func completePendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
+	if operation == storage.ControlOperationStop {
+		return fmt.Errorf("complete pending stop control request for apply %s: a stop must complete through completePendingStopControlRequest so the cutover it superseded is settled first", apply.ApplyIdentifier)
+	}
+	return markPendingControlRequestCompleted(ctx, store, apply, operation)
+}
+
+// completePendingStopControlRequest completes the apply's pending stop request.
+//
+// Completing a pending stop is where the stop takes effect on every engine
+// path, so the cutover it superseded is answered first, while the stop is
+// still pending (CO-4). The pending stop is what keeps a drive from taking a
+// cutover, so a failed settlement leaves both requests pending and the
+// owner's retry settles the cutover before the stop gate comes down. The other
+// order would let one failed write complete the stop and leave the old cutover
+// pending, to fire on the copy a later start resumes.
+func completePendingStopControlRequest(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	stopReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStop)
+	if err != nil {
+		return err
+	}
+	if stopReq == nil {
+		logger.DebugContext(ctx, "no pending stop request to complete", apply.LogAttrs()...)
+		return nil
+	}
+	if err := SettlePendingCutoverAfterStop(ctx, store, logger, apply); err != nil {
+		return fmt.Errorf("settle the cutover superseded by stop before completing the stop request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := markPendingControlRequestCompleted(ctx, store, apply, storage.ControlOperationStop); err != nil {
+		return err
+	}
+	logger.InfoContext(ctx, "completed pending stop request",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(stopReq))...)
+	return nil
+}
+
+// markPendingControlRequestCompleted writes the completion of the apply's
+// pending control request of the given operation, after verifying the apply
+// lease still holds.
+func markPendingControlRequestCompleted(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
@@ -45,35 +147,547 @@ func completePendingControlRequests(ctx context.Context, store storage.Storage, 
 	return nil
 }
 
-// completePendingRequestsForTerminalApply completes the pending control
-// requests that a terminal apply moots: a pending stop is settled (the apply
-// can no longer be stopped), a pending revert or skip-revert can no longer
-// act because the revert window is gone, and a pending volume adjustment has
-// no running copy left to retune. Sweeping them keeps a request issued moments
-// before the apply settled — or one that lost to a contradictory command —
-// from lingering pending forever.
-func completePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	for _, op := range []storage.ControlOperation{
-		storage.ControlOperationStop,
-		storage.ControlOperationRevert,
-		storage.ControlOperationSkipRevert,
-		storage.ControlOperationVolume,
-	} {
+// SettlePendingRequestsForTerminalApply settles the pending control requests
+// that a terminal apply moots: a pending stop is settled (the apply can no
+// longer be stopped), and a pending release completes, keeping its latch.
+// Sweeping the mooted requests keeps a request issued moments before the apply
+// settled — or one that lost to a contradictory command — from lingering
+// pending forever.
+//
+// A pending cutover, cancel, revert, and skip-revert are settled rather than
+// completed outright: the terminal state decides whether the operator's command
+// took effect (CO-2). A pending cancel is mooted by every terminal state except
+// stopped, since a stopped apply remains cancellable and its pending cancel
+// stays deliverable for the next drive.
+//
+// This is the one terminal sweep: the drive tail runs it on the apply it just
+// settled, and the operator's post-drive settlement and the stranded control
+// request reaper run it on a reloaded terminal apply, so a request a drive
+// failed to settle is answered the same way whichever path reaches it.
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	if err := completePendingStopControlRequest(ctx, store, logger, apply); err != nil {
+		return err
+	}
+	// A pending request for a retired operation can only be a row written by a
+	// previous release; no driver services it anymore, so this sweep is its
+	// only settlement path.
+	for _, op := range storage.RetiredControlOperations() {
+		controlReq, err := pendingControlRequest(ctx, store, apply, op)
+		if err != nil {
+			return err
+		}
+		if controlReq == nil {
+			logger.DebugContext(ctx, "no pending control request of this operation to settle", append(apply.LogAttrs(), "operation", op)...)
+			continue
+		}
+		logger.InfoContext(ctx, "completing pending control request the terminal apply moots",
+			append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq))...)
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
+			return err
+		}
+	}
+	if err := completePendingReleaseForTerminalApply(ctx, store, logger, apply); err != nil {
+		return err
+	}
+	// Requests settled against the outcome the apply reached.
+	if err := SettlePendingCutoverForResolvedApply(ctx, store, logger, apply); err != nil {
+		return err
+	}
+	if err := SettlePendingRevertPhaseForResolvedApply(ctx, store, logger, apply); err != nil {
+		return err
+	}
+	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
+}
+
+// completePendingReleaseForTerminalApply completes a release still pending
+// once the apply is terminal. A release is accepted only on a paused apply and
+// no drive consumes it: its pending row is the latch the claim ordering reads
+// while the rollout runs, so without this it stays pending after the apply
+// settles. A completed release latches exactly as a pending one does (see
+// storage.ApplyControlRequest.ReleasesPausedRollout), so completing it leaves
+// the rollout released and only answers the command.
+//
+// The caller must have established that the apply is terminal.
+func completePendingReleaseForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationRelease)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		logger.DebugContext(ctx, "no pending release request to complete", apply.LogAttrs()...)
+		return nil
+	}
+	logger.InfoContext(ctx, "completing pending release request for terminal apply; the rollout stays released",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+	return completePendingControlRequests(ctx, store, apply, storage.ControlOperationRelease)
+}
+
+// SettlePendingRevertPhaseForResolvedApply answers the pending revert and
+// skip-revert of an apply that has reached a terminal state, whichever path
+// drove it there: the drive that stored the outcome, the operator's post-drive
+// settlement, or the reaper's stranded control-request sweep. Each one owes the
+// operator the same answer about the command they issued, so they share this
+// entry point (see settlePendingRevertPhaseRequestForTerminalApply).
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingRevertPhaseForResolvedApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	for _, op := range []storage.ControlOperation{storage.ControlOperationRevert, storage.ControlOperationSkipRevert} {
+		if err := settlePendingRevertPhaseRequestForTerminalApply(ctx, store, logger, apply, op); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// settlePendingRevertPhaseRequestOutsideWindow answers a revert or skip-revert a
+// drive finds pending once the apply has left its revert window, without
+// another engine call: the window is where the engine acts on either command.
+// A terminal apply settles the request by its outcome. An apply still on its
+// way out of the window — reverting, or skipping the revert — leaves it
+// pending: the command may be the one carrying the apply there, so failing it
+// now could contradict the outcome it is about to reach, and the terminal
+// settlement answers it once that outcome is stored.
+func settlePendingRevertPhaseRequestOutsideWindow(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, op storage.ControlOperation) error {
+	if state.IsTerminalApplyState(apply.State) {
+		return settlePendingRevertPhaseRequestForTerminalApply(ctx, store, logger, apply, op)
+	}
+	logger.DebugContext(ctx, "leaving the pending control request for the terminal settlement: the apply left the revert window and has not settled",
+		append(apply.LogAttrs(), "operation", op)...)
+	return nil
+}
+
+// settlePendingRevertPhaseRequestForTerminalApply answers a revert or
+// skip-revert still pending once the apply is terminal. The revert window is
+// gone, so the request can no longer act; whether it took effect is read from
+// the outcome. A revert took effect only when the apply settled reverted, and a
+// skip-revert only when it settled completed — the window closed and the change
+// stayed. Any other outcome outran the command, so it fails with a reason that
+// says so rather than being reported as carried out, and the apply history
+// records that it did not take effect.
+//
+// The caller must have established that the apply is terminal.
+func settlePendingRevertPhaseRequestForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, op storage.ControlOperation) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, op)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if revertPhaseRequestTookEffect(op, apply.State) {
+		logger.InfoContext(ctx, "completing pending control request: the apply settled on its outcome",
+			append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq))...)
+		return completePendingControlRequests(ctx, store, apply, op)
+	}
+	reason := revertPhaseOutrunReason(op, apply.State)
+	caller := controlRequestCaller(controlReq)
+	logger.WarnContext(ctx, "failing pending control request: the apply settled before it could take effect",
+		append(apply.LogAttrs(), "operation", op, "requested_by", caller, "reason", reason)...)
+	if err := failPendingControlRequests(ctx, store, apply, op, reason); err != nil {
+		return err
+	}
+	appendSettledRequestEvent(ctx, store, logger, apply, storage.LogLevelWarn, revertPhaseEventType(op),
+		fmt.Sprintf("%s did not take effect: %s%s", remoteControlOperationLabel(op), reason, callerApplyLogSuffix(caller)))
+	return nil
+}
+
+// revertPhaseEventType is the apply event type that records a revert or
+// skip-revert in the apply history.
+func revertPhaseEventType(op storage.ControlOperation) string {
+	if op == storage.ControlOperationSkipRevert {
+		return storage.LogEventSkipRevertTriggered
+	}
+	return storage.LogEventRevertTriggered
+}
+
+// revertPhaseRequestTookEffect reports whether a terminal apply state is the
+// outcome a revert or skip-revert asked for.
+func revertPhaseRequestTookEffect(op storage.ControlOperation, applyState string) bool {
+	switch op {
+	case storage.ControlOperationRevert:
+		return state.IsState(applyState, state.Apply.Reverted)
+	case storage.ControlOperationSkipRevert:
+		return state.IsState(applyState, state.Apply.Completed)
+	default:
+		return false
+	}
+}
+
+// revertPhaseOutrunReason names what overtook a revert or skip-revert on an
+// apply that reached applyState, in the operator's vocabulary for the state.
+func revertPhaseOutrunReason(op storage.ControlOperation, applyState string) string {
+	command := op.Command()
+	if state.IsState(applyState, state.Apply.Completed) {
+		return fmt.Sprintf("the schema change completed before the %s could take effect; the change is live on the target", command)
+	}
+	info, known := state.LookupApply(state.NormalizeState(applyState))
+	if !known {
+		return fmt.Sprintf("the schema change settled before the %s could take effect", command)
+	}
+	return fmt.Sprintf("the schema change reached %s before the %s could take effect", info.Label, command)
+}
+
+// cutoverSupersededByStopMessage answers a cutover that was still pending when
+// a stop took effect.
+const cutoverSupersededByStopMessage = "cutover request was superseded by stop; start the schema change and run cutover again once it is waiting for cutover"
+
+// SettlePendingCutoverAfterStop answers the apply's pending cutover once a stop
+// has taken effect. A stop halts the copy the cutover was queued against, and a
+// later start resumes a copy the operator has not yet approved swapping in, so
+// the queued cutover is failed rather than left to fire on its own (CO-4). A
+// stop that landed on an apply which already resolved defers to the outcome it
+// reached.
+func SettlePendingCutoverAfterStop(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	if state.IsTerminalApplyState(apply.State) || cutoverRequestResolvedByApplyState(apply.State) {
+		return SettlePendingCutoverForResolvedApply(ctx, store, logger, apply)
+	}
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationCutover)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	boundIDs, err := controlReq.CutoverOperationIDs()
+	if err != nil {
+		return fmt.Errorf("read the operations the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+	}
+	supersededByStop := func(*storage.ApplyOperation) string { return cutoverSupersededByStopMessage }
+	switch len(boundIDs) {
+	case 0:
+		// An unbound request is failed as superseded below.
+	case 1:
+		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundIDs[0], supersededByStop)
+	default:
+		return settleCutoverSet(ctx, store, logger, apply, controlReq, boundIDs, supersededByStop)
+	}
+	return failPendingCutover(ctx, store, logger, apply, controlReq, cutoverSupersededByStopMessage)
+}
+
+// SettlePendingCutoverForResolvedApply answers the pending cutover of an apply
+// that has reached a terminal state, whichever path drove it there. An apply
+// that cut over completes the cutover; a stopped apply fails it as superseded
+// by the stop; any other terminal state fails it with that state, so the
+// request never lingers pending on an apply no drive will advance. A cutover
+// bound to one operation is answered from that operation's outcome instead
+// (CO-6): the members sharing the apply end on their own, so the parent's
+// verdict is not the bound operation's.
+//
+// The caller must have established that the apply is terminal or has cut over.
+func SettlePendingCutoverForResolvedApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationCutover)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	boundIDs, err := controlReq.CutoverOperationIDs()
+	if err != nil {
+		return fmt.Errorf("read the operations the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+	}
+	notApplied := func(op *storage.ApplyOperation) string { return boundCutoverNotAppliedMessage(apply, op) }
+	switch len(boundIDs) {
+	case 0:
+		// An unbound request is settled from the apply's own state below.
+	case 1:
+		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundIDs[0], notApplied)
+	default:
+		return settleCutoverSet(ctx, store, logger, apply, controlReq, boundIDs, notApplied)
+	}
+	switch {
+	case cutoverRequestResolvedByApplyState(apply.State):
+		logger.InfoContext(ctx, "completing pending cutover request: the apply cut over",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return completePendingControlRequests(ctx, store, apply, storage.ControlOperationCutover)
+	case state.IsState(apply.State, state.Apply.Stopped):
+		return failPendingCutover(ctx, store, logger, apply, controlReq, cutoverSupersededByStopMessage)
+	default:
+		return failPendingCutover(ctx, store, logger, apply, controlReq, cutoverNotAppliedMessage(apply.State))
+	}
+}
+
+// settleBoundPendingCutover answers a pending cutover bound to operation
+// boundID from that operation's stored outcome, the way
+// boundCutoverRequestTurn does: an operation that cut over completes it, and a
+// missing operation fails it. notCutOver names the reason to fail it with when
+// the operation has not cut over.
+func settleBoundPendingCutover(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, boundID int64, notCutOver func(op *storage.ApplyOperation) string) error {
+	opStore := store.ApplyOperations()
+	if opStore == nil {
+		return fmt.Errorf("settle pending cutover of apply %s bound to apply_operation %d: apply operation store is not available", apply.ApplyIdentifier, boundID)
+	}
+	op, err := opStore.Get(ctx, boundID)
+	if err != nil {
+		return fmt.Errorf("load apply_operation %d the pending cutover of apply %s is for: %w", boundID, apply.ApplyIdentifier, err)
+	}
+	if op == nil {
+		logger.WarnContext(ctx, "failing pending cutover request bound to an operation that does not exist",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)...)
+		return failPendingControlRequests(ctx, store, apply, storage.ControlOperationCutover, boundCutoverMissingOperationMessage(boundID))
+	}
+	if cutoverRequestResolvedByApplyState(op.State) {
+		logger.InfoContext(ctx, "completing pending cutover request: the operation it was sent for cut over",
+			append(op.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return completePendingControlRequests(ctx, store, apply, storage.ControlOperationCutover)
+	}
+	reason := notCutOver(op)
+	logger.InfoContext(ctx, "failing pending cutover request: the operation it was sent for can no longer cut over on it",
+		append(op.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "reason", reason)...)
+	return failPendingControlRequests(ctx, store, apply, storage.ControlOperationCutover, reason)
+}
+
+// boundCutoverNotAppliedMessage answers a bound cutover whose operation did
+// not cut over on a resolved apply. An operation that ended says so in its own
+// state; one that has not ended has no drive left to advance it once the apply
+// resolved, so the apply's state is the reason.
+func boundCutoverNotAppliedMessage(apply *storage.Apply, op *storage.ApplyOperation) string {
+	switch {
+	case state.IsState(op.State, state.ApplyOperation.Stopped):
+		return cutoverSupersededByStopMessage
+	case state.IsApplyOperationTerminal(op.State):
+		return boundCutoverOperationEndedMessage(op.State)
+	default:
+		return cutoverNotAppliedMessage(apply.State)
+	}
+}
+
+// boundCutoverMissingOperationMessage answers a cutover bound to an operation
+// that does not exist.
+func boundCutoverMissingOperationMessage(boundID int64) string {
+	return fmt.Sprintf("cutover request was not applied because the operation it was sent for (%d) does not exist", boundID)
+}
+
+// boundCutoverOperationEndedMessage answers a cutover whose bound operation
+// ended without cutting over.
+func boundCutoverOperationEndedMessage(operationState string) string {
+	return fmt.Sprintf("cutover request was not applied because the operation it was sent for is %s", operationState)
+}
+
+// failPendingCutover fails the apply's pending cutover with the given reason.
+func failPendingCutover(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, reason string) error {
+	logger.InfoContext(ctx, "failing pending cutover request: the apply can no longer cut over on it",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "reason", reason)...)
+	return failPendingControlRequests(ctx, store, apply, storage.ControlOperationCutover, reason)
+}
+
+// cutoverNotAppliedMessage answers a cutover that a terminal apply outran.
+func cutoverNotAppliedMessage(applyState string) string {
+	return fmt.Sprintf("cutover request was not applied because apply is %s", applyState)
+}
+
+// settleRequestsForStoredOutcome settles the pending control requests that an
+// apply's durably stored terminal outcome moots. A settlement failure is
+// logged rather than returned: the outcome is stored, so the summary is owed
+// (RC-5 withholds a summary only for an outcome storage never held) and the
+// caller proceeds to release the gauge and notify the observer. The unsettled
+// requests stay pending for the operator's post-drive settlement, and an
+// operator can re-issue one; a summary that never posts has no such recovery.
+func (c *LocalClient) settleRequestsForStoredOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply) {
+	if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		logger.Warn("failed to settle pending control requests for the stored terminal outcome; they stay pending for the operator's post-drive settlement and the terminal summary still posts",
+			"state", apply.State, "error", err)
+	}
+}
+
+// SettlePendingCancelForResolvedApply settles the pending cancel of an apply
+// that has reached a terminal state, whichever path drove it there. An apply
+// resolves under more than one drive shape, and every one of them owes the
+// operator the same answer about the command they issued, so they share this
+// entry point rather than each deciding for itself what a settled cancel means.
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingCancelForResolvedApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		// A stopped apply remains cancellable, so the request stays deliverable
+		// for the drive that resumes it.
+		logger.DebugContext(ctx, "leaving the pending cancel request deliverable for a stopped apply", apply.LogAttrs()...)
+		return nil
+	}
+	return settlePendingCancelForTerminalApply(ctx, store, logger, apply)
+}
+
+// SettlePendingStartForResolvedApply answers the pending start of an apply that
+// has reached a terminal state. A drive that stores the outcome answers the
+// start itself, but when that answer does not land the outcome still stands, and
+// nothing re-claims a settled apply to try again — so the operator's post-drive
+// settlement answers it here instead of leaving it pending forever.
+//
+// A completed apply is the start having taken effect. Any other settled state
+// fails the start, with the apply's own failure reason when it has one, so the
+// operator reads that the command did not reach the outcome they asked for. A
+// stopped apply keeps its start: that is the request that resumes it.
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingStartForResolvedApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		logger.DebugContext(ctx, "leaving the pending start request deliverable for a stopped apply", apply.LogAttrs()...)
+		return nil
+	}
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if state.IsState(apply.State, state.Apply.Completed) {
+		logger.InfoContext(ctx, "completing pending start request for completed apply",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return completePendingControlRequests(ctx, store, apply, storage.ControlOperationStart)
+	}
+	reason := apply.ErrorMessage
+	if reason == "" {
+		reason = "the schema change settled before the start could take effect"
+		if info, known := state.LookupApply(state.NormalizeState(apply.State)); known {
+			reason = fmt.Sprintf("the schema change reached %s before the start could take effect", info.Label)
+		}
+	}
+	logger.WarnContext(ctx, "failing pending start request for settled apply",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "reason", reason)...)
+	return failPendingControlRequests(ctx, store, apply, storage.ControlOperationStart, reason)
+}
+
+// settlePendingCancelForTerminalApply settles an apply's pending cancel once the
+// apply has reached a terminal state, and discloses which outcome the operator
+// got. A cancel the apply's own terminal state answered completes. A cancel the
+// schema change outran fails with that reason, so the surfaces an operator reads
+// — the PR comment's command-not-applied notice, the apply history, and the
+// answer a re-issued cancel gets back — say the command did not take effect
+// instead of reporting it applied.
+//
+// The caller must have established that the apply is terminal.
+//
+// The pending request is read here rather than taken from the caller, because
+// the settle is a conditional update on a still-pending row and a zero-row
+// write reports success: a caller acting on a copy it read before another path
+// settled the same request would otherwise append a second disclosure
+// contradicting the outcome already recorded.
+func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationCancel)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		logger.DebugContext(ctx, "no pending cancel request to settle; leaving the recorded outcome as found", apply.LogAttrs()...)
+		return nil
+	}
+	reason := cancelOutrunReason(apply.State)
+	if reason == "" {
+		if err := completePendingControlRequests(ctx, store, apply, storage.ControlOperationCancel); err != nil {
+			return err
+		}
+	} else if err := failPendingControlRequests(ctx, store, apply, storage.ControlOperationCancel, reason); err != nil {
+		return err
+	}
+	discloseSettledTerminalCancel(ctx, store, logger, apply, controlReq, reason)
+	return nil
+}
+
+// cancelOutrunReason names what overtook an accepted cancel on an apply that
+// reached applyState, and returns "" when nothing did. It is read by an operator
+// looking for the effect of a command they issued, so it says what happened to
+// the schema change rather than reporting a rejection. The state is normalized
+// before it reaches the operator, so a caller holding a proto-form state does
+// not put SchemaBot's internal spelling of it in a PR comment.
+func cancelOutrunReason(applyState string) string {
+	switch {
+	case state.IsState(applyState, state.Apply.Cancelled):
+		// The cancel is what settled the apply.
+		return ""
+	case state.IsState(applyState, state.Apply.Stopped):
+		// A stopped apply remains cancellable, so nothing has outrun the command:
+		// either it took effect on work that was already stopped, or a later drive
+		// still has one to deliver.
+		return ""
+	case state.IsState(applyState, state.Apply.Completed):
+		return "the schema change completed before the cancel could take effect; the change is live on the target"
+	default:
+		// The operator's own name for the state, not SchemaBot's stored token:
+		// most states store as a snake_case identifier that reads as internal
+		// spelling in the middle of an English sentence. A state the registry
+		// does not carry has no such name, so the sentence names no state rather
+		// than reaching for the token the registry would have translated.
+		info, known := state.LookupApply(state.NormalizeState(applyState))
+		if !known {
+			return "the schema change settled before the cancel could take effect"
+		}
+		return fmt.Sprintf("the schema change reached %s before the cancel could take effect", info.Label)
+	}
+}
+
+// discloseSettledTerminalCancel records how a terminal apply settled its pending
+// cancel, in the server log and in the apply history. An empty reason is the
+// cancel having taken effect; otherwise the entries disclose that it did not, so
+// the history does not show an accepted cancel followed by a different terminal
+// state with no explanation.
+//
+// Best-effort: the request is already settled, so a failure to append the apply
+// event is logged rather than returned. Retrying the settlement would find no
+// pending cancel and would never write the event.
+func discloseSettledTerminalCancel(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, reason string) {
+	caller := controlRequestCaller(controlReq)
+	var level, message string
+	if reason == "" {
+		level = storage.LogLevelInfo
+		message = fmt.Sprintf("Pending cancel request completed for %s apply%s", state.NormalizeState(apply.State), callerApplyLogSuffix(caller))
+		logger.InfoContext(ctx, "completing pending cancel request for terminal apply",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+	} else {
+		level = storage.LogLevelWarn
+		message = fmt.Sprintf("Cancel did not take effect: %s%s", reason, callerApplyLogSuffix(caller))
+		logger.WarnContext(ctx, "failing pending cancel request: the schema change settled before the cancel could take effect",
+			append(apply.LogAttrs(), "requested_by", caller, "reason", reason)...)
+	}
+	appendSettledRequestEvent(ctx, store, logger, apply, level, storage.LogEventCancelRequested, message)
+}
+
+// appendSettledRequestEvent records in the apply history how a settled control
+// request resolved.
+//
+// Best-effort: the request is already settled, so a failure to append the apply
+// event is logged rather than returned. Retrying the settlement would find no
+// pending request and would never write the event.
+func appendSettledRequestEvent(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, level, eventType, message string) {
+	logStore := store.ApplyLogs()
+	if logStore == nil {
+		logger.ErrorContext(ctx, "apply log store is not available; the settled control request will not appear in the apply history",
+			append(apply.LogAttrs(), "event_type", eventType, "event_message", message)...)
+		return
+	}
+	entry := &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     level,
+		EventType: eventType,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   message,
+		CreatedAt: time.Now(),
+	}
+	if err := logStore.Append(ctx, entry); err != nil {
+		logger.WarnContext(ctx, "failed to append the settled control request apply event; the outcome remains in the control request and the server log",
+			append(apply.LogAttrs(), "error", err, "event_type", eventType, "event_message", message)...)
+	}
+}
+
 // failPendingControlRequests marks the pending control request of the given
 // operation terminally failed. A failed request is no longer pending, so the
 // operator-owned retry loop stops re-running the operation instead of spinning
 // on a permanent rejection.
-func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string) error {
+//
+// The stored message is rewritten for the operator before it is persisted, so a
+// rejection reads the same whether it arrived on the API's immediate attempt or
+// on this retry — the durable record must not spell the schema change
+// differently depending on which path reached the data plane. remoteIDs are the
+// remote identifiers the caller addressed; a remote caller passes the id it sent
+// the RPC to, and a local caller passes none because its identifiers are already
+// operator-facing.
+func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string, remoteIDs ...string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
+	errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
 	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, operation); err != nil {
 		return err
 	}
@@ -87,8 +701,61 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 	return nil
 }
 
-func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	if !state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Running) {
+// settlePendingControlRequestRevision settles controlReq as completed or failed
+// only while its row still carries the revision the caller evaluated, so a
+// drive that decided on one command never settles a later command re-armed on
+// the same row. A row that has moved on is left to the drive evaluating the
+// command it now carries. remoteIDs are the remote applies a failure message
+// may name, kept out of the operator-facing text.
+func settlePendingControlRequestRevision(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string, remoteIDs ...string) error {
+	_, err := settleControlRequestRevisionIfCurrent(ctx, store, logger, apply, controlReq, status, errorMessage, remoteIDs...)
+	return err
+}
+
+// settleControlRequestRevisionIfCurrent is settlePendingControlRequestRevision
+// for a caller that acts on the answer. settled reports whether this call wrote
+// the outcome onto the row: it is false when the row had already been settled
+// or re-armed for a newer command, so the caller records nothing further
+// against a command it did not evaluate.
+func settleControlRequestRevisionIfCurrent(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string, remoteIDs ...string) (settled bool, err error) {
+	if store == nil {
+		return false, fmt.Errorf("storage is not available")
+	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, controlReq.Operation); err != nil {
+		return false, err
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	if status == storage.ControlRequestFailed {
+		errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
+	}
+	settled, err = controlStore.SettlePendingRevision(ctx, controlReq, status, errorMessage)
+	if err != nil {
+		return false, fmt.Errorf("settle pending %s control request for apply %s as %s: %w", controlReq.Operation, apply.ApplyIdentifier, status, err)
+	}
+	if !settled {
+		logger.InfoContext(ctx, "pending control request was not settled: the request this drive evaluated has already been settled or replaced by a newer command",
+			append(apply.LogAttrs(), "operation", controlReq.Operation, "requested_by", controlRequestCaller(controlReq),
+				"request_revision", controlReq.Revision, "status", status)...)
+	}
+	return settled, nil
+}
+
+// controlRefusalMessage renders the reason the executing side gave for refusing
+// a control request. A refusal that arrives without a reason still has to read
+// as an answer to the operator's command rather than a bare "not accepted", so
+// the fallback names the operation that was refused.
+func controlRefusalMessage(operation storage.ControlOperation, errorMessage string) string {
+	if errorMessage == "" {
+		return fmt.Sprintf("%s was refused with no reason given", operation)
+	}
+	return errorMessage
+}
+
+func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, logger *slog.Logger) error {
+	if !state.IsState(apply.State, state.Apply.WaitingForCutover) && !state.IsRunningApplyState(apply.State) {
 		return nil
 	}
 	if store == nil {
@@ -102,9 +769,217 @@ func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.St
 	now := time.Now()
 	apply.State = state.Apply.CuttingOver
 	apply.UpdatedAt = now
+	// A multi-operation drive owns only its operation: the parent cutting_over
+	// write is the operator's projection to make — a direct write here fails
+	// closed under the operation-only lease and would block a cutover the
+	// engine is ready to accept. The in-memory transition still stands so this
+	// drive proceeds to dispatch the cutover.
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("pending cutover request accepted under operation lease; parent cutting_over state is the operator's projection",
+			"state", apply.State)
+		return nil
+	}
 	if err := applyStore.Update(ctx, apply); err != nil {
 		*apply = previous
 		return fmt.Errorf("mark apply %s cutting over for pending cutover request: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+// preCutoverStateForRestore names the state a cutover the data plane does not
+// accept returns the apply to. The drive that first sends a cutover reads it
+// off the apply before marking it cutting_over. A drive that re-sends a request
+// an earlier drive left pending — its call went unanswered, or its restore
+// write failed — finds the apply already marked, so the state before the mark
+// is derived from the stored tasks: the control plane never marks a task
+// cutting_over for a request, and the task rows follow the data plane's
+// progress, so their derived apply state is what the apply would hold had it
+// never been marked.
+//
+// A derivation that is not itself a state a cutover can be requested from —
+// tasks already cutting over on the data plane, a terminal state, or no task
+// rows — names cutting_over, and the restore then writes nothing: those are
+// states the progress sync settles on its own.
+func preCutoverStateForRestore(ctx context.Context, store storage.Storage, apply *storage.Apply) (string, error) {
+	if !state.IsState(apply.State, state.Apply.CuttingOver) {
+		return apply.State, nil
+	}
+	if store == nil {
+		return "", fmt.Errorf("storage is not available")
+	}
+	taskStore := store.Tasks()
+	if taskStore == nil {
+		return "", fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("load tasks for apply %s before re-sending cutover: %w", apply.ApplyIdentifier, err)
+	}
+	derived := state.DeriveApplyState(taskStates(tasks))
+	if state.IsState(derived, state.Apply.WaitingForCutover) || state.IsRunningApplyState(derived) {
+		return derived, nil
+	}
+	return state.Apply.CuttingOver, nil
+}
+
+// restoreApplyStateAfterUnacceptedCutover returns the apply to the state it held
+// before markApplyCuttingOverForControlRequest, for a cutover the data plane
+// did not accept: the call failed, came back empty, or was refused. A stored
+// cutting_over with no cutover behind it wedges the apply: the progress sync
+// never moves stored state backward, so it keeps cutting_over over the
+// data plane's waiting_for_cutover, and a fresh cutover command is answered as
+// already in progress without recording a request, so nothing sends the
+// cutover again.
+//
+// A failed call has an unknown outcome: the data plane may have started the
+// cutover before the answer was lost. Restoring is still safe, because every
+// state such a cutover reports next (cutting_over, revert_window, or a
+// terminal state) outranks the restored state, so the progress sync adopts it.
+//
+// A drive whose mark stayed in memory (see suppressParentApplyWrites) writes
+// nothing here either. On a failed write the in-memory apply keeps the stored
+// cutting_over and the caller must leave the cutover request pending: the next
+// drive re-sends it, and derives the state to restore from the stored tasks
+// (see preCutoverStateForRestore) should the data plane refuse again.
+func restoreApplyStateAfterUnacceptedCutover(ctx context.Context, store storage.Storage, apply *storage.Apply, preCutoverState string, logger *slog.Logger) error {
+	if state.IsState(apply.State, preCutoverState) {
+		logger.InfoContext(ctx, "cutover was not accepted; apply state is left as stored, the progress sync settles it from the data plane's report",
+			apply.MutableLogAttrs()...)
+		return nil
+	}
+	if suppressParentApplyWrites(ctx) {
+		apply.State = preCutoverState
+		logger.InfoContext(ctx, "cutover was not accepted under operation lease; parent apply state was never written, restored in memory only",
+			apply.MutableLogAttrs()...)
+		return nil
+	}
+	if store == nil {
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: storage is not available", apply.ApplyIdentifier, preCutoverState)
+	}
+	applyStore := store.Applies()
+	if applyStore == nil {
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: apply store is not available", apply.ApplyIdentifier, preCutoverState)
+	}
+	marked := *apply
+	apply.State = preCutoverState
+	apply.UpdatedAt = time.Now()
+	if err := applyStore.Update(ctx, apply); err != nil {
+		*apply = marked
+		return fmt.Errorf("restore apply %s to %s after unaccepted cutover: %w", apply.ApplyIdentifier, preCutoverState, err)
+	}
+	logger.InfoContext(ctx, "restored apply state after the data plane did not accept the cutover",
+		append(apply.MutableLogAttrs(), "marked_state", marked.State)...)
+	return nil
+}
+
+// cutoverOutcomeUnknownWindow bounds how long a cutover request stays pending
+// once a send of it has lost its answer. Each progress tick sends it again, so
+// a broken connection that heals settles it within seconds; a database that
+// stays unreachable this long settles it as unconfirmed (CO-2), and neither
+// the drive's poll budget nor its liveness bounds the wait on its own, since
+// the engine's in-memory progress keeps answering.
+const cutoverOutcomeUnknownWindow = 5 * time.Minute
+
+// cutoverOutcomeUnconfirmedMessage answers a cutover request whose outcome was
+// still unknown when the window closed. It does not claim the cutover failed:
+// the restored apply state is outranked by any cutover state progress reports.
+var cutoverOutcomeUnconfirmedMessage = fmt.Sprintf("SchemaBot could not confirm the cutover: the database did not answer for %d minutes after it was sent. The schema change's progress shows whether it ran; if it is still waiting for cutover, run cutover again.", int(cutoverOutcomeUnknownWindow.Minutes()))
+
+// cutoverOutcomeStillUnknown reports whether a send of a cutover request left
+// its outcome unknown. The engine says so for the send that lost its answer
+// and for every resend that errs; a resend the backend turns away as not ready
+// settles nothing about the send that may have started the cutover either, so
+// once since is set it keeps the request inside the window rather than
+// retrying outside it.
+func cutoverOutcomeStillUnknown(err error, since time.Time) bool {
+	return engine.IsOutcomeUnknown(err) || (engine.IsNotReady(err) && !since.IsZero())
+}
+
+// holdCutoverRequestWithUnknownOutcome keeps a cutover request pending after
+// a send whose outcome is unknown, and reports when the request has been
+// unknown for longer than cutoverOutcomeUnknownWindow so the caller settles
+// it. operationID names the operation the send was for, 0 for a request not
+// bound to one. since is when that operation's send first lost its answer,
+// zero for the send that just did: that send stamps the request row, so the
+// window survives a lease handover and an error from a later resend is never
+// read as the outcome of the send that may have started the cutover.
+func holdCutoverRequestWithUnknownOutcome(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, since, now time.Time, sendErr error, logger *slog.Logger, attrs ...any) (settle bool, err error) {
+	attrs = append(append(apply.MutableLogAttrs(), attrs...), "requested_by", controlRequestCaller(controlReq), "error", sendErr)
+	if since.IsZero() {
+		if err := stampCutoverOutcomeUnknown(ctx, store, apply, controlReq, operationID, now, logger); err != nil {
+			return false, err
+		}
+		logger.Warn("pending cutover request has an unknown outcome; the request stays pending and is sent again at the next progress tick", attrs...)
+		return false, nil
+	}
+	unknownFor := now.Sub(since)
+	if unknownFor < cutoverOutcomeUnknownWindow {
+		logger.Warn("pending cutover request still has an unknown outcome; the request stays pending and is sent again at the next progress tick",
+			append(attrs, "unknown_for", unknownFor)...)
+		return false, nil
+	}
+	logger.Error("pending cutover request outcome could not be confirmed within the window; the request is settled as unconfirmed",
+		append(attrs, "unknown_for", unknownFor, "window", cutoverOutcomeUnknownWindow)...)
+	return true, nil
+}
+
+// stampCutoverOutcomeUnknown records on controlReq's row when its send for
+// operationID (0 for a request not bound to an operation) lost its answer. A
+// row that has since been settled or re-armed for a new command is left
+// alone, and so is an existing stamp for the operation.
+func stampCutoverOutcomeUnknown(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, now time.Time, logger *slog.Logger) error {
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("record unknown cutover outcome for apply %s: control request store is not available", apply.ApplyIdentifier)
+	}
+	_, err := controlStore.UpdateMetadata(ctx, apply.ID, storage.ControlOperationCutover, func(req *storage.ApplyControlRequest) ([]byte, error) {
+		if req.ID != controlReq.ID || req.Revision != controlReq.Revision || req.Status != storage.ControlRequestPending {
+			logger.Debug("cutover request was settled or re-armed after it was sent; its unknown outcome is not recorded",
+				append(apply.MutableLogAttrs(), "status", req.Status, "revision", req.Revision, "operation_id", operationID)...)
+			return nil, nil
+		}
+		since, err := req.CutoverOutcomeUnknownSince(operationID)
+		if err != nil {
+			return nil, err
+		}
+		if !since.IsZero() {
+			logger.Debug("cutover request already records when its outcome became unknown",
+				append(apply.MutableLogAttrs(), "outcome_unknown_since", since, "operation_id", operationID)...)
+			return nil, nil
+		}
+		return req.WithCutoverOutcomeUnknownSince(operationID, now)
+	})
+	if err != nil {
+		return fmt.Errorf("record unknown cutover outcome for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+// settleCutoverRequestUnconfirmed fails, through fail, a cutover request whose
+// outcome stayed unknown for the whole window, and closes the timeline's
+// unknown-outcome entry so the resend it announced does not read as still
+// coming. The timeline entry follows the settle so a failed settle, which
+// leaves the request pending for the next drive, announces nothing.
+func (c *LocalClient) settleCutoverRequestUnconfirmed(ctx context.Context, apply *storage.Apply, fail func(reason string) error) error {
+	if err := fail(cutoverOutcomeUnconfirmedMessage); err != nil {
+		return err
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		cutoverOutcomeUnconfirmedMessage, "", "")
+	return nil
+}
+
+// failUnacceptedCutoverRequest resolves a pending cutover request the engine
+// did not take: it restores the apply's pre-cutover state, then fails the
+// request with the engine's reason. The restore comes first so a failed restore
+// write leaves the request pending for the next drive to re-send, rather than
+// failing it over an apply still stored as cutting_over.
+func failUnacceptedCutoverRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, preCutoverState, errorMessage string, logger *slog.Logger, remoteIDs ...string) error {
+	if err := restoreApplyStateAfterUnacceptedCutover(ctx, store, apply, preCutoverState, logger); err != nil {
+		return err
+	}
+	if err := failPendingControlRequests(ctx, store, apply, storage.ControlOperationCutover, errorMessage, remoteIDs...); err != nil {
+		return fmt.Errorf("fail pending cutover request: %w", err)
 	}
 	return nil
 }
@@ -113,7 +988,7 @@ func applyReadyForCutoverRequest(ctx context.Context, store storage.Storage, app
 	if state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.CuttingOver) {
 		return true, nil
 	}
-	if !state.IsState(apply.State, state.Apply.Running) {
+	if !state.IsRunningApplyState(apply.State) {
 		return false, nil
 	}
 	if store == nil {
@@ -163,7 +1038,40 @@ func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storag
 	return nil
 }
 
-func completePendingStopIfStoredApplyResolved(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
+// settlePendingCancelIfStoredApplyResolved is the cancel counterpart of
+// completePendingStopIfStoredApplyResolved: it reloads the apply and, once
+// the stored row is terminal, settles the pending cancel against the state the
+// apply actually reached. A cancel the engine rejected as already completed
+// settles the apply completed, and this is where that outcome resolves the
+// operator's command — as one that did not take effect, not as one applied.
+func settlePendingCancelIfStoredApplyResolved(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) (bool, error) {
+	if store == nil {
+		return false, fmt.Errorf("storage is not available")
+	}
+	storedApply, err := store.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("load apply %s before settling pending cancel: %w", apply.ApplyIdentifier, err)
+	}
+	if storedApply == nil {
+		return false, fmt.Errorf("load apply %s before settling pending cancel: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	if !state.IsTerminalApplyState(storedApply.State) {
+		return false, nil
+	}
+	if err := settlePendingCancelForTerminalApply(ctx, store, logger, storedApply); err != nil {
+		return false, err
+	}
+	*apply = *storedApply
+	return true, nil
+}
+
+// completePendingStopIfStoredApplyResolved reloads the apply and, when its
+// stored state is terminal, completes the pending stop request and refreshes
+// the caller's copy of the apply. It returns false without error when the
+// stored apply has not resolved yet — the caller decides whether that means
+// the request stays pending (a settle deferred to the apply-state projection)
+// or the consumption failed.
+func completePendingStopIfStoredApplyResolved(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) (bool, error) {
 	if store == nil {
 		return false, fmt.Errorf("storage is not available")
 	}
@@ -177,7 +1085,7 @@ func completePendingStopIfStoredApplyResolved(ctx context.Context, store storage
 	if !state.IsTerminalApplyState(storedApply.State) {
 		return false, nil
 	}
-	if err := completePendingControlRequests(ctx, store, storedApply, storage.ControlOperationStop); err != nil {
+	if err := completePendingStopControlRequest(ctx, store, logger, storedApply); err != nil {
 		return false, err
 	}
 	*apply = *storedApply
@@ -191,9 +1099,123 @@ func controlRequestCaller(req *storage.ApplyControlRequest) string {
 	return req.RequestedBy
 }
 
-func callerApplyLogSuffix(caller string) string {
+// controlRequestRequester names the requester to record on a durable control
+// request. An empty caller means the command reached this plane without an
+// operator identity — an internal resume, or a plane that predates the caller
+// field — so the row names the path it arrived on rather than inventing a
+// person.
+func controlRequestRequester(caller string) string {
 	if caller == "" {
-		caller = "unknown"
+		return storage.ForwardingControlRequestCaller
 	}
-	return fmt.Sprintf(" (caller: %s)", caller)
+	return caller
+}
+
+func callerApplyLogSuffix(caller string) string {
+	return fmt.Sprintf(" (caller: %s)", storage.ApplyLogCaller(caller))
+}
+
+// StopSupersedesPendingStart reports whether a stop recorded on this apply
+// supersedes its pending start, which the stop's own write then completes in
+// the same transaction. An apply driven under the operation lease keeps its
+// start pending until it settles, because the operations the start resumes are
+// claimed one at a time on its behalf, and a pending start on a stopped apply
+// is what reopens it. Left pending under the new stop, that start would resume
+// the apply as soon as the stop landed on every operation, so the stop the
+// operator issued last would lose to the start they issued first (CO-4). An
+// apply driven under the parent lease consumes its start when its drive
+// resumes, so its start is left to that drive. Both clients record stops
+// through this decision, so a rollout's stop holds on the control plane and on
+// the data plane apply its operations share.
+func StopSupersedesPendingStart(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, caller string) (bool, error) {
+	start, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
+	if err != nil {
+		return false, fmt.Errorf("load pending start before recording a stop: %w", err)
+	}
+	if start == nil {
+		return false, nil
+	}
+	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	operationLease, err := ApplyDrivesUnderOperationLease(ctx, store, apply, ops)
+	if err != nil {
+		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if !operationLease {
+		logger.InfoContext(ctx, "stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
+			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+		return false, nil
+	}
+	logger.InfoContext(ctx, "stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
+		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+	return true, nil
+}
+
+// ApplyDriveMode is the lease an apply's operations are driven under, and the
+// reason the operator chose it.
+type ApplyDriveMode int
+
+const (
+	// ApplyDriveUnattached is an apply with no operation attached yet. It has
+	// not been driven, so no drive mode applies.
+	ApplyDriveUnattached ApplyDriveMode = iota
+	// ApplyDriveParentLease is a lone operation with tasks and no sibling
+	// expected. Its drive holds the parent apply's lease and writes the parent.
+	ApplyDriveParentLease
+	// ApplyDriveOperationSet is a rollout of several attached operations.
+	ApplyDriveOperationSet
+	// ApplyDriveAwaitingSiblings is a lone attached operation whose generation
+	// manifest still expects siblings. A parent-lease drive of it would
+	// terminalize the parent while later dispatches are still on their way.
+	ApplyDriveAwaitingSiblings
+	// ApplyDriveTasklessOperation is a lone operation without tasks, such as
+	// plan-level VSchema work, which apply-level claiming cannot pick up.
+	ApplyDriveTasklessOperation
+)
+
+// UnderOperationLease reports whether the apply's operations are driven under
+// the operation lease, with the parent projected from them, rather than under
+// the parent lease.
+func (m ApplyDriveMode) UnderOperationLease() bool {
+	switch m {
+	case ApplyDriveOperationSet, ApplyDriveAwaitingSiblings, ApplyDriveTasklessOperation:
+		return true
+	default:
+		return false
+	}
+}
+
+// DecideApplyDriveMode is the operator's drive-mode decision for an apply and
+// its attached operations. The operator drives a claimed operation by it, and
+// the control paths that must know how the apply is driven read the same
+// decision, so the two cannot disagree.
+func DecideApplyDriveMode(ctx context.Context, store storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) (ApplyDriveMode, error) {
+	switch {
+	case len(ops) == 0:
+		return ApplyDriveUnattached, nil
+	case len(ops) > 1:
+		return ApplyDriveOperationSet, nil
+	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
+		return ApplyDriveAwaitingSiblings, nil
+	}
+	tasks, err := store.Tasks().GetByApplyOperationID(ctx, ops[0].ID)
+	if err != nil {
+		return ApplyDriveUnattached, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", ops[0].ID, ops[0].Deployment, err)
+	}
+	if len(tasks) == 0 {
+		return ApplyDriveTasklessOperation, nil
+	}
+	return ApplyDriveParentLease, nil
+}
+
+// ApplyDrivesUnderOperationLease reports whether the apply's operations are
+// driven under the operation lease, by the operator's drive-mode decision.
+func ApplyDrivesUnderOperationLease(ctx context.Context, store storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
+	mode, err := DecideApplyDriveMode(ctx, store, apply, ops)
+	if err != nil {
+		return false, err
+	}
+	return mode.UnderOperationLease(), nil
 }

@@ -3,27 +3,224 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// storeApplyPlanCheckRecord stores a check record when an apply plan is posted.
-// The apply-time plan does not evaluate review-time deployment drift, so it must
-// not clear a stored drift block: the block depends on live deployment state,
-// not PR content, and only a fresh rollup may clear it.
-func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
-	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, reviewDriftOutcome{state: driftNotEvaluated})
+// storeApplyCheckRecord stores a check record when an apply plan is posted.
+// When the apply runs other targets' own plans, the record is the rollout
+// round's, so the check counts every target's pending work rather than the
+// primary plan's alone, which can be empty (MG-12). That round passed its
+// contract, so it is a fresh rollup and may clear a stored drift block.
+//
+// Otherwise the apply-time plan does not evaluate review-time deployment drift,
+// so it must not clear a stored drift block: the block depends on live
+// deployment state, not PR content, and only a fresh rollup may clear it. The
+// rollout's member work still names the targets the apply runs on, as it does
+// when only the primary target has work or the other targets mirror its plan.
+// It also deliberately skips the manual plan path's apply-owned no-op recovery:
+// an in_progress row stamped with an apply ID may belong to a live apply whose
+// terminal outcome must land on it, so only the manual plan command may
+// override that claim.
+func (h *Handler) storeApplyCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, runsMemberWork bool) (string, error) {
+	if planResp.NarrowedTo != "" {
+		return h.storeNarrowedApplyCheck(ctx, client, repo, pr, schema, planResp, environment)
+	}
+	if runsMemberWork {
+		rollout.dispatchesApply = true
+		return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, rollout)
+	}
+	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, primaryPlanApplyOutcome(rollout))
+}
+
+// primaryPlanApplyOutcome is the outcome an apply running the primary plan
+// records: drift not evaluated, so a stored drift block stays, and the
+// rollout's member work, so the row names the targets the apply runs on.
+func primaryPlanApplyOutcome(rollout reviewDriftOutcome) reviewDriftOutcome {
+	return reviewDriftOutcome{state: driftNotEvaluated, work: rollout.work, dispatchesApply: true}
+}
+
+// applyChangeSummary is the Change column an apply's row carries from the
+// moment the apply starts, with the rollout counts that go with it. The row is
+// kept through the apply's completion, so the text names what the apply runs
+// rather than what a plan found pending, which would go stale once the apply
+// lands. Empty text leaves the stored summary as it is.
+type applyChangeSummary struct {
+	text     string
+	targets  int
+	withWork int
+}
+
+// rolloutApplyChangeSummary is the Change column for an apply of the rollout:
+// the primary plan's summary and the targets the apply runs on. An apply
+// narrowed to one target names that target instead, and no counts go with it.
+func (h *Handler) rolloutApplyChangeSummary(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, work memberWork) applyChangeSummary {
+	if planResp.NarrowedTo != "" {
+		return applyChangeSummary{text: narrowedApplyCheckSummary(h.narrowedTargetName(planResp.NarrowedTo, schema.Database, environment))}
+	}
+	targets, withWork := work.rolloutCounts()
+	return applyChangeSummary{
+		text:     reviewDriftOutcome{work: work, dispatchesApply: true}.changeSummary(summarizePlanChanges(schema, planResp, environment)),
+		targets:  targets,
+		withWork: withWork,
+	}
+}
+
+// applyTo writes the summary onto a check row the apply is claiming.
+func (s applyChangeSummary) applyTo(check *storage.Check) {
+	if s.text == "" {
+		return
+	}
+	check.ChangeSummary = s.text
+	check.RolloutTargets = s.targets
+	check.RolloutTargetsWithWork = s.withWork
+}
+
+// narrowedApplyCheckSummary is the stored Change column for an environment
+// whose apply was narrowed to one target, written before the apply dispatches.
+// It describes the rollout step rather than the apply, which holds whether or
+// not it goes on to run. Rolling out one target at a time is an ordinary
+// rollout, so it names the next step rather than a problem.
+func narrowedApplyCheckSummary(target string) string {
+	return clampDriftSummary(fmt.Sprintf("rolling out `%s` alone; apply the rest of the environment to finish", target))
+}
+
+// narrowedApplyCompletedSummary is the stored Change column once an apply
+// narrowed to one target completes, so a reviewer reading the check sees which
+// target the rollout last reached.
+func narrowedApplyCompletedSummary(target string) string {
+	return clampDriftSummary(fmt.Sprintf("`%s` applied; apply the rest of the environment to finish", target))
+}
+
+// narrowedTargetName names the rollout member a narrowed plan or apply was
+// made for the way every PR surface names it: by its deployment, qualified with
+// the target when the deployment addresses several targets in the environment.
+// Targets that cannot be resolved leave the name qualified, which never reads
+// as another target.
+func (h *Handler) narrowedTargetName(memberID, database, environment string) string {
+	// The first slash always ends the deployment (routing.ExecutionTarget.MemberID).
+	deployment, target, ok := strings.Cut(memberID, "/")
+	if !ok {
+		h.logger.Warn("narrowed rollout member has no target; naming it as recorded",
+			"database", database, "environment", environment, "narrowed_to", memberID)
+		return memberID
+	}
+	member := routing.ExecutionTarget{Deployment: deployment, Target: target}
+	targets, err := h.service.Config().ResolveDatabaseTargets(database, environment)
+	if err != nil {
+		h.logger.Warn("could not resolve the environment's targets to name the narrowed target; naming it with its target",
+			"database", database, "environment", environment, "narrowed_to", memberID, "error", err)
+		return member.MemberID()
+	}
+	return routing.DisplayNames(append([]routing.ExecutionTarget{member}, targets...))[0]
+}
+
+// storeNarrowedApplyCheck blocks the environment's check before an apply
+// narrowed to one rollout member dispatches. The narrowed plan says nothing
+// about the other targets, so it cannot be recorded as the environment's plan
+// result, and the check must not keep reading as a pass from an earlier plan
+// while one target changes (MG-12). The block holds after the apply completes
+// (updateCheckRecordForApplyResult) and lifts when an apply or plan of the
+// whole environment records its own result.
+func (h *Handler) storeNarrowedApplyCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
+	h.logger.Info("apply narrowed to one target; blocking the environment's check until a plan of every target records its result",
+		"repo", repo, "pr", pr, "head_sha", schema.HeadSHA, "environment", environment,
+		"database_type", schema.Type, "database", schema.Database,
+		"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+	blocked := reviewDriftOutcome{
+		state:    driftBlocked,
+		summary:  narrowedApplyCheckSummary(h.narrowedTargetName(planResp.NarrowedTo, schema.Database, environment)),
+		block:    narrowedApplyBlock,
+		preserve: narrowedApplyKeptBlockingReasons(),
+	}
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
+	if err != nil {
+		return headSHA, fmt.Errorf("block check for apply narrowed to %s: %w", planResp.NarrowedTo, err)
+	}
+	return headSHA, nil
+}
+
+// narrowedApplyKeptBlockingReasons returns the stored blocks an apply narrowed
+// to one target leaves on the environment's row from dispatch through
+// completion. A narrowed apply evaluates neither reconciliation nor review-time
+// drift. A reconciliation block says work may have reached the target, and a
+// drift or namespace placement block depends on live deployment state that only
+// a fresh rollup of the whole environment may clear. narrowed_apply would trade
+// either for a block that reads as the next step of an ordinary rollout.
+func narrowedApplyKeptBlockingReasons() []string {
+	return append(checkstate.ReconciliationBlockingReasons(), checkstate.RollupBlockingReasons()...)
+}
+
+// narrowedApplyKeepsBlock reports whether an apply narrowed to one target
+// leaves a row stored with this blocking reason as it is.
+func narrowedApplyKeepsBlock(reason string) bool {
+	return slices.Contains(narrowedApplyKeptBlockingReasons(), reason)
+}
+
+// isNarrowedApply reports whether an apply was narrowed to one rollout member.
+// The option is fixed when the apply is created.
+func isNarrowedApply(apply *storage.Apply) bool {
+	return storage.ParseApplyOptions(apply.Options).NarrowedTo != ""
 }
 
 // updateCheckRecordForApplyStart updates the stored check state to "in_progress"
 // when an apply begins execution. The aggregate check is updated to reflect the
 // state. If the apply is already terminal by the time the claim lands, the
 // stored check state is immediately refreshed to the apply's terminal outcome.
-func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, applyID int64) error {
+//
+// An apply narrowed to one target claims the row without lifting a block
+// narrowedApplyKeepsBlock names, and is not refused on a drift or namespace
+// placement block: applying one target at a time is how diverged targets are
+// brought back in line, and the block stays until a rollup of the whole
+// environment clears it.
+//
+// summary is the Change column the apply's row carries while the apply runs and
+// after it completes. A plan of the whole environment can rewrite the row
+// between the apply command and its confirmation, so the claim writes it rather
+// than keeping whatever the last plan stored. A row whose block the apply
+// keeps keeps its summary too, since the summary explains that block.
+//
+// The apply parameter is the caller's pre-claim snapshot: only its identifiers
+// (ID, ApplyIdentifier) and its creation-time options are read here. Live state is reloaded from storage
+// after the claim lands, so a snapshot that went stale between accept and
+// claim cannot leak outdated state into the check row.
+func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, apply *storage.Apply, summary applyChangeSummary) error {
+	// Fail closed on a missing or non-persisted apply before touching check
+	// state: claiming the check row without a real apply row would record
+	// ownership nothing can ever reconcile.
+	if apply == nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		return fmt.Errorf("update check state for apply start repo %s pr %d environment %s database_type %s database %s: apply is nil",
+			repo, pr, environment, schema.Type, schema.Database)
+	}
+	if apply.ID == 0 {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		return fmt.Errorf("update check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %s: apply row ID is unset",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
+	}
+
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, schema.Type, schema.Database)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -34,16 +231,20 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			Environment:  environment,
 			Status:       "error",
 		})
-		return fmt.Errorf("look up stored check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %d: %w",
-			repo, pr, environment, schema.Type, schema.Database, applyID, err)
+		return fmt.Errorf("look up stored check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier, err)
 	}
 
-	// A stored review-time deployment drift block must not be cleared by starting
-	// an apply: the block means a deployment's live schema no longer matches the
-	// reviewed plan, so transitioning the row to in_progress (which clears the
-	// block) would let the apply proceed against unverified drift. Fail closed and
-	// leave the block for an operator to reconcile.
-	if check != nil && check.BlockingReason == storage.ReviewTimeDeploymentDriftBlockingReason {
+	keepsBlock := isNarrowedApply(apply) && check != nil && narrowedApplyKeepsBlock(check.BlockingReason)
+
+	// A stored review-time block must not be cleared by starting an apply.
+	// Deployment drift means a deployment's live schema no longer matches the
+	// primary plan; a namespace placement refusal means the environment has no
+	// plan that places every namespace. Transitioning the row to in_progress
+	// (which clears the block) would let the apply proceed past either, so fail
+	// closed and leave the block for the fix its reason names. An apply narrowed
+	// to one target keeps the block instead, so it is not refused.
+	if !keepsBlock && check != nil && check.BlockingReason == storage.ReviewTimeDeploymentDriftBlockingReason {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "apply_started",
 			Repository:   repo,
@@ -55,9 +256,25 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 		h.logger.Warn("apply start refused: review-time deployment drift block is present; reconcile the deployment drift before applying",
 			"repo", repo, "pr", pr, "environment", environment,
 			"database_type", schema.Type, "database", schema.Database,
-			"apply_id", applyID, "head_sha", check.HeadSHA)
-		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %d: review-time deployment drift block present",
-			repo, pr, environment, schema.Type, schema.Database, applyID)
+			"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
+		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: review-time deployment drift block present",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
+	}
+	if !keepsBlock && check != nil && check.BlockingReason == storage.NamespacePlacementRefusedBlockingReason {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "placement_blocked",
+		})
+		h.logger.Warn("apply start refused: namespace placement block is present; fix the namespace placement and re-run plan before applying",
+			"repo", repo, "pr", pr, "environment", environment,
+			"database_type", schema.Type, "database", schema.Database,
+			"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
+		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: namespace placement refused this environment's plan; fix the namespace placement in the server config or the schema files, or upgrade the deployment the plan comment names, and re-run plan",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
 	}
 
 	if check == nil {
@@ -72,8 +289,8 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 				Environment:  environment,
 				Status:       "error",
 			})
-			return fmt.Errorf("fetch PR for apply start check repo %s pr %d environment %s database_type %s database %s apply_id %d: %w",
-				repo, pr, environment, schema.Type, schema.Database, applyID, err)
+			return fmt.Errorf("fetch PR for apply start check repo %s pr %d environment %s database_type %s database %s apply_id %s: %w",
+				repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier, err)
 		}
 		check = &storage.Check{
 			Repository:   repo,
@@ -82,18 +299,29 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			Environment:  environment,
 			DatabaseType: schema.Type,
 			DatabaseName: schema.Database,
-			ApplyID:      applyID,
+			ApplyID:      apply.ID,
 			HasChanges:   true,
 			Status:       checkStatusInProgress,
 			Conclusion:   "",
 		}
+		summary.applyTo(check)
 	} else {
-		check.ApplyID = applyID
+		check.ApplyID = apply.ID
 		check.HasChanges = true
 		check.Status = checkStatusInProgress
 		check.Conclusion = ""
-		check.BlockingReason = ""
-		check.ErrorMessage = ""
+		if keepsBlock {
+			h.logger.Info("apply narrowed to one target started; the environment's check keeps its stored block until a rollup of every target clears it",
+				"repo", repo, "pr", pr, "environment", environment,
+				"database_type", schema.Type, "database", schema.Database,
+				"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA,
+				"narrowed_to", storage.ParseApplyOptions(apply.Options).NarrowedTo,
+				"blocking_reason", check.BlockingReason)
+		} else {
+			check.BlockingReason = ""
+			check.ErrorMessage = ""
+			summary.applyTo(check)
+		}
 	}
 
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
@@ -105,13 +333,13 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			Environment:  environment,
 			Status:       "error",
 		})
-		return fmt.Errorf("upsert stored check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %d head_sha %s: %w",
-			repo, pr, environment, schema.Type, schema.Database, applyID, check.HeadSHA, err)
+		return fmt.Errorf("upsert stored check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %s head_sha %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier, check.HeadSHA, err)
 	}
 	h.logger.Info("check record marked in_progress for apply",
 		"repo", repo, "pr", pr, "database", schema.Database,
 		"database_type", schema.Type, "environment", environment,
-		"apply_id", applyID, "head_sha", check.HeadSHA)
+		"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
 
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:    "apply_started",
@@ -129,19 +357,19 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 	// the terminal refresh here so the stored check state converges to the
 	// apply's outcome instead of staying in_progress with no writer left to
 	// complete it.
-	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
+	reloaded, err := h.service.Storage().Applies().Get(ctx, apply.ID)
 	if err != nil {
-		return fmt.Errorf("reload apply after check claim repo %s pr %d environment %s database_type %s database %s apply_id %d: %w",
-			repo, pr, environment, schema.Type, schema.Database, applyID, err)
+		return fmt.Errorf("reload apply after check claim repo %s pr %d environment %s database_type %s database %s apply_id %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier, err)
 	}
-	if apply == nil {
-		return fmt.Errorf("apply missing after check claim repo %s pr %d environment %s database_type %s database %s apply_id %d",
-			repo, pr, environment, schema.Type, schema.Database, applyID)
+	if reloaded == nil {
+		return fmt.Errorf("apply missing after check claim repo %s pr %d environment %s database_type %s database %s apply_id %s",
+			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
 	}
-	if state.IsTerminalApplyState(apply.State) {
+	if state.IsTerminalApplyState(reloaded.State) {
 		h.logger.Info("apply finished before its check claim; refreshing stored check state to the terminal outcome",
-			apply.LogAttrs()...)
-		h.refreshChecksForTerminalApply(ctx, apply, "apply finished before check claim")
+			reloaded.LogAttrs()...)
+		h.refreshChecksForTerminalApply(ctx, reloaded, "apply finished before check claim")
 		// The refresh resolves its own GitHub client from the durable apply; if
 		// that resolution fails, the stored check state has still converged but
 		// the visible aggregate Check Run has not. Refresh it with the request's
@@ -153,38 +381,4 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 
 	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 	return nil
-}
-
-// updateCheckRunAfterUnlock updates a check run to neutral after lock release.
-func (h *Handler) updateCheckRunAfterUnlock(ctx context.Context, repo string, pr int, lock *storage.Lock, installationID int64) {
-	client, err := h.clientForRepo(repo, installationID)
-	if err != nil {
-		h.logger.Error("failed to create GitHub client for check run update",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-		return
-	}
-
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
-	if err != nil {
-		h.logger.Error("failed to fetch PR for check run update",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-		return
-	}
-
-	checkName := fmt.Sprintf("SchemaBot Apply: /%s/%s", lock.DatabaseType, lock.DatabaseName)
-
-	opts := ghclient.CheckRunOptions{
-		Name:       checkName,
-		Status:     checkStatusCompleted,
-		Conclusion: checkConclusionNeutral,
-		Output: &ghclient.CheckRunOutput{
-			Title:   "Lock released",
-			Summary: "Schema change cancelled. Lock has been released.",
-		},
-	}
-
-	if _, err := client.CreateCheckRun(ctx, repo, prInfo.HeadSHA, opts); err != nil {
-		h.logger.Error("failed to update check run after unlock",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "head_sha", prInfo.HeadSHA, "error", err)
-	}
 }

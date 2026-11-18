@@ -11,9 +11,8 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 **runningSchemaChange** — Tracks a running schema change: the Spirit runners, affected tables, DDL statements, state, and a cancel function for stopping. Created by `Apply()`, consumed by `Progress()` and control operations.
 
 **Config** — Engine configuration:
-- `TargetChunkTime` (default 500ms): How long each batch of row copies should take
-- `Threads` (default 4): Number of concurrent copier threads
-- `LockWaitTimeout` (default 30s): How long to wait for table locks during cutover
+- `Threads` (default 2): Number of concurrent copier threads
+- `LockWaitTimeout` (default 10s): How long to wait for table locks during the checksum and cutover. Spirit's ForceKill (on by default) clears blocking transactions at 90% of this timeout — except an explicit LOCK TABLES holder or a transaction heavier than `dbconn.TransactionWeightThreshold`, which are left to finish naturally rather than killed — so this is fixed rather than scaled up for heavier changes
 - `DebugLogs`: Enable verbose Spirit debug output
 
 ## How It Works
@@ -31,7 +30,7 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 1. Categorizes DDL statements by type: CREATE, ALTER, DROP
 2. Executes CREATE statements first (direct SQL), then ALTER (via Spirit), then DROP (direct SQL)
 3. For ALTER statements, creates a `spiritmigration.Migration` with:
-   - `DeferCutOver` / `RespectSentinel` — When deferred cutover is requested
+   - `DeferCutOver` — When deferred cutover is requested; the apply then waits on Spirit's sentinel table until cutover is released. Only a deferred apply waits, so a sentinel left in the schema by another run never holds a non-deferred apply's cutover
    - Non-strict mode — Spirit falls back to a fresh copy when checkpoint resume fails (idempotent behavior)
 4. Runs the migration in a background goroutine with a cancellable context
 5. If only CREATE/DROP statements exist (no ALTER), completes immediately without Spirit
@@ -53,19 +52,6 @@ Polls Spirit's Progress API and maps Spirit's internal states to engine states:
 
 When `defer_cutover` is set, Spirit pauses after row copy completes and waits for a sentinel table (`_spirit_sentinel`) to be dropped. Calling `Cutover()` drops this sentinel table, signaling Spirit to proceed with the atomic table swap.
 
-### Volume
-
-Adjusts schema change speed by mapping volume levels (1-11) to Spirit settings:
-
-| Volume | Threads | Chunk Time | Lock Wait |
-|--------|---------|------------|-----------|
-| 1      | 1       | 500ms      | 5s        |
-| 3      | 2       | 2s         | 30s       |
-| 5      | 4       | 4s         | 30s       |
-| 11     | 16      | 5s         | 30s       |
-
-Implementation: Stop → reconfigure → Start. Spirit resumes from its checkpoint with the new settings.
-
 ## Checkpoint Error Handling
 
 Two checkpoint-related errors require user intervention:
@@ -80,6 +66,6 @@ Two checkpoint-related errors require user intervention:
 |------|---------|
 | `spirit.go` | Engine type, `Plan()`, `Apply()`, `Progress()` |
 | `execution.go` | `executeSchemaChange()`, Spirit runner setup, error handling |
-| `control.go` | `Stop()`, `Start()`, `Cutover()`, `Volume()`, `Revert()`, `SkipRevert()` |
+| `control.go` | `Stop()`, `Start()`, `Cutover()`, `Revert()`, `SkipRevert()` |
 | `helpers.go` | Schema fetching, DSN parsing, statement classification, internal table detection |
 | `logger.go` | Custom log handler that filters Spirit debug logs and routes to apply log storage |

@@ -13,6 +13,7 @@ CREATE TABLE `applies` (
   `installation_id` bigint NOT NULL DEFAULT '0',
   `external_id` varchar(255) NOT NULL DEFAULT '',
   `idempotency_key` varchar(255) DEFAULT NULL,
+  `expected_operation_keys` json DEFAULT NULL,
   `engine` varchar(50) NOT NULL,
   `state` varchar(100) NOT NULL,
   `error_message` text,
@@ -24,6 +25,8 @@ CREATE TABLE `applies` (
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
   `revert_skipped_at` datetime DEFAULT NULL,
+  `superseded_by` varchar(255) NOT NULL DEFAULT '',
+  `resumed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
@@ -37,6 +40,7 @@ CREATE TABLE `applies` (
   KEY `idx_created_id` (`created_at`,`id`),
   KEY `idx_environment_created_id` (`environment`,`created_at`,`id`),
   KEY `idx_state_created_id` (`state`,`created_at`,`id`),
+  KEY `idx_state_updated` (`state`,`updated_at`),
   KEY `idx_environment_state_created_id` (`environment`,`state`,`created_at`,`id`),
   KEY `idx_completed_at_state` (`completed_at`,`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

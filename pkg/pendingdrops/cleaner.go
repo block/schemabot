@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/namedlock"
 )
 
 const (
@@ -31,6 +33,14 @@ type Target struct {
 
 	// DSN is the resolved MySQL connection string for the target.
 	DSN string
+
+	// Locker is the advisory-lock implementation for this target's engine,
+	// used to serialize cleanup across SchemaBot instances with a
+	// session-scoped lock held on the pinned target connection. The producer
+	// chooses it per target because one cleanup pass can span heterogeneous
+	// engines. A target without a locker fails closed rather than assuming
+	// MySQL semantics.
+	Locker namedlock.Locker
 }
 
 // Cleaner permanently drops quarantined tables from _pending_drops once they
@@ -86,6 +96,14 @@ func (c *Cleaner) Run(ctx context.Context) error {
 // cleanTarget connects to one target, serializes against other SchemaBot
 // instances with an advisory lock, and drops expired quarantined tables.
 func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
+	// A missing locker is a producer wiring bug, not a connectivity failure:
+	// it fails every pass until the producer is fixed, so it gets its own
+	// metric reason instead of blending into transient target errors.
+	if target.Locker == nil {
+		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "locker_missing")
+		return fmt.Errorf("target %s/%s has no advisory locker; cleanup cannot serialize across instances without one", target.Database, target.Environment)
+	}
+
 	db, err := mysqlconn.Open(target.DSN)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
@@ -98,7 +116,8 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		return fmt.Errorf("ping target %s/%s: %w", target.Database, target.Environment, err)
 	}
 
-	// GET_LOCK is session-scoped, so hold one connection for the whole pass.
+	// The advisory lock is session-scoped, so hold one connection for the
+	// whole pass.
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
@@ -107,12 +126,12 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 	defer utils.CloseAndLog(conn)
 
 	lockName := targetLockName(target)
-	var locked int
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", lockName).Scan(&locked); err != nil {
+	acquired, err := target.Locker.Acquire(ctx, conn, lockName, 0)
+	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
 		return fmt.Errorf("acquire advisory lock on %s/%s: %w", target.Database, target.Environment, err)
 	}
-	if locked != 1 {
+	if !acquired {
 		c.logger.Info("pending drops cleanup skipped: another instance holds the cleanup lock",
 			"database", target.Database,
 			"environment", target.Environment,
@@ -121,16 +140,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		metrics.RecordPendingDropsCleanupLockSkipped(ctx, target.Database, target.Environment)
 		return nil
 	}
-	defer func() {
-		if _, err := conn.ExecContext(context.WithoutCancel(ctx), "SELECT RELEASE_LOCK(?)", lockName); err != nil {
-			c.logger.Warn("failed to release pending drops cleanup lock; the lock releases when the session closes",
-				"database", target.Database,
-				"environment", target.Environment,
-				"lock_name", lockName,
-				"error", err,
-			)
-		}
-	}()
+	defer c.releaseCleanupLock(ctx, target, conn, lockName)
 
 	exists, err := pendingDropsDatabaseExists(ctx, conn)
 	if err != nil {
@@ -155,8 +165,16 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 	cutoff := now.Add(-c.retention)
 	var dropped, wouldDrop, kept, skipped int
 	var dropErr error
+	hasLog := false
+	remaining := make([]string, 0, len(tables))
 
 	for _, tableName := range tables {
+		if tableName == LogTable {
+			// The quarantine log records which apply moved each table here;
+			// it is not a quarantined table and is never dropped.
+			hasLog = true
+			continue
+		}
 		quarantinedAt, ok := ParseTimestamp(tableName)
 		if !ok {
 			c.logger.Warn("pending drops cleanup: table name has no valid timestamp prefix, table will never be auto-dropped",
@@ -165,10 +183,12 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 				"table", tableName,
 			)
 			metrics.RecordPendingDropsCleanupSkipped(ctx, target.Database, target.Environment)
+			remaining = append(remaining, tableName)
 			skipped++
 			continue
 		}
 		if !quarantinedAt.Before(cutoff) {
+			remaining = append(remaining, tableName)
 			kept++
 			continue
 		}
@@ -181,6 +201,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 				"table", tableName,
 				"age", age,
 			)
+			remaining = append(remaining, tableName)
 			wouldDrop++
 			continue
 		}
@@ -194,6 +215,7 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 				"error", err,
 			)
 			metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "drop_error")
+			remaining = append(remaining, tableName)
 			dropErr = err
 			continue
 		}
@@ -207,6 +229,8 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		dropped++
 	}
 
+	prunedRecords, logErr := c.pruneQuarantineLog(ctx, conn, target, hasLog, remaining, cutoff)
+
 	attrs := []any{
 		"database", target.Database,
 		"environment", target.Environment,
@@ -215,15 +239,104 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		"skipped_unparseable", skipped,
 	}
 	if c.dryRun {
-		attrs = append(attrs, "would_drop", wouldDrop)
+		attrs = append(attrs, "would_drop", wouldDrop, "would_prune_log_records", prunedRecords)
 	} else {
-		attrs = append(attrs, "dropped", dropped)
+		attrs = append(attrs, "dropped", dropped, "pruned_log_records", prunedRecords)
 	}
 	c.logger.Info("pending drops cleanup pass complete", attrs...)
+
+	// Both causes are kept: a pass that could neither drop a copy nor read
+	// the log has two things for an operator to look at.
+	var errs []error
 	if dropErr != nil {
-		return fmt.Errorf("drop expired pending drops tables on %s/%s: %w", target.Database, target.Environment, dropErr)
+		errs = append(errs, fmt.Errorf("drop expired pending drops tables on %s/%s: %w", target.Database, target.Environment, dropErr))
 	}
-	return nil
+	if logErr != nil {
+		errs = append(errs, fmt.Errorf("prune %s.%s on %s/%s: %w", Database, LogTable, target.Database, target.Environment, logErr))
+	}
+	return errors.Join(errs...)
+}
+
+// lockReleaseTimeout bounds how long a pass may spend releasing its cleanup
+// lock. A release stuck on a half-open connection would otherwise never
+// return, and the pass's own context may already be cancelled by the time
+// the release runs.
+//
+// The bound ends this instance's wait, not the lock. The pinned connection
+// is closed with the pass's pool, and a server that never sees that close
+// keeps the lock with its old session until it notices the session is gone.
+//
+// A variable so tests can shorten it.
+var lockReleaseTimeout = 5 * time.Second
+
+// releaseCleanupLock releases the advisory lock held on conn's session within
+// lockReleaseTimeout. It runs after the pass's context may have been
+// cancelled, so it does not inherit that cancellation. A release that fails,
+// times out, or reports the lock was not held is logged, not returned: the
+// pass's outcome is already decided, and the pinned connection is closed with
+// the pass's pool either way, which releases the lock server-side.
+func (c *Cleaner) releaseCleanupLock(ctx context.Context, target Target, conn *sql.Conn, lockName string) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockReleaseTimeout)
+	defer cancel()
+
+	released, err := target.Locker.Release(releaseCtx, conn, lockName)
+	switch {
+	case err != nil:
+		c.logger.Warn("failed to release pending drops cleanup lock; the lock releases when the session closes",
+			"database", target.Database,
+			"environment", target.Environment,
+			"lock_name", lockName,
+			"error", err,
+		)
+	case !released:
+		c.logger.Warn("pending drops cleanup lock was no longer held at release; another instance may have run concurrently against this target",
+			"database", target.Database,
+			"environment", target.Environment,
+			"lock_name", lockName,
+		)
+	}
+}
+
+// pruneQuarantineLog deletes the quarantine log records of copies past
+// retention that no longer exist: copies this or an earlier pass dropped, and
+// copies whose RENAME never landed. remaining lists the pending drops tables
+// still present after this pass. A dry run reports how many records it would
+// delete and deletes none, and a target with no log has nothing to prune.
+func (c *Cleaner) pruneQuarantineLog(ctx context.Context, conn *sql.Conn, target Target, hasLog bool, remaining []string, cutoff time.Time) (int, error) {
+	if !hasLog {
+		return 0, nil
+	}
+	expired, err := expiredLogRecords(ctx, conn, remaining, cutoff)
+	if err != nil {
+		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "log_error")
+		return 0, err
+	}
+	if c.dryRun {
+		for _, name := range expired {
+			c.logger.Info("pending drops cleanup dry run: quarantine log record of a copy that is gone would be deleted",
+				"database", target.Database,
+				"environment", target.Environment,
+				"quarantine_table", name,
+			)
+		}
+		return len(expired), nil
+	}
+	deleteSQL := "DELETE FROM `" + Database + "`.`" + LogTable + "` WHERE quarantine_table = ?"
+	pruned := 0
+	for _, name := range expired {
+		if _, err := conn.ExecContext(ctx, deleteSQL, name); err != nil {
+			c.logger.Error("pending drops cleanup: could not delete the quarantine log record of a copy that is gone; it is deleted on a later pass",
+				"database", target.Database,
+				"environment", target.Environment,
+				"quarantine_table", name,
+				"error", err,
+			)
+			metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "log_error")
+			return pruned, fmt.Errorf("delete log record of %s: %w", name, err)
+		}
+		pruned++
+	}
+	return pruned, nil
 }
 
 func targetLockName(target Target) string {

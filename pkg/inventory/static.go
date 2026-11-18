@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 
 	"github.com/block/schemabot/pkg/secrets"
 )
@@ -23,40 +24,73 @@ type StaticConfig struct {
 type StaticTarget struct {
 	DatabaseType string `yaml:"type"`
 	// DSN is a full connection string or secret reference. It is resolved once,
-	// when the resolver is constructed, and cached. Mutually exclusive with
-	// DSNFrom.
+	// when the resolver is constructed, and cached. A PostgreSQL DSN is passed
+	// through as written: the dsn_from transport gate (the sslmode allowlist
+	// and CA resolution) does not apply, so an explicit weaker sslmode —
+	// including disable — is honored. It is the deliberate escape hatch for
+	// dev and compatibility setups; production PostgreSQL targets should use
+	// DSNFrom. Mutually exclusive with DSNFrom.
 	DSN string `yaml:"dsn,omitempty"`
-	// DSNFrom assembles a namespace-free MySQL DSN from separate config and
-	// password secret references. Unlike DSN it is resolved fresh on every request
-	// so a rotated target credential (for example one re-synced by the External
+	// DSNFrom assembles a DSN from separate config and password secret
+	// references: a namespace-free MySQL DSN, or a PostgreSQL libpq URL carrying
+	// the database name. Unlike DSN it is resolved fresh on every request so a
+	// rotated target credential (for example one re-synced by the External
 	// Secrets Operator) is picked up without restarting the worker. Mutually
 	// exclusive with DSN.
 	//
+	// The target router keys its client cache on a hash of the assembled DSN,
+	// so the first request after a rotation misses deterministically and opens
+	// a fresh client; applies already running keep the client they started on.
+	//
 	// Intended backend: file: secret references (the ESO-synced case). The
-	// per-request assembly runs before the target router's client-cache lookup,
-	// and on a cache hit the freshly assembled DSN is discarded (the cached client
-	// serves the request), so today dsn_from buys rotation-safety only at the next
-	// cache miss. With secretsmanager: refs that means every routed request pays a
-	// GetSecretValue call (two, for the split config/password refs) and gains a
-	// per-request dependency on secret-backend availability with no offsetting
-	// benefit until the DSN-aware client cache lands; with file: refs the cost and
-	// availability risk are negligible. Prefer file: refs until that follow-up.
+	// per-request assembly runs on every routed request, so with secretsmanager:
+	// refs each request pays a GetSecretValue call (two, for the split
+	// config/password refs) and takes a per-request dependency on secret-backend
+	// availability; with file: refs the cost and availability risk are
+	// negligible. Prefer file: refs.
 	DSNFrom  *StaticDSNFromConfig `yaml:"dsn_from,omitempty"`
 	Metadata map[string]string    `yaml:"metadata,omitempty"`
+	// SchemaOverrides maps a requested (canonical) namespace to the physical
+	// schema name on this target, for targets whose physical schema names
+	// embed environment or region (e.g. bikeshare → bikeshare_eu_qa). On MySQL
+	// the physical name is a database, so the target DSN stays namespace-free
+	// and the mapped name is injected per operation. On PostgreSQL the DSN
+	// names the database and the physical name is a schema within it, swapped
+	// in at the engine boundary. When non-empty it is a strict allowlist: a
+	// requested namespace without a mapping fails rather than falling back to
+	// the canonical name, so a misrouted request cannot land in the wrong
+	// physical schema. MySQL and PostgreSQL only; currently limited to a
+	// single mapping per target.
+	SchemaOverrides map[string]string `yaml:"schema_overrides,omitempty"`
+	// TableOwner is the PostgreSQL role used for greenfield table creation.
+	// Empty preserves creation as the connected role. PostgreSQL only.
+	TableOwner string `yaml:"table_owner,omitempty"`
 }
 
-// StaticDSNFromConfig assembles a namespace-free MySQL DSN for a static target
-// from secret references, resolved fresh on every request. It deliberately never
+// ValidateTypeSpelling rejects noncanonical spellings of a configured engine.
+func (t StaticTarget) ValidateTypeSpelling() error {
+	if t.DatabaseType != canonicalDatabaseType(t.DatabaseType) {
+		return fmt.Errorf("type %q must be lowercase with no surrounding whitespace", t.DatabaseType)
+	}
+	return nil
+}
+
+// StaticDSNFromConfig assembles a DSN for a static target from secret
+// references, resolved fresh on every request. For MySQL it deliberately never
 // reads a database name: the per-operation request supplies the schema, so the
-// assembled DSN carries none (a DSN with a database name is rejected).
+// assembled DSN carries none (a DSN with a database name is rejected). For
+// PostgreSQL the connection is made to one database, so the config document
+// must carry the database name and the assembled DSN includes it; the request
+// namespace selects a schema within that database.
 type StaticDSNFromConfig struct {
 	// ConfigRef is a secret reference to a JSON document holding the target's
-	// connection metadata (host and port). Like PasswordRef it may contain a
-	// "{target}" placeholder, replaced with the request target for per-target
-	// secret naming, and is resolved fresh on every request.
+	// connection metadata (host and port, plus the database name for
+	// PostgreSQL). Like PasswordRef it may contain a "{target}" placeholder,
+	// replaced with the request target for per-target secret naming, and is
+	// resolved fresh on every request.
 	ConfigRef string `yaml:"config_ref"`
-	// ConfigPaths selects which keys in ConfigRef hold the host and port,
-	// defaulting to "host" and "port".
+	// ConfigPaths selects which keys in ConfigRef hold the connection fields,
+	// defaulting to "host", "port", and (PostgreSQL only) "dbname".
 	ConfigPaths StaticDSNFromPaths `yaml:"config_paths,omitempty"`
 	// Username is the database user included in the assembled DSN.
 	Username string `yaml:"username"`
@@ -64,16 +98,27 @@ type StaticDSNFromConfig struct {
 	// contain a "{target}" placeholder, replaced with the request target for
 	// per-target secret naming, and is resolved fresh on every request.
 	PasswordRef string `yaml:"password_ref"`
-	// Params are appended as MySQL DSN query parameters (for example TLS
-	// settings).
+	// Params are appended as DSN query parameters. For MySQL they are freeform
+	// (for example TLS settings); for PostgreSQL only "sslmode: verify-full" is
+	// accepted — TLS trust material is configured via CARef, never via raw
+	// libpq parameters.
 	Params map[string]string `yaml:"params,omitempty"`
+	// CARef (PostgreSQL only) selects the CA bundle the data plane verifies the
+	// server against: "embedded:rds-global" or "file:<absolute-path>". Empty
+	// defaults to the embedded RDS bundle when the resolved host is an RDS
+	// endpoint and fails otherwise — a verified CA is required.
+	CARef string `yaml:"ca_ref,omitempty"`
 }
 
-// StaticDSNFromPaths selects the host and port keys in a StaticDSNFromConfig's
-// config document. Keys are looked up at the top level of the document.
+// StaticDSNFromPaths selects the connection-field keys in a
+// StaticDSNFromConfig's config document. Keys are looked up at the top level of
+// the document.
 type StaticDSNFromPaths struct {
 	Host string `yaml:"host,omitempty"`
 	Port string `yaml:"port,omitempty"`
+	// DBName is the key holding the PostgreSQL database name, defaulting to
+	// "dbname". PostgreSQL only: MySQL targets stay namespace-free.
+	DBName string `yaml:"dbname,omitempty"`
 }
 
 // StaticResolver resolves targets from static configuration.
@@ -88,6 +133,11 @@ type staticTargetEntry struct {
 	target       string
 	databaseType string
 	metadata     map[string]string
+	// schemaOverrides is the validated canonical→physical MySQL schema
+	// allowlist for this target; empty means the requested namespace is the
+	// physical schema.
+	schemaOverrides map[string]string
+	tableOwner      string
 	// dsn is set (non-nil) for entries resolved once at construction.
 	dsn *string
 	// dsnFrom is set for entries assembled fresh on every request.
@@ -95,6 +145,7 @@ type staticTargetEntry struct {
 }
 
 var _ Resolver = (*StaticResolver)(nil)
+var _ Enumerator = (*StaticResolver)(nil)
 
 // NewStaticResolver creates a static target resolver.
 func NewStaticResolver(config StaticConfig) (*StaticResolver, error) {
@@ -125,7 +176,7 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 	}
 	entry, ok := r.targets[req.Target]
 	if !ok {
-		return nil, fmt.Errorf("target %q is not configured", req.Target)
+		return nil, fmt.Errorf("target %q is not configured: %w", req.Target, ErrTargetNotFound)
 	}
 	if strings.TrimSpace(req.DatabaseType) != "" {
 		requestedType := canonicalDatabaseType(req.DatabaseType)
@@ -133,23 +184,60 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 			return nil, fmt.Errorf("target %q is configured for database type %q, not %q", req.Target, entry.databaseType, requestedType)
 		}
 	}
-	dsn, err := entry.resolveDSN(ctx, req)
+	dsn, assembled, err := entry.resolveConnection(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	// Configured metadata supplies extra engine fields but must not override
+	// the fields the assembler resolved (for example the PostgreSQL CA
+	// reference), so it is written first and the assembled fields last.
+	metadata := maps.Clone(entry.metadata)
+	if len(assembled) > 0 {
+		if metadata == nil {
+			metadata = make(map[string]string, len(assembled))
+		}
+		maps.Copy(metadata, assembled)
+	}
 	return &Target{
-		Target:       entry.target,
-		DatabaseType: entry.databaseType,
-		DSN:          dsn,
-		Metadata:     maps.Clone(entry.metadata),
+		Target:          entry.target,
+		DatabaseType:    entry.databaseType,
+		DSN:             dsn,
+		Metadata:        metadata,
+		SchemaOverrides: maps.Clone(entry.schemaOverrides),
+		TableOwner:      entry.tableOwner,
 	}, nil
+}
+
+// Enumerate returns every configured target in target-name order. Static
+// resolution does not scope by environment, so the requests carry none.
+func (r *StaticResolver) Enumerate(context.Context) ([]ProbeRequest, error) {
+	if r == nil {
+		return nil, fmt.Errorf("static target resolver is nil")
+	}
+	var requests []ProbeRequest
+	for target, entry := range r.targets {
+		requests = append(requests, ProbeRequest{Target: target, DatabaseType: entry.databaseType})
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		return requests[i].Target < requests[j].Target
+	})
+	return requests, nil
+}
+
+// UnenumerableDatabaseTypes returns nil: a static resolver lists every target
+// it serves.
+func (r *StaticResolver) UnenumerableDatabaseTypes() []string {
+	return nil
 }
 
 // newStaticTargetEntry prepares one static target: it validates the entry, and
 // for a dsn entry resolves and caches the DSN now, while a dsn_from entry only
 // validates its shape (its DSN is assembled per request).
 func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry, error) {
-	databaseType := canonicalDatabaseType(entry.DatabaseType)
+	if err := entry.ValidateTypeSpelling(); err != nil {
+		return nil, fmt.Errorf("target %q %w", target, err)
+	}
+	databaseType := entry.DatabaseType
 	if databaseType == "" {
 		return nil, fmt.Errorf("target %q missing type", target)
 	}
@@ -161,16 +249,24 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 	case !hasDSN && !hasDSNFrom:
 		return nil, fmt.Errorf("target %q missing dsn or dsn_from", target)
 	}
+	if err := ValidateSchemaOverrides(databaseType, entry.SchemaOverrides); err != nil {
+		return nil, fmt.Errorf("target %q: %w", target, err)
+	}
+	if err := ValidateTableOwner(databaseType, entry.TableOwner); err != nil {
+		return nil, fmt.Errorf("target %q: %w", target, err)
+	}
 	prepared := &staticTargetEntry{
-		target:       target,
-		databaseType: databaseType,
-		metadata:     maps.Clone(entry.Metadata),
+		target:          target,
+		databaseType:    databaseType,
+		metadata:        maps.Clone(entry.Metadata),
+		schemaOverrides: maps.Clone(entry.SchemaOverrides),
+		tableOwner:      entry.TableOwner,
 	}
 	if hasDSNFrom {
-		if databaseType != "mysql" {
-			return nil, fmt.Errorf("target %q dsn_from is only supported for mysql, not %q", target, databaseType)
+		if databaseType != "mysql" && databaseType != "postgres" {
+			return nil, fmt.Errorf("target %q dsn_from is only supported for mysql and postgres, not %q", target, databaseType)
 		}
-		if err := entry.DSNFrom.validate(target); err != nil {
+		if err := entry.DSNFrom.validate(target, databaseType); err != nil {
 			return nil, err
 		}
 		prepared.dsnFrom = entry.DSNFrom
@@ -190,24 +286,120 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 	return prepared, nil
 }
 
-// resolveDSN returns the entry's DSN: the cached value for a dsn entry, or a
-// freshly assembled namespace-free DSN for a dsn_from entry.
-func (e staticTargetEntry) resolveDSN(ctx context.Context, req Request) (string, error) {
+// resolveConnection returns the entry's DSN and any assembled engine metadata:
+// the cached DSN for a dsn entry, or a freshly assembled DSN (plus, for
+// PostgreSQL, the resolved CA reference) for a dsn_from entry.
+func (e staticTargetEntry) resolveConnection(ctx context.Context, req Request) (string, map[string]string, error) {
 	if e.dsn != nil {
-		return *e.dsn, nil
+		return *e.dsn, nil, nil
 	}
-	dsn, err := e.dsnFrom.assemble(ctx, req, e.databaseType)
+	dsn, assembled, err := e.dsnFrom.assemble(ctx, req, e.databaseType)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := validateResolvedStaticTargetDSN(e.target, e.databaseType, dsn); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return dsn, nil
+	return dsn, assembled, nil
 }
 
 func canonicalDatabaseType(databaseType string) string {
 	return strings.ToLower(strings.TrimSpace(databaseType))
+}
+
+// ValidateSchemaOverrides checks a canonical→physical schema mapping for
+// MySQL or PostgreSQL (for Vitess the namespace is a keyspace, a different
+// concept). The mapping is currently limited to a single entry: operations
+// address one schema per target, and a
+// wider map would silently permit multi-schema routing this feature does not
+// support yet. It is exported so every consumer of a resolved target (not just
+// static inventory) enforces the same contract; a custom resolver cannot hand
+// an invalid mapping past it.
+func ValidateSchemaOverrides(databaseType string, overrides map[string]string) error {
+	if len(overrides) == 0 {
+		return nil
+	}
+	if databaseType != "mysql" && databaseType != "postgres" {
+		return fmt.Errorf("schema_overrides is only supported for mysql and postgres, not %q", databaseType)
+	}
+	if len(overrides) > 1 {
+		return fmt.Errorf("schema_overrides supports exactly one mapping, got %d", len(overrides))
+	}
+	for canonical, physical := range overrides {
+		if err := validateSchemaIdentifier(databaseType, canonical); err != nil {
+			return fmt.Errorf("schema_overrides key %q: %w", canonical, err)
+		}
+		if err := validateSchemaIdentifier(databaseType, physical); err != nil {
+			return fmt.Errorf("schema_overrides value %q for key %q: %w", physical, canonical, err)
+		}
+	}
+	return nil
+}
+
+// ValidateTableOwner checks the optional role used for PostgreSQL greenfield
+// table creation. An empty owner preserves creation as the connected role.
+func ValidateTableOwner(databaseType, owner string) error {
+	if owner == "" {
+		return nil
+	}
+	if databaseType != "postgres" {
+		return fmt.Errorf("table_owner is only supported for postgres, not %q", databaseType)
+	}
+	if err := validatePostgresIdentifier("role", owner); err != nil {
+		return fmt.Errorf("table_owner %q: %w", owner, err)
+	}
+	return nil
+}
+
+func validateSchemaIdentifier(databaseType, name string) error {
+	switch databaseType {
+	case "mysql":
+		return validateMySQLSchemaIdentifier(name)
+	case "postgres":
+		return validatePostgresSchemaIdentifier(name)
+	default:
+		return fmt.Errorf("unsupported database type %q", databaseType)
+	}
+}
+
+func validateMySQLSchemaIdentifier(name string) error {
+	if name == "" {
+		return fmt.Errorf("schema name must not be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("schema name exceeds MySQL's 64-character identifier limit")
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '$':
+		default:
+			return fmt.Errorf("schema name contains unsupported character %q; only [a-zA-Z0-9_$] is allowed", r)
+		}
+	}
+	return nil
+}
+
+func validatePostgresSchemaIdentifier(name string) error {
+	return validatePostgresIdentifier("schema", name)
+}
+
+func validatePostgresIdentifier(kind, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s name must not be empty", kind)
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("%s name exceeds PostgreSQL's 63-byte identifier limit", kind)
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("%s name must not have leading or trailing whitespace", kind)
+	}
+	if strings.ContainsRune(name, '"') {
+		return fmt.Errorf("%s name must not contain a double quote", kind)
+	}
+	if strings.ContainsRune(name, '\x00') {
+		return fmt.Errorf("%s name must not contain NUL", kind)
+	}
+	return nil
 }
 
 func validateResolvedStaticTargetDSN(target, databaseType, dsn string) error {
@@ -225,9 +417,15 @@ func validateResolvedStaticTargetDSN(target, databaseType, dsn string) error {
 }
 
 // validate checks that a dsn_from entry has the fields required to assemble a
-// DSN. The password is not read here — it is resolved per request so a rotated
-// credential is picked up without a restart.
-func (c *StaticDSNFromConfig) validate(target string) error {
+// DSN, including the engine-specific ones: the PostgreSQL-only fields are
+// rejected on other engines rather than silently ignored, and the PostgreSQL
+// TLS configuration is checked here so a misconfiguration surfaces at
+// construction, not on the first routed request. The assembler enforces the
+// same TLS rules again per request; that copy is the only gate for inventory
+// sources that construct the assembler directly, so neither check is
+// redundant. The password is not read here — it is resolved per request so a
+// rotated credential is picked up without a restart.
+func (c *StaticDSNFromConfig) validate(target, databaseType string) error {
 	if c.ConfigRef == "" {
 		return fmt.Errorf("target %q dsn_from missing config_ref", target)
 	}
@@ -237,46 +435,117 @@ func (c *StaticDSNFromConfig) validate(target string) error {
 	if c.PasswordRef == "" {
 		return fmt.Errorf("target %q dsn_from missing password_ref", target)
 	}
+	if databaseType != "postgres" {
+		if c.CARef != "" {
+			return fmt.Errorf("target %q dsn_from ca_ref is only supported for postgres, not %q", target, databaseType)
+		}
+		if c.ConfigPaths.DBName != "" {
+			return fmt.Errorf("target %q dsn_from config_paths.dbname is only supported for postgres, not %q", target, databaseType)
+		}
+		return nil
+	}
+	if err := ValidatePostgresDSNParams(c.Params); err != nil {
+		return fmt.Errorf("target %q dsn_from: %w", target, err)
+	}
+	if c.CARef != "" {
+		if err := ValidatePostgresCARef(c.CARef); err != nil {
+			return fmt.Errorf("target %q dsn_from: %w", target, err)
+		}
+	}
 	return nil
 }
 
-// assemble builds a namespace-free MySQL DSN from the config document (host and
-// port) and the password reference, both resolved fresh. It reuses the shared
-// MySQL assembler and the fail-closed secret-ref credential resolver so a rotated
+// assemble builds the entry's DSN from the config document and the password
+// reference, both resolved fresh, routing to the engine's assembler: a
+// namespace-free MySQL DSN, or a PostgreSQL libpq URL carrying the database
+// name plus the resolved CA reference as engine metadata. It reuses the shared
+// assemblers and the fail-closed secret-ref credential resolver so a rotated
 // password or empty secret is handled identically to the Etre data-plane path.
-func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databaseType string) (string, error) {
-	host, port, err := c.resolveEndpoint(ctx, req.Target)
+func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databaseType string) (string, map[string]string, error) {
+	document, err := c.resolveConfigDocument(ctx, req.Target)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	creds, err := SecretRefCredentialResolver{Username: c.Username, PasswordRef: c.PasswordRef}.ResolveCredentials(ctx, req, nil)
+	if databaseType == "postgres" {
+		return c.assemblePostgres(ctx, document, req)
+	}
+	// The database name in the document, if any, is ignored: static MySQL
+	// target DSNs are namespace-free, the request supplies the schema.
+	host, port, err := c.endpoint(document, req.Target, "3306")
 	if err != nil {
-		return "", err
+		return "", nil, err
+	}
+	creds, err := c.resolveCredentials(ctx, req)
+	if err != nil {
+		return "", nil, err
 	}
 	assembler := MySQLConnectionAssembler{Type: databaseType, DefaultPort: port, Params: c.Params}
 	dsn, _, err := assembler.Assemble(host, nil, creds)
 	if err != nil {
-		return "", fmt.Errorf("assemble DSN for target %q: %w", req.Target, err)
+		return "", nil, fmt.Errorf("assemble DSN for target %q: %w", req.Target, err)
 	}
-	return dsn, nil
+	return dsn, nil, nil
 }
 
-// resolveEndpoint resolves the config document and reads the target host and
-// port from it. The port defaults to 3306 when absent; the database name in the
-// document, if any, is ignored (static target DSNs are namespace-free).
-func (c *StaticDSNFromConfig) resolveEndpoint(ctx context.Context, target string) (host, port string, err error) {
+// assemblePostgres builds a PostgreSQL libpq URL from the config document's
+// host, port, and database name. The database name is required: a PostgreSQL
+// connection is made to one database, and assembling a DSN without one would
+// fail closed only at dial time with a confusing server-side error.
+func (c *StaticDSNFromConfig) assemblePostgres(ctx context.Context, document map[string]any, req Request) (string, map[string]string, error) {
+	target := req.Target
+	host, port, err := c.endpoint(document, target, "5432")
+	if err != nil {
+		return "", nil, err
+	}
+	dbnameKey := c.ConfigPaths.DBName
+	if dbnameKey == "" {
+		dbnameKey = PostgresDBNameAttribute
+	}
+	dbname, err := requiredStringField(document, dbnameKey)
+	if err != nil {
+		return "", nil, fmt.Errorf("read dbname for target %q: %w", target, err)
+	}
+	creds, err := c.resolveCredentials(ctx, req)
+	if err != nil {
+		return "", nil, err
+	}
+	assembler := PostgresConnectionAssembler{DefaultPort: port, Params: c.Params, CARef: c.CARef}
+	dsn, metadata, err := assembler.Assemble(host, map[string]string{PostgresDBNameAttribute: dbname}, creds)
+	if err != nil {
+		return "", nil, fmt.Errorf("assemble DSN for target %q: %w", target, err)
+	}
+	return dsn, metadata, nil
+}
+
+// resolveCredentials resolves the entry's username and per-request password.
+// It runs after the config document's connection fields are read so a
+// malformed document fails before it costs a password secret read, and with
+// the endpoint error rather than a later credential one.
+func (c *StaticDSNFromConfig) resolveCredentials(ctx context.Context, req Request) (*Credentials, error) {
+	return SecretRefCredentialResolver{Username: c.Username, PasswordRef: c.PasswordRef}.ResolveCredentials(ctx, req, nil)
+}
+
+// resolveConfigDocument resolves the config reference and parses it as a JSON
+// document.
+func (c *StaticDSNFromConfig) resolveConfigDocument(ctx context.Context, target string) (map[string]any, error) {
 	ref := strings.ReplaceAll(c.ConfigRef, "{target}", target)
 	document, err := secrets.ResolveContext(ctx, ref, "")
 	if err != nil {
-		return "", "", fmt.Errorf("resolve config reference for target %q: %w", target, err)
+		return nil, fmt.Errorf("resolve config reference for target %q: %w", target, err)
 	}
 	if document == "" {
-		return "", "", fmt.Errorf("config reference for target %q resolved an empty value", target)
+		return nil, fmt.Errorf("config reference for target %q resolved an empty value", target)
 	}
 	var config map[string]any
 	if err := json.Unmarshal([]byte(document), &config); err != nil {
-		return "", "", fmt.Errorf("parse config for target %q: %w", target, err)
+		return nil, fmt.Errorf("parse config for target %q: %w", target, err)
 	}
+	return config, nil
+}
+
+// endpoint reads the target host and port from the config document. The port
+// defaults to the engine's default when absent.
+func (c *StaticDSNFromConfig) endpoint(document map[string]any, target, defaultPort string) (host, port string, err error) {
 	hostKey := c.ConfigPaths.Host
 	if hostKey == "" {
 		hostKey = "host"
@@ -285,16 +554,16 @@ func (c *StaticDSNFromConfig) resolveEndpoint(ctx context.Context, target string
 	if portKey == "" {
 		portKey = "port"
 	}
-	host, err = requiredStringField(config, hostKey)
+	host, err = requiredStringField(document, hostKey)
 	if err != nil {
 		return "", "", fmt.Errorf("read host for target %q: %w", target, err)
 	}
-	port, err = optionalNumericField(config, portKey)
+	port, err = optionalNumericField(document, portKey)
 	if err != nil {
 		return "", "", fmt.Errorf("read port for target %q: %w", target, err)
 	}
 	if port == "" {
-		port = "3306"
+		port = defaultPort
 	}
 	return host, port, nil
 }

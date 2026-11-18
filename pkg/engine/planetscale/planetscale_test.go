@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,22 +34,44 @@ func TestDeployStateToEngineState(t *testing.T) {
 		{"complete_error", engine.StateFailed},
 		{"error", engine.StateFailed},
 		{"failed", engine.StateFailed},
-		{"in_progress_cancel", engine.StateCancelled},
+		{"in_progress_cancel", engine.StateRunning},
 		{"cancelled", engine.StateCancelled},
 		{"complete_cancel", engine.StateCancelled},
 		{"in_progress_revert", engine.StateReverting},
 		{"in_progress_revert_vschema", engine.StateReverting},
 		{"complete_revert", engine.StateReverted},
 		{"complete_revert_error", engine.StateFailed},
-		{"unknown_state", engine.StateRunning},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.deployState, func(t *testing.T) {
-			got := deployStateToEngineState(tt.deployState)
+			got, known := deployStateToEngineState(tt.deployState)
 			assert.Equal(t, tt.expectedState, got)
+			assert.True(t, known, "every state PlanetScale documents is recognized")
 		})
 	}
+}
+
+// A deployment state SchemaBot has never seen keeps the apply polling as
+// running rather than settling it on an outcome PlanetScale did not report,
+// and is flagged so the caller can log it.
+func TestDeployStateToEngineState_UnknownStateKeepsPolling(t *testing.T) {
+	got, known := deployStateToEngineState("in_progress_something_new")
+	assert.Equal(t, engine.StateRunning, got)
+	assert.False(t, got.IsTerminal())
+	assert.False(t, known)
+}
+
+// A cancel PlanetScale has accepted but not yet confirmed can still end in a
+// failed deploy, so the in-flight cancel must never read as a settled outcome:
+// only complete_cancel and cancelled close the deploy request as cancelled.
+func TestDeployStateToEngineState_CancelInFlightIsNotTerminal(t *testing.T) {
+	inFlight, _ := deployStateToEngineState(deployState.InProgressCancel)
+	assert.False(t, inFlight.IsTerminal())
+	completeCancel, _ := deployStateToEngineState(deployState.CompleteCancel)
+	assert.True(t, completeCancel.IsTerminal())
+	cancelled, _ := deployStateToEngineState(deployState.Cancelled)
+	assert.True(t, cancelled.IsTerminal())
 }
 
 func TestDeployStateToMessage(t *testing.T) {
@@ -119,7 +141,7 @@ func TestGenerateBranchName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := generateBranchName(tt.database, tt.planID)
+			got := GenerateBranchName(tt.database, tt.planID)
 			assert.Equal(t, tt.expected, got)
 		})
 	}
@@ -218,6 +240,7 @@ func TestSplitStatements(t *testing.T) {
 func TestIsSnapshotInProgress(t *testing.T) {
 	assert.True(t, isSnapshotInProgress(fmt.Errorf("Cannot update VSchema while a schema snapshot is in progress.")))
 	assert.True(t, isSnapshotInProgress(fmt.Errorf("wrapped: schema snapshot is in progress")))
+	assert.True(t, isSnapshotInProgress(fmt.Errorf("fetch VSchema for keyspace commerce: schema refreshing; please try again in a few moments")))
 	assert.False(t, isSnapshotInProgress(fmt.Errorf("connection refused")))
 	assert.False(t, isSnapshotInProgress(nil))
 }

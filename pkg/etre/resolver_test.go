@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/square/etre"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,15 +29,80 @@ func newEtreResolverForTest(t *testing.T, gotQuery *string, entities []etre.Enti
 // capturingCredResolver records what the resolver passes to credential
 // resolution so tests can assert the surfaced attributes.
 type capturingCredResolver struct {
-	gotTarget string
-	gotAttrs  map[string]string
-	creds     *inventory.Credentials
+	gotTarget      string
+	gotEnvironment string
+	gotAttrs       map[string]string
+	creds          *inventory.Credentials
 }
 
 func (c *capturingCredResolver) ResolveCredentials(_ context.Context, req inventory.Request, attrs map[string]string) (*inventory.Credentials, error) {
 	c.gotTarget = req.Target
+	c.gotEnvironment = req.Environment
 	c.gotAttrs = attrs
 	return c.creds, nil
+}
+
+// Inventory environment aliases select the exact registered target while
+// credentials and repeated lifecycle resolutions retain the logical identity.
+func TestEtreResolverEnvironmentMapping(t *testing.T) {
+	for _, env := range []string{"sandbox", "staging", "production"} {
+		t.Run(env, func(t *testing.T) {
+			var query string
+			creds := &capturingCredResolver{creds: &inventory.Credentials{Username: "ddl", Password: "pw"}}
+			mapping := map[string]string{"sandbox": "production"}
+			r := newEtreResolverForTest(t, &query, []etre.Entity{{
+				"writer_endpoint": "orders.example", "aws_account_id": "123456789012",
+			}}, EtreResolverConfig{
+				TargetLabel: "dsid", EnvLabel: "env", EnvironmentMapping: mapping,
+				HostField: "writer_endpoint", AttributeFields: []string{"aws_account_id"}, Credentials: creds,
+			})
+			// The constructed resolver owns its mapping even if the caller edits config.
+			mapping["sandbox"] = "staging"
+			req := inventory.Request{Target: "orders-002", DatabaseType: "mysql", Environment: env}
+			for range 2 {
+				target, err := r.ResolveTarget(t.Context(), req)
+				require.NoError(t, err)
+				inventoryEnv := env
+				if env == "sandbox" {
+					inventoryEnv = "production"
+				}
+				assert.Equal(t, "dsid=orders-002,env="+inventoryEnv, query)
+				assert.Equal(t, req.Target, target.Target)
+				assert.Equal(t, env, creds.gotEnvironment)
+				assert.Equal(t, map[string]string{"aws_account_id": "123456789012"}, creds.gotAttrs)
+				assert.Empty(t, target.SchemaOverrides)
+				dsn, err := mysql.ParseDSN(target.DSN)
+				require.NoError(t, err)
+				assert.Equal(t, "orders.example:3306", dsn.Addr)
+				assert.Empty(t, dsn.DBName)
+			}
+		})
+	}
+}
+
+func TestNewEtreResolverValidatesEnvironmentMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		envLabel string
+		mapping  map[string]string
+	}{
+		{"no env label", "", map[string]string{"sandbox": "production"}},
+		{"empty key", "env", map[string]string{"": "production"}},
+		{"empty value", "env", map[string]string{"sandbox": ""}},
+		{"whitespace", "env", map[string]string{"sandbox": " production"}},
+		{"uppercase", "env", map[string]string{"Sandbox": "production"}},
+		{"selector syntax", "env", map[string]string{"sandbox": "production,dsid=other"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewEtreResolver(EtreResolverConfig{
+				Client:      newClient(mockClient(nil, nil, nil), "cluster", nil),
+				TargetLabel: "dsid", EnvLabel: tc.envLabel, EnvironmentMapping: tc.mapping,
+				Credentials: inventory.SecretRefCredentialResolver{Username: "ddl", PasswordRef: "pw"},
+				Assembler:   inventory.MySQLConnectionAssembler{},
+			})
+			require.ErrorContains(t, err, "environment mapping")
+		})
+	}
 }
 
 // fakeAssembler records what the resolver hands the assembler and returns a
@@ -93,7 +158,7 @@ func TestEtreResolverResolvesMySQLTarget(t *testing.T) {
 // the assembler produces a namespace-free vtgate DSN for SHOW VITESS_MIGRATIONS
 // progress alongside the PlanetScale API metadata.
 func TestEtreResolverResolvesVitessTarget(t *testing.T) {
-	entity := etre.Entity{"endpoint": "vtgate.example", "organization": "acme"}
+	entity := etre.Entity{"endpoint": "vtgate.example", "organization": "acme", "name": "boardgames_main"}
 	creds := &capturingCredResolver{creds: &inventory.Credentials{
 		Username: "vt-user",
 		Password: "vt-pass",
@@ -105,7 +170,7 @@ func TestEtreResolverResolvesVitessTarget(t *testing.T) {
 	r := newEtreResolverForTest(t, nil, []etre.Entity{entity}, EtreResolverConfig{
 		TargetLabel:     "dsid",
 		HostField:       "endpoint",
-		AttributeFields: []string{"organization"},
+		AttributeFields: []string{"organization", "name"},
 		Credentials:     creds,
 		Assembler:       inventory.VitessConnectionAssembler{DefaultPort: "3306"},
 	})
@@ -115,6 +180,7 @@ func TestEtreResolverResolvesVitessTarget(t *testing.T) {
 
 	assert.Equal(t, "vitess", target.DatabaseType)
 	assert.Equal(t, "acme", target.Metadata[inventory.MetadataOrganization])
+	assert.Equal(t, "boardgames_main", target.Metadata[inventory.MetadataDatabase])
 	assert.Equal(t, "tok-secret", target.Metadata[inventory.MetadataTokenValue])
 
 	cfg, err := mysql.ParseDSN(target.DSN)
@@ -168,7 +234,8 @@ func TestEtreResolverOmitsEnvLabelWhenUnset(t *testing.T) {
 }
 
 // A not-found lookup fails closed and surfaces the sentinel so a multi-type
-// resolver could fall back.
+// resolver could fall back, and reports the target as one the inventory does
+// not have.
 func TestEtreResolverFailsClosedOnNotFound(t *testing.T) {
 	r := newEtreResolverForTest(t, nil, nil, EtreResolverConfig{
 		TargetLabel: "dsid",
@@ -178,6 +245,7 @@ func TestEtreResolverFailsClosedOnNotFound(t *testing.T) {
 	_, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "missing"})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, err, inventory.ErrTargetNotFound)
 }
 
 // A request whose type does not match the engine the resolver serves fails
@@ -261,10 +329,11 @@ func TestNewEtreResolverValidatesConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	cases := map[string]func(*EtreResolverConfig){
-		"etre client is required":          func(c *EtreResolverConfig) { c.Client = nil },
-		"target label is required":         func(c *EtreResolverConfig) { c.TargetLabel = "" },
-		"credential resolver is required":  func(c *EtreResolverConfig) { c.Credentials = nil },
-		"connection assembler is required": func(c *EtreResolverConfig) { c.Assembler = nil },
+		"etre client is required":                    func(c *EtreResolverConfig) { c.Client = nil },
+		"target label is required":                   func(c *EtreResolverConfig) { c.TargetLabel = "" },
+		"credential resolver is required":            func(c *EtreResolverConfig) { c.Credentials = nil },
+		"connection assembler is required":           func(c *EtreResolverConfig) { c.Assembler = nil },
+		"table_owner is only supported for postgres": func(c *EtreResolverConfig) { c.TableOwner = "app_owner" },
 	}
 	for wantErr, mutate := range cases {
 		cfg := base
@@ -273,4 +342,34 @@ func TestNewEtreResolverValidatesConfig(t *testing.T) {
 		require.Error(t, err, wantErr)
 		assert.Contains(t, err.Error(), wantErr)
 	}
+}
+
+// End to end with the real PostgreSQL assembler: the inventory records the
+// cluster endpoint but no database name, so the database comes from the
+// credential secret (decoded from the JSON format AWS uses for RDS database
+// secrets), and every resolved target carries the configured table owner so
+// tables the engine creates are owned by the application's owner role.
+func TestEtreResolverResolvesPostgresTarget(t *testing.T) {
+	var gotQuery string
+	entity := etre.Entity{"writer_endpoint": "orders.cluster-abc.us-east-1.rds.amazonaws.com", "name": "orders-cluster"}
+	r := newEtreResolverForTest(t, &gotQuery, []etre.Entity{entity}, EtreResolverConfig{
+		TargetLabel: "dsid",
+		EnvLabel:    "env",
+		HostField:   "writer_endpoint",
+		Credentials: inventory.SecretRefCredentialResolver{
+			PasswordRef: `{"username":"engine","password":"s3cret","dbname":"orders"}`,
+			Decode:      inventory.DecodePostgresSecret,
+		},
+		Assembler:  inventory.PostgresConnectionAssembler{DefaultPort: "5432"},
+		TableOwner: "app_owner",
+	})
+
+	target, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "orders-dsid", DatabaseType: "postgres", Environment: "staging"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "dsid=orders-dsid,env=staging", gotQuery)
+	assert.Equal(t, "postgres", target.DatabaseType)
+	assert.Equal(t, "postgresql://engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", target.DSN) // sadscan:disable np.postgres.1
+	assert.Equal(t, map[string]string{inventory.MetadataPostgresCARef: inventory.PostgresCARefEmbeddedRDSGlobal}, target.Metadata)
+	assert.Equal(t, "app_owner", target.TableOwner)
 }

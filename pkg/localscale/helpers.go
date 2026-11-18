@@ -162,7 +162,14 @@ func showCreateAllFromConn(ctx context.Context, conn *sql.Conn, opts ...table.Fi
 			return nil, fmt.Errorf("show create table %s: %w", name, err)
 		}
 		if optSet[table.WithStrippedAutoIncrement] {
-			createStmt = table.StripAutoIncrement(createStmt)
+			// An unstrippable counter is an error rather than a passthrough:
+			// returning the statement as-is would write one shard's counter
+			// into the schema this read produces.
+			stripped, err := table.StripAutoIncrement(createStmt)
+			if err != nil {
+				return nil, fmt.Errorf("strip auto-increment from %s: %w", name, err)
+			}
+			createStmt = stripped
 		}
 		result = append(result, table.TableSchema{Name: tbl, Schema: createStmt})
 	}
@@ -176,8 +183,17 @@ func hasVSchemaData(s sql.NullString) bool {
 
 // buildDDLStrategy constructs the Vitess online DDL strategy string.
 // If instantDDL is true, --prefer-instant-ddl is used; otherwise --postpone-completion.
+//
+// --analyze-table is deliberately absent. It runs ANALYZE TABLE on the shadow
+// table inside the cutover preparation, which replicates and briefly blocks
+// the table for writes, so the stream the cutover is about to wait on falls
+// behind. A stream that is behind at that moment reads the sentry table's DDL
+// after the cutover has locked the tables, reloads its schema, and blocks on
+// the locked table -- and the cutover is waiting on that same stream. The
+// statistics it produces are there for a replica promoted right after a
+// production cutover, which is not what this local backend is for.
 func buildDDLStrategy(instantDDL bool) string {
-	const baseFlags = " --in-order-completion --allow-zero-in-date --analyze-table" +
+	const baseFlags = " --in-order-completion --allow-zero-in-date" +
 		" --force-cut-over-after=1ms --cut-over-threshold=15s" +
 		" --singleton-context --allow-concurrent"
 
@@ -250,7 +266,15 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		return nil, nil, fmt.Errorf("invalid shard %s: %w", shard, err)
 	}
 
-	conn, err := backend.unscopedVtgateDB.Conn(ctx)
+	// Acquiring the connection and targeting the shard are both round trips to
+	// vtgate, so they carry their own deadline rather than the caller's lifetime:
+	// a vtgate that accepts a connection and then stops answering must not hold
+	// the caller indefinitely before it has a statement to time out. A shorter
+	// deadline already on ctx still wins.
+	setupCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+
+	conn, err := backend.unscopedVtgateDB.Conn(setupCtx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get vtgate connection: %w", err)
 	}
@@ -262,7 +286,7 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("invalid shard target %s: %w", target, err)
 	}
-	if _, err := conn.ExecContext(ctx, "USE "+quoteIdentifier(target)); err != nil {
+	if _, err := conn.ExecContext(setupCtx, "USE "+quoteIdentifier(target)); err != nil {
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("target shard %s: %w", target, err)
 	}
@@ -320,7 +344,7 @@ func (s *Server) getBranchSchemaFromBackend(ctx context.Context, backend *databa
 }
 
 func (s *Server) getBranchSchemaWithDSN(ctx context.Context, dsnBase, branch, keyspace string) ([]string, error) {
-	db, err := sql.Open("mysql", dsnBase+branchDBName(branch, keyspace))
+	db, err := openMySQL(dsnBase, branchDBName(branch, keyspace))
 	if err != nil {
 		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)
 	}
@@ -517,34 +541,60 @@ func (s *Server) resolveDeployAction(r *http.Request) (*databaseBackend, deployR
 	return backend, deployRequest{org: org, database: database, number: number}, nil
 }
 
-// deployResponse returns the standard deploy request response map with number, branch, and state.
-func deployResponse(number uint64, branch, state string) map[string]any {
+// deployResponse returns the standard deploy request response map with number,
+// branch, state, and creation time.
+func deployResponse(number uint64, branch, state, createdAt string) map[string]any {
 	return map[string]any{
 		"number":           number,
 		"branch":           branch,
 		"deployment_state": state,
+		"created_at":       createdAt,
 	}
 }
 
+// storedTimestampLayout is the format the metadata database renders TIMESTAMP
+// columns in when scanned as strings.
+const storedTimestampLayout = "2006-01-02 15:04:05"
+
+// deployRequestCreatedAt converts a stored deploy request created_at value to
+// the RFC3339 form the PlanetScale API uses for the field. Clients anchor
+// schema change context discovery on this value, so it must round-trip into
+// the SDK's time field rather than being omitted.
+func deployRequestCreatedAt(raw string) (string, error) {
+	ts, err := time.Parse(storedTimestampLayout, raw)
+	if err != nil {
+		return "", fmt.Errorf("parse deploy request created_at %q: %w", raw, err)
+	}
+	return ts.UTC().Format(time.RFC3339), nil
+}
+
 // deployRequestInfo holds commonly needed fields from a deploy request row.
+// createdAt carries the row's creation time already converted to the RFC3339
+// form deploy request responses use.
 type deployRequestInfo struct {
 	branch           string
 	migrationContext string
 	deploymentState  string
+	createdAt        string
 }
 
 // getDeployRequestInfo fetches common deploy request fields.
 func (s *Server) getDeployRequestInfo(ctx context.Context, ref deployRequest) (*deployRequestInfo, error) {
 	var info deployRequestInfo
 	err := s.metadataDB.QueryRowContext(ctx,
-		`SELECT branch, migration_context, deployment_state
+		`SELECT branch, migration_context, deployment_state, created_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		ref.org, ref.database, ref.number,
-	).Scan(&info.branch, &info.migrationContext, &info.deploymentState)
+	).Scan(&info.branch, &info.migrationContext, &info.deploymentState, &info.createdAt)
 	if err != nil {
 		return nil, newHTTPError(http.StatusNotFound, "deploy request not found: %d", ref.number)
 	}
+	createdAt, err := deployRequestCreatedAt(info.createdAt)
+	if err != nil {
+		return nil, newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", ref.number, err)
+	}
+	info.createdAt = createdAt
 	return &info, nil
 }
 
@@ -552,7 +602,7 @@ func (s *Server) getDeployRequestInfo(ctx context.Context, ref deployRequest) (*
 // and shuts down any TCP proxy associated with the branch. Branches live on
 // the backend's mysqld (not the metadata DB), so we connect there for the DROP.
 func (s *Server) dropBranchDatabases(ctx context.Context, backend *databaseBackend, branch string) {
-	db, err := sql.Open("mysql", backend.mysqlDSNBase)
+	db, err := openMySQL(backend.mysqlDSNBase, "")
 	if err != nil {
 		s.logger.Error("dropBranchDatabases: open backend", "branch", branch, "error", err)
 		return
@@ -733,8 +783,7 @@ func (s *Server) openBranchDB(ctx context.Context, branch, keyspace string) (*sq
 		return nil, fmt.Errorf("find backend for branch %s (%s/%s): %w", branch, org, database, err)
 	}
 
-	dsn := backend.mysqlDSNBase + branchDBName(branch, keyspace)
-	db, err := sql.Open("mysql", dsn)
+	db, err := openMySQL(backend.mysqlDSNBase, branchDBName(branch, keyspace))
 	if err != nil {
 		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)
 	}
@@ -809,29 +858,101 @@ func validateBranchName(name string) error {
 	return nil
 }
 
-// waitForOnlineDDLReady polls each keyspace's sidecar database until Vitess's
-// online DDL executor is operational. The executor requires the per-shard sidecar
-// databases to be initialized before it can process migrations. Without this check,
-// the first deploy request's DDL submission can hang waiting for a sidecar that
-// hasn't been created yet.
+// onlineDDLReadyTimeout bounds how long the whole cluster gets to finish
+// creating the sidecar databases its online DDL executors run out of. It covers
+// every keyspace together rather than each in turn, because vtcombo initializes
+// them concurrently — a per-keyspace budget would grant the last keyspace a
+// fresh window it has already spent waiting.
+const onlineDDLReadyTimeout = 3 * time.Minute
+
+// onlineDDLSidecarTable is the bookkeeping table Vitess's online DDL executor
+// keeps in a shard's sidecar database. Its presence is what makes the shard able
+// to accept a DDL submission.
+const onlineDDLSidecarTable = "schema_migrations"
+
+// waitForOnlineDDLReady polls until every shard of every keyspace has an online
+// DDL executor that can accept work. Each shard gets its own sidecar database,
+// and until that database is populated a DDL submission hangs waiting for a
+// sidecar that does not exist yet.
+//
+// Readiness is read off the cluster's mysqld rather than asked of vtgate,
+// because vtgate answers for a keyspace and this question is per shard: a
+// keyspace-scoped query cannot describe a keyspace whose shards are still being
+// brought up, and on a sharded keyspace it does not describe one shard at all.
 func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
+	deadline := time.Now().Add(onlineDDLReadyTimeout)
 	for key, backend := range s.backends {
-		for keyspace, db := range backend.vtgateDBs {
-			deadline := time.Now().Add(60 * time.Second)
+		db, err := openMySQL(backend.mysqlDSNBase, "")
+		if err != nil {
+			return fmt.Errorf("connect to mysqld for %s/%s: %w", key.org, key.database, err)
+		}
+		// Report an unreachable mysqld as the connectivity failure it is. Without
+		// this every probe below fails on the same dial error and the cluster
+		// spends its whole readiness budget before reporting a timeout waiting
+		// for online DDL.
+		if err := db.PingContext(ctx); err != nil {
+			utils.CloseAndLog(db)
+			return fmt.Errorf("ping mysqld for %s/%s: %w", key.org, key.database, err)
+		}
+		err = s.waitForBackendSidecars(ctx, key, backend, db, deadline)
+		utils.CloseAndLog(db)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitForBackendSidecars waits for one backend's shards, so the mysqld handle it
+// polls through is closed whether or not the wait succeeds.
+func (s *Server) waitForBackendSidecars(
+	ctx context.Context,
+	key backendKey,
+	backend *databaseBackend,
+	db *sql.DB,
+	deadline time.Time,
+) error {
+	for keyspace, shardCount := range backend.shardCounts {
+		for _, shard := range buildShards(shardCount) {
+			sidecar := shardSidecarDBName(keyspace, shard.Name)
+			started := time.Now()
 			ready := false
-			for time.Now().Before(deadline) {
-				rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
-				if err == nil {
-					utils.CloseAndLog(rows)
-					s.logger.Info("online DDL ready", "database", key.database, "keyspace", keyspace)
+			var lastErr error
+			// Probe every shard at least once, even when an earlier shard has
+			// already spent the cluster's budget, so the failure names what this
+			// shard was actually missing instead of reporting no cause at all.
+			for {
+				if err := ctx.Err(); err != nil {
+					return fmt.Errorf("online DDL readiness for %s/%s shard %s: %w",
+						key.database, keyspace, shard.Name, err)
+				}
+				var found int
+				err := db.QueryRowContext(ctx,
+					"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+					sidecar, onlineDDLSidecarTable).Scan(&found)
+				if err == nil && found > 0 {
+					s.logger.Info("online DDL ready",
+						"database", key.database, "keyspace", keyspace, "shard", shard.Name,
+						"sidecar", sidecar, "waited", time.Since(started))
 					ready = true
 					break
 				}
-				s.logger.Debug("waiting for online DDL readiness", "database", key.database, "keyspace", keyspace, "error", err)
+				if err != nil {
+					lastErr = err
+				} else {
+					lastErr = fmt.Errorf("sidecar database %s has no %s table yet", sidecar, onlineDDLSidecarTable)
+				}
+				if !time.Now().Before(deadline) {
+					break
+				}
+				s.logger.Debug("waiting for online DDL readiness",
+					"database", key.database, "keyspace", keyspace, "shard", shard.Name,
+					"sidecar", sidecar, "error", lastErr)
 				time.Sleep(time.Second)
 			}
 			if !ready {
-				return fmt.Errorf("online DDL not ready after 60s for %s/%s", key.database, keyspace)
+				return fmt.Errorf("online DDL not ready for %s/%s shard %s after waiting %s of the cluster's %s budget: %w",
+					key.database, keyspace, shard.Name, time.Since(started).Round(time.Second), onlineDDLReadyTimeout, lastErr)
 			}
 		}
 	}
@@ -865,7 +986,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, data any) {
 
 func (s *Server) writeError(w http.ResponseWriter, code int, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	s.logger.Warn("api error", "code", code, "message", msg)
+	s.logger.Warn("api error", "code", code, "error_message", msg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	// Use PlanetScale SDK error code strings so the SDK's error parser

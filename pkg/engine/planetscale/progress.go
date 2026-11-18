@@ -25,6 +25,10 @@ import (
 // Progress polls deploy request status from PlanetScale's API and optionally queries
 // SHOW VITESS_MIGRATIONS for per-table, per-shard row counts and ETA.
 func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
 		return &engine.ProgressResult{
 			State:   engine.StatePending,
@@ -61,15 +65,45 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		return nil, fmt.Errorf("get deploy request: %w", err)
 	}
 
-	engineState := deployStateToEngineState(dr.DeploymentState)
+	engineState, knownState := deployStateToEngineState(dr.DeploymentState)
+	if !knownState {
+		e.logger.Warn("unknown planetscale deploy request state; reporting the apply as running until planetscale reports a known state",
+			"database", req.Database, "deploy_request", dr.Number, "deployment_state", dr.DeploymentState)
+	}
+	message := deployStateToMessage(dr.DeploymentState)
 
 	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
 	if meta.DeferredDeploy && dr.DeploymentState == deployState.Ready {
 		engineState = engine.StateWaitingForDeploy
 	}
 
-	// Update instant DDL flag from deploy request if not already set.
-	if !meta.IsInstant && dr.Deployment != nil && dr.Deployment.InstantDDLEligible {
+	// A deploy request closed before it was deployed keeps the deployment state
+	// it had (pending or ready), so read from that alone it would still look
+	// like a deploy waiting to start. Nothing can start it any more: a cancel
+	// or stop retires an undeployed deploy request by closing it, and so does
+	// an operator closing it in the PlanetScale UI. It is the cancelled outcome,
+	// and reporting it as such is what lets the apply settle — the
+	// waiting-for-deploy timeout stops the deploy request and then relies on
+	// this poll to read the result, as the cutover timeout does.
+	if deployRequestClosedUndeployed(dr) {
+		engineState = engine.StateCancelled
+		message = fmt.Sprintf("Deploy request #%d closed before it was deployed", dr.Number)
+	}
+
+	if dr.DeploymentState == deployState.InProgressCancel {
+		e.warnOnCancelInFlightTooLong(req.Database, dr)
+	}
+
+	// Recover the instant DDL flag for an apply whose metadata was persisted
+	// before the deploy decision was made.
+	//
+	// The deploy request reports both what it could have done and what it did,
+	// and only the second one is the flag: an eligible change is deployed with a
+	// row copy whenever the cutover is held for the operator, and a change
+	// reported as instant on that basis renders as already swapped while it is
+	// still copying rows and waiting at the gate. What the deployment ran as is
+	// the only thing worth reading here.
+	if !meta.IsInstant && dr.Deployment != nil && dr.Deployment.InstantDDL {
 		meta.IsInstant = true
 	}
 
@@ -103,7 +137,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	// Late schema-change-context recovery. A progress poll can run in a process
+	// Late recovery of the schema change context. A progress poll can run in a process
 	// that never captured the pre-deploy baseline — a different replica, or an
 	// apply whose deploy was created before Vitess exposed its context — so the
 	// stored context is empty even though the deploy is live and producing
@@ -137,7 +171,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	result := &engine.ProgressResult{
 		State:       engineState,
-		Message:     deployStateToMessage(dr.DeploymentState),
+		Message:     message,
 		ResumeState: req.ResumeState,
 		Metadata:    psDisplayMetadata(meta),
 	}
@@ -148,12 +182,32 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	hasVtgateDSN := req.Credentials.DSN != ""
 	hasMigrationContext := req.ResumeState != nil && req.ResumeState.MigrationContext != ""
 	if hasVtgateDSN && hasMigrationContext {
-		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+		tables, overallProgress, failed, shardFailed := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
 		e.logger.Debug("vitess migrations queried",
 			"database", req.Database,
 			"table_count", len(tables),
 			"overall_progress", overallProgress,
 		)
+		// The deploy request reports that the schema change failed but never why.
+		// The shard rows carry the reason, so attach it to the failure the drive
+		// is about to record; without it the pull request and the CLI show a
+		// state and nothing an operator can act on.
+		if reason := adoptedFailureReason(engineState, failed, shardFailed); reason != "" {
+			result.ErrorMessage = reason
+			// The target's own words are the triage detail and stay server-side.
+			// The rendered reason names this log, so it carries them at the
+			// severity of the failure rather than behind a debug level an
+			// operator would have to turn on after the fact.
+			e.logger.Warn("schema change failed on the target",
+				"database", req.Database,
+				"deploy_request", meta.DeployRequestID,
+				"keyspace", failed.Keyspace,
+				"shard", failed.Shard,
+				"table", failed.Table,
+				"reason", reason,
+				"target_message", clampTargetMessage(failed.Message),
+			)
+		}
 		if len(tables) > 0 {
 			result.Tables = tables
 			if overallProgress > 0 {
@@ -167,7 +221,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	} else {
 		// No per-shard/row-copy progress this poll. A missing vtgate DSN is a target
-		// resolution gap that persists for the whole apply; a missing schema-change
+		// resolution gap that persists for the whole apply; a missing schema change
 		// context is transient during setup/recovery. Either way the comment and CLI
 		// fall back to deploy-request state, and the drive surfaces the reason once
 		// per apply.
@@ -199,9 +253,62 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	return result, nil
 }
 
+// cancelInFlightWarnAfter is how long a deploy request may sit in
+// in_progress_cancel before each progress poll warns that the cancel has not
+// settled. The apply stays active for as long as the cancel is in flight, and
+// nothing on SchemaBot's side ends that wait, so the warning is what makes a
+// stuck cancel visible to an operator.
+const cancelInFlightWarnAfter = 15 * time.Minute
+
+const cancelInFlightTooLongLog = "deploy request cancel has not settled; the apply stays active until PlanetScale reports the deploy request cancelled or failed; check the deploy request's deployment status in PlanetScale"
+
+// warnOnCancelInFlightTooLong warns when a deploy request has stayed in
+// in_progress_cancel for longer than cancelInFlightWarnAfter. The outcome is
+// unchanged: the deploy request keeps reading as running until it settles on
+// cancelled or failed. The elapsed time is measured from the deploy request's
+// last update, which for a request sitting in in_progress_cancel is no
+// earlier than when it entered that state, so the warning never fires early.
+func (e *Engine) warnOnCancelInFlightTooLong(database string, dr *ps.DeployRequest) {
+	if dr.UpdatedAt.IsZero() {
+		e.logger.Debug("deploy request reports no update time; cannot tell how long its cancel has been in flight",
+			"database", database,
+			"deploy_request", dr.Number,
+			"deployment_state", dr.DeploymentState)
+		return
+	}
+	elapsed := e.clock().Sub(dr.UpdatedAt)
+	if elapsed <= cancelInFlightWarnAfter {
+		e.logger.Debug("deploy request cancel in flight",
+			"database", database,
+			"deploy_request", dr.Number,
+			"deployment_state", dr.DeploymentState,
+			"elapsed", elapsed.Round(time.Second).String())
+		return
+	}
+	e.logger.Warn(cancelInFlightTooLongLog,
+		"database", database,
+		"deploy_request", dr.Number,
+		"deployment_state", dr.DeploymentState,
+		"elapsed", elapsed.Round(time.Second).String(),
+		"warn_after", cancelInFlightWarnAfter.String())
+}
+
+// baselineContextRetention bounds how much terminal history
+// captureExistingContexts keeps in the pre-deploy context baseline. SHOW
+// VITESS_MIGRATIONS retains every schema change ever run against the target,
+// and the baseline is persisted into durable engine resume state on every
+// apply, so an unbounded capture grows linearly with the target's lifetime.
+const baselineContextRetention = 24 * time.Hour
+
 // captureExistingContexts returns the set of migration_context values currently
 // in SHOW VITESS_MIGRATIONS. Used as a baseline before deploying so that new
-// contexts can be identified after deploy.
+// contexts can be identified after deploy. The baseline is bounded: contexts
+// with a non-terminal row are always kept (they are live work that discovery
+// must not attach to), while purely terminal history is kept only when active
+// within baselineContextRetention. A terminal context that ages out and is
+// later resurrected by a Vitess retry keeps its original requested_timestamp,
+// so the requested-at-or-after-deploy check in selectSchemaChangeContext still
+// excludes it.
 func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials) map[string]MigrationContextTimestamps {
 	existing := make(map[string]MigrationContextTimestamps)
 	if creds.DSN == "" {
@@ -219,6 +326,8 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 		return existing
 	}
 
+	cutoff := time.Now().Add(-baselineContextRetention)
+	var skippedRows int
 	for _, ks := range keyspaces {
 		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
 		if err != nil {
@@ -226,14 +335,47 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 			continue
 		}
 		for _, r := range rows {
-			if r.MigrationContext != "" {
-				existing[r.MigrationContext] = migrationRowTimestamps(r)
+			if r.MigrationContext == "" {
+				continue
 			}
+			if !baselineContextRow(r, cutoff) {
+				skippedRows++
+				continue
+			}
+			existing[r.MigrationContext] = migrationRowTimestamps(r)
 		}
 	}
 
-	e.logger.Info("captured schema change context baseline", "count", len(existing))
+	e.logger.Info("captured schema change context baseline",
+		"count", len(existing), "skipped_old_terminal_rows", skippedRows)
 	return existing
+}
+
+// baselineContextRow reports whether a SHOW VITESS_MIGRATIONS row belongs in
+// the pre-deploy context baseline. Non-terminal rows always do. Terminal rows
+// qualify only when active at or after cutoff; a terminal row with no
+// timestamps at all is kept because its age cannot be proven.
+func baselineContextRow(r vitessMigrationRow, cutoff time.Time) bool {
+	if !state.IsTerminalVitessState(r.Status) {
+		return true
+	}
+	latest := latestMigrationRowTime(r)
+	if latest == nil {
+		return true
+	}
+	return !latest.Before(cutoff)
+}
+
+// latestMigrationRowTime returns the most recent of a row's requested, started,
+// and completed timestamps, or nil when none is set.
+func latestMigrationRowTime(r vitessMigrationRow) *time.Time {
+	var latest *time.Time
+	for _, ts := range []*time.Time{r.RequestedAt, r.StartedAt, r.CompletedAt} {
+		if ts != nil && (latest == nil || ts.After(*latest)) {
+			latest = ts
+		}
+	}
+	return latest
 }
 
 // migrationRowTimestamps snapshots a baseline row's Vitess timestamp fields for
@@ -302,6 +444,13 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 		e.logger.Warn("multiple in-flight schema change contexts; keeping stored identifier to avoid attaching to the wrong change",
 			"database", database, "candidate_count", len(candidates), "candidates", candidates)
 		return ""
+	case len(candidates) == 1:
+		// The sole in-flight context was requested before this deploy was
+		// created, so it is another change's work — typically an old change
+		// resurrected by a Vitess retry. Keep the stored identifier.
+		e.logger.Warn("sole in-flight schema change context predates this deploy; keeping stored identifier to avoid attaching to a resurrected change",
+			"database", database, "candidate", candidates[0], "deploy_created_at", deployCreatedAt)
+		return ""
 	default:
 		e.logger.Warn("schema change context not discovered yet", "database", database)
 		return ""
@@ -315,8 +464,9 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 // completed history that SHOW VITESS_MIGRATIONS retains is terminal and must be
 // ignored so an empty-baseline rediscovery never attaches to an old, unrelated
 // change. It returns the single context when exactly one candidate remains and
-// the full candidate list so the caller can distinguish the zero and multiple
-// cases (both ambiguous, both must keep the stored identifier).
+// its requested_timestamp is at or after the deploy, plus the full candidate
+// list so the caller can distinguish the zero and multiple cases (both
+// ambiguous, both must keep the stored identifier).
 func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) (string, []string) {
 	// A context is a candidate if it is absent from the pre-deploy baseline and
 	// any of its shards is still non-terminal: the change is in flight even when
@@ -345,8 +495,18 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 	}
 	sort.Strings(candidates)
 
-	if len(candidates) <= 1 {
-		if len(candidates) == 1 {
+	if len(candidates) == 0 {
+		return "", candidates
+	}
+	if len(candidates) == 1 {
+		// Even a sole candidate must prove it is this deploy's work: a
+		// pre-deploy change resurrected by a Vitess retry re-enters SHOW
+		// VITESS_MIGRATIONS as non-terminal, and the bounded baseline no longer
+		// remembers old terminal history. Retries preserve the original
+		// requested_timestamp, so the requested-at-or-after-deploy check
+		// excludes such a change; when the check fails, stay ambiguous so the
+		// caller keeps the stored identifier.
+		if requestedAtOrAfterDeploy(earliestRequested[candidates[0]], deployCreatedAt) {
 			return candidates[0], candidates
 		}
 		return "", candidates
@@ -362,7 +522,7 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 	var bestRequested *time.Time
 	for _, c := range candidates {
 		requested := earliestRequested[c]
-		if requested == nil || requested.Before(deployCreatedAt) {
+		if !requestedAtOrAfterDeploy(requested, deployCreatedAt) {
 			continue
 		}
 		if best == "" || requested.Before(*bestRequested) || (requested.Equal(*bestRequested) && c < best) {
@@ -374,6 +534,21 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 		return best, candidates
 	}
 	return "", candidates
+}
+
+// requestedAtOrAfterDeploy reports whether a candidate context's earliest
+// requested_timestamp shows it was created by this apply's deploy. Vitess
+// stamps requested_timestamp when a change is submitted and preserves it
+// across retries, so a resurrected pre-deploy change always fails this check
+// regardless of baseline membership. A nil requested timestamp proves
+// nothing, and a zero deploy creation time gives the comparison no anchor —
+// both fail closed so discovery keeps the stored identifier rather than
+// attaching on evidence it does not have.
+func requestedAtOrAfterDeploy(requested *time.Time, deployCreatedAt time.Time) bool {
+	if deployCreatedAt.IsZero() {
+		return false
+	}
+	return requested != nil && !requested.Before(deployCreatedAt)
 }
 
 // earlierTime reports whether candidate is strictly earlier than current,
@@ -448,11 +623,18 @@ type vitessMigrationRow struct {
 	RequestedAt      *time.Time
 	StartedAt        *time.Time
 	CompletedAt      *time.Time
+	// Message is Vitess's own account of what happened to this shard. On a
+	// failed shard it carries the reason the schema change stopped, which is
+	// the only place that reason exists: the deploy request reports a state
+	// and no cause.
+	Message string
 }
 
 // queryVitessMigrations queries SHOW VITESS_MIGRATIONS across all keyspaces via vtgate
-// and aggregates per-shard results into per-table TableProgress entries.
-func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int) {
+// and aggregates per-shard results into per-table TableProgress entries. The
+// last two returns are the shard whose failure the apply should report and
+// whether there was one.
+func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int, vitessMigrationRow, bool) {
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
 		Organization: credOrg(creds),
@@ -461,7 +643,7 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 	})
 	if err != nil {
 		e.logger.Warn("queryVitessMigrations: failed to list keyspaces", "error", err)
-		return nil, 0
+		return nil, 0, vitessMigrationRow{}, false
 	}
 
 	var allRows []vitessMigrationRow
@@ -475,14 +657,51 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 	}
 
 	if len(allRows) == 0 {
-		return nil, 0
+		return nil, 0, vitessMigrationRow{}, false
 	}
 
-	return aggregateShardProgress(allRows)
+	for _, r := range allRows {
+		if !state.IsKnownVitessState(r.Status) {
+			e.logger.Warn("unknown vitess schema change status; showing the table as running until vitess reports a known status",
+				"database", database, "keyspace", r.Keyspace, "shard", r.Shard, "table", r.Table, "vitess_status", r.Status)
+		}
+	}
+
+	tables, overallProgress := aggregateShardProgress(allRows)
+	failed, shardFailed := failedShard(allRows)
+	return tables, overallProgress, failed, shardFailed
+}
+
+// failedShard returns the shard whose failure the apply should report, or false
+// when no shard failed or Vitess recorded nothing about the one that did.
+// Shards that fail together almost always fail for the same reason, so the
+// first failure in a stable ordering is representative, and ordering by
+// keyspace, table and shard keeps successive polls reporting the same one
+// rather than alternating between them.
+func failedShard(rows []vitessMigrationRow) (vitessMigrationRow, bool) {
+	failed := make([]vitessMigrationRow, 0, len(rows))
+	for _, r := range rows {
+		if state.IsState(r.Status, state.Vitess.Failed) && strings.TrimSpace(r.Message) != "" {
+			failed = append(failed, r)
+		}
+	}
+	if len(failed) == 0 {
+		return vitessMigrationRow{}, false
+	}
+	sort.Slice(failed, func(i, j int) bool {
+		if failed[i].Keyspace != failed[j].Keyspace {
+			return failed[i].Keyspace < failed[j].Keyspace
+		}
+		if failed[i].Table != failed[j].Table {
+			return failed[i].Table < failed[j].Table
+		}
+		return shardLess(failed[i].Shard, failed[j].Shard)
+	})
+	return failed[0], true
 }
 
 // showVitessMigrationsForKeyspace connects to vtgate and runs
-// SHOW VITESS_MIGRATIONS LIKE '<context>' for a single keyspace.
+// SHOW VITESS_MIGRATIONS FROM `<keyspace>` LIKE '<context>' for a single keyspace.
 // If migrationContext is empty, returns all migrations.
 func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keyspace, migrationContext string) ([]vitessMigrationRow, error) {
 	if migrationContext != "" {
@@ -496,23 +715,10 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		return nil, fmt.Errorf("get vtgate connection for keyspace %s: %w", keyspace, err)
 	}
 
-	conn, err := db.Conn(ctx)
+	query := showVitessMigrationsQuery(keyspace, migrationContext)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("get connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	if _, err := conn.ExecContext(ctx, "USE `"+keyspace+"`"); err != nil {
-		return nil, fmt.Errorf("use keyspace %s: %w", keyspace, err)
-	}
-
-	query := "SHOW VITESS_MIGRATIONS"
-	if migrationContext != "" {
-		query += " LIKE '" + migrationContext + "'"
-	}
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("show vitess_migrations: %w", err)
+		return nil, fmt.Errorf("show vitess_migrations for keyspace %s: %w", keyspace, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -529,8 +735,7 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			colPtrs[i] = &colValues[i]
 		}
 		if err := rows.Scan(colPtrs...); err != nil {
-			e.logger.Debug("scan vitess_migrations row", "keyspace", keyspace, "error", err)
-			continue
+			return nil, fmt.Errorf("scan vitess_migrations row for keyspace %s: %w", keyspace, err)
 		}
 		colMap := make(map[string]string)
 		for i, col := range columns {
@@ -549,6 +754,7 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			ReadyToComplete:  colMap["ready_to_complete"] == "1",
 			DDLAction:        colMap["ddl_action"],
 			IsImmediate:      colMap["is_immediate_operation"] == "1",
+			Message:          colMap["message"],
 		}
 		if v, err := parseProgressPercent(colMap["progress"]); err != nil {
 			e.logger.Debug("parse vitess_migrations field", "field", "progress", "value", colMap["progress"], "error", err)
@@ -587,6 +793,20 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+// showVitessMigrationsQuery builds the SHOW VITESS_MIGRATIONS statement for one
+// keyspace. The keyspace is named in the statement rather than selected with
+// USE, so the query leaves no session state on the pooled vtgate connection:
+// the pool is shared with other readers, and a connection handed back still
+// switched to this keyspace would silently point the next reader at the wrong
+// keyspace. migrationContext must already have passed validateMigrationContext.
+func showVitessMigrationsQuery(keyspace, migrationContext string) string {
+	query := "SHOW VITESS_MIGRATIONS FROM `" + strings.ReplaceAll(keyspace, "`", "``") + "`"
+	if migrationContext != "" {
+		query += " LIKE '" + migrationContext + "'"
+	}
+	return query
 }
 
 // validateMigrationContext rejects migration context strings containing unsafe characters.
@@ -770,11 +990,13 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 				latestCompletedAt = sh.completedAt
 			}
 
-			// Resolve effective shard state: running + ready_to_complete = ready_to_complete
-			shardState := sh.status
-			if sh.status == state.Vitess.Running && sh.readyToComplete {
-				shardState = state.Vitess.ReadyToComplete
-			}
+			// Resolve effective shard state from Vitess's authoritative readiness signal.
+			// The flag can be stale on a non-terminal shard: a Vitess retry re-queues a
+			// failed schema change without clearing ready_to_complete, so a retried shard
+			// briefly renders as ready for cutover until Vitess recomputes the flag once
+			// the copy restarts. This affects display only — apply state comes from the
+			// deploy request.
+			shardState := effectiveShardState(sh.status, sh.readyToComplete)
 
 			shardPct := min(sh.progress, 100)
 			shardCopied := sh.rowsCopied
@@ -853,6 +1075,18 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 	return tables, overallProgress
 }
 
+// effectiveShardState resolves the state a shard is shown in. A status
+// SchemaBot recognizes is resolved with the ready_to_complete flag. A status it
+// does not recognize is kept as Vitess reported it, even with the flag set:
+// the flag says the copy has finished, and nothing says what the unrecognized
+// status means for the cutover.
+func effectiveShardState(status string, readyToComplete bool) string {
+	if !state.IsKnownVitessState(status) {
+		return state.EffectiveVitessState(status, false)
+	}
+	return state.EffectiveVitessState(status, readyToComplete)
+}
+
 // resolveTableState merges a shard's state into the current table state.
 // A table has one Vitess migration per shard, each in a different state.
 // This picks the "worst" state so the table reflects the least-progressed shard:
@@ -862,6 +1096,9 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 //	queued            — at least one shard not started, none running or failed
 //	ready_to_complete — all shards done copying, waiting for cutover
 //	complete          — all shards finished (initial value)
+//
+// A status Vitess reports that SchemaBot does not recognize counts as running:
+// nothing says that shard is done, so the table must not read as complete.
 func resolveTableState(tableState, shardState string) string {
 	switch shardState {
 	case state.Vitess.Failed, state.Vitess.Cancelled:
@@ -877,6 +1114,12 @@ func resolveTableState(tableState, shardState string) string {
 	case state.Vitess.ReadyToComplete:
 		if tableState == state.Vitess.Complete {
 			return state.Vitess.ReadyToComplete
+		}
+	case state.Vitess.Complete:
+		// A finished shard leaves the table state as the other shards set it.
+	default:
+		if tableState != state.Vitess.Failed {
+			return state.Vitess.Running
 		}
 	}
 	return tableState

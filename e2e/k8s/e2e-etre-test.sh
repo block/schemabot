@@ -11,6 +11,11 @@
 #
 # Usage:
 #   e2e/k8s/e2e-etre-test.sh
+#
+# Environment:
+#   E2E_TEST_TIMEOUT   go test's own timeout (default 10m); CI sets it on the
+#                      job whose budget must exceed it plus setup, so the two
+#                      numbers are read and changed together
 
 set -euo pipefail
 
@@ -26,8 +31,11 @@ done
 
 if ! minikube status > /dev/null 2>&1; then
     echo "Starting minikube..."
-    minikube start --driver=docker --cpus=4 --memory=4096
+    minikube start --driver=docker --container-runtime=docker --cpus=4 --memory=4096
 fi
+
+# shellcheck source=e2e/k8s/pin-minikube-kubeconfig.sh
+source "$REPO_ROOT/e2e/k8s/pin-minikube-kubeconfig.sh"
 
 # --- Build images into minikube's docker daemon ---
 
@@ -41,6 +49,7 @@ docker build -t etre:test "$REPO_ROOT/e2e/k8s/etre/"
 
 PIDS=()
 cleanup() {
+    rm -f "$PINNED_KUBECONFIG"
     echo "Cleaning up port-forwards..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
@@ -137,7 +146,7 @@ TEST_EXIT_CODE=0
 E2E_SCHEMABOT_URL=http://localhost:8080 \
 E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:3307)/schemabot?parseTime=true&multiStatements=true" \
 E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:3308)/testapp?parseTime=true&multiStatements=true" \
-go test -count=1 -v -tags=e2e -timeout=10m -run TestK8sEtre ./e2e/k8s/... || TEST_EXIT_CODE=$?
+go test -count=1 -v -tags=e2e -timeout="${E2E_TEST_TIMEOUT:-10m}" -run TestK8sEtre ./e2e/k8s/... || TEST_EXIT_CODE=$?
 
 teardown_namespace
 exit "$TEST_EXIT_CODE"

@@ -5,7 +5,10 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -13,11 +16,13 @@ import (
 // Shared preview error messages — used by both PR comment and CLI preview functions
 // to keep failure scenarios consistent across output formats.
 const (
-	PreviewErrorFirstFailed  = "Error 1061: Duplicate key name 'idx_user_id'"
-	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
-	previewRepository        = "block/schemabot"
-	previewHeadSHA           = "abcdef1234567890abcdef1234567890abcdef12"
-	previewRequestedBy       = "jackjackbits"
+	PreviewErrorFirstFailed     = "Error 1061: Duplicate key name 'idx_user_id'"
+	PreviewErrorMiddleFailed    = "lock wait timeout exceeded; try restarting transaction"
+	PreviewErrorPreflightFailed = "preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end"
+	previewRepository           = "block/schemabot"
+	previewHeadSHA              = "abcdef1234567890abcdef1234567890abcdef12"
+	previewStaleSHA             = "0123456789abcdef0123456789abcdef01234567"
+	previewRequestedBy          = "jackjackbits"
 )
 
 func previewSupportChannel() SupportChannelData {
@@ -29,14 +34,20 @@ func previewSupportChannel() SupportChannelData {
 
 // PreviewCommentPlan renders a sample plan comment with DDL changes and lint violations.
 func PreviewCommentPlan() string {
-	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+	return RenderPlanComment(previewPlanData())
+}
+
+// previewPlanData is the sample plan the plan previews render from.
+func previewPlanData() PlanCommentData {
+	return PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -45,11 +56,740 @@ func PreviewCommentPlan() string {
 					"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 					"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 				},
+				TableSizes: []TableSizeData{
+					{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+				},
 			},
 		},
-		LintViolations: []LintViolationData{
-			{Message: "New column uses floating-point data type", Table: "orders", LinterName: "has_float"},
-			{Message: "Column added without DEFAULT value", Table: "users", LinterName: "no_default"},
+		LintViolations: sampleLintWarnings(),
+	}
+}
+
+// PreviewCommentPlanIgnoredNamespaces renders a sample plan from a schema root
+// whose config withholds a namespace via ignore_namespaces, showing the
+// exclusion disclosure alongside the remaining namespace's changes.
+func PreviewCommentPlanIgnoredNamespaces() string {
+	data := previewPlanData()
+	data.LintViolations = nil
+	data.IgnoredNamespaces = []string{"local_fixtures"}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanWhoCanApply renders a sample auto-plan on a deployment
+// that turns on PR command authorization, for a PR whose author may not run
+// the apply, so it lists who can under the apply command.
+func PreviewCommentPlanWhoCanApply() string {
+	data := previewPlanData()
+	data.RequestedBy = ""
+	data.LintViolations = nil
+	data.ApplyAuthorization = &ApplyAuthorizationData{
+		OperatorPrincipals: []string{"acme/testapp-operators"},
+		OtherPrincipals:    []string{"acme/db-admins", "jdoe"},
+	}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanUnmanagedSchema renders the plan comment a staging-scoped
+// deployment posts for a PR that also changes a schema directory it does not
+// manage. It posts no separate notice, since a deployment serving another
+// environment may manage that directory, so the plan closes with a note
+// naming it.
+func PreviewCommentPlanUnmanagedSchema() string {
+	plan := previewPlanData()
+	plan.LintViolations = nil
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     plan.Database,
+		SchemaName:   plan.SchemaName,
+		HeadSHA:      plan.HeadSHA,
+		Repository:   plan.Repository,
+		DatabaseType: plan.DatabaseType,
+		IsMySQL:      plan.IsMySQL,
+		RequestedBy:  plan.RequestedBy,
+		Environments: []string{"staging"},
+		Plans:        map[string]*PlanCommentData{"staging": &plan},
+		UnmanagedSchema: []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		},
+		UnmanagedEnvironments: []string{"staging"},
+	})
+}
+
+// PreviewCommentPlanExemptTables renders a plan with archive-named live tables.
+func PreviewCommentPlanExemptTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "app", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		DatabaseType: "postgres",
+		Changes:      []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"CREATE TABLE app.users (id bigint PRIMARY KEY);"}}},
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "app",
+			Tables:    []string{"events_archive_2025_01", "orders_archive_2024"},
+			Reason:    "archive naming",
+		}},
+	})
+}
+
+// PreviewCommentPlanIgnoreTables renders the plan a repository gets once its
+// config withholds a live table nothing declares. The plan is clean, which is
+// where the disclosures carry the most: they are the only evidence on the
+// comment that the table was seen and deliberately left alone rather than
+// missed. The disclosure names the config key the decision is recorded in, so
+// a reviewer can tell a table the config withheld from one an engine exempted
+// for reasons of its own.
+func PreviewCommentPlanIgnoreTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "testapp",
+			Tables:    []string{"flyway_schema_history"},
+			Reason:    "ignore_tables",
+		}},
+	})
+}
+
+// previewBytes returns a pointer to a sample byte estimate.
+//
+//go:fix inline
+func previewBytes(n int64) *int64 {
+	return new(n)
+}
+
+// PreviewCommentPlanColumnOnlyAlter renders a sample plan whose only alter
+// adds a plain column — a metadata-only change whose cost doesn't scale with
+// the table — so the comment carries no table-size section.
+func PreviewCommentPlanColumnOnlyAlter() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;",
+				},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanPartitionedTables renders a plan for partitioned tables:
+// a new table partitioned by month, a REORGANIZE PARTITION that splits the
+// catch-all partition, and an ALTER that adds a column and repartitions. Each
+// partition definition shows on its own line.
+func PreviewCommentPlanPartitionedTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"CREATE TABLE `ledger_entries` (`id` bigint NOT NULL AUTO_INCREMENT, `settlement_date` date NOT NULL, `amount_cents` bigint NOT NULL, " +
+					"PRIMARY KEY (`id`,`settlement_date`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci " +
+					"PARTITION BY RANGE COLUMNS(`settlement_date`) (" +
+					"PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB," +
+					"PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB," +
+					"PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB," +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB);",
+				"ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (" +
+					"PARTITION `p202611` VALUES LESS THAN ('2026-12-01'), " +
+					"PARTITION `p202612` VALUES LESS THAN ('2027-01-01'), " +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE));",
+				"ALTER TABLE `payouts` ADD COLUMN `note` varchar(64) NULL DEFAULT NULL " +
+					"PARTITION BY RANGE COLUMNS (`settlement_date`) (" +
+					"PARTITION `p2025` VALUES LESS THAN ('2026-01-01')," +
+					"PARTITION `p2026` VALUES LESS THAN ('2027-01-01')," +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE));",
+			},
+		}},
+	})
+}
+
+// PreviewCommentPlanCollationChanges renders a plan that moves a table onto a
+// new default collation, which re-collates the columns the ALTER redeclares,
+// and makes one unique column case-sensitive. The collation section under the
+// sizes says what each move does to how values compare.
+func PreviewCommentPlanCollationChanges() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, MODIFY COLUMN `title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL, DEFAULT CHARSET=utf8mb4, COLLATE=utf8mb4_0900_ai_ci;",
+				"ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL;",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+				{Table: "customers", EstimatedBytes: previewBytes(2_900_000_000)},
+			},
+			CollationChanges: []CollationChangeData{
+				{
+					Table: "products", Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+					CanMergeValues: true, UniqueIndexes: []string{"uk_sku"},
+				},
+				{
+					Table: "products", Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+					CanMergeValues: true,
+				},
+				{
+					Table: "customers", Column: "handle", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
+					Case: engine.ComparisonBecomesSensitive, TrailingSpaces: engine.ComparisonUnchanged,
+				},
+			},
+		}},
+	})
+}
+
+// previewManyTableSizes is the table set PreviewCommentPlanManyTables indexes:
+// a spread of sizes from kilobytes to hundreds of gigabytes, in plan
+// (alphabetical) order, with two tables whose size probe returned nothing.
+var previewManyTableSizes = []struct {
+	table string
+	bytes int64
+}{
+	{"accounts", 610_000_000},
+	{"addresses", 1_450_000_000},
+	{"api_keys", 6_100_000},
+	{"audit_events", 186_000_000_000},
+	{"carts", 3_200_000_000},
+	{"categories", 1_600_000},
+	{"coupons", 41_000_000},
+	{"customers", 2_900_000_000},
+	{"disputes", 150_000_000},
+	{"feature_flags", 180_000},
+	{"fulfillments", 11_800_000_000},
+	{"inventory", 5_300_000_000},
+	{"invoices", 17_400_000_000},
+	{"ledger_entries", 121_000_000_000},
+	{"line_items", 58_000_000_000},
+	{"locations", 4_200_000},
+	{"notifications", 44_000_000_000},
+	{"order_events", 0},
+	{"orders", 26_500_000_000},
+	{"payment_methods", 2_600_000_000},
+	{"payments", 23_100_000_000},
+	{"payouts", 820_000_000},
+	{"prices", 210_000_000},
+	{"products", 1_130_000_000},
+	{"refunds", 1_300_000_000},
+	{"reviews", 6_900_000_000},
+	{"sessions", 0},
+	{"settlements", 2_100_000_000},
+	{"shipments", 10_900_000_000},
+	{"subscriptions", 470_000_000},
+	{"tax_rates", 2_300_000},
+	{"transfers", 7_700_000_000},
+	{"users", 3_600_000_000},
+	{"webhooks", 540_000_000},
+}
+
+// PreviewCommentPlanManyTables renders a plan that adds a tenant index to every
+// table in the schema, so the size section carries more tables than it lists
+// inline and collapses, listing the tables largest first.
+func PreviewCommentPlanManyTables() string {
+	statements := make([]string, 0, len(previewManyTableSizes))
+	sizes := make([]TableSizeData, 0, len(previewManyTableSizes))
+	for _, t := range previewManyTableSizes {
+		statements = append(statements, "ALTER TABLE `"+t.table+"` ADD INDEX `idx_tenant_id` (`tenant_id`);")
+		size := TableSizeData{Table: t.table}
+		if t.bytes > 0 {
+			size.EstimatedBytes = previewBytes(t.bytes)
+		}
+		sizes = append(sizes, size)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: statements,
+			TableSizes: sizes,
+		}},
+	})
+}
+
+// PreviewCommentPlanBlocked renders a sample plan containing a statement the
+// engine deterministically refuses (execution-mode verdict "blocked").
+func PreviewCommentPlanBlocked() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported"},
+			{Table: "orders", Reason: "adding foreign key constraints is not supported"},
+		},
+	})
+}
+
+// PreviewCommentPlanBlockedPostgres renders a sample PostgreSQL plan whose
+// refused table carries two independent causes — a planner refusal and the
+// native-safe size ceiling — so the plan comment lists both at plan time,
+// before any apply is attempted.
+func PreviewCommentPlanBlockedPostgres() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE orders ADD COLUMN notes text",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
+				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
+			})},
+		},
+	})
+}
+
+// PreviewCommentPlanUnsafe renders a sample plan whose changes the unsafe gate
+// holds until the apply carries --allow-unsafe. The footer states that
+// requirement under the plain command, which never carries the flag itself.
+func PreviewCommentPlanUnsafe() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP COLUMN `legacy_ref`;",
+					"ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
+		},
+	})
+}
+
+// PreviewCommentPlanManyUnsafeChanges renders a sample plan whose unsafe list
+// is long and mixes destructive drops of a table, a column and an index with
+// findings that destroy nothing: the drops lead the list, the rest fold past
+// the first findings, and the apply instruction numbers each drop's safety
+// step ahead of the consent.
+func PreviewCommentPlanManyUnsafeChanges() string {
+	timestamp := func(column string) string {
+		return "Column `" + column + "` uses `TIMESTAMP` which overflows on 2038-01-19."
+	}
+	var statements []string
+	var unsafe []UnsafeChangeData
+	for _, table := range []string{"loans", "refunds", "ledger"} {
+		statements = append(statements, "CREATE TABLE `"+table+"` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;")
+		unsafe = append(unsafe,
+			UnsafeChangeData{Table: table, Reason: timestamp("created_at"), ChangeType: "create"},
+			UnsafeChangeData{Table: table, Reason: timestamp("updated_at"), ChangeType: "create"},
+		)
+	}
+	statements = append(statements,
+		"ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;",
+		"ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;",
+		"DROP TABLE `refund_backfill`;",
+	)
+	unsafe = append(unsafe,
+		UnsafeChangeData{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data", ChangeType: "alter", DDL: "ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`;"},
+		UnsafeChangeData{Table: "payouts", Reason: "DROP INDEX removes the index", ChangeType: "alter", DDL: "ALTER TABLE `payouts` DROP INDEX `idx_payouts_status`;"},
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`;"},
+	)
+	return RenderPlanComment(PlanCommentData{
+		Database:         "testapp",
+		SchemaName:       "testapp",
+		Environment:      "staging",
+		HeadSHA:          previewHeadSHA,
+		Repository:       previewRepository,
+		RequestedBy:      previewRequestedBy,
+		IsMySQL:          true,
+		DatabaseType:     "mysql",
+		Changes:          []KeyspaceChangeData{{Keyspace: "testapp", Statements: statements}},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    unsafe,
+	})
+}
+
+// PreviewCommentPlanAttributedChange renders a sample plan whose destructive
+// changes target tables another open pull request applied but has not merged
+// yet, so each entry is annotated with its owner. Attribution is table-grained,
+// so a dropped column is named by its table exactly as a dropped table is.
+func PreviewCommentPlanAttributedChange() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP COLUMN `notes`;",
+					"DROP TABLE `reconcile_state`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data"},
+			{Table: "reconcile_state", Reason: "DROP TABLE removes all data"},
+		},
+		AttributedChanges: []AttributedChangeData{
+			{Table: "orders", Repository: previewRepository, PullRequest: 4820},
+			{Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821},
+		},
+	})
+}
+
+// PreviewCommentPlanDirect renders a sample locked apply comment for a plan
+// whose refused statement the direct execution policy routes to native MySQL
+// DDL (execution-mode verdict "direct"), showing the disclosure of how it runs.
+// The policy approves the change, so the apply runs without a confirmation.
+func PreviewCommentPlanDirect() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT",
+				},
+			},
+		},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "the table has ~1,240 rows"},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyDiscarded renders a sample plan comment for a plan
+// whose apply will throw away an unfinished copy already on the target, showing
+// what the operator would lose by applying while that decision is still theirs.
+func PreviewCommentPlanCopyDiscarded() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedPaused renders the discard on the locked
+// comment of an automatic apply that stopped for confirmation because of it.
+// The copy is still on the target and confirming is what destroys it, so the
+// section warns and names the remedy.
+func PreviewCommentPlanCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+		PendingManualConfirmation: true,
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedStopped renders the same discard on the
+// comment that stops an apply the operator confirmed themselves, when a copy
+// appeared after the comment they confirmed was posted. Nothing automatic was
+// in flight, so the notice names their own apply as what stopped.
+func PreviewCommentPlanCopyDiscardedStopped() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+		PendingManualConfirmation: true,
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedApplying renders the same discard on a
+// comment that announces an apply already under way rather than asking for
+// confirmation. Nothing is being asked of the reader and the copy is already
+// gone, so the section is a record of what the apply threw away rather than a
+// warning with a remedy.
+//
+// The copy-discard gate stops every automatic apply that would discard, so it
+// is the paused rendering above that an operator meets in practice. This one is
+// the shape the section takes on any locked comment carrying no confirmation
+// request, and it is here so that shape stays correct: a comment posted after
+// the copy is destroyed must not offer the remedy for saving it.
+func PreviewCommentPlanCopyDiscardedApplying() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyAdopted renders a sample plan comment for a plan whose
+// apply will resume an unfinished copy already on the target rather than
+// starting it over.
+func PreviewCommentPlanCopyAdopted() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+					"ALTER TABLE `products` ADD COLUMN `sku` varchar(64);",
+				},
+			},
+		},
+		AdoptedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders", "products"},
+				Age:       "3h 12m",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyRunning renders a sample plan comment for a plan whose
+// apply will join a copy still being made on the target. Nothing stopped, so
+// there is nothing to pick back up: the apply resolves the operator onto work
+// already in flight and keeps every row of it.
+func PreviewCommentPlanCopyRunning() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+					"ALTER TABLE `products` ADD COLUMN `sku` varchar(64);",
+				},
+			},
+		},
+		RunningCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders", "products"},
+				Age:       "4s",
+				Running:   true,
+			},
+		},
+	})
+}
+
+// PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
+// plan containing statements the engine refuses. The table carries two
+// independent causes — a planner refusal and the native-safe size ceiling —
+// which is a PostgreSQL shape: that engine's size gate adds its cause to a
+// step the planner already refused, so both reach the operator at once.
+func PreviewCommentApplyBlockedRejected() string {
+	return RenderBlockedChangesApplyRejected(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE users ALTER COLUMN email TYPE bigint",
+					"ALTER TABLE orders ADD COLUMN notes text",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
+				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
+				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
+			})},
 		},
 	})
 }
@@ -57,29 +797,469 @@ func PreviewCommentPlan() string {
 // PreviewCommentPlanTenant renders a tenant-targeted plan comment.
 func PreviewCommentPlanTenant() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		Tenant:      "alpha",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
-		Changes:     samplePlanChanges(),
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		Tenant:       "alpha",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
 	})
 }
 
 // PreviewCommentPlanNoChanges renders a sample plan comment with no changes detected.
 func PreviewCommentPlanNoChanges() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
-		Changes:     nil,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
+	})
+}
+
+// PreviewCommentPlanBaseSchemaChanged renders a plan of a branch that is
+// missing a newer change its base branch made to the environment's schema.
+func PreviewCommentPlanBaseSchemaChanged() string {
+	data := previewPlanData()
+	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", ChangedPaths: []string{"schema/staging"}}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanBaseSchemaUnverified renders a plan whose base branch
+// could not be checked for newer changes to the environment's schema.
+func PreviewCommentPlanBaseSchemaUnverified() string {
+	data := previewPlanData()
+	data.BaseSchema = &BaseSchemaData{BaseBranch: "main", Unverified: true}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
+// rollup confirmed the primary plan on every deployment (uniform clean line).
+func PreviewCommentPlanDriftClean() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match"},
+				{Deployment: "us", Class: "match"},
+			},
+			TableSizes: previewDriftTargetSizes(),
+		},
+	})
+}
+
+// PreviewCommentPlanDriftCleanBlocked renders a plan comment whose review-time
+// drift rollup confirmed the primary plan on every deployment while one
+// deployment carries a change its target will refuse at apply: the uniform
+// clean line followed by a per-deployment breakdown naming that deployment.
+func PreviewCommentPlanDriftCleanBlocked() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match", Blocked: 1},
+				{Deployment: "us", Class: "match"},
+			},
+			TableSizes: previewDriftTargetSizes(),
+		},
+	})
+}
+
+// previewDriftTargetSizes is each deployment's size for the table the drift
+// previews' plan indexes. A clean rollup carries every target's sizes, since
+// every target was planned.
+func previewDriftTargetSizes() []TargetTableSize {
+	return []TargetTableSize{
+		previewTargetSize("eu", "products", 1_130_000_000),
+		previewTargetSize("au", "products", 412_000_000),
+		previewTargetSize("us", "products", 8_700_000_000),
+	}
+}
+
+// PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift
+// rollup found deployments that no longer match the primary plan: a
+// per-deployment breakdown naming the matching, diverged, and errored targets.
+func PreviewCommentPlanDriftDetected() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    false,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs this plan"},
+				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
+			},
+		},
+	})
+}
+
+// previewRolloutMembers is the three independent targets the rollout previews
+// below are rendered for, in rollout order with the primary target first.
+func previewRolloutMembers() []DeploymentDriftEntry {
+	return []DeploymentDriftEntry{
+		{Deployment: "us", Target: "testapp_1", Primary: true, Class: "planned"},
+		{Deployment: "us", Target: "testapp_2", Class: "planned"},
+		{Deployment: "us", Target: "testapp_3", Class: "planned"},
+	}
+}
+
+// PreviewCommentPlanRolloutConverging renders a plan comment for a rollout of
+// independent targets partway through converging: the primary target and one
+// other still need the change, and the third already holds it. The plan renders
+// under the two targets that run it, and the third is named as already there.
+func PreviewCommentPlanRolloutConverging() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"us/testapp_1", "us/testapp_2"}, Primary: true, Changes: samplePlanChanges()},
+				{Members: []string{"us/testapp_3"}},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
+// whose primary target already holds the desired schema while other targets do
+// not. The primary target has no plan to show, so the comment renders the plan
+// of the targets still missing the change and names the primary target as
+// already there.
+func PreviewCommentPlanRolloutConvergedPrimary() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"us/testapp_1"}, Primary: true},
+				{Members: []string{"us/testapp_2", "us/testapp_3"}, Changes: samplePlanChanges()},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutCopyDiscardedPaused renders the locked comment of
+// an automatic apply on a rollout of independent targets that stopped for
+// confirmation because applying throws away an unfinished copy on a target
+// other than the primary. The copy is named under the plan of the target it
+// is on, and confirming runs every target's plan, that one included.
+func PreviewCommentPlanRolloutCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"us/testapp_1", "us/testapp_2", "us/testapp_3"}, Primary: true, Changes: samplePlanChanges()},
+			},
+			DiscardedCopies: []TargetExistingCopy{{
+				Target: "us/testapp_3",
+				Copy: ExistingCopyData{
+					Namespace: "testapp",
+					Tables:    []string{"products"},
+					Reason:    "statement_differs",
+					Age:       "3h 12m",
+					Statement: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
+				},
+			}},
+		},
+		PendingManualConfirmation: true,
+	})
+}
+
+// PreviewCommentPlanRolloutWide renders a plan comment for a 32-target rollout
+// where 4 targets already hold the tables and 28 new targets are about to
+// create them. The 28 targets' names sit in a collapsed grid. Lint names the
+// targets that raised a finding once above the findings they share, names no
+// targets for the finding every target raised, and keeps the names of a
+// finding's targets on its own line when it is alone in its set.
+func PreviewCommentPlanRolloutWide() string {
+	return previewPlanRolloutWide(32)
+}
+
+// PreviewCommentPlanRolloutWider renders the same rollout across 128 targets,
+// where the 124 new targets' names fill a longer collapsed grid and are still
+// named once in the lint section.
+func PreviewCommentPlanRolloutWider() string {
+	return previewPlanRolloutWide(128)
+}
+
+// previewPlanRolloutWide renders a rollout of total targets where the first 4
+// already hold the tables and the rest are about to create them.
+func previewPlanRolloutWide(total int) string {
+	var deployments []DeploymentDriftEntry
+	var existing, created []string
+	for n := 1; n <= total; n++ {
+		target := fmt.Sprintf("testapp_%03d", n)
+		deployments = append(deployments, DeploymentDriftEntry{Deployment: "us", Target: target, Primary: n == 1, Class: "planned"})
+		if n <= 4 {
+			existing = append(existing, "us/"+target)
+		} else {
+			created = append(created, "us/"+target)
+		}
+	}
+	const sharedTimestamp = `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`
+	alter := []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `orders` ADD COLUMN `notes` varchar(255) NULL;"},
+	}}
+	create := []KeyspaceChangeData{{
+		Keyspace: "testapp",
+		Statements: []string{
+			"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  `last_login_at` timestamp NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+			"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `notes` varchar(255) NULL,\n  `created_at` timestamp DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_status` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		},
+	}}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      alter,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: deployments,
+			Plans: []DeploymentPlanGroup{
+				{Members: existing, Primary: true, Changes: alter, LintViolations: []LintViolationData{
+					{Message: sharedTimestamp, Table: "orders", LinterName: "has_timestamp"},
+					{Message: `Index "idx_user" on column "user_id" is redundant - covered by index "idx_user_status" on columns ("user_id", "status")`, Table: "orders", LinterName: "redundant_indexes"},
+					{Message: `AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's "int" data type`, Table: "orders", LinterName: "auto_inc_capacity"},
+				}},
+				{Members: created, Changes: create, LintViolations: []LintViolationData{
+					{Message: sharedTimestamp, Table: "orders", LinterName: "has_timestamp"},
+					{Message: `Column "last_login_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "users", LinterName: "has_timestamp"},
+				}},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
+// independent targets that need different work: the primary target and one
+// other need the email column, and the third needs it with an index as well.
+// Each target applies its own plan, so each plan renders under its targets.
+func PreviewCommentPlanRolloutDistinctPlans() string {
+	email := "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;"
+	reviewed := []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{email}}}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"us/testapp_1", "us/testapp_2"}, Primary: true, Changes: reviewed},
+				{Members: []string{"us/testapp_3"}, Changes: []KeyspaceChangeData{{
+					Keyspace:   "testapp",
+					Statements: []string{email, "ALTER TABLE `users` ADD INDEX `idx_email` (`email`);"},
+				}}},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutTwoTargetTableSizes renders a plan comment for a
+// rollout of two independent targets that run the same index builds. Each
+// size line gives the total and names the target with the largest size, since
+// the primary target is not always the one the build takes longest on.
+func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
+	members := previewRolloutMembers()[:2]
+	return previewRolloutTableSizes(members, []TargetTableSize{
+		previewTargetSize("us/testapp_1", "orders", 610_000_000),
+		previewTargetSize("us/testapp_1", "users", 95_000_000),
+		previewTargetSize("us/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("us/testapp_2", "users", 98_000_000),
+	})
+}
+
+// PreviewCommentPlanRolloutTableSizes renders a plan comment for a rollout of
+// three independent targets that run the same index builds. Each size line
+// gives the total, the largest size with its target named, and the smallest,
+// and names a target that reported no estimate, since the total then
+// understates the table.
+func PreviewCommentPlanRolloutTableSizes() string {
+	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
+		previewTargetSize("us/testapp_1", "orders", 610_000_000),
+		previewTargetSize("us/testapp_1", "users", 95_000_000),
+		previewTargetSize("us/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("us/testapp_2", "users", 98_000_000),
+		{Target: "us/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
+		previewTargetSize("us/testapp_3", "users", 104_000_000),
+	})
+}
+
+// PreviewCommentPlanRolloutPrimaryTargetTableSizes renders a plan comment for
+// a rollout whose third target could not be planned. The rollout carries no
+// per-target sizes, so the section shows the primary plan's and names the
+// primary target they were read from.
+func PreviewCommentPlanRolloutPrimaryTargetTableSizes() string {
+	members := previewRolloutMembers()
+	members[2].Class = "errored"
+	members[2].Detail = "diff failed; see server logs"
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`);",
+				"ALTER TABLE `users` ADD INDEX `idx_email` (`email`);",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "orders", EstimatedBytes: previewBytes(610_000_000)},
+				{Table: "users", EstimatedBytes: previewBytes(95_000_000)},
+			},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: false, Independent: true,
+			Deployments: members,
+		},
+	})
+}
+
+func previewTargetSize(target, table string, bytes int64) TargetTableSize {
+	return TargetTableSize{Target: target, Keyspace: "testapp", Size: TableSizeData{Table: table, EstimatedBytes: &bytes}}
+}
+
+// previewRolloutTableSizes renders a rollout whose targets all run the same
+// two index builds, with the given per-target sizes.
+func previewRolloutTableSizes(members []DeploymentDriftEntry, sizes []TargetTableSize) string {
+	var reviewedSizes []TableSizeData
+	for _, ts := range sizes {
+		if ts.Target == members[0].Deployment+"/"+members[0].Target {
+			reviewedSizes = append(reviewedSizes, ts.Size)
+		}
+	}
+	reviewed := []KeyspaceChangeData{{
+		Keyspace: "testapp",
+		Statements: []string{
+			"ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`);",
+			"ALTER TABLE `users` ADD INDEX `idx_email` (`email`);",
+		},
+		TableSizes: reviewedSizes,
+	}}
+	names := make([]string, 0, len(members))
+	for _, m := range members {
+		names = append(names, m.Deployment+"/"+m.Target)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: members,
+			Plans:       []DeploymentPlanGroup{{Members: names, Primary: true, Changes: reviewed}},
+			TableSizes:  sizes,
+		},
+	})
+}
+
+// PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
+// drift rollup could not be computed, so the plan check fails closed.
+func PreviewCommentPlanDriftUnverified() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:        "testapp",
+		SchemaName:      "testapp",
+		Environment:     "production",
+		HeadSHA:         previewHeadSHA,
+		Repository:      previewRepository,
+		RequestedBy:     previewRequestedBy,
+		IsMySQL:         true,
+		DatabaseType:    "mysql",
+		Changes:         samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{Computed: false},
 	})
 }
 
@@ -100,7 +1280,7 @@ func PreviewCommentNoManagedSchemaChanges() string {
 func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
 	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy: previewRequestedBy,
-		Timestamp:   "2026-03-15 14:30:00",
+		Repository:  previewRepository,
 		HeadSHA:     previewHeadSHA,
 	})
 }
@@ -111,7 +1291,7 @@ func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
 func PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants() string {
 	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy:    previewRequestedBy,
-		Timestamp:      "2026-03-15 14:30:00",
+		Repository:     previewRepository,
 		HeadSHA:        previewHeadSHA,
 		GatedOnTenants: true,
 	})
@@ -159,12 +1339,30 @@ func PreviewCommentHelp() string {
 	return RenderHelpComment()
 }
 
+// PreviewCommentAgentHint renders a sample plan comment as a deployment that
+// configures an agent hint sends it.
+func PreviewCommentAgentHint() string {
+	data := previewPlanData()
+	data.AgentHint = "Agents: fetch the SchemaBot command reference by commenting `schemabot help`."
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentSupportChannel renders a sample error comment with a support-channel footer.
 func PreviewCommentSupportChannel() string {
 	return "### Invalid command\n\n" +
 		RenderSupportChannelFooter(RenderInvalidCommand(), previewSupportChannel()) +
 		"\n\n### Apply failure\n\n" +
 		RenderSupportChannelFooter(PreviewCommentApplyFailed(), previewSupportChannel())
+}
+
+// PreviewCommentOversized renders the notice posted in place of a comment
+// larger than GitHub accepts, with the support-channel footer it offers.
+func PreviewCommentOversized() string {
+	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
+		Title:         "## Schema Change Apply — Staging",
+		RenderedBytes: 84801,
+		Environment:   "staging",
+	}), previewSupportChannel())
 }
 
 // PreviewCommentErrorNoConfig renders the "no config found" error comment.
@@ -196,6 +1394,88 @@ func PreviewCommentErrorNotFound() string {
 		Environment:  "staging",
 		DatabaseName: "nonexistent-db",
 		CommandName:  action.Plan,
+	})
+}
+
+// PreviewCommentErrorNotFoundScoped renders the "database not found" error
+// comment for a repository too large to search in full, where only the
+// database's configured schema directories were probed.
+func PreviewCommentErrorNotFoundScoped() string {
+	return RenderDatabaseNotFound(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Plan,
+		SearchedDirs: []string{"services/payments/schema", "services/payments/legacy-schema"},
+	})
+}
+
+// PreviewCommentErrorDatabaseNotConfigured renders the error comment for a
+// command naming a database the SchemaBot server has no configuration for.
+func PreviewCommentErrorDatabaseNotConfigured() string {
+	return RenderDatabaseNotConfigured(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
+// PreviewCommentErrorDatabaseNotRegistered renders the error comment the
+// staging aggregate leader posts for an unscoped command on a schemabot.yaml
+// whose database it has not registered.
+func PreviewCommentErrorDatabaseNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+		},
+	})
+}
+
+// PreviewCommentErrorDatabasesNotRegistered renders the same error for a PR
+// carrying several such schemabot.yaml files, which one reply names together.
+func PreviewCommentErrorDatabasesNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			{Database: "payments", SchemaPath: "services/payments/schema"},
+		},
+	})
+}
+
+// PreviewCommentErrorDatabaseRepoNotAllowed renders the error comment for a
+// command naming a database the SchemaBot server configures for other
+// repositories only.
+func PreviewCommentErrorDatabaseRepoNotAllowed() string {
+	return RenderDatabaseRepoNotAllowed(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
+// PreviewCommentErrorRepositoryTruncated renders the error comment for a
+// database-scoped command on a repository whose tree GitHub truncated, where
+// the server-side schema directories could not bound the search.
+func PreviewCommentErrorRepositoryTruncated() string {
+	return RenderRepositoryTreeTruncated(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
 	})
 }
 
@@ -237,6 +1517,12 @@ func PreviewCommentMissingEnv() string {
 	return RenderMissingEnv(action.Plan)
 }
 
+// PreviewCommentControlMissingEnv renders the reply to a control command that
+// names an apply but omits -e.
+func PreviewCommentControlMissingEnv() string {
+	return RenderControlMissingEnv(action.Stop, "apply-a1b2c3d4e5f6", "staging")
+}
+
 // PreviewCommentInvalidCmd renders the "invalid command" error comment.
 func PreviewCommentInvalidCmd() string {
 	return RenderInvalidCommand()
@@ -253,6 +1539,7 @@ func PreviewCommentApplyStarted() string {
 		Environment: "staging",
 		RequestedBy: previewRequestedBy,
 		ApplyID:     "apply-a1b2c3d4e5f6",
+		State:       state.Apply.Pending,
 	})
 }
 
@@ -272,6 +1559,7 @@ func PreviewCommentApplyBlockedByOtherPR() string {
 		LockRepo:     "block/myapp",
 		LockPR:       42,
 		LockCreated:  sampleTime().Add(-2 * time.Hour),
+		LockedApply:  LockedDatabaseApply{Checked: true},
 	})
 }
 
@@ -291,18 +1579,70 @@ func PreviewCommentApplyBlockedByCLI() string {
 // PreviewCommentApplyInProgress renders a sample "apply already in progress" comment.
 func PreviewCommentApplyInProgress() string {
 	return RenderApplyInProgress(ApplyLockConflictData{
-		Database:     "testapp",
-		DatabaseType: "mysql",
-		Environment:  "staging",
-		RequestedBy:  previewRequestedBy,
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		ApplyState:   "running",
+		Database:          "testapp",
+		DatabaseType:      "mysql",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		ApplyID:           "apply-a1b2c3d4e5f6",
+		ApplyState:        "running",
+		ApplyAgainCommand: ApplyCommand("staging", "", ApplyCommandOptions{}),
 	})
+}
+
+// PreviewCommentApplyInProgressLatestCommit renders a sample "apply already in
+// progress" comment where the running apply is applying the PR's latest commit.
+func PreviewCommentApplyInProgressLatestCommit() string {
+	return RenderApplyInProgress(ApplyLockConflictData{
+		Database:            "testapp",
+		DatabaseType:        "mysql",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		ApplyID:             "apply-a1b2c3d4e5f6",
+		ApplyState:          "running",
+		ApplyAgainCommand:   ApplyCommand("staging", "", ApplyCommandOptions{}),
+		AppliesLatestCommit: true,
+	})
+}
+
+// PreviewCommentApplyBlockedClosedPR renders a sample apply rejection for a
+// closed-but-unmerged PR.
+func PreviewCommentApplyBlockedClosedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, false)
+}
+
+// PreviewCommentApplyBlockedMergedPR renders a sample apply rejection for a
+// merged PR.
+func PreviewCommentApplyBlockedMergedPR() string {
+	return RenderApplyBlockedClosedPR("staging", previewRequestedBy, true)
 }
 
 // PreviewCommentApplyConfirmNoLock renders a sample "no lock found" comment.
 func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
+}
+
+// PreviewCommentConfirmationPlanForOtherEnvironment renders a sample refusal
+// of an apply-confirm that named a different environment than the pending
+// confirmation was planned for.
+func PreviewCommentConfirmationPlanForOtherEnvironment() string {
+	return RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		PlanEnvironment:      "staging",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
+}
+
+// PreviewCommentConfirmationPlanUnavailable renders a sample refusal of an
+// apply-confirm whose pending confirmation pins no plan that can be loaded.
+func PreviewCommentConfirmationPlanUnavailable() string {
+	return RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
+		RequestedBy:          previewRequestedBy,
+		Database:             "testapp",
+		RequestedEnvironment: "production",
+		Options:              ApplyCommandOptions{DeferCutover: true},
+	})
 }
 
 // PreviewCommentBaseSchemaFreshnessRejected renders a sample path-scoped base
@@ -316,14 +1656,104 @@ func PreviewCommentBaseSchemaFreshnessRejected() string {
 	})
 }
 
-// PreviewCommentReviewRequired renders a sample "review required" comment.
+// PreviewCommentReviewRequired renders a sample "review required" comment:
+// the database's operators lead in their own section, with the broader
+// authorized principals as an explicit fallback.
 func PreviewCommentReviewRequired() string {
 	return RenderReviewRequired(ReviewGateData{
-		Database:    "testapp",
-		Environment: "staging",
-		RequestedBy: previewRequestedBy,
-		Reviewers:   []string{"acme/schema-reviewers", "jdoe"},
-		PRAuthor:    previewRequestedBy,
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+	})
+}
+
+// PreviewCommentReviewRequiredUnauthorizedApprover renders the "review
+// required" comment when the PR's only approval comes from a reviewer who is
+// not an authorized reviewer for the database.
+func PreviewCommentReviewRequiredUnauthorizedApprover() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:              "testapp",
+		Environment:           "production",
+		RequestedBy:           previewRequestedBy,
+		OperatorReviewers:     []string{"acme/testapp-operators"},
+		OtherReviewers:        []string{"acme/schema-reviewers"},
+		PRAuthor:              previewRequestedBy,
+		UnauthorizedApprovers: []string{"jdoe"},
+	})
+}
+
+// PreviewCommentReviewRequiredNoOperators renders the "review required"
+// comment for a database with no configured operators: a single flat list of
+// authorized reviewers.
+func PreviewCommentReviewRequiredNoOperators() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:       "testapp",
+		Environment:    "staging",
+		RequestedBy:    previewRequestedBy,
+		OtherReviewers: []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:       previewRequestedBy,
+	})
+}
+
+// PreviewCommentReviewRequiredStaleApproval renders the "review required"
+// comment when an authorized reviewer approved an earlier commit and the PR's
+// schema change differs at the head, so that approval no longer counts. The
+// author dropped a column comment after the review, and the collapsed block
+// shows the DDL each commit runs.
+func PreviewCommentReviewRequiredStaleApproval() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
+		ChangedStatements: []ChangedStatements{{
+			Path:        "schema/testapp/orders.sql",
+			Dialect:     schema.DialectMySQL,
+			ApprovedSHA: "4f1c2d9e8b7a",
+			HeadSHA:     "9a3b5c7d1e2f",
+			Approved:    []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL COMMENT 'NULL until a coupon is applied'"},
+			Head:        []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL"},
+		}},
+	})
+}
+
+// PreviewCommentReviewRequiredStaleApprovalOtherBranch renders the "review
+// required" comment for a PR targeting a branch other than the default, where
+// changes that reach that branch count as a change to the PR's schema change.
+func PreviewCommentReviewRequiredStaleApprovalOtherBranch() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
+		BaseRef:           "release-1.2",
+		DefaultBranch:     "main",
+	})
+}
+
+// PreviewCommentReviewRequiredChangedBase renders the rejection of an
+// earlier approval when identical files have different merge-base versions.
+func PreviewCommentReviewRequiredChangedBase() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		ChangedApprovers:  []string{"jdoe"},
+		ChangedBasePaths:  []string{"schema/testapp/orders.sql"},
 	})
 }
 
@@ -333,18 +1763,36 @@ func PreviewCommentReviewGateError() string {
 		RequestedBy: previewRequestedBy,
 		Environment: "staging",
 		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+	})
+}
+
+// PreviewCommentReviewGateErrorApprovalNotComparable renders the review gate
+// error comment when an approval on an earlier commit cannot be compared with
+// the head, so it does not count and the apply is blocked (fail-closed).
+func PreviewCommentReviewGateErrorApprovalNotComparable() string {
+	return RenderReviewGateError(ReviewGateData{
+		Database:            "testapp",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		OperatorReviewers:   []string{"acme/testapp-operators"},
+		OtherReviewers:      []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:            previewRequestedBy,
+		UncomparedApprovers: []string{"jdoe"},
 	})
 }
 
 // PreviewCommentPRCommandNotAuthorized renders a sample actor authorization
-// denial for apply/apply-confirm PR comments.
+// denial for apply/apply-confirm PR comments: the database's operators lead
+// in their own section, with the broader admins as an explicit fallback.
 func PreviewCommentPRCommandNotAuthorized() string {
 	return RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
-		RequestedBy: "mona",
-		CommandName: action.Apply,
-		Database:    "orders",
-		Environment: "staging",
+		RequestedBy:        "mona",
+		CommandName:        action.Apply,
+		Database:           "orders",
+		Environment:        "staging",
+		OperatorPrincipals: []string{"acme/orders-operators"},
+		OtherPrincipals:    []string{"acme/db-admins", "jdoe"},
 	})
 }
 
@@ -384,6 +1832,80 @@ func PreviewCommentApplyBlockedByPriorEnvInProgress() string {
 	return RenderApplyBlockedByPriorEnvInProgress("testapp", "production", "staging")
 }
 
+// PreviewCommentApplyBlockedByCheckStatusError renders a sample fail-closed
+// block for a check-status read that failed because the GitHub App
+// installation is missing permissions.
+func PreviewCommentApplyBlockedByCheckStatusError() string {
+	return RenderApplyBlockedByCheckStatusError("staging",
+		fmt.Errorf("list check runs for ref: Resource not accessible by integration"),
+		&CheckStatusAccessDetails{
+			GitHubApp:          "schemabot-app",
+			MissingPermissions: []string{"Checks: Read", "Commit statuses: Read"},
+		})
+}
+
+// PreviewCommentApplyBlockedByStoppedPriorEnvApply renders a sample "production
+// blocked by a stopped staging apply" comment.
+func PreviewCommentApplyBlockedByStoppedPriorEnvApply() string {
+	return RenderApplyBlockedByStoppedPriorEnvApply("testapp", "production", "staging")
+}
+
+// PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
+// block for a prior-environment check that could not be read.
+func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
+	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs")
+}
+
+// PreviewCommentApplyBlockedByMissingPriorEnvCheck renders a sample block for
+// a prior environment with no completed SchemaBot check on the PR.
+func PreviewCommentApplyBlockedByMissingPriorEnvCheck() string {
+	return RenderApplyBlockedByMissingPriorEnvCheck("staging")
+}
+
+// PreviewCommentApplyBlockedByStalePriorEnvCheck renders a sample block for a
+// prior environment whose stored check state names a commit other than the one
+// the apply read its schema from.
+func PreviewCommentApplyBlockedByStalePriorEnvCheck() string {
+	return RenderApplyBlockedByStalePriorEnvCheck("staging", previewStaleSHA, previewHeadSHA)
+}
+
+// PreviewCommentApplyBlockedByUntrustedPriorEnvCheck renders a sample block
+// for a prior-environment check created only by untrusted GitHub Apps.
+func PreviewCommentApplyBlockedByUntrustedPriorEnvCheck() string {
+	return RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"acme-automation"})
+}
+
+// PreviewCommentApplyBlockedByUnlistedEnvironment renders a sample block for a
+// target environment missing from the configured promotion order.
+func PreviewCommentApplyBlockedByUnlistedEnvironment() string {
+	return RenderApplyBlockedByUnlistedEnvironment("development", []string{"staging", "production"})
+}
+
+// PreviewCommentStaleSchemaRejected renders a sample rejection for schema
+// files loaded at an older commit than the current PR HEAD.
+func PreviewCommentStaleSchemaRejected() string {
+	return RenderStaleSchemaRejection(StaleSchemaRejectionData{
+		RequestedBy:  previewRequestedBy,
+		Database:     "testapp",
+		Environment:  "staging",
+		DiscoverySHA: previewStaleSHA,
+		CurrentSHA:   previewHeadSHA,
+		Action:       "apply",
+	})
+}
+
+// PreviewCommentStalePlanRejected renders a sample rejection for a confirmed
+// plan rendered against a commit that is no longer the PR HEAD.
+func PreviewCommentStalePlanRejected() string {
+	return RenderStalePlanRejection(StalePlanRejectionData{
+		RequestedBy: previewRequestedBy,
+		Database:    "testapp",
+		Environment: "staging",
+		PlanSHA:     previewStaleSHA,
+		CurrentSHA:  previewHeadSHA,
+	})
+}
+
 // sampleTime returns a fixed time for preview rendering consistency.
 func sampleTime() time.Time {
 	return time.Date(2026, 3, 15, 14, 30, 0, 0, time.UTC)
@@ -399,20 +1921,130 @@ func samplePlanChanges() []KeyspaceChangeData {
 				"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 				"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 			},
+			TableSizes: []TableSizeData{
+				{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+			},
 		},
 	}
+}
+
+// sampleLintWarnings returns warning-severity lint findings that match the
+// statements in samplePlanChanges, in the message format Spirit's linters emit.
+func sampleLintWarnings() []LintViolationData {
+	return []LintViolationData{
+		{Message: `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "users", LinterName: "has_timestamp"},
+		{Message: `Index "idx_category" on column "category" is redundant - covered by index "idx_category_price" on columns ("category", "price")`, Table: "products", LinterName: "redundant_indexes"},
+	}
+}
+
+// PreviewCommentPlanPrimaryKeyWarning renders an index addition on an existing
+// table whose unchanged varchar primary key raises an advisory finding.
+func PreviewCommentPlanPrimaryKeyWarning() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `customers` ADD INDEX `idx_created_at` (`created_at`);"},
+		}},
+		LintViolations: []LintViolationData{{
+			Table: "customers", LinterName: "primary_key",
+			Message: `Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
+// PreviewCommentPlanPrimaryKeyIssue renders a new table whose varchar primary
+// key requires explicit acknowledgement, with the same guide beside the issue.
+func PreviewCommentPlanPrimaryKeyIssue() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"CREATE TABLE `customers` (\n  `id` varchar(64) NOT NULL,\n  `created_at` datetime(3) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{{
+			Table: "customers", Reason: `[ERROR] primary_key: Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
+// PreviewCommentPlanRelatedGuidance shows multiple rules contributing distinct
+// guides while repeated primary key warnings contribute only one link.
+func PreviewCommentPlanRelatedGuidance() string {
+	data := PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"rename_column"},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []UnsafeChangeData{{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`}},
+	}
+	change := KeyspaceChangeData{
+		Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;"},
+	}
+	for _, table := range []string{"customers", "orders", "invoices", "shipments", "sessions", "events"} {
+		change.Statements = append(change.Statements, fmt.Sprintf("ALTER TABLE `%s` ADD INDEX `idx_created_at` (`created_at`);", table))
+		data.LintRuleNames = append(data.LintRuleNames, "primary_key")
+		data.LintViolations = append(data.LintViolations, LintViolationData{
+			Table: table, LinterName: "primary_key", Message: `Primary key column "id" has type "varchar"`,
+		})
+	}
+	data.Changes = []KeyspaceChangeData{change}
+	return RenderPlanComment(data)
+}
+
+// PreviewCommentPlanManyLintWarnings renders a plan whose lint findings exceed
+// the fold threshold, exercising the collapsed details block grouped by table.
+func PreviewCommentPlanManyLintWarnings() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:      "testapp",
+		LintRuleNames: []string{"primary_key"},
+		SchemaName:    "testapp",
+		Environment:   "staging",
+		HeadSHA:       previewHeadSHA,
+		Repository:    previewRepository,
+		RequestedBy:   previewRequestedBy,
+		IsMySQL:       true,
+		DatabaseType:  "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP INDEX `idx_legacy_status`;",
+					"ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;",
+				},
+			},
+		},
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: `Index "idx_legacy_status" should be made invisible before dropping to ensure it's not needed`},
+			{Table: "order_events", Reason: `Index "idx_events_archived" should be made invisible before dropping to ensure it's not needed`},
+		},
+		LintViolations: []LintViolationData{
+			{Message: `Primary key column "order_ref" has type "varchar"`, Table: "orders", LinterName: "primary_key"},
+			{Message: `Index "idx_status_created" has "DATETIME" column "created_at" in position 3 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
+			{Message: `Index "idx_region_created" has "DATETIME" column "created_at" in position 4 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
+			{Message: `Primary key column "event_id" has type "mediumint"`, Table: "order_events", LinterName: "primary_key"},
+			{Message: `Index "idx_status_created" on columns ("status", "region", "created_at", "event_id", "order_pk") has a redundant PRIMARY KEY suffix "order_pk" — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns ("order_pk", "event_id") to secondary indexes, so spelling out part of the PK at the end of the index is redundant.`, Table: "order_events", LinterName: "redundant_indexes"},
+			{Message: `Column "event_id" in table "order_events" has type "mediumint(9)" but 2 other table(s) use type "int(11)" (e.g. shipments, invoices)`, Table: "order_events", LinterName: "type_pedantic"},
+		},
+	})
 }
 
 // PreviewCommentUnsafeBlocked renders a sample "unsafe changes blocked" comment.
 func PreviewCommentUnsafeBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -424,8 +2056,8 @@ func PreviewCommentUnsafeBlocked() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 	})
 }
@@ -434,13 +2066,14 @@ func PreviewCommentUnsafeBlocked() string {
 // column drop is blocked until the application rollout is safe.
 func PreviewCommentDropColumnBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -452,8 +2085,10 @@ func PreviewCommentDropColumnBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: DROP COLUMN `nickname`",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
+				DDL:        "ALTER TABLE `customers` DROP COLUMN `nickname`",
+				ChangeType: "alter",
 			},
 		},
 	})
@@ -463,13 +2098,14 @@ func PreviewCommentDropColumnBlocked() string {
 // index drop is blocked until query performance has been reviewed.
 func PreviewCommentDropIndexBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -481,9 +2117,45 @@ func PreviewCommentDropIndexBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
+				DDL:        "ALTER TABLE `customers` DROP INDEX `idx_customers_email`",
+				ChangeType: "alter",
 			},
+		},
+	})
+}
+
+// PreviewCommentLintErrorsBlocked renders a sample plan where error-severity
+// schema lint violations block the apply. The reasons carry the raw
+// "[ERROR] linter:" prefixes engines report; the renderer strips them.
+func PreviewCommentLintErrorsBlocked() string {
+	return RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT;",
+					"ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"; [WARNING] has_timestamp: Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`},
+			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
+		},
+		LintRuleNames: []string{"primary_key", "has_timestamp", "rename_column"},
+		LintViolations: []LintViolationData{
+			{Message: `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "orders", LinterName: "has_timestamp"},
 		},
 	})
 }
@@ -498,6 +2170,7 @@ func PreviewCommentApplyPlan() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes:      samplePlanChanges(),
 		IsLocked:     true,
 		LockOwner:    "acme/myapp#42",
@@ -515,6 +2188,7 @@ func PreviewCommentApplyPlanOptions() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes:      samplePlanChanges(),
 		DeferCutover: true,
 		SkipRevert:   true,
@@ -527,13 +2201,14 @@ func PreviewCommentApplyPlanOptions() string {
 // PreviewCommentApplyPlanUnsafe renders a sample locked apply-plan with unsafe warning.
 func PreviewCommentApplyPlanUnsafe() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -546,8 +2221,8 @@ func PreviewCommentApplyPlanUnsafe() string {
 		HasUnsafeChanges: true,
 		AllowUnsafe:      true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 		IsLocked:     true,
 		LockOwner:    "acme/myapp#42",
@@ -559,18 +2234,27 @@ func PreviewCommentApplyPlanUnsafe() string {
 // manual confirmation after automatic apply was downgraded by a safety recheck.
 func PreviewCommentApplyPlanDowngraded() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:                   "testapp",
-		SchemaName:                 "testapp",
-		Environment:                "staging",
-		HeadSHA:                    previewHeadSHA,
-		Repository:                 previewRepository,
-		RequestedBy:                previewRequestedBy,
-		IsMySQL:                    true,
-		Changes:                    samplePlanChanges(),
-		IsLocked:                   true,
-		LockOwner:                  "acme/myapp#42",
-		LockAcquired:               "2026-03-14 10:30:00 UTC",
-		AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
+		Database:                  "testapp",
+		SchemaName:                "testapp",
+		Environment:               "staging",
+		HeadSHA:                   previewHeadSHA,
+		Repository:                previewRepository,
+		RequestedBy:               previewRequestedBy,
+		IsMySQL:                   true,
+		DatabaseType:              "mysql",
+		Changes:                   samplePlanChanges(),
+		IsLocked:                  true,
+		LockOwner:                 "acme/myapp#42",
+		LockAcquired:              "2026-03-14 10:30:00 UTC",
+		PendingManualConfirmation: true,
+		PausedApplyCause: &PausedApplyCauseData{
+			Heading: "Schema changes differ from the plan this apply was started from",
+			Entries: []string{
+				"`orders` (alter) now runs a different statement",
+				"`products` (alter) is new",
+				"`shipments` (create) is no longer planned",
+			},
+		},
 	})
 }
 
@@ -603,6 +2287,7 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 			Keyspace: "commerce_sharded",
 			Statements: []string{
 				"CREATE TABLE `addresses` (\n  `id` bigint unsigned NOT NULL,\n  `customer_id` bigint unsigned NOT NULL,\n  `street` varchar(255) NOT NULL,\n  `city` varchar(100) NOT NULL,\n  PRIMARY KEY (`id`),\n  INDEX `idx_customer_id` (`customer_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+				"ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier` (`loyalty_tier`);",
 			},
 			VSchemaChanged: true,
 			VSchemaDiff: `--- a/commerce_sharded.json
@@ -629,17 +2314,106 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 	}
 }
 
+// PreviewCommentPostgresPlan renders a sample PostgreSQL plan comment whose
+// statements are classified and formatted under the PostgreSQL grammar. The
+// standalone index build on an existing table is named as an index to create
+// in the plan summary.
+func PreviewCommentPostgresPlan() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"CREATE TABLE sessions (id uuid PRIMARY KEY, user_id bigint NOT NULL, payload jsonb, created_at timestamptz NOT NULL DEFAULT now())",
+					"ALTER TABLE users ADD COLUMN last_seen_at timestamptz, ADD COLUMN preferences jsonb",
+					"CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)",
+				},
+			},
+		},
+	})
+}
+
 // PreviewCommentVitessPlan renders a sample Vitess plan comment with keyspaces and VSchema diff.
 func PreviewCommentVitessPlan() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "commerce",
-		SchemaName:  "commerce",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     false,
-		Changes:     sampleVitessPlanChanges(),
+		Database:     "commerce",
+		SchemaName:   "commerce",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "vitess",
+		Changes:      sampleVitessPlanChanges(),
+	})
+}
+
+// PreviewCommentVitessPlanVSchemaRemoval renders a sample Vitess plan comment
+// where the VSchema change removes a lookup vindex and its column-vindex
+// association — the removals surface in the Issues section as unsafe changes.
+func PreviewCommentVitessPlanVSchemaRemoval() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "commerce",
+		SchemaName:   "commerce",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "vitess",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace:       "commerce_sharded",
+				VSchemaChanged: true,
+				VSchemaDiff: `--- a/commerce_sharded.json
++++ b/commerce_sharded.json
+@@ -3,10 +3,6 @@
+     "hash": {
+       "type": "hash"
+-    },
+-    "customers_email_lookup": {
+-      "type": "consistent_lookup_unique",
+-      "params": {
+-        "table": "customers_email_lookup",
+-        "from": "email",
+-        "to": "keyspace_id"
+-      },
+-      "owner": "customers"
+     }
+   },
+@@ -18,8 +14,4 @@
+         {
+           "column": "id",
+           "name": "hash"
+-        },
+-        {
+-          "column": "email",
+-          "name": "customers_email_lookup"
+         }
+       ]
+     }`,
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
+			},
+			{
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
+			},
+		},
 	})
 }
 
@@ -653,6 +2427,7 @@ func PreviewCommentVitessApplyPlan() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      false,
+		DatabaseType: "vitess",
 		Changes:      sampleVitessPlanChanges(),
 		DeferCutover: true,
 		SkipRevert:   true,
@@ -665,12 +2440,13 @@ func PreviewCommentVitessApplyPlan() string {
 // PreviewCommentMySQLMultiSchema renders a MySQL plan with multiple schema names.
 func PreviewCommentMySQLMultiSchema() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "myapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "myapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "app_primary",
@@ -703,22 +2479,25 @@ func PreviewCommentMultiEnvPlan() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
-				Database:    "testapp",
-				Environment: "staging",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     changes,
+				Database:     "testapp",
+				Environment:  "staging",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      changes,
 			},
 			"production": {
-				Database:    "testapp",
-				Environment: "production",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     changes,
+				Database:     "testapp",
+				Environment:  "production",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      changes,
 			},
 		},
 		Errors: map[string]string{},
@@ -729,21 +2508,19 @@ func PreviewCommentMultiEnvPlan() string {
 // with lint violations included in each environment's plan.
 func PreviewCommentMultiEnvPlanLint() string {
 	changes := samplePlanChanges()
-	lintViolations := []LintViolationData{
-		{Message: "Primary key uses signed integer type (should be UNSIGNED)", Table: "orders", LinterName: "primary_key"},
-		{Message: "Column uses utf8 charset (should be utf8mb4)", Table: "users", LinterName: "allow_charset"},
-	}
+	lintViolations := sampleLintWarnings()
 	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  "",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
-			"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
-			"production": {Database: "testapp", Environment: "production", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
+			"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes, LintViolations: lintViolations},
+			"production": {Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes, LintViolations: lintViolations},
 		},
 		Errors: map[string]string{},
 	})
@@ -759,15 +2536,17 @@ func PreviewCommentMultiEnvPlanError() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
-				Database:    "testapp",
-				Environment: "staging",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     changes,
+				Database:     "testapp",
+				Environment:  "staging",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      changes,
 			},
 		},
 		Errors: map[string]string{
@@ -785,22 +2564,25 @@ func PreviewCommentMultiEnvPlanDiff() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
-				Database:    "testapp",
-				Environment: "staging",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     nil,
+				Database:     "testapp",
+				Environment:  "staging",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      nil,
 			},
 			"production": {
-				Database:    "testapp",
-				Environment: "production",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     samplePlanChanges(),
+				Database:     "testapp",
+				Environment:  "production",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      samplePlanChanges(),
 			},
 		},
 		Errors: map[string]string{},
@@ -815,19 +2597,25 @@ func PreviewCommentMultiEnvPlanDiff() string {
 func sampleApplyTables() []TableProgressData {
 	return []TableProgressData{
 		{
-			Namespace: "testapp",
-			TableName: "orders",
-			DDL:       "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
+			Namespace:      "testapp",
+			TableName:      "orders",
+			EstimatedBytes: new(int64(438_000_000)),
+			EstimatedRows:  new(int64(1_620_000)),
+			DDL:            "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
 		},
 		{
-			Namespace: "testapp",
-			TableName: "users",
-			DDL:       "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+			Namespace:      "testapp",
+			TableName:      "users",
+			EstimatedBytes: new(int64(391_000_000)),
+			EstimatedRows:  new(int64(1_480_000)),
+			DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
 		},
 		{
-			Namespace: "testapp",
-			TableName: "products",
-			DDL:       "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
+			Namespace:      "testapp",
+			TableName:      "products",
+			EstimatedBytes: new(int64(157_000_000)),
+			EstimatedRows:  new(int64(612_000)),
+			DDL:            "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
 		},
 	}
 }
@@ -880,6 +2668,55 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplySeveralRunning renders an apply comment where two tables
+// copy at once, so the summary shows the rows copied over the rows to copy
+// across both rather than one table's percent.
+func PreviewCommentApplySeveralRunning() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Running
+	tables[1].RowsCopied = 914707
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 62
+	tables[1].ETASeconds = 195
+	tables[2].Status = state.Task.Running
+	tables[2].RowsCopied = 122400
+	tables[2].RowsTotal = 612000
+	tables[2].PercentComplete = 20
+	tables[2].ETASeconds = 410
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
+// PreviewCommentApplyThrottled renders an apply comment where the active row
+// copy is paused by the engine's throttler, so the stalled bar reads as a
+// deliberate slowdown with its trigger named rather than a hang.
+func PreviewCommentApplyThrottled() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Running
+	tables[1].RowsCopied = 914707
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 62
+	tables[1].ETASeconds = 195
+	tables[1].Throttled = true
+	tables[1].ThrottleReason = "commit-latency 112.4ms >= 100ms"
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
+// PreviewCommentApplyCatchingUp renders an apply comment where a table has
+// finished copying and is draining the changes that accumulated during the copy.
+func PreviewCommentApplyCatchingUp() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.CatchingUp
+	tables[1].RowsCopied = 1466232
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 100
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.CatchingUp, tables))
+}
+
 // PreviewCommentApplyChecksumming renders an apply comment where a table has
 // finished copying and entered the checksum phase to verify the copied data.
 func PreviewCommentApplyChecksumming() string {
@@ -889,7 +2726,35 @@ func PreviewCommentApplyChecksumming() string {
 	tables[1].ChecksumRowsChecked = 321450
 	tables[1].ChecksumRowsTotal = 1466232
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Checksumming, tables))
+}
+
+// PreviewCommentApplyChecksummingDeferredCutover renders the checksumming
+// comment for an apply started with --defer-cutover, which carries the
+// deferred-cutover option.
+func PreviewCommentApplyChecksummingDeferredCutover() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Checksumming
+	tables[1].ChecksumRowsChecked = 321450
+	tables[1].ChecksumRowsTotal = 1466232
+	tables[2].Status = state.Task.Pending
+	data := sampleApplyData(state.Apply.Checksumming, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyPostChecksum renders an apply comment where a table has
+// passed the checksum and is draining the changes that accumulated during it.
+func PreviewCommentApplyPostChecksum() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.PostChecksum
+	tables[1].RowsCopied = 1466232
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 100
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.PostChecksum, tables))
 }
 
 // PreviewCommentApplyEstimateExceeded renders an apply comment where the active row copy has exceeded MySQL's initial estimate.
@@ -965,11 +2830,12 @@ func PreviewCommentApplyVitessMultiKeyspaceVSchema() string {
 
 // PreviewCommentApplyShardProgress renders a sharded apply where one table is
 // copying across a handful of shards, exercising the inline per-shard summary
-// (each shard listed, a percent only on the actively-copying shards).
+// (each shard listed, a percent on the actively-copying shards and a status
+// word on the glyphs that need one).
 func PreviewCommentApplyShardProgress() string {
 	shards := []ShardProgressData{
 		{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100},
-		{Shard: "40-80", Status: state.Task.Running, PercentComplete: 62},
+		{Shard: "40-80", Status: state.Task.WaitingForCutover, PercentComplete: 100},
 		{Shard: "80-c0", Status: state.Task.Running, PercentComplete: 31},
 		{Shard: "c0-", Status: state.Task.Pending},
 	}
@@ -1075,6 +2941,23 @@ func PreviewCommentApplyFailed() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyFailedBeforeRowCopy renders an apply comment where the
+// first table was rejected by an engine preflight check before any rows were
+// copied: the row renders without a progress bar and carries its own error
+// detail, while the apply-level failure reason holds the table-qualified form
+// promoted from the failed task.
+func PreviewCommentApplyFailedBeforeRowCopy() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Failed
+	tables[0].DDL = "ALTER TABLE `orders` MODIFY COLUMN `status` ENUM('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL"
+	tables[0].ErrorMessage = PreviewErrorPreflightFailed
+	tables[1].Status = state.Task.Cancelled
+	tables[2].Status = state.Task.Cancelled
+	data := sampleApplyData(state.Apply.Failed, tables)
+	data.ErrorMessage = fmt.Sprintf("table %s failed: %s", tables[0].TableName, PreviewErrorPreflightFailed)
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplyRetrying renders an apply comment where the middle table
 // was interrupted by a retryable failure and the driver is redispatching it,
 // with the attempt counter showing how much of the retry budget is used.
@@ -1090,6 +2973,23 @@ func PreviewCommentApplyRetrying() string {
 	data := sampleApplyData(state.Apply.FailedRetryable, tables)
 	data.Attempt = 1
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyRemoteRetryablePause renders a sample comment for an
+// active apply whose data plane is retrying a failed table on its own. The
+// stored apply stays active through the pause, so the Retrying status is
+// derived from the task rows, and no attempt count is shown — the data plane's
+// attempt number does not cross the wire.
+func PreviewCommentApplyRemoteRetryablePause() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.
@@ -1132,12 +3032,41 @@ func PreviewCommentApplyCancelled() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Cancelled, tables))
 }
 
-// PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover comment.
+// PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover
+// comment for a deferred apply, where cutover waits on an explicit operator
+// trigger and the footer offers the pasteable cutover command.
 func PreviewCommentApplyWaitingForCutover() string {
 	tables := sampleApplyTables()
 	for i := range tables {
 		tables[i].Status = state.Task.WaitingForCutover
-		tables[i].ReadyToComplete = true
+	}
+	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyWaitingForCutoverFirstLanded renders a deferred apply
+// waiting for cutover after one table has already completed: the readiness
+// line counts only the tables still facing the cutover, so the completed
+// table is neither ready nor waited on.
+func PreviewCommentApplyWaitingForCutoverFirstLanded() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.WaitingForCutover
+	tables[2].Status = state.Task.WaitingForCutover
+	data := sampleApplyData(state.Apply.WaitingForCutover, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyWaitingForCutoverAutomatic renders a sample
+// waiting-for-cutover comment for a non-deferred apply, where the drive
+// triggers cutover automatically and the footer tells the operator no action
+// is needed.
+func PreviewCommentApplyWaitingForCutoverAutomatic() string {
+	tables := sampleApplyTables()
+	for i := range tables {
+		tables[i].Status = state.Task.WaitingForCutover
 	}
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.WaitingForCutover, tables))
 }
@@ -1205,8 +3134,8 @@ func PreviewCommentApplyReverting() string {
 
 // sampleDeploymentDetail builds one deployment's single-deployment comment data
 // for the per-deployment <details> body, with its own database name.
-func sampleDeploymentDetail(database, applyState string, tables []TableProgressData) ApplyStatusCommentData {
-	return ApplyStatusCommentData{
+func sampleDeploymentDetail(database, applyState string, tables []TableProgressData) *ApplyStatusCommentData {
+	return &ApplyStatusCommentData{
 		Database:    database,
 		Environment: "production",
 		RequestedBy: "aparajon",
@@ -1220,7 +3149,19 @@ func sampleDeploymentDetail(database, applyState string, tables []TableProgressD
 
 // PreviewCommentMultiDeploymentApplyInProgress renders a barrier rollout
 // mid-flight: one deployment parked ready for cutover, one copying, two queued.
+// SchemaBot cuts the parked deployment over itself, so no command is offered.
 func PreviewCommentMultiDeploymentApplyInProgress() string {
+	return previewBarrierRolloutInProgress(false)
+}
+
+// PreviewCommentMultiDeploymentApplyDeferredCutover renders the same barrier
+// rollout started with --defer-cutover: the parked deployment waits for an
+// operator, so the comment offers the cutover command.
+func PreviewCommentMultiDeploymentApplyDeferredCutover() string {
+	return previewBarrierRolloutInProgress(true)
+}
+
+func previewBarrierRolloutInProgress(deferCutover bool) string {
 	model := presentation.Derive([]presentation.Operation{
 		{Deployment: "eu", State: state.ApplyOperation.WaitingForCutover, Barrier: true},
 		{Deployment: "us", State: state.ApplyOperation.Running, Barrier: true},
@@ -1231,7 +3172,6 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	euTables := sampleApplyTables()
 	for i := range euTables {
 		euTables[i].Status = state.Task.WaitingForCutover
-		euTables[i].ReadyToComplete = true
 	}
 
 	usTables := sampleApplyTables()
@@ -1243,16 +3183,194 @@ func PreviewCommentMultiDeploymentApplyInProgress() string {
 	usTables[1].ETASeconds = 195
 	usTables[2].Status = state.Task.Pending
 
+	details := []*ApplyStatusCommentData{
+		sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
+		sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
+	}
+	for _, detail := range details {
+		detail.DeferCutover = deferCutover
+	}
+
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
 		ApplyID:     "apply-a1b2c3d4e5f6",
 		Environment: "production",
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-12 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
-			"us": sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
+		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplyInProgress renders a parallel rollout across
+// two deployments of 64 targets each, with the apply's driver cap holding eight
+// targets in flight and the rest queued. Each deployment rolls its targets up
+// into one section: counts by status, one line per table naming the targets
+// copying it, and the DDL once per distinct change. In us, eight targets also
+// add a `note` column and one target failed; the rollout continues past it.
+func PreviewCommentMultiTargetApplyInProgress() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const addIndexAndColumn = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`), ADD COLUMN `note` text"
+	const rows = 1_466_232
+	var ops []presentation.Operation
+	var details []*ApplyStatusCommentData
+	add := func(deployment string, i int, opState, taskState, ddl string, copied, total, eta int64) {
+		target := fmt.Sprintf("orders_%03d", i)
+		op := presentation.Operation{Deployment: deployment, Target: target, State: opState, Parallel: true, ContinueOnFailure: true}
+		if opState == state.ApplyOperation.Failed {
+			op.Error = "Error 1062: Duplicate entry '12345' for key 'orders.idx_user_id'"
+		}
+		ops = append(ops, op)
+		details = append(details, sampleDeploymentDetail(target, opState, []TableProgressData{
+			{TableName: "orders", DDL: ddl, Status: taskState, RowsCopied: copied, RowsTotal: total, ETASeconds: eta},
+		}))
+	}
+	queue := func(deployment string, i int, ddl string) {
+		add(deployment, i, state.ApplyOperation.Pending, state.Task.Pending, ddl, 0, 0, 0)
+	}
+	for i := range 64 {
+		ddl := addIndex
+		if i >= 56 {
+			ddl = addIndexAndColumn
+		}
+		switch {
+		case i < 40:
+			add("us", i, state.ApplyOperation.Completed, state.Task.Completed, ddl, rows, rows, 0)
+		case i < 44:
+			add("us", i, state.ApplyOperation.Running, state.Task.Running, ddl, 914_707, rows, 195)
+		case i == 62:
+			add("us", i, state.ApplyOperation.Failed, state.Task.Failed, ddl, 402_118, rows, 0)
+		default:
+			queue("us", i, ddl)
+		}
+	}
+	for i := range 64 {
+		if i < 4 {
+			add("eu", i, state.ApplyOperation.Running, state.Task.Running, addIndex, 183_029, rows, 1_380)
+			continue
+		}
+		queue("eu", i, addIndex)
+	}
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive(ops),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplySummaryAlreadyHadIt renders the summary of a
+// finished rollout across four targets, one of which already had the change
+// when the apply was created: it ran nothing, so the comment neither names nor
+// counts it.
+func PreviewCommentMultiTargetApplySummaryAlreadyHadIt() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	var ops []presentation.Operation
+	var details []*ApplyStatusCommentData
+	for i := range 4 {
+		target := fmt.Sprintf("orders_%03d", i)
+		op := presentation.Operation{Deployment: "us", Target: target, State: state.ApplyOperation.Completed, Parallel: true, ContinueOnFailure: true}
+		if i == 3 {
+			op.NeverStarted = true
+			op.AlreadyConverged = true
+			ops = append(ops, op)
+			details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, nil))
+			continue
+		}
+		ops = append(ops, op)
+		details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: state.Task.Completed, RowsCopied: rows, RowsTotal: rows},
+		}))
+	}
+
+	return RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive(ops),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().UTC().Format(time.RFC3339),
+		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplyInProgressOneDeployment renders a rollout
+// whose one deployment addresses four targets: one done, one copying, one
+// queued, and one that already had the change. With no other deployment to
+// tell it apart from, the status is one line and the table lines sit under it.
+func PreviewCommentMultiTargetApplyInProgressOneDeployment() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	target := func(i int, opState string) presentation.Operation {
+		return presentation.Operation{Deployment: "us", Target: fmt.Sprintf("orders_%03d", i), State: opState, Parallel: true, ContinueOnFailure: true}
+	}
+	detail := func(i int, opState, taskState string, copied, eta int64) *ApplyStatusCommentData {
+		return sampleDeploymentDetail(fmt.Sprintf("orders_%03d", i), opState, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: taskState, RowsCopied: copied, RowsTotal: rows, ETASeconds: eta},
+		})
+	}
+	converged := target(3, state.ApplyOperation.Completed)
+	converged.NeverStarted = true
+	converged.AlreadyConverged = true
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			target(0, state.ApplyOperation.Completed),
+			target(1, state.ApplyOperation.Running),
+			target(2, state.ApplyOperation.Pending),
+			converged,
+		}),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details: []*ApplyStatusCommentData{
+			detail(0, state.ApplyOperation.Completed, state.Task.Completed, rows, 0),
+			detail(1, state.ApplyOperation.Running, state.Task.Running, 914_707, 195),
+			nil,
+			sampleDeploymentDetail("orders_003", state.ApplyOperation.Completed, nil),
 		},
+	})
+}
+
+// PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
+// members were planned independently and so run different plans: `eu` is
+// already at the desired schema bar one index, while `us` still needs all
+// three. Each member's section names the plan it runs, so a reader can tie it
+// back to the block they reviewed. The converged rollouts above name none.
+func PreviewCommentMultiDeploymentApplyDivergentPlans() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "us", State: state.ApplyOperation.Running},
+		{Deployment: "eu", State: state.ApplyOperation.Pending},
+	})
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Running
+	usTables[0].RowsCopied = 914707
+	usTables[0].RowsTotal = 1466232
+	usTables[0].PercentComplete = 62
+	usTables[0].ETASeconds = 195
+	usTables[1].Status = state.Task.Pending
+	usTables[2].Status = state.Task.Pending
+
+	euTables := sampleApplyTables()[:1]
+	euTables[0].Status = state.Task.Pending
+
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Running, usTables)
+	usDetail.PlanID = "plan_7c41f9"
+	euDetail := sampleDeploymentDetail("payments_eu", state.Apply.Pending, euTables)
+	euDetail.PlanID = "plan_3344ab"
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-6 * time.Minute).UTC().Format(time.RFC3339),
+		Details:     []*ApplyStatusCommentData{usDetail, euDetail},
 	})
 }
 
@@ -1288,9 +3406,9 @@ func PreviewCommentMultiDeploymentApplyFailed() string {
 		Environment: "production",
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
-			"us": usDetail,
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
+			usDetail,
 		},
 	})
 }
@@ -1319,10 +3437,10 @@ func PreviewCommentMultiDeploymentApplyCompleted() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
-			"us": sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
-			"au": sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
 		},
 	})
 }
@@ -1352,10 +3470,10 @@ func PreviewCommentMultiDeploymentApplySummaryCompleted() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
-			"us": sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
-			"au": sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
+			sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
 		},
 	})
 }
@@ -1391,9 +3509,9 @@ func PreviewCommentMultiDeploymentApplySummaryFailed() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-1 * time.Minute).UTC().Format(time.RFC3339),
-		Details: map[string]ApplyStatusCommentData{
-			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
-			"us": usDetail,
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
+			usDetail,
 		},
 	})
 }
@@ -1434,41 +3552,6 @@ func PreviewCommentApplySingleProgress() string {
 	return RenderApplyStatusComment(sampleSingleApplyData(state.Apply.Running, table))
 }
 
-// PreviewCommentApplySingleProgressVolume renders a single-table apply in
-// progress with a tuned volume level shown on the status line.
-func PreviewCommentApplySingleProgressVolume() string {
-	table := sampleSingleTable()
-	table.Status = state.Task.Running
-	table.RowsCopied = 3500000
-	table.RowsTotal = 7200000
-	table.PercentComplete = 48
-	table.ETASeconds = 330
-	data := sampleSingleApplyData(state.Apply.Running, table)
-	data.Volume = 8
-	return RenderApplyStatusComment(data)
-}
-
-// PreviewCommentVolumeSupersededProgress renders an old progress comment after
-// a volume change froze it: the final pre-change progress collapses into a
-// details block under a pointer to the fresh comment now tracking the apply.
-func PreviewCommentVolumeSupersededProgress() string {
-	table := sampleSingleTable()
-	table.Status = state.Task.Running
-	table.RowsCopied = 2300000
-	table.RowsTotal = 7200000
-	table.PercentComplete = 32
-	table.ETASeconds = 780
-	data := sampleSingleApplyData(state.Apply.Running, table)
-	data.Volume = 3
-	return RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
-		Volume:       8,
-		Repo:         "acme/testapp",
-		PR:           42,
-		NewCommentID: 2222222222,
-		PreviousBody: RenderApplyStatusComment(data),
-	})
-}
-
 // PreviewCommentResumeSupersededProgress renders an old progress comment after
 // a resume froze it: the final pre-stop progress collapses into a details
 // block under a pointer to the fresh comment now tracking the apply.
@@ -1479,7 +3562,84 @@ func PreviewCommentResumeSupersededProgress() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 32
 	data := sampleSingleApplyData(state.Apply.Stopped, table)
-	return RenderResumeSupersededProgressComment(ResumeSupersededProgressData{
+	return RenderResumeSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentRevertSupersededProgress renders an old progress comment after
+// a user revert froze it: the final revert-window rendering collapses into a
+// details block under a pointer to the fresh comment now tracking the revert.
+func PreviewCommentRevertSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.RevertWindow
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
+	return RenderRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentSkipRevertSupersededProgress renders an old progress comment
+// after a skip-revert froze it: the final revert-window rendering collapses
+// into a details block under a pointer to the fresh comment now tracking the
+// finalizing schema change.
+func PreviewCommentSkipRevertSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.RevertWindow
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.RevertWindow, table)
+	return RenderSkipRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentCutoverCommandSupersededProgress renders the progress comment
+// that waited at the deferred-cutover gate after the operator's cutover took
+// effect: the waiting-for-cutover rendering collapses into a details block
+// under a pointer to the fresh comment now tracking the cutover.
+func PreviewCommentCutoverCommandSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.WaitingForCutover
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
+	return RenderCutoverCommandSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
+// PreviewCommentCutoverSuperseded renders a spent cutover prompt after a
+// deferred cutover completed into a still-active apply: the prompt collapses
+// into a details block under a pointer to the fresh comment now tracking the
+// post-cutover phase.
+func PreviewCommentCutoverSuperseded() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.WaitingForCutover
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
+	return RenderCutoverSupersededComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
@@ -1584,6 +3744,18 @@ func PreviewCommentRollbackStatus() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentRollbackOfRolloutUnsupported previews the refusal of a
+// rollback of a schema change across multiple targets.
+func PreviewCommentRollbackOfRolloutUnsupported() string {
+	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
+		Environment:    "staging",
+		Database:       "payments",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RoutingChecked: true,
+		PR:             PRStateOpen,
+	})
+}
+
 // PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
 // completed rollback apply — announced as a rollback, never as an applied
 // schema change.
@@ -1591,6 +3763,42 @@ func PreviewCommentRollbackSummaryCompleted() string {
 	data := sampleSummaryData(state.Apply.Completed, sampleRollbackTables(state.Task.Completed))
 	data.Rollback = true
 	return RenderApplySummaryComment(data)
+}
+
+// sampleRollbackPlanUnsafeData is a rollback plan for a PR whose apply added
+// the audit_log table, so rolling it back drops the table again.
+func sampleRollbackPlanUnsafeData() PlanCommentData {
+	return PlanCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		ApplyID:      "apply_8c2f4e1a",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"DROP TABLE `audit_log`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "audit_log", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `audit_log`", ChangeType: "drop"},
+		},
+	}
+}
+
+// PreviewCommentRollbackPlanUnsafe renders a rollback plan comment whose
+// rollback drops a table, naming the unsafe change and the --allow-unsafe
+// consent its confirmation takes.
+func PreviewCommentRollbackPlanUnsafe() string {
+	return RenderRollbackPlanComment(sampleRollbackPlanUnsafeData())
+}
+
+// PreviewCommentRollbackUnsafeBlocked renders the refusal posted when
+// rollback-confirm is given without --allow-unsafe on that rollback plan.
+func PreviewCommentRollbackUnsafeBlocked() string {
+	data := sampleRollbackPlanUnsafeData()
+	data.ApplyID = ""
+	return RenderRollbackUnsafeChangesBlocked(data)
 }
 
 // PreviewCommentSummaryCompletedVitessDDLWithVSchema renders a completed Vitess
@@ -1634,9 +3842,81 @@ func PreviewCommentSummaryFailed() string {
 	tables[1].PercentComplete = 30
 	tables[2].Status = state.Task.Cancelled
 	data := sampleSummaryData(state.Apply.Failed, tables)
-	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
+	// The engine reports a failure as a reason SchemaBot wrote, keyed off the
+	// target's error code. The target's own words — which quote the row that
+	// could not be copied — stay in the server logs.
+	data.ErrorMessage = mysqlerr.ReasonFromText("(errno 1364)")
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false)
+		RenderFailureLogs([]LogGroupData{
+			{Entries: sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value")},
+		}, GitHubIssueCommentMaxChars)
+}
+
+// PreviewCommentSummaryStoppedAtCutoverOnOnlyShard renders the final summary
+// of an apply on a keyspace's only shard that deferred its cutover across
+// three tables. users failed while orders and products had copied and waited
+// at the cutover, which could then never run, so SchemaBot stopped them,
+// saved their copies, and failed the apply. The error is users' alone, and a
+// note says a new apply resumes the stopped tables.
+func PreviewCommentSummaryStoppedAtCutoverOnOnlyShard() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Stopped
+	tables[1].Status = state.Task.Failed
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[2].Status = state.Task.Stopped
+	data := sampleSummaryData(state.Apply.Failed, tables)
+	data.DeferCutover = true
+	data.ErrorMessage = "lock wait timeout exceeded; try restarting transaction"
+	data.StoppedAtCutover = presentation.StoppedAtCutover{Count: 2, EndedBy: "users"}
+	return RenderApplySummaryComment(data)
+}
+
+// PreviewCommentSummaryFailedEngineLogs renders a failed summary for an apply
+// a data plane drove. The one logs fold carries both accounts of it:
+// SchemaBot's own, and the engine's account of why the copy stopped. The error
+// block above them names the code and no more, because the target's own words
+// quote the row it could not convert; the engine's line is what turns that
+// code into something an operator can act on without leaving the PR, which is
+// where the error block sends them.
+func PreviewCommentSummaryFailedEngineLogs() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Failed
+	tables[1].DDL = "ALTER TABLE `users` MODIFY COLUMN `nickname` varchar(32) NOT NULL"
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	// The stored reason is what SchemaBot recorded and what its own log line
+	// repeats. A reason chosen by code renders as is; only the generic sentence
+	// is rewritten to point at the fold below.
+	stored := mysqlerr.ReasonFromText("(errno 1265)")
+	data := sampleSummaryData(state.Apply.Failed, tables)
+	data.ErrorMessage = mysqlerr.PointToRenderedLogs(stored)
+	return RenderApplySummaryComment(data) +
+		RenderFailureLogs([]LogGroupData{
+			{Label: "apply logs", Entries: sampleRemoteFailureLogEntries("users", stored)},
+			{Label: "engine logs: shard-a", Entries: sampleEngineFailureLogEntries("users", "nickname")},
+		}, GitHubIssueCommentMaxChars)
+}
+
+// PreviewCommentSummaryFailedEngineLogsMultiDeployment renders the logs fold
+// for an apply that fanned out across two data planes. Every account keeps its
+// own group: the clocks and log ids behind them are independent, so merging
+// them into one stream would assert an ordering across machines.
+func PreviewCommentSummaryFailedEngineLogsMultiDeployment() string {
+	shardA := sampleEngineFailureLogEntries("users", "nickname")
+	shardB := []LogEntryData{
+		{CreatedAt: sampleTime().Add(-8*time.Minute + 30*time.Second), Level: "info", Message: "[users] copy starting: 1192044 rows estimated, 4 threads"},
+		{CreatedAt: sampleTime().Add(-3 * time.Minute), Level: "info", Message: "[users] copy complete: 1192044 rows"},
+		{CreatedAt: sampleTime().Add(-2 * time.Minute), Level: "info", Message: "[users] cutover complete"},
+	}
+	return RenderFailureLogs([]LogGroupData{
+		{Label: "apply logs", Entries: sampleRemoteFailureLogEntries("users", mysqlerr.ReasonFromText("(errno 1265)"))},
+		{Label: "engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001", Entries: shardA},
+		{Label: "engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002", Entries: shardB},
+	}, GitHubIssueCommentMaxChars)
 }
 
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.
@@ -1692,7 +3972,7 @@ func PreviewCommentSummaryFailedLarge() string {
 	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 3*time.Hour+30*time.Minute)
 	data.ErrorMessage = "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'"), GitHubIssueCommentMaxChars, false)
+		RenderFailureLogs([]LogGroupData{{Entries: sampleFailureLogEntries("addresses", "Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'")}}, GitHubIssueCommentMaxChars)
 }
 
 // PreviewCommentSummaryMultiNamespaceFailed renders a failed summary with tables from multiple namespaces.
@@ -1707,7 +3987,7 @@ func PreviewCommentSummaryMultiNamespaceFailed() string {
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = "table customers.addresses failed: Error 1205: Lock wait timeout exceeded"
 	return RenderApplySummaryComment(data) +
-		RenderRecentFailureLogs(sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded"), GitHubIssueCommentMaxChars, false)
+		RenderFailureLogs([]LogGroupData{{Entries: sampleFailureLogEntries("addresses", "Error 1205: Lock wait timeout exceeded")}}, GitHubIssueCommentMaxChars)
 }
 
 // PreviewCommentSummaryMultiNamespaceCompleted renders a completed summary with tables from multiple namespaces.

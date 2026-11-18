@@ -18,6 +18,13 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
+// ErrRemoteOperationNeverStarts is returned by an operation-scoped remote drive
+// when the data plane reports the operation will never start: no driver there
+// claimed it before its apply settled. The drive has already failed the
+// operation's tasks with that reason, so the operator derives the operation
+// from them like any other failure instead of polling it forever.
+var ErrRemoteOperationNeverStarts = errors.New("remote operation will never start: its apply settled before it began")
+
 // ErrApplyLeasePresumedLost is returned by a drive whose lease heartbeat
 // writes have been failing for the full storage.ApplyLeaseStaleAfter window.
 // The lease was never definitively reported lost — storage was unreachable —
@@ -27,12 +34,74 @@ var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation
 // as an engine failure.
 var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after heartbeat failures spanning the staleness window")
 
+// ErrOperatorShutdown is the cause the operator cancels its drives with when the
+// process shuts down. A drive handing its apply back for any other reason halts
+// the engine work it started in this process before it returns; one ended by
+// shutdown leaves that to the shutdown, which halts every in-process engine
+// itself once the drives have returned.
+var ErrOperatorShutdown = errors.New("operator is shutting down")
+
+type operatorShutdownKey struct{}
+
+// NewOperatorContext returns the context an operator runs its drives under and
+// the function that shuts them down, which cancels the drives with
+// ErrOperatorShutdown. A drive's context can end for other reasons first — a
+// lost lease, a stall, a hand-back, or the operator's parent context being
+// cancelled — and then its cause never says shutdown. So the signal that
+// shutdown has begun lives on a context of its own that only shutDown ends,
+// and a drive tearing down after any earlier cancellation still sees a
+// shutdown begin and leaves the teardown to it.
+func NewOperatorContext(parent context.Context) (ctx context.Context, shutDown func()) {
+	drives, cancelDrives := context.WithCancelCause(parent)
+	shutdown, signalShutdown := context.WithCancelCause(context.WithoutCancel(parent))
+	ctx = context.WithValue(drives, operatorShutdownKey{}, shutdown)
+	return ctx, func() {
+		signalShutdown(ErrOperatorShutdown)
+		cancelDrives(ErrOperatorShutdown)
+	}
+}
+
+// operatorShuttingDown reports whether the operator running this drive has
+// begun shutting down, read from the drive's own cancellation cause and from
+// the shutdown signal NewOperatorContext attached.
+func operatorShuttingDown(ctx context.Context) bool {
+	if errors.Is(context.Cause(ctx), ErrOperatorShutdown) {
+		return true
+	}
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
+	return ok && errors.Is(context.Cause(shutdown), ErrOperatorShutdown)
+}
+
+// afterOperatorShutdown arranges for f to run once the operator running this
+// drive begins shutting down, and returns a function that stops the
+// arrangement. A drive with no operator shutdown signal never runs f.
+func afterOperatorShutdown(ctx context.Context, f func()) (stop func() bool) {
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
+	if !ok {
+		return func() bool { return true }
+	}
+	return context.AfterFunc(shutdown, func() {
+		if errors.Is(context.Cause(shutdown), ErrOperatorShutdown) {
+			f()
+		}
+	})
+}
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps
 // ErrNoTasksForApplyOperation so the same fail-closed handling (errors.Is)
 // terminalizes the stale claim rather than retrying it forever.
 var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", ErrNoTasksForApplyOperation)
+
+// ErrPlanMissingForApplyOperation is returned when a task-less operation's
+// parent apply points at a plan row that is absent. The plan is what decides
+// whether an operation with no tasks is a legitimate VSchema-only drive, so
+// without it the operation can never be dispatched. Like
+// ErrApplyOperationRowMissing it names its own cause while wrapping
+// ErrNoTasksForApplyOperation, so the operator terminalizes the claim instead of
+// re-driving an operation that no retry can advance.
+var ErrPlanMissingForApplyOperation = fmt.Errorf("plan not found for apply operation: %w", ErrNoTasksForApplyOperation)
 
 // ErrApplyTasksNotLoaded is returned by a whole-apply drive that loaded zero
 // tasks for an apply that owns task rows. Such an apply is undriveable, not
@@ -42,13 +111,91 @@ var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", 
 // visibly stuck until the rows load or an operator intervenes.
 var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader did not return")
 
+// ErrApplyTaskRowMissing is returned by a sequential drive whose pre-start
+// re-read of a task found no row. The drive loaded that task, so the apply is
+// undriveable, not done: the rows that remain would derive a verdict the
+// vanished task never earned. The drive exits without a verdict and the apply
+// stays claimable, so the work stays visibly stuck until the row is restored or
+// an operator intervenes.
+var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
+
+// ErrLogsTargetNotInApply is returned by a Logs read scoped to a target the
+// apply has no operation on. An empty result would read as a target that wrote
+// nothing, so the read refuses instead.
+var ErrLogsTargetNotInApply = errors.New("apply has no operation on the requested target")
+
+// ErrLogsShardNotInApply is returned by a Logs read scoped to a shard none of
+// the apply's operations (on the requested target, when one is named) runs on.
+// It refuses for the same reason as ErrLogsTargetNotInApply.
+var ErrLogsShardNotInApply = errors.New("apply has no operation on the requested shard")
+
+// ErrTaskRequeueRefused is returned by a resume whose write putting a
+// failed_retryable task back to pending for a retry, or a stopped task back to
+// pending for a start, did not land. The drive exits with the task row still at
+// rest and the next claim repeats the requeue. A local drive and a gRPC drive
+// dispatching a retry exit before any engine work starts, since running the
+// task's DDL while storage records it at rest would leave work no stored state
+// accounts for. A gRPC drive requeues its stopped tasks only after the data
+// plane accepted the start, so there the remote work is already running; the
+// start request stays pending, and the next claim adopts the data plane's
+// state and retries the requeue before completing it. A retry's claim spends
+// one of the apply's recovery attempts, so that loop ends with the recovery
+// budget; a start's claim spends none, so the request stays pending until the
+// write lands. The operator counts every exit under its own resume failure
+// reason, so a requeue that keeps being refused is visible rather than one
+// warning per claim.
+var ErrTaskRequeueRefused = errors.New("task requeue refused")
+
+// ErrTaskVerdictRefused is returned by a drive whose write recording a task's
+// terminal outcome — failed, failed_retryable, cancelled behind a permanent
+// failure, or an outcome adopted from the engine — did not land. The apply's
+// outcome, and in a multi-operation drive the operation row the operator
+// derives, is read from the task rows, so the drive records nothing on top of
+// a verdict storage never took: the apply stays active and the next claim reads
+// every task as stored and settles it. Verdicts already stored for earlier
+// tasks stay stored. The operator leaves an operation whose drive returned this
+// as found, running and claimable, rather than deriving its row from a task
+// set that is only partly settled: a stored failure ahead of a refused write
+// would otherwise terminalize the operation over a task that still reads
+// active, and a terminal operation gets no next claim.
+var ErrTaskVerdictRefused = errors.New("task verdict refused")
+
+// ErrPostTerminalReconcile is matched by a drive's failure in the work an apply
+// owes after its terminal outcome is stored, such as answering the start that
+// admitted the claim. The drive has already settled the schema change and
+// nothing re-claims a settled apply, so a caller runs its post-drive settlement
+// rather than treating the drive as unfinished.
+var ErrPostTerminalReconcile = errors.New("reconcile after the stored terminal outcome failed")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.
 	ErrPullSchemaUnsupportedType = errors.New("pull schema unsupported database type")
 	// ErrPullSchemaInvalidRequest marks a malformed pull request.
 	ErrPullSchemaInvalidRequest = errors.New("pull schema invalid request")
+	// ErrCompareSchemaFileChangeUnsupported marks a schema file comparison
+	// for a database type whose engine cannot compare files.
+	ErrCompareSchemaFileChangeUnsupported = errors.New("schema file comparison unsupported for database type")
 )
+
+// SchemaFileChangeComparer is the optional engine capability behind
+// CompareSchemaFileChange. An engine whose schema files can only be
+// understood by running them on the target implements it; LocalClient fails
+// closed with ErrCompareSchemaFileChangeUnsupported for an engine that does
+// not.
+type SchemaFileChangeComparer interface {
+	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
+}
+
+// SchemaPuller is the optional engine capability that answers PullSchema for
+// database types without a built-in pull path. An engine supplied through
+// LocalConfig.EngineFactories advertises live-schema pull support by
+// implementing it; LocalClient delegates pull requests for its type to the
+// capability and fails closed with ErrPullSchemaUnsupportedType when the
+// engine does not provide it.
+type SchemaPuller interface {
+	PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+}
 
 // Client defines the interface for schema change operations.
 // Uses proto-generated types for type safety.
@@ -64,6 +211,12 @@ type Client interface {
 	// plan. Its result is not applyable (no plan_id); it is the read-only
 	// producer the control plane runs per deployment to detect review-time drift.
 	PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error)
+
+	// CompareSchemaFileChange reports whether a pull request's edit to one
+	// schema file generates the same schema change on two bases, by running
+	// each version on the target in a rolled-back transaction. It is
+	// read-only; the review gate asks it for files it cannot compare offline.
+	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
 
 	// Apply executes a previously generated plan.
 	// Validates that the schema hasn't changed since Plan was called.
@@ -88,9 +241,6 @@ type Client interface {
 
 	// Start resumes a stopped schema change.
 	Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error)
-
-	// Volume modifies the schema change speed/concurrency in-flight.
-	Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error)
 
 	// Revert reverts a completed schema change during the revert window.
 	// Only supported for Vitess (PlanetScale).
@@ -147,4 +297,42 @@ type Client interface {
 
 	// Close releases any resources held by the client.
 	Close() error
+}
+
+// ShutdownHalter is an optional capability for clients whose engines drive
+// schema changes inside this process. A halting client brings that in-process
+// work down so the process can exit without leaving a target held while it has
+// stopped renewing the apply's lease. Clients that delegate to a separate Tern
+// service do not implement it: that service owns its own engines and halts them
+// on its own shutdown.
+type ShutdownHalter interface {
+	// HaltForShutdown brings this client's in-flight schema change work down,
+	// checkpointed so another driver can resume it, and returns once its engine
+	// no longer holds the target. It is not an operator stop: the applies it
+	// halts stay active for reclaim.
+	HaltForShutdown(ctx context.Context) error
+}
+
+// DriverCapacity is the drivers a deployment's live servers run.
+type DriverCapacity struct {
+	// LiveServers is how many of the deployment's servers reported their
+	// drivers within its live window.
+	LiveServers int
+	// Drivers is how many drivers those servers run, together.
+	Drivers int
+	// DeferredCutoverDrivers is how many of those drivers may hold an
+	// operation waiting at a deferred cutover.
+	DeferredCutoverDrivers int
+	// MaxDriversPerApply is how many operations of one apply the deployment
+	// runs at once.
+	MaxDriversPerApply int
+}
+
+// DriverCapacityReader is a client for a deployment whose operators run its
+// operations on another plane. Every operation sent there runs on one of that
+// plane's drivers, so a deferred apply is checked against that plane's drivers
+// as well as this one's. A nil capacity with no error is a deployment that
+// does not report it, and a deferred apply that needs it is refused there.
+type DriverCapacityReader interface {
+	DriverCapacity(ctx context.Context) (*DriverCapacity, error)
 }

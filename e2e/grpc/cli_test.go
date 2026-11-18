@@ -257,68 +257,6 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 }
 
-// TestGRPCCLI_Volume tests adjusting schema change speed during an apply via CLI.
-// Uses INT->BIGINT PK change to force Spirit copy-swap (not instant DDL).
-func TestGRPCCLI_Volume(t *testing.T) {
-	bin := grpcCLIBuildOrFind(t)
-	endpoint := grpcSchemabotURL(t)
-
-	tableName := uniqueGRPCTableName("cli_volume")
-	grpcCreateTestTable(t, "staging", tableName, fmt.Sprintf(
-		`CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)`, tableName))
-
-	grpcSeedRows(t, "staging", tableName, "name, data",
-		"CONCAT('user_', seq), REPEAT('x', 500)", 100000)
-	grpcEnsureNoActiveChange(t, "testapp", "staging")
-
-	// Schema with INT->BIGINT PK change
-	schemaDir := grpcCLISchemaDir(t, map[string]string{
-		tableName + ".sql": fmt.Sprintf(
-			`CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);`, tableName),
-	})
-
-	// Apply
-	out := e2eutil.RunCLIInDir(t, bin, schemaDir, "apply",
-		"-s", ".",
-		"-e", "staging",
-		"--endpoint", endpoint,
-		"-y",
-		"--watch=false",
-		"--allow-unsafe",
-		"-o", "json",
-	)
-	applyID := parseApplyID(t, out)
-
-	// Wait for running state
-	testutil.WaitForAnyState(t, endpoint, applyID,
-		[]string{state.Apply.Running, state.Apply.Completed}, 60*time.Second)
-
-	// Try to adjust volume (may fail if Spirit completed too fast -- that's OK)
-	progOut, _ := e2eutil.RunCLIWithErrorInDir(t, bin, schemaDir, "progress",
-		applyID,
-		"--endpoint", endpoint,
-		"--watch=false",
-	)
-	if !strings.Contains(e2eutil.StripANSI(progOut), "Completed") {
-		volOut, err := e2eutil.RunCLIWithErrorInDir(t, bin, schemaDir, "volume",
-			applyID,
-			"-e", "staging",
-			"-v", "5",
-			"--endpoint", endpoint,
-		)
-		if err != nil {
-			t.Logf("volume command returned error (may have completed): %v\nOutput: %s", err, volOut)
-		} else {
-			t.Logf("volume adjustment output: %s", volOut)
-		}
-	}
-
-	// Wait for completion
-	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 5*time.Minute)
-
-	grpcEnsureNoActiveChange(t, "testapp", "staging")
-}
-
 // TestGRPCCLI_Progress_ByApplyID tests that progress can be fetched by apply ID.
 func TestGRPCCLI_Progress_ByApplyID(t *testing.T) {
 	bin := grpcCLIBuildOrFind(t)

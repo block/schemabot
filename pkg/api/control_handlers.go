@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -27,7 +31,20 @@ func controlStatus(accepted bool) string {
 
 type controlOperationHTTPError struct {
 	status int
+	code   string
 	err    error
+}
+
+type terminalControlError struct {
+	err error
+}
+
+func (e *terminalControlError) Error() string {
+	return e.err.Error()
+}
+
+func (e *terminalControlError) Unwrap() error {
+	return e.err
 }
 
 func (e *controlOperationHTTPError) Error() string {
@@ -47,6 +64,33 @@ func controlConflictf(format string, args ...any) error {
 	}
 }
 
+// controlConflictCodef is controlConflictf with an error code, for a rejection
+// a client acts on by its code rather than by its message.
+func controlConflictCodef(code, format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: http.StatusConflict,
+		code:   code,
+		err:    fmt.Errorf(format, args...),
+	}
+}
+
+// terminalControlf marks a control failure that retrying the same request
+// cannot repair: an internal data invariant violation or a deterministic
+// downstream rejection.
+func terminalControlf(format string, args ...any) error {
+	return &terminalControlError{err: fmt.Errorf(format, args...)}
+}
+
+// controlOperationErrorCode is the error code a rejection carries, empty for
+// one that carries none.
+func controlOperationErrorCode(err error) string {
+	var httpErr *controlOperationHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.code
+	}
+	return ""
+}
+
 func controlOperationHTTPStatus(err error) int {
 	var httpErr *controlOperationHTTPError
 	if errors.As(err, &httpErr) {
@@ -64,6 +108,14 @@ func IsInternalControlError(err error) bool {
 	return controlOperationHTTPStatus(err) >= http.StatusInternalServerError
 }
 
+// IsTerminalControlError reports whether retrying the same control request
+// cannot change its outcome. Internal invariant failures remain HTTP 500s but
+// are terminal for durable command processing.
+func IsTerminalControlError(err error) bool {
+	var terminalErr *terminalControlError
+	return errors.As(err, &terminalErr) || !IsInternalControlError(err)
+}
+
 // ControlOperationHTTPStatus returns the HTTP status associated with a control
 // operation error. Untyped errors are internal failures.
 func ControlOperationHTTPStatus(err error) int {
@@ -73,6 +125,16 @@ func ControlOperationHTTPStatus(err error) int {
 func controlHTTPErrorf(status int, format string, args ...any) error {
 	return &controlOperationHTTPError{
 		status: status,
+		err:    fmt.Errorf(format, args...),
+	}
+}
+
+// controlHTTPCodeErrorf is controlHTTPErrorf with an error code, for an answer
+// a client acts on by its code rather than by its status or message.
+func controlHTTPCodeErrorf(status int, code, format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: status,
+		code:   code,
 		err:    fmt.Errorf(format, args...),
 	}
 }
@@ -100,20 +162,20 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return nil, nil, controlHTTPErrorf(http.StatusBadRequest, "environment is required")
 	}
 	if s.storage == nil {
-		return nil, nil, fmt.Errorf("storage is not available")
+		return nil, nil, terminalControlf("storage is not available")
 	}
 
 	applyStore := s.storage.Applies()
 	if applyStore == nil {
-		return nil, nil, fmt.Errorf("apply store is not available")
+		return nil, nil, terminalControlf("apply store is not available")
 	}
 	planStore := s.storage.Plans()
 	if planStore == nil {
-		return nil, nil, fmt.Errorf("plan store is not available")
+		return nil, nil, terminalControlf("plan store is not available")
 	}
 	taskStore := s.storage.Tasks()
 	if taskStore == nil {
-		return nil, nil, fmt.Errorf("task store is not available")
+		return nil, nil, terminalControlf("task store is not available")
 	}
 
 	apply, err := applyStore.GetByApplyIdentifier(ctx, req.ApplyIdentifier)
@@ -133,7 +195,7 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, nil, fmt.Errorf("load source plan %d for rollback apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return apply, nil, fmt.Errorf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
+		return apply, nil, terminalControlf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
 	}
 	if !plan.HasOriginalFilesCapture() {
 		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
@@ -150,10 +212,34 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, plan, controlConflictf("apply %s is not the schema change that the current rollback planner would select for database %s environment %s", apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
 	if latestTask.PlanID != apply.PlanID {
-		return apply, plan, fmt.Errorf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		memberOfRound, err := taskPlanIsMemberOfRound(ctx, planStore, latestTask, plan)
+		if err != nil {
+			return apply, plan, err
+		}
+		if !memberOfRound {
+			return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		}
+		s.logger.Debug("rollback source task ran a member plan of the apply's review round",
+			append(apply.LogAttrs(), "task_id", latestTask.TaskIdentifier, "task_plan_id", latestTask.PlanID)...)
 	}
 
 	return apply, plan, nil
+}
+
+// taskPlanIsMemberOfRound reports whether task ran a member plan stored for
+// the review round of primary. A rollout whose targets are each planned
+// against their own schema runs every target but the primary from a plan of
+// its own, bound to the primary plan, so its tasks legitimately point at a plan
+// other than the apply's.
+func taskPlanIsMemberOfRound(ctx context.Context, planStore storage.PlanStore, task *storage.Task, primary *storage.Plan) (bool, error) {
+	taskPlan, err := planStore.GetByID(ctx, task.PlanID)
+	if err != nil {
+		return false, fmt.Errorf("load plan %d of rollback source task %s: %w", task.PlanID, task.TaskIdentifier, err)
+	}
+	if taskPlan == nil {
+		return false, nil
+	}
+	return primary.PlanIdentifier != "" && taskPlan.PrimaryPlanIdentifier == primary.PlanIdentifier, nil
 }
 
 func validateRollbackSourceScope(req RollbackSourceRequest, apply *storage.Apply) error {
@@ -221,13 +307,6 @@ func rollbackTaskCompletedAfter(candidate, current *storage.Task) bool {
 	return candidate.CreatedAt.After(current.CreatedAt)
 }
 
-func controlOperationCaller(caller string) string {
-	if caller == "" {
-		return "unknown"
-	}
-	return caller
-}
-
 // resolveCaller returns the identity an operation is attributed to: the
 // authenticated caller when the request carried a real identity (API auth
 // enabled), otherwise the caller supplied in the request. The authenticated
@@ -235,19 +314,36 @@ func controlOperationCaller(caller string) string {
 // than a client-supplied string; with auth disabled (or on paths with no
 // authenticated user, like control-plane dispatch) the request caller is used
 // unchanged.
+//
+// When the request caller declares a CLI origin ("cli:<user>@<host>"), the
+// verified subject replaces the client-claimed username but the channel prefix
+// and hostname are preserved: they carry no identity weight, and an operator
+// triaging an apply wants to see how it was driven and from which machine.
+// Only the CLI channel is preserved; any other channel prefix is attributed to
+// the subject alone. So is a hostname that fails validation, or a composite
+// that would not fit the stored caller column — the verified identity is never
+// sacrificed for the advisory hostname.
 func resolveCaller(ctx context.Context, requestCaller string) string {
-	if subject, ok := auth.AuthenticatedSubject(ctx); ok {
-		return subject
+	subject, ok := auth.AuthenticatedSubject(ctx)
+	if !ok {
+		return requestCaller
 	}
-	return requestCaller
+	if _, host, ok := caller.SplitCLI(requestCaller); ok && caller.ValidHost(host) {
+		if composite := caller.FormatCLI(subject, host); len(composite) <= storage.MaxCallerChars {
+			return composite
+		}
+	}
+	return subject
 }
 func (s *Service) logControlOperationForApply(ctx context.Context, apply *storage.Apply, caller, eventType, message string) {
 	logStore := s.storage.ApplyLogs()
 	if logStore == nil {
-		s.logger.Error("apply log store not available for control operation log", append(apply.LogAttrs(), "event", eventType)...)
+		s.logger.Error("apply log store not available for control operation log",
+			append(apply.LogAttrs(),
+				"event", eventType)...)
 		return
 	}
-	logMessage := fmt.Sprintf("%s (caller: %s)", message, controlOperationCaller(caller))
+	logMessage := fmt.Sprintf("%s (caller: %s)", message, storage.ApplyLogCaller(caller))
 	if err := logStore.Append(ctx, &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     storage.LogLevelInfo,
@@ -255,7 +351,9 @@ func (s *Service) logControlOperationForApply(ctx context.Context, apply *storag
 		Source:    storage.LogSourceSchemaBot,
 		Message:   logMessage,
 	}); err != nil {
-		s.logger.Error("failed to append control operation log", "apply_id", apply.ID, "event", eventType, "error", err)
+		s.logger.Error("failed to append control operation log",
+			append(apply.LogAttrs(),
+				"event", eventType, "error", err)...)
 	}
 }
 
@@ -264,21 +362,14 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 	status := controlOperationHTTPStatus(err)
 	attrs := []any{"error", err}
 	if apply != nil {
-		attrs = append(attrs,
-			"apply_id", apply.ApplyIdentifier,
-			"external_apply_id", apply.ExternalID,
-			"database", apply.Database,
-			"database_type", apply.DatabaseType,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-		)
+		attrs = append(attrs, apply.LogAttrs()...)
 	}
 	if status >= http.StatusInternalServerError {
 		s.logger.Error(opName+" failed", attrs...)
 		s.writeError(w, status, opName+" failed: "+err.Error())
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
-		s.writeError(w, status, opName+" rejected: "+err.Error())
+		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
 	}
 }
 
@@ -306,12 +397,15 @@ func (s *Service) rejectControlIfStopPending(ctx context.Context, opName string,
 	return nil
 }
 
-// decodeControlRequest decodes a control request (stop/start/cutover/volume),
-// loads the apply record, and returns a Tern client using the deployment stored
-// on that apply. Control operations are scoped by apply_id + environment; the
-// database is derived from storage so callers cannot target a different
-// database than the one originally planned.
-func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, dest any,
+// decodeControlRequest decodes a control request (stop/start/cutover),
+// loads the apply record, authorizes the caller against the apply's database,
+// and returns a Tern client using the deployment stored on that apply. Control
+// operations are scoped by apply_id + environment; the database is derived
+// from storage so callers cannot target a different database than the one
+// originally planned — which is also why per-database authorization happens
+// here, after the target resolves, and not in the middleware. operation is the
+// control operation name, used for authorization decisions and metrics.
+func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, operation string, dest any,
 	applyID, environment *string) (tern.Client, *storage.Apply, string, bool) {
 
 	decoder := json.NewDecoder(r.Body)
@@ -320,6 +414,7 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 		s.writeBodyDecodeError(w, err)
 		return nil, nil, "", false
 	}
+	*environment = storage.CanonicalKey(*environment)
 	if *applyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
 		return nil, nil, "", false
@@ -357,14 +452,14 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 			fmt.Sprintf("apply %q belongs to environment %q, not %q", applyIdentifier, apply.Environment, *environment))
 		return nil, nil, "", false
 	}
+	if !s.authorizeDirectWrite(w, r, operation, apply.Database, apply.Environment) {
+		return nil, nil, "", false
+	}
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
 		s.logger.Error("control request apply is missing stored deployment metadata",
-			"apply_id", applyIdentifier,
-			"database", apply.Database,
-			"database_type", apply.DatabaseType,
-			"environment", apply.Environment,
-			"error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return nil, nil, "", false
 	}
@@ -372,11 +467,10 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		s.logger.Error("failed to create Tern client",
-			"deployment", deployment,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
-		s.writeError(w, http.StatusNotFound, err.Error())
+			append(apply.LogAttrs(),
+				"operation", operation, "error", err)...)
+		failure := controlTernClientFailure(apply, deployment, err)
+		s.writeErrorCode(w, controlOperationHTTPStatus(failure), controlOperationErrorCode(failure), failure.Error())
 		return nil, nil, "", false
 	}
 
@@ -414,25 +508,52 @@ func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier,
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
 		s.logger.Error("control request apply is missing stored deployment metadata",
-			"operation", operation,
-			"apply_id", applyIdentifier,
-			"database", apply.Database,
-			"database_type", apply.DatabaseType,
-			"environment", apply.Environment,
-			"error", err)
+			append(apply.LogAttrs(),
+				"operation", operation, "error", err)...)
 		return nil, apply, "", err
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		s.logger.Error("failed to create Tern client",
-			"operation", operation,
-			"deployment", deployment,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
-		return nil, apply, "", controlHTTPErrorf(http.StatusNotFound, "%s", err.Error())
+			append(apply.LogAttrs(),
+				"operation", operation, "error", err)...)
+		return nil, apply, "", controlTernClientFailure(apply, deployment, err)
 	}
 	return client, apply, ternApplyIDForStoredApply(apply), nil
+}
+
+// controlEngineUnavailableMessage is what a control request answers when the
+// Tern client for its apply's deployment cannot be built. The cause can carry
+// DSN or host fragments, so it goes to the server log and never to the
+// requester. The message does not promise that a retry will succeed, because
+// the cause can also be a configuration error that only an operator can fix.
+const controlEngineUnavailableMessage = "SchemaBot could not connect to the schema change engine for this deployment. " +
+	"Retry in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log."
+
+// controlTernClientFailure maps a failure to obtain the Tern client for an
+// apply's deployment to the error a control request answers with.
+//
+// A deployment that is not in the server configuration is a 404 with the
+// deployment-not-found code, which the requester cannot repair by retrying.
+// Its message is built from the apply's own database, deployment, and
+// environment, never from the failure's text, so nothing a later wrap adds to
+// that text can reach the requester.
+//
+// Any other failure means the client could not be built, for example because
+// a DSN or token did not resolve or the gRPC client did not start. That is a
+// 503 with the engine-unavailable code, which clients treat as retryable. A
+// configuration entry that exists but can never produce a client lands here
+// too, because it cannot be told apart from an outage at this point. Nothing
+// is recorded for a request answered this way, so a retry cannot wedge an
+// apply, and a caller that retries must bound its attempts.
+func controlTernClientFailure(apply *storage.Apply, deployment string, err error) error {
+	if errors.Is(err, errTernDeploymentNotConfigured) {
+		return controlHTTPCodeErrorf(http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
+			"no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config",
+			apply.Database, deployment, apply.Environment)
+	}
+	return controlHTTPCodeErrorf(http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable,
+		"%s", controlEngineUnavailableMessage)
 }
 
 // ternApplyIDForStoredApply returns the identifier that a Tern RPC expects for
@@ -461,7 +582,7 @@ type CutoverRequest struct {
 // handleCutover handles POST /api/cutover requests.
 func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	var req CutoverRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "cutover", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -518,16 +639,15 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		return nil, 0, err
 	}
 	if controlReq != nil {
+		if err := s.rejectPendingCutoverMissingMembers(ctx, apply, controlReq, caller); err != nil {
+			return nil, 0, err
+		}
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
 			"Cutover requested by user while cutover request already pending")
 		s.logger.Info("cutover request already pending",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"original_requested_by", controlReq.RequestedBy)
+			append(apply.LogAttrs(),
+				"requested_by", caller, "original_requested_by", controlReq.RequestedBy)...)
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
@@ -543,27 +663,57 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, err
 	}
+	// One member's cutover in progress does not make the request redundant
+	// for the rest of a multi-operation apply: under an ordered policy another
+	// member can be parked and free to cut over at the same time. The turn is
+	// decided before the in-progress answer, so the request lands on that
+	// member, and the in-progress answer is left for when nothing is.
+	var turn cutoverTurn
+	if multiOp && (readiness == cutoverRequestReady || readiness == cutoverRequestAlreadyInProgress) {
+		turn, err = s.cutoverTurnForRequest(ctx, apply)
+		if err != nil {
+			err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+			return nil, 0, err
+		}
+		if hold := turn.hold; hold != nil {
+			s.logger.Info("cutover request rejected because an earlier member holds every parked member",
+				append(apply.LogAttrs(),
+					"requested_by", caller,
+					"parked_member", hold.parked,
+					"blocking_member", hold.blocker,
+					"blocking_state", hold.blockerState)...)
+			err := controlConflictf("%s", hold.message())
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+			return nil, 0, err
+		}
+		if turn.notReady != "" {
+			s.logger.Info("cutover request rejected because not every member of a deferred apply waits at its cutover",
+				append(apply.LogAttrs(), "requested_by", caller, "reason", turn.notReady)...)
+			err := controlConflictf("%s", turn.notReady)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+			return nil, 0, err
+		}
+		switch {
+		case len(turn.takers) > 0:
+			readiness = cutoverRequestReady
+		case turn.inProgress:
+			readiness = cutoverRequestAlreadyInProgress
+		}
+	}
 	if readiness == cutoverRequestAlreadyInProgress {
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
 			"Cutover requested by user while cutover already in progress")
 		s.logger.Info("cutover request accepted because cutover is already in progress",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"state", apply.State)
+			append(apply.LogAttrs(),
+				"requested_by", caller)...)
 		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyInProgress}, http.StatusAccepted, nil
 	}
 	if readiness == cutoverRequestRecovering {
 		s.logger.Info("cutover request rejected while apply is recovering",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"state", apply.State)
+			append(apply.LogAttrs(),
+				"requested_by", caller)...)
 		err := controlConflictf("schema change is recovering after restart; cutover will be available once recovery completes")
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err
@@ -573,16 +723,37 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err
 	}
-	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+	cutoverReq := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCutover,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: caller,
-	})
+	}
+	if len(turn.takers) > 0 {
+		// Bind the request to the members that take it, so this one command
+		// cuts over each member free to cut over now and cannot pass on to a
+		// member that becomes free later.
+		metadata, err := storage.CutoverRequestSetMetadata(operationIDs(turn.takers))
+		if err != nil {
+			err := fmt.Errorf("bind cutover request for apply %s to its members: %w", apply.ApplyIdentifier, err)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+			return nil, 0, err
+		}
+		cutoverReq.Metadata = metadata
+	}
+	recorded, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
 	if err != nil {
 		err := fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, err
+	}
+	if alreadyPending {
+		// Another command was recorded first, bound to the members free when
+		// it was issued. This one is acknowledged by it only if it covers
+		// every member free now.
+		if err := s.rejectPendingCutoverMissingMembers(ctx, apply, recorded, caller); err != nil {
+			return nil, 0, err
+		}
 	}
 	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 	message := "Cutover requested by user"
@@ -591,16 +762,58 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered, message)
 	s.logger.Info("cutover request queued for operator",
-		"apply_id", apply.ApplyIdentifier,
-		"database", apply.Database,
-		"deployment", apply.Deployment,
-		"environment", apply.Environment,
-		"requested_by", caller)
+		append(apply.LogAttrs(),
+			"requested_by", caller)...)
 	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 	if alreadyPending {
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
 	return &apitypes.ControlResponse{Accepted: true}, http.StatusOK, nil
+}
+
+// rejectPendingCutoverMissingMembers refuses a cutover that a pending cutover
+// would acknowledge without carrying: the pending request is bound to the
+// members that were free when it was issued, and a member free now that it
+// does not name would never be cut over by it. A pending request bound to no
+// member is taken by whichever member's drive reaches it, as it always was. A
+// deferred apply with a member that has not reached its cutover is refused as
+// a first cutover would be.
+func (s *Service) rejectPendingCutoverMissingMembers(ctx context.Context, apply *storage.Apply, pending *storage.ApplyControlRequest, caller string) error {
+	boundIDs, err := pending.CutoverOperationIDs()
+	if err != nil {
+		err := fmt.Errorf("read the members the pending cutover of apply %s is bound to: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return err
+	}
+	if len(boundIDs) == 0 {
+		return nil
+	}
+	turn, err := s.cutoverTurnForRequest(ctx, apply)
+	if err != nil {
+		err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return err
+	}
+	if turn.notReady != "" {
+		s.logger.Info("cutover request rejected because not every member of a deferred apply waits at its cutover",
+			append(apply.LogAttrs(), "requested_by", caller, "original_requested_by", pending.RequestedBy, "reason", turn.notReady)...)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return controlConflictf("%s", turn.notReady)
+	}
+	var missing []string
+	for _, op := range turn.takers {
+		if !slices.Contains(boundIDs, op.ID) {
+			missing = append(missing, cutoverOperationName(op))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	s.logger.Info("cutover request rejected because the pending cutover does not include every member free to cut over",
+		append(apply.LogAttrs(), "requested_by", caller, "original_requested_by", pending.RequestedBy,
+			"cutover_operation_ids", boundIDs, "not_included", missing)...)
+	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+	return controlConflictf("a cutover sent earlier is still pending and does not include %s; run cutover again once it settles", strings.Join(missing, ", "))
 }
 
 type cutoverRequestReadiness int
@@ -613,6 +826,14 @@ const (
 )
 
 func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID string, multiOp bool) (cutoverRequestReadiness, error) {
+	// The stored state is authoritative over the remote data plane: a schema
+	// change SchemaBot has already ended cannot be cut over, whatever the remote
+	// still reports.
+	if state.IsTerminalApplyState(apply.State) {
+		s.logger.Info("cutover request rejected because the schema change has already ended",
+			apply.LogAttrs()...)
+		return cutoverRequestNotReady, nil
+	}
 	if state.IsState(apply.State, state.Apply.WaitingForCutover) {
 		return cutoverRequestReady, nil
 	}
@@ -673,6 +894,212 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 	return cutoverRequestNotReady, nil
 }
 
+// cutoverTurnHold names the members of an ordered rollout when a cutover
+// request has no member that could take it: the first parked member, and the
+// earlier member whose state holds it.
+type cutoverTurnHold struct {
+	parked           string
+	blocker          string
+	blockerState     string
+	blockerOnFailure string
+}
+
+// message is the refusal an operator reads: which member holds the cutover,
+// its state, and what lets the rollout go on from there (storage
+// CutoverBlocker). An earlier target of the same deployment holds only in a
+// state the rollout halts on, so each of those cases names the one action
+// that clears it; an earlier deployment holds until it has completed, so the
+// default case names the member to wait for.
+func (h *cutoverTurnHold) message() string {
+	switch h.blockerState {
+	case state.ApplyOperation.Failed:
+		next := "stop the schema change, or fix the failure and apply again"
+		if h.blockerOnFailure == storage.OnFailurePause {
+			next = "release the rollout to continue past it, or stop the schema change"
+		}
+		return fmt.Sprintf("cutover is held: %s failed ahead of %s, and on_failure %s holds every later cutover; %s",
+			h.blocker, h.parked, h.blockerOnFailure, next)
+	case state.ApplyOperation.FailedRetryable:
+		return fmt.Sprintf("cutover is held: %s is retrying a failure ahead of %s; run cutover again once %s recovers",
+			h.blocker, h.parked, h.blocker)
+	case state.ApplyOperation.Stopped:
+		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
+			h.blocker, h.parked)
+	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not run their cutover; stop the schema change and apply again",
+			h.blocker, h.blockerState, h.parked)
+	default:
+		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",
+			h.blocker, h.parked, h.blockerState, h.blocker)
+	}
+}
+
+// cutoverTurn is the intake's answer for a cutover request on a
+// multi-operation apply. takers are the parked operations whose cutover has
+// not started and that no earlier member holds, which the request is bound
+// to: every such operation of an apply that deferred its cutover, so one
+// command cuts over each member free to cut over when it was issued, and the
+// first of them otherwise. hold is set instead when an earlier member holds
+// every such operation.
+// inProgress reports, under an ordered policy with no taker and no hold, that
+// a member's cutover has already started, so the request has nothing left to
+// start. All are unset when the cutover of an apply that did not defer it is
+// unordered, or when no member is parked by task evidence, which leaves the
+// decision to the caller's readiness check.
+type cutoverTurn struct {
+	takers     []*storage.ApplyOperation
+	hold       *cutoverTurnHold
+	inProgress bool
+	// notReady refuses the request on an apply that deferred its cutover
+	// while an operation free to cut over has not reached it.
+	notReady string
+}
+
+// cutoverTurnForRequest decides which member of a multi-operation apply that
+// has a member parked at cutover may take a cutover request now. The request is
+// apply-level and only a parked member no earlier member holds may take it
+// (the drive's own gate, operationCutoverRequestTurn in pkg/tern), so
+// accepting one while an earlier member holds every parked member would queue
+// it for a consumer that is not there yet. A parked member under an unordered
+// cutover policy takes an unbound request as it always has, unless the apply
+// deferred its cutover: the shards of one member drive in parallel under every
+// policy, so they all park, and the request is bound to each of them. The turn
+// is decided by storage CutoverBlocker, the rule the automatic cutover claim
+// follows.
+func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Apply) (cutoverTurn, error) {
+	opStore := s.storage.ApplyOperations()
+	ops, err := opStore.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return cutoverTurn{}, fmt.Errorf("list apply operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	taskStore := s.storage.Tasks()
+	if taskStore == nil {
+		return cutoverTurn{}, fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return cutoverTurn{}, fmt.Errorf("load tasks for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	tasksByOp := make(map[int64][]*storage.Task, len(ops))
+	for _, task := range tasks {
+		if task.ApplyOperationID == nil {
+			continue
+		}
+		tasksByOp[*task.ApplyOperationID] = append(tasksByOp[*task.ApplyOperationID], task)
+	}
+	names := memberDisplayNames(ops)
+	// An apply started with --defer-cutover holds every member until the
+	// operator acts, so one command releases every member free to cut over,
+	// the way the automatic cutover would have released each of them. Without
+	// it a member waits only where the rollout parks it, and each command
+	// cuts over the next member in turn.
+	releasesEveryFreeMember := apply.GetOptions().DeferCutover
+	var turn cutoverTurn
+	cutoverStarted := false
+	for i, op := range ops {
+		if cutoverStartedOnTasks(tasksByOp[op.ID]) {
+			cutoverStarted = true
+			continue
+		}
+		if !parkedOnTasks(tasksByOp[op.ID]) {
+			continue
+		}
+		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) && !releasesEveryFreeMember {
+			return cutoverTurn{}, nil
+		}
+		blocker, err := opStore.CutoverBlocker(ctx, op.ID)
+		if err != nil {
+			return cutoverTurn{}, fmt.Errorf("check cutover order for member %s of apply %s: %w", names[i], apply.ApplyIdentifier, err)
+		}
+		if blocker == nil {
+			turn.takers = append(turn.takers, op)
+			if !releasesEveryFreeMember {
+				return cutoverTurn{takers: turn.takers}, nil
+			}
+			continue
+		}
+		if turn.hold == nil {
+			turn.hold = &cutoverTurnHold{
+				parked:           names[i],
+				blocker:          memberDisplayName(ops, names, blocker),
+				blockerState:     blocker.CutoverHoldState(tasksByOp[blocker.ID]),
+				blockerOnFailure: blocker.OnFailure,
+			}
+		}
+	}
+	if releasesEveryFreeMember {
+		waiting, notReached, err := deferredCutoverReadiness(ctx, opStore, ops, tasksByOp)
+		if err != nil {
+			return cutoverTurn{}, fmt.Errorf("check every member of apply %s waits at its cutover: %w", apply.ApplyIdentifier, err)
+		}
+		if len(notReached) > 0 {
+			return cutoverTurn{notReady: deferredCutoverNotReadyMessage(waiting, notReached)}, nil
+		}
+	}
+	if len(turn.takers) > 0 {
+		return cutoverTurn{takers: turn.takers}, nil
+	}
+	if turn.hold == nil {
+		turn.inProgress = cutoverStarted
+	}
+	return turn, nil
+}
+
+// operationIDs returns the identifiers of ops, in order.
+func operationIDs(ops []*storage.ApplyOperation) []int64 {
+	ids := make([]int64, 0, len(ops))
+	for _, op := range ops {
+		ids = append(ids, op.ID)
+	}
+	return ids
+}
+
+// parkedOnTasks reports whether an operation's tasks are parked at the
+// cutover.
+func parkedOnTasks(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.WaitingForCutover) {
+			return true
+		}
+	}
+	return false
+}
+
+// cutoverStartedOnTasks reports whether an operation's cutover has started:
+// one of its tasks is cutting over. A request cuts over a member's remote
+// apply as a whole, so a member that has started is not one a later request
+// can take again.
+func cutoverStartedOnTasks(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.CuttingOver) {
+			return true
+		}
+	}
+	return false
+}
+
+// memberDisplayNames resolves the operator-facing name of every operation of
+// an apply, naming a member by deployment/target only where its deployment
+// addresses several targets — the rule the PR comment labels members by.
+func memberDisplayNames(ops []*storage.ApplyOperation) []string {
+	members := make([]routing.ExecutionTarget, len(ops))
+	for i, op := range ops {
+		members[i] = routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
+	}
+	return routing.DisplayNames(members)
+}
+
+// memberDisplayName returns op's name from names, index-parallel to ops,
+// falling back to its deployment when op is not among them.
+func memberDisplayName(ops []*storage.ApplyOperation, names []string, op *storage.ApplyOperation) string {
+	for i, candidate := range ops {
+		if candidate.ID == op.ID {
+			return names[i]
+		}
+	}
+	return op.Deployment
+}
+
 // StopRequest is the HTTP request body for POST /api/stop.
 type StopRequest struct {
 	ApplyID     string `json:"apply_id"`
@@ -687,11 +1114,18 @@ type stopControlRequestMetadata struct {
 
 const stopResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequested
 
+// stopResponseStatusLeftToClaimedDrive marks a stop recorded on a stopped apply
+// whose operation a drive has already claimed. The parent stays stopped while
+// that drive resumes the operation, so a stopped parent is no proof the stop
+// landed, and only the drive may complete the stop. It never reaches the wire:
+// the caller sees an ordinary pending stop.
+const stopResponseStatusLeftToClaimedDrive = "left_to_claimed_drive"
+
 // handleStop handles POST /api/stop requests.
 // Records durable stop intent for the apply owner to process.
 func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	var req StopRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "stop", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -720,6 +1154,16 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 // the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
+	// SchemaBot's own stop of an apply whose deferred cutover can no longer
+	// run is told apart by its caller: the drive tail leaves it for the settle
+	// and retry expiry skips the apply. A stop sent under that caller would
+	// hold the apply open with nothing to settle it, so it is refused.
+	if caller == storage.EndedOperationStopCaller {
+		s.logger.Warn("operator: refused a stop sent under the caller SchemaBot reserves for its own stop",
+			append(apply.LogAttrs(), "caller", caller)...)
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "the caller %q is reserved for SchemaBot's own stop; send the stop under your own name", caller)
+	}
 	if apply.Engine == storage.EnginePlanetScale {
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "stop is not supported for this schema change; use cancel to permanently cancel it")
@@ -736,18 +1180,28 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		logMessage := "Stop requested by user"
-		if responseStatus == stopResponseStatusAlreadyRequested {
+		switch responseStatus {
+		case stopResponseStatusAlreadyRequested:
 			logMessage = "Stop requested by user while stop request already pending"
+		case apitypes.ControlStatusStartWithdrawn:
+			logMessage = "Stop requested by user withdrew the queued start; schema change stays stopped"
 		}
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested, logMessage)
-		if responseStatus == stopResponseStatusAlreadyRequested {
+		switch responseStatus {
+		case apitypes.ControlStatusStartWithdrawn:
+			s.logger.Info("immediate stop skipped because the stop withdrew a queued start and the apply is still stopped",
+				append(apply.LogAttrs(),
+					"requested_by", caller)...)
+		case stopResponseStatusAlreadyRequested:
 			s.logger.Info("immediate stop skipped because stop request is already pending",
-				"apply_id", apply.ApplyIdentifier,
-				"database", apply.Database,
-				"deployment", apply.Deployment,
-				"environment", apply.Environment,
-				"requested_by", caller)
-		} else {
+				append(apply.LogAttrs(),
+					"requested_by", caller)...)
+		case stopResponseStatusLeftToClaimedDrive:
+			s.logger.Info("immediate stop skipped because a drive already claimed an operation of the stopped apply; that drive completes the pending stop",
+				append(apply.LogAttrs(),
+					"requested_by", caller)...)
+			responseStatus = ""
+		default:
 			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, environment, caller)
 		}
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
@@ -759,7 +1213,7 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	}
 	return &apitypes.StopResponse{
 		Accepted:     resp.Accepted,
-		ErrorMessage: resp.ErrorMessage,
+		ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage),
 		StoppedCount: resp.StoppedCount,
 		SkippedCount: resp.SkippedCount,
 		Status:       responseStatus,
@@ -775,117 +1229,81 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 	// the aggregate. The durable stop request is already queued at this point.
 	if multiOp, err := s.applyHasMultipleOperations(ctx, apply); err != nil {
 		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate stop",
-			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 	} else if multiOp {
 		s.logger.Info("immediate stop skipped for multi-operation apply; operator will fan out the durable stop request per operation",
-			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "requested_by", caller)
+			append(apply.LogAttrs(),
+				"requested_by", caller)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			"Stop queued; operator will stop each deployment of this multi-deployment apply")
 		return
 	}
 	if client == nil {
 		s.logger.Warn("immediate stop not attempted because Tern client is unavailable; durable stop request remains pending for apply owner retry",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller)
+			append(apply.LogAttrs(),
+				"requested_by", caller)...)
 		return
 	}
 	if client.IsRemote() {
 		s.logger.Info("propagating stop request to remote Tern durable queue",
-			"apply_id", apply.ApplyIdentifier,
-			"tern_apply_id", ternApplyID,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller)
+			append(apply.LogAttrs(),
+				"tern_apply_id", ternApplyID, "requested_by", caller)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			"Stop request propagation to remote Tern durable queue started")
 	}
 	resp, err := client.Stop(ctx, &ternv1.StopRequest{
 		ApplyId:     ternApplyID,
 		Environment: environment,
+		Caller:      caller,
 	})
 	if err != nil {
 		s.logger.Warn("immediate stop failed; durable stop request remains pending for apply owner retry",
-			"apply_id", apply.ApplyIdentifier,
-			"tern_apply_id", ternApplyID,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"error", err)
+			append(apply.LogAttrs(),
+				"tern_apply_id", ternApplyID, "requested_by", caller, "error", err)...)
+		// The transport error is logged above with the identifiers that make it
+		// triageable. The apply log is operator-facing, so it carries the outcome
+		// rather than raw driver text naming hosts, addresses, or internals.
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			fmt.Sprintf("Immediate stop attempt failed; durable stop request remains pending: %v", err))
+			"Immediate stop attempt failed; durable stop request remains pending; see server logs")
 		return
 	}
 	if resp == nil {
 		s.logger.Warn("immediate stop returned nil response; durable stop request remains pending for apply owner retry",
-			"apply_id", apply.ApplyIdentifier,
-			"tern_apply_id", ternApplyID,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller)
+			append(apply.LogAttrs(),
+				"tern_apply_id", ternApplyID, "requested_by", caller)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			"Immediate stop attempt returned no response; durable stop request remains pending")
 		return
 	}
 	if !resp.Accepted {
 		s.logger.Warn("immediate stop was not accepted; durable stop request remains pending for apply owner retry",
-			"apply_id", apply.ApplyIdentifier,
-			"tern_apply_id", ternApplyID,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"error_message", resp.ErrorMessage,
-			"stopped_count", resp.StoppedCount,
-			"skipped_count", resp.SkippedCount)
+			append(apply.LogAttrs(),
+				"tern_apply_id", ternApplyID, "requested_by", caller, "error_message", resp.ErrorMessage, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			fmt.Sprintf("Immediate stop attempt was not accepted; durable stop request remains pending: %s", resp.ErrorMessage))
+			fmt.Sprintf("Immediate stop attempt was not accepted; durable stop request remains pending: %s", apply.OperatorFacingMessage(resp.ErrorMessage)))
 		return
 	}
 	stopCompleted, err := s.completeImmediateStopRequestIfStopped(ctx, apply, caller)
 	if err != nil {
 		s.logger.Warn("immediate stop accepted but durable stop request completion failed; durable stop request remains pending for apply owner retry",
-			"apply_id", apply.ApplyIdentifier,
-			"tern_apply_id", ternApplyID,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"stopped_count", resp.StoppedCount,
-			"skipped_count", resp.SkippedCount,
-			"error", err)
+			append(apply.LogAttrs(),
+				"tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount, "error", err)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			fmt.Sprintf("Immediate stop accepted but durable stop request completion failed; durable stop request remains pending: %v", err))
 		return
 	}
 	if !stopCompleted {
 		s.logger.Info("immediate stop accepted; durable apply owner will reconcile final stop state",
-			"apply_id", apply.ApplyIdentifier,
-			"tern_apply_id", ternApplyID,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"stopped_count", resp.StoppedCount,
-			"skipped_count", resp.SkippedCount)
+			append(apply.LogAttrs(),
+				"tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			"Immediate stop accepted; durable apply owner will reconcile final stop state")
 		return
 	}
 	s.logger.Info("immediate stop accepted and durable stop request completed",
-		"apply_id", apply.ApplyIdentifier,
-		"tern_apply_id", ternApplyID,
-		"database", apply.Database,
-		"deployment", apply.Deployment,
-		"environment", apply.Environment,
-		"requested_by", caller,
-		"stopped_count", resp.StoppedCount,
-		"skipped_count", resp.SkippedCount)
+		append(apply.LogAttrs(),
+			"tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount)...)
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 		"Immediate stop accepted and durable stop request completed")
 }
@@ -900,21 +1318,33 @@ func (s *Service) completeImmediateStopRequestIfStopped(ctx context.Context, app
 	}
 	if !stopRequestCompletedByApplyState(storedApply.State) {
 		s.logger.Info("immediate stop accepted but stored apply is not stopped; durable stop request remains pending for apply owner retry",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", caller,
-			"state", storedApply.State)
+			append(storedApply.LogAttrs(),
+				"requested_by", caller)...)
 		return false, nil
 	}
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
 		return false, fmt.Errorf("control request store is not available")
 	}
+	if err := s.settleCutoverSupersededByStop(ctx, storedApply); err != nil {
+		return false, err
+	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return false, fmt.Errorf("complete pending stop control request for apply %s after immediate stop: %w", apply.ApplyIdentifier, err)
 	}
 	return true, nil
+}
+
+// settleCutoverSupersededByStop answers the cutover still pending when the
+// apply's stop took effect, so it cannot fire on the copy a later start
+// resumes. Callers settle it before completing the stop request (CO-4): the
+// pending stop keeps a drive from taking the cutover, so a failed settlement
+// leaves the stop pending for the retry that settles it.
+func (s *Service) settleCutoverSupersededByStop(ctx context.Context, apply *storage.Apply) error {
+	if err := tern.SettlePendingCutoverAfterStop(ctx, s.storage, s.logger, apply); err != nil {
+		return fmt.Errorf("settle pending cutover superseded by stop for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
 }
 
 func stopRequestCompletedByApplyState(applyState string) bool {
@@ -930,7 +1360,7 @@ const cancelResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyReques
 
 func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.ControlRequest
-	client, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, _, ok := s.decodeControlRequest(w, r, "cancel", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -977,7 +1407,7 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 
 	httpResp := &apitypes.CancelResponse{
 		Accepted:       resp.Accepted,
-		ErrorMessage:   resp.ErrorMessage,
+		ErrorMessage:   apply.OperatorFacingMessage(resp.ErrorMessage),
 		CancelledCount: resp.CancelledCount,
 		SkippedCount:   resp.SkippedCount,
 		Status:         responseStatus,
@@ -999,7 +1429,14 @@ func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.A
 	}
 	cancelledCount, skippedCount := stopRequestCounts(tasks)
 	if cancelledCount == 0 && skippedCount == 0 {
-		return nil, "", controlConflictf("no active schema change for apply %s", apply.ApplyIdentifier)
+		// The apply owns no task rows: it was queued before its first drive
+		// created them, or it is a VSchema-only apply that never has any. The
+		// apply row itself is still active work (the caller already rejected
+		// terminal applies), so the durable request is recorded and the drive's
+		// task-less settle path resolves it — refusing here would leave the
+		// apply with no command that can end it.
+		s.logger.Info("cancel requested for a task-less apply; recording the durable request for the task-less settle path",
+			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
 	controlReq, alreadyPending, err := s.createCancelControlRequest(ctx, apply, caller, cancelledCount, skippedCount)
 	if err != nil {
@@ -1043,6 +1480,20 @@ func cancelResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (
 	return resp, nil
 }
 
+// immediateCancelNotAcceptedMessage renders the apply-log line for a cancel the
+// fast path attempted and the executing side did not accept. The reason is
+// rewritten for the operator, who reads this on the PR timeline and cannot
+// resolve a data-plane identifier. A refusal is not obliged to carry a reason,
+// so the sentence stands on its own when none is given rather than trailing a
+// colon into nothing.
+func immediateCancelNotAcceptedMessage(apply *storage.Apply, errorMessage string) string {
+	const notAccepted = "Immediate cancel attempt was not accepted; durable cancel request remains pending"
+	if errorMessage == "" {
+		return notAccepted
+	}
+	return fmt.Sprintf("%s: %s", notAccepted, apply.OperatorFacingMessage(errorMessage))
+}
+
 func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) {
 	if multiOp, err := s.applyHasMultipleOperations(ctx, apply); err != nil {
 		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate cancel",
@@ -1061,19 +1512,24 @@ func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, ap
 	if client.IsRemote() {
 		ternApplyID = apply.ExternalID
 	}
-	resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: ternApplyID, Environment: apply.Environment})
+	resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: ternApplyID, Environment: apply.Environment, Caller: caller})
 	if err != nil {
 		s.logger.Warn("immediate cancel failed; durable cancel request remains pending for apply owner retry",
 			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error", err)...)
 		return
 	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
+	if resp == nil {
+		s.logger.Warn("immediate cancel returned nil response; durable cancel request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller)...)
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCancelRequested,
+			"Immediate cancel attempt returned no response; durable cancel request remains pending")
+		return
+	}
+	if !resp.Accepted {
 		s.logger.Warn("immediate cancel was not accepted; durable cancel request remains pending for apply owner retry",
-			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error_message", errorMessage)...)
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error_message", resp.ErrorMessage, "cancelled_count", resp.CancelledCount, "skipped_count", resp.SkippedCount)...)
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCancelRequested,
+			immediateCancelNotAcceptedMessage(apply, resp.ErrorMessage))
 		return
 	}
 	cancelCompleted, err := s.completeImmediateCancelRequestIfCancelled(ctx, apply, caller)
@@ -1118,18 +1574,36 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 	if resp, responseStatus, found, err := s.pendingStopResponseIfPresent(ctx, apply); err != nil || found {
 		return resp, responseStatus, err
 	}
-	if state.IsTerminalApplyState(apply.State) {
-		return nil, "", controlConflictf("schema change is already terminal (current state: %s)", apply.State)
-	}
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	stoppedCount, skippedCount := stopRequestCounts(tasks)
-	if stoppedCount == 0 && skippedCount == 0 {
-		return nil, "", controlConflictf("no active schema change for apply %s", apply.ApplyIdentifier)
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		resp, responseStatus, resumed, err := s.stopQueuedStart(ctx, apply, caller, stoppedCount, skippedCount)
+		if err != nil || resumed == nil {
+			return resp, responseStatus, err
+		}
+		apply = resumed
 	}
-	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount)
+	if state.IsTerminalApplyState(apply.State) {
+		return nil, "", controlConflictf("schema change is already terminal (current state: %s)", apply.State)
+	}
+	if stoppedCount == 0 && skippedCount == 0 {
+		// The apply owns no task rows: it was queued before its first drive
+		// created them, or it is a VSchema-only apply that never has any. The
+		// apply row itself is still active work (a terminal apply was rejected
+		// above), so the durable request is recorded and the drive's task-less
+		// settle path resolves it — refusing here would leave the apply with no
+		// stop command that can park it.
+		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+	}
+	supersedesStart, err := tern.StopSupersedesPendingStart(ctx, s.storage, s.logger, apply, caller)
+	if err != nil {
+		return nil, "", err
+	}
+	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount, supersedesStart)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1145,6 +1619,75 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, "", nil
+}
+
+// stopQueuedStart answers a stop on a stopped apply. The apply is stopped, but
+// an operator's start may be queued behind it that no driver has acted on yet,
+// and the stop must win over that start (CO-4): it withdraws the start in the
+// same write that records the stop, so no claim can resume the apply. With no
+// start queued there is nothing to stop and the stop is refused (CO-6).
+//
+// A claim may resume the apply between the caller's read and the write, which
+// leaves the start to the drive it resumed. resumed is then the reloaded apply,
+// for the caller to stop along the path for a running one; otherwise the stop
+// is answered here and resumed is nil.
+func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*ternv1.StopResponse, string, *storage.Apply, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, "", nil, fmt.Errorf("control request store is not available")
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("list apply_operations for stopped apply %s before stopping its queued start: %w", apply.ApplyIdentifier, err)
+	}
+	operationLease, err := tern.ApplyDrivesUnderOperationLease(ctx, s.storage, apply, ops)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("decide drive mode of stopped apply %s before stopping its queued start: %w", apply.ApplyIdentifier, err)
+	}
+	metadata, err := json.Marshal(stopControlRequestMetadata{StoppedCount: stoppedCount, SkippedCount: skippedCount})
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	_, outcome, err := controlStore.StopQueuedStart(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadata,
+	}, operationLease)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("record stop against the queued start of stopped apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	attrs := append(apply.LogAttrs(), "requested_by", caller, "operation_lease", operationLease, "outcome", string(outcome))
+	switch outcome {
+	case storage.QueuedStartWithdrawn:
+		s.logger.Info("stop withdrew the queued start of a stopped apply; the apply stays stopped", attrs...)
+		if s.OnQueuedStartWithdrawn != nil {
+			s.OnQueuedStartWithdrawn(apply, caller)
+		} else {
+			s.logger.Debug("no PR is told the queued start was withdrawn: no GitHub surface is registered on this server", attrs...)
+		}
+		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, apitypes.ControlStatusStartWithdrawn, nil, nil
+	case storage.QueuedStartStopPending:
+		s.logger.Info("stop withdrew the queued start of a stopped apply and is pending for the drive that already claimed an operation", attrs...)
+		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, stopResponseStatusLeftToClaimedDrive, nil, nil
+	case storage.QueuedStartNone:
+		s.logger.Info("stop rejected: the apply is already stopped and no start is queued", attrs...)
+		return nil, "", nil, controlConflictCodef(apitypes.ErrCodeAlreadyStopped, "schema change is already stopped")
+	case storage.QueuedStartApplyNotStopped:
+		resumed, err := s.storage.Applies().Get(ctx, apply.ID)
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("reload apply %s after a claim resumed it: %w", apply.ApplyIdentifier, err)
+		}
+		if resumed == nil {
+			return nil, "", nil, fmt.Errorf("reload apply %s after a claim resumed it: apply not found", apply.ApplyIdentifier)
+		}
+		s.logger.Info("stop found the apply already resumed by a claim; stopping it as a running apply",
+			append(resumed.LogAttrs(), "requested_by", caller)...)
+		return nil, "", resumed, nil
+	default:
+		return nil, "", nil, fmt.Errorf("record stop against the queued start of stopped apply %s: unknown outcome %q", apply.ApplyIdentifier, outcome)
+	}
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
@@ -1185,11 +1728,36 @@ func (s *Service) createControlRequest(ctx context.Context, apply *storage.Apply
 	return controlReq, alreadyPending, nil
 }
 
-func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
-	return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, stopControlRequestMetadata{
+// createStopControlRequest records the stop. When supersedesStart is set, the
+// apply's pending start is completed in the same transaction, so a failed stop
+// write leaves that start deliverable.
+func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64, supersedesStart bool) (*storage.ApplyControlRequest, bool, error) {
+	metadata := stopControlRequestMetadata{
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
-	})
+	}
+	if !supersedesStart {
+		return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, metadata)
+	}
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, false, fmt.Errorf("control request store is not available")
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	controlReq, alreadyPending, err := controlStore.RequestPendingSuperseding(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadataJSON,
+	}, storage.ControlOperationStart)
+	if err != nil {
+		return nil, false, fmt.Errorf("record stop control request superseding the pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return controlReq, alreadyPending, nil
 }
 
 // pendingControlResponseIfPresent loads any pending control request for the
@@ -1286,7 +1854,7 @@ const (
 // handleStart handles POST /api/start requests.
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	var req StartRequest
-	client, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, _, ok := s.decodeControlRequest(w, r, "start", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -1384,7 +1952,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 
 	httpResp := &apitypes.StartResponse{
 		Accepted:     resp.Accepted,
-		ErrorMessage: resp.ErrorMessage,
+		ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage),
 		StartedCount: resp.StartedCount,
 		SkippedCount: resp.SkippedCount,
 		Status:       responseStatus,
@@ -1415,37 +1983,28 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 	}
 
 	if stopRequestCompletedByApplyState(apply.State) {
+		if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+			return err
+		}
 		if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 			return fmt.Errorf("complete pending stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 		}
 		s.logger.Info("completed resolved stop request before start",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", stopCaller,
-			"start_requested_by", caller,
-			"state", apply.State)
+			append(apply.LogAttrs(),
+				"requested_by", stopCaller, "start_requested_by", caller)...)
 		return nil
 	}
 
 	if !client.IsRemote() {
 		s.logger.Info("pending stop request not completed before start because local apply is not stopped yet",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", stopCaller,
-			"start_requested_by", caller,
-			"state", apply.State)
+			append(apply.LogAttrs(),
+				"requested_by", stopCaller, "start_requested_by", caller)...)
 		return nil
 	}
 	if apply.ExternalID == "" {
 		s.logger.Warn("pending stop request not completed before start because remote apply has no external id",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", stopCaller,
-			"start_requested_by", caller,
-			"state", apply.State)
+			append(apply.LogAttrs(),
+				"requested_by", stopCaller, "start_requested_by", caller)...)
 		return nil
 	}
 	progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
@@ -1462,26 +2021,54 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 
 	now := time.Now()
 	oldState := apply.State
-	apply.State = state.Apply.Stopped
-	apply.CompletedAt = &now
-	apply.UpdatedAt = now
-	if err := s.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+	synced := *apply
+	synced.State = state.Apply.Stopped
+	synced.CompletedAt = &now
+	synced.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, &synced); err != nil {
+		if !errors.Is(err, storage.ErrApplyReopenRefused) {
+			return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+		}
+		// The remote check takes real time, and the apply finished in storage
+		// while it ran. Writing stopped over that verdict would make a finished
+		// apply startable again, so the start proceeds from the stored row and
+		// the pending stop stays with whoever finished it.
+		return s.reloadApplyAfterRefusedStopSync(ctx, apply, oldState, stopCaller, caller)
+	}
+	*apply = synced
+	if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+		return err
 	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 	}
 	s.logger.Info("completed remote stop request before start after remote state check",
-		"apply_id", apply.ApplyIdentifier,
-		"external_apply_id", apply.ExternalID,
-		"database", apply.Database,
-		"environment", apply.Environment,
-		"requested_by", stopCaller,
-		"start_requested_by", caller,
-		"old_state", oldState,
-		"new_state", apply.State)
+		append(apply.LogAttrs(),
+			"requested_by", stopCaller, "start_requested_by", caller, "old_state", oldState, "new_state", apply.State)...)
 	s.logControlOperationForApply(ctx, apply, stopCaller, storage.LogEventStopRequested,
-		fmt.Sprintf("Pending remote stop request completed before start (caller: %s)", stopCaller))
+		"Pending remote stop request completed before start")
+	return nil
+}
+
+// reloadApplyAfterRefusedStopSync replaces the handler's copy of the apply with
+// the stored row after storage refused to write stopped over a finished apply,
+// then validates the start against that row, so the operator is refused for
+// the verdict that won rather than for the stop request it left pending.
+func (s *Service) reloadApplyAfterRefusedStopSync(ctx context.Context, apply *storage.Apply, readState, stopCaller, caller string) error {
+	fresh, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("reload apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("reload apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	*apply = *fresh
+	s.logger.Info("apply finished while the remote stop check ran; stop request left pending and start revalidated against the stored state",
+		append(apply.LogAttrs(),
+			"requested_by", stopCaller, "start_requested_by", caller, "read_state", readState)...)
+	if err := validateStartRequestState(apply); err != nil {
+		return fmt.Errorf("start apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, err)
+	}
 	return nil
 }
 
@@ -1497,14 +2084,33 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 	if err != nil {
 		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	neverStarted := neverStartedStoppedOperationIDs(ops)
 	var startedCount int64
 	var skippedCount int64
+	operationsWithTasks := make(map[int64]bool)
 	for _, task := range tasks {
+		if task.ApplyOperationID != nil {
+			operationsWithTasks[*task.ApplyOperationID] = true
+		}
 		switch {
 		case state.IsState(task.State, state.Task.Stopped):
 			startedCount++
+		case taskQueuedUnderNeverStartedStop(task, neverStarted):
+			startedCount++
 		case state.IsTerminalTaskState(task.State):
 			skippedCount++
+		}
+	}
+	// An operation with no tasks, such as a finalizer that publishes the
+	// change once its shards complete, is resumable work of its own when a
+	// stop caught it before it began.
+	for id := range neverStarted {
+		if !operationsWithTasks[id] {
+			startedCount++
 		}
 	}
 	if startedCount == 0 {
@@ -1515,17 +2121,36 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 	}
 	if state.IsRunningApplyState(apply.State) {
 		s.logger.Info("queueing start for stopped tasks while stored apply is still running",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"stopped_count", startedCount,
-			"terminal_count", skippedCount)
+			append(apply.LogAttrs(),
+				"stopped_count", startedCount, "terminal_count", skippedCount)...)
 		if err := s.ensureStoredApplyStoppedForStartClaim(ctx, apply); err != nil {
 			return nil, "", err
 		}
 	}
 	return s.persistStartRequestForOperator(ctx, apply, caller, startedCount, skippedCount)
+}
+
+// neverStartedStoppedOperationIDs returns the operations a stop caught before
+// any engine took them up: stopped, never claimed, and holding no remote
+// apply. Their tasks, if they have any, are still pending, because nothing ran
+// them, and a start queues them again (RequeueNeverStartedForStartByApply), so
+// their work is stopped work the start resumes.
+func neverStartedStoppedOperationIDs(ops []*storage.ApplyOperation) map[int64]bool {
+	ids := make(map[int64]bool)
+	for _, op := range ops {
+		if state.IsState(op.State, state.ApplyOperation.Stopped) && op.StartedAt == nil && op.ExternalID == "" {
+			ids[op.ID] = true
+		}
+	}
+	return ids
+}
+
+// taskQueuedUnderNeverStartedStop reports whether a task is pending work of an
+// operation a stop caught before it started.
+func taskQueuedUnderNeverStartedStop(task *storage.Task, neverStarted map[int64]bool) bool {
+	return task.ApplyOperationID != nil &&
+		neverStarted[*task.ApplyOperationID] &&
+		state.IsState(task.State, state.Task.Pending)
 }
 
 // queueRemoteStoppedApplyForOperator validates remote stopped state before
@@ -1556,14 +2181,8 @@ func (s *Service) queueRemoteStoppedApplyForOperator(ctx context.Context, client
 	}
 	if state.IsRunningApplyState(apply.State) {
 		s.logger.Info("queueing remote start while stored apply is still running",
-			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
-			"database", apply.Database,
-			"deployment", apply.Deployment,
-			"environment", apply.Environment,
-			"remote_state", remoteState,
-			"stopped_count", startedCount,
-			"terminal_count", skippedCount)
+			append(apply.LogAttrs(),
+				"remote_state", remoteState, "stopped_count", startedCount, "terminal_count", skippedCount)...)
 		if err := s.ensureStoredApplyStoppedForStartClaim(ctx, apply); err != nil {
 			return nil, "", err
 		}
@@ -1677,6 +2296,14 @@ func storedApplyMayHaveStoppedTasksForStart(storedApplyState string) bool {
 }
 
 func validateStartRequestState(apply *storage.Apply) error {
+	// A superseded apply is refused before its state is consulted: the marker
+	// records that another apply took over this one's unfinished work, which no
+	// state on this row can express. The driver refuses the claim too, so this
+	// only decides whether the operator is told now or after a queued start
+	// fails.
+	if apply.SupersededBy != "" {
+		return controlConflictf("schema change was superseded by %s and cannot be started; check that apply for the outcome of this work", apply.SupersededBy)
+	}
 	if !isStartRequestAllowedState(apply.State) {
 		return startNotAllowedForState(apply)
 	}
@@ -1688,16 +2315,17 @@ func validateStartRequestState(apply *storage.Apply) error {
 
 // isStartRequestAllowedState is an allowlist for states where /start has a
 // concrete action. New apply states must opt in here before they can reach the
-// operator or Tern start paths.
+// operator or Tern start paths. The running family is allowed because stop
+// persists stopped task rows before the derived apply row flips, so a start
+// against a still-running-family apply row may have real resume work.
 func isStartRequestAllowedState(applyState string) bool {
-	return state.IsState(
-		applyState,
-		state.Apply.WaitingForDeploy,
-		state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.RunningDegraded,
-		state.Apply.Stopped,
-	)
+	return state.IsRunningApplyState(applyState) ||
+		state.IsState(
+			applyState,
+			state.Apply.WaitingForDeploy,
+			state.Apply.Pending,
+			state.Apply.Stopped,
+		)
 }
 
 func startNotAllowedForState(apply *storage.Apply) error {
@@ -1754,7 +2382,7 @@ const releaseResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyReque
 // deployment failure proceed with its remaining deployments.
 func (s *Service) handleRelease(w http.ResponseWriter, r *http.Request) {
 	var req ReleaseRequest
-	_, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	_, apply, _, ok := s.decodeControlRequest(w, r, "release", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -1907,78 +2535,6 @@ func (s *Service) validateReleaseRequestState(ctx context.Context, apply *storag
 	return nil
 }
 
-// VolumeRequest is the HTTP request body for POST /api/volume.
-type VolumeRequest struct {
-	ApplyID     string `json:"apply_id"`
-	Environment string `json:"environment"`
-	Volume      int32  `json:"volume"` // 1-11 (1=conservative, 11=aggressive)
-	Caller      string `json:"caller,omitempty"`
-}
-
-// handleVolume handles POST /api/volume requests.
-func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
-	var req VolumeRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
-	if !ok {
-		return
-	}
-
-	if req.Volume < storage.MinVolume || req.Volume > storage.MaxVolume {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("volume must be between %d and %d", storage.MinVolume, storage.MaxVolume))
-		return
-	}
-
-	resp, err := s.executeVolumeForApply(r.Context(), client, apply, applyID, req.Caller, req.Volume)
-	if err != nil {
-		s.writeControlError(w, "volume", apply, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, resp)
-}
-
-// ExecuteVolume queues a durable volume adjustment for an apply. The driving
-// instance retunes the engine at its next progress tick. It resolves the
-// apply's data-plane client and proxies the request, so the HTTP handler and
-// the PR-comment command share one path — the tern client owns the gating
-// (terminal apply, conflicting pending level, multi-deployment apply).
-func (s *Service) ExecuteVolume(ctx context.Context, req apitypes.ControlRequest, volume int32) (*apitypes.VolumeResponse, error) {
-	if volume < storage.MinVolume || volume > storage.MaxVolume {
-		return nil, controlHTTPErrorf(http.StatusBadRequest, "volume must be between %d and %d", storage.MinVolume, storage.MaxVolume)
-	}
-	client, apply, ternApplyID, err := s.controlTarget(ctx, "volume", req.ApplyID, req.Environment)
-	if err != nil {
-		return nil, err
-	}
-	return s.executeVolumeForApply(ctx, client, apply, ternApplyID, req.Caller, volume)
-}
-
-// executeVolumeForApply proxies the volume adjustment to the apply's tern
-// client, which queues a durable control request for the driver, and records
-// an apply log entry when the queue accepts the level.
-func (s *Service) executeVolumeForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string, volume int32) (*apitypes.VolumeResponse, error) {
-	resp, err := client.Volume(ctx, &ternv1.VolumeRequest{
-		ApplyId:     ternApplyID,
-		Environment: apply.Environment,
-		Volume:      volume,
-	})
-	if err != nil {
-		metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, "error")
-		return nil, fmt.Errorf("queue volume change to %d for apply %s: %w", volume, apply.ApplyIdentifier, err)
-	}
-	metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
-	if resp.Accepted {
-		s.logControlOperationForApply(ctx, apply, resolveCaller(ctx, caller), storage.LogEventVolumeRequested,
-			fmt.Sprintf("Volume change to %d queued; the driver applies it at its next progress check", volume))
-	}
-
-	return &apitypes.VolumeResponse{
-		Accepted:       resp.Accepted,
-		ErrorMessage:   resp.ErrorMessage,
-		PreviousVolume: resp.PreviousVolume,
-		NewVolume:      resp.NewVolume,
-	}, nil
-}
-
 // RevertRequest is the HTTP request body for POST /api/revert.
 type RevertRequest struct {
 	ApplyID     string `json:"apply_id"`
@@ -1989,7 +2545,7 @@ type RevertRequest struct {
 // handleRevert handles POST /api/revert requests.
 func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req RevertRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "revert", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -2077,6 +2633,12 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventRevertTriggered, "Revert triggered by user")
 
+	if s.immediateControlSkippedForMultiOperationApply(ctx, apply, "revert", caller) {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+
 	// Attempt the revert immediately. If it fails or this process dies, the
 	// durable request remains pending for the apply owner to retry.
 	resp, err := client.Revert(ctx, &ternv1.RevertRequest{
@@ -2098,13 +2660,39 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 			s.logger.Warn("failed to complete revert control request after immediate success; operator will reconcile",
 				append(apply.LogAttrs(), "error", err)...)
 		}
-	} else if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationRevert, resp.ErrorMessage); err != nil {
-		s.logger.Warn("failed to fail rejected revert control request",
-			append(apply.LogAttrs(), "error", err)...)
+	} else {
+		s.logger.Warn("revert was not accepted by the data plane",
+			append(apply.LogAttrs(), "error_message", resp.ErrorMessage)...)
+		if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationRevert, apply.OperatorFacingMessage(resp.ErrorMessage)); err != nil {
+			s.logger.Warn("failed to fail rejected revert control request",
+				append(apply.LogAttrs(), "error", err)...)
+		}
 	}
 	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 
-	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: resp.ErrorMessage}, http.StatusOK, nil
+	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage)}, http.StatusOK, nil
+}
+
+// immediateControlSkippedForMultiOperationApply reports whether the immediate
+// engine attempt of a revert-window control must be skipped because the apply
+// spans several operations. Each operation drives against its own deployment
+// with its own remote apply, so an immediate call keyed on one apply id would
+// act on a single operation and, on acceptance, complete the whole durable
+// request before its siblings receive the command. The request is left pending
+// for the operations' drives instead. When the operation count cannot be
+// determined the immediate attempt is skipped for the same reason.
+func (s *Service) immediateControlSkippedForMultiOperationApply(ctx context.Context, apply *storage.Apply, operation, caller string) bool {
+	multiOp, err := s.applyHasMultipleOperations(ctx, apply)
+	if err != nil {
+		s.logger.Warn("could not determine apply operation count; immediate "+operation+" skipped and the durable request stays pending for the driver",
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+		return true
+	}
+	if multiOp {
+		s.logger.Info("immediate "+operation+" skipped for multi-operation apply; the durable request stays pending for the operations' drives",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+	}
+	return multiOp
 }
 
 // SkipRevertRequest is the HTTP request body for POST /api/skip-revert.
@@ -2117,7 +2705,7 @@ type SkipRevertRequest struct {
 // handleSkipRevert handles POST /api/skip-revert requests.
 func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	var req SkipRevertRequest
-	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, "skip_revert", &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -2203,6 +2791,12 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventSkipRevertTriggered, "Skip-revert triggered by user")
 
+	if s.immediateControlSkippedForMultiOperationApply(ctx, apply, "skip-revert", caller) {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+
 	// Attempt the skip immediately. If it fails or this process dies, the durable
 	// request remains pending for the apply owner to retry.
 	resp, err := client.SkipRevert(ctx, &ternv1.SkipRevertRequest{
@@ -2221,7 +2815,9 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 	if resp.Accepted {
 		if apply.Engine == storage.EnginePlanetScale {
 			if err := s.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
-				s.logger.Error("failed to record skip-revert on apply", append(apply.LogAttrs(), "error", err)...)
+				s.logger.Error("failed to record skip-revert on apply",
+					append(apply.LogAttrs(),
+						"error", err)...)
 			}
 		}
 		// The engine accepted the skip; the durable request's work is done.
@@ -2229,13 +2825,17 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 			s.logger.Warn("failed to complete skip-revert control request after immediate success; operator will reconcile",
 				append(apply.LogAttrs(), "error", err)...)
 		}
-	} else if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationSkipRevert, resp.ErrorMessage); err != nil {
-		s.logger.Warn("failed to fail rejected skip-revert control request",
-			append(apply.LogAttrs(), "error", err)...)
+	} else {
+		s.logger.Warn("skip-revert was not accepted by the data plane",
+			append(apply.LogAttrs(), "error_message", resp.ErrorMessage)...)
+		if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationSkipRevert, apply.OperatorFacingMessage(resp.ErrorMessage)); err != nil {
+			s.logger.Warn("failed to fail rejected skip-revert control request",
+				append(apply.LogAttrs(), "error", err)...)
+		}
 	}
 	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 
-	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: resp.ErrorMessage}, http.StatusOK, nil
+	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage)}, http.StatusOK, nil
 }
 
 // RollbackPlanRequest is the HTTP request body for POST /api/rollback/plan.
@@ -2255,6 +2855,7 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Environment = storage.CanonicalKey(req.Environment)
 	if req.ApplyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
 		return
@@ -2270,6 +2871,9 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.writeControlError(w, "rollback plan", apply, err)
+		return
+	}
+	if !s.authorizeDirectWrite(w, r, "rollback_plan", apply.Database, apply.Environment) {
 		return
 	}
 

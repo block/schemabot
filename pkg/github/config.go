@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // DatabaseType represents the type of database backend.
@@ -23,10 +27,30 @@ const (
 
 // SchemabotConfig represents the schemabot.yaml configuration file.
 // The presence of this file in a directory indicates that directory contains schema files.
+//
+// Database and Type are row-identity keys: FetchConfig folds them with
+// storage.CanonicalKey so a consumer repository's spelling always matches the
+// canonical server config key and the identity stored on every row, whatever
+// case the file was written in.
 type SchemabotConfig struct {
 	Database string       `yaml:"database" json:"database"`
 	Name     string       `yaml:"name" json:"name"`
 	Type     DatabaseType `yaml:"type,omitempty" json:"type,omitempty"`
+	// IgnoreNamespaces lists namespace subdirectories of the schema root that
+	// SchemaBot must not reconcile against the live database — for example a
+	// keyspace that only exists in local test infrastructure. Ignored
+	// namespaces are excluded from plans, applies, and checks.
+	IgnoreNamespaces []string `yaml:"ignore_namespaces,omitempty" json:"ignore_namespaces,omitempty"`
+	// IgnoreTables lists live tables SchemaBot must not reconcile — for example
+	// the bookkeeping table of a versioned schema change tool, or a table
+	// another team owns in a shared schema. Without the exclusion a live table
+	// no schema file declares is planned as DROP TABLE, which blocks the merge.
+	// Entries are matched against the target's own catalog, in every namespace
+	// the plan covers: a plain entry exactly and case-sensitively, and an entry
+	// wrapped in slashes, such as /^events_[0-9]+$/, as a regular expression
+	// over the whole name, for a family of tables created at runtime. Every
+	// plan discloses what it withheld.
+	IgnoreTables []string `yaml:"ignore_tables,omitempty" json:"ignore_tables,omitempty"`
 }
 
 // GetType returns the database type. Type is always set — FetchConfig rejects empty values.
@@ -57,15 +81,50 @@ var (
 	ErrGitTreeTruncated  = fmt.Errorf("GitHub returned a truncated repository tree; config discovery is incomplete")
 	ErrPRFilesIncomplete = fmt.Errorf("GitHub returned the maximum number of pull request files; config discovery is incomplete")
 	ErrDirListingCapped  = fmt.Errorf("GitHub returned the maximum number of directory entries; schema discovery is incomplete")
+
+	// ErrConfigDiscoveryTruncated is the config-discovery case of
+	// ErrGitTreeTruncated, which it wraps: the tree was truncated and the
+	// server-configured schema directories could not bound where a
+	// schemabot.yaml may live, so no scoped probe could stand in for the
+	// whole-repository scan. Schema-file loading below an already discovered
+	// config returns the bare ErrGitTreeTruncated instead, so callers can tell
+	// "could not find the config" from "found it, could not list its files".
+	ErrConfigDiscoveryTruncated = fmt.Errorf("%w; the configured schema directories do not bound where schemabot.yaml may live", ErrGitTreeTruncated)
 )
 
 // DatabaseNotFoundError indicates the specified database was not found in any config.
 type DatabaseNotFoundError struct {
 	DatabaseName       string
 	AvailableDatabases []string
+	// SearchedDirs lists the directories a database-scoped search probed when
+	// GitHub truncated the repository tree and only the database's configured
+	// schema directories could be searched. Empty when the whole repository
+	// was searched.
+	SearchedDirs []string
+	// SearchScoped reports that the search was limited to SearchedDirs because
+	// GitHub truncated the repository tree. Scoped with no directories means
+	// the server configures no schema directory for the database in this
+	// repository, which by the ConfigDirHints contract is a database that does
+	// not accept changes from the repository.
+	SearchScoped bool
+}
+
+// RepositoryNotAccepted reports whether the miss is a policy answer rather than
+// a search result: the database is configured on the server but accepts no
+// schema changes from this repository, so no location in it was searched.
+func (e *DatabaseNotFoundError) RepositoryNotAccepted() bool {
+	return e.SearchScoped && len(e.SearchedDirs) == 0
 }
 
 func (e *DatabaseNotFoundError) Error() string {
+	if e.RepositoryNotAccepted() {
+		return fmt.Sprintf("database '%s' accepts no schema changes from this repository; the server configures no schema directories for it here",
+			e.DatabaseName)
+	}
+	if len(e.SearchedDirs) > 0 {
+		return fmt.Sprintf("database '%s' not found in its configured schema directories: %s",
+			e.DatabaseName, strings.Join(e.SearchedDirs, ", "))
+	}
 	if len(e.AvailableDatabases) == 0 {
 		return fmt.Sprintf("database '%s' not found", e.DatabaseName)
 	}
@@ -95,17 +154,26 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
+	declaredType := config.Type
+	config.Database = storage.CanonicalKey(config.Database)
+	config.Type = DatabaseType(storage.CanonicalKey(string(config.Type)))
 
 	if config.Database == "" {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: database is required", configPath)
 	}
 	if config.Type == "" {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required (must be 'vitess', 'mysql', 'strata', or 'postgres')", configPath)
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", configPath)
 	}
 	switch config.Type {
 	case DatabaseTypeVitess, DatabaseTypeMySQL, DatabaseTypeStrata, DatabaseTypePostgres:
 	default:
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess', 'mysql', 'strata', or 'postgres', got '%s'", configPath, config.Type)
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: unknown type '%s'; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", configPath, declaredType)
+	}
+	if err := schema.ValidateIgnoreNamespaces(config.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
+	}
+	if err := schema.ValidateIgnoreTables(config.IgnoreTables); err != nil {
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
 
 	return &config, nil
@@ -121,7 +189,7 @@ type FindAllConfigsResult struct {
 // in the repository. When the repository is too large for the Trees API to
 // list completely, discovery falls back to scanning the server-configured
 // schema directories for the repo; when no such fallback is possible it fails
-// closed with ErrGitTreeTruncated.
+// closed with ErrConfigDiscoveryTruncated.
 func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref string) (*FindAllConfigsResult, error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
 	if err != nil {
@@ -133,7 +201,7 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 			return nil, fmt.Errorf("discover schemabot configs in configured schema dirs of repo %s ref %s: %w", repo, ref, hintErr)
 		}
 		if !ok {
-			return nil, fmt.Errorf("discover schemabot configs in repo %s ref %s: %w", repo, ref, ErrGitTreeTruncated)
+			return nil, fmt.Errorf("discover schemabot configs in repo %s ref %s: %w", repo, ref, ErrConfigDiscoveryTruncated)
 		}
 		ic.logger.Info("git tree truncated; discovered configs from configured schema dirs",
 			"repo", repo, "ref", ref,
@@ -181,29 +249,29 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 // findAllConfigsForDatabase discovers configs for a database-scoped lookup.
 // With a complete tree it returns the full discovery result (scoped=false).
 // With a truncated tree it probes only the named database's configured
-// schema directories (scoped=true): absence there is authoritative for the
-// database, but the result does not enumerate other databases' configs. When
-// the database's directories cannot be probed exhaustively, it fails closed
-// with ErrGitTreeTruncated.
-func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, bool, error) {
+// schema directories (scoped=true, searchedDirs naming them): absence there
+// is authoritative for the database, but the result does not enumerate other
+// databases' configs. When the database's directories cannot be probed
+// exhaustively, it fails closed with ErrConfigDiscoveryTruncated.
+func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, repo, ref, databaseName string) (result *FindAllConfigsResult, searchedDirs []string, scoped bool, err error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
 	if err != nil {
-		return nil, false, fmt.Errorf("fetch git tree: %w", err)
+		return nil, nil, false, fmt.Errorf("fetch git tree: %w", err)
 	}
 	if !truncated {
-		return ic.collectConfigsFromTree(ctx, repo, ref, entries), false, nil
+		return ic.collectConfigsFromTree(ctx, repo, ref, entries), nil, false, nil
 	}
-	result, ok, hintErr := ic.findConfigsInDatabaseHintDirs(ctx, repo, ref, databaseName)
+	result, searchedDirs, ok, hintErr := ic.findConfigsInDatabaseHintDirs(ctx, repo, ref, databaseName)
 	if hintErr != nil {
-		return nil, false, fmt.Errorf("discover schemabot config in configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, hintErr)
+		return nil, nil, false, fmt.Errorf("discover schemabot config in configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, hintErr)
 	}
 	if !ok {
-		return nil, false, fmt.Errorf("discover schemabot config for database %s in repo %s ref %s: %w", databaseName, repo, ref, ErrGitTreeTruncated)
+		return nil, nil, false, fmt.Errorf("discover schemabot config for database %s in repo %s ref %s: %w", databaseName, repo, ref, ErrConfigDiscoveryTruncated)
 	}
 	ic.logger.Info("git tree truncated; scoped config discovery to the database's configured schema dirs",
-		"repo", repo, "ref", ref, "database", databaseName,
+		"repo", repo, "ref", ref, "database", databaseName, "searched_dirs", searchedDirs,
 		"valid", len(result.ValidConfigs), "invalid", len(result.InvalidConfigs))
-	return result, true, nil
+	return result, searchedDirs, true, nil
 }
 
 // findConfigsInHintDirs discovers schemabot.yaml configs by scanning the
@@ -252,30 +320,32 @@ func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, r
 
 // findConfigsInDatabaseHintDirs discovers schemabot.yaml configs by scanning
 // only the named database's configured schema directories, for lookups that
-// already know which database they want. ok is false when the client has no
-// hints or the database's directories are not exhaustive (its config could
-// live outside any probe-able directory) — the caller must keep failing
-// closed with the truncation error. Unlike the repo-wide scan, an empty
-// result with exhaustive directories IS authoritative: no policy-valid
-// location for this database's config was left unscanned.
-func (ic *InstallationClient) findConfigsInDatabaseHintDirs(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, bool, error) {
+// already know which database they want. It returns the directories it
+// scanned so a miss can name them. ok is false when the client has no hints
+// or the database's directories are not exhaustive (the database is not
+// configured here, or its config could live outside any probe-able
+// directory) — the caller must keep failing closed with the truncation error.
+// Unlike the repo-wide scan, an empty result with exhaustive directories IS
+// authoritative: no policy-valid location for this database's config was left
+// unscanned.
+func (ic *InstallationClient) findConfigsInDatabaseHintDirs(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, []string, bool, error) {
 	if ic.configDirHints == nil {
 		ic.logger.Debug("no config dir hints configured; cannot scan truncated repo",
 			"repo", repo, "ref", ref, "database", databaseName)
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	hints, exhaustive := ic.configDirHints.SchemaDirHintsForDatabase(repo, databaseName)
 	if !exhaustive {
-		ic.logger.Warn("database's configured schema dirs do not cover every policy-valid config location; keeping fail-closed truncation error",
+		ic.logger.Warn("cannot bound where the database's config may live (database not configured here, or its allowed_dirs unrestricted); keeping fail-closed truncation error",
 			"repo", repo, "ref", ref, "database", databaseName, "hint_dirs", len(hints))
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 
 	result, err := ic.scanHintDirsForConfigs(ctx, repo, ref, hints)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	return result, true, nil
+	return result, hints, true, nil
 }
 
 // scanHintDirsForConfigs scans the recursive subtree of each directory for
@@ -378,7 +448,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 		return nil, "", fmt.Errorf("fetch PR info: %w", err)
 	}
 
-	result, scoped, err := ic.findAllConfigsForDatabase(ctx, repo, prInfo.HeadSHA, databaseName)
+	result, searchedDirs, scoped, err := ic.findAllConfigsForDatabase(ctx, repo, prInfo.HeadSHA, databaseName)
 	if err != nil {
 		return nil, "", fmt.Errorf("find configs: %w", err)
 	}
@@ -398,9 +468,11 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 		}
 		if !ok {
 			// The scoped scan covered every directory this database's config
-			// could live in, so absence is authoritative. Other databases
-			// were not enumerated, so no available-databases list is offered.
-			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName}
+			// could live in, so absence is authoritative there — and the miss
+			// names those directories, since the rest of the repository was
+			// never searched. Other databases were not enumerated, so no
+			// available-databases list is offered.
+			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, SearchedDirs: searchedDirs, SearchScoped: true}
 		}
 		ic.logger.Debug("found config for database via scoped truncated-tree probe", "database", databaseName, "path", configDir)
 		return config, configDir, nil
@@ -426,94 +498,36 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 	return config, configDir, nil
 }
 
-// FindConfigForPR finds the schemabot.yaml config by searching changed config files and directories of changed schema files.
+// FindConfigForPR resolves the single schemabot.yaml config that manages the
+// PR's changed files, using the same discovery as auto-plan: changed config
+// files plus the nearest config above each changed schema file. A PR whose
+// changes resolve to more than one config is ambiguous for single-database
+// callers and returns ErrMultipleConfigs naming every candidate — the caller
+// must scope the command with -d.
 func (ic *InstallationClient) FindConfigForPR(ctx context.Context, repo string, pr int) (*SchemabotConfig, string, error) {
-	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch PR info: %w", err)
-	}
-
-	configs, err := ic.findConfigsChangedInPR(ctx, repo, pr, prInfo.HeadSHA)
+	configs, err := ic.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
 		return nil, "", err
 	}
-	if len(configs) == 1 {
+	return SingleDiscoveredConfig(configs)
+}
+
+// SingleDiscoveredConfig reduces a discovery result to the one config a
+// single-database code path can act on: ErrNoConfig when nothing was
+// discovered, the config itself when exactly one was, and ErrMultipleConfigs
+// naming every candidate database when the changed files span several configs.
+func SingleDiscoveredConfig(configs []DiscoveredConfig) (*SchemabotConfig, string, error) {
+	switch len(configs) {
+	case 0:
+		return nil, "", ErrNoConfig
+	case 1:
 		return configs[0].Config, configs[0].SchemaDir, nil
 	}
-	if len(configs) > 1 {
-		var databases []string
-		for _, dc := range configs {
-			databases = append(databases, fmt.Sprintf("`%s` (%s)", dc.Config.Database, dc.SchemaDir))
-		}
-		return nil, "", fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
+	var databases []string
+	for _, dc := range configs {
+		databases = append(databases, fmt.Sprintf("`%s` (%s)", dc.Config.Database, dc.SchemaDir))
 	}
-
-	files, err := ic.FetchPRFiles(ctx, repo, pr)
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch PR files: %w", err)
-	}
-
-	var schemaFiles []string
-	for _, file := range files {
-		if IsSchemaFile(file.Filename) {
-			schemaFiles = append(schemaFiles, file.Filename)
-		}
-	}
-
-	if len(schemaFiles) == 0 {
-		return nil, "", ErrNoConfig
-	}
-
-	// Collect all unique directories to search for config
-	dirsToSearch := make(map[string]bool)
-	for _, file := range schemaFiles {
-		dir := path.Dir(file)
-		for dir != "." && dir != "" {
-			dirsToSearch[dir] = true
-			dir = path.Dir(dir)
-		}
-		dirsToSearch["."] = true
-	}
-
-	// Search for config starting from shallowest directory
-	var bestConfig *SchemabotConfig
-	var bestConfigDir string
-	bestDepth := -1
-
-	for dir := range dirsToSearch {
-		configPath := dir + "/" + ConfigFileName
-		if dir == "." {
-			configPath = ConfigFileName
-		}
-
-		config, err := ic.FetchConfig(ctx, repo, configPath, prInfo.HeadSHA)
-		if err != nil {
-			if errors.Is(err, ErrNoConfig) {
-				continue
-			}
-			// Config not found at this path is expected — the search
-			// walks up parent directories. Other errors (auth failures,
-			// rate limits, server errors) must propagate.
-			return nil, "", err
-		}
-
-		depth := strings.Count(dir, "/")
-		if dir == "." {
-			depth = 0
-		}
-
-		if bestConfig == nil || depth < bestDepth {
-			bestConfig = config
-			bestConfigDir = dir
-			bestDepth = depth
-		}
-	}
-
-	if bestConfig == nil {
-		return nil, "", ErrNoConfig
-	}
-
-	return bestConfig, bestConfigDir, nil
+	return nil, "", fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
 }
 
 // FindAllConfigsForPR finds ALL schemabot.yaml configs that apply to the changed files in a PR.
@@ -561,12 +575,7 @@ func (ic *InstallationClient) FindConfigsForPRFiles(ctx context.Context, repo, r
 		probes[configDir] = config
 	}
 
-	var filenames []string
-	for _, f := range files {
-		filenames = append(filenames, f.Filename)
-	}
-	schemaFiles := filterSchemaFiles(filenames)
-	for _, schemaFile := range schemaFiles {
+	for _, schemaFile := range DiscoverySchemaPaths(files) {
 		config, configDir, err := ic.findNearestConfig(ctx, repo, ref, schemaFile, probes)
 		if err != nil {
 			return nil, err
@@ -623,7 +632,7 @@ func IsSchemaFile(filename string) bool {
 // should refresh the visible SchemaBot plan.
 func HasSchemaInputFiles(files []PRFile) bool {
 	for _, file := range files {
-		if isSchemaInputFile(file.Filename) || isSchemaInputFile(file.PreviousFilename) {
+		if file.Symlink || file.PreviousSymlink || isSchemaInputFile(file.Filename) || isSchemaInputFile(file.PreviousFilename) {
 			return true
 		}
 	}
@@ -638,15 +647,71 @@ func isConfigFile(filename string) bool {
 	return path.Base(filename) == ConfigFileName
 }
 
+// isDiscoveryInputFile reports whether a changed file can make a pull request
+// resolve a database: FindConfigsForPRFiles reads changed configs directly and
+// walks up from changed schema files to the nearest config, and ignores
+// everything else.
+func isDiscoveryInputFile(filename string) bool {
+	return IsSchemaFile(filename) || isConfigFile(filename)
+}
+
+// renamedAwaySchemaPath reports the schema file path a rename vacated when it is
+// not also the file's current path. A rename that moves a schema file to a
+// non-schema name, or out of every config directory, stops the default branch
+// declaring its tables, so discovery must still resolve the config that managed
+// the old path — as it does for a plain deletion.
+func renamedAwaySchemaPath(file PRFile) (string, bool) {
+	vacated, ok := vacatedSchemaPath(file)
+	if !ok || vacated == file.Filename {
+		return "", false
+	}
+	return vacated, true
+}
+
+// isDiscoveryInputPRFile reports whether a changed file can make a pull request
+// resolve a database, by its current path or by the schema path it vacated.
+func isDiscoveryInputPRFile(file PRFile) bool {
+	if file.Symlink || isDiscoveryInputFile(file.Filename) {
+		return true
+	}
+	_, vacated := renamedAwaySchemaPath(file)
+	return vacated
+}
+
+// HasDiscoveryInputFiles reports whether any changed file could resolve a
+// database. Callers use it to skip work entirely on the pull requests — most of
+// them, in a repository of any size — that touch no schema at all.
+func HasDiscoveryInputFiles(files []PRFile) bool {
+	return slices.ContainsFunc(files, isDiscoveryInputPRFile)
+}
+
+func isAddedPRFile(status string) bool {
+	return strings.EqualFold(status, "added")
+}
+
 func isRemovedPRFile(status string) bool {
 	return strings.EqualFold(status, "removed")
 }
 
-func filterSchemaFiles(files []string) []string {
+func isRenamedPRFile(status string) bool {
+	return strings.EqualFold(status, "renamed")
+}
+
+// DiscoverySchemaPaths returns the schema file paths discovery walks up from:
+// each changed file's current path when it is a schema file or a symlink, and
+// the schema path a rename vacated. Callers deciding whether a pull request needs config
+// discovery at all read the same paths, so a rename that vacates a schema
+// path is never read as "no schema files changed".
+func DiscoverySchemaPaths(files []PRFile) []string {
 	var result []string
 	for _, file := range files {
-		if IsSchemaFile(file) {
-			result = append(result, file)
+		// A changed symlink, such as an environment link, sits inside the
+		// config directory it changes, so discovery walks up from it too.
+		if file.Symlink || IsSchemaFile(file.Filename) {
+			result = append(result, file.Filename)
+		}
+		if vacated, ok := renamedAwaySchemaPath(file); ok {
+			result = append(result, vacated)
 		}
 	}
 	return result
@@ -725,35 +790,14 @@ func newDiscoveredConfig(config *SchemabotConfig, dir string) DiscoveredConfig {
 	}
 }
 
-func (ic *InstallationClient) findConfigsChangedInPR(ctx context.Context, repo string, pr int, ref string) ([]DiscoveredConfig, error) {
-	files, err := ic.FetchPRFiles(ctx, repo, pr)
-	if err != nil {
-		return nil, fmt.Errorf("fetch PR files: %w", err)
-	}
-
-	configsByPath := make(map[string]DiscoveredConfig)
-	for _, file := range files {
-		if !isConfigFile(file.Filename) {
-			continue
-		}
-		if isRemovedPRFile(file.Status) {
-			continue
-		}
-		configDir := path.Dir(file.Filename)
-		config, err := ic.FetchConfig(ctx, repo, file.Filename, ref)
-		if err != nil {
-			return nil, fmt.Errorf("fetch changed config %s: %w", file.Filename, err)
-		}
-		configsByPath[configDir] = newDiscoveredConfig(config, configDir)
-	}
-
-	return sortedConfigs(configsByPath), nil
-}
-
+// selectConfigByDatabaseName matches the requested database against discovered
+// configs by canonical key: FetchConfig folds every declared database at parse,
+// so folding the request here is the only comparison needed.
 func selectConfigByDatabaseName(databaseName string, configs []DiscoveredConfig) (*SchemabotConfig, string, bool, error) {
+	databaseName = storage.CanonicalKey(databaseName)
 	var matches []DiscoveredConfig
 	for _, dc := range configs {
-		if strings.EqualFold(dc.Config.Database, databaseName) {
+		if dc.Config.Database == databaseName {
 			matches = append(matches, dc)
 		}
 	}

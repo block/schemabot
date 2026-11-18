@@ -10,19 +10,16 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
-	"github.com/block/schemabot/pkg/testutil"
 )
 
 // A data-plane host queues control-plane-authorized dispatches through
@@ -35,26 +32,10 @@ import (
 func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 	ctx := t.Context()
 
-	container, err := mysql.Run(ctx,
-		"mysql:8.0",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
+	dsn := newStorageDatabaseWithSchema(t).DSN
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	require.NoError(t, db.PingContext(ctx), "failed to ping database")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
@@ -148,13 +129,14 @@ func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 	})
 	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
 
-	// The committed apply and task rows make the queued apply claimable by an
-	// operator driver.
-	claimed, err := stor.Applies().FindNextApply(ctx, "driver-test")
+	// The committed apply, task, and operation rows make the queued apply
+	// claimable by an operator driver.
+	claimed, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "driver-test")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "queued apply must be operator-claimable")
-	assert.Equal(t, applyID, claimed.ID)
-	assert.Equal(t, state.Apply.Pending, claimed.State)
+	assert.Equal(t, applyID, claimed.ApplyID)
+	assert.Equal(t, operations[0].ID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Pending, claimed.State, "caller sees the pre-claim state")
 }
 
 // When API auth is enabled, an authorized write persists an apply attributed to
@@ -165,26 +147,10 @@ func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 func TestEnqueueAuthorizedApplyRecordsAuthenticatedCaller(t *testing.T) {
 	ctx := t.Context()
 
-	container, err := mysql.Run(ctx,
-		"mysql:8.4",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
+	dsn := newStorageDatabaseWithSchema(t).DSN
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	require.NoError(t, db.PingContext(ctx), "failed to ping database")
 	t.Cleanup(func() { utils.CloseAndLog(db) })

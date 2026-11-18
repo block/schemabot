@@ -148,6 +148,26 @@ func (c *RoutingClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (
 	return client.PlanDiff(ctx, routedReq)
 }
 
+// CompareSchemaFileChange routes a schema file comparison to the request's
+// single execution target, mirroring PlanDiff's routing.
+func (c *RoutingClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("schema file comparison request is required")
+	}
+	target, err := c.resolveSingleExecutionTarget(ctx, req.Database, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	client, err := c.clientForDeployment(ctx, target.Deployment, req.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("get client for deployment %q environment %q: %w", target.Deployment, req.Environment, err)
+	}
+	routedReq := proto.Clone(req).(*ternv1.CompareSchemaFileChangeRequest)
+	routedReq.Type = target.DatabaseType
+	routedReq.Target = target.Target
+	return client.CompareSchemaFileChange(ctx, routedReq)
+}
+
 // Apply executes a stored plan on its plan-time execution target.
 func (c *RoutingClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	if req == nil {
@@ -277,13 +297,6 @@ func (c *RoutingClient) Start(ctx context.Context, req *ternv1.StartRequest) (*t
 	return routeApply(ctx, c, req, "start", func(r *ternv1.StartRequest, applyID, environment string) {
 		r.ApplyId, r.Environment = applyID, environment
 	}, Client.Start)
-}
-
-// Volume modifies the schema change speed/concurrency in-flight.
-func (c *RoutingClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return routeApply(ctx, c, req, "volume", func(r *ternv1.VolumeRequest, applyID, environment string) {
-		r.ApplyId, r.Environment = applyID, environment
-	}, Client.Volume)
 }
 
 // Revert reverts a completed schema change during the revert window.

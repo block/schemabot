@@ -1,0 +1,285 @@
+package postgres
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"log/slog"
+	"math/big"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
+)
+
+// TestCACertPath pins the CA-reference contract: an absent reference and the
+// embedded RDS bundle both rely on the automatic RDS trust (no path), a file
+// reference resolves to the named bundle only when the DSN verifies the
+// server certificate, and anything else is refused so an unrecognized or
+// unenforceable CA can never silently downgrade verification.
+func TestCACertPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		dsn      string
+		metadata map[string]string
+		want     string
+		wantErr  string
+	}{
+		{name: "absent reference trusts the embedded RDS roots"},
+		{
+			name:     "embedded reference resolves to no path",
+			metadata: map[string]string{metadataCARef: caRefEmbeddedRDSGlobal},
+		},
+		{
+			name:     "file reference with a verify-full DSN resolves to its path",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=verify-full",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			want:     "/etc/ssl/rds.pem",
+		},
+		{
+			name:     "file reference with a verify-ca DSN resolves to its path",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=verify-ca",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			want:     "/etc/ssl/rds.pem",
+		},
+		{
+			name:     "file reference with sslmode=require is refused",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=require",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			wantErr:  "would never be consulted",
+		},
+		{
+			name:     "file reference with sslmode=prefer is refused",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=prefer",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			wantErr:  "would never be consulted",
+		},
+		{
+			name:     "file reference with sslmode=disable is refused",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=disable",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			wantErr:  "would never be consulted",
+		},
+		{
+			name:     "file reference with no path is refused",
+			metadata: map[string]string{metadataCARef: "file:"},
+			wantErr:  "names no path",
+		},
+		{
+			name:     "relative file reference is refused",
+			metadata: map[string]string{metadataCARef: "file:ca.pem"},
+			wantErr:  "requires an absolute path",
+		},
+		{
+			name:     "unknown reference is refused",
+			metadata: map[string]string{metadataCARef: "vault:some-ca"},
+			wantErr:  "unsupported reference",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := caCertPath(&engine.Credentials{DSN: tt.dsn, Metadata: tt.metadata})
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestSpritePoolConfig pins the trust wiring the plan and apply dial sites
+// share: a file reference's bundle path rides into the pg-sprite pool
+// configuration alongside the normalized DSN, and the embedded RDS reference
+// leaves the path empty so pg-sprite's own RDS auto-trust applies.
+func TestSpritePoolConfig(t *testing.T) {
+	dsn := "postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full"
+
+	t.Run("file reference carries its bundle path into the pool config", func(t *testing.T) {
+		creds := &engine.Credentials{DSN: dsn, Metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"}}
+		caPath, err := caCertPath(creds)
+		require.NoError(t, err)
+		cfg, err := spritePoolConfig(creds.DSN, caPath)
+		require.NoError(t, err)
+		assert.Equal(t, "/etc/ssl/rds.pem", cfg.CACertPath)
+		assert.Equal(t, dsn, cfg.URL)
+	})
+
+	t.Run("embedded reference leaves the pool config path empty", func(t *testing.T) {
+		creds := &engine.Credentials{DSN: dsn, Metadata: map[string]string{metadataCARef: caRefEmbeddedRDSGlobal}}
+		caPath, err := caCertPath(creds)
+		require.NoError(t, err)
+		cfg, err := spritePoolConfig(creds.DSN, caPath)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.CACertPath)
+		assert.Equal(t, dsn, cfg.URL)
+	})
+
+	t.Run("unparseable DSN is refused", func(t *testing.T) {
+		_, err := spritePoolConfig("postgres://schemabot@:not-a-port/app", "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "judge PostgreSQL DSN for pg-sprite pool")
+	})
+
+	t.Run("non-verifying RDS pool posture is announced", func(t *testing.T) {
+		var logs bytes.Buffer
+		originalLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		t.Cleanup(func() { slog.SetDefault(originalLogger) })
+
+		_, err := spritePoolConfig("postgres://schemabot:secret@apply-only.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", "")
+		require.NoError(t, err)
+		assert.Contains(t, logs.String(), "does not authenticate the server")
+	})
+}
+
+// A bundle the validation connection cannot trust is refused before any dial:
+// a missing file and a file with no parseable certificates both fail closed,
+// while a readable bundle yields the pinning option and no path yields none.
+func TestValidationRootCAs(t *testing.T) {
+	t.Run("no path needs no options", func(t *testing.T) {
+		opts, err := validationRootCAs("")
+		require.NoError(t, err)
+		assert.Empty(t, opts)
+	})
+
+	t.Run("missing bundle fails closed", func(t *testing.T) {
+		_, err := validationRootCAs(filepath.Join(t.TempDir(), "absent.pem"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read PostgreSQL CA bundle")
+	})
+
+	t.Run("bundle with no certificates fails closed", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "empty.pem")
+		require.NoError(t, os.WriteFile(path, []byte("not a certificate"), 0o600))
+		_, err := validationRootCAs(path)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "contains no usable certificates")
+	})
+
+	t.Run("readable bundle yields the pinning option", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ca.pem")
+		require.NoError(t, os.WriteFile(path, testCAPEM(t), 0o600))
+		opts, err := validationRootCAs(path)
+		require.NoError(t, err)
+		assert.Len(t, opts, 1)
+	})
+}
+
+// ConnectionOptions is the trust policy a caller outside the engine dials
+// under: it follows the CA reference exactly as the engine's own dial sites
+// do, so a reference the engine refuses is refused here, a readable pinned
+// bundle yields the pinning option, and the embedded RDS trust needs none.
+func TestConnectionOptions(t *testing.T) {
+	verifyFullDSN := "postgres://user:pw@db.example.com:5432/app?sslmode=verify-full"
+
+	t.Run("embedded RDS trust needs no options", func(t *testing.T) {
+		opts, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefEmbeddedRDSGlobal}})
+		require.NoError(t, err)
+		assert.Empty(t, opts)
+	})
+
+	t.Run("pinned bundle yields the pinning option", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ca.pem")
+		require.NoError(t, os.WriteFile(path, testCAPEM(t), 0o600))
+		opts, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefFilePrefix + path}})
+		require.NoError(t, err)
+		assert.Len(t, opts, 1)
+	})
+
+	t.Run("missing bundle fails closed", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "absent.pem")
+		_, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefFilePrefix + path}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read PostgreSQL CA bundle")
+	})
+
+	t.Run("unsupported reference fails closed", func(t *testing.T) {
+		_, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: "vault:corp-ca"}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported reference")
+	})
+}
+
+func TestPlanRefusesUnknownCAReferenceBeforeConnecting(t *testing.T) {
+	eng := New()
+	_, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "app",
+		Credentials: &engine.Credentials{
+			DSN:      "postgres://localhost/app",
+			Metadata: map[string]string{metadataCARef: "vault:some-ca"},
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported reference")
+}
+
+func TestApplyRefusesUnknownCAReferenceAtAcceptance(t *testing.T) {
+	eng := New()
+	_, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{
+			Namespace: "public",
+			TableChanges: []engine.TableChange{{
+				Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text",
+			}},
+		}},
+		Credentials: &engine.Credentials{
+			DSN:      "postgres://localhost/app",
+			Metadata: map[string]string{metadataCARef: "vault:some-ca"},
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported reference")
+}
+
+// A file-referenced bundle the pool could never trust — missing here — refuses
+// the apply at acceptance instead of failing later inside the background
+// drive.
+func TestApplyRefusesUnreadableCABundleAtAcceptance(t *testing.T) {
+	eng := New()
+	_, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{
+			Namespace: "public",
+			TableChanges: []engine.TableChange{{
+				Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text",
+			}},
+		}},
+		Credentials: &engine.Credentials{
+			DSN:      "postgres://localhost/app?sslmode=verify-full",
+			Metadata: map[string]string{metadataCARef: "file:" + filepath.Join(t.TempDir(), "absent.pem")},
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read PostgreSQL CA bundle")
+}
+
+// testCAPEM returns a self-signed CA certificate in PEM form.
+func testCAPEM(t *testing.T) []byte {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "schemabot test ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, pub, priv)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}

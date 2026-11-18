@@ -8,9 +8,12 @@
 package pendingdrops
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -33,6 +36,11 @@ const (
 	// milliseconds, parsed separately since Go's time.Parse cannot parse
 	// concatenated millisecond digits without a separator.
 	timestampBaseFormat = "20060102150405"
+
+	// disambiguatorHashLen is the number of hex characters of the source
+	// table's hash appended to a quarantine name that would otherwise be
+	// truncated or collide with another name in the same move.
+	disambiguatorHashLen = 8
 )
 
 // TableName returns the quarantine table name for a dropped table, capped at
@@ -40,14 +48,48 @@ const (
 // table was quarantined so the cleaner can compute its age from the name alone.
 // ParseTimestamp reads the prefix back as UTC, so both sides agree on the
 // instant regardless of the server's local time zone.
-func TableName(_ string, tableName string, now time.Time) string {
-	now = now.UTC()
-	prefix := fmt.Sprintf("%s%03d_", now.Format(timestampBaseFormat), now.Nanosecond()/int(time.Millisecond))
-	maxTableLen := tableNameLengthLimit - len(prefix)
-	if len(tableName) > maxTableLen {
-		tableName = tableName[:maxTableLen]
+//
+// A table name too long to fit after the prefix is shortened and ends in a
+// hash of the source schema and full table name, so two long names that share
+// their leading characters still get different quarantine names.
+func TableName(schemaName, tableName string, now time.Time) string {
+	prefix := timestampPrefix(now)
+	if utf8.RuneCountInString(prefix)+utf8.RuneCountInString(tableName) > tableNameLengthLimit {
+		return disambiguatedTableName(prefix, schemaName, tableName, 0)
 	}
 	return prefix + tableName
+}
+
+// timestampPrefix is the "YYYYMMDDHHmmSSmmm_" prefix for now, in UTC.
+func timestampPrefix(now time.Time) string {
+	now = now.UTC()
+	return fmt.Sprintf("%s%03d_", now.Format(timestampBaseFormat), now.Nanosecond()/int(time.Millisecond))
+}
+
+// disambiguatedTableName returns prefix, then as much of tableName as fits,
+// then "_" and a hash of the source schema and full table name, capped at
+// MySQL's 64-character limit. Each later attempt consumes one more hex
+// character of the hash until the prefix and hash alone fill the limit, after
+// which attempts salt the hash instead, so every attempt yields a distinct
+// name. The same table, prefix, and attempt always produce the same name, and
+// the name still starts with the timestamp prefix ParseTimestamp reads.
+func disambiguatedTableName(prefix, schemaName, tableName string, attempt int) string {
+	prefixLen := utf8.RuneCountInString(prefix)
+	maxHashLen := tableNameLengthLimit - prefixLen - len("_")
+	hashInput := schemaName + "\x00" + tableName
+	hashLen := disambiguatorHashLen + attempt
+	if hashLen > maxHashLen {
+		hashInput += "\x00" + strconv.Itoa(attempt)
+		hashLen = disambiguatorHashLen
+	}
+	sum := sha256.Sum256([]byte(hashInput))
+	suffix := "_" + hex.EncodeToString(sum[:])[:hashLen]
+	maxTableLen := tableNameLengthLimit - prefixLen - len(suffix)
+	tableRunes := []rune(tableName)
+	if len(tableRunes) > maxTableLen {
+		tableName = string(tableRunes[:maxTableLen])
+	}
+	return prefix + tableName + suffix
 }
 
 // ParseTimestamp extracts the quarantine time from a table name produced by

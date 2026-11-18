@@ -3,18 +3,17 @@ package api
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
-
-const vSchemaArtifactName = "vschema.json"
 
 func pullSchemaResponseFromProto(resp *ternv1.PullSchemaResponse) *apitypes.PullSchemaResponse {
 	return &apitypes.PullSchemaResponse{
@@ -164,6 +163,47 @@ func protoSchemaFilesToAPI(sf map[string]*ternv1.SchemaFiles) map[string]*apityp
 	return result
 }
 
+// tableChangeResponseFromProto converts a proto table change to its HTTP API
+// form. This is the single proto→apitypes hop for table changes: every field —
+// identity, unsafe, and execution-mode annotations — is mapped here so a new
+// field crosses the boundary with one edit.
+func tableChangeResponseFromProto(t *ternv1.TableChange) *apitypes.TableChangeResponse {
+	return &apitypes.TableChangeResponse{
+		TableName:        t.TableName,
+		Namespace:        t.Namespace,
+		DDL:              t.Ddl,
+		ChangeType:       protoChangeTypeToOperation(t.ChangeType),
+		IsUnsafe:         t.IsUnsafe,
+		UnsafeReason:     t.UnsafeReason,
+		ExecutionMode:    t.ExecutionMode,
+		ModeReason:       t.ModeReason,
+		EstimatedRows:    t.EstimatedRows,
+		ShardCount:       int(t.ShardCount),
+		LargestShardRows: t.LargestShardRows,
+		EstimatedBytes:   t.EstimatedBytes,
+		CollationChanges: collationChangesFromProto(t.CollationChanges),
+	}
+}
+
+func collationChangesFromProto(changes []*ternv1.CollationChange) []apitypes.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]apitypes.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = apitypes.CollationChange{
+			Column:         c.GetColumn(),
+			From:           c.GetFromCollation(),
+			To:             c.GetToCollation(),
+			Case:           c.GetCaseComparison(),
+			TrailingSpaces: c.GetTrailingSpaceComparison(),
+			CanMergeValues: c.GetCanMergeValues(),
+			UniqueIndexes:  c.GetUniqueIndexes(),
+		}
+	}
+	return out
+}
+
 // planResponseFromProto converts a protobuf PlanResponse to an HTTP PlanResponse.
 func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 	httpResp := &apitypes.PlanResponse{
@@ -184,14 +224,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 			Metadata:  sc.Metadata,
 		}
 		for _, t := range sc.TableChanges {
-			apiSC.TableChanges = append(apiSC.TableChanges, &apitypes.TableChangeResponse{
-				TableName:    t.TableName,
-				Namespace:    t.Namespace,
-				DDL:          t.Ddl,
-				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-			})
+			apiSC.TableChanges = append(apiSC.TableChanges, tableChangeResponseFromProto(t))
 		}
 		httpResp.Changes = append(httpResp.Changes, apiSC)
 	}
@@ -219,14 +252,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 			if t == nil {
 				continue
 			}
-			apiSP.Changes = append(apiSP.Changes, &apitypes.TableChangeResponse{
-				TableName:    t.TableName,
-				Namespace:    t.Namespace,
-				DDL:          t.Ddl,
-				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-			})
+			apiSP.Changes = append(apiSP.Changes, tableChangeResponseFromProto(t))
 		}
 		// An empty shard plan is a shard that already matches the desired schema
 		// while sibling shards change (a partially-applied keyspace). Keep it so the
@@ -236,7 +262,82 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		httpResp.Shards = append(httpResp.Shards, apiSP)
 	}
 
+	httpResp.ExistingCopies = existingCopiesFromProto(resp.ExistingCopies)
+	httpResp.ExemptTables = exemptTablesFromProto(resp.ExemptTables)
+
 	return httpResp
+}
+
+func exemptTablesFromProto(groups []*ternv1.ExemptTables) []*apitypes.ExemptTablesResponse {
+	result := make([]*apitypes.ExemptTablesResponse, 0, len(groups))
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		result = append(result, &apitypes.ExemptTablesResponse{
+			Namespace: group.Namespace,
+			Tables:    group.Tables,
+			Reason:    group.Reason,
+		})
+	}
+	return result
+}
+
+// withheldTablesFromProto returns the live tables a plan reports it withheld
+// on the repository's instruction, across every namespace and sorted. The
+// planner exempts tables for reasons of its own as well — an engine's archive
+// naming convention — and only the config's own exclusions answer whether a
+// configured entry matched anything.
+func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
+	var tables []string
+	for _, group := range groups {
+		if group == nil || group.Reason != engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		tables = append(tables, group.Tables...)
+	}
+	slices.Sort(tables)
+	return slices.Compact(tables)
+}
+
+// plannedDropsWithheldBy returns the tables the plan proposes dropping, in its
+// namespace changes or its per-shard changes, that ignored withholds, sorted. A
+// planner that honored the config never sees those tables, so any such drop
+// comes from one that was never shown the exclusion, or could not read it.
+func plannedDropsWithheldBy(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, ignored engine.IgnoredTables) []string {
+	if ignored.Empty() {
+		return nil
+	}
+	var dropped []string
+	for _, drop := range plannedTableDrops(changes, shards) {
+		if ignored.Withholds(drop.table) {
+			dropped = append(dropped, drop.table)
+		}
+	}
+	slices.Sort(dropped)
+	return slices.Compact(dropped)
+}
+
+// existingCopiesFromProto carries the target's unfinished copies through to the
+// plan response so the operator is told, before applying, whether the apply
+// resumes an existing copy or throws it away and starts over.
+func existingCopiesFromProto(copies []*ternv1.ExistingCopy) []*apitypes.ExistingCopyResponse {
+	var result []*apitypes.ExistingCopyResponse
+	for _, c := range copies {
+		if c == nil {
+			continue
+		}
+		result = append(result, &apitypes.ExistingCopyResponse{
+			Namespace:   c.Namespace,
+			Disposition: c.Disposition,
+			Reason:      c.Reason,
+			Tables:      c.Tables,
+			AgeSeconds:  c.AgeSeconds,
+			Statement:   c.Statement,
+			Running:     c.Running,
+		})
+	}
+	return result
 }
 
 // protoChangesToNamespaces converts proto SchemaChanges to storage namespace plan data.
@@ -257,13 +358,7 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 		}
 		nsData := &storage.NamespacePlanData{}
 		for _, t := range sc.TableChanges {
-			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:        t.TableName,
-				DDL:          t.Ddl,
-				Operation:    protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-			})
+			nsData.Tables = append(nsData.Tables, tern.StorageTableChangeFromProto(t, "", t.TableName, t.Ddl, protoChangeTypeToOperation(t.ChangeType)))
 		}
 		if len(sc.OriginalFiles) > 0 {
 			nsData.OriginalFiles = sc.OriginalFiles
@@ -274,10 +369,12 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 				nsData.OriginalFiles = map[string]string{}
 			}
 		}
-		if sc.Metadata["vschema_changed"] == "true" {
+		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
+		nsData.Finalize = sc.Metadata[engine.MetadataNeedsFinalizer] == "true"
+		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
 			if nsFiles := schemaFiles[ns]; nsFiles != nil {
-				if vschema := nsFiles.Files[vSchemaArtifactName]; vschema != "" {
-					nsData.Artifacts = map[string]string{vSchemaArtifactName: vschema}
+				if vschema := nsFiles.Files[storage.VSchemaArtifactName]; vschema != "" {
+					nsData.Artifacts = map[string]string{storage.VSchemaArtifactName: vschema}
 				}
 			}
 		}
@@ -332,51 +429,20 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 			if cn := strings.TrimSpace(ch.Namespace); cn != "" && cn != namespace {
 				return nil, fmt.Errorf("shard plan %d shard %q change %d (table %q) namespace %q disagrees with shard namespace %q", i, shardName, j, table, cn, namespace)
 			}
-			sp.Changes = append(sp.Changes, storage.TableChange{
-				Namespace:    namespace,
-				Table:        table,
-				DDL:          changeDDL,
-				Operation:    protoChangeTypeToOperation(ch.ChangeType),
-				IsUnsafe:     ch.IsUnsafe,
-				UnsafeReason: ch.UnsafeReason,
-			})
+			sp.Changes = append(sp.Changes, tern.StorageTableChangeFromProto(ch, namespace, table, changeDDL, protoChangeTypeToOperation(ch.ChangeType)))
 		}
 		out = append(out, sp)
 	}
 	return out, nil
 }
 
-// protoChangeTypeToOperation converts a proto ChangeType enum to a storage operation string.
+// protoChangeTypeToOperation converts a proto change type to a storage operation.
+// Unmapped values use "other" because storage retains unsupported change types.
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	default:
-		return "other"
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
-}
-
-// changeTypeToProto converts operation string to proto ChangeType enum.
-func changeTypeToProto(op string) ternv1.ChangeType {
-	if strings.EqualFold(op, "vschema_update") {
-		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
-	}
-	switch ddl.OpToStatementType(op) {
-	case statement.StatementCreateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case statement.StatementAlterTable:
-		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case statement.StatementDropTable:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP
-	default:
-		return ternv1.ChangeType_CHANGE_TYPE_OTHER
-	}
+	return "other"
 }
 
 // protoToSchemaFiles converts proto SchemaFiles to the engine's schema.SchemaFiles,

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -113,7 +113,7 @@ func TestMTLS_BranchConnection(t *testing.T) {
 	// Connect to branch proxy via mTLS
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/testkeyspace?tls=test-mtls&interpolateParams=true",
 		pw.Username, pw.PlainText, pw.Hostname)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

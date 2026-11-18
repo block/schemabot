@@ -108,7 +108,19 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	}
 
 	headSHA := prInfo.HeadSHA
-	timestamp := templates.NowFunc().UTC().Format("2006-01-02 15:04:05")
+
+	// Participant selection reads what the PR proposes against the default
+	// branch, as auto-plan and the leader's refold do, so a config deletion the
+	// PR only inherited selects no participant here either. Only a leader or a
+	// participant reads the list below, so a repository with no aggregate role
+	// never makes the comparison and cannot fail on it.
+	listed := files
+	if h.hasAggregateRole(repo) {
+		files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
+		if err != nil {
+			return fmt.Errorf("scope PR files to what the PR proposes before refreshing checks for PR with no managed schema changes: %w", err)
+		}
+	}
 
 	// Stale plan-only checks from commits whose schema changes were since
 	// reverted would keep the aggregate blocked, so clean them up first —
@@ -117,19 +129,26 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	// retains them as blocking.
 	h.cleanupStaleChecks(repo, pr, headSHA, installationID, nil)
 
-	if h.isAggregateParticipant(repo) {
+	if h.isAggregateParticipant(repo) && !h.participantPathsTouched(repo, files) {
 		h.logger.Info("aggregate participant staying silent on plan for PR with no managed schema changes",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
 		return nil
 	}
 
-	if h.leaderExpectsParticipantsForPR(repo, files) {
+	// The same question the leader's fold asks: a participant the narrowed list
+	// no longer selects still gates the refresh while its own run on the head
+	// is not passing, so the refresh never posts a passing aggregate over it.
+	expectedParticipants, err := h.leaderParticipantsForPR(ctx, client, repo, pr, headSHA, listed, files)
+	if err != nil {
+		return fmt.Errorf("resolve participants before refreshing checks for PR with no managed schema changes: %w", err)
+	}
+	if len(expectedParticipants) > 0 {
 		h.logger.Info("plan found no leader-managed schema changes but expected participant paths are touched; aggregate gate will block until participants report",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{
 			RequestedBy:    requestedBy,
-			Timestamp:      timestamp,
+			Repository:     repo,
 			HeadSHA:        headSHA,
 			GatedOnTenants: true,
 		}))
@@ -138,20 +157,28 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 
 	h.logger.Info("plan found no managed schema changes; refreshing passing aggregate checks",
 		"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
-	h.postPassingAggregates(ctx, client, repo, pr, headSHA)
+	// Reached only when the PR carries no SchemaBot files at all, so there is
+	// no unmanaged schema to name.
+	h.postPassingAggregates(ctx, client, repo, pr, headSHA, nil)
 	h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy: requestedBy,
-		Timestamp:   timestamp,
+		Repository:  repo,
 		HeadSHA:     headSHA,
 	}))
 	return nil
 }
 
+// prHasCurrentSchemaBotFiles reports whether a command must go through normal
+// config discovery rather than the "no managed schema changes" path. It reads
+// the same schema paths discovery walks up from, so a rename that vacates a
+// schema path (users.sql renamed to users.sql.disabled, or moved out of the
+// config directory) counts, as a deletion does: merging it stops declaring
+// that file's tables, and refreshing the checks as passing would hide that.
 func prHasCurrentSchemaBotFiles(files []ghclient.PRFile) bool {
+	if len(ghclient.DiscoverySchemaPaths(files)) > 0 {
+		return true
+	}
 	for _, file := range files {
-		if strings.HasSuffix(file.Filename, ".sql") || strings.HasSuffix(file.Filename, "vschema.json") {
-			return true
-		}
 		if path.Base(file.Filename) == ghclient.ConfigFileName && !strings.EqualFold(file.Status, "removed") {
 			return true
 		}
@@ -221,7 +248,7 @@ func (h *Handler) schemaChangeReconciliationRecords(ctx context.Context, repo st
 			h.logger.Warn("stored check has started-apply state without an apply ID during schema change reconciliation; check will still block",
 				"repo", repo, "pr", pr, "database", check.DatabaseName,
 				"environment", check.Environment, "check_id", check.ID,
-				"status", check.Status)
+				"check_status", check.Status)
 		}
 
 		records = append(records, schemaChangeReconciliationRecord{check: check, apply: apply})

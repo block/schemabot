@@ -2,12 +2,18 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -21,45 +27,86 @@ import (
 // distinct physical primaries that run concurrently by design, so a task on
 // another shard is not a conflict. dispatchShard is "" for a non-sharded apply,
 // which conflicts with any active task on the database (today's behaviour).
-func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string) error {
+//
+// attachApplyID names the keyed apply a sibling dispatch is attaching into (0
+// when the dispatch creates a new apply). That apply's own tasks are the
+// dispatch's siblings, not conflicts: the apply already holds the database's
+// reservation and the driver orders sibling work, so only other applies'
+// active work blocks the attach.
+//
+// The conflict that refused the dispatch is returned alongside the error, so a
+// caller that can resolve into the holding apply rather than be refused by it
+// has the apply in hand without repeating the scan.
+//
+// The stopped applies whose resting tasks the check released are returned with
+// it: their work is what a dispatch for the same table takes over, and the scan
+// that frees the database is the one place that already knows who they are.
+//
+// environment is the dispatch's own environment. It plays no part in what
+// blocks — a namesake's active work on the shared database name still refuses
+// the dispatch — but it decides which released holders the dispatch may later
+// mark superseded (see supersededTakeovers): only work attributable to the
+// same environment and target is the dispatch's to take over.
+func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder, error) {
+	memo := newConflictScanMemo()
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
 		if err != nil {
-			return fmt.Errorf("check existing tasks: %w", err)
+			return blockingTask{}, nil, fmt.Errorf("check existing tasks: %w", err)
 		}
 
 		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
-		blockingTaskID := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard)
-		if blockingTaskID == "" {
-			return nil
+		blocking, released := c.findBlockingTask(ctx, existingTasks, plan, environment, dispatchShard, attachApplyID, memo)
+		if !blocking.blocks() {
+			return blockingTask{}, released, nil
 		}
 
-		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
-		// Handles the race where storage is updated but Spirit hasn't fully finished.
+		// Retry a bounded number of times with a short sleep between
+		// attempts, to ride out the window where storage is updated but the
+		// engine has not fully finished. The sleep is the floor of each
+		// attempt, not its length: an attempt that probes a running apply
+		// waits on the engine's progress read, so the loop's worst case is
+		// the attempt count times that read's own bound.
 		if attempt < 9 {
-			c.logger.Debug("found potentially stale active task, retrying", "task_id", blockingTaskID, "attempt", attempt)
+			c.logger.Debug("found potentially stale active task, retrying",
+				"task_id", blocking.taskIdentifier, "table", blocking.table, "shard", blocking.shard,
+				"apply_id", blocking.applyIdentifier(), "apply_state", blocking.applyStateName(),
+				"attempt", attempt)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		return fmt.Errorf("schema change already in progress for database %q (plan %s): blocking task %s", plan.Database, plan.PlanIdentifier, blockingTaskID)
+		// The refusal is what the operator sees when an apply dies on arrival, so
+		// it names the apply holding the database rather than only the task, which
+		// on its own gives them nothing to act on.
+		return blocking, nil, fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
+			plan.Database, plan.PlanIdentifier, blocking.describe())
 	}
-	return nil
+	return blockingTask{}, nil, nil
 }
 
 // findBlockingTask checks if any non-terminal task for this database is truly active.
-// Returns the blocking task's identifier, or "" if no conflict exists.
+// Returns the conflict, or a zero blockingTask when no conflict exists, along
+// with the stopped applies whose resting tasks it released along the way.
 // As a side effect, resolves stale tasks by checking engine state.
 //
 // dispatchShard scopes the conflict to a single shard (see checkActiveTaskConflict):
 // when both the candidate apply and an existing task target a non-empty shard,
 // a different shard does not conflict, so a sharded fan-out runs its shards
 // concurrently instead of serializing on the first one.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string) string {
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64, memo *conflictScanMemo) (blockingTask, []supersededHolder) {
+	var released []supersededHolder
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
 		if t.DatabaseType != plan.DatabaseType || state.IsTerminalTaskState(t.State) {
+			continue
+		}
+
+		// A task of the apply this dispatch is attaching into is sibling work
+		// under the same reservation, not a conflict (see checkActiveTaskConflict).
+		if attachApplyID != 0 && t.ApplyID == attachApplyID {
+			c.logger.Debug("conflict check: skipping sibling task of the attach-target apply", "task_id", t.TaskIdentifier, "shard", t.Shard)
 			continue
 		}
 
@@ -70,118 +117,637 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue
 		}
 
-		// A pending task of a terminal apply can never start; cancel it so it
-		// stops blocking the database as phantom active work.
-		if c.tryResolveOrphanedPendingTask(ctx, t) {
+		// Both resolvers below decide based on the task's parent apply — its
+		// state and its lease ownership. Any uncertainty (a storage failure or a
+		// missing apply row) means the task cannot be proven resolvable, so it
+		// keeps blocking (fail closed).
+		apply, ok := c.applyForConflictCheck(ctx, t)
+		if !ok {
+			return newBlockingTask(t, nil), nil
+		}
+
+		// A task of a terminal apply waits for a driver that will never arrive;
+		// settle it so it stops blocking the database as phantom active work.
+		c.settleOrphanedTask(ctx, t, apply)
+
+		// Settled terminal, the task is done and no longer blocks. Settled to
+		// stopped, it stays in play for the resting checks below, which own the
+		// takeover of its copy and the superseding of its apply.
+		if state.IsTerminalTaskState(t.State) {
+			continue
+		}
+
+		// A stopped task rests without ending. Nothing reaches for it until a
+		// person asks, so it does not hold the database — and its apply's work
+		// is what a dispatch for the same table takes over. The decision is
+		// storage-only and memoized across the check's retry attempts: the
+		// retries exist to absorb engine staleness, which cannot change this
+		// answer (see conflictScanMemo).
+		resting, decided := memo.resting[t.TaskIdentifier]
+		if !decided {
+			resting.releases = c.restingTaskReleasesDatabase(ctx, t, apply)
+			if resting.releases {
+				resting.attributable = c.releasedHolderAttributableToDispatch(ctx, t, apply, plan, environment, memo.operationTargets)
+			}
+			memo.resting[t.TaskIdentifier] = resting
+		}
+		if resting.releases {
+			if resting.attributable {
+				released = append(released, supersededHolder{
+					applyID:         apply.ID,
+					applyIdentifier: apply.ApplyIdentifier,
+					namespace:       t.Namespace,
+					table:           t.TableName,
+				})
+			}
 			continue
 		}
 
 		// Storage says non-terminal — verify with engine before blocking.
-		if c.tryResolveStaleTask(ctx, t, plan.Database) {
+		if c.tryResolveStaleTask(ctx, t, apply, plan.Database, memo) {
 			continue // Task was stale; engine confirmed it's done.
 		}
 
-		c.logger.Debug("conflict check: task is active", "task_id", t.TaskIdentifier)
-		return t.TaskIdentifier
+		c.logger.Debug("conflict check: task is active", append(t.LogAttrs(),
+			"apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return newBlockingTask(t, apply), nil
 	}
-	return ""
+	return blockingTask{}, released
 }
 
-// tryResolveOrphanedPendingTask cancels a pending task whose parent apply has
-// already reached a terminal state. Such a task can never start: a terminal
-// apply is not claimable, so no drive will ever pick the task up, and pending
-// means no engine work or checkpoint exists to preserve. Left alone the task
-// would block every later apply targeting its database as phantom active work.
-// Any uncertainty — a non-pending state, a storage failure, or a missing apply
-// row — leaves the task untouched so it keeps blocking (fail closed).
-// Returns true if the task was cancelled and no longer blocks.
-func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *storage.Task) bool {
-	if !state.IsState(t.State, state.Task.Pending) {
-		// Only a pending task is provably unstarted; every other state may own
-		// engine work or a checkpoint and stays with the engine-backed checks.
+// conflictScanMemo carries one conflict check's decisions across its retry
+// attempts. The retries exist to absorb engine staleness — storage already
+// updated, the engine not yet settled — but the resting decision is
+// storage-only: re-deciding it on every attempt would count one refusal in the
+// ownership-block metrics up to once per attempt and re-read the apply's
+// control requests for an answer that does not change within the check. Going
+// stale inside the check's window is safe in both directions: a hold that
+// lifts is picked up by the dispatch's own retry, and a release that an
+// operator command overtakes is re-checked durably when the dispatch tries to
+// create its apply against the one-active-apply gate.
+//
+// operationTargets caches the operation-row targets read while attributing
+// released holders. ownershipBlocks keeps repeated engine probes from logging
+// and counting the same ownership refusal on every retry.
+type conflictScanMemo struct {
+	resting          map[string]restingDecision
+	operationTargets map[int64]string
+	ownershipBlocks  map[string]struct{}
+}
+
+// restingDecision is what one conflict check decided about a stopped task:
+// whether it rests without holding the database, and — only when it does —
+// whether its apply's work is attributable to the dispatch and so eligible to
+// be marked superseded.
+type restingDecision struct {
+	releases     bool
+	attributable bool
+}
+
+func newConflictScanMemo() *conflictScanMemo {
+	return &conflictScanMemo{
+		resting:          map[string]restingDecision{},
+		operationTargets: map[int64]string{},
+		ownershipBlocks:  map[string]struct{}{},
+	}
+}
+
+// firstOwnershipBlock records that this scan refused to settle t for reason,
+// and reports whether this is the first such refusal. The caller logs and
+// counts a refusal only the first time, so a task re-probed on every retry
+// attempt is reported once per scan.
+func (m *conflictScanMemo) firstOwnershipBlock(t *storage.Task, reason string) bool {
+	key := t.TaskIdentifier + "/" + reason
+	if _, recorded := m.ownershipBlocks[key]; recorded {
 		return false
 	}
+	m.ownershipBlocks[key] = struct{}{}
+	return true
+}
+
+// blockingTask names the active work that refuses a new apply on a database,
+// in the terms an operator needs to clear it: what is being changed, which task
+// tracks it, and the apply that owns that task.
+//
+// apply is nil when it could not be loaded. That task still blocks — the
+// conflict check fails closed — so the conflict is reported by task alone
+// rather than being suppressed.
+type blockingTask struct {
+	taskIdentifier string
+	table          string
+	shard          string
+	apply          *storage.Apply
+}
+
+// newBlockingTask records the conflicting task, and the apply that owns it when
+// that apply could be loaded.
+func newBlockingTask(t *storage.Task, apply *storage.Apply) blockingTask {
+	return blockingTask{
+		taskIdentifier: t.TaskIdentifier,
+		table:          t.TableName,
+		shard:          t.Shard,
+		apply:          apply,
+	}
+}
+
+// blocks reports whether a conflicting task was found.
+func (b blockingTask) blocks() bool { return b.taskIdentifier != "" }
+
+// applyIdentifier and applyStateName name the holding apply for logs, empty
+// when it could not be loaded, so a triage line reports the conflict by task
+// alone rather than dropping the log or dereferencing a missing apply.
+func (b blockingTask) applyIdentifier() string {
+	if b.apply == nil {
+		return ""
+	}
+	return b.apply.ApplyIdentifier
+}
+
+func (b blockingTask) applyStateName() string {
+	if b.apply == nil {
+		return ""
+	}
+	return b.apply.State
+}
+
+// describe renders the conflict for an operator: what holds the database, who
+// owns it, and what has to happen before the database is free.
+//
+// The holding change is named by its pull request or its caller, not by the
+// engine's apply identifier. That identifier belongs to the data plane alone:
+// the control plane resolves an apply only by its own identifier, so offering
+// the engine's as the handle sends an operator to a command that refuses them.
+// It stays in the logs, where every triage attribute already carries it.
+func (b blockingTask) describe() string {
+	if b.apply == nil {
+		return b.subject() + " is held by a schema change that could not be loaded"
+	}
+
+	described := fmt.Sprintf("%s is held by a schema change (%s)%s",
+		b.subject(), b.apply.State, b.holder())
+	if hold := state.Hold(b.apply.State); hold != "" {
+		return described + "; " + hold
+	}
+	return described
+}
+
+// holder names who owns the blocking change, preferring the pull request an
+// operator can open over the caller string. Both are empty for a change whose
+// provenance was not recorded, which leaves the conflict described by its work
+// and its state alone rather than by an identifier that resolves nowhere.
+func (b blockingTask) holder() string {
+	switch {
+	case b.apply.Repository != "" && b.apply.PullRequest > 0:
+		return fmt.Sprintf(" on %s#%d", b.apply.Repository, b.apply.PullRequest)
+	case b.apply.Caller != "":
+		return fmt.Sprintf(" started by %s", b.apply.Caller)
+	default:
+		return ""
+	}
+}
+
+// conflict renders the refusal as the structured facts a caller can present on
+// its own surfaces: the work being held, the state holding it, and who owns the
+// holding change.
+//
+// The holding apply's own identifier crosses too, but as a lookup key rather
+// than as text. A caller that dispatched this work recorded that identifier
+// against its own apply, so it can turn the key into a handle that resolves on
+// its side. That is the opposite of what describe() omits — this identifier is
+// never rendered, it is what lets the caller avoid rendering it.
+//
+// Returns nil when there is no conflict to report, or when the blocking task's
+// apply could not be loaded — the dispatch is still refused (the check fails
+// closed), but with nothing proven about the holder there is nothing to render
+// beyond the sanitized error the caller already has.
+func (b blockingTask) conflict() *ternv1.ApplyConflict {
+	if !b.blocks() || b.apply == nil {
+		return nil
+	}
+	return &ternv1.ApplyConflict{
+		Table:            b.table,
+		Shard:            b.shard,
+		BlockingState:    state.NormalizeState(b.apply.State),
+		Repository:       b.apply.Repository,
+		PullRequest:      int32(b.apply.PullRequest),
+		Caller:           b.apply.Caller,
+		HolderExternalId: b.apply.ApplyIdentifier,
+	}
+}
+
+// subject names the work being done, leading with the table an operator
+// recognizes and keeping the task identifier as the handle for the CLI. A
+// multi-table atomic change records no table, so it is named by task alone —
+// but it still names its shard when it has one, because only that shard is
+// held and an operator reading the refusal needs to know which.
+func (b blockingTask) subject() string {
+	switch {
+	case b.table == "" && b.shard == "":
+		return fmt.Sprintf("task %s", b.taskIdentifier)
+	case b.table == "":
+		return fmt.Sprintf("shard %s (task %s)", b.shard, b.taskIdentifier)
+	case b.shard == "":
+		return fmt.Sprintf("table %s (task %s)", b.table, b.taskIdentifier)
+	default:
+		return fmt.Sprintf("table %s shard %s (task %s)", b.table, b.shard, b.taskIdentifier)
+	}
+}
+
+// applyForConflictCheck loads the parent apply the conflict-check resolvers
+// decide on. Returns ok=false when the apply cannot be loaded or the row is
+// missing — the caller must keep the task blocking, because without the apply
+// neither the task's orphan status nor its lease ownership can be proven.
+func (c *LocalClient) applyForConflictCheck(ctx context.Context, t *storage.Task) (*storage.Apply, bool) {
 	apply, err := c.storage.Applies().Get(ctx, t.ApplyID)
 	if err != nil {
-		c.logger.Warn("conflict check: failed to load the pending task's apply; the task keeps blocking the database",
+		c.logger.Warn("conflict check: failed to load the task's apply; the task keeps blocking the database",
 			append(t.LogAttrs(), "error", err)...)
-		return false
+		return nil, false
 	}
 	if apply == nil {
-		c.logger.Warn("conflict check: pending task's apply row is missing; the task keeps blocking the database",
+		c.logger.Warn("conflict check: task's apply row is missing; the task keeps blocking the database",
 			t.LogAttrs()...)
-		return false
+		return nil, false
+	}
+	return apply, true
+}
+
+// orphanedTaskSettlement returns the state an orphaned task settles to under a
+// terminal apply, and whether the task is one that can be settled at all.
+//
+// Only the states that wait for a driver settle here. Pending and
+// failed_retryable work is claimed unprompted, which is precisely what a
+// terminal apply guarantees will never happen again, so a task left in either
+// one has no way out on its own. Running and its phases may still own live
+// engine work, and stopped is already a resting state; both stay with the
+// checks that can tell.
+//
+// A stopped apply settles its retryable work to stopped rather than cancelled.
+// The operator asked for a stop, the copy on the target may still be resumable,
+// and stopped is the one state both start and the takeover path can act on —
+// cancelling would discard a copy the apply never decided to discard. Every
+// other terminal apply has ended for good, so its tasks are cancelled.
+func orphanedTaskSettlement(taskState, applyState string) (string, bool) {
+	switch {
+	case state.IsState(taskState, state.Task.Pending):
+		// Pending is provably unstarted: no engine work and no checkpoint
+		// exists to preserve, so there is nothing for a later start to resume.
+		return state.Task.Cancelled, true
+	case state.IsState(taskState, state.Task.FailedRetryable):
+		if state.IsState(applyState, state.Apply.Stopped) {
+			return state.Task.Stopped, true
+		}
+		return state.Task.Cancelled, true
+	default:
+		return "", false
+	}
+}
+
+// orphanedTaskSettlementLogMessage is the durable apply-log entry a settlement
+// records. Operators read it on the holding apply to see why a task moved
+// without a driver ever touching it.
+const orphanedTaskSettlementLogMessage = "Settled orphaned task: its apply was already terminal, so no driver could ever claim it"
+
+// settleOrphanedTask settles a task whose parent apply has already reached a
+// terminal state. Such a task is waiting for a driver that will never arrive: a
+// terminal apply is not claimable, so nothing picks the task up, and left alone
+// it blocks every later apply targeting its database as phantom active work.
+//
+// The sweep is written against the invariant — a terminal apply's tasks must be
+// settled — rather than against the single task state it was first needed for,
+// so a state that reaches a terminal apply by some other route is settled too
+// instead of moving the hole.
+//
+// The task is mutated in place and the caller re-reads its state: settled
+// terminal it is done, and settled to stopped it stays in play for the resting
+// checks that own the takeover of its copy. A refused write leaves the task
+// untouched and blocking, because reporting it settled would admit a new apply
+// while storage still records the orphan as active work.
+func (c *LocalClient) settleOrphanedTask(ctx context.Context, t *storage.Task, apply *storage.Apply) {
+	settledState, settles := orphanedTaskSettlement(t.State, apply.State)
+	if !settles {
+		return
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		c.logger.Debug("conflict check: pending task's apply is still active; the task blocks normally",
+		c.logger.Debug("conflict check: orphan candidate's apply is still active; the task blocks normally",
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
-		return false
+		return
 	}
-	c.logger.Info("conflict check: cancelling orphaned pending task; its apply is terminal so the task can never start",
-		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
-	previousState := t.State
-	now := time.Now()
-	t.State = state.Task.Cancelled
-	t.ErrorMessage = "Task orphaned: its apply reached a terminal state before the task started"
-	t.CompletedAt = &now
-	t.UpdatedAt = now
-	// The task only stops blocking once the cancellation is durably written:
-	// reporting it resolved on a failed write would admit the new apply while
-	// storage still records the orphan as active work.
-	if err := c.storage.Tasks().Update(ctx, t); err != nil {
-		t.State = previousState
-		t.ErrorMessage = ""
-		t.CompletedAt = nil
-		c.logger.Error("conflict check: failed to persist orphaned task cancellation; the task keeps blocking the database",
+	// A terminal apply with a fresh lease is a driver mid-settlement of this
+	// same apply — its own task writes may still be in flight, and racing them
+	// leaves the row to whichever write lands last. This check holds no lease,
+	// so it defers: the task keeps blocking, and the sweep settles it on a
+	// later check once the lease has aged out.
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Debug("conflict check: orphan candidate's apply still holds a fresh lease; a driver may be settling it, so the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		return
+	}
+	op, err := c.taskOperation(ctx, t)
+	if err != nil {
+		c.logger.Warn("conflict check: orphan candidate's operation lease is unreadable; the task keeps blocking the database",
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
-		return false
+		return
+	}
+	if op.HasFreshLease(time.Now()) {
+		c.logger.Info("conflict check: orphan candidate's operation has a live drive; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "operation_lease_owner", op.LeaseOwner)...)
+		return
+	}
+	ctx = operationLeaseAbsenceContext(ctx, t, op)
+	c.logger.Info("conflict check: settling orphaned task; its apply is terminal so no driver will ever claim the task",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State, "settled_state", settledState)...)
+
+	previous := *t
+	now := time.Now()
+	t.State = settledState
+	t.UpdatedAt = now
+	// Every settled state is at rest, so the row must not carry a frozen ETA
+	// or render as paused with no copy in flight (the same clearing
+	// persistTaskStateTransition does). The rows this sweep repairs are
+	// precisely the ones written by paths that never got to clear them.
+	t.ETASeconds = 0
+	t.Throttled = false
+	t.ThrottleReason = ""
+	// A settlement that ends the task records why it ended. A settlement to
+	// stopped keeps the engine's own failure message instead: the change is
+	// resumable, and that message is why the copy stopped where it did.
+	if state.IsTerminalTaskState(settledState) {
+		t.ErrorMessage = "Task orphaned: its apply reached a terminal state before the task could be driven"
+		t.CompletedAt = &now
+	}
+	if err := c.storage.Tasks().Update(ctx, t); err != nil {
+		*t = previous
+		c.logger.Error("conflict check: failed to persist orphaned task settlement; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error", err)...)
+		return
 	}
 	taskID := t.ID
 	c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start",
-		previousState, state.Task.Cancelled)
+		orphanedTaskSettlementLogMessage, previous.State, settledState)
+}
+
+// restingTaskReleasesDatabase reports whether a stopped task has stopped
+// holding its database.
+//
+// A task holds the database only while a driver will pick it up on its own:
+// running work is being driven now, and pending or failed_retryable work is
+// claimed unprompted. Stopped is the one state where a task still exists and
+// nothing reaches for it until a person asks. That is what makes it safe to
+// ignore, and it is exactly what a terminal-task test cannot express, because
+// the same fact that makes it inert also makes it resumable.
+//
+// Three conditions must hold, each closing off a way a driver could still
+// arrive:
+//
+//	apply is terminal        a claimable apply is work someone will drive
+//	no fresh lease           a live driver is mid-settlement of this apply
+//	no pending start/cancel  an operator already asked, and the claim
+//	                         predicate admits a stopped apply for either
+//
+// Uncertainty keeps the hold: a control-request read that fails cannot prove no
+// driver is coming, so the task keeps blocking.
+func (c *LocalClient) restingTaskReleasesDatabase(ctx context.Context, t *storage.Task, apply *storage.Apply) bool {
+	if !state.IsState(t.State, state.Task.Stopped) {
+		// Every other non-terminal task state is either being driven now or
+		// waiting for a driver, so it stays with the engine-backed checks.
+		return false
+	}
+
+	if !state.IsTerminalApplyState(apply.State) {
+		c.logger.Debug("conflict check: stopped task's apply is still claimable; the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return false
+	}
+
+	// A terminal apply with a fresh lease is a driver mid-settlement of this
+	// same apply, so the task falls through to tryResolveStaleTask, which
+	// checks the lease again and owns the fresh_lease ownership-block record —
+	// recording it here too would count one refusal twice.
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Debug("conflict check: stopped task's apply still holds a fresh lease; the engine-backed checks decide whether it blocks",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		return false
+	}
+
+	operation, err := c.pendingDriverRequest(ctx, apply)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to read the stopped apply's control requests; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "control_request_unreadable")
+		return false
+	}
+	if operation != "" {
+		c.logger.Info("conflict check: stopped task's apply has an operator command waiting for a driver; the task keeps blocking until that command is delivered",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "pending_operation", string(operation))...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "pending_control_request")
+		return false
+	}
+
+	c.logger.Info("conflict check: stopped task rests with no driver coming for it; it no longer holds the database",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
 	return true
+}
+
+// releasedHolderAttributableToDispatch reports whether a released resting
+// task's work provably belongs to the environment and target this dispatch is
+// for. Task rows are keyed by database name alone, which is not a target: the
+// name can be shared by this deployment's staging and production databases
+// (see runningCopyTables). Releasing the hold is safe either way — a resting
+// task holds nothing regardless of whose it is — but the superseded marker is
+// a write-once, permanent refusal of start on the holder, so a holder that
+// cannot be attributed to this dispatch's own environment and target must not
+// be marked: refusing a namesake's apply forever is worse than leaving its
+// marker to the dispatch that actually meets its copy. Every unattributable
+// shape — a mismatched or absent environment, a target that cannot be
+// resolved, a failed attribution read — fails toward not marking, the same
+// direction taskRunsOnPlanTarget fails for plan disclosures.
+func (c *LocalClient) releasedHolderAttributableToDispatch(ctx context.Context, t *storage.Task, apply *storage.Apply, plan *storage.Plan, environment string, operationTargets map[int64]string) bool {
+	if !c.taskDescribesPlanTarget(t, environment) {
+		c.logger.Info("conflict check: released resting task belongs to a namesake environment, so this dispatch takes over none of its work",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "dispatch_environment", environment)...)
+		return false
+	}
+	onTarget, err := c.taskRunsOnPlanTarget(ctx, t, plan.Target, operationTargets)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to attribute a released resting task to a target, so this dispatch will not mark its apply superseded",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "plan_target", plan.Target, "error", err)...)
+		return false
+	}
+	if !onTarget {
+		c.logger.Info("conflict check: released resting task runs on another target, so this dispatch takes over none of its work",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "plan_target", plan.Target)...)
+		return false
+	}
+	return true
+}
+
+// pendingDriverRequest names the operator command that will bring a driver back
+// to a stopped apply, empty when none is pending. Start and cancel are the two
+// the apply claim predicate admits on a stopped apply: a start resumes it and a
+// cancel is delivered by a drive, so either one means a driver arrives without
+// anyone asking again.
+func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.Apply) (storage.ControlOperation, error) {
+	requests := c.storage.ControlRequests()
+	if requests == nil {
+		// A storage without a control request store cannot answer whether a
+		// command is waiting, and an unanswerable question is not a "no".
+		return "", fmt.Errorf("read pending requests for apply %s: control request store is not configured", apply.ApplyIdentifier)
+	}
+
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel} {
+		request, err := requests.GetPending(ctx, apply.ID, operation)
+		if err != nil {
+			return "", fmt.Errorf("read pending %s request for apply %s: %w", operation, apply.ApplyIdentifier, err)
+		}
+		if request != nil {
+			return operation, nil
+		}
+	}
+	return "", nil
 }
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
 // If the engine reports a terminal state, or reports no active work for a task that
-// storage believes is in-flight, the task is updated in storage and no longer blocks.
-// Resting tasks (Stopped, FailedRetryable) are left untouched.
-// Returns true if the task was resolved (no longer blocking).
-func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, database string) bool {
+// storage believes is in-flight, the task is updated in storage and no longer blocks;
+// a terminal report that maps to a resting state (a retryable failure, or a stop) is
+// stored in that state instead, which keeps blocking like any resting task under a
+// claimable apply. A retryable failure also pauses the apply for retry
+// (pauseStaleApplyForRetry), so its recovery is charged against the retry
+// budget. Resting tasks (Stopped, FailedRetryable) are left untouched.
+//
+// The engine probe answers from this process's own memory of the work: it
+// reports what this process ran, not the task's actual cross-process state. The
+// task's leases decide whether that memory is authoritative — a fresh lease on
+// its parent apply or on the operation that owns it means a live driver owns
+// the work and the task keeps blocking, and a terminal report is only trusted
+// for a task in flight whose last lease belongs to this process (the
+// completing process's own report; see terminalReportDescribesTask).
+// Returns true if the task was resolved (no longer blocking), which requires
+// the settlement to be durably written; a refused write keeps the task blocking.
+func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string, memo *conflictScanMemo) bool {
 	eng := c.getEngine()
 	if eng == nil {
 		c.logger.Error("tryResolveStaleTask: engine is nil", t.LogAttrs()...)
 		return false
 	}
 
-	result, err := eng.Progress(ctx, &engine.ProgressRequest{
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Info("conflict check: task's apply is actively driven; the task keeps blocking until its lease owner settles it",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "fresh_lease")
+		return false
+	}
+
+	// A multi-operation drive heartbeats only the operation it holds, so the
+	// parent apply's lease can read stale — or name a leftover owner — while
+	// that drive is live. The operation's own lease is what decides, read the
+	// way the claim path reads it: a fresh one means the drive owns the task,
+	// and a lease that cannot be read cannot rule that drive out.
+	op, err := c.taskOperation(ctx, t)
+	if err != nil {
+		if memo.firstOwnershipBlock(t, "operation_lease_unreadable") {
+			c.logger.Warn("conflict check: failed to read the lease of the operation that owns the task; the task keeps blocking the database",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+			metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "operation_lease_unreadable")
+		}
+		return false
+	}
+	if op.HasFreshLease(time.Now()) {
+		if memo.firstOwnershipBlock(t, "fresh_operation_lease") {
+			c.logger.Info("conflict check: a live drive holds the lease of the operation that owns the task; the task keeps blocking until that drive settles it",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_lease_owner", apply.LeaseOwner,
+					"apply_operation_id", op.ID, "operation_deployment", op.Deployment, "operation_lease_owner", op.LeaseOwner)...)
+			metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "fresh_operation_lease")
+		}
+		return false
+	}
+	settlementCtx := operationLeaseAbsenceContext(ctx, t, op)
+
+	// The raw target credentials (no namespace mapping) are correct here
+	// because per-namespace resolution only exists for MySQL, whose engine
+	// never connects from a Progress request — Spirit's progress is purely
+	// in-memory. For every other database type credentialsForTask is the
+	// identity: the target-level credentials are the task's credentials, so
+	// an engine whose Progress does connect from them (PlanetScale builds an
+	// API client; PostgreSQL reads only through the session its own executor
+	// already holds) addresses exactly what the apply itself addressed. Were
+	// MySQL's engine ever to connect from these credentials, this probe would
+	// have to resolve them per task first, or under schema overrides it
+	// would address the canonical name instead of the physical schema.
+	//
+	// The task identifier rides along for engines that key progress by apply
+	// identity (postgres): a probe about work the engine is still running
+	// must see its live state and keep blocking, while an unrecognized
+	// identity reads the idle sentinel and resolves as abandoned. Engines
+	// that ignore identity (Spirit) or require resume metadata instead
+	// (PlanetScale) behave exactly as before.
+	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    database,
 		Credentials: c.credentials(),
+		ResumeState: &engine.ResumeState{MigrationContext: t.TaskIdentifier},
 	})
 	if err != nil {
 		// result may be nil when err is non-nil, so it must not be dereferenced here.
 		c.logger.Warn("conflict check: engine progress failed", append(t.LogAttrs(), "err", err)...)
 		return false
 	}
-	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "message", result.Message)
+	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "engine_message", result.Message)
 
 	// Engine says terminal — update storage and unblock.
 	// IMPORTANT: Only trust terminal states, NOT "No active schema change".
 	// "No active schema change" just means Spirit has no runningSchemaChange,
 	// which could mean completed, never started, or crashed.
 	if result.State.IsTerminal() {
+		if !c.terminalReportDescribesTask(ctx, t, apply, result, memo) {
+			return false
+		}
 		c.logger.Info("conflict check: engine reports terminal state",
 			"task_id", t.TaskIdentifier, "engine_state", result.State,
 			"engine_message", result.Message, "storage_state", t.State)
-		now := time.Now()
-		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, engineStateToStorage(result.State), "")
+		// The task stops blocking only once its settlement is durable:
+		// reporting it resolved on a refused write would admit a new apply
+		// while storage still records the task as in-flight work. A refused
+		// write restores the task, so it keeps blocking and a later conflict
+		// check retries the settlement cleanly. The write carries the
+		// operation lease absence guard, so a drive that claimed the
+		// operation after the lease was read refuses it the same way.
+		//
+		// The report is settled the way the drive would have settled it: a
+		// failure the engine marks retryable rests as failed_retryable and a
+		// stopped report rests as stopped, neither with a completion stamp, so
+		// a later drive of the apply picks the task up again. A failure keeps
+		// the engine's reason unless the task already carries one, which the
+		// drive that owned the task wrote and outranks this process's memory.
+		previous := *t
+		settledState := taskStateFromProgressResult(result)
+		rests := staleTaskSettlementRests(settledState)
+		if !rests {
+			now := time.Now()
+			t.CompletedAt = &now
+		}
+		if result.State == engine.StateFailed && t.ErrorMessage == "" {
+			t.ErrorMessage = progressFailureMessage(result)
+		}
+		if err := c.persistTaskStateTransition(settlementCtx, t, 0, settledState, ""); err != nil {
+			*t = previous
+			c.logStaleTaskSettlementRefused(t, apply, settledState, err)
+			return false
+		}
+		if rests {
+			c.logger.Info("conflict check: settled a stale task into a resting state; it keeps blocking the database while its apply is still claimable",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error_message", t.ErrorMessage)...)
+			if state.IsState(settledState, state.Task.FailedRetryable) {
+				c.pauseStaleApplyForRetry(ctx, t, &previous, apply, op)
+			}
+			return false
+		}
 		return true
 	}
 
-	// The engine has no active work. For in-flight states this means the task was
-	// abandoned (e.g. a server crash) and must be failed so it stops blocking.
+	// The engine has no active work. For attributable in-flight states this means
+	// the task was abandoned (e.g. a server crash) and must be failed so it stops
+	// blocking.
 	// Resting states (Stopped, FailedRetryable) also have no active engine work,
 	// but that is expected — Spirit keeps the checkpoint until an operator resumes
 	// or retries. Failing them here would destroy resumable work and void the
@@ -193,21 +759,243 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 				"task_id", t.TaskIdentifier, "storage_state", t.State)
 			return false
 		}
+		if apply.LeaseOwner == "" {
+			c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "unattributed_no_active_report",
+				"conflict check: engine reports no active schema change, but the apply records no lease holder, so the report cannot be attributed to this process; the task keeps blocking until a driver settles it")
+			return false
+		}
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
 			"task_id", t.TaskIdentifier, "storage_state", t.State, "started_at", t.StartedAt)
+		// As with a terminal report, the task stops blocking only once its
+		// failure is durable, and the write carries the same absence guard.
+		previous := *t
 		now := time.Now()
 		t.ErrorMessage = "Task abandoned: engine has no active schema change (server may have crashed)"
 		t.CompletedAt = &now
-		c.transitionTaskState(ctx, t, 0, state.Task.Failed, "")
+		if err := c.persistTaskStateTransition(settlementCtx, t, 0, state.Task.Failed, ""); err != nil {
+			*t = previous
+			c.logStaleTaskSettlementRefused(t, apply, state.Task.Failed, err)
+			return false
+		}
 		return true
 	}
 
 	return false
 }
 
+// staleTaskSettlementRests reports whether a stale task settled from an engine
+// terminal report rests rather than ends. Every engine terminal report maps to
+// a terminal task state except a retryable failure (failed_retryable) and a
+// stopped report (stopped). Both rest under an apply that is still claimable,
+// so a later drive of the apply picks the task up again, and the task keeps the
+// hold every later conflict check gives it: a failed_retryable task always
+// blocks, and a stopped one blocks until its apply is terminal. Any other
+// non-terminal state rests too, so a report that maps to a state this
+// predicate does not name keeps blocking rather than admitting a new apply.
+func staleTaskSettlementRests(settledState string) bool {
+	return !state.IsTerminalTaskState(settledState)
+}
+
+// pauseStaleApplyForRetry moves the apply of a stale task the conflict check
+// has just settled as failed_retryable to failed_retryable too, together with
+// the task's operation, so the apply's next recovery goes through the
+// retryable claim, which charges and enforces the retry budget (attempt).
+// Left active, the apply is re-leased by the stale-active claim, which charges
+// nothing, so a retryable failure that recurs with no live driver to record it
+// would be retried forever.
+//
+// The task settlement has already landed in its own transaction; this is a
+// second one, guarded on the lease tokens the conflict check read. A refused
+// or failed move leaves the apply where it was, which is the behaviour without
+// this step: the task still blocks the database and the stale-active claim
+// recovers the apply. Either way the task keeps blocking, so nothing here
+// changes what the conflict check reports.
+//
+// The pause is attempted once, in the pass that settles the task. A later
+// conflict check meets a task that already rests failed_retryable, which it
+// leaves alone, so an apply whose pause was refused or failed is recovered by
+// the stale-active claim without a charge. That uncharged path is one recovery
+// long: the drive that re-leases the apply records the next failure itself,
+// through the paths that charge the budget.
+//
+// An apply in a revert phase, or a task that was in one before it settled
+// (settledFrom), is left in it. The retryable claim rewinds the apply it
+// claims to running, and a spent budget settles it failed over a change that
+// already cut over; both erase the stored phase that revert-phase handling,
+// not forward-apply handling, owns the outcome of.
+//
+// Multi-operation applies move the same way. The rollout projection derives a
+// failed_retryable parent from any failed_retryable operation, so the pair this
+// writes is the state the projection would reach once the operation recorded
+// its failure, its compare-and-swap reads that state like any other, and the
+// operation claim resumes a failed_retryable operation and charges the parent's
+// budget under either drive mode. The store refuses the move while any sibling
+// operation holds a fresh lease, so a live sibling drive is never paused under
+// it, and siblings that are pending or done are left as they are.
+//
+// An operation parked at the cutover barrier is left as today: its copy is
+// done and it is reserved for the cutover claim, so routing it through the
+// retryable copy claim would take it out of the barrier's ordering.
+func (c *LocalClient) pauseStaleApplyForRetry(ctx context.Context, t, settledFrom *storage.Task, apply *storage.Apply, op *storage.ApplyOperation) {
+	if applyInRevertPhase(apply) || taskInRevertPhase(settledFrom) {
+		c.logger.Info("conflict check: the stale task was in a revert phase, so its apply is left in that phase rather than paused for retry",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State, "settled_from", settledFrom.State)...)
+		return
+	}
+	if op != nil && state.IsState(op.State, state.ApplyOperation.WaitingForCutover) {
+		c.logger.Info("conflict check: the stale task's operation is parked at the cutover barrier, so its apply is left for the cutover claim rather than paused for retry",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "operation_deployment", op.Deployment)...)
+		return
+	}
+	req := storage.StaleRetryableRequest{
+		ApplyID:         apply.ID,
+		ApplyLeaseToken: apply.LeaseToken,
+		ErrorMessage:    t.ErrorMessage,
+	}
+	if op != nil {
+		req.OperationID = op.ID
+		req.OperationLeaseToken = op.LeaseToken
+	}
+	moved, err := c.storage.Applies().MarkStaleApplyRetryable(ctx, req)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to pause the stale task's apply for retry; the apply stays active and its next recovery is not charged against the retry budget",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", req.OperationID, "error", err)...)
+		return
+	}
+	if !moved {
+		c.logger.Info("conflict check: storage refused to pause the stale task's apply for retry, so it is left to the writer that holds it; the storage debug log names the row and the reason",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", req.OperationID)...)
+		return
+	}
+
+	previousState := apply.State
+	apply.State = state.Apply.FailedRetryable
+	apply.ErrorMessage = req.ErrorMessage
+	apply.CompletedAt = nil
+	apply.LeaseOwner = ""
+	apply.LeaseToken = ""
+	apply.LeaseAcquiredAt = nil
+	c.logger.Info("conflict check: paused the stale task's apply for retry, so its next recovery is charged against the retry budget",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_operation_id", req.OperationID,
+			"previous_state", previousState, "attempt", apply.Attempt, "error_message", req.ErrorMessage)...)
+	c.logApplyPausedForRetry(ctx, apply, previousState, req.ErrorMessage)
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
+}
+
+// logStaleTaskSettlementRefused records why tryResolveStaleTask left a task
+// blocking after its settlement write did not land. A write the operation
+// lease absence guard refused means a drive claimed the operation after the
+// conflict check read its lease, which is that guard working as intended and
+// worth a warning; any other refusal is a storage failure that must be seen,
+// since the task blocks its database until a later check retries it.
+func (c *LocalClient) logStaleTaskSettlementRefused(t *storage.Task, apply *storage.Apply, settledState string, err error) {
+	attrs := append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error", err)
+	if errors.Is(err, storage.ErrOperationLeaseActive) {
+		c.logger.Warn("conflict check: a drive took the task's operation lease before its settlement landed; the task keeps blocking until that drive settles it", attrs...)
+		return
+	}
+	c.logger.Error("conflict check: failed to persist a stale task's settlement; the task keeps blocking the database", attrs...)
+}
+
+// terminalReportDescribesTask reports whether a terminal engine report has
+// enough evidence to be stamped onto t. The engine answers from this process's
+// memory of the last schema change it ran on the database, which it keeps after
+// that work ends, so task state and lease ownership are necessary guards rather
+// than proof that a database-wide report belongs to one task:
+//
+//   - t is in flight. A task that never started (pending) or is resting
+//     (stopped, failed_retryable) has no engine work this report could be the
+//     outcome of; the report is an earlier run's, and stamping it would record
+//     work as done that never ran, or end a resumable task.
+//   - The apply's last lease belongs to this process. A lease last held by
+//     another process means that driver's work, which this process's memory
+//     says nothing about. An apply with no recorded lease holder cannot be
+//     attributed to this process either: its lease was released, or its work
+//     runs under an operation lease the apply row does not carry.
+//
+// When the engine names the tables its report covers, t must be among them:
+// this process can have run a later schema change on the same database under
+// its own lease, and that run's outcome says nothing about t. Each refusal is
+// logged and counted once per conflict scan, and the task keeps blocking until
+// the driver that owns it settles it.
+func (c *LocalClient) terminalReportDescribesTask(ctx context.Context, t *storage.Task, apply *storage.Apply, result *engine.ProgressResult, memo *conflictScanMemo) bool {
+	if !state.IsInFlightTaskState(t.State) {
+		c.logger.Debug("conflict check: engine reports terminal state, but the task is not in flight, so the report is an earlier run's; the task is left untouched",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier,
+				"engine_state", result.State, "engine_message", result.Message)...)
+		return false
+	}
+	if len(result.Tables) > 0 && !slices.ContainsFunc(result.Tables, func(tp engine.TableProgress) bool { return tp.Table == t.TableName }) {
+		c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "terminal_report_other_table",
+			"conflict check: engine reports terminal state for other tables, so the report is not this task's outcome; the task keeps blocking until a driver settles it")
+		return false
+	}
+	if apply.LeaseOwner == "" {
+		c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "unattributed_terminal_report",
+			"conflict check: engine reports terminal state, but the apply records no lease holder, so the report cannot be attributed to this process; the task keeps blocking until a driver settles it")
+		return false
+	}
+	if !storage.LeaseOwnedByThisProcess(apply.LeaseOwner) {
+		c.recordConflictOwnershipBlock(ctx, memo, t, apply, result, "foreign_terminal_report",
+			"conflict check: engine reports terminal state, but the apply's last lease belongs to another process; the task keeps blocking until driver recovery settles it")
+		return false
+	}
+	return true
+}
+
+// recordConflictOwnershipBlock logs and counts one refusal to settle t from
+// engine memory. The conflict check re-probes the same task on every retry of
+// a scan, so the memo keeps one refusal from being reported once per attempt.
+func (c *LocalClient) recordConflictOwnershipBlock(ctx context.Context, memo *conflictScanMemo, t *storage.Task, apply *storage.Apply, result *engine.ProgressResult, reason, message string) {
+	if !memo.firstOwnershipBlock(t, reason) {
+		return
+	}
+	c.logger.Warn(message, append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner,
+		"engine_state", result.State, "engine_message", result.Message)...)
+	metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, reason)
+}
+
+// taskOperation loads the apply_operation that owns t, whose lease decides
+// whether a live drive holds the task. A task that records no operation has no
+// operation lease to hold it: it returns nil and is left to the apply-level
+// checks. Every other unanswerable shape — no operation store, a failed read,
+// an operation row that does not exist — is an error, because the conflict
+// check must not settle a task whose drive it could not rule out.
+func (c *LocalClient) taskOperation(ctx context.Context, t *storage.Task) (*storage.ApplyOperation, error) {
+	if t.ApplyOperationID == nil {
+		c.logger.Debug("conflict check: task records no operation, so no operation lease holds it", t.LogAttrs()...)
+		return nil, nil
+	}
+	operationID := *t.ApplyOperationID
+	operations := c.storage.ApplyOperations()
+	if operations == nil {
+		return nil, fmt.Errorf("read operation %d owning task %s: apply operation store is not configured", operationID, t.TaskIdentifier)
+	}
+	op, err := operations.Get(ctx, operationID)
+	if err != nil {
+		return nil, fmt.Errorf("read operation %d owning task %s: %w", operationID, t.TaskIdentifier, err)
+	}
+	if op == nil {
+		return nil, fmt.Errorf("read operation %d owning task %s: operation row does not exist", operationID, t.TaskIdentifier)
+	}
+	if op.ApplyID != t.ApplyID {
+		return nil, fmt.Errorf("read operation %d owning task %s: operation belongs to apply %d, not apply %d", operationID, t.TaskIdentifier, op.ApplyID, t.ApplyID)
+	}
+	return op, nil
+}
+
+func operationLeaseAbsenceContext(ctx context.Context, t *storage.Task, op *storage.ApplyOperation) context.Context {
+	if op == nil {
+		return ctx
+	}
+	return storage.WithOperationLeaseAbsent(ctx, storage.OperationLeaseAbsence{
+		ApplyID: t.ApplyID, OperationID: op.ID,
+	})
+}
+
 // logApplyEvent appends a log entry for an apply operation.
 func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *int64, level, eventType, source, message string, oldState, newState string) {
-	log := &storage.ApplyLog{
+	c.appendApplyEvent(ctx, &storage.ApplyLog{
 		ApplyID:   applyID,
 		TaskID:    taskID,
 		Level:     level,
@@ -217,31 +1005,71 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 		OldState:  oldState,
 		NewState:  newState,
 		CreatedAt: time.Now(),
-	}
+	})
+}
+
+// logOperationEvent records an event about one operation from a path that
+// holds no lease on it, where Append cannot attribute the entry from the
+// context, so a read scoped to another target or shard leaves it out.
+func (c *LocalClient) logOperationEvent(ctx context.Context, applyID, operationID int64, level, eventType, source, message string, oldState, newState string) {
+	c.appendApplyEvent(ctx, &storage.ApplyLog{
+		ApplyID:          applyID,
+		ApplyOperationID: &operationID,
+		Level:            level,
+		EventType:        eventType,
+		Source:           source,
+		Message:          message,
+		OldState:         oldState,
+		NewState:         newState,
+		CreatedAt:        time.Now(),
+	})
+}
+
+func (c *LocalClient) appendApplyEvent(ctx context.Context, log *storage.ApplyLog) {
 	if err := c.storage.ApplyLogs().Append(ctx, log); err != nil {
-		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "message", message)
+		c.logger.Warn("failed to log apply event", "error", err, "event", log.EventType, "event_message", log.Message)
 	}
 }
 
+// logEngineResumeOnce records a timeline event the first time a drive claim
+// observes the engine reattached to a durable checkpoint instead of starting
+// the copy fresh. One event per drive claim is intentional: every claim that
+// resumes (pod restart, lease handover, operator start after a stop) is a
+// real engine resume the operator should see on the timeline. eventLogged is
+// the per-drive latch; the durable checkpoint itself lives in the engine.
+func (c *LocalClient) logEngineResumeOnce(ctx context.Context, logger *slog.Logger, apply *storage.Apply, resumed bool, eventLogged *bool) {
+	if !resumed || *eventLogged {
+		return
+	}
+	*eventLogged = true
+	const msg = "Engine resumed from checkpoint; row copy continues from durable progress"
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		msg, "", "")
+	logger.Info("engine resumed from checkpoint")
+}
+
 // setupSpiritLogging wires up Spirit's log callback to route engine logs to the apply_logs table.
-// Builds a table-name-to-task lookup so each log line is attributed to the correct task.
 // Returns a cleanup function that must be deferred.
 func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func() {
 	spiritEng, ok := c.spiritEngine.(*spirit.Engine)
 	if !ok {
 		return func() {}
 	}
+	spiritEng.SetLogCallback(c.spiritApplyLogFunc(ctx, apply, tasks))
+	return func() { spiritEng.SetLogCallback(nil) }
+}
 
+// spiritApplyLogFunc builds the callback that records one Spirit log line in
+// the apply log stream. It attributes each line to its task by table name and
+// embeds the table in the stored message so operators can tell interleaved
+// lines apart during multi-table applies.
+func (c *LocalClient) spiritApplyLogFunc(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func(level slog.Level, tableName, msg string) {
 	taskByTable := make(map[string]*storage.Task)
-	var firstTask *storage.Task
 	for _, task := range tasks {
 		taskByTable[task.TableName] = task
-		if firstTask == nil {
-			firstTask = task
-		}
 	}
 
-	spiritEng.SetLogCallback(func(level slog.Level, tableName, msg string) {
+	return func(level slog.Level, tableName, msg string) {
 		logLevel := storage.LogLevelInfo
 		if level >= slog.LevelWarn {
 			logLevel = storage.LogLevelWarn
@@ -249,77 +1077,133 @@ func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.App
 		if level >= slog.LevelError {
 			logLevel = storage.LogLevelError
 		}
-		task := taskByTable[tableName]
-		if task == nil {
-			task = firstTask
+		// Embed the table in the stored message so it survives every log
+		// surface — CLI output, deployment log fetches, and PR comment log
+		// folds render the message text only.
+		if tableName != "" {
+			msg = fmt.Sprintf("[%s] %s", tableName, msg)
 		}
+		// Run-level lines (or lines spanning several tables) carry no single
+		// task's table name; attribute those to the apply, not to an
+		// arbitrary task.
 		var taskID *int64
-		if task != nil {
+		if task := taskByTable[tableName]; task != nil {
 			id := task.ID
 			taskID = &id
 		}
 		c.logApplyEvent(ctx, apply.ID, taskID, logLevel, storage.LogEventInfo, storage.LogSourceSpirit, msg, "", "")
-	})
-	return func() { spiritEng.SetLogCallback(nil) }
+	}
 }
 
 // transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
 // Fields like CompletedAt, StartedAt, ErrorMessage, or progress must be set on the task BEFORE calling this.
+// A persistence failure is logged, not returned: callers on best-effort
+// progress paths keep driving and the next poll retries the write. Callers
+// whose control flow depends on the write durably landing use
+// persistTaskStateTransition directly and fail closed on its error.
 func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) {
+	if err := c.persistTaskStateTransition(ctx, task, applyID, newState, logMsg); err != nil {
+		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+	}
+}
+
+// persistTaskStateTransition updates a task's state, persists it, and — once the
+// write has landed — optionally records the transition in the apply's durable
+// log. A storage failure (including a lease-guarded write refused because the
+// drive's lease was lost to a peer) is returned without recording the log
+// event, so the durable log never claims a transition the task row does not
+// carry, and the task is rolled back to the values it arrived with, so nothing
+// downstream reads a state transition that did not happen. The rollback is to
+// the caller's own pre-call task rather than to storage: a caller that
+// refreshed display fields such as progress before calling keeps them, since
+// only the state gates control flow.
+func (c *LocalClient) persistTaskStateTransition(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) error {
+	previous := *task
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
+	// An ETA and throttle state are only meaningful while an engine is
+	// actively driving the task and refreshing them. Clear them when the task
+	// comes to rest (terminal, stopped, retryable, pending) so the stored row
+	// never carries a frozen estimate or renders as paused with no copy in
+	// flight; a resumed or retried task gets fresh figures from the first
+	// engine poll.
+	if !state.IsInFlightTaskState(newState) {
+		task.ETASeconds = 0
+		task.Throttled = false
+		task.ThrottleReason = ""
+	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
-		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+		*task = previous
+		return fmt.Errorf("update task %s state %s -> %s: %w", task.TaskIdentifier, oldState, newState, err)
 	}
 	if logMsg != "" && applyID > 0 {
 		taskID := task.ID
 		c.logApplyEvent(ctx, applyID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			logMsg, oldState, newState)
 	}
+	return nil
 }
 
-// markTasksRunning sets DDL tasks to running state with a start timestamp.
-func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) {
+// markTasksRunning sets DDL tasks to running state with a start timestamp. The
+// first refused write stops the loop and is returned: the task it was writing
+// is put back to the values it arrived with, so nothing downstream reads a
+// running task storage does not hold. Tasks written before it stay running in
+// storage and in memory, for the caller's settlement to move on.
+func (c *LocalClient) markTasksRunning(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	now := time.Now()
 	for _, task := range tasks {
+		previous := *task
 		task.State = state.Task.Running
 		task.StartedAt = &now
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+			*task = previous
+			return fmt.Errorf("mark task %s running for apply %s (database %s): %w",
+				task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, err)
 		}
 	}
+	return nil
 }
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic
-// doesn't crash the entire process. On panic, all tasks and the apply are marked failed.
-func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			errMsg := fmt.Sprintf("panic in apply goroutine: %v", r)
-			c.logger.Error(errMsg, apply.LogAttrs()...)
-			c.failApplyWithTasks(ctx, apply, tasks, errMsg)
+// doesn't crash the entire process. On panic, all tasks and the apply are marked
+// failed and the panic surfaces as a *panicsafe.Error, so the operator routes it
+// through its drive-panic handling (AV-5) rather than treating it as a transient
+// drive failure it should retry.
+func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func() error) error {
+	recovered, err := panicsafe.Catch(fn)
+	if recovered != nil {
+		errMsg := fmt.Sprintf("panic in apply goroutine: %v", recovered.Value)
+		c.logger.Error(errMsg, apply.LogAttrs()...)
+		if failErr := c.failApplyWithTasks(ctx, apply, tasks, errMsg); failErr != nil {
+			// The panic is what the operator acts on (AV-5); its containment
+			// marks the tasks and the apply failed from the reloaded rows.
+			c.logger.Error("failed to record the panicked drive's failure; the operator's panic containment records it instead",
+				append(apply.LogAttrs(), "error", failErr)...)
 		}
-	}()
-	fn()
+		return recovered
+	}
+	return err
 }
 
-// groupedApplyMode classifies the grouped-apply strategy for a drive. It reads
-// DeferCutover from the effective options map (which may carry an automatic
-// barrier-park decision, see effectiveCopyDriveOptions) rather than from
-// apply.GetOptions(), so an operation-scoped copy drive that must park at the
-// cutover barrier takes the atomic-cutover path.
+// groupedApplyMode classifies the grouped-apply strategy for a drive, for logs
+// and operator-facing descriptions. It reads DeferCutover from the effective
+// options map (which may carry an automatic barrier-park decision, see
+// effectiveCopyDriveOptions) rather than from apply.GetOptions(), so an
+// operation-scoped copy drive that must park at the cutover barrier takes the
+// atomic-cutover label. Whether a drive groups at all is
+// storage.GroupsEngineExecution's call; this only names the engine-specific
+// strategy behind a grouping it selected.
 func groupedApplyMode(apply *storage.Apply, options map[string]string) string {
 	opts := storage.ApplyOptionsFromMap(options)
-	switch {
-	case apply.DatabaseType == storage.DatabaseTypeMySQL && opts.DeferCutover:
-		return "spirit_atomic_cutover"
-	case apply.DatabaseType == storage.DatabaseTypeVitess:
-		return "vitess_deploy_request"
-	default:
+	if !storage.GroupsEngineExecution(apply.DatabaseType, opts.DeferCutover) {
 		return "grouped_engine_apply"
 	}
+	if apply.DatabaseType == storage.DatabaseTypeVitess {
+		return "vitess_deploy_request"
+	}
+	return "spirit_atomic_cutover"
 }
 
 func groupedApplyModeDescription(apply *storage.Apply, options map[string]string) string {
@@ -334,13 +1218,10 @@ func groupedApplyModeDescription(apply *storage.Apply, options map[string]string
 }
 
 func (c *LocalClient) usesGroupedApply(apply *storage.Apply, options map[string]string) bool {
-	if apply.DatabaseType == storage.DatabaseTypeVitess {
-		return true
-	}
-	return apply.DatabaseType == storage.DatabaseTypeMySQL && storage.ApplyOptionsFromMap(options).DeferCutover
+	return storage.GroupsEngineExecution(apply.DatabaseType, storage.ApplyOptionsFromMap(options).DeferCutover)
 }
 
-func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) uint64 {
+func (c *LocalClient) setApplyCancel(cancel context.CancelCauseFunc) uint64 {
 	c.cancelMu.Lock()
 	c.cancelApplyGeneration++
 	generation := c.cancelApplyGeneration
@@ -363,9 +1244,12 @@ func (c *LocalClient) currentApplyCancel() applyCancelHandle {
 	return applyCancelHandle{generation: c.cancelApplyGeneration, cancel: c.cancelApply}
 }
 
-func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
+// cancelApplyHandle cancels the drive the handle was taken from, with cause as
+// the drive context's cause: engine.ErrCancelledByOperator when the command
+// ends the schema change for good, nil when another drive may resume it.
+func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle, cause error) {
 	if handle.cancel != nil {
-		handle.cancel()
+		handle.cancel(cause)
 	}
 	c.cancelMu.Lock()
 	if c.cancelApplyGeneration == handle.generation {
@@ -374,17 +1258,58 @@ func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
 	c.cancelMu.Unlock()
 }
 
-func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
+	// Admission normally refuses this work first. The admitting deployment's
+	// verdict also travels on each row so a drive loading work from a peer or
+	// prior build fails closed without relying on the plan it happens to hold.
+	if err := blockedTaskError(tasks); err != nil {
+		return c.refuseBlockedTasks(ctx, apply, tasks, err)
+	}
 	if c.usesGroupedApply(apply, options) {
-		c.runWithRecovery(ctx, apply, tasks, func() {
-			c.executeGroupedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+		return c.runWithRecovery(ctx, apply, tasks, func() error {
+			return c.executeGroupedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 		})
-		return
 	}
 
-	c.runWithRecovery(ctx, apply, tasks, func() {
-		c.executeApplySequential(ctx, apply, tasks, plan, options)
+	return c.runWithRecovery(ctx, apply, tasks, func() error {
+		return c.executeApplySequential(ctx, apply, tasks, plan, options)
 	})
+}
+
+// refuseBlockedTasks fails a fresh drive whose task rows carry a blocked
+// verdict, then settles what the now-terminal apply owes: the pending control
+// requests a failed apply moots, and the observer that posts the terminal
+// summary. Nothing later re-claims a failed apply to do either. A
+// multi-operation drive owns only its operation, so there the operator's
+// projection settles the parent and posts the summary instead; failApplyWithTasks
+// already logged that handoff. A drive cancelled before the failure was
+// recorded leaves the apply non-terminal for another driver to claim, so it
+// owes nothing here. A failure write that did not land is returned with
+// nothing settled.
+func (c *LocalClient) refuseBlockedTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, refusal error) error {
+	return c.failApplyAndNotify(ctx, apply, tasks, refusal.Error())
+}
+
+// blockedTaskError returns the operator-facing refusal for a task row the
+// admitting deployment marked blocked. It is phrased like the whole-plan
+// refusal so every admission path gives the same remedy.
+func blockedTaskError(tasks []*storage.Task) error {
+	for _, task := range tasks {
+		if task == nil || !task.EngineBlocked() {
+			continue
+		}
+		reason := task.ModeReason
+		if reason == "" {
+			reason = "the engine refuses this statement"
+		}
+		// Independent causes are listed one per line so an operator fixing the
+		// first is not surprised by the second on the next attempt.
+		if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+			return fmt.Errorf("stored task %s contains a blocked change for table %q:\n- %s", task.TaskIdentifier, task.TableName, strings.Join(causes, "\n- "))
+		}
+		return fmt.Errorf("stored task %s contains a blocked change for table %q: %s", task.TaskIdentifier, task.TableName, reason)
+	}
+	return nil
 }
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
@@ -392,31 +1317,38 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 
 // deriveOverallState determines the overall state from a list of tasks.
 // Priority order:
-// 1. RUNNING/WAITING_FOR_CUTOVER/CUTTING_OVER - active work in progress
-// 2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
-// 3. FAILED_RETRYABLE - operator recovery may retry failed task work
-// 4. PENDING - more work queued
-// 5. STOPPED - apply was stopped (even if some tasks completed)
-// 6. COMPLETED - all tasks completed successfully
+//  1. Active work, least-advanced phase first: RUNNING, then CATCHING_UP,
+//     CHECKSUMMING, POST_CHECKSUM (the post-copy phases surfacing only once
+//     every table has started), then CUTTING_OVER once it is the least
+//     advanced work left, then WAITING_FOR_CUTOVER once nothing is still
+//     working
+//  2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
+//  3. FAILED_RETRYABLE - operator recovery may retry failed task work
+//  4. PENDING - more work queued
+//  5. STOPPED - apply was stopped (even if some tasks completed)
+//  6. COMPLETED - all tasks completed successfully
 func deriveOverallState(tasks []*storage.Task) string {
 	if len(tasks) == 0 {
 		return state.Task.Pending
 	}
 
-	var hasRunning, hasPending, hasStopped, hasFailed, hasRetryableFailed, hasCancelled, hasCompleted, hasRevertWindow bool
-	var runningState string
+	var hasRunning, hasCatchingUp, hasChecksumming, hasPostChecksum, hasWaitingForCutover, hasCuttingOver bool
+	var hasPending, hasStopped, hasFailed, hasRetryableFailed, hasCancelled, hasCompleted, hasRevertWindow bool
 
 	for _, t := range tasks {
 		switch t.State {
 		case state.Task.Running:
 			hasRunning = true
-			runningState = state.Task.Running
+		case state.Task.CatchingUp:
+			hasCatchingUp = true
+		case state.Task.Checksumming:
+			hasChecksumming = true
+		case state.Task.PostChecksum:
+			hasPostChecksum = true
 		case state.Task.WaitingForCutover:
-			hasRunning = true
-			runningState = state.Task.WaitingForCutover
+			hasWaitingForCutover = true
 		case state.Task.CuttingOver:
-			hasRunning = true
-			runningState = state.Task.CuttingOver
+			hasCuttingOver = true
 		case state.Task.Pending:
 			hasPending = true
 		case state.Task.Stopped:
@@ -434,9 +1366,34 @@ func deriveOverallState(tasks []*storage.Task) string {
 		}
 	}
 
-	// Priority order
-	if hasRunning {
-		return runningState
+	// Active work, mirroring state.DeriveApplyState: surface the
+	// least-advanced active phase — while any table still copies rows the
+	// apply is running, the post-copy phases surface only once every table
+	// has started and is draining or verifying, a cutover only once it is
+	// the least advanced work left, and waiting_for_cutover only when
+	// nothing is still working. A cutover is the last step of a table's
+	// work, and a drive cuts tables over as each finishes — sequentially,
+	// rolling, or across concurrent shards — so naming a sibling's cutover
+	// while an earlier phase is still active would overstate progress and
+	// force the derived state to fall back once that cutover completes.
+	// Resolving least-advanced-first keeps the derived state monotone
+	// across the whole drive. A parked WAITING_FOR_CUTOVER sibling does not
+	// hold a cutover back: it is waiting on a command, not working.
+	switch {
+	case hasRunning:
+		return state.Task.Running
+	case hasPending && (hasCatchingUp || hasChecksumming || hasPostChecksum || hasCuttingOver):
+		return state.Task.Running
+	case hasCatchingUp:
+		return state.Task.CatchingUp
+	case hasChecksumming:
+		return state.Task.Checksumming
+	case hasPostChecksum:
+		return state.Task.PostChecksum
+	case hasCuttingOver:
+		return state.Task.CuttingOver
+	case hasWaitingForCutover:
+		return state.Task.WaitingForCutover
 	}
 	if hasFailed || hasCancelled {
 		// Cancelled implies a prior task failed (sequential mode), so overall is failed.
@@ -469,10 +1426,59 @@ func deriveApplyPhase(event engine.ApplyEvent) string {
 	return event.NewState
 }
 
+// recordDriveStarted marks the apply running and started before the drive hands
+// any work to the engine, and reports whether the drive may go on. A drive of a
+// multi-operation apply holds only its operation lease: the parent's running
+// state is the operator's projection to write, so the drive keeps the mark in
+// memory and leaves the stored row alone. When storage refuses the write
+// because the apply is no longer this driver's to run, the drive stands down
+// before starting any work. Any other write failure is logged and the drive
+// goes on, since only an outcome storage has confirmed ends a drive.
+func (c *LocalClient) recordDriveStarted(ctx context.Context, apply *storage.Apply, logger *slog.Logger) bool {
+	now := time.Now()
+	apply.State = state.Apply.Running
+	apply.StartedAt = &now
+	apply.UpdatedAt = now
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("drive holds only its operation lease; parent running state is the operator's projection",
+			apply.MutableLogAttrs()...)
+		return true
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		if applyWriteEndsDrive(err) {
+			logger.Warn("apply is no longer this driver's to run; drive will stand down before calling the engine",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return false
+		}
+		logger.Error("failed to record apply started; drive will continue",
+			append(apply.MutableLogAttrs(), "error", err)...)
+	}
+	return true
+}
+
+// applyWriteEndsDrive reports whether a failed apply write means this driver
+// must not start engine work: another driver took the lease, storage refused to
+// reopen an apply another writer already finished, or another apply went active
+// on the same target. The causes differ, but in each one work started after the
+// write would run on behalf of an apply this driver can no longer record, or
+// alongside another apply's schema change on the same target.
+func applyWriteEndsDrive(err error) bool {
+	switch {
+	case errors.Is(err, storage.ErrApplyLeaseLost):
+		return true
+	case errors.Is(err, storage.ErrApplyReopenRefused):
+		return true
+	default:
+		return errors.Is(err, storage.ErrActiveApplyExists)
+	}
+}
+
 // applyEventStateTransition updates an apply's state based on an engine event.
 // Skips the write if the state hasn't changed. On DB write failure, rolls back
 // the in-memory state so the next event with the same NewState retries.
 // Returns the new state if a transition occurred, or empty string if skipped.
+// The logger is expected to carry the apply's identity attributes already
+// bound, so the failure line appends only the mutable snapshot.
 func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, updateFn func(*storage.Apply) error, logger *slog.Logger) string {
 	oldState := apply.State
 	newState := deriveApplyPhase(event)
@@ -482,7 +1488,7 @@ func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, up
 	apply.State = newState
 	apply.UpdatedAt = time.Now()
 	if err := updateFn(apply); err != nil {
-		logger.Error("failed to update apply phase", append(apply.LogAttrs(), "error", err)...)
+		logger.Error("failed to update apply phase", append(apply.MutableLogAttrs(), "error", err)...)
 		apply.State = oldState
 		return ""
 	}

@@ -68,9 +68,9 @@ var tuiPreviewScenarios = map[string]tuiPreviewScenario{
 					{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
 				},
 				Tables: []*apitypes.TableProgressResponse{
-					{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.WaitingForCutover, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
-					{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000 + poll*500, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
-					{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
+					{Deployment: "us-east", Target: "orders-us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.WaitingForCutover, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+					{Deployment: "eu-west", Target: "orders-eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000 + poll*500, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
+					{Deployment: "ap-south", Target: "orders-ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
 				},
 			}
 		},
@@ -111,7 +111,18 @@ func previewTUI(name string, live bool) error {
 	fmt.Printf("Starting TUI preview: %s\n", scenario.Description)
 	fmt.Println("Press Esc to exit.")
 	fmt.Println()
-	return watchApplyProgressByApplyIDWithEnvironment(server.URL, scenario.ApplyID, "staging", true)
+	return previewWatchExit(watchApplyProgressByApplyIDWithEnvironment(server.URL, scenario.ApplyID, "staging", true))
+}
+
+// previewWatchExit is the preview's result once its watch has returned. The
+// scenario never ends, so pressing Esc is the only way out and is the preview
+// finishing as intended, not an operator leaving an apply behind; it exits 0
+// rather than with the watch's detach status.
+func previewWatchExit(err error) error {
+	if ExitCodeFor(err) == ExitInterrupted {
+		return nil
+	}
+	return err
 }
 
 func previewTUIStatic(scenario tuiPreviewScenario) {
@@ -128,7 +139,6 @@ func previewTUIStatic(scenario tuiPreviewScenario) {
 	model.tables = msg.tables
 	model.operations = msg.operations
 	model.errorMsg = msg.errorMsg
-	model.currentVolume = msg.volume
 	model.initialized = true
 
 	fmt.Print(model.View())

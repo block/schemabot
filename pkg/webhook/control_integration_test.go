@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -21,7 +23,6 @@ import (
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +32,7 @@ import (
 // and preserves each caller in apply logs for incident triage.
 func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -144,7 +145,7 @@ func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 // command records permanent cancel intent and preserves the caller in apply logs.
 func TestE2ECancelCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -210,7 +211,7 @@ func TestE2ECancelCommandRecordsDurableRequest(t *testing.T) {
 // active local schema change but this process does not own the Spirit runner.
 func TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -302,7 +303,7 @@ func TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner(t *testing.T
 // claiming execution from the webhook process.
 func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -385,12 +386,127 @@ func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
 	assertReactionEventually(t, reactions)
 }
 
+// TestE2EStartAcknowledgementDelayedPastAWithdrawal: an operator starts a
+// stopped schema change from its PR, and while the start's acknowledgement is
+// still being posted, a stop from the CLI withdraws the start. The stop holds
+// its withdrawal notice back until the acknowledgement has landed, and the
+// start command then posts it, so the PR reads acknowledgement, then
+// withdrawal, once each, and ends on the withdrawal, matching the stopped apply.
+func TestE2EStartAcknowledgementDelayedPastAWithdrawal(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_bcdf6789"
+	database := "start_withdrawn_pr_comments_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.Stopped
+	storedApply.UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Applies().Update(ctx, storedApply))
+	// The apply was started from this PR's installation, so a stop from
+	// elsewhere has a PR to tell.
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET installation_id = ? WHERE id = ?", 12345, applyID)
+	require.NoError(t, err)
+	storedTasks, err := store.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedTasks, 1)
+	storedTasks[0].State = state.Task.Stopped
+	storedTasks[0].UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Tasks().Update(ctx, storedTasks[0]))
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{})
+
+	client, mux := setupGitHubServer(t)
+	var (
+		mu     sync.Mutex
+		landed []string
+	)
+	land := func(body string) {
+		mu.Lock()
+		defer mu.Unlock()
+		landed = append(landed, body)
+	}
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		if strings.Contains(body.Body, "Start Request Accepted") {
+			// Hold the acknowledgement until a CLI stop has withdrawn the
+			// start and the withdrawal is recorded on the start request.
+			resp, err := service.ExecuteStop(ctx, apitypes.ControlRequest{ApplyID: applyIdentifier, Environment: "staging", Caller: "cli:bob@laptop.local"})
+			assert.NoError(t, err)
+			if assert.NotNil(t, resp) {
+				assert.Equal(t, apitypes.ControlStatusStartWithdrawn, resp.Status)
+			}
+			assert.Eventually(t, func() bool {
+				start, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStart)
+				if err != nil || start == nil {
+					return false
+				}
+				var metadata struct {
+					Notice startNotice `json:"pr_notice"`
+				}
+				return json.Unmarshal(start.Metadata, &metadata) == nil && metadata.Notice.Withdrawn
+			}, webhookIntegrationCheckRunDeadline, 20*time.Millisecond, "the withdrawal is recorded on the start request")
+		}
+		land(body.Body)
+		w.WriteHeader(http.StatusCreated)
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 99}))
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
+	})
+
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+	service.OnQueuedStartWithdrawn = h.reportQueuedStartWithdrawn
+
+	postStartCommand(t, h, applyIdentifier, "alice")
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(landed) == 2
+	}, webhookIntegrationCheckRunDeadline, 50*time.Millisecond, "the acknowledgement and the notice")
+	drainCtx, cancel := context.WithTimeout(ctx, webhookIntegrationCheckRunDeadline)
+	defer cancel()
+	h.DrainInProcessWebhookWork(drainCtx)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, landed, 2, "the notice is posted once")
+	assert.Contains(t, landed[0], "Start Request Accepted")
+	assert.Contains(t, landed[1], "## Start Withdrawn", "the PR ends on the withdrawal")
+	assert.NotContains(t, landed[1], "Stopped by", "a CLI stopper is not named")
+	final, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, final)
+	assert.Equal(t, state.Apply.Stopped, final.State, "the stop won; the apply stays stopped")
+}
+
 // TestE2EStartCommandRejectsCompletedApply verifies that a PR comment start
 // command surfaces an actionable error when the apply is already terminal and
 // does not record a durable start request.
 func TestE2EStartCommandRejectsCompletedApply(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -457,7 +573,7 @@ func TestE2EStartCommandRejectsCompletedApply(t *testing.T) {
 // environment, then leaves the operator owner to perform the data-plane action.
 func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -539,7 +655,7 @@ func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 // PlanetScale apply in its revert window.
 func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -613,7 +729,7 @@ func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
 // immediate attempt cannot land.
 func TestE2ERevertCommandRevertsApply(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -697,7 +813,7 @@ func TestE2ERevertCommandRevertsApply(t *testing.T) {
 // operator's stop intent and surfacing the rejection back to the PR.
 func TestE2ECutoverCommandRejectsPendingStop(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -771,164 +887,6 @@ func TestE2ECutoverCommandRejectsPendingStop(t *testing.T) {
 	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
 	require.NoError(t, err)
 	assert.True(t, applyLogContains(logs, "Pending stop request blocked cutover (caller: github:stopper@octocat/hello-world#1)"))
-	assertReactionEventually(t, reactions)
-}
-
-// TestE2EVolumeCommandQueuesDurableRequest verifies that a PR comment volume
-// command queues a durable volume control request carrying the requested level,
-// and that the acknowledgement comment states the queued semantics — the driver
-// applies the level at its next progress check — rather than claiming the new
-// level is already in effect.
-func TestE2EVolumeCommandQueuesDurableRequest(t *testing.T) {
-	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
-	require.NoError(t, err)
-	require.NoError(t, schemabotDB.PingContext(ctx))
-
-	store := mysqlstore.New(schemabotDB)
-	applyIdentifier := "apply_ecafe123"
-	database := "volume_pr_comments_db"
-	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-	t.Cleanup(func() {
-		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-		utils.CloseAndLog(schemabotDB)
-	})
-	applyID := createStopCommandApply(t, store, applyIdentifier, database)
-
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 10)
-	reactions := make(chan string, 10)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Body string `json:"body"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		comments <- body.Body
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Content string `json:"content"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		reactions <- body.Content
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-
-	service := apiServiceForStopCommandTest(t, store, database)
-	localClient, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:  database,
-		Type:      storage.DatabaseTypeMySQL,
-		TargetDSN: e2eTargetDSN,
-	}, store, testLogger())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		utils.CloseAndLog(localClient)
-	})
-	service.RegisterTernClient(database, "staging", localClient)
-	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
-	}
-
-	postVolumeCommand(t, h, applyIdentifier, "alice", "8")
-	comment := readComment(t, comments)
-	assert.Contains(t, comment, "Volume Request Accepted")
-	assert.Contains(t, comment, "`"+applyIdentifier+"`")
-	assert.Contains(t, comment, "@alice")
-	assert.Contains(t, comment, "Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly")
-
-	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
-	require.NoError(t, err)
-	require.NotNil(t, controlReq)
-	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
-	level, err := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
-	require.NoError(t, err)
-	assert.Equal(t, int32(8), level)
-
-	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
-	require.NoError(t, err)
-	assert.True(t, applyLogContains(logs, "Volume change to 8 queued; the driver applies it at its next progress check (caller: github:alice@octocat/hello-world#1)"))
-	assertReactionEventually(t, reactions)
-}
-
-// TestE2EVolumeCommandRejectsTerminalApply verifies that a volume command
-// against a terminal apply posts the rejection comment carrying the queue's
-// SchemaBot-authored error message and records no durable volume request —
-// there is no driver left to apply the level.
-func TestE2EVolumeCommandRejectsTerminalApply(t *testing.T) {
-	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
-	require.NoError(t, err)
-	require.NoError(t, schemabotDB.PingContext(ctx))
-
-	store := mysqlstore.New(schemabotDB)
-	applyIdentifier := "apply_ecafe456"
-	database := "volume_pr_comments_completed_db"
-	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-	t.Cleanup(func() {
-		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-		utils.CloseAndLog(schemabotDB)
-	})
-
-	applyID := createStopCommandApply(t, store, applyIdentifier, database)
-	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
-	require.NoError(t, err)
-	require.NotNil(t, storedApply)
-	storedApply.State = state.Apply.Completed
-	storedApply.UpdatedAt = time.Now().UTC()
-	require.NoError(t, store.Applies().Update(ctx, storedApply))
-
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 10)
-	reactions := make(chan string, 10)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Body string `json:"body"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		comments <- body.Body
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Content string `json:"content"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		reactions <- body.Content
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-
-	service := apiServiceForStopCommandTest(t, store, database)
-	localClient, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:  database,
-		Type:      storage.DatabaseTypeMySQL,
-		TargetDSN: e2eTargetDSN,
-	}, store, testLogger())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		utils.CloseAndLog(localClient)
-	})
-	service.RegisterTernClient(database, "staging", localClient)
-	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
-	}
-
-	postVolumeCommand(t, h, applyIdentifier, "alice", "8")
-	comment := readComment(t, comments)
-	assert.Contains(t, comment, "Volume Failed")
-	assert.Contains(t, comment, "volume can only be adjusted while it is running")
-
-	pendingVolume, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
-	require.NoError(t, err)
-	assert.Nil(t, pendingVolume)
 	assertReactionEventually(t, reactions)
 }
 
@@ -1067,19 +1025,6 @@ func postCutoverCommand(t *testing.T, h *Handler, applyIdentifier, user string) 
 	assert.Contains(t, rr.Body.String(), "cutover started")
 }
 
-func postVolumeCommand(t *testing.T, h *Handler, applyIdentifier, user, level string) {
-	t.Helper()
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment:   "schemabot volume " + applyIdentifier + " -e staging -v " + level,
-		userLogin: user,
-		isPR:      true,
-	}, nil)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "volume started")
-}
-
 func postSkipRevertCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
 	t.Helper()
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1183,10 +1128,6 @@ func (c *stopCommandTernClient) Cancel(context.Context, *ternv1.CancelRequest) (
 }
 
 func (c *stopCommandTernClient) Start(context.Context, *ternv1.StartRequest) (*ternv1.StartResponse, error) {
-	return nil, nil
-}
-
-func (c *stopCommandTernClient) Volume(context.Context, *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
 	return nil, nil
 }
 

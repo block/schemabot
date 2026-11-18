@@ -21,7 +21,7 @@ import (
 // tests can verify whether the unlock guard permitted a release.
 type unlockTestStorage struct {
 	emptyStorage
-	locks   *unlockTestLockStore
+	locks   storage.LockStore
 	applies storage.ApplyStore
 }
 
@@ -29,24 +29,37 @@ func (s *unlockTestStorage) Locks() storage.LockStore { return s.locks }
 
 func (s *unlockTestStorage) Applies() storage.ApplyStore { return s.applies }
 
+// unlockTestLockStore serves configurable lock lookups and records release
+// calls, with injectable failures for each storage touchpoint the unlock core
+// classifies. Release failures are injected per database so multi-lock tests
+// can fail one release while the rest succeed.
 type unlockTestLockStore struct {
 	storage.LockStore
-	locks             []*storage.Lock
-	releaseCalls      int
-	forceReleaseCalls int
+	locks       []*storage.Lock
+	getByPRErr  error
+	releaseErrs map[string]error
+
+	releaseCalls int
+	released     []string
 }
 
 func (s *unlockTestLockStore) GetByPR(_ context.Context, _ string, _ int) ([]*storage.Lock, error) {
+	if s.getByPRErr != nil {
+		return nil, s.getByPRErr
+	}
 	return s.locks, nil
 }
 
-func (s *unlockTestLockStore) Release(_ context.Context, _, _, _ string) error {
-	s.releaseCalls++
-	return nil
+func (s *unlockTestLockStore) List(_ context.Context) ([]*storage.Lock, error) {
+	return s.locks, nil
 }
 
-func (s *unlockTestLockStore) ForceRelease(_ context.Context, _, _ string) error {
-	s.forceReleaseCalls++
+func (s *unlockTestLockStore) ReleaseByID(_ context.Context, _ int64, database, _, _, _ string) error {
+	s.releaseCalls++
+	if err := s.releaseErrs[database]; err != nil {
+		return err
+	}
+	s.released = append(s.released, database)
 	return nil
 }
 
@@ -72,6 +85,21 @@ func unlockTestHandler(t *testing.T, st storage.Storage, client *ghclient.Instal
 	return &Handler{
 		service:   service,
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: client}),
+		logger:    testLogger(),
+	}
+}
+
+// actorAuthClientSetTestHandler is unlockTestHandler with PR command actor
+// authorization enabled and a caller-chosen client set, for pinning the
+// authorization-client dispositions that only run when the gate is active.
+func actorAuthClientSetTestHandler(t *testing.T, st storage.Storage, ghClients ghclient.ClientSet) *Handler {
+	t.Helper()
+	service := api.New(st, &api.ServerConfig{
+		PRCommandAuthorization: api.PRCommandAuthorizationConfig{Enabled: true},
+	}, nil, testLogger())
+	return &Handler{
+		service:   service,
+		ghClients: ghClients,
 		logger:    testLogger(),
 	}
 }
@@ -113,13 +141,13 @@ func TestUnlockRefusedWhenActiveApplyLookupFails(t *testing.T) {
 	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 	assert.Equal(t, 0, lockStore.releaseCalls, "unlock must not release any lock when apply state is unknown")
-	assert.Equal(t, 0, lockStore.forceReleaseCalls, "unlock must not force-release any lock when apply state is unknown")
 
 	select {
 	case body := <-comments:
 		assert.Contains(t, body, "Failed to verify active applies for database `orders`")
-		assert.Contains(t, body, "storage read failed")
-		assert.Contains(t, body, "No locks were released")
+		assert.Contains(t, body, "No locks were released; retry the command.")
+		assert.NotContains(t, body, "storage read failed",
+			"the raw storage error stays in the server log, out of the PR comment")
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "timed out waiting for unlock error comment")
 	}
@@ -127,28 +155,12 @@ func TestUnlockRefusedWhenActiveApplyLookupFails(t *testing.T) {
 
 // TestUnlockReleasesLockWhenNoActiveApplies verifies the unlock happy path:
 // when the active-apply check confirms no non-terminal apply exists for the
-// locked database, the PR-owned lock is released, a success comment is
-// posted, and the apply check run is set to neutral.
+// locked database, the PR-owned lock is released and a success comment is
+// posted. Unlock never writes Check Runs: lock state is not check state, and
+// the aggregate check must keep reflecting the stored apply outcomes.
 func TestUnlockReleasesLockWhenNoActiveApplies(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := recordComments(t, mux)
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"ref": "feature-branch", "sha": "abc123"},
-			"base": map[string]any{"ref": "main", "sha": "def456"},
-			"user": map[string]any{"login": "testuser"},
-		}))
-	})
-	checkRuns := make(chan string, 2)
-	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Conclusion string `json:"conclusion"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		checkRuns <- body.Conclusion
-		w.WriteHeader(http.StatusCreated)
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
-	})
 
 	lockStore := &unlockTestLockStore{locks: []*storage.Lock{{
 		DatabaseName: "orders",
@@ -163,7 +175,6 @@ func TestUnlockReleasesLockWhenNoActiveApplies(t *testing.T) {
 	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 	assert.Equal(t, 1, lockStore.releaseCalls, "exactly one owned-lock release expected")
-	assert.Equal(t, 0, lockStore.forceReleaseCalls, "non-force unlock must not force-release")
 
 	select {
 	case body := <-comments:
@@ -172,12 +183,5 @@ func TestUnlockReleasesLockWhenNoActiveApplies(t *testing.T) {
 		assert.Contains(t, body, "@testuser")
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "timed out waiting for unlock success comment")
-	}
-
-	select {
-	case conclusion := <-checkRuns:
-		assert.Equal(t, "neutral", conclusion)
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "timed out waiting for check run update after unlock")
 	}
 }

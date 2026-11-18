@@ -2,10 +2,13 @@ package templates
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/block/schemabot/pkg/ui"
+	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // ApplyLockConflictData contains data for apply lock conflict comments.
@@ -24,6 +27,52 @@ type ApplyLockConflictData struct {
 	// Active apply info (for "apply in progress" case)
 	ApplyID    string
 	ApplyState string
+	// ApplyEnvironment is the active apply's own environment, which a PR's
+	// applies in other environments can block. The control commands address
+	// it; empty means the requested environment.
+	ApplyEnvironment string
+	// DeferCutover is the active apply's own option: when set, its
+	// waiting_for_cutover state waits on an operator's cutover command
+	// rather than on SchemaBot.
+	DeferCutover bool
+	// ApplyAgainCommand is the apply the requester commented, rendered so it
+	// can be pasted once the active apply finishes. Empty renders the
+	// environment's plain apply command.
+	ApplyAgainCommand string
+	// ApplyAgainConsent leads into ApplyAgainCommand: UnsafeReconsent's
+	// clause when the requester's command carried --allow-unsafe.
+	ApplyAgainConsent string
+	// AppliesLatestCommit is set when the active apply was planned from the
+	// PR's latest commit in the requested environment. It is applying this
+	// change already, so once it completes another apply has nothing to run,
+	// and the comment offers none.
+	AppliesLatestCommit bool
+
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
+
+	// Tenant is the deployment's own tenant; when set, the PR-comment unlock
+	// hints carry it so pasting them addresses this deployment.
+	Tenant string
+
+	// LockedApply is what SchemaBot found running on the locked database.
+	LockedApply LockedDatabaseApply
+}
+
+// LockedDatabaseApply is what a lookup found running on a locked database. A
+// running apply keeps the lock: closing the holding PR retains it and unlock
+// refuses. The zero value is an unchecked lookup, so a caller that never
+// looked renders only what holds without it.
+type LockedDatabaseApply struct {
+	// Checked reports that the lookup succeeded.
+	Checked bool
+	// RunningApplyID identifies the apply still running on the database;
+	// empty when none is.
+	RunningApplyID string
+	// RunningIsLockHolders reports that the running apply belongs to the PR
+	// holding the lock.
+	RunningIsLockHolders bool
 }
 
 // ActorAuthorizationCommentData contains data for PR command actor
@@ -33,10 +82,13 @@ type ActorAuthorizationCommentData struct {
 	CommandName string
 	Database    string
 	Environment string
-	// AuthorizedPrincipals are the GitHub teams (org/team) and users allowed
-	// to run mutating commands for the database, listed on rejection so the
-	// blocked user knows who to ask.
-	AuthorizedPrincipals []string
+	// OperatorPrincipals are the database's own operator teams (org/team) and
+	// users — the people the blocked user should ask first, shown in their own
+	// section on rejection.
+	OperatorPrincipals []string
+	// OtherPrincipals are the broader principals also allowed to run mutating
+	// commands: deployment-wide admins and the repository's admins.
+	OtherPrincipals []string
 }
 
 // RenderPRCommandNotAuthorized renders a comment when a GitHub PR command
@@ -52,20 +104,55 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	} else {
 		fmt.Fprintf(&sb, "The requester is not authorized to run `schemabot %s` for this database.\n\n", data.CommandName)
 	}
-	if len(data.AuthorizedPrincipals) > 0 {
-		// Principals render as inline code, never @-mentions: the list is
-		// guidance for the blocked user, and mentions would notify every
-		// admin team and operator on every rejected command.
-		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
-		for _, principal := range data.AuthorizedPrincipals {
-			fmt.Fprintf(&sb, "- `%s`\n", principal)
+	// The database's own operators lead in their own section so the blocked
+	// user knows who to ask first, mirroring the review-required comment; the
+	// broader principals follow as an explicit fallback. Principals render as
+	// @-mentions, the same as the review-required comment's reviewer list, so
+	// the blocked user can click straight through to each team or user.
+	hasOperators := len(data.OperatorPrincipals) > 0
+	hasOthers := len(data.OtherPrincipals) > 0
+	switch {
+	case hasOperators:
+		fmt.Fprintf(&sb, "**Operators of `%s`** — members of these teams, or these users, can run it:\n", data.Database)
+		writeMentionList(&sb, data.OperatorPrincipals)
+		if hasOthers {
+			sb.WriteString("\n**Other authorized teams and users**:\n")
+			writeMentionList(&sb, data.OtherPrincipals)
 		}
-		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
-	} else {
+		writeAskPrincipalsGuidance(&sb, data.OperatorPrincipals, data.OtherPrincipals)
+	case hasOthers:
+		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
+		writeMentionList(&sb, data.OtherPrincipals)
+		writeAskPrincipalsGuidance(&sb, data.OtherPrincipals)
+	default:
 		sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
 	}
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
+}
+
+// writeAskPrincipalsGuidance closes the principal lists with what the blocked
+// user can do next. Requesting team membership is only suggested when a team
+// is actually listed — lists of plain user logins have no team to join.
+func writeAskPrincipalsGuidance(sb *strings.Builder, principalLists ...[]string) {
+	if anyTeamPrincipal(principalLists...) {
+		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
+		return
+	}
+	sb.WriteString("\nAsk one of them to run it.\n")
+}
+
+// anyTeamPrincipal reports whether any listed principal is a GitHub team
+// (org/team) rather than a user login.
+func anyTeamPrincipal(principalLists ...[]string) bool {
+	for _, principals := range principalLists {
+		for _, principal := range principals {
+			if strings.Contains(principal, "/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RenderPRCommandDatabaseNotConfigured renders a comment when a mutating PR
@@ -78,10 +165,10 @@ func RenderPRCommandDatabaseNotConfigured(data ActorAuthorizationCommentData) st
 	sb.WriteString("## SchemaBot Command Not Authorized\n\n")
 	writeDBEnvLine(&sb, data.Database, data.Environment)
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database `%s` is not configured on this SchemaBot instance.\n\n", data.CommandName, data.Database)
+	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database %s is not configured on this SchemaBot instance.\n\n", data.CommandName, inlineCode(data.Database))
 	sb.WriteString("Verify the database name, or run the command against the SchemaBot instance that manages this database.\n")
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderPRCommandAuthorizationUnavailable renders a comment when SchemaBot
@@ -99,13 +186,32 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 	sb.WriteString("If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.\n\n")
 	sb.WriteString("A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.\n")
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderUnsafeChangesBlocked renders a comment when unsafe changes are detected
 // and --allow-unsafe was not specified. Shows the plan DDL plus a blocking message
-// instructing the user to re-run with --allow-unsafe.
+// instructing the user to re-run the apply with --allow-unsafe added.
 func RenderUnsafeChangesBlocked(data PlanCommentData) string {
+	// Every target's plan renders when the apply runs other targets' plans, so
+	// the refusal shows what each would run. The refusal lists every unsafe
+	// change itself, naming its targets, so the groups do not repeat them, and
+	// like a single target's refusal it discloses no existing copies.
+	if RendersTargetPlans(data.DeploymentDrift) {
+		drift := *data.DeploymentDrift
+		drift.Plans = slices.Clone(drift.Plans)
+		for i := range drift.Plans {
+			drift.Plans[i].UnsafeChanges = nil
+		}
+		drift.DiscardedCopies = nil
+		data.DeploymentDrift = &drift
+	}
+	return renderWithinCommentLimit(countCommentDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {
+		return renderUnsafeChangesBlocked(data, budget)
+	})
+}
+
+func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Render the full plan first (DDL, lint warnings, etc.) so the user can see
@@ -116,50 +222,131 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
 
-	// Count and show changes
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
-
-	if totalChanges > 0 {
-		writeKeyspaceChanges(&sb, data)
+	// Count and show changes, every target's when the apply runs them.
+	summary := data
+	if RendersTargetPlans(data.DeploymentDrift) {
+		// The refusal lists every target's unsafe changes below, and like a
+		// single target's refusal it does not disclose existing copies, so no
+		// plan above it carries either.
+		groups := data
+		groups.HasUnsafeChanges, groups.UnsafeChanges = false, nil
+		groups.DiscardedCopies, groups.AdoptedCopies, groups.RunningCopies = nil, nil, nil
+		writeTargetPlans(&sb, groups, budget, false)
+		summary.Changes = combinedTargetPlanChanges(data)
+		summary.summaryRollout = data.DeploymentDrift
+	} else if statements, keyspaceUpdates := countChanges(data.Changes); statements+keyspaceUpdates > 0 {
+		writeKeyspaceChanges(&sb, data, budget)
 	}
+	writeTableSizesSection(&sb, data)
+	writeCollationChangesSection(&sb, data)
+	totalStatements, keyspaceUpdates := countChanges(summary.Changes)
 
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, summary, totalStatements, keyspaceUpdates)
 
-	// Unsafe changes blocked section
-	sb.WriteString("---\n\n")
-	fmt.Fprintf(&sb, "**⛔ %d Unsafe %s Detected:**\n", len(data.UnsafeChanges), pluralize("Change", len(data.UnsafeChanges)))
-	for _, c := range data.UnsafeChanges {
-		reason := ui.CleanLintReason(c.Reason)
-		if reason != "" {
-			fmt.Fprintf(&sb, "- `%s`: %s\n", c.Table, reason)
-		} else {
-			fmt.Fprintf(&sb, "- `%s`\n", c.Table)
-		}
+	// Lint findings, and the guides for what they name. This is where the
+	// operator decides whether to pass --allow-unsafe, so the reading that
+	// informs the decision belongs above the rejection rather than only on the
+	// plan comment that preceded it.
+	if len(data.LintViolations) > 0 {
+		writeLintViolations(&sb, data.LintViolations)
 	}
-	sb.WriteString("\n")
-	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
 
-	sb.WriteString("**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
-	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
+	applyCmd := appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase), data.Target)
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
-	applyCmd += " --allow-unsafe"
-	fmt.Fprintf(&sb, "```\n%s\n```\n", applyCmd)
+	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd)
 
-	return sb.String()
+	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
+}
+
+// writeUnsafeChangesRejection writes the refusal for a command that would run
+// unsafe changes without `--allow-unsafe`: the heading names what was
+// rejected, each unsafe change is listed, and the comment ends in the steps
+// that make any destructive drop safe and the command to re-run. Like the plan's apply instruction, the consent requirement leads
+// into the command and the flag stays out of the pasteable command, so
+// consenting to destroy data takes typing it.
+func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
+	sb.WriteString("---\n\n")
+	drops, rest := splitDestructiveDrops(data.UnsafeChanges, data.DatabaseType)
+	fmt.Fprintf(sb, "**%s %s**: %s\n", glyph.Refused, rejected, unsafeCountPhrase(drops, rest))
+	writeUnsafeFindingList(sb, drops, rest, nil)
+	sb.WriteString("\n")
+
+	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
+	// is consent to destroy the data, and whether the change is this pull
+	// request's to make is part of what the operator is consenting to.
+	if len(data.AttributedChanges) > 0 {
+		writeAttributedChanges(sb, data.AttributedChanges)
+	}
+
+	consent := newUnsafeConsent(data.UnsafeChanges, data.DatabaseType, data.IsMySQL, !unsafeCountCoversEveryTarget(data.DeploymentDrift))
+	writeUnsafeConsentCommand(sb, fmt.Sprintf("**%s To proceed with these destructive changes**", glyph.Escalation), consent, command)
+}
+
+// RenderBlockedChangesApplyRejected renders the rejection comment for an
+// apply whose plan contains statements that the schema change engine refuses.
+// Unlike unsafe changes there is no opt-in flag that lets a refused statement
+// through, so the comment carries no retry instructions — the guidance is to
+// rewrite the change or contact the operators.
+func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderBlockedChangesApplyRejected(data, budget)
+	})
+}
+
+func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBudget) string {
+	var sb strings.Builder
+
+	// Render the full plan first (DDL, summary) so the user can see what was
+	// planned — but without a lock or confirm footer.
+	writeEnvironmentTitle(&sb, "Schema Change Plan", data.Environment)
+
+	writePlanMetadata(&sb, data)
+	writePlanAttribution(&sb, data)
+	sb.WriteString("\n")
+
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	if totalStatements+keyspaceUpdates > 0 {
+		writeKeyspaceChanges(&sb, data, budget)
+	}
+	writeTableSizesSection(&sb, data)
+	writeCollationChangesSection(&sb, data)
+
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
+
+	sb.WriteString("---\n\n")
+	n := len(data.BlockedChanges)
+	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the engine refuses to execute\n", n, pluralize("change", n))
+	for _, c := range data.BlockedChanges {
+		table := inlineCode(c.Table)
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
+		}
+		writeEngineReasonItem(&sb, table, c.Reason)
+	}
+	sb.WriteString("\nFix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n")
+
+	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
 // RenderApplyStarted renders the initial body of the live progress comment when
 // an apply begins. It uses the same stable status title as the in-place status
 // comment the observer later edits this into, so the headline does not jump from
-// one title to another on the first progress update.
+// one title to another on the first progress update. An apply that has not
+// started yet reads as queued, since that is what it is until SchemaBot picks it
+// up and the first progress update replaces this body.
 func RenderApplyStarted(data ApplyStatusCommentData) string {
 	var sb strings.Builder
 
 	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
+	writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
+	if state.IsState(data.State, state.Apply.Pending) {
+		writeApplyStatusDetail(&sb, data)
+		return sb.String()
+	}
 	sb.WriteString("\nSchema changes are being applied. This comment will be updated with progress.\n")
 
 	return sb.String()
@@ -213,41 +400,194 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	isCLI := data.LockPR == 0
 	if isCLI {
 		sb.WriteString("A CLI session currently holds the lock for this database.\n\n")
-		fmt.Fprintf(&sb, "**Locked by**: `%s`\n", data.LockOwner)
+		fmt.Fprintf(&sb, "**Locked by**: `%s`\n", caller.Short(data.LockOwner))
 	} else {
 		sb.WriteString("Another PR currently holds the lock for this database.\n\n")
 		if data.LockRepo != "" {
-			fmt.Fprintf(&sb, "**Locked by**: [%s#%d](https://github.com/%s/pull/%d)\n",
-				data.LockRepo, data.LockPR, data.LockRepo, data.LockPR)
+			fmt.Fprintf(&sb, "**Locked by**: %s\n",
+				caller.PullRequestMarkdownLink(data.LockRepo, data.LockPR))
 		} else {
-			fmt.Fprintf(&sb, "**Locked by**: `%s`\n", data.LockOwner)
+			fmt.Fprintf(&sb, "**Locked by**: `%s`\n", caller.Short(data.LockOwner))
 		}
 	}
 	fmt.Fprintf(&sb, "**Since**: %s\n\n", data.LockCreated.UTC().Format("2006-01-02 15:04:05 UTC"))
 
 	if isCLI {
-		sb.WriteString("Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:\n")
-		fmt.Fprintf(&sb, "```\nschemabot unlock -d %s --force\n```\n", data.Database)
+		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
+		fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
 	} else {
-		sb.WriteString("Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.\n")
+		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant), data.LockedApply) + "\n")
+	}
+
+	return offerSupportChannel(sb.String())
+}
+
+// otherPRLockReleaseHint tells the requester when another PR's lock goes away.
+// A PR's lock outlives its apply: it is released when that PR is merged or
+// closed, or when the unlock command is commented on it. Neither works while
+// an apply is still running, so that case names the apply to wait for. When
+// the lookup failed, only the part that holds without it is said.
+func otherPRLockReleaseHint(unlockCommand string, locked LockedDatabaseApply) string {
+	if !locked.Checked {
+		return "The lock is held until that PR is merged or closed."
+	}
+	release := "when that PR is merged or closed, or when `" + unlockCommand + "` is commented on it."
+	switch {
+	case locked.RunningApplyID == "":
+		return "The lock is released " + release
+	case locked.RunningIsLockHolders:
+		return "That PR's apply `" + locked.RunningApplyID + "` is still running. Once it finishes, the lock is released " + release
+	default:
+		return "Apply `" + locked.RunningApplyID + "` is still running on this database. Once it finishes, the lock is released " + release
+	}
+}
+
+// cliUnlockArgs renders the CLI unlock arguments for the lock on database.
+// Locks are keyed by database and type, and the CLI's unlock defaults -t to
+// mysql, so the type is named whenever it is known: without it, a hint for a
+// PostgreSQL or Vitess lock would miss the lock it names.
+func cliUnlockArgs(database, databaseType string) string {
+	args := "unlock -d " + database
+	if databaseType != "" {
+		args += " -t " + databaseType
+	}
+	return args
+}
+
+// RenderApplyInProgress renders a comment when the same PR already has an active
+// apply. The active apply's state decides the next step: one waiting on an
+// operator command (a deferred cutover or deploy, an open revert window) names
+// that command, and every state ends with the apply to run once it finishes.
+func RenderApplyInProgress(data ApplyLockConflictData) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, glyph.Attention+" Apply Already In Progress", data.Environment)
+	writeDBLine(&sb, data.Database)
+	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	sb.WriteString("\n")
+
+	applyAgain := data.ApplyAgainCommand
+	if applyAgain == "" {
+		applyAgain = appendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
+	}
+	applyEnvironment := data.ApplyEnvironment
+	if applyEnvironment == "" {
+		applyEnvironment = data.Environment
+	}
+	control := func(verb string) string {
+		return appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
+	}
+	// An apply in another environment is named by it, since the heading
+	// names the requested one.
+	activeApply := "This PR's apply"
+	if applyEnvironment != data.Environment {
+		activeApply = "This PR's " + applyEnvironment + " apply"
+	}
+
+	// thenApplyAgain closes the comment with what to run once the active
+	// apply ends: the apply again, unless the active apply is already
+	// applying this PR's latest commit. That apply's own progress comment
+	// then says how it ended and what to do next, since it may still fail
+	// or be stopped.
+	thenApplyAgain := func(lead string) {
+		if data.AppliesLatestCommit {
+			fmt.Fprintf(&sb, "It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.\n")
+			return
+		}
+		writeApplyAgain(&sb, lead, applyAgain, data.ApplyAgainConsent)
+	}
+
+	switch {
+	case activeApplyAwaitsCutover(data):
+		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
+		fmt.Fprintf(&sb, "To run the cutover:\n```\n%s\n```\n\n", control("cutover"))
+		thenApplyAgain("Once it completes, apply again")
+	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
+		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
+		fmt.Fprintf(&sb, "To keep its changes and close the window:\n```\n%s\n```\n\n", control("skip-revert"))
+		thenApplyAgain("Once it completes, apply again")
+	default:
+		fmt.Fprintf(&sb, "%s `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", activeApply, data.ApplyID, data.ApplyState)
+		thenApplyAgain("Once it finishes, apply again")
 	}
 
 	return sb.String()
 }
 
-// RenderApplyInProgress renders a comment when the same PR already has an active apply.
-func RenderApplyInProgress(data ApplyLockConflictData) string {
+// writeApplyAgain writes the apply to run again in its own fenced block, led
+// into by consent when there is one.
+func writeApplyAgain(sb *strings.Builder, lead, command, consent string) {
+	writeRerunCommand(sb, lead, consent, command, "\n")
+}
+
+// ApplyLockIntentChangedData describes an apply or apply-confirm rejected
+// because another command pinned or released this PR's lock while the apply
+// was checking or planning against it.
+type ApplyLockIntentChangedData struct {
+	CommandName string
+	Database    string
+	Environment string
+	RequestedBy string
+	// ApplyAgainCommand is the apply to re-run, scoped and optioned as the
+	// operator sent it, and ApplyAgainConsent the clause that leads into it.
+	ApplyAgainCommand string
+	ApplyAgainConsent string
+}
+
+// RenderApplyLockIntentChanged renders the rejection of an apply whose lock
+// another command changed under it. The apply leaves the lock as that command
+// set it; a retry finds it and reports which command holds the lock and how to
+// settle it, or plans afresh when the lock is free. The command to re-run is
+// rendered in full rather than as a clamped error detail, so a long database
+// name or option list never cuts it or its consent clause short.
+func RenderApplyLockIntentChanged(data ApplyLockIntentChangedData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Apply Already In Progress", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" "+capitalizeFirst(data.CommandName)+" Refused", data.Environment)
 	writeDBLine(&sb, data.Database)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "An apply is already running for this PR (apply ID: `%s`, state: `%s`).\n\n",
-		data.ApplyID, data.ApplyState)
-	sb.WriteString("Wait for it to complete or stop it first.\n")
 
-	return sb.String()
+	fmt.Fprintf(&sb, "Another SchemaBot command changed the lock on `%s` while this apply was running, "+
+		"so the apply was rejected to leave the lock as that command set it. "+
+		"If the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.\n\n", data.Database)
+	writeApplyAgain(&sb, "Re-run the apply", data.ApplyAgainCommand, data.ApplyAgainConsent)
+
+	return offerSupportChannel(sb.String())
+}
+
+// activeApplyAwaitsCutover reports whether the active apply is parked until an
+// operator triggers its cutover: a deploy request waiting to be deployed always
+// is, and a waiting_for_cutover apply is only when it was started with deferred
+// cutover (otherwise SchemaBot cuts over on its own).
+func activeApplyAwaitsCutover(data ApplyLockConflictData) bool {
+	if state.IsState(data.ApplyState, state.Apply.WaitingForDeploy) {
+		return true
+	}
+	return data.DeferCutover && state.IsState(data.ApplyState, state.Apply.WaitingForCutover)
+}
+
+// RenderApplyBlockedClosedPR renders a rejection when an apply command targets
+// a closed PR. merged selects the copy: a merged PR cannot be reopened and its
+// schema changes did merge, so the abandoned-PR guidance ("reopen this PR" /
+// "can never merge") would mislead the operator.
+func RenderApplyBlockedClosedPR(environment, requestedBy string, merged bool) string {
+	var sb strings.Builder
+
+	if merged {
+		writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked: PR Is Merged", environment)
+		writeRequesterOrTimestamp(&sb, requestedBy)
+		sb.WriteString("\nThis PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.\n\n")
+		sb.WriteString("If the schema change still needs to be applied, open a new PR with it and apply from there.\n")
+		return sb.String()
+	}
+
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked: PR Is Closed", environment)
+	writeRequesterOrTimestamp(&sb, requestedBy)
+	sb.WriteString("\nThis PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.\n\n")
+	sb.WriteString("Reopen this PR, or open a new PR with the schema change, and apply from there.\n")
+
+	return offerSupportChannel(sb.String())
 }
 
 // RenderNoLocksFound renders a comment when unlock finds no locks for this PR.
@@ -260,11 +600,23 @@ func RenderNoLocksFound() string {
 	return sb.String()
 }
 
+// RenderLocksAlreadyReleased renders a comment when every lock matched by an
+// unlock command was already released by a concurrent operation, so the
+// command had nothing left to do.
+func RenderLocksAlreadyReleased() string {
+	var sb strings.Builder
+
+	sb.WriteString("## 🔓 Locks Already Released\n\n")
+	sb.WriteString("Every lock matched by this unlock command had already been released by a concurrent operation. Nothing left to unlock.\n")
+
+	return sb.String()
+}
+
 // RenderCannotUnlock renders a comment when unlock is blocked by an active apply.
 func RenderCannotUnlock(database, environment, applyID, applyState string) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Cannot Unlock", environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Cannot Unlock", environment)
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "An apply is currently active (apply ID: `%s`, state: `%s`).\n\n",
@@ -303,7 +655,7 @@ type StaleSchemaRejectionData struct {
 func RenderStaleSchemaRejection(data StaleSchemaRejectionData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Rejected — new commits since discovery", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Rejected — new commits since discovery", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "Schema files were loaded at `%s`, but the current PR HEAD is `%s`. ", data.DiscoverySHA, data.CurrentSHA)
@@ -337,7 +689,7 @@ type StalePlanRejectionData struct {
 func RenderStalePlanRejection(data StalePlanRejectionData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Rejected — the plan you confirmed is stale", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Rejected — the plan you confirmed is stale", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "The confirmation plan was rendered at `%s`, but the current PR HEAD is `%s`. ", data.PlanSHA, data.CurrentSHA)
@@ -368,14 +720,14 @@ type BaseSchemaFreshnessRejectionData struct {
 func RenderBaseSchemaFreshnessRejection(data BaseSchemaFreshnessRejectionData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Apply rejected — base schema is newer", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Apply rejected — base schema is newer", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	if data.VerificationError {
 		sb.WriteString("SchemaBot could not verify whether this PR includes the current base branch's schema changes. The apply was rejected to avoid reverting a change that may already be on the base branch.\n\n")
 		sb.WriteString("Retry the command. If verification continues to fail, contact a SchemaBot operator.\n")
 	} else {
-		fmt.Fprintf(&sb, "The base branch contains newer changes to the schema directory `%s` that are not included in this PR. Applying this branch could revert those changes.\n\n", data.SchemaPath)
+		fmt.Fprintf(&sb, "The base branch contains newer changes to the schema directory %s that are not included in this PR. Applying this branch could revert those changes.\n\n", inlineCode(data.SchemaPath))
 		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
 	}
 
@@ -404,23 +756,39 @@ func RenderApplyConfirmNoLock(database, environment string) string {
 func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action string) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "%s %s. %s before applying to %s.\n\n", capitalizeFirst(priorEnv), status, action, environment)
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", priorEnv)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // BlockingCheck represents a PR check that is blocking apply, either because
 // it completed without passing or because it is still running. State holds the
 // GitHub-reported conclusion (e.g. "failure", "timed_out", "cancelled") for
-// completed checks, or the status (e.g. "in_progress", "queued", "pending")
-// for in-progress checks.
+// completed checks, or the status for unfinished checks — any status other than
+// "completed" ("in_progress", "queued", "pending", "waiting", "requested", or
+// one GitHub adds later), rendered as GitHub reported it.
 type BlockingCheck struct {
 	Name  string
 	State string
+}
+
+// checkStatusWaiting is the GitHub check-run status of an Actions job paused on
+// an environment protection rule: it stays there until a deployment reviewer
+// approves or rejects the deployment, so waiting on it is not enough by itself.
+const checkStatusWaiting = "waiting"
+
+// anyCheckInState reports whether any of the checks carries the given State.
+func anyCheckInState(checks []BlockingCheck, state string) bool {
+	for _, c := range checks {
+		if c.State == state {
+			return true
+		}
+	}
+	return false
 }
 
 // RenderApplyBlockedByNonPassingChecks renders a comment when apply is blocked
@@ -428,7 +796,7 @@ type BlockingCheck struct {
 func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []BlockingCheck) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
 	if len(notPassing) == 0 {
 		// Defensive: callers should only invoke this template when at least
 		// one non-passing check has been identified. Render a generic message
@@ -442,18 +810,20 @@ func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []Block
 	sb.WriteString("| Check | Status |\n")
 	sb.WriteString("|-------|--------|\n")
 	for _, f := range notPassing {
-		fmt.Fprintf(&sb, "| `%s` | %s |\n", f.Name, f.State)
+		fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(f.Name), f.State)
 	}
 	sb.WriteString("\nGet the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByCheckStatusError renders a comment when apply is blocked
 // because the GitHub API returned an error while fetching PR check statuses.
 // The function recognises the "Resource not accessible" permission error and
-// surfaces a targeted hint; all other errors are shown verbatim. Both branches
+// surfaces a targeted hint; the error itself is never rendered — raw GitHub
+// errors can carry internal detail (hosts, headers, newlines) that must not
+// land in PR markdown, so operators triage from the server logs. Both branches
 // include a fenced retry command, matching the non-passing/in-progress siblings.
 type CheckStatusAccessDetails struct {
 	GitHubApp              string
@@ -465,7 +835,10 @@ type CheckStatusAccessDetails struct {
 func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	// Failure glyph, not refusal: a check-status read error is transient — an
+	// unchanged retry can succeed — so this is a failed verification the apply
+	// fail-closed on, not a request SchemaBot refuses to perform.
+	writeEnvironmentTitle(&sb, glyph.Failed+" Apply Blocked", environment)
 
 	if err != nil && strings.Contains(err.Error(), "Resource not accessible") {
 		app := "SchemaBot GitHub App"
@@ -490,22 +863,11 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 		return sb.String()
 	}
 
-	if err != nil {
-		sb.WriteString("Unable to verify PR check statuses:\n\n")
-		sb.WriteString("```\n")
-		fmt.Fprintf(&sb, "%s\n", err)
-		sb.WriteString("```\n")
-		sb.WriteString("\nResolve the issue and retry:\n")
-	} else {
-		// Defensive: callers should always pass a non-nil error here, but
-		// rendering an empty fenced block followed by "Resolve the issue"
-		// would be confusing if a nil error ever slipped through.
-		sb.WriteString("Unable to verify PR check statuses.\n\n")
-		sb.WriteString("Retry:\n")
-	}
+	sb.WriteString("Unable to verify PR check statuses; see server logs for details.\n\n")
+	sb.WriteString("Retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByInProgressChecks renders a comment when apply is blocked
@@ -540,7 +902,11 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 		sb.WriteString("| Check | Status |\n")
 		sb.WriteString("|-------|--------|\n")
 		for _, c := range inProgress {
-			fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
+			fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(c.Name), c.State)
+		}
+		if anyCheckInState(inProgress, checkStatusWaiting) {
+			sb.WriteString("\nA check in `waiting` is paused for a deployment reviewer to approve or reject its environment and will not finish on its own. ")
+			sb.WriteString("If the apply should not depend on that approval, leave the check out of `required_checks`.\n")
 		}
 		sb.WriteString("\nWait for checks to complete and retry:\n")
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
@@ -554,28 +920,34 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 		sb.WriteString("| Check | Status |\n")
 		sb.WriteString("|-------|--------|\n")
 		for _, c := range notReported {
-			fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
+			fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(c.Name), c.State)
 		}
 		sb.WriteString("\nIf a check never reports, waiting will not unblock the apply. ")
 		sb.WriteString("Verify the name in `required_checks` matches the check exactly and that it runs on this PR, then retry:\n")
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 	}
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByPriorEnvCheckError renders a comment when apply is blocked
 // because the GitHub API returned an error while verifying a prior environment's
 // aggregate check status. Reason describes the operation that failed (e.g.
-// "create GitHub client", "fetch PR details", "query check runs").
-func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string, err error) string {
+// "create GitHub client", "fetch PR details", "query check runs"). The error
+// itself is never rendered — raw GitHub/storage errors can carry internal
+// detail that must not land in PR markdown, so operators triage from the
+// server logs.
+func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
+	// Failure glyph, not refusal: the prior-environment read is transient —
+	// an unchanged retry can succeed — so this is a failed verification the
+	// apply fail-closed on, not a request SchemaBot refuses to perform.
+	sb.WriteString("## " + glyph.Failed + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Retry the apply command.\n\n", priorEnv, reason)
-	fmt.Fprintf(&sb, "_Error: %v_", err)
+	sb.WriteString("_See server logs for details._")
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByMissingPriorEnvCheck renders a comment when apply is
@@ -585,13 +957,33 @@ func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string, err error) 
 func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
+	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "SchemaBot could not find a completed `%s` check for this PR.\n\n", priorEnv)
 	fmt.Fprintf(&sb, "SchemaBot must verify `%s` before applying a later environment. Create the missing `%s` status with:\n", priorEnv, priorEnv)
 	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
 	fmt.Fprintf(&sb, "If the plan finds changes, apply `%s` and wait for the SchemaBot check to succeed. Then retry this apply.\n", priorEnv)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
+}
+
+// RenderApplyBlockedByStalePriorEnvCheck renders a comment when apply is
+// blocked because the prior environment's stored check state was recorded on a
+// commit other than the one this apply read its schema from. A result for
+// another commit does not verify what the PR would apply now, so the prior
+// environment has to be re-checked on the PR head; retrying the later apply
+// alone does not help unless that check lands first. The comment names both
+// commits without ranking them: the head may have moved while the command ran,
+// so headSHA is not always the newer of the two.
+func RenderApplyBlockedByStalePriorEnvCheck(priorEnv, checkSHA, headSHA string) string {
+	var sb strings.Builder
+
+	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
+	fmt.Fprintf(&sb, "The `%s` check for this PR was recorded on commit `%s`, but this apply read the schema at commit `%s`.\n\n", priorEnv, shortSHA(checkSHA), shortSHA(headSHA))
+	fmt.Fprintf(&sb, "SchemaBot only accepts a `%s` result recorded on the commit being applied. Re-check `%s` on the PR head with:\n", priorEnv, priorEnv)
+	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
+	fmt.Fprintf(&sb, "If the plan finds changes, apply `%s` and wait for the SchemaBot check to succeed. Then retry this apply.\n", priorEnv)
+
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByUntrustedPriorEnvCheck renders a comment when apply is
@@ -603,7 +995,7 @@ func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 func RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName string, untrustedApps []string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
+	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "A `%s` check named `%s` exists on this PR, but it was created by a GitHub App this SchemaBot deployment does not trust:\n\n", priorEnv, checkName)
 	for _, app := range untrustedApps {
 		fmt.Fprintf(&sb, "- `%s`\n", app)
@@ -615,7 +1007,7 @@ func RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName string, untr
 	sb.WriteString("- If you do not recognize the App, do not trust it — the check may be impersonating SchemaBot.\n\n")
 	fmt.Fprintf(&sb, "Re-running `schemabot plan -e %s` will not resolve this.\n", priorEnv)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByPriorEnvInProgress renders a comment when an apply is blocked
@@ -630,7 +1022,24 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
+}
+
+// RenderApplyBlockedByStoppedPriorEnvApply renders a comment when an apply is
+// blocked because a prior environment's apply is stopped: it holds the prior
+// environment until it is started again, so it is the operator's move, not
+// something to wait for.
+func RenderApplyBlockedByStoppedPriorEnvApply(database, environment, priorEnv string) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
+	writeDBLine(&sb, database)
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "%s has a stopped apply. Start it again with the command on its progress comment.\n\n", capitalizeFirst(priorEnv))
+	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
+	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
+
+	return offerSupportChannel(sb.String())
 }
 
 // RenderApplyBlockedByUnlistedEnvironment renders a comment when an apply is
@@ -641,12 +1050,12 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder []string) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
 	fmt.Fprintf(&sb, "`%s` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.\n\n", environment)
 	if len(promotionOrder) > 0 {
 		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))
 	}
-	fmt.Fprintf(&sb, "Add `%s` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
+	fmt.Fprintf(&sb, "Add `%s` to `environment_order` (the server-wide list, or this database's override when it has one) so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }

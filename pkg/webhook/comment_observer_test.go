@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -22,9 +23,11 @@ type stubApplyOperationStore struct {
 	ops        []*storage.ApplyOperation
 	err        error
 	resumeByOp map[int64]*storage.EngineResumeState
+	listCalls  int
 }
 
 func (s *stubApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	s.listCalls++
 	return s.ops, s.err
 }
 
@@ -35,17 +38,57 @@ func (s *stubApplyOperationStore) GetEngineResumeState(_ context.Context, opID i
 	return nil, storage.ErrEngineResumeStateNotFound
 }
 
-// stubStorage exposes only the ApplyOperations accessor the comment dispatch
-// needs; every other store would panic, keeping the test honest about the path
-// it covers.
+// stubStorage exposes only the accessors the comment dispatch needs; every
+// other store would panic, keeping the test honest about the path it covers.
 type stubStorage struct {
 	storage.Storage
-	ops storage.ApplyOperationStore
+	ops       storage.ApplyOperationStore
+	applies   storage.ApplyStore
+	applyLogs storage.ApplyLogStore
+	settled   []*storage.ApplyControlRequest
+	// settledReads counts the settled-control-request reads, so a test can
+	// pin that rendering a comment body twice still reads storage once.
+	settledReads *int
 }
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
+func (s *stubStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *stubStorage) ApplyLogs() storage.ApplyLogStore { return s.applyLogs }
+
+// stubApplyStore serves the authority gate's fresh re-read of the apply row
+// from a fixed result.
+type stubApplyStore struct {
+	storage.ApplyStore
+	apply *storage.Apply
+	err   error
+}
+
+func (s *stubApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return s.apply, s.err
+}
+
 func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
+
+func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
+	return stubControlRequestStore{settled: s.settled, reads: s.settledReads}
+}
+
+// stubControlRequestStore supplies the settled-control-request read the comment
+// dispatch path makes, from whatever the test seeded.
+type stubControlRequestStore struct {
+	storage.ControlRequestStore
+	settled []*storage.ApplyControlRequest
+	reads   *int
+}
+
+func (s stubControlRequestStore) ListSettled(context.Context, int64) ([]*storage.ApplyControlRequest, error) {
+	if s.reads != nil {
+		*s.reads++
+	}
+	return s.settled, nil
+}
 
 // stubTaskStore supplies the per-shard read the comment dispatch path makes; the
 // routing tests have no shard rows, so it returns none.
@@ -132,8 +175,8 @@ func TestFormatStatusCommentRoutesMultiDeployment(t *testing.T) {
 	body := o.formatStatusComment(runningApply(), nil)
 
 	assert.Contains(t, body, "**Deployments**: 1 completed, 1 running")
-	assert.Contains(t, body, "- ✅ eu — completed")
-	assert.Contains(t, body, "- 🔄 us — running table copy")
+	assert.Contains(t, body, "- ✅ `eu` — completed")
+	assert.Contains(t, body, "- 🔄 `us` — running table copy")
 }
 
 // A single-operation apply (every apply today, until fan-out lands) renders the
@@ -173,8 +216,8 @@ func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.Contains(t, body, "**Deployments**: 2 completed")
-	assert.Contains(t, body, "- ✅ eu — completed")
-	assert.Contains(t, body, "- ✅ us — completed")
+	assert.Contains(t, body, "- ✅ `eu` — completed")
+	assert.Contains(t, body, "- ✅ `us` — completed")
 }
 
 // A single-operation terminal apply renders the single-deployment summary
@@ -209,10 +252,23 @@ type capturedLog struct {
 }
 
 type capturingLogger struct {
+	debugs []capturedLog
+	infos  []capturedLog
+	warns  []capturedLog
 	errors []capturedLog
 }
 
-func (l *capturingLogger) Info(msg string, args ...any) {}
+func (l *capturingLogger) Debug(msg string, args ...any) {
+	l.debugs = append(l.debugs, capturedLog{msg: msg, args: args})
+}
+
+func (l *capturingLogger) Info(msg string, args ...any) {
+	l.infos = append(l.infos, capturedLog{msg: msg, args: args})
+}
+
+func (l *capturingLogger) Warn(msg string, args ...any) {
+	l.warns = append(l.warns, capturedLog{msg: msg, args: args})
+}
 
 func (l *capturingLogger) Error(msg string, args ...any) {
 	l.errors = append(l.errors, capturedLog{msg: msg, args: args})
@@ -302,7 +358,7 @@ func TestAggregateTerminalObserverBypassesApplyLeaseCheck(t *testing.T) {
 
 	normal := NewCommentObserver(cfg)
 	assert.False(t, normal.leaseStillOwnsObserver(unleasedApply, "terminal"),
-		"a normal observer with no apply lease must fail closed")
+		"a terminal apply short-circuits the in-flight gate, so a normal observer with no apply lease fails closed")
 
 	aggregate := NewAggregateTerminalCommentObserver(cfg)
 	assert.True(t, aggregate.leaseStillOwnsObserver(unleasedApply, "terminal"),
@@ -314,6 +370,184 @@ func TestAggregateTerminalObserverBypassesApplyLeaseCheck(t *testing.T) {
 	ctx := aggregate.contextWithApplyLease(t.Context(), unleasedApply)
 	_, hasLease := storage.ApplyLeaseFromContext(ctx)
 	assert.False(t, hasLease, "aggregate terminal observer must not attach an apply lease to storage writes")
+}
+
+// The progress-comment authority exists only for applies whose work runs under
+// operation leases while the parent apply lease is legitimately unheld. This
+// pins the shape gate to the operator's drive-mode split: a multi-operation
+// rollout with keyed work still in flight, or a generation manifest still
+// promising operations, qualifies; terminal applies, settled keyed work,
+// single-operation applies, and whole-deployment operations — whose drives
+// hold the parent lease, so an unheld lease there means no driver — do not.
+func TestOperationScopedWorkInFlight(t *testing.T) {
+	runningApply := &storage.Apply{ApplyIdentifier: "apply-1", State: state.Apply.Running}
+
+	t.Run("terminal apply has no in-flight work", func(t *testing.T) {
+		// The operation rows alone would qualify — keyed, multiple, one still
+		// running — so only the apply's terminal state produces the denial.
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+			{ID: 2, Deployment: "primary", OperationKey: "orders/80-", State: state.ApplyOperation.Running},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), &storage.Apply{ApplyIdentifier: "apply-1", State: state.Apply.Completed})
+		require.NoError(t, err)
+		assert.False(t, inFlight)
+	})
+
+	t.Run("a single keyed operation drives under the parent lease", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Running},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.False(t, inFlight)
+	})
+
+	t.Run("non-terminal operation-keyed row is in flight", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+			{ID: 2, Deployment: "primary", OperationKey: "orders/80-", State: state.ApplyOperation.Running},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.True(t, inFlight)
+	})
+
+	t.Run("settled keyed work is not in flight", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+			{ID: 2, Deployment: "primary", OperationKey: "orders/80-", State: state.ApplyOperation.Completed},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.False(t, inFlight)
+	})
+
+	t.Run("whole-deployment operations are governed by the parent lease", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", State: state.ApplyOperation.Running},
+			{ID: 2, Deployment: "replica", State: state.ApplyOperation.Running},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.False(t, inFlight)
+	})
+
+	t.Run("manifest keys with no attached operation are in flight", func(t *testing.T) {
+		manifestApply := &storage.Apply{
+			ApplyIdentifier:       "apply-1",
+			State:                 state.Apply.Running,
+			ExpectedOperationKeys: []string{"orders/-80", "orders/80-"},
+		}
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), manifestApply)
+		require.NoError(t, err)
+		assert.True(t, inFlight)
+	})
+
+	t.Run("an operation-load failure is surfaced, never treated as in flight", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{err: errors.New("db unavailable")})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.Error(t, err)
+		assert.False(t, inFlight)
+	})
+}
+
+// inFlightKeyedOps is an operation set that qualifies for the durable
+// progress-comment authority: a multi-operation rollout with keyed work still
+// running.
+func inFlightKeyedOps() []*storage.ApplyOperation {
+	return []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "primary", OperationKey: "orders/80-", State: state.ApplyOperation.Running},
+	}
+}
+
+// The observer's poller snapshot can be a tick old, so the authority gate
+// re-reads the apply row before claiming. A dispatch wave that re-claimed the
+// parent lease since the snapshot — or a projection that settled the apply
+// terminal — owns the comment through its own path, and the authority must
+// deny so two writers never edit the same comment concurrently.
+func TestProgressCommentAuthorityDeniesOnFreshApplyRowChanges(t *testing.T) {
+	snapshot := &storage.Apply{ID: 7, ApplyIdentifier: "apply-1", State: state.Apply.Running}
+
+	t.Run("parent lease re-claimed since the snapshot", func(t *testing.T) {
+		logger := &capturingLogger{}
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: inFlightKeyedOps()})
+		o.logger = logger
+		o.stor.(*stubStorage).applies = &stubApplyStore{apply: &storage.Apply{
+			ID: 7, ApplyIdentifier: "apply-1", State: state.Apply.Running,
+			LeaseOwner: "driver-host/9/dispatch", LeaseToken: "wave-token",
+		}}
+
+		assert.False(t, o.progressCommentAuthorityOwnsObserver(snapshot, "progress"),
+			"a freshly claimed parent lease must deny the durable authority")
+		require.Len(t, logger.debugs, 1)
+		assert.Contains(t, logger.debugs[0].msg, "parent apply lease re-claimed")
+	})
+
+	t.Run("apply settled terminal since the snapshot", func(t *testing.T) {
+		logger := &capturingLogger{}
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: inFlightKeyedOps()})
+		o.logger = logger
+		o.stor.(*stubStorage).applies = &stubApplyStore{apply: &storage.Apply{
+			ID: 7, ApplyIdentifier: "apply-1", State: state.Apply.Completed,
+		}}
+
+		assert.False(t, o.progressCommentAuthorityOwnsObserver(snapshot, "progress"),
+			"a freshly settled terminal apply must deny the durable authority")
+		require.Len(t, logger.debugs, 1)
+		assert.Contains(t, logger.debugs[0].msg, "apply settled terminal")
+	})
+
+	t.Run("a re-read failure fails closed", func(t *testing.T) {
+		logger := &capturingLogger{}
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: inFlightKeyedOps()})
+		o.logger = logger
+		o.stor.(*stubStorage).applies = &stubApplyStore{err: errors.New("db unavailable")}
+
+		assert.False(t, o.progressCommentAuthorityOwnsObserver(snapshot, "progress"))
+		require.Len(t, logger.errors, 1)
+		assert.Contains(t, logger.errors[0].msg, "failed to re-read the apply")
+	})
+
+	t.Run("a vanished apply row fails closed", func(t *testing.T) {
+		logger := &capturingLogger{}
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: inFlightKeyedOps()})
+		o.logger = logger
+		o.stor.(*stubStorage).applies = &stubApplyStore{}
+
+		assert.False(t, o.progressCommentAuthorityOwnsObserver(snapshot, "progress"))
+		require.Len(t, logger.errors, 1)
+		assert.Contains(t, logger.errors[0].msg, "apply row no longer exists")
+	})
+}
+
+// One observer callback checks the side-effect gate several times — before the
+// comment lookup, the client creation, the edit, and the tracking write. The
+// authority decision is made once per callback against fresh storage rows and
+// then reused, so a tick issues one operation scan and one claim write rather
+// than one per gate check. Resetting the decision (the next callback) decides
+// afresh.
+func TestProgressCommentAuthorityDecidesOncePerCallback(t *testing.T) {
+	snapshot := &storage.Apply{ID: 7, ApplyIdentifier: "apply-1", State: state.Apply.Running}
+	opStore := &stubApplyOperationStore{ops: inFlightKeyedOps()}
+	o := newDispatchTestObserver(opStore)
+	o.logger = &capturingLogger{}
+	o.stor.(*stubStorage).applies = &stubApplyStore{apply: &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-1", State: state.Apply.Running,
+		LeaseOwner: "driver-host/9/dispatch", LeaseToken: "wave-token",
+	}}
+
+	assert.False(t, o.progressCommentAuthorityOwnsObserver(snapshot, "progress"))
+	assert.False(t, o.progressCommentAuthorityOwnsObserver(snapshot, "edit GitHub comment"))
+	assert.Equal(t, 1, opStore.listCalls, "the second gate check in one callback must reuse the decision")
+
+	o.resetProgressCommentAuthorityDecision()
+	assert.False(t, o.progressCommentAuthorityOwnsObserver(snapshot, "progress"))
+	assert.Equal(t, 2, opStore.listCalls, "the next callback must decide afresh")
 }
 
 // A per-driver observer for a multi-operation apply must not publish a separate
@@ -363,4 +597,286 @@ func TestShouldPublishSeparateSummaryAlwaysTrueForAggregateWinner(t *testing.T) 
 	aggregate := NewAggregateTerminalCommentObserver(cfg)
 
 	assert.True(t, aggregate.shouldPublishSeparateSummary(completedApply(), nil, errors.New("db unavailable")))
+}
+
+// leaseCheckApplyStore records CheckLease calls and returns a configured
+// error, standing in for the ownership re-check before GitHub side effects.
+// fresh (or getErr) serves the re-reads of the row that follow a failed check:
+// the own-lease takeover decision and the progress-comment authority gate.
+type leaseCheckApplyStore struct {
+	storage.ApplyStore
+	err    error
+	calls  int
+	fresh  *storage.Apply
+	getErr error
+}
+
+func (s *leaseCheckApplyStore) CheckLease(context.Context, storage.ApplyLease) error {
+	s.calls++
+	return s.err
+}
+
+func (s *leaseCheckApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return s.fresh, s.getErr
+}
+
+// authorityClaimStore grants every progress-comment authority claim and counts
+// them, so a test can tell the authority path decided the side effect.
+type authorityClaimStore struct {
+	storage.ApplyCommentStore
+	claims int
+}
+
+func (s *authorityClaimStore) ClaimProgressCommentAuthority(context.Context, int64, string) (bool, error) {
+	s.claims++
+	return true, nil
+}
+
+type leaseCheckStorage struct {
+	storage.Storage
+	applies  *leaseCheckApplyStore
+	ops      storage.ApplyOperationStore
+	comments storage.ApplyCommentStore
+}
+
+func (s *leaseCheckStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *leaseCheckStorage) ApplyComments() storage.ApplyCommentStore { return s.comments }
+
+func (s *leaseCheckStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
+
+func newLeaseCheckObserver(logger *capturingLogger, store *leaseCheckApplyStore, lease storage.ApplyLease) *CommentObserver {
+	return NewCommentObserver(CommentObserverConfig{
+		Repo:       "org/repo",
+		PR:         42,
+		ApplyID:    7,
+		ApplyLease: lease,
+		Logger:     logger,
+		Storage:    &leaseCheckStorage{applies: store},
+	})
+}
+
+func leaseLostErr() error {
+	return fmt.Errorf("apply lease for apply 7 is no longer current: %w", storage.ErrApplyLeaseLost)
+}
+
+// When a newer owner claims the apply out from under the observer's own lease,
+// the takeover is permanent: the observer warns once, latches supersession,
+// and every later side-effect check skips the storage re-read and stays at
+// debug. During a drawn-out apply this keeps a superseded observer from
+// re-reporting the same expected handover on every progress tick.
+func TestObserverSupersededByNewerOwnerWarnsOnceAndLatches(t *testing.T) {
+	logger := &capturingLogger{}
+	// The row carries the newer owner's lease — a takeover replaces the lease,
+	// it never leaves the row unleased.
+	apply := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
+		State: state.Apply.Running, LeaseOwner: "host-b/2/driver-1", LeaseToken: "token-new",
+	}
+	store := &leaseCheckApplyStore{err: leaseLostErr(), fresh: apply}
+	observer := newLeaseCheckObserver(logger, store, storage.ApplyLease{
+		ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-old",
+	})
+
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"),
+		"a superseded lease must fail the side-effect check")
+	assert.True(t, observer.Superseded())
+	require.Len(t, logger.warns, 1, "the takeover warns exactly once")
+	assert.Empty(t, logger.errors, "an expected handover is not an error")
+	fields := fieldsOf(t, logger.warns[0].args)
+	assert.Equal(t, "apply-abc123", fields["apply_id"])
+	assert.Equal(t, "host-a/1/driver-0", fields["lease_owner"])
+	assert.Equal(t, "host-b/2/driver-1", fields["new_lease_owner"])
+
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "terminal"))
+	assert.Equal(t, 1, store.calls, "latched supersession must not re-read storage")
+	assert.Len(t, logger.warns, 1, "later checks stay quiet")
+	assert.Len(t, logger.debugs, 2, "later checks demote to debug")
+}
+
+// An operation-scoped drive claims the parent apply lease only per dispatch
+// wave and releases it in between. The observer's construction-time lease
+// failing its check while the row records no lease at all is that release,
+// not a takeover: the decision falls to the durable progress-comment
+// authority and the supersession latch stays unset, so the observer keeps
+// publishing for the rest of the rollout.
+func TestObserverReleasedBackLeaseDefersToAuthorityWithoutLatch(t *testing.T) {
+	logger := &capturingLogger{}
+	store := &leaseCheckApplyStore{
+		err: leaseLostErr(),
+		// The authority gate re-reads the row before claiming; a re-claimed
+		// parent lease denies this callback with debug-level noise only.
+		fresh: &storage.Apply{
+			ID: 7, ApplyIdentifier: "apply-abc123", State: state.Apply.Running,
+			LeaseOwner: "driver-host/9/dispatch", LeaseToken: "wave-token",
+		},
+	}
+	observer := NewCommentObserver(CommentObserverConfig{
+		Repo:       "org/repo",
+		PR:         42,
+		ApplyID:    7,
+		ApplyLease: storage.ApplyLease{ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-old"},
+		Logger:     logger,
+		Storage: &leaseCheckStorage{
+			applies: store,
+			ops:     &stubApplyOperationStore{ops: inFlightKeyedOps()},
+		},
+	})
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging", State: state.Apply.Running}
+
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
+	assert.False(t, observer.Superseded(), "a released-back lease is not a takeover and must not latch")
+	assert.Empty(t, logger.warns)
+	assert.Empty(t, logger.errors)
+	require.NotEmpty(t, logger.debugs)
+	assert.Contains(t, logger.debugs[len(logger.debugs)-1].msg, "parent apply lease re-claimed")
+}
+
+// The callback's apply snapshot can be a tick old. When it still shows the
+// observer's own lease but the parent lease was released between the snapshot
+// and the check, the lease check fails even though no driver took the apply
+// over. The observer decides from a fresh read of the row, finds it unleased,
+// and hands the side effect to the progress-comment authority, so the release
+// never silences it for the rest of the apply.
+func TestObserverReleaseAfterSnapshotDefersToAuthorityWithoutLatch(t *testing.T) {
+	logger := &capturingLogger{}
+	ownLease := storage.ApplyLease{ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-wave"}
+	store := &leaseCheckApplyStore{
+		err:   leaseLostErr(),
+		fresh: &storage.Apply{ID: 7, ApplyIdentifier: "apply-abc123", State: state.Apply.Running},
+	}
+	comments := &authorityClaimStore{}
+	observer := NewCommentObserver(CommentObserverConfig{
+		Repo:       "org/repo",
+		PR:         42,
+		ApplyID:    7,
+		ApplyLease: ownLease,
+		Logger:     logger,
+		Storage: &leaseCheckStorage{
+			applies:  store,
+			ops:      &stubApplyOperationStore{ops: inFlightKeyedOps()},
+			comments: comments,
+		},
+	})
+	snapshot := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
+		State: state.Apply.Running, LeaseOwner: ownLease.Owner, LeaseToken: ownLease.Token,
+	}
+
+	assert.True(t, observer.leaseStillOwnsObserver(snapshot, "progress"),
+		"the progress-comment authority decides a released lease")
+	assert.False(t, observer.Superseded(), "a release seen only on the fresh row must not latch")
+	assert.Equal(t, 1, comments.claims, "the authority path claimed the comment")
+	assert.Empty(t, logger.warns)
+	assert.Empty(t, logger.errors)
+}
+
+// A failed check of the observer's own lease is only a takeover when a fresh
+// read proves another driver holds the apply. When that read fails or still
+// shows the observer's own lease, nothing is proven: the side effect is
+// skipped and the latch stays unset, so the next check decides again.
+func TestObserverOwnLeaseLossWithoutProofDoesNotLatch(t *testing.T) {
+	ownLease := storage.ApplyLease{ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-old"}
+	snapshot := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
+		State: state.Apply.Running, LeaseOwner: ownLease.Owner, LeaseToken: ownLease.Token,
+	}
+
+	t.Run("the re-read fails", func(t *testing.T) {
+		logger := &capturingLogger{}
+		store := &leaseCheckApplyStore{err: leaseLostErr(), getErr: errors.New("connection refused")}
+		observer := newLeaseCheckObserver(logger, store, ownLease)
+
+		assert.False(t, observer.leaseStillOwnsObserver(snapshot, "progress"))
+		assert.False(t, observer.Superseded())
+		require.Len(t, logger.errors, 1)
+		assert.Contains(t, logger.errors[0].msg, "could not be re-read")
+	})
+
+	t.Run("the row is gone", func(t *testing.T) {
+		logger := &capturingLogger{}
+		store := &leaseCheckApplyStore{err: leaseLostErr()}
+		observer := newLeaseCheckObserver(logger, store, ownLease)
+
+		assert.False(t, observer.leaseStillOwnsObserver(snapshot, "progress"))
+		assert.False(t, observer.Superseded())
+		require.Len(t, logger.warns, 1)
+		assert.Contains(t, logger.warns[0].msg, "apply row not found")
+	})
+
+	t.Run("the fresh row still carries the observer's lease", func(t *testing.T) {
+		logger := &capturingLogger{}
+		store := &leaseCheckApplyStore{err: leaseLostErr(), fresh: snapshot}
+		observer := newLeaseCheckObserver(logger, store, ownLease)
+
+		assert.False(t, observer.leaseStillOwnsObserver(snapshot, "progress"))
+		assert.False(t, observer.Superseded())
+		require.Len(t, logger.warns, 1)
+		assert.Contains(t, logger.warns[0].msg, "still carries this observer's lease")
+	})
+}
+
+// An observer constructed without its own lease borrows the lease from the
+// apply row it was just handed. Losing that lease only means a concurrent
+// claim landed between the two reads — the next tick reads the new lease from
+// a fresh row — so the observer must not latch supersession.
+func TestObserverFallbackLeaseLossDoesNotLatch(t *testing.T) {
+	logger := &capturingLogger{}
+	store := &leaseCheckApplyStore{err: leaseLostErr()}
+	observer := newLeaseCheckObserver(logger, store, storage.ApplyLease{})
+	apply := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
+		State: state.Apply.Running, LeaseOwner: "host-b/2/driver-1", LeaseToken: "token-race",
+	}
+
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
+	assert.False(t, observer.Superseded(), "a fallback-lease race must not latch supersession")
+	assert.Equal(t, 2, store.calls, "each check re-reads storage so the next tick can recover")
+	assert.Len(t, logger.warns, 2)
+	assert.Empty(t, logger.errors)
+}
+
+// A storage failure during the lease re-check leaves ownership unknown: the
+// side effect is skipped (fail closed) but nothing latches, so the observer
+// recovers as soon as storage does.
+func TestObserverLeaseCheckStorageFailureFailsClosedWithoutLatch(t *testing.T) {
+	logger := &capturingLogger{}
+	store := &leaseCheckApplyStore{err: errors.New("connection refused")}
+	observer := newLeaseCheckObserver(logger, store, storage.ApplyLease{
+		ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-old",
+	})
+	// The row still carries a lease: with the row unleased, a failed check
+	// routes to the progress-comment authority instead of this fail-closed
+	// branch.
+	apply := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
+		State: state.Apply.Running, LeaseOwner: "host-a/1/driver-0", LeaseToken: "token-old",
+	}
+
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
+	assert.False(t, observer.Superseded(), "storage uncertainty must not latch supersession")
+	require.Len(t, logger.errors, 1, "a storage failure is a real error")
+	assert.Empty(t, logger.warns)
+
+	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
+	assert.Equal(t, 2, store.calls, "each check retries the read")
+}
+
+// Once the lease check passes, the observer publishes normally and the
+// supersession latch stays unset.
+func TestObserverLeaseCheckPassesWhileOwned(t *testing.T) {
+	logger := &capturingLogger{}
+	store := &leaseCheckApplyStore{}
+	observer := newLeaseCheckObserver(logger, store, storage.ApplyLease{
+		ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-current",
+	})
+	apply := &storage.Apply{ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging", State: state.Apply.Running}
+
+	assert.True(t, observer.leaseStillOwnsObserver(apply, "progress"))
+	assert.False(t, observer.Superseded())
+	assert.Equal(t, 1, store.calls)
+	assert.Empty(t, logger.warns)
+	assert.Empty(t, logger.errors)
 }

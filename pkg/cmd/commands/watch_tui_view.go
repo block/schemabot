@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -41,19 +42,21 @@ func (m WatchModel) View() string {
 	if state.IsState(m.state, state.NoActiveChange) {
 		return "No active schema change for this database.\n"
 	}
-	if len(m.operations) > 1 {
-		return m.multiDeploymentProgressView()
+	if templates.RendersOperationSections(m.operations, m.sharded) {
+		return m.fitToWindow(m.multiDeploymentProgressSections())
 	}
 
-	return m.progressView()
+	return m.fitToWindow(m.progressSections())
 }
 
-// progressView renders the progress display.
-func (m WatchModel) progressView() string {
+// progressSections renders the progress display as its body (the status line
+// and tables) and its footer (the outcome or the keys the operator can press),
+// so a view too tall for the window can give up body lines and keep the footer.
+func (m WatchModel) progressSections() (string, string) {
 	var b strings.Builder
 
 	// Sort tables by status priority (running first, then pending, then completed)
-	tables := make([]tableProgress, len(m.tables))
+	tables := make([]templates.TableProgress, len(m.tables))
 	copy(tables, m.tables)
 	sortTablesByProgress(tables)
 
@@ -66,21 +69,19 @@ func (m WatchModel) progressView() string {
 	// Status line with spinner for active states
 	// Note: spinner.Dot already includes trailing space
 	switch {
-	case m.volumeChanging:
-		// Volume change in progress
-		b.WriteString(m.spinner.View() + fmt.Sprintf("Changing volume to %d...\n", m.volumePending))
-	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled):
-		// Stop/cancel has been triggered but state hasn't updated yet
-		if m.isPlanetScale() {
-			b.WriteString(m.spinner.View() + "Cancelling...\n")
-		} else {
-			b.WriteString(m.spinner.View() + "Stopping...\n")
-		}
+	case m.stopAwaitingConfirmation():
+		b.WriteString(m.spinner.View() + m.stopPendingLabel() + "\n")
 	case effectivelyStopped:
 		// Don't show status line - stopped message comes after tables
 	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered && !m.deployTriggered:
 		b.WriteString(m.spinner.View() + "Running...")
 		b.WriteString("\n")
+	case state.IsState(m.state, state.Apply.CatchingUp) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Catching up on accumulated changes...\n")
+	case state.IsState(m.state, state.Apply.Checksumming) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Checksumming to verify data...\n")
+	case state.IsState(m.state, state.Apply.PostChecksum) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Data verified, applying final changes...\n")
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		if m.cutoverTriggered {
 			b.WriteString(m.spinner.View() + "Cutover triggered, waiting for completion...\n")
@@ -123,7 +124,16 @@ func (m WatchModel) progressView() string {
 		}
 		b.WriteString(m.spinner.View() + msg + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.Pending) && !m.pastPending:
-		b.WriteString(m.spinner.View() + "Starting...\n")
+		b.WriteString(m.spinner.View() + "Queued, starts automatically" + m.elapsed() + "\n")
+	}
+
+	if m.sharded {
+		if counts := templates.ShardCounts(m.state, m.operations, m.tables, m.released); counts != "" {
+			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
+		}
+		if note := templates.ShardedStoppedAtCutoverNote(m.state, m.operations, m.tables, m.released); note != "" {
+			fmt.Fprintf(&b, "  ⏹️ %s\n", note)
+		}
 	}
 
 	// Keep the PlanetScale deploy request link visible throughout the apply,
@@ -139,134 +149,134 @@ func (m WatchModel) progressView() string {
 	// Show table progress once past branch setup phases.
 	if !state.IsSetupPhase(m.state) {
 		m.renderTables(&b, tables)
+		b.WriteString(templates.FormatThrottleReference(tables))
 	}
 
+	var f strings.Builder
 	// Footer based on state
 	isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
 
 	switch {
 	case state.IsState(m.state, state.Apply.Completed):
-		b.WriteString("\n\n")
-		b.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
-		b.WriteString("\n")
+		f.WriteString("\n\n")
+		f.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
+		f.WriteString("\n")
 	case state.IsState(m.state, state.Apply.Failed):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if m.errorMsg != "" {
 			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-			b.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
+			f.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
 		}
-		b.WriteString(templates.FormatApplyFailed())
-		b.WriteString("\n")
+		f.WriteString(templates.FormatApplyFailed())
+		f.WriteString("\n")
 	case state.IsState(m.state, state.Apply.Cancelled):
-		b.WriteString("\n\n")
-		b.WriteString("🚫 Schema change cancelled.\n")
-		b.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
+		f.WriteString("\n\n")
+		f.WriteString("🚫 Schema change cancelled.\n")
+		f.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
+	case state.IsState(m.state, state.Apply.Reverted):
+		f.WriteString("\n\n")
+		f.WriteString("↩️ Schema change reverted.\n")
+		f.WriteString("The schema change was undone after cutover. Start a new apply to make it again.\n")
 	case state.IsState(m.state, state.Apply.Reverting):
-		b.WriteString("\n\n")
-		b.WriteString(m.spinner.View() + "Reverting — undoing the schema change...\n")
+		f.WriteString("\n\n")
+		f.WriteString(m.spinner.View() + "Reverting — undoing the schema change...\n")
 	case state.IsState(m.state, state.Apply.RevertWindow, state.Apply.SkippingRevert):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if state.IsState(m.state, state.Apply.SkippingRevert) || m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
 			elapsed := ""
 			if !m.skipRevertAt.IsZero() {
 				elapsed = fmt.Sprintf(" (%ds)", int(time.Since(m.skipRevertAt).Seconds()))
 			}
-			b.WriteString(m.spinner.View() + "Finalizing — closing revert window..." + elapsed + "\n")
+			f.WriteString(m.spinner.View() + "Finalizing — closing revert window..." + elapsed + "\n")
 		} else {
-			b.WriteString("Schema change deployed. Revert window is open.\n\n")
-			b.WriteString("Press Enter to skip revert or ESC to detach\n")
+			f.WriteString("Schema change deployed. Revert window is open.\n\n")
+			f.WriteString("Press Enter to skip revert or ESC to detach\n")
 		}
 	case effectivelyStopped:
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if m.errorMsg != "" {
 			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-			b.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
+			f.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
 		}
-		b.WriteString(templates.FormatApplyStopped())
-		b.WriteString("\n")
+		f.WriteString(templates.FormatApplyStopped())
+		f.WriteString("\n")
 		if m.applyID != "" {
-			fmt.Fprintf(&b, "Use 'schemabot start -e %s %s' to resume.\n", m.environment, m.applyID)
+			f.WriteString(templates.FormatNextCommand(templates.ResumeLabel, templates.ControlCommand("start", m.applyID, m.environment)))
 		} else {
-			fmt.Fprintf(&b, "Use 'schemabot status -d %s -e %s' to find the apply ID.\n", m.database, m.environment)
+			fmt.Fprintf(&f, "Use '%s' to find the apply ID.\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 		}
 	case isCuttingOver:
 		// During cutover, show minimal footer - no detach/stop allowed
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		b.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
-		b.WriteString("\n")
+		f.WriteString(dimStyle.Render(cutoverInProgressFooter))
+		f.WriteString("\n")
 	case m.deployTriggered:
-		b.WriteString("\n\n")
-		b.WriteString(m.spinner.View() + "Deploying...\n")
+		f.WriteString("\n\n")
+		f.WriteString(m.spinner.View() + "Deploying...\n")
 	case state.IsState(m.state, state.Apply.WaitingForDeploy):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if m.deployRequestURL != "" {
-			b.WriteString("Deploy request created: " + m.deployRequestURL + "\n")
+			f.WriteString("Deploy request created: " + m.deployRequestURL + "\n")
 		} else {
-			b.WriteString("Deploy request created.\n")
+			f.WriteString("Deploy request created.\n")
 		}
 		if m.metadata != nil && m.metadata["is_instant"] == "true" {
-			b.WriteString("⚡ This change will be applied using instant mode.\n")
+			f.WriteString("⚡ This change will be applied using instant mode.\n")
 		}
-		b.WriteString("\n")
+		f.WriteString("\n")
 		if m.allowControlActions {
-			b.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
+			f.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: schemabot start -e %s %s\n", m.environment, m.applyID)
+				fmt.Fprintf(&f, "To proceed: %s\n", templates.ControlCommand("start", m.applyID, m.environment))
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: schemabot status -d %s -e %s\n", m.database, m.environment)
+				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
-			b.WriteString("Watching for deploy... (ESC to detach)\n")
+			f.WriteString("Watching for deploy... (ESC to detach)\n")
 		}
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
-		b.WriteString("\n\n")
-		b.WriteString("Row copy complete. All data has been copied and new writes\n")
-		b.WriteString("continue to be replicated to keep the shadow table in sync.\n\n")
+		f.WriteString("\n\n")
+		f.WriteString("Row copy complete. All data has been copied and new writes\n")
+		f.WriteString("continue to be replicated to keep the shadow table in sync.\n\n")
 		if m.allowControlActions {
-			b.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
+			f.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: schemabot cutover -e %s %s\n", m.environment, m.applyID)
+				fmt.Fprintf(&f, "To proceed: %s\n", templates.ControlCommand("cutover", m.applyID, m.environment))
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: schemabot status -d %s -e %s\n", m.database, m.environment)
+				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
-			b.WriteString("Watching for cutover... (ESC to detach)\n")
+			f.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
 	case state.IsState(m.state, state.Apply.Recovering):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if pct, ok := recoveringCopyPercent(m.tables); ok {
-			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
+			fmt.Fprintf(&f, "SchemaBot is recovering after restart.\nRow copy is in progress (%s); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
 		} else {
-			b.WriteString("SchemaBot is recovering after restart.\n")
-			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
+			f.WriteString("SchemaBot is recovering after restart.\n")
+			f.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
 		}
-	case state.IsState(m.state, state.Apply.Running):
-		b.WriteString("\n\n")
-		if m.volumeMode {
-			// Volume mode - show volume adjustment UI
-			b.WriteString(m.formatVolumeMode())
-		} else {
-			// Normal mode - simple footer without volume
-			b.WriteString(m.formatFooter())
-		}
-		b.WriteString("\n")
+	case state.IsRunningApplyState(m.state):
+		f.WriteString("\n\n")
+		f.WriteString(m.formatFooter())
+		f.WriteString("\n")
 	case state.IsSetupPhase(m.state):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		b.WriteString(dimStyle.Render("ESC to detach"))
-		b.WriteString("\n")
+		f.WriteString(dimStyle.Render("ESC to detach"))
+		f.WriteString("\n")
 	}
 
 	// Fetch error during active progress (mid-flight). State and tables are
 	// preserved from the last successful poll; the error tells the user
 	// the server is currently unreachable.
 	if m.errorMsg != "" && m.consecutiveErrors > 0 {
-		b.WriteString("\n")
-		b.WriteString(m.fetchErrorLine())
+		f.WriteString("\n")
+		f.WriteString(m.fetchErrorLine())
 	}
 
-	return b.String()
+	return b.String(), f.String()
 }
 
 // fetchErrorLine formats the fetch error with consecutive failure count.
@@ -279,67 +289,31 @@ func (m WatchModel) fetchErrorLine() string {
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
-func recoveringCopyPercent(tables []tableProgress) (int, bool) {
-	percent := 100
+// recoveringCopyPercent returns the least-progressed recovering table's copy
+// percent as display text, so the recovery footer never overstates how far
+// the slowest table has come.
+func recoveringCopyPercent(tables []templates.TableProgress) (string, bool) {
+	fraction := 0.0
+	text := ""
 	found := false
 	for _, table := range tables {
-		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.Percent >= 100 {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.PercentComplete >= 100 {
 			continue
 		}
-		percent = min(percent, ui.ClampPercent(table.Percent))
+		if frac := ui.RowCopyFraction(table.PercentComplete, table.RowsCopied, table.RowsTotal); !found || frac < fraction {
+			fraction = frac
+			text = ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
+		}
 		found = true
 	}
-	return percent, found
+	return text, found
 }
 
-// toTemplateTables converts TUI tableProgress slices to template TableProgress
-// so the shared rendering functions can be used.
-func toTemplateTables(tables []tableProgress) []templates.TableProgress {
-	result := make([]templates.TableProgress, len(tables))
-	for i, t := range tables {
-		// Table-level ETA: the table's own estimate (MySQL/Spirit), or the
-		// slowest shard's for a sharded (Vitess) table.
-		etaSeconds := t.ETASeconds
-		for _, sh := range t.Shards {
-			if sh.ETASeconds > etaSeconds {
-				etaSeconds = sh.ETASeconds
-			}
-		}
-		tp := templates.TableProgress{
-			TableName:       t.Name,
-			Deployment:      t.Deployment,
-			Namespace:       t.Keyspace,
-			DDL:             t.DDL,
-			ChangeType:      t.ChangeType,
-			Status:          state.NormalizeTaskStatus(t.Status),
-			RowsCopied:      t.RowsCopied,
-			RowsTotal:       t.RowsTotal,
-			PercentComplete: t.Percent,
-			ETASeconds:      etaSeconds,
-			ProgressDetail:  t.ProgressDetail,
-			IsInstant:       t.IsInstant,
-		}
-		for _, sh := range t.Shards {
-			tp.Shards = append(tp.Shards, templates.ShardProgress{
-				Shard:      sh.Shard,
-				Status:     state.NormalizeShardStatus(sh.Status),
-				RowsCopied: sh.RowsCopied,
-				RowsTotal:  sh.RowsTotal,
-				ETASeconds: sh.ETASeconds,
-			})
-		}
-		result[i] = tp
-	}
-	return result
-}
-
-// renderTables converts TUI tables to template types and uses the shared
-// FormatNamespacedTables / FormatTableProgress rendering from the CLI templates.
-func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
-	tplTables := toTemplateTables(tables)
-
+// renderTables renders tables with the shared FormatNamespacedTables /
+// FormatTableProgress rendering from the CLI templates.
+func (m WatchModel) renderTables(b *strings.Builder, tables []templates.TableProgress) {
 	hasNamespaces := false
-	for _, t := range tplTables {
+	for _, t := range tables {
 		if t.Namespace != "" {
 			hasNamespaces = true
 			break
@@ -350,45 +324,47 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
 	activityLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	activityLabel := activityLabelStyle.Render("Finalizing copy " + activityLabelFrames[m.activityLabelFrame%len(activityLabelFrames)])
 	if hasNamespaces {
-		b.WriteString(templates.FormatNamespacedTablesWithActivity(tplTables, activityBar, activityLabel))
+		b.WriteString(templates.FormatNamespacedTablesWithActivity(tables, activityBar, activityLabel))
 	} else {
 		b.WriteString("\n")
-		for _, t := range tplTables {
+		for _, t := range tables {
 			b.WriteString(templates.FormatTableProgressWithActivity(t, activityBar, activityLabel))
 		}
 	}
 }
 
-// formatFooter returns the standard footer (no volume shown by default).
+// cutoverInProgressFooter replaces the keys a watcher offers while a cutover is
+// underway, since it ignores them until the cutover lands.
+const cutoverInProgressFooter = "Cutover in progress - please wait..."
+
+// formatFooter returns the standard footer.
 func (m WatchModel) formatFooter() string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
 	stopHint := templates.StopKeyHint
 	if m.isPlanetScale() {
 		stopHint = "c cancel"
 	}
-	return dimStyle.Render("ESC detach • " + stopHint + " • v volume")
+	return dimStyle.Render("ESC detach • " + stopHint)
 }
 
 // isPlanetScale returns true if the current apply is using the PlanetScale engine.
-func (m WatchModel) isPlanetScale() bool {
-	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
+// stopAwaitingConfirmation reports whether the operator pressed s and the
+// server has not yet reported the apply stopped or cancelled.
+func (m WatchModel) stopAwaitingConfirmation() bool {
+	return m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled)
 }
 
-// formatVolumeMode returns the footer when in volume adjustment mode.
-func (m WatchModel) formatVolumeMode() string {
-	var b strings.Builder
-	dimStyle := lipgloss.NewStyle().Faint(true)
+// stopPendingLabel names what the s key requested: PlanetScale cancels the
+// deploy request, every other engine stops the copy at its checkpoint.
+func (m WatchModel) stopPendingLabel() string {
+	if m.isPlanetScale() {
+		return "Cancelling..."
+	}
+	return "Stopping..."
+}
 
-	// Simple volume display: just the number and a simple bar
-	vol := max(min(m.currentVolume, 11), 1)
-
-	// Simple bar using block characters
-	filled := strings.Repeat("█", vol)
-	empty := strings.Repeat("░", 11-vol)
-
-	fmt.Fprintf(&b, "Volume: %s%s %d/11\n", filled, empty, vol)
-	b.WriteString(dimStyle.Render("↑↓ adjust • 1-9 direct • ESC done"))
-	return b.String()
+func (m WatchModel) isPlanetScale() bool {
+	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
 }
 
 // elapsed returns a formatted elapsed time string for the status line.
@@ -416,13 +392,13 @@ func (m WatchModel) detachedView() string {
 	}
 	b.WriteString("\n")
 	if m.applyID != "" {
-		fmt.Fprintf(&b, "To reattach: schemabot progress %s\n", m.applyID)
+		fmt.Fprintf(&b, "To reattach: %s\n", templates.ProgressCommand(m.applyID, m.environment))
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
-			fmt.Fprintf(&b, "To deploy:   schemabot start -e %s %s\n", m.environment, m.applyID)
+			fmt.Fprintf(&b, "To deploy:   %s\n", templates.ControlCommand("start", m.applyID, m.environment))
 		}
-		fmt.Fprintf(&b, "To stop:     schemabot stop -e %s %s\n", m.environment, m.applyID)
+		fmt.Fprintf(&b, "To stop:     %s\n", templates.ControlCommand("stop", m.applyID, m.environment))
 	} else {
-		fmt.Fprintf(&b, "Find apply:  schemabot status -d %s -e %s\n", m.database, m.environment)
+		fmt.Fprintf(&b, "Find apply:  %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 	}
 	return b.String()
 }

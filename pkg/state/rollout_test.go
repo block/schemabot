@@ -1,0 +1,489 @@
+package state
+
+import (
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// rolloutShard builds payments-a's work on one shard of orders for target.
+func rolloutShard(target, shard, opState string) RolloutOperation {
+	return RolloutOperation{
+		Deployment:   "payments-a",
+		OperationKey: target + OperationKeyDelimiter + "orders" + OperationKeyDelimiter + shard + OperationKeyDelimiter + "orders",
+		Work:         true,
+		State:        opState,
+	}
+}
+
+// rolloutFinalizer builds payments-a's orders finalizer for target.
+func rolloutFinalizer(target, opState string) RolloutOperation {
+	return RolloutOperation{
+		Deployment:   "payments-a",
+		OperationKey: target + OperationKeyDelimiter + "orders" + OperationKeyDelimiter + "group_finalizer",
+		Finalizer:    true,
+		State:        opState,
+	}
+}
+
+// TestRolloutChildren_Orphaned verifies which finalizers every rollout
+// projection treats as dead. payments-001's orders finalizer is orphaned once
+// one of its own shards has failed, whether it is still pending or a stop
+// moved it to stopped. It is not orphaned while its shards are only parked,
+// once it has started, or when the failed shard belongs to payments-002, and
+// a work row is never an orphan.
+func TestRolloutChildren_Orphaned(t *testing.T) {
+	cases := []struct {
+		name      string
+		candidate RolloutOperation
+		siblings  []RolloutOperation
+		want      bool
+	}{
+		{
+			name:      "pending finalizer behind its own failed shard",
+			candidate: rolloutFinalizer("payments-001", ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutShard("payments-001", "-80", ApplyOperation.Failed), rolloutShard("payments-001", "80-", ApplyOperation.Completed)},
+			want:      true,
+		},
+		{
+			name:      "stopped finalizer behind its own failed shard",
+			candidate: rolloutFinalizer("payments-001", ApplyOperation.Stopped),
+			siblings:  []RolloutOperation{rolloutShard("payments-001", "-80", ApplyOperation.Failed)},
+			want:      true,
+		},
+		{
+			name:      "pending finalizer behind parked shards",
+			candidate: rolloutFinalizer("payments-001", ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutShard("payments-001", "-80", ApplyOperation.WaitingForCutover)},
+		},
+		{
+			name:      "running finalizer",
+			candidate: rolloutFinalizer("payments-001", ApplyOperation.Running),
+			siblings:  []RolloutOperation{rolloutShard("payments-001", "-80", ApplyOperation.Failed)},
+		},
+		{
+			name:      "failed shard of another target",
+			candidate: rolloutFinalizer("payments-001", ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutShard("payments-002", "-80", ApplyOperation.Failed)},
+		},
+		{
+			name:      "failed shard of another deployment",
+			candidate: rolloutFinalizer("payments-001", ApplyOperation.Pending),
+			siblings: []RolloutOperation{func() RolloutOperation {
+				op := rolloutShard("payments-001", "-80", ApplyOperation.Failed)
+				op.Deployment = "payments-b"
+				return op
+			}()},
+		},
+		{
+			name:      "work row",
+			candidate: rolloutShard("payments-001", "80-", ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutShard("payments-001", "-80", ApplyOperation.Failed)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := append([]RolloutOperation{tc.candidate}, tc.siblings...)
+			assert.Equal(t, tc.want, RolloutChildren(ops)[0].Orphaned)
+		})
+	}
+}
+
+// TestDeriveRolloutApplyState_NeverStartedStopped verifies that a row a stop
+// caught before any driver claimed it counts as pending. region-a's work
+// failed; region-b's row is stopped. When region-b never started, halt
+// settles the rollout failed and an unreleased pause settles it paused, as
+// they would with region-b still pending; continue keeps it running_degraded,
+// since start resumes region-b past the failure. When region-b had started
+// before the stop, halt keeps the rollout running_degraded until it settles.
+func TestDeriveRolloutApplyState_NeverStartedStopped(t *testing.T) {
+	regionA := func(policy func(*RolloutOperation)) RolloutOperation {
+		op := RolloutOperation{Deployment: "region-a", Work: true, State: ApplyOperation.Failed}
+		policy(&op)
+		return op
+	}
+	regionB := func(policy func(*RolloutOperation), finalizer, neverStarted bool) RolloutOperation {
+		op := RolloutOperation{Deployment: "region-b", Work: !finalizer, Finalizer: finalizer, State: ApplyOperation.Stopped, NeverStarted: neverStarted}
+		policy(&op)
+		return op
+	}
+	halt := func(*RolloutOperation) {}
+	cont := func(op *RolloutOperation) { op.ContinueOnFailure = true }
+	pause := func(op *RolloutOperation) { op.PauseOnFailure = true }
+
+	cases := []struct {
+		name string
+		ops  []RolloutOperation
+		want string
+	}{
+		{name: "halt, work never started", ops: []RolloutOperation{regionA(halt), regionB(halt, false, true)}, want: Apply.Failed},
+		{name: "halt, finalizer never started", ops: []RolloutOperation{regionA(halt), regionB(halt, true, true)}, want: Apply.Failed},
+		{name: "halt, work had started", ops: []RolloutOperation{regionA(halt), regionB(halt, false, false)}, want: Apply.RunningDegraded},
+		{name: "pause, work never started", ops: []RolloutOperation{regionA(pause), regionB(pause, false, true)}, want: Apply.Paused},
+		{name: "continue, work never started", ops: []RolloutOperation{regionA(cont), regionB(cont, false, true)}, want: Apply.RunningDegraded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(RolloutChildren(tc.ops)))
+		})
+	}
+
+	// NeverStarted describes a row that has not moved past pending or stopped;
+	// on a row a driver is running it is ignored, so a stale flag cannot
+	// settle a rollout over live work.
+	running := regionB(halt, false, true)
+	running.State = ApplyOperation.Running
+	assert.Equal(t, Apply.RunningDegraded, DeriveRolloutApplyState(RolloutChildren([]RolloutOperation{regionA(halt), running})))
+}
+
+// TestRolloutChildren_FinalizerScopedToItsNamespace verifies that a
+// namespace's finalizer is orphaned only by its own namespace's failed work,
+// in both key shapes. Target orders-001 of a targets list runs ns_0 and ns_1:
+// when ns_0's shard fails, ns_0's finalizer is dead and ns_1's is still owed,
+// and the same holds the other way round. A single-target apply keys the same
+// rows without the target and reaches the same answer.
+func TestRolloutChildren_FinalizerScopedToItsNamespace(t *testing.T) {
+	for _, shape := range []struct {
+		name   string
+		prefix string
+	}{
+		{name: "targets list", prefix: "orders-001" + OperationKeyDelimiter},
+		{name: "single target", prefix: ""},
+	} {
+		work := func(namespace, opState string) RolloutOperation {
+			return RolloutOperation{
+				Deployment:   "orders",
+				OperationKey: shape.prefix + namespace + OperationKeyDelimiter + "-80" + OperationKeyDelimiter + "orders",
+				Work:         true,
+				State:        opState,
+			}
+		}
+		finalizer := func(namespace string) RolloutOperation {
+			return RolloutOperation{
+				Deployment:   "orders",
+				OperationKey: shape.prefix + namespace + OperationKeyDelimiter + GroupFinalizerKeySegment,
+				Finalizer:    true,
+				State:        ApplyOperation.Pending,
+			}
+		}
+		for _, failing := range []string{"ns_0", "ns_1"} {
+			succeeding := "ns_1"
+			if failing == "ns_1" {
+				succeeding = "ns_0"
+			}
+			t.Run(shape.name+"/"+failing+" fails", func(t *testing.T) {
+				ops := []RolloutOperation{
+					work(failing, ApplyOperation.Failed),
+					work(succeeding, ApplyOperation.Completed),
+					finalizer(failing),
+					finalizer(succeeding),
+				}
+				children := RolloutChildren(ops)
+				assert.True(t, children[2].Orphaned, "%s's finalizer is dead behind its own failed shard", failing)
+				assert.False(t, children[3].Orphaned, "%s's finalizer is still owed: its own work completed", succeeding)
+			})
+		}
+	}
+}
+
+// TestFinalizerFinalizesWork verifies which work a finalizer finalizes in
+// each key shape: the work under its own namespace, and under its own target
+// when a targets list qualifies the keys.
+func TestFinalizerFinalizesWork(t *testing.T) {
+	cases := []struct {
+		name      string
+		finalizer string
+		work      string
+		want      bool
+	}{
+		{name: "single target, own namespace", finalizer: "ns_0/group_finalizer", work: "ns_0/-80/orders", want: true},
+		{name: "single target, other namespace", finalizer: "ns_0/group_finalizer", work: "ns_1/-80/orders"},
+		{name: "single target, namespace sharing a prefix", finalizer: "ns_0/group_finalizer", work: "ns_01/-80/orders"},
+		{name: "targets list, own target and namespace", finalizer: "orders-001/ns_0/group_finalizer", work: "orders-001/ns_0/-80/orders", want: true},
+		{name: "targets list, other namespace on the same target", finalizer: "orders-001/ns_0/group_finalizer", work: "orders-001/ns_1/-80/orders"},
+		{name: "targets list, same namespace on another target", finalizer: "orders-001/ns_0/group_finalizer", work: "orders-002/ns_0/-80/orders"},
+		{name: "deployment-scoped finalizer", finalizer: "group_finalizer", work: "group_finalizer/-80/orders"},
+		{name: "work keyed by the scope itself", finalizer: "ns_0/group_finalizer", work: "ns_0", want: true},
+		{name: "target-scoped finalizer, other target", finalizer: "orders-001/group_finalizer", work: "orders-002"},
+		{name: "not a finalizer key", finalizer: "ns_0/-80/orders", work: "ns_0/-80/orders"},
+		{name: "namespace differing only by case", finalizer: "orders/group_finalizer", work: "Orders/-80/orders"},
+		{name: "namespace differing only by accent", finalizer: "cafe/group_finalizer", work: "café/-80/orders"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, FinalizerFinalizesWork(tc.finalizer, tc.work))
+		})
+	}
+}
+
+// rolloutStep builds payments-a's table step for target.
+func rolloutStep(target string, step int, opState string) RolloutOperation {
+	return RolloutOperation{
+		Deployment:   "payments-a",
+		OperationKey: target + OperationKeyDelimiter + "step-" + strconv.Itoa(step),
+		Work:         true,
+		RolloutStep:  step,
+		State:        opState,
+		NeverStarted: opState == ApplyOperation.Pending || opState == ApplyOperation.Stopped,
+	}
+}
+
+// TestRolloutChildren_StepOrphanedByAnEarlierFailedStep verifies which table
+// steps every rollout projection treats as dead. payments-002's second step is
+// orphaned once any target's first step has failed, been cancelled or been
+// reverted, whether it is pending or a stop caught it before it started: the
+// claim starts it only once every earlier step completed, so each of those
+// holds it for good. It is not orphaned while an earlier step
+// is only retrying, when the failed row is in its own step, or when the failure
+// is in another deployment, and a row that runs its member's whole change is
+// never a step orphan.
+func TestRolloutChildren_StepOrphanedByAnEarlierFailedStep(t *testing.T) {
+	cases := []struct {
+		name      string
+		candidate RolloutOperation
+		siblings  []RolloutOperation
+		want      bool
+	}{
+		{
+			name:      "pending step behind another target's failed step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Failed), rolloutStep("payments-002", 1, ApplyOperation.Completed)},
+			want:      true,
+		},
+		{
+			name:      "stopped step behind its own target's failed step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Stopped),
+			siblings:  []RolloutOperation{rolloutStep("payments-002", 1, ApplyOperation.Failed)},
+			want:      true,
+		},
+		{
+			name:      "pending step behind a cancelled step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Cancelled), rolloutStep("payments-002", 1, ApplyOperation.Completed)},
+			want:      true,
+		},
+		{
+			name:      "pending step behind a reverted step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Reverted), rolloutStep("payments-002", 1, ApplyOperation.Completed)},
+			want:      true,
+		},
+		{
+			name:      "pending step behind a retrying step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.FailedRetryable)},
+		},
+		{
+			name:      "pending step beside a failure in its own step",
+			candidate: rolloutStep("payments-002", 1, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Failed)},
+		},
+		{
+			name:      "failed step of another deployment",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings: []RolloutOperation{func() RolloutOperation {
+				op := rolloutStep("payments-001", 1, ApplyOperation.Failed)
+				op.Deployment = "payments-b"
+				return op
+			}()},
+		},
+		{
+			name:      "whole-change row",
+			candidate: RolloutOperation{Deployment: "payments-a", OperationKey: "payments-002", Work: true, State: ApplyOperation.Pending},
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Failed)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := append([]RolloutOperation{tc.candidate}, tc.siblings...)
+			assert.Equal(t, tc.want, RolloutChildren(ops)[0].Orphaned)
+		})
+	}
+}
+
+// TestDeriveRolloutApplyState_FailedStepEndsTheRollout verifies that a rollout
+// run table by table settles once a failed step leaves nothing that can run.
+// payments-001 failed `stations`; payments-002 finished it, and both targets'
+// `docks` step is pending behind the failure. Under continue the step boundary
+// still holds, so nothing will start `docks` and the rollout settles failed
+// rather than waiting on rows that never move. While payments-002 is still
+// running `stations`, the rollout stays open for it. A `stations` row that was
+// cancelled or reverted holds `docks` the same way, so the rollout settles in
+// that state.
+func TestDeriveRolloutApplyState_FailedStepEndsTheRollout(t *testing.T) {
+	ops := func(firstFirstStep, secondFirstStep string) []RolloutOperation {
+		rows := []RolloutOperation{
+			rolloutStep("payments-001", 1, firstFirstStep),
+			rolloutStep("payments-002", 1, secondFirstStep),
+			rolloutStep("payments-001", 2, ApplyOperation.Pending),
+			rolloutStep("payments-002", 2, ApplyOperation.Pending),
+		}
+		for i := range rows {
+			rows[i].ContinueOnFailure = true
+		}
+		return rows
+	}
+
+	assert.Equal(t, Apply.Failed, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Failed, ApplyOperation.Completed))))
+	assert.Equal(t, Apply.RunningDegraded, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Failed, ApplyOperation.Running))))
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Completed))))
+	assert.Equal(t, Apply.Reverted, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Reverted, ApplyOperation.Completed))))
+}
+
+// TestDeriveRolloutApplyState_CancelWaitsForWorkUnderWay verifies that a cancel
+// settles a rollout only once it has reached every target already copying.
+// payments-002 had not started `stations` when the cancel arrived, so it
+// settled at once; payments-001 is still copying it. The rollout keeps
+// reporting the copy until payments-001 is cancelled too, and a target that
+// never started holds nothing.
+func TestDeriveRolloutApplyState_CancelWaitsForWorkUnderWay(t *testing.T) {
+	ops := func(first, second, third string) []RolloutOperation {
+		return []RolloutOperation{
+			rolloutStep("payments-001", 1, first),
+			rolloutStep("payments-002", 1, second),
+			rolloutStep("payments-003", 1, third),
+			rolloutStep("payments-001", 2, ApplyOperation.Pending),
+			rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			rolloutStep("payments-003", 2, ApplyOperation.Pending),
+		}
+	}
+
+	assert.Equal(t, Apply.Running, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running, ApplyOperation.Cancelled, ApplyOperation.Pending))))
+	assert.Equal(t, Apply.WaitingForCutover, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.WaitingForCutover, ApplyOperation.Cancelled, ApplyOperation.Pending))))
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Cancelled, ApplyOperation.Pending))))
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Completed, ApplyOperation.Cancelled))))
+}
+
+// TestDeriveRolloutApplyState_CancelAfterAPartialStop verifies a cancel that
+// follows a stop which had not landed everywhere. The stop reached payments-002
+// while payments-001 was still copying `stations`, and the cancel then settled
+// payments-003. The rollout keeps reporting payments-001's copy rather than
+// stopped, and once that copy stops too it reads stopped, so the pending cancel
+// still reopens it to reach both stopped targets.
+func TestDeriveRolloutApplyState_CancelAfterAPartialStop(t *testing.T) {
+	// Every target had started copying before the stop, so a stopped row here
+	// holds partly copied work rather than a stop caught before any claim.
+	started := func(target, opState string) RolloutOperation {
+		op := rolloutStep(target, 1, opState)
+		op.NeverStarted = false
+		return op
+	}
+	ops := func(first, second, third string) []RolloutOperation {
+		return []RolloutOperation{
+			started("payments-001", first),
+			started("payments-002", second),
+			started("payments-003", third),
+		}
+	}
+
+	assert.Equal(t, Apply.Running, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running, ApplyOperation.Stopped, ApplyOperation.Cancelled))),
+		"a stopped target must not hide the copy still under way")
+	assert.Equal(t, Apply.WaitingForCutover, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.WaitingForCutover, ApplyOperation.Stopped, ApplyOperation.Cancelled))))
+	assert.Equal(t, Apply.Stopped, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Stopped, ApplyOperation.Stopped, ApplyOperation.Cancelled))),
+		"stopped targets the cancel has not reached keep the rollout open")
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Cancelled, ApplyOperation.Cancelled))))
+}
+
+// TestDeriveRolloutApplyState_StopWaitsForWorkUnderWay verifies that a rollout
+// reads stopped only once no target is still working. The stop caught
+// payments-002 and payments-003 before they started, so they stopped at once,
+// while payments-001 is still copying `stations` until its own engine stops.
+// The same shape runs the other way on start: payments-001 resumes first and
+// the stopped targets wait their turn, and the rollout reports the resumed
+// copy rather than stopped.
+func TestDeriveRolloutApplyState_StopWaitsForWorkUnderWay(t *testing.T) {
+	ops := func(first, second, third string) []RolloutOperation {
+		return []RolloutOperation{
+			rolloutStep("payments-001", 1, first),
+			rolloutStep("payments-002", 1, second),
+			rolloutStep("payments-003", 1, third),
+			rolloutStep("payments-001", 2, ApplyOperation.Stopped),
+			rolloutStep("payments-002", 2, ApplyOperation.Stopped),
+			rolloutStep("payments-003", 2, ApplyOperation.Stopped),
+		}
+	}
+
+	assert.Equal(t, Apply.Running, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running, ApplyOperation.Stopped, ApplyOperation.Stopped))),
+		"a stop that has not landed on the copying target must not read stopped")
+	assert.Equal(t, Apply.WaitingForCutover, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.WaitingForCutover, ApplyOperation.Stopped, ApplyOperation.Stopped))))
+	assert.Equal(t, Apply.Resuming, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Resuming, ApplyOperation.Stopped, ApplyOperation.Stopped))),
+		"a start reads resuming while its first target resumes")
+	assert.Equal(t, Apply.Stopped, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Stopped, ApplyOperation.Stopped, ApplyOperation.Stopped))))
+	assert.Equal(t, Apply.Stopped, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Completed, ApplyOperation.Completed, ApplyOperation.Stopped))),
+		"completed targets hold nothing, so only the stopped work remains")
+}
+
+// TestDeriveRolloutApplyState_StartedRolloutStaysRunning verifies that a
+// rollout across payments-001..003 reads pending only until any of its work
+// has started. Once payments-001 has completed, or parked at the cutover gate,
+// the parent reads running while the rest wait to be claimed: there is no
+// moment between one target finishing and the next being claimed in which a
+// half-finished rollout reads as not started.
+func TestDeriveRolloutApplyState_StartedRolloutStaysRunning(t *testing.T) {
+	cases := []struct {
+		name string
+		ops  []RolloutOperation
+		want string
+	}{
+		{
+			name: "nothing started",
+			ops:  []RolloutOperation{rolloutShard("payments-001", "-", ApplyOperation.Pending), rolloutShard("payments-002", "-", ApplyOperation.Pending)},
+			want: Apply.Pending,
+		},
+		{
+			name: "one target completed, the rest queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.Completed),
+				rolloutShard("payments-002", "-", ApplyOperation.Pending),
+				rolloutShard("payments-003", "-", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			name: "work completed, finalizer queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-80", ApplyOperation.Completed),
+				rolloutShard("payments-001", "80-", ApplyOperation.Completed),
+				rolloutFinalizer("payments-001", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			name: "one target parked at the cutover gate, the rest queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForCutover),
+				rolloutShard("payments-002", "-", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			// A deferred deploy reads waiting_for_deploy only once every target
+			// is ready, so /start stays refused while the rest are still queued.
+			name: "one target waiting for deploy, the rest queued",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForDeploy),
+				rolloutShard("payments-002", "-", ApplyOperation.Pending),
+			},
+			want: Apply.Running,
+		},
+		{
+			name: "every target waiting for deploy",
+			ops: []RolloutOperation{
+				rolloutShard("payments-001", "-", ApplyOperation.WaitingForDeploy),
+				rolloutShard("payments-002", "-", ApplyOperation.WaitingForDeploy),
+			},
+			want: Apply.WaitingForDeploy,
+		},
+		{
+			name: "every target completed",
+			ops:  []RolloutOperation{rolloutShard("payments-001", "-", ApplyOperation.Completed), rolloutShard("payments-002", "-", ApplyOperation.Completed)},
+			want: Apply.Completed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(RolloutChildren(tc.ops)))
+		})
+	}
+}

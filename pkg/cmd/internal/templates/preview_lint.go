@@ -14,8 +14,10 @@ func previewLintViolationsOutput() {
 	warnings := []apitypes.LintViolationResponse{
 		{Message: "has_float: New column uses floating-point data type", Table: "orders", Linter: "has_float"},
 		{Message: "no_default: Column added without DEFAULT value", Table: "users", Linter: "no_default"},
+		{Message: `Primary key column "id" has type "varchar"`, Table: "customers", Linter: "primary_key"},
 	}
 	WriteLintViolations(warnings)
+	WriteRelatedGuidance([]string{"has_float", "no_default", "primary_key"}, true)
 }
 
 func previewUnsafeBlockedOutput() {
@@ -27,7 +29,7 @@ func previewUnsafeBlockedOutput() {
 		{Table: "orders", Reason: "DROP TABLE", ChangeType: "DROP TABLE"},
 		{Table: "products", Reason: "MODIFY COLUMN price_cents: INT → SMALLINT (potential data loss); DROP INDEX idx_category", ChangeType: "MODIFY COLUMN"},
 	}
-	WriteUnsafeChangesBlocked(changes, "testapp", "staging", "./schema/testapp")
+	WriteUnsafeChangesBlocked(changes, "apply -s ./schema/testapp -e staging --allow-unsafe")
 }
 
 func previewUnsafeAllowedOutput() {
@@ -38,7 +40,7 @@ func previewUnsafeAllowedOutput() {
 		{Table: "users", Reason: "DROP COLUMN email", ChangeType: "DROP COLUMN"},
 		{Table: "orders", Reason: "DROP TABLE", ChangeType: "DROP TABLE"},
 	}
-	WriteUnsafeWarningAllowed(changes)
+	WriteUnsafeWarningAllowed(changes, UnsafeConsentAllowFlag)
 }
 
 func previewLintAllOutput() {
@@ -55,7 +57,7 @@ func previewLintAllOutput() {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Println("---", s.name, strings.Repeat("-", 50-len(s.name)))
+		fmt.Println("---", s.name, strings.Repeat("-", max(50-len(s.name), 3)))
 		fmt.Println()
 		s.fn()
 	}

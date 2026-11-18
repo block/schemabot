@@ -1,0 +1,494 @@
+package templates
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/block/schemabot/pkg/glyph"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func unsafeConsentPlan(env string) *PlanCommentData {
+	return &PlanCommentData{
+		Database: "payments", Environment: env, IsMySQL: true, DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "payments",
+			Statements: []string{
+				"ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`",
+				"DROP TABLE `refund_backfill`",
+			},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data"},
+			{Table: "refund_backfill", Reason: "DROP TABLE removes all data"},
+		},
+	}
+}
+
+// fencedCommands returns the contents of every fenced block in a comment, which
+// is what a reader copies and pastes.
+func fencedCommands(t *testing.T, comment string) []string {
+	t.Helper()
+	parts := strings.Split(comment, "```")
+	require.Equal(t, 1, len(parts)%2, "comment has an unbalanced fence")
+	var blocks []string
+	for i := 1; i < len(parts); i += 2 {
+		blocks = append(blocks, strings.TrimSpace(parts[i]))
+	}
+	return blocks
+}
+
+// A plan with unsafe changes states, in the sentence leading into the apply
+// command, that the apply needs --allow-unsafe and which tables it confirms, so
+// the reader meets the requirement before copying the command rather than in a
+// rejection comment. The flag stays out of the pasteable command: consenting to
+// destroy data takes typing it.
+func TestRenderPlanComment_UnsafeConsentLeadsIntoPlainCommand(t *testing.T) {
+	out := RenderPlanComment(*unsafeConsentPlan("staging"))
+
+	assert.Contains(t, fencedCommands(t, out), "schemabot apply -e staging")
+	for _, block := range fencedCommands(t, out) {
+		assert.NotContains(t, block, "--allow-unsafe", "the pasteable command never carries the consent flag")
+	}
+	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging\n   ```")
+	assert.NotContains(t, out, glyph.Tip+" Before allowing", "the drop steps lead into the command rather than repeating as a tip")
+	assert.NotContains(t, out, glyph.Attention+" This plan", "the footer adds no second warning glyph")
+}
+
+// The consent counts each finding but names each table once, in plan order.
+func TestRenderPlanComment_UnsafeConsentNamesEachTableOnce(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = []UnsafeChangeData{
+		{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data"},
+		{Table: "refunds", Reason: "DROP COLUMN discards the column's data"},
+		{Table: "transfer_events", Reason: "DROP INDEX removes the index"},
+		{Table: "ledger", Reason: "DROP TABLE removes all data"},
+	}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "to confirm 4 unsafe changes on `transfer_events`, `refunds` and `ledger`:")
+
+	data.UnsafeChanges = data.UnsafeChanges[:1]
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, "to confirm 1 unsafe change on `transfer_events`:")
+}
+
+// A sharded change is named by its table alone, and a VSchema change by its
+// namespace. Which shards carry the change is the unsafe findings' to say, so
+// the consent stays one short clause.
+func TestRenderPlanComment_UnsafeConsentNamesTablesAndVSchema(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = []UnsafeChangeData{
+		{Table: "mutes", Reason: "DROP COLUMN removes data and is irreversible", Shards: []string{"40-80"}, TotalShards: 4},
+		{Table: "commerce_sharded/vschema.json", VSchemaNamespace: "commerce_sharded", Reason: "lookup vindex `customers_email_lookup` is removed"},
+		{Table: "commerce_sharded/vschema.json", VSchemaNamespace: "commerce_sharded", Reason: "table `customers` no longer uses vindex `customers_email_lookup`"},
+	}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "to confirm 3 unsafe changes on `mutes` and `commerce_sharded` VSchema:")
+}
+
+// When the plan undoes a change another open pull request applied, the
+// attribution rides on that table's unsafe finding, so each change is
+// explained once and the reader meets it where they review the change. The
+// apply instruction stays one short clause and prescribes nothing about the
+// other pull request, which may land or may have been abandoned.
+func TestRenderPlanComment_AttributionRidesOnTheUnsafeFinding(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.Repository = "acme/payments"
+	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
+	out := RenderPlanComment(*data)
+
+	assert.Contains(t, out, "1. `transfer_events`: DROP COLUMN discards the column's data (changed by open PR [#4790](https://github.com/acme/payments/pull/4790))\n2. `refund_backfill`: DROP TABLE removes all data\n")
+	assert.Contains(t, out, "a change another PR applied before merging shows up here as one to undo")
+	assert.NotContains(t, out, "Check before applying", "the attribution is not repeated in a section of its own")
+	_, footer, found := strings.Cut(out, "▶️ **To apply**")
+	require.True(t, found, "the comment offers an apply")
+	assert.Equal(t, ":\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging\n   ```\n", footer)
+}
+
+// An owner in another repository is named with its repository, and a table
+// whose ownership could not be established says so on its finding.
+func TestRenderPlanComment_AttributionNotesForOtherRepoAndUnknownOwner(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.Repository = "acme/payments"
+	data.AttributedChanges = []AttributedChangeData{
+		{Table: "transfer_events", Repository: "acme/ledger", PullRequest: 12},
+		{Table: "refund_backfill", Unresolved: true},
+	}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "1. `transfer_events`: DROP COLUMN discards the column's data (changed by open PR [acme/ledger#12](https://github.com/acme/ledger/pull/12))\n")
+	assert.Contains(t, out, "2. `refund_backfill`: DROP TABLE removes all data (ownership could not be established)\n")
+	assert.NotContains(t, out, "Check before applying")
+}
+
+// An attributed table the unsafe warning does not list keeps the attribution
+// section, so folding never drops a disclosure.
+func TestRenderPlanComment_AttributionKeepsItsSectionWhenNotAnUnsafeFinding(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.AttributedChanges = []AttributedChangeData{{Table: "ledger_holds", Repository: "acme/payments", PullRequest: 4790}}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
+	assert.NotContains(t, out, "(changed by open PR")
+}
+
+// A paused comment's apply-confirm carries --allow-unsafe forward, so the
+// comment lists the unsafe changes it consents to: the plan can have changed
+// since the operator first opted in, and confirming must not run an unsafe
+// change no comment showed. An attribution rides on its finding there as on
+// the plan comment. The comment of an apply already running leaves the list,
+// the drop guidance, and the attribution out, since its reader has no decision
+// left to make, and shows the DDL the apply runs.
+func TestRenderPlanComment_PausedCommentListsTheUnsafeChangesItConsentsTo(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
+	data.IsLocked = true
+	data.AllowUnsafe = true
+	data.PendingManualConfirmation = true
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "⚠️ **Issues**: 2 unsafe changes detected\n1. `transfer_events`: DROP COLUMN discards the column's data (changed by open PR [acme/payments#4790](https://github.com/acme/payments/pull/4790))\n2. `refund_backfill`: DROP TABLE removes all data\n")
+	assert.NotContains(t, out, "Check before applying", "the attribution folds into its finding")
+	assert.Contains(t, out, glyph.Tip+" Before allowing a destructive drop")
+	assert.Contains(t, fencedCommands(t, out), "schemabot apply-confirm -e staging --allow-unsafe")
+
+	data.PendingManualConfirmation = false
+	out = RenderPlanComment(*data)
+	assert.NotContains(t, out, "**Issues**", "the running comment leaves the consented unsafe changes out")
+	assert.NotContains(t, out, glyph.Tip+" Before allowing a destructive drop", "the guidance is out of reach once the apply runs")
+	assert.NotContains(t, out, "changed by open PR", "the attribution coaches a decision the running apply no longer offers")
+	assert.NotContains(t, out, "Check before applying")
+	assert.Contains(t, out, "**Applying automatically**")
+}
+
+// A plan without unsafe changes keeps the plain instruction.
+func TestRenderPlanComment_NoUnsafeConsentWithoutUnsafeChanges(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.HasUnsafeChanges = false
+	data.UnsafeChanges = nil
+	out := RenderPlanComment(*data)
+	assert.NotContains(t, out, "--allow-unsafe")
+	assert.Contains(t, out, "▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```")
+}
+
+// The locked apply comment already carries the operator's consent in its
+// apply-confirm command, so it gets no consent instruction.
+func TestRenderPlanComment_NoUnsafeConsentOnLockedApply(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.IsLocked = true
+	data.AllowUnsafe = true
+	data.PendingManualConfirmation = true
+	out := RenderPlanComment(*data)
+	assert.NotContains(t, out, "to confirm 2 unsafe changes")
+	assert.Contains(t, fencedCommands(t, out), "schemabot apply-confirm -e staging --allow-unsafe")
+}
+
+// On a multi-environment plan, each environment's apply instruction carries
+// the consent only when that environment's own plan has unsafe changes.
+func TestRenderMultiEnvPlanComment_UnsafeConsentPerEnvironment(t *testing.T) {
+	render := func(staging, production *PlanCommentData) string {
+		return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+			Database: "payments", IsMySQL: true, DatabaseType: "mysql",
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": staging, "production": production},
+		})
+	}
+	clean := unsafeConsentPlan("staging")
+	clean.HasUnsafeChanges = false
+	clean.UnsafeChanges = nil
+
+	out := render(clean, unsafeConsentPlan("production"))
+	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "After verifying staging, apply to production:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e production\n   ```")
+	for _, block := range fencedCommands(t, out) {
+		assert.NotContains(t, block, "--allow-unsafe")
+	}
+
+	out = render(unsafeConsentPlan("staging"), unsafeConsentPlan("production"))
+	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging\n   ```")
+
+	out = RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "payments", IsMySQL: true, DatabaseType: "mysql",
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": unsafeConsentPlan("staging"), "production": nil},
+	})
+	assert.Contains(t, out, "▶️ **To apply** these changes:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging\n   ```")
+}
+
+func refusedChangePlan(env string) *PlanCommentData {
+	data := unsafeConsentPlan(env)
+	data.BlockedChanges = []BlockedChangeData{{Table: "orders", Reason: "statement for table \"orders\" must be rewritten into a form the engine can execute natively, then re-planned"}}
+	return data
+}
+
+// A plan that carries a change the engine refuses fails its apply whatever the
+// flags, so the footer offers no apply and no --allow-unsafe: it says why and
+// offers the re-plan that follows fixing the change.
+func TestRenderPlanComment_RefusedChangeOffersReplanNotApply(t *testing.T) {
+	data := refusedChangePlan("staging")
+	data.ScopedDatabase = "payments"
+	out := RenderPlanComment(*data)
+
+	_, footer, found := strings.Cut(out, "\n---\n")
+	require.True(t, found, "the comment has a footer")
+	assert.Equal(t, "\nThe engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:\n```\nschemabot plan -e staging -d payments\n```\n", footer)
+	assert.NotContains(t, out, "--allow-unsafe")
+	assert.NotContains(t, out, "▶️ **To apply**")
+	for _, block := range fencedCommands(t, out) {
+		assert.NotContains(t, block, "schemabot apply")
+	}
+}
+
+// Across environments, one whose plan carries a refused change is offered a
+// re-plan in place of its apply, an earlier clean one keeps its apply, and a
+// later one waits on it.
+func TestRenderMultiEnvPlanComment_RefusedChangeOffersReplanNotApply(t *testing.T) {
+	render := func(staging, production *PlanCommentData) string {
+		return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+			Database: "payments", IsMySQL: true, DatabaseType: "mysql",
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": staging, "production": production},
+		})
+	}
+
+	out := render(unsafeConsentPlan("staging"), refusedChangePlan("production"))
+	assert.Contains(t, out, "▶️ **To apply** these changes:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n   ```\n   schemabot apply -e staging\n   ```")
+	assert.Contains(t, out, "The engine refuses a change in the **production** plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:\n```\nschemabot plan -e production\n```")
+	assert.NotContains(t, fencedCommands(t, out), "schemabot apply -e production")
+
+	out = render(refusedChangePlan("staging"), unsafeConsentPlan("production"))
+	assert.Contains(t, out, "The engine refuses a change in the **staging** plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:\n```\nschemabot plan -e staging\n```")
+	assert.Contains(t, out, glyph.Attention+" **Production** applies only after staging, and staging's plan carries a change the engine refuses (see above).")
+	assert.NotContains(t, out, "▶️ **To apply**")
+	assert.NotContains(t, out, "No changes to apply.")
+	for _, block := range fencedCommands(t, out) {
+		assert.NotContains(t, block, "schemabot apply")
+	}
+}
+
+// The consent names two tables and counts the rest, so a plan that drops many
+// tables keeps its instruction to one short line. A third table left over is
+// named, since naming it is as short as counting it. The finding count still
+// covers every change.
+func TestRenderPlanComment_UnsafeConsentBoundsTheTableList(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = nil
+	for _, table := range []string{"t1", "t2", "t3", "t4", "t5", "t6", "t7"} {
+		data.UnsafeChanges = append(data.UnsafeChanges, UnsafeChangeData{Table: table, Reason: "DROP TABLE removes all data"})
+	}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "2. Add `--allow-unsafe` to confirm 7 unsafe changes on `t1`, `t2` and 5 more:\n")
+
+	data.UnsafeChanges = data.UnsafeChanges[:4]
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, "to confirm 4 unsafe changes on `t1`, `t2` and 2 more:")
+
+	data.UnsafeChanges = data.UnsafeChanges[:3]
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, "to confirm 3 unsafe changes on `t1`, `t2` and `t3`:")
+}
+
+// When the rollup is blocked or could not be computed, the comment has no plan
+// per target to count from, so the consent counts the unsafe changes of the one
+// plan it has and says the flag covers any the other targets carry. The apply
+// plans the rollout again, so the instruction stays: a rollup clean by then
+// runs.
+func TestRenderPlanComment_UnsafeConsentCoversOtherTargetsWithoutTargetPlans(t *testing.T) {
+	for name, drift := range map[string]*DeploymentDriftData{
+		"blocked":      {Computed: true, Clean: false, Deployments: previewRolloutMembers()},
+		"not computed": {Computed: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := unsafeConsentPlan("staging")
+			data.DeploymentDrift = drift
+			out := RenderPlanComment(*data)
+			assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`, and any the other targets carry:\n   ```\n   schemabot apply -e staging\n   ```")
+		})
+	}
+
+	data := unsafeConsentPlan("staging")
+	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: true, Deployments: previewRolloutMembers()}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:", "a clean mirrored rollup runs the primary plan everywhere, so its count covers every target")
+}
+
+// --allow-unsafe consents to every target's disclosed unsafe changes, so the
+// instruction counts and names another target's changes too, and asks for the
+// flag even when the reviewed plan carries none of its own. It names each table
+// once, without the targets that carry it: the unsafe findings list them, and
+// a wide rollout would repeat every target name for every table.
+func TestRenderPlanComment_UnsafeConsentCoversOtherTargets(t *testing.T) {
+	data := convergedPrimaryPlanData()
+	data.DeploymentDrift.Plans[1].UnsafeChanges = []UnsafeChangeData{
+		{Table: "users", Reason: "has_timestamp: column created_at uses TIMESTAMP", ChangeType: "alter"},
+		{Table: "legacy", Reason: "DROP TABLE removes all data", ChangeType: "drop", Targets: []string{"primary/testapp_3"}, TotalTargets: 2},
+	}
+	out := RenderPlanComment(data)
+	_, footer, found := strings.Cut(out, "▶️ **To apply**")
+	require.True(t, found, "the comment offers an apply")
+	assert.Contains(t, footer, "2. Add `--allow-unsafe` to confirm 2 unsafe changes on `legacy` and `users`:\n   ```\n   schemabot apply -e production\n   ```\n", "the dropped table is named first")
+}
+
+// timestampFindings is six advisory unsafe findings, two on each of three
+// tables, enough to push a list past the fold.
+func timestampFindings() []UnsafeChangeData {
+	var changes []UnsafeChangeData
+	for _, table := range []string{"loans", "refunds", "ledger"} {
+		changes = append(changes,
+			UnsafeChangeData{Table: table, Reason: "Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+			UnsafeChangeData{Table: table, Reason: "Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19."},
+		)
+	}
+	return changes
+}
+
+// A long unsafe list shows its first findings and folds the rest, as a long
+// lint list folds, so it stops burying the plan under it. The header keeps the
+// count in view, numbering runs on into the fold, and the apply instruction
+// still counts every finding. A fold that would hide a single finding shows it
+// instead, so a list one past the threshold stays open.
+func TestRenderPlanComment_LongUnsafeListFolds(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = append(timestampFindings(), UnsafeChangeData{Table: "payouts", Reason: "Column `paid_at` uses `TIMESTAMP` which overflows on 2038-01-19."})
+	require.Greater(t, len(data.UnsafeChanges), unsafeFindingsFoldThreshold+1)
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, glyph.Attention+" **Issues**: 7 unsafe changes detected\n"+
+		"1. `loans`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n", "%s", out)
+	assert.Contains(t, out, "5. `ledger`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
+		"\n<details>\n<summary>2 more unsafe changes</summary>\n\n"+
+		"6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
+		"7. `payouts`: Column `paid_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n", "%s", out)
+	assert.Contains(t, out, "to confirm 7 unsafe changes on `loans`, `refunds` and 2 more:")
+
+	data.UnsafeChanges = timestampFindings()
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, "6. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n", "%s", out)
+	assert.NotContains(t, out, "<details>\n<summary>1 more", "a fold never hides a single finding")
+}
+
+// Destructive drops lead the unsafe list and are counted in the header, so a
+// dropped table or column reads apart from findings that destroy nothing
+// without a section of its own. The steps that make the drops safe lead the
+// apply instruction. In a long list the drops count toward the findings
+// shown, so a drop cannot fold behind dozens of advisory findings.
+func TestRenderPlanComment_LongUnsafeListKeepsDropsOpen(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = append(timestampFindings(),
+		UnsafeChangeData{Table: "transfer_events", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `transfer_events` DROP COLUMN `legacy_ref`"},
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`"},
+	)
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, glyph.Attention+" **Issues**: 8 unsafe changes detected (2 drops)\n"+
+		"1. `transfer_events`: DROP COLUMN discards the column's data\n"+
+		"2. `refund_backfill`: DROP TABLE removes all data\n"+
+		"3. `loans`: Column `created_at` uses `TIMESTAMP`", "%s", out)
+	assert.Contains(t, out, "5. `refunds`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n"+
+		"\n<details>\n<summary>3 more unsafe changes</summary>\n\n6. `refunds`:", "%s", out)
+	assert.Contains(t, out, "8. `ledger`: Column `updated_at` uses `TIMESTAMP` which overflows on 2038-01-19.\n\n</details>\n\n", "%s", out)
+	assert.Contains(t, out, "▶️ **To apply**:\n1. Deploy application code that no longer reads from or writes to the dropped table and column.\n2. Add", "%s", out)
+	assert.Contains(t, out, "to confirm 8 unsafe changes on `transfer_events`, `refund_backfill` and 3 more:",
+		"the consent sentence names the dropped tables before it starts counting")
+}
+
+// More drops than the list shows before folding all stay open: a drop never
+// folds, and only the findings after them do.
+func TestRenderPlanComment_EveryDropStaysOpen(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = timestampFindings()
+	for _, table := range []string{"a_archive", "b_archive", "c_archive", "d_archive", "e_archive", "f_archive"} {
+		data.UnsafeChanges = append(data.UnsafeChanges,
+			UnsafeChangeData{Table: table, Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `" + table + "`"})
+	}
+
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "**Issues**: 12 unsafe changes detected (6 drops)\n", "%s", out)
+	assert.Contains(t, out, "6. `f_archive`: DROP TABLE removes all data\n"+
+		"\n<details>\n<summary>6 more unsafe changes</summary>\n\n7. `loans`:", "%s", out)
+}
+
+// The apply refusal is where the operator decides whether to pass
+// --allow-unsafe, so it lists the unsafe changes the way the plan comment
+// does: drops first, the rest folded past the first findings.
+func TestRenderUnsafeChangesBlocked_LeadsWithDrops(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.UnsafeChanges = append(timestampFindings(),
+		UnsafeChangeData{Table: "refund_backfill", Reason: "DROP TABLE removes all data", ChangeType: "drop", DDL: "DROP TABLE `refund_backfill`"},
+	)
+
+	out := RenderUnsafeChangesBlocked(*data)
+	assert.Contains(t, out, "**"+glyph.Refused+" Apply rejected**: 7 unsafe changes detected (1 drop)\n"+
+		"1. `refund_backfill`: DROP TABLE removes all data\n"+
+		"2. `loans`:", "%s", out)
+	assert.Contains(t, out, "\n<details>\n<summary>2 more unsafe changes</summary>\n\n6. `ledger`:", "%s", out)
+	assert.Contains(t, out, "**"+glyph.Escalation+" To proceed with these destructive changes**:\n1. Deploy application code that no longer reads from or writes to the dropped table.\n2. Add", "%s", out)
+	assert.Contains(t, out, "to confirm 7 unsafe changes on `refund_backfill`, `loans` and 2 more:", "%s", out)
+}
+
+// A list of only drops has nothing to set them apart from, so its header does
+// not count drops separately.
+func TestRenderPlanComment_DropOnlyListIsPlain(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "**Issues**: 2 unsafe changes detected\n"+
+		"1. `transfer_events`: DROP COLUMN discards the column's data\n", "%s", out)
+	assert.NotContains(t, out, "detected (", "%s", out)
+}
+
+// Every kind of destructive drop leads the list and counts in the header: a
+// dropped column, index or partition as much as a dropped table. A partition
+// drop discards the partition's rows, so it counts with the rest.
+// Classification reads the statement, and the reason when the statement is
+// unavailable.
+func TestRenderPlanComment_EveryKindOfDropLeads(t *testing.T) {
+	for name, drop := range map[string]UnsafeChangeData{
+		"column":             {Table: "events", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `events` DROP COLUMN `legacy_ref`"},
+		"index":              {Table: "events", Reason: "DROP INDEX removes the index", DDL: "ALTER TABLE `events` DROP INDEX `idx_legacy_ref`"},
+		"partition":          {Table: "events", Reason: "Unsafe operation detected: \"DROP PARTITION\"", DDL: "ALTER TABLE `events` DROP PARTITION `p2020`"},
+		"truncate partition": {Table: "events", Reason: "Unsafe operation detected: \"TRUNCATE PARTITION\""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := unsafeConsentPlan("staging")
+			data.UnsafeChanges = append(timestampFindings(), drop)
+
+			out := RenderPlanComment(*data)
+			assert.Contains(t, out, "detected (1 drop)\n1. `events`: ", "%s", out)
+			assert.Contains(t, out, "\n2. `loans`: Column `created_at`", "%s", out)
+			assert.Contains(t, out, "<summary>2 more unsafe changes</summary>", "%s", out)
+		})
+	}
+}
+
+// The steps that make a drop safe are numbered ahead of the --allow-unsafe
+// consent wherever a footer offers the apply, so the reader meets everything
+// to do before applying in one list. Where no footer offers it — a comment
+// paused for confirmation, or an environment queued behind one whose apply is
+// refused — the steps stay beneath the findings as a tip, so they are never
+// lost with the apply instruction.
+func TestRenderPlanComment_DropStepsStayAsTipWithoutApplyInstruction(t *testing.T) {
+	const tip = glyph.Tip + " Before allowing a destructive drop, deploy application code that no longer reads from or writes to the dropped table and column.\n"
+
+	t.Run("paused for confirmation", func(t *testing.T) {
+		data := unsafeConsentPlan("staging")
+		data.IsLocked = true
+		data.PendingManualConfirmation = true
+		out := RenderPlanComment(*data)
+
+		assert.Contains(t, out, "2. `refund_backfill`: DROP TABLE removes all data\n\n"+tip, "%s", out)
+		assert.NotContains(t, out, "1. Deploy application code", "%s", out)
+	})
+
+	t.Run("queued behind a refused environment", func(t *testing.T) {
+		out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+			Database: "payments", IsMySQL: true, DatabaseType: "mysql",
+			Environments: []string{"staging", "production"},
+			Plans:        map[string]*PlanCommentData{"staging": refusedChangePlan("staging"), "production": unsafeConsentPlan("production")},
+		})
+
+		_, production, found := strings.Cut(out, "### Production")
+		require.True(t, found, "%s", out)
+		assert.Contains(t, production, tip, "%s", out)
+		assert.NotContains(t, out, "1. Deploy application code", "%s", out)
+	})
+}

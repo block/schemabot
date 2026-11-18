@@ -6,16 +6,21 @@ package webhook
 
 import (
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"testing"
 	"time"
 
+	mysql "github.com/block/mysql"
+	"github.com/block/spirit/pkg/utils"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -127,6 +132,309 @@ func TestE2EPlanWithChanges(t *testing.T) {
 	assert.Equal(t, "action_required", check.Conclusion)
 }
 
+// TestE2EPlanUnscopedRejectsMultipleManagedDatabases verifies that an unscoped
+// plan command on a PR whose changes span two databases this deployment manages
+// is rejected with the "Multiple Databases Detected" comment instead of
+// arbitrarily picking one of the databases. One command drives one database, so
+// the user must disambiguate with -d.
+func TestE2EPlanUnscopedRejectsMultipleManagedDatabases(t *testing.T) {
+	dbName := "webhook_plan_multidb"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+	// The second database is genuinely this deployment's: registered and with
+	// its own allowed dir, so the ambiguity is real rather than an ownership
+	// artifact.
+	svc.Config().Databases["webhook_plan_multidb_other"] = api.DatabaseConfig{
+		Type:         "mysql",
+		AllowedRepos: []string{"octocat/hello-world"},
+		AllowedDirs:  []string{"schema2"},
+	}
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	prFiles := []*gh.CommitFile{
+		{Filename: new("schema/schemabot.yaml"), Status: new("modified")},
+		{Filename: new("schema2/schemabot.yaml"), Status: new("modified")},
+	}
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
+	registerSecondSchemabotConfig(t, mux, "schema2/schemabot.yaml", "database: webhook_plan_multidb_other\ntype: mysql\n")
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Multiple Databases Detected")
+		assert.Contains(t, body, dbName)
+		assert.Contains(t, body, "webhook_plan_multidb_other")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for multiple databases rejection comment")
+	}
+
+	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, plan := range plans {
+		assert.NotEqual(t, dbName, plan.Database, "ambiguous unscoped plan should not be stored")
+	}
+}
+
+// TestE2EPlanUnscopedPlansOwnedDatabaseWhenPRTouchesUnownedConfig verifies the
+// fan-out contract for unscoped commands on a PR spanning several databases:
+// discovered configs are narrowed to the ones this deployment manages before
+// deciding whether the command is ambiguous. A PR touching one config this
+// deployment owns and one it does not must plan the owned database rather than
+// reject with "Multiple Databases Detected" — the unowned config is another
+// deployment's to handle.
+func TestE2EPlanUnscopedPlansOwnedDatabaseWhenPRTouchesUnownedConfig(t *testing.T) {
+	dbName := "webhook_plan_fanout_owned"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	prFiles := []*gh.CommitFile{
+		{Filename: new("schema/schemabot.yaml"), Status: new("modified")},
+		{Filename: new("unowned/schemabot.yaml"), Status: new("modified")},
+	}
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
+	registerSecondSchemabotConfig(t, mux, "unowned/schemabot.yaml", "database: webhook_plan_fanout_unowned\ntype: mysql\n")
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+		assert.NotContains(t, body, "webhook_plan_fanout_unowned")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for plan comment for the owned database")
+	}
+}
+
+// TestE2EPlanUnscopedPlansRegisteredDatabaseWhenPRTouchesUnregisteredConfig
+// verifies the fan-out contract on repos partitioned by database registry
+// rather than allowed_dirs: with no directory allowlist configured, every
+// discovered config passes the directory filter, so multiplicity must be
+// decided over the configs whose database this deployment has registered. A PR
+// touching one registered database's config and one unregistered database's
+// config must plan the registered database instead of rejecting with
+// "Multiple Databases Detected" — the unregistered config belongs to whichever
+// deployment has that database in its registry.
+func TestE2EPlanUnscopedPlansRegisteredDatabaseWhenPRTouchesUnregisteredConfig(t *testing.T) {
+	dbName := "webhook_plan_registry_owned"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	prFiles := []*gh.CommitFile{
+		{Filename: new("schema/schemabot.yaml"), Status: new("modified")},
+		{Filename: new("other/schemabot.yaml"), Status: new("modified")},
+	}
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
+	registerSecondSchemabotConfig(t, mux, "other/schemabot.yaml", "database: webhook_plan_registry_unregistered\ntype: mysql\n")
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+		assert.NotContains(t, body, "Multiple Databases Detected")
+		assert.NotContains(t, body, "webhook_plan_registry_unregistered")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for plan comment for the registered database")
+	}
+}
+
+// setupFakeGitHubForRenameVacatingSchema serves a PR whose only changed file
+// renames schema/<db>/users.sql to users.sql.disabled while the default branch
+// still holds users.sql, and orders.sql stays in the schema directory. Merging
+// the PR stops the default branch declaring the users table, so the PR is a
+// schema change for that database even though no current file name is a
+// schema file.
+func setupFakeGitHubForRenameVacatingSchema(t *testing.T, mux *http.ServeMux, dbName string) *planFlowResult {
+	t.Helper()
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"orders.sql": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	vacated := "schema/" + dbName + "/users.sql"
+	prFiles := []*gh.CommitFile{{
+		Filename:         new(vacated + ".disabled"),
+		PreviousFilename: new(vacated),
+		Status:           new("renamed"),
+	}}
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
+	result.baseHolds(vacated, "schema/"+dbName+"/orders.sql")
+	return result
+}
+
+// assertRenameVacatingSchemaIsPlanned waits for the plan comment and the
+// aggregate Check Run of a PR that only renames a schema file away, and checks
+// the PR was planned and blocked rather than refreshed as passing.
+func assertRenameVacatingSchemaIsPlanned(t *testing.T, result *planFlowResult, dbName string) {
+	t.Helper()
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, dbName)
+		assert.Contains(t, body, "orders")
+		assert.NotContains(t, body, "No Schema Files Changed")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment on a rename that vacates a schema path")
+	}
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for the aggregate Check Run on a rename that vacates a schema path")
+	}
+}
+
+// TestE2EPlanCommandOnRenameVacatingSchemaPlansDatabase covers a user
+// commenting a bare `schemabot plan` on a PR whose only change renames a schema
+// file to a non-schema name (users.sql to users.sql.disabled) while the default
+// branch still holds users.sql. The command must resolve the config through
+// the vacated path, post a plan, and leave the aggregate Check Run blocking —
+// never the "No Schema Files Changed" refresh that would publish a passing
+// aggregate for a PR that stops declaring a table.
+func TestE2EPlanCommandOnRenameVacatingSchemaPlansDatabase(t *testing.T) {
+	dbName := "webhook_plan_rename_vacated"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForRenameVacatingSchema(t, mux, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	assertRenameVacatingSchemaIsPlanned(t, result, dbName)
+}
+
+// TestE2EAutoPlanOnRenameVacatingSchemaPlansDatabase covers the same PR as
+// TestE2EPlanCommandOnRenameVacatingSchemaPlansDatabase arriving as an opened
+// pull request: auto-plan must discover the database through the vacated path,
+// post a plan, and leave the aggregate Check Run blocking.
+func TestE2EAutoPlanOnRenameVacatingSchemaPlansDatabase(t *testing.T) {
+	dbName := "webhook_autoplan_rename_vacated"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForRenameVacatingSchema(t, mux, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	assertRenameVacatingSchemaIsPlanned(t, result, dbName)
+}
+
+// registerSecondSchemabotConfig serves an additional schemabot.yaml at the
+// given repo path so a test PR can span more than one discovered config.
+func registerSecondSchemabotConfig(t *testing.T, mux *http.ServeMux, repoPath, content string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+repoPath, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Name:     new(path.Base(repoPath)),
+			Path:     new(repoPath),
+			Content:  new(base64.StdEncoding.EncodeToString([]byte(content))),
+			Encoding: new("base64"),
+		}))
+	})
+}
+
 // TestE2EPlanSourcePolicyBlocksUnauthorizedRepo verifies the trusted GitHub
 // discovery path enforces server-side source policy before a plan is stored.
 // The manual command path should also write a failing aggregate check so the
@@ -170,7 +478,7 @@ func TestE2EPlanSourcePolicyBlocksUnauthorizedRepo(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## ❌ Plan Failed")
 		assert.Contains(t, body, "source policy")
-		assert.Contains(t, body, "repo \"octocat/hello-world\" is not authorized")
+		assert.Contains(t, body, "repo &#34;octocat/hello-world&#34; is not authorized")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for source policy failure comment")
 	}
@@ -212,7 +520,7 @@ func TestE2EPlanNoChanges(t *testing.T) {
 	// Create the table in the target DB first so the plan finds no changes
 	ctx := t.Context()
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
-	db, err := sql.Open("mysql", appDSN)
+	db, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
@@ -336,6 +644,186 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 	}
 }
 
+// A plan that adds an index to an existing table renders the table's
+// approximate on-disk size in the plan comment — read from the target's
+// statistics at plan time — so an operator sees the scale of the index build
+// before applying. Only statements whose cost scales with the table carry a
+// size line: metadata-only alters and tables being created are not listed.
+func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
+	dbName := "webhook_plan_table_sizes"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	// Seed an existing table with enough rows that statistics report a
+	// meaningful estimate, and refresh statistics so the estimate is current.
+	dsnConfig, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	dsnConfig.DBName = dbName
+	appDB, err := sql.Open("block-mysql", dsnConfig.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(appDB)
+	require.NoError(t, appDB.PingContext(t.Context()), "ping target database")
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `name` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `notes` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `body` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	var values strings.Builder
+	for i := range 1200 {
+		if i > 0 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "('name-%d')", i)
+	}
+	_, err = appDB.ExecContext(t.Context(), "INSERT INTO `items` (`name`) VALUES "+values.String())
+	require.NoError(t, err)
+	_, err = appDB.ExecContext(t.Context(), "ANALYZE TABLE `items`")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		// One existing table gains an index (a size line), another gains only a
+		// column (no size line), and a new table is created (no size line).
+		"items.sql":   "CREATE TABLE `items` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"notes.sql":   "CREATE TABLE `notes` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `body` varchar(255) NOT NULL,\n  `priority` int DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "📊 **Table sizes**:")
+		assert.Regexp(t, "\n- `items`: ~[0-9.]+ (B|KB|MB)\n", body, "the size line carries the table's byte estimate")
+		assert.NotContains(t, body, "- `notes`:", "a column-only alter carries no size line")
+		assert.NotContains(t, body, "- `widgets`:", "a table being created is not listed in the size section")
+		sizesAt := strings.Index(body, "📊 **Table sizes**")
+		summaryAt := strings.Index(body, "📋 **Plan**:")
+		assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+}
+
+// A plan that moves a table onto a new default collation and makes a unique
+// column case-sensitive says, under the DDL, what each move does to how the
+// columns compare. The column the ALTER redeclares without a collation picks
+// up the new table default, starts treating trailing spaces as significant,
+// says that values differing by accents or other characters can start
+// comparing equal, and names its unique index for that reason. The column moved onto the binary collation starts treating letter
+// case as significant and names no index: no two values can start colliding.
+func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
+	dbName := "webhook_plan_collation_changes"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	dsnConfig, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	dsnConfig.DBName = dbName
+	appDB, err := sql.Open("block-mysql", dsnConfig.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(appDB)
+	require.NoError(t, appDB.PingContext(t.Context()), "ping target database")
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `handles` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `handle` varchar(64) NOT NULL,\n"+
+		"  `note` varchar(255) DEFAULT NULL,\n"+
+		"  PRIMARY KEY (`id`),\n"+
+		"  UNIQUE KEY `uk_handle` (`handle`),\n"+
+		"  UNIQUE KEY `uk_note` (`note`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"handles.sql": "CREATE TABLE `handles` (\n" +
+			"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+			"  `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL,\n" +
+			"  `note` varchar(255) DEFAULT NULL,\n" +
+			"  PRIMARY KEY (`id`),\n" +
+			"  UNIQUE KEY `uk_handle` (`handle`),\n" +
+			"  UNIQUE KEY `uk_note` (`note`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.\n"+
+			"- `handle` on `handles`: `utf8mb4_general_ci` → `utf8mb4_bin`\n"+
+			"  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
+			"- `note` on `handles`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n"+
+			"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
+			"  - Values that differ only by accents or other characters can start comparing equal.\n"+
+			"  - `note` is in unique index `uk_note`: the apply fails if two existing rows collide in that index under the new collation.\n", body)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+}
+
 // TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates verifies the
 // check-refresh path of a plan command on a PR with no managed schema changes
 // when an earlier commit left behind a stale plan-only blocking check (for
@@ -386,7 +874,7 @@ func TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates(t *testing.T
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "No Schema Files Changed")
 		assert.Contains(t, body, "refreshed as passing")
 		assert.Contains(t, body, "abc123")
 	case <-time.After(10 * time.Second):
@@ -546,7 +1034,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 	// Pre-create the table in staging so staging has no changes, but production still does
 	ctx := t.Context()
 	appDSNStaging := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName+"_staging", 1) + "&multiStatements=true"
-	db, err := sql.Open("mysql", appDSNStaging)
+	db, err := sql.Open("block-mysql", appDSNStaging)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
@@ -609,14 +1097,14 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 	ctx := t.Context()
 
 	// Create the app database on the target
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
 	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`")
 	require.NoError(t, err)
 	_ = targetDB.Close()
 
 	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		if err == nil {
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+dbName+"`")
 			_ = db.Close()
@@ -626,7 +1114,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -713,3 +1201,134 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 }
 
 // --- Container helpers (matches e2e/setup_test.go patterns) ---
+
+// TestE2EPlanExcludesIgnoredNamespaces verifies that namespace directories
+// listed in schemabot.yaml ignore_namespaces never reach the plan: a schema
+// root carrying a local-test-only namespace alongside the real one produces a
+// plan (comment, stored record, check) covering only the real namespace, so
+// SchemaBot never tries to reconcile test fixtures against the live database.
+func TestE2EPlanExcludesIgnoredNamespaces(t *testing.T) {
+	dbName := "webhook_plan_ignore_ns"
+	// ignore_namespaces requires the namespace-free MySQL DSN shape (a
+	// database-scoped DSN diffs the whole database as one unit and refuses the
+	// exclusion), so this scenario configures the target the supported way.
+	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{targetDSN: namespaceFreeTargetDSN(t)})
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n", dbName)
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"local_fixtures/widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	// The plan comment covers the real namespace only, and discloses the
+	// exclusion so a reviewer can tell the namespace was withheld by config
+	// rather than unchanged.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "users")
+		assert.NotContains(t, body, "widgets")
+		assert.Contains(t, body, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `local_fixtures`")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+
+	// The stored plan record carries no trace of the ignored namespace.
+	ctx := t.Context()
+	plans, err := svc.Storage().Plans().GetByPR(ctx, "octocat/hello-world", 1)
+	require.NoError(t, err)
+	var plan *storage.Plan
+	for _, p := range plans {
+		if p.Database == dbName {
+			plan = p
+			break
+		}
+	}
+	require.NotNil(t, plan, "expected a plan record for database %s", dbName)
+	require.NotNil(t, plan.Namespaces)
+	assert.Contains(t, plan.Namespaces, dbName)
+	assert.NotContains(t, plan.Namespaces, "local_fixtures")
+}
+
+// TestE2EPlanIgnoringEveryNamespaceFails verifies the safety boundary when
+// ignore_namespaces excludes every namespace in the schema root: the plan
+// must fail with an error naming the exclusion rather than planning an empty
+// desired state, which on a live database would read as "drop everything".
+func TestE2EPlanIgnoringEveryNamespaceFails(t *testing.T) {
+	dbName := "webhook_plan_ignore_all"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nignore_namespaces:\n  - %s\n  - local_fixtures\n", dbName, dbName)
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"local_fixtures/widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "schema request error handled")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "after excluding ignored namespaces")
+		assert.NotContains(t, body, "No schema changes detected")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}

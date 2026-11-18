@@ -56,7 +56,12 @@ func setupFakeGitHubForReviewGate(
 		})
 	})
 
-	// PR reviews
+	// PR reviews. A review without a commit is served as submitted on the head.
+	for _, r := range reviews {
+		if r.CommitID == nil {
+			r.CommitID = new("abc123")
+		}
+	}
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/reviews", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(reviews)
@@ -105,6 +110,32 @@ func setupFakeGitHubForReviewGate(
 		_ = json.NewEncoder(w).Encode(gh.Tree{
 			SHA:       new("abc123"),
 			Entries:   treeEntries,
+			Truncated: new(false),
+		})
+	})
+
+	// Base-branch freshness endpoints: the base ref still points at the PR's
+	// base commit, which is therefore also the merge base, so the base-schema
+	// freshness gate lets applies proceed.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: new("def456")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456...abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		})
+	})
+	// The base commit's shallow root tree: the gate walks this level looking
+	// for the managed "schema" directory entry.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA: new("def456"),
+			Entries: []*gh.TreeEntry{
+				{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-base")},
+			},
 			Truncated: new(false),
 		})
 	})
@@ -505,13 +536,10 @@ func TestE2EApplyTeamSlugApproval(t *testing.T) {
 		},
 	)
 
-	// Team members endpoint — bob is a member
-	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/members", func(w http.ResponseWriter, _ *http.Request) {
+	// Team membership endpoint — bob is an active member
+	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/memberships/bob", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]*gh.User{
-			{Login: new("bob")},
-			{Login: new("carol")},
-		})
+		_ = json.NewEncoder(w).Encode(map[string]string{"state": "active", "role": "member"})
 	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -571,13 +599,14 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 		},
 	)
 
-	// Team members — dave is not in the list
-	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/members", func(w http.ResponseWriter, _ *http.Request) {
+	// Team membership — dave has none, and the team itself reads back, so
+	// he is not a member rather than the team being unreadable
+	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/memberships/dave", func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	})
+	mux.HandleFunc("GET /orgs/octocat/teams/dba-team", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]*gh.User{
-			{Login: new("bob")},
-			{Login: new("carol")},
-		})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "slug": "dba-team"})
 	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -606,7 +635,8 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 }
 
 // TestE2EApplyCodeownersOptIn verifies that CODEOWNERS approvals satisfy the
-// review gate only when review policy explicitly includes CODEOWNERS.
+// review gate only when review policy explicitly includes CODEOWNERS, and that
+// the approver is the owner of the database's schema directory.
 func TestE2EApplyCodeownersOptIn(t *testing.T) {
 	dbName := "webhook_review_gate_codeowners"
 	svc := setupE2EService(t, dbName)
@@ -627,7 +657,7 @@ func TestE2EApplyCodeownersOptIn(t *testing.T) {
 	}
 
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
-		"schema/webhook_review_gate_codeowners/ @bob\n",
+		"/web/ @carol\n/schema/ @bob\n",
 		[]*gh.PullRequestReview{
 			{
 				User:        &gh.User{Login: new("bob")},

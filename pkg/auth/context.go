@@ -13,6 +13,7 @@ import "context"
 const AnonymousSubject = "anonymous"
 
 type contextKey struct{}
+type verifiedContextKey struct{}
 
 // User represents an authenticated caller extracted from a request.
 type User struct {
@@ -26,6 +27,13 @@ type User struct {
 // WithUser returns a new context with the given user attached.
 func WithUser(ctx context.Context, user *User) context.Context {
 	return context.WithValue(ctx, contextKey{}, user)
+}
+
+// WithVerifiedUser returns a new context with a user whose identity was
+// established by an authenticator's verified lane.
+func WithVerifiedUser(ctx context.Context, user *User) context.Context {
+	ctx = WithUser(ctx, user)
+	return context.WithValue(ctx, verifiedContextKey{}, true)
 }
 
 // UserFromContext returns the authenticated user from the context, or nil if
@@ -46,4 +54,13 @@ func AuthenticatedSubject(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	return u.Subject, true
+}
+
+// VerifiedSubject returns the caller's subject only when an authenticator
+// established the identity through a verified lane.
+func VerifiedSubject(ctx context.Context) (string, bool) {
+	if verified, _ := ctx.Value(verifiedContextKey{}).(bool); !verified {
+		return "", false
+	}
+	return AuthenticatedSubject(ctx)
 }

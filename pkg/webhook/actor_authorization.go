@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -13,9 +14,14 @@ import (
 
 // actorAuthorizationClient resolves the installation-scoped GitHub client used
 // for actor authorization team membership lookups. The client is only needed
-// when PR command authorization is enabled. A client resolution failure fails
-// closed: the command is blocked and an authorization-unavailable comment is
-// posted so the actor knows no schema change action was taken.
+// when PR command authorization is enabled; a nil client with a nil error
+// means authorization is skipped — either the gate is disabled or no GitHub
+// clients are configured. A client resolution failure fails closed: the
+// command is blocked, a best-effort authorization-unavailable comment is
+// posted so the actor knows no schema change action was taken, and the cause
+// is returned so durable callers can classify it — a deterministic GitHub App
+// resolution failure (errGitHubAppResolution) is terminal, while a transient
+// client-creation failure stays retryable.
 func (h *Handler) actorAuthorizationClient(
 	repo string,
 	pr int,
@@ -24,25 +30,37 @@ func (h *Handler) actorAuthorizationClient(
 	database string,
 	environment string,
 	commandName string,
-) (*ghclient.InstallationClient, bool) {
+) (*ghclient.InstallationClient, error) {
 	if !h.service.Config().PRCommandAuthorizationEnabled() || h.ghClients.Len() == 0 {
-		return nil, false
+		return nil, nil
 	}
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		h.logger.Warn("PR command blocked because the actor authorization GitHub client could not be created",
-			"repo", repo, "pr", pr, "database", database,
-			"environment", environment, "command", commandName,
-			"requested_by", requestedBy, "error", err)
+		// A GitHub App resolution failure is deterministic per deployment
+		// config — durable callers dead-letter the command permanently — so
+		// it logs at Error naming the cause, while a transient client-creation
+		// failure (an installation token fetch, for example) may clear on a
+		// later attempt and stays a Warn.
+		if errors.Is(err, errGitHubAppResolution) {
+			h.logger.Error("PR command blocked: cannot resolve GitHub App client for actor authorization",
+				"repo", repo, "pr", pr, "database", database,
+				"environment", environment, "command", commandName,
+				"requested_by", requestedBy, "error", err)
+		} else {
+			h.logger.Warn("PR command blocked because the actor authorization GitHub client could not be created",
+				"repo", repo, "pr", pr, "database", database,
+				"environment", environment, "command", commandName,
+				"requested_by", requestedBy, "error", err)
+		}
 		h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
 			RequestedBy: requestedBy,
 			CommandName: commandName,
 			Database:    database,
 			Environment: environment,
 		}))
-		return nil, true
+		return nil, fmt.Errorf("actor authorization GitHub client for %s command %s#%d: %w", commandName, repo, pr, err)
 	}
-	return client, false
+	return client, nil
 }
 
 func (h *Handler) enforcePRCommandActorAuthorization(
@@ -56,24 +74,35 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 	databaseType string,
 	environment string,
 	commandName string,
-) bool {
+	suppressRetryComments bool,
+) (blocked bool, err error) {
 	result, err := h.authorizePRCommandActor(ctx, client, requestedBy, repo, database)
 	status := actorAuthorizationMetricStatus(result, err)
 	metrics.RecordPRCommandActorAuthorization(ctx, metricActionKey(commandName), database, environment, repo, status, result.Reason)
 
+	// An authorization evaluation failure (for example a GitHub team-membership
+	// read) stops the command (fail closed) and is returned as an error, not a
+	// block: the actor's authorization could not be determined, so the outcome
+	// is not the command's answer and a durable driver may re-drive it.
+	// suppressRetryComments silences the evaluation-failure comment on durable
+	// attempts, where the driver retries and posts the single terminal answer
+	// instead; merit denials always comment because they are the command's
+	// answer.
 	if err != nil {
-		h.logger.Warn("PR command blocked by actor authorization error",
+		h.logger.Warn("PR command stopped by actor authorization error",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", databaseType, "environment", environment,
 			"command", commandName, "requested_by", requestedBy,
 			"reason", result.Reason, "error", err)
-		h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
-			RequestedBy: requestedBy,
-			CommandName: commandName,
-			Database:    database,
-			Environment: environment,
-		}))
-		return true
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
+				RequestedBy: requestedBy,
+				CommandName: commandName,
+				Database:    database,
+				Environment: environment,
+			}))
+		}
+		return false, fmt.Errorf("actor authorization for %s command %s#%d: %w", commandName, repo, pr, err)
 	}
 	if !result.Allowed {
 		// A missing database config is operationally distinct from an actor who
@@ -91,28 +120,30 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 				Database:    database,
 				Environment: environment,
 			}))
-			return true
+			return true, nil
 		}
 		h.logger.Warn("PR command blocked by actor authorization",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", databaseType, "environment", environment,
 			"command", commandName, "requested_by", requestedBy,
 			"reason", result.Reason)
+		operatorPrincipals, otherPrincipals := h.service.Config().PRCommandAuthorizedPrincipals(repo, database)
 		h.postComment(repo, pr, installationID, templates.RenderPRCommandNotAuthorized(templates.ActorAuthorizationCommentData{
-			RequestedBy:          requestedBy,
-			CommandName:          commandName,
-			Database:             database,
-			Environment:          environment,
-			AuthorizedPrincipals: h.service.Config().PRCommandAuthorizedPrincipals(repo, database),
+			RequestedBy:        requestedBy,
+			CommandName:        commandName,
+			Database:           database,
+			Environment:        environment,
+			OperatorPrincipals: operatorPrincipals,
+			OtherPrincipals:    otherPrincipals,
 		}))
-		return true
+		return true, nil
 	}
 	if result.Reason == api.ActorAuthReasonDisabled {
 		h.logger.Debug("skipping PR command actor authorization because it is disabled",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", databaseType, "environment", environment,
 			"command", commandName, "requested_by", requestedBy)
-		return false
+		return false, nil
 	}
 	// Rollback, rollback-confirm, and unlock execute DDL or force-release locks,
 	// so the allow decision is audit-relevant. Log it at Info with the same
@@ -123,7 +154,62 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 		"database_type", databaseType, "environment", environment,
 		"command", commandName, "requested_by", requestedBy,
 		"reason", result.Reason, "matched_principal", result.MatchedPrincipal)
-	return false
+	return false, nil
+}
+
+// applyAuthorizationForPlanComment returns who may run `schemabot apply` for
+// database via repo, for the plan comment to show next to its apply command.
+// It returns nil when the comment has nothing to say: PR command authorization
+// is off, or reader may already run the apply. reader is the person the
+// comment answers: whoever commented the plan command, or the PR author on an
+// auto-plan.
+//
+// It runs the same check the apply gate does, so on top of the config read it
+// asks GitHub for reader's membership in each configured team until one
+// includes reader, reusing any membership this delivery has already read. When
+// that check cannot be evaluated, the list renders: it is still true, and it
+// names whom to ask.
+func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, reader string) *templates.ApplyAuthorizationData {
+	if h.service == nil || !h.service.Config().PRCommandAuthorizationEnabled() {
+		return nil
+	}
+	operators, others := h.service.Config().PRCommandAuthorizedPrincipals(repo, database)
+	auth := &templates.ApplyAuthorizationData{OperatorPrincipals: operators, OtherPrincipals: others}
+	if strings.TrimSpace(reader) == "" {
+		h.logger.Debug("plan comment lists who can apply because it has no reader to check",
+			"repo", repo, "pr", pr, "database", database)
+		return auth
+	}
+	result, err := h.authorizePRCommandActor(ctx, client, reader, repo, database)
+	if err != nil {
+		h.logger.Warn("plan comment lists who can apply because the reader's apply authorization could not be checked",
+			"repo", repo, "pr", pr, "database", database, "reader", reader,
+			"reason", result.Reason, "error", err)
+		return auth
+	}
+	if result.Allowed {
+		h.logger.Debug("plan comment omits who can apply because the reader may run the apply",
+			"repo", repo, "pr", pr, "database", database, "reader", reader,
+			"matched_principal", result.MatchedPrincipal)
+		return nil
+	}
+	return auth
+}
+
+// planCommentReader returns whom a plan comment answers: the requester of a
+// commented plan, or the PR author on an auto-plan, which has no requester.
+// It returns "" when the PR author cannot be read.
+func (h *Handler) planCommentReader(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, requestedBy string) string {
+	if requestedBy != "" {
+		return requestedBy
+	}
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Warn("plan comment cannot read the PR author, so it lists who can apply",
+			"repo", repo, "pr", pr, "error", err)
+		return ""
+	}
+	return prInfo.User
 }
 
 func (h *Handler) authorizePRCommandActor(

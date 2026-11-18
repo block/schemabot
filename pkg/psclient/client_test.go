@@ -1,0 +1,1171 @@
+package psclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	ps "github.com/planetscale/planetscale-go/planetscale"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// createDeployRequestServer serves the deploy-request create endpoint and
+// captures the body SchemaBot actually sent.
+func createDeployRequestServer(t *testing.T, captured *map[string]any) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/v1/organizations/block/databases/orders/deploy-requests", r.URL.Path)
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(body, captured))
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"dr1","number":132,"state":"open"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The cutover setting has to survive serialization: PlanetScale reads an absent
+// auto_cutover as "use the database default", which on a database whose default
+// is on hands the schema swap to the backend. A deploy request SchemaBot creates
+// says false out loud.
+func TestCreateDeployRequestSendsAutoCutoverFalse(t *testing.T) {
+	var captured map[string]any
+	srv := createDeployRequestServer(t, &captured)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	dr, err := client.CreateDeployRequest(t.Context(), &ps.CreateDeployRequestRequest{
+		Organization:     "block",
+		Database:         "orders",
+		Branch:           "schemabot-orders-02846775",
+		IntoBranch:       "main",
+		AutoCutover:      false,
+		AutoDeleteBranch: false,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(132), dr.Number)
+
+	require.Contains(t, captured, "auto_cutover", "the cutover setting must reach PlanetScale")
+	assert.Equal(t, false, captured["auto_cutover"])
+	require.Contains(t, captured, "auto_delete_branch", "branch teardown must not fall to the database default either")
+	assert.Equal(t, false, captured["auto_delete_branch"])
+	assert.Equal(t, "schemabot-orders-02846775", captured["branch"])
+	assert.Equal(t, "main", captured["into_branch"])
+}
+
+// A true setting is transmitted the same way, so nothing about the explicit
+// body depends on the value being the zero one.
+func TestCreateDeployRequestSendsAutoDeleteBranchTrue(t *testing.T) {
+	var captured map[string]any
+	srv := createDeployRequestServer(t, &captured)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	_, err = client.CreateDeployRequest(t.Context(), &ps.CreateDeployRequestRequest{
+		Organization:     "block",
+		Database:         "orders",
+		Branch:           "schemabot-orders-02846775",
+		AutoDeleteBranch: true,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, true, captured["auto_delete_branch"])
+	assert.Equal(t, false, captured["auto_cutover"])
+}
+
+// A rejected create carries the API's own response text, so an operator reading
+// the apply's failure does not have to reproduce the call to learn why.
+func TestCreateDeployRequestSurfacesAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"branch has no schema changes"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	_, err = client.CreateDeployRequest(t.Context(), &ps.CreateDeployRequestRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "schemabot-orders-02846775",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "branch has no schema changes")
+	assert.Contains(t, err.Error(), "orders")
+}
+
+// The service token authenticates these calls the same way the SDK's do.
+func TestCreateDeployRequestSendsServiceToken(t *testing.T) {
+	var auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"number":1}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	_, err = client.CreateDeployRequest(t.Context(), &ps.CreateDeployRequestRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "schemabot-orders-02846775",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "token-name:token-value", auth)
+}
+
+// autoCutoverServer serves the deploy-request read endpoint with a fixed body.
+func autoCutoverServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/organizations/block/databases/orders/deploy-requests/132", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The cutover setting cannot be changed once a deploy request exists, so the
+// only way to know the one SchemaBot asked for is the one being honoured is to
+// read it back. PlanetScale carries it on the deployment rather than on the
+// deploy request itself.
+func TestDeployRequestAutoCutoverReadsTheDeploymentSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"held for the operator", `{"number":132,"deployment":{"auto_cutover":false}}`, false},
+		{"performed by the backend", `{"number":132,"deployment":{"auto_cutover":true}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", autoCutoverServer(t, tc.body).URL)
+			require.NoError(t, err)
+
+			autoCutover, err := client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, autoCutover)
+		})
+	}
+}
+
+// A caller reads this setting precisely because it cannot assume one, so a
+// response that omits it is an error rather than a default. Having no deployment
+// to read and having a deployment that does not report the setting are separate
+// causes: the first is a read with nothing in it yet, the second is the API
+// answering in a shape this no longer matches, and an operator triaging a
+// refused deploy needs to know which one they are looking at.
+func TestDeployRequestAutoCutoverRefusesAnUnreportedSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want error
+	}{
+		{"no deployment to read", `{"number":132}`, ErrDeploymentNotReported},
+		{"deployment without the setting", `{"number":132,"deployment":{"state":"ready"}}`, ErrAutoCutoverNotReported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", autoCutoverServer(t, tc.body).URL)
+			require.NoError(t, err)
+
+			_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			require.Error(t, err)
+			assert.ErrorIs(t, err, tc.want)
+			assert.Contains(t, err.Error(), "orders")
+			assert.Contains(t, err.Error(), "#132")
+		})
+	}
+}
+
+// A failed call travels up as the apply's failure message and is rendered into a
+// PR comment. Only the API's own message field is written for a human to read;
+// the rest of a response body is text from whatever answered, so a response that
+// is not the API's error shape contributes nothing to the message and is kept on
+// the error for the server log instead.
+func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		wantInError string
+		wantOmitted []string
+	}{
+		{
+			name:        "the API refuses in its own words",
+			body:        `{"message":"deploy request is not deploying"}`,
+			wantInError: "deploy request is not deploying",
+		},
+		{
+			name:        "something else answered",
+			body:        "upstream 10.4.19.7:3306 unreachable\n| broken | table |",
+			wantOmitted: []string{"10.4.19.7", "|", "\n"},
+		},
+		{
+			name:        "the refusal would break the markdown it lands in",
+			body:        `{"message":"branch | main\nis behind"}`,
+			wantInError: "branch / main is behind",
+			wantOmitted: []string{"|", "\n"},
+		},
+		{
+			name:        "the refusal carries several kilobytes of detail beside its message",
+			body:        `{"message":"branch has no schema changes","detail":"` + strings.Repeat("x", 9<<10) + `"}`,
+			wantInError: "branch has no schema changes",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+			require.NoError(t, err)
+
+			_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "502 Bad Gateway")
+			assert.Contains(t, err.Error(), "/v1/organizations/block/databases/orders/deploy-requests/132")
+			assert.NotContains(t, err.Error(), srv.URL, "the endpoint host does not belong in an operator-facing message")
+			if tc.wantInError != "" {
+				assert.Contains(t, err.Error(), tc.wantInError)
+			}
+			for _, omitted := range tc.wantOmitted {
+				assert.NotContains(t, err.Error(), omitted)
+			}
+
+			var apiErr *APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+			assert.Equal(t, tc.body, apiErr.Body, "a short response stays on the error whole for the server log")
+		})
+	}
+}
+
+// captureLogs routes the default logger into a buffer for the test and returns
+// a function that decodes the records logged so far.
+func captureLogs(t *testing.T) func() []map[string]any {
+	t.Helper()
+	var logs bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+	return func() []map[string]any {
+		var records []map[string]any
+		dec := json.NewDecoder(bytes.NewReader(logs.Bytes()))
+		for dec.More() {
+			var record map[string]any
+			require.NoError(t, dec.Decode(&record), "decode a captured log record")
+			records = append(records, record)
+		}
+		return records
+	}
+}
+
+// requireLogged returns the one captured record carrying msg.
+func requireLogged(t *testing.T, records []map[string]any, msg string) map[string]any {
+	t.Helper()
+	var matched []map[string]any
+	for _, record := range records {
+		if record["msg"] == msg {
+			matched = append(matched, record)
+		}
+	}
+	require.Len(t, matched, 1, "log records with message %q", msg)
+	return matched[0]
+}
+
+// A failed call reads only the start of its response: a proxy that answers
+// with megabytes of HTML still produces a typed APIError with the status, and
+// only the first 64 KiB are kept on the error and in the server log, which
+// says whether anything was left out. A body of exactly 64 KiB is kept whole,
+// and a cut that lands inside a multi-byte character drops that character
+// rather than leaving half of it.
+func TestRawRequestFailureKeepsOnlyTheStartOfALargeBody(t *testing.T) {
+	const limit = 64 << 10
+	for _, tc := range []struct {
+		name          string
+		body          string
+		wantKept      int
+		wantTruncated bool
+	}{
+		{
+			name:     "a body of exactly the limit",
+			body:     strings.Repeat("y", limit),
+			wantKept: limit,
+		},
+		{
+			name:          "a body one byte over the limit",
+			body:          strings.Repeat("y", limit+1),
+			wantKept:      limit,
+			wantTruncated: true,
+		},
+		{
+			name:          "a proxy page of three megabytes",
+			body:          strings.Repeat("<p>gateway</p>", 3<<20/len("<p>gateway</p>")),
+			wantKept:      limit,
+			wantTruncated: true,
+		},
+		{
+			// One byte, then two-byte characters: the limit falls after the
+			// first byte of one of them.
+			name:          "a cut inside a multi-byte character",
+			body:          "y" + strings.Repeat("é", limit),
+			wantKept:      limit - 1,
+			wantTruncated: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLogs(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+			require.NoError(t, err)
+
+			_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			var apiErr *APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+			assert.Equal(t, tc.body[:tc.wantKept], apiErr.Body)
+			assert.True(t, utf8.ValidString(apiErr.Body), "the kept body is valid UTF-8")
+
+			record := requireLogged(t, logged(), "PlanetScale API request failed")
+			assert.Equal(t, tc.body[:tc.wantKept], record["response_body"])
+			assert.Equal(t, tc.wantTruncated, record["response_body_truncated"])
+		})
+	}
+}
+
+// A failed response whose body breaks off part-way is reported as a read
+// failure that still names the status the API answered with, and keeps the
+// cause of the break so a caller can match it.
+func TestRawRequestFailureWithAnUnreadableBodyKeepsTheStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Declaring more than is written makes the server end the connection
+		// before the body is complete.
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("partial"))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Contains(t, err.Error(), "read GET /v1/organizations/block/databases/orders/deploy-requests/132 response (status 502)")
+	assert.NotContains(t, err.Error(), srv.URL)
+}
+
+// A successful response of up to 8 MiB is read whole. One byte more is larger
+// than any raw endpoint sends, and is refused with a typed error naming the
+// endpoint, rather than read whole into memory or cut short into JSON that
+// fails to decode. The refusal is logged with the status the API answered
+// with, since the request itself succeeded.
+func TestRawRequestRefusesAnOversizedResponse(t *testing.T) {
+	const limit = 8 << 20
+	for _, tc := range []struct {
+		name        string
+		size        int
+		wantRefused bool
+	}{
+		{name: "a response of exactly the limit", size: limit},
+		{name: "a response one byte over the limit", size: limit + 1, wantRefused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLogs(t)
+			prefix, suffix := `{"deployment":{"auto_cutover":true},"padding":"`, `"}`
+			body := prefix + strings.Repeat("x", tc.size-len(prefix)-len(suffix)) + suffix
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			t.Cleanup(srv.Close)
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+			require.NoError(t, err)
+
+			autoCutover, err := client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			if !tc.wantRefused {
+				require.NoError(t, err)
+				assert.True(t, autoCutover)
+				assert.Empty(t, logged(), "a response within the limit logs nothing")
+				return
+			}
+			require.ErrorIs(t, err, ErrResponseTooLarge)
+			assert.Contains(t, err.Error(), "GET /v1/organizations/block/databases/orders/deploy-requests/132")
+			assert.NotContains(t, err.Error(), srv.URL)
+
+			record := requireLogged(t, logged(), "PlanetScale API response refused: larger than SchemaBot reads")
+			assert.Equal(t, "/v1/organizations/block/databases/orders/deploy-requests/132", record["path"])
+			assert.Equal(t, float64(http.StatusOK), record["status_code"])
+			assert.Equal(t, float64(limit), record["limit_bytes"])
+		})
+	}
+}
+
+// A plan decides that a branch has no keyspace by a given name only on the
+// API's not-found answer to a read of that one keyspace. The read addresses
+// the keyspace by name, and a 404 comes back as the typed not-found error the
+// plan recognizes, while a keyspace that exists comes back by name.
+func TestGetKeyspaceReadsOneKeyspaceByName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		switch r.URL.Path {
+		case "/v1/organizations/block/databases/orders/branches/main/keyspaces/commerce":
+			_, _ = w.Write([]byte(`{"name":"commerce","sharded":true}`))
+		case "/v1/organizations/block/databases/orders/branches/main/keyspaces/billing":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"not_found","message":"Not Found"}`))
+		default:
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			w.WriteHeader(http.StatusTeapot)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	t.Run("a keyspace the branch has", func(t *testing.T) {
+		keyspace, err := client.GetKeyspace(t.Context(), &ps.GetKeyspaceRequest{Organization: "block", Database: "orders", Branch: "main", Keyspace: "commerce"})
+		require.NoError(t, err)
+		assert.Equal(t, "commerce", keyspace.Name)
+	})
+
+	t.Run("a keyspace the branch does not have", func(t *testing.T) {
+		keyspace, err := client.GetKeyspace(t.Context(), &ps.GetKeyspaceRequest{Organization: "block", Database: "orders", Branch: "main", Keyspace: "billing"})
+		var psErr *ps.Error
+		require.ErrorAs(t, err, &psErr)
+		assert.Equal(t, ps.ErrNotFound, psErr.Code)
+		assert.Nil(t, keyspace)
+	})
+}
+
+// keyspacesServer serves the keyspace list endpoint for branch main of
+// block/orders, answering each requested page with the body pages maps it to.
+// A page with no entry is answered 404, so a request the test did not expect
+// fails loudly. The pages requested, in order, are appended to requested.
+func keyspacesServer(t *testing.T, pages map[string]string, requested *[]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/organizations/block/databases/orders/branches/main/keyspaces", r.URL.Path)
+		assert.Equal(t, "token-name:token-value", r.Header.Get("Authorization"))
+		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
+		page := r.URL.Query().Get("page")
+		*requested = append(*requested, page)
+		body, ok := pages[page]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"page not found"}`))
+			return
+		}
+		if body == "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"keyspace listing unavailable"}`))
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func listOrdersKeyspaces(t *testing.T, baseURL string) ([]*ps.Keyspace, error) {
+	t.Helper()
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", baseURL)
+	require.NoError(t, err)
+	return client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+}
+
+func keyspaceNames(keyspaces []*ps.Keyspace) []string {
+	names := make([]string, 0, len(keyspaces))
+	for _, ks := range keyspaces {
+		names = append(names, ks.Name)
+	}
+	return names
+}
+
+// A branch with more keyspaces than fit on one page is listed in full: every
+// page the API reports is read, in order, so progress and failure detail cover
+// the keyspaces on the later pages too.
+func TestListKeyspacesReadsEveryPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"type":"list","current_page":1,"next_page":2,"data":[{"name":"orders","shards":2},{"name":"orders_lookup","shards":1}]}`,
+		"2": `{"type":"list","current_page":2,"next_page":3,"data":[{"name":"payments","shards":4}]}`,
+		"3": `{"type":"list","current_page":3,"next_page":null,"data":[{"name":"refunds","shards":1}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders", "orders_lookup", "payments", "refunds"}, keyspaceNames(keyspaces))
+	assert.Equal(t, 4, keyspaces[2].Shards)
+	assert.Equal(t, []string{"1", "2", "3"}, requested)
+}
+
+// A single page with no next page is the whole branch, and is read once.
+func TestListKeyspacesStopsWhenNoNextPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"type":"list","current_page":1,"data":[{"name":"orders","shards":1}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+	assert.Equal(t, []string{"1"}, requested)
+}
+
+func TestListKeyspacesStopsWhenNextPageIsZero(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"next_page":0,"data":[{"name":"orders","shards":1}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+	assert.Equal(t, []string{"1"}, requested)
+}
+
+// A keyspace added while the pages are being read shifts the later ones onto
+// the next page, so a name can be listed twice. The copy from the earlier page
+// is kept, and the repeat is not counted as a second keyspace.
+func TestListKeyspacesDeduplicatesNamesAcrossPages(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"next_page":2,"data":[{"name":"orders","shards":1}]}`,
+		"2": `{"data":[{"name":"orders","shards":3},{"name":"payments","shards":2}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders", "payments"}, keyspaceNames(keyspaces))
+	assert.Equal(t, 1, keyspaces[0].Shards, "the copy from the earlier page is kept")
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+func TestListKeyspacesFailsToDecodeALaterPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"next_page":2,"data":[{"name":"orders","shards":1}]}`,
+		"2": `{not-json}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "decode keyspaces for block/orders branch main page 2")
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// Organization, database, and branch names are path segments. One that carries
+// a character URL syntax gives meaning to is escaped, so it neither retargets
+// the request nor swallows the page query that the whole listing depends on.
+func TestListKeyspacesEscapesPathSegments(t *testing.T) {
+	var gotPath, gotPage string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		gotPage = r.URL.Query().Get("page")
+		_, _ = w.Write([]byte(`{"data":[{"name":"orders","shards":1}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	keyspaces, err := client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "feature/x?y",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+	assert.Equal(t, "/v1/organizations/block/databases/orders/branches/feature%2Fx%3Fy/keyspaces", gotPath)
+	assert.Equal(t, "1", gotPage)
+}
+
+// A failure on a later page fails the listing rather than returning the pages
+// already read, and the error says which branch and page failed.
+func TestListKeyspacesFailsOnALaterPage(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"type":"list","current_page":1,"next_page":2,"data":[{"name":"orders","shards":2}]}`,
+		"2": "",
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main page 2")
+	assert.Contains(t, err.Error(), "keyspace listing unavailable")
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusInternalServerError, apiErr.StatusCode)
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// An API that keeps reporting another page is not followed forever: the
+// listing stops at the page bound and fails.
+func TestListKeyspacesFailsPastThePageBound(t *testing.T) {
+	var requested []string
+	pages := make(map[string]string, maxKeyspacePages+1)
+	for page := 1; page <= maxKeyspacePages+1; page++ {
+		pages[strconv.Itoa(page)] = fmt.Sprintf(`{"current_page":%d,"next_page":%d,"data":[{"name":"ks%d"}]}`, page, page+1, page)
+	}
+	srv := keyspacesServer(t, pages, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), fmt.Sprintf("API still reports page %d after %d pages and %d keyspaces", maxKeyspacePages+1, maxKeyspacePages, maxKeyspacePages))
+	assert.Len(t, requested, maxKeyspacePages)
+}
+
+// A next page that does not move forward would re-read the same keyspaces
+// forever, so it fails the listing at once.
+func TestListKeyspacesFailsWhenNextPageDoesNotAdvance(t *testing.T) {
+	var requested []string
+	srv := keyspacesServer(t, map[string]string{
+		"1": `{"current_page":1,"next_page":2,"data":[{"name":"orders"}]}`,
+		"2": `{"current_page":2,"next_page":2,"data":[{"name":"payments"}]}`,
+	}, &requested)
+
+	keyspaces, err := listOrdersKeyspaces(t, srv.URL)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "page 2 reports next page 2, which does not advance")
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// stalledPageRequestTimeout is the per-request timeout in the stalled-listing
+// tests. It is far longer than the bounds those tests exercise, so a listing
+// that ends in time was ended by the bound under test, not by a page timeout.
+const stalledPageRequestTimeout = 10 * time.Second
+
+// stalledKeyspacesWrapper returns a wrapper whose API answers the pages in
+// pages and never answers any other page: the request stays open until the
+// client gives up on it. Its listing bound is listingTimeout.
+func stalledKeyspacesWrapper(t *testing.T, pages map[string]string, listingTimeout time.Duration) *psClientWrapper {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := pages[r.URL.Query().Get("page")]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	// Cleanups run last-registered-first: release any stalled handler before
+	// Close waits for its connection.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+	wrapper, ok := client.(*psClientWrapper)
+	require.True(t, ok)
+	wrapper.httpClient.Timeout = stalledPageRequestTimeout
+	wrapper.keyspaceListingTimeout = listingTimeout
+	return wrapper
+}
+
+func listOrdersKeyspacesWith(ctx context.Context, wrapper *psClientWrapper) ([]*ps.Keyspace, error) {
+	return wrapper.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+}
+
+// A caller with no deadline of its own lists a branch whose API answers the
+// first page and then stops answering. The listing ends at its overall bound,
+// long before any page request times out, and the error says the listing as a
+// whole timed out, which branch it was, and how far it got.
+func TestListKeyspacesEndsAtTheOverallBound(t *testing.T) {
+	wrapper := stalledKeyspacesWrapper(t, map[string]string{
+		"1": `{"current_page":1,"next_page":2,"data":[{"name":"orders"}]}`,
+	}, 200*time.Millisecond)
+
+	start := time.Now()
+	keyspaces, err := listOrdersKeyspacesWith(t.Context(), wrapper)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main: listing as a whole timed out after 200ms (pages read: 1, waiting on page 2)")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at its overall bound, not at a page timeout")
+}
+
+// The default bound is two per-request timeouts: one slow page can spend its
+// whole budget and the rest of the listing still has room to finish, and no
+// listing can hold a driver for the page bound times the per-request timeout.
+func TestDefaultKeyspaceListingTimeoutValue(t *testing.T) {
+	require.Equal(t, 2*planetScaleHTTPTimeout, defaultKeyspaceListingTimeout)
+}
+
+// A wrapper built as a struct literal carries no listing bound of its own. It
+// lists under the default bound rather than expiring before its first request.
+func TestListKeyspacesOnLiteralWrapper(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"current_page":1,"data":[{"name":"orders"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	wrapper := &psClientWrapper{httpClient: srv.Client(), baseURL: srv.URL, tokenName: "token-name", tokenValue: "token-value"}
+
+	keyspaces, err := listOrdersKeyspacesWith(t.Context(), wrapper)
+	require.NoError(t, err)
+	require.Len(t, keyspaces, 1)
+	assert.Equal(t, "orders", keyspaces[0].Name)
+}
+
+// Which deadline ended a page request is decided by which fired first, not by
+// which contexts have ended by the time the failure is classified. Both
+// deadlines have expired before classification in every case here.
+func TestListingBoundEndedFollowsTheFirstDeadline(t *testing.T) {
+	t.Run("listing bound fired before the caller's deadline", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, time.Millisecond, errListingBound)
+		defer cancel()
+		<-listCtx.Done()
+		<-caller.Done()
+
+		assert.True(t, listingBoundEnded(listCtx, fmt.Errorf("page 2: %w", context.DeadlineExceeded)))
+		assert.False(t, listingBoundEnded(listCtx, errors.New("page 2: connection reset")), "a page that failed for its own reason keeps its error")
+	})
+
+	t.Run("caller's deadline fired before the listing bound", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, 50*time.Millisecond, errListingBound)
+		defer cancel()
+		<-caller.Done()
+		<-listCtx.Done()
+
+		assert.False(t, listingBoundEnded(listCtx, fmt.Errorf("page 1: %w", context.DeadlineExceeded)))
+	})
+}
+
+// A caller whose own deadline comes before the listing's bound ends the
+// listing at that deadline, and the error reports the caller's context
+// ending on the page in flight rather than the listing bound.
+func TestListKeyspacesCallerDeadlineWins(t *testing.T) {
+	wrapper := stalledKeyspacesWrapper(t, map[string]string{}, stalledPageRequestTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	keyspaces, err := listOrdersKeyspacesWith(ctx, wrapper)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main page 1")
+	assert.NotContains(t, err.Error(), "listing as a whole")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at the caller's deadline")
+}
+
+// urlCapturingTransport records the URL of the request it is handed and fails
+// it, so a raw-HTTP call never leaves the process.
+type urlCapturingTransport struct {
+	url string
+}
+
+func (ct *urlCapturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ct.url = req.URL.String()
+	return nil, errors.New("request captured")
+}
+
+// requestedURL makes one SDK call on a cancelled context and one raw-HTTP call
+// through a capturing transport, so neither leaves the process, and returns the
+// URL each was addressed to. The raw call's error names only the path, so its
+// URL is read from the request itself.
+func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{Organization: "block", Database: "orders", Branch: "main"})
+	var sdkErr *url.Error
+	require.ErrorAs(t, err, &sdkErr)
+
+	wrapper, ok := client.(*psClientWrapper)
+	require.True(t, ok)
+	capture := &urlCapturingTransport{}
+	wrapper.httpClient = &http.Client{Transport: capture}
+	_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+	require.Error(t, err)
+
+	return sdkErr.URL, capture.url
+}
+
+// errDialFailed stands in for whatever the network returns when the API host
+// cannot be reached.
+var errDialFailed = errors.New("dial failed")
+
+// secretHost is the API host the raw-request tests address. Its name is what
+// the tests look for in error messages.
+const secretHost = "secret-host.example"
+
+// unreachableWrapper addresses a host that every connection attempt fails to
+// reach with dialErr, so the request fails in the transport before any
+// response.
+func unreachableWrapper(dialErr error) *psClientWrapper {
+	return &psClientWrapper{
+		httpClient: &http.Client{Transport: &http.Transport{
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return nil, dialErr
+			},
+		}},
+		baseURL:    "https://" + secretHost,
+		tokenName:  "token-name",
+		tokenValue: "token-value",
+	}
+}
+
+// A raw-HTTP call that never reaches the API fails with an error that travels
+// up into apply failure messages and logs. It names the method and the
+// endpoint path in place of the request URL, so the URL's host and query
+// string are not in the message. The network's own error stays in the chain
+// as it was reported, for callers that classify it; when that error names the
+// host, as a failed DNS lookup does, the host appears there and nowhere else.
+func TestRawRequestTransportFailureNamesOnlyThePath(t *testing.T) {
+	const keyspacesPath = "/v1/organizations/block/databases/orders/branches/main/keyspaces"
+	lookupFailed := &net.DNSError{Err: "no such host", Name: secretHost, IsNotFound: true}
+	for _, tc := range []struct {
+		name          string
+		dialErr       error
+		ctx           func(t *testing.T) context.Context
+		wantErr       error
+		wantHostCount int
+	}{
+		{
+			name:    "the host cannot be reached",
+			dialErr: errDialFailed,
+			ctx:     func(t *testing.T) context.Context { return t.Context() },
+			wantErr: errDialFailed,
+		},
+		{
+			name:          "the host does not resolve",
+			dialErr:       lookupFailed,
+			ctx:           func(t *testing.T) context.Context { return t.Context() },
+			wantErr:       lookupFailed,
+			wantHostCount: 1,
+		},
+		{
+			name:    "the caller's context is cancelled",
+			dialErr: errDialFailed,
+			ctx: func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			wantErr: context.Canceled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unreachableWrapper(tc.dialErr).ListKeyspaces(tc.ctx(t), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "send GET "+keyspacesPath+" request")
+			assert.NotContains(t, err.Error(), "https://"+secretHost, "the request URL does not belong in an operator-facing message")
+			assert.Equal(t, tc.wantHostCount, strings.Count(err.Error(), secretHost), "the host appears only where the transport's own error names it")
+			assert.NotContains(t, err.Error(), "per_page", "the query string does not belong in an operator-facing message")
+			assert.NotContains(t, err.Error(), "?")
+			assert.ErrorIs(t, err, tc.wantErr)
+
+			var urlErr *url.Error
+			require.ErrorAs(t, err, &urlErr)
+			assert.Equal(t, keyspacesPath, urlErr.URL)
+			assert.Equal(t, "Get", urlErr.Op)
+		})
+	}
+}
+
+// A raw request that cannot be built, because an identifier does not form a
+// valid URL, fails before anything is sent. That error names the endpoint in
+// place of the URL too, so the base URL is in no raw-request error at all.
+func TestRawRequestThatCannotBeBuiltNamesOnlyThePath(t *testing.T) {
+	const badPath = "/v1/organizations/bad%zzorg/databases/orders/deploy-requests/1"
+	_, err := unreachableWrapper(errDialFailed).DeployRequestAutoCutover(t.Context(), "bad%zzorg", "orders", 1)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create GET "+badPath+" request")
+	assert.NotContains(t, err.Error(), secretHost, "the base URL does not belong in an operator-facing message")
+
+	var urlErr *url.Error
+	require.ErrorAs(t, err, &urlErr)
+	assert.Equal(t, badPath, urlErr.URL)
+	assert.Equal(t, "parse", urlErr.Op)
+}
+
+// A database configured without an API base URL is a real PlanetScale one, so
+// both the SDK calls and the raw-HTTP calls address the public API.
+func TestEmptyBaseURLAddressesThePublicAPI(t *testing.T) {
+	fromDefault, err := NewPSClient("token-name", "token-value")
+	require.NoError(t, err)
+	fromEmpty, err := NewPSClientWithBaseURL("token-name", "token-value", "")
+	require.NoError(t, err)
+
+	for name, client := range map[string]PSClient{"NewPSClient": fromDefault, "NewPSClientWithBaseURL": fromEmpty} {
+		sdkURL, rawURL := requestedURL(t, client)
+		assert.Equal(t, "https://api.planetscale.com/v1/organizations/block/databases/orders/branches/main", sdkURL, name)
+		assert.Equal(t, "https://api.planetscale.com/v1/organizations/block/databases/orders/branches/main/keyspaces?page=1&per_page=100", rawURL, name)
+	}
+}
+
+// A base URL written with a trailing slash, or with a path prefix, still
+// addresses one server and one path root for SDK and raw-HTTP calls alike, so
+// a deploy request created over raw HTTP is the one the SDK later reads.
+func TestBaseURLSpellingDoesNotSplitSDKAndRawCalls(t *testing.T) {
+	for _, suffix := range []string{"/", "/api", "/api/", "//"} {
+		t.Run(suffix, func(t *testing.T) {
+			var paths []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/keyspaces") {
+					_, _ = w.Write([]byte(`{"data":[{"name":"orders","shards":1}]}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"name":"main"}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL+suffix)
+			require.NoError(t, err)
+			_, err = client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{Organization: "block", Database: "orders", Branch: "main"})
+			require.NoError(t, err)
+			_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+			require.NoError(t, err)
+
+			wantRoot := strings.TrimRight(suffix, "/")
+			require.Len(t, paths, 2)
+			assert.Equal(t, wantRoot+"/v1/organizations/block/databases/orders/branches/main", paths[0])
+			assert.Equal(t, paths[0]+"/keyspaces", paths[1], "SDK and raw calls must share one path root")
+		})
+	}
+}
+
+// A configured base URL is where every call goes: the raw-HTTP calls for
+// endpoints the SDK does not cover reach the same server as the SDK calls, and
+// a base URL passed among the SDK options cannot split them.
+func TestConfiguredBaseURLCarriesSDKAndRawCalls(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/keyspaces") {
+			_, _ = w.Write([]byte(`{"data":[{"name":"orders","shards":1}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"name":"main"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL, ps.WithBaseURL("https://ps.example.invalid"))
+	require.NoError(t, err)
+
+	branch, err := client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{Organization: "block", Database: "orders", Branch: "main"})
+	require.NoError(t, err)
+	assert.Equal(t, "main", branch.Name)
+
+	keyspaces, err := client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+
+	assert.Equal(t, []string{
+		"/v1/organizations/block/databases/orders/branches/main",
+		"/v1/organizations/block/databases/orders/branches/main/keyspaces",
+	}, paths)
+}
+
+// recordingTransport counts the requests routed through it, so a test can show
+// which HTTP client actually carried a call.
+type recordingTransport struct {
+	calls int
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.calls++
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// Both constructors carry the request timeout on the client their raw-HTTP
+// calls use, so a PlanetScale endpoint that stops answering cannot hold a
+// driver forever.
+func TestPSClientConstructorsBoundRawRequests(t *testing.T) {
+	require.NotNil(t, newPlanetScaleHTTPClient().Transport,
+		"the service-token option wraps the installed transport, so it must be non-nil")
+
+	fromDefault, err := NewPSClient("token-name", "token-value")
+	require.NoError(t, err)
+	fromBaseURL, err := NewPSClientWithBaseURL("token-name", "token-value", "https://ps.example.com")
+	require.NoError(t, err)
+
+	for name, client := range map[string]PSClient{"NewPSClient": fromDefault, "NewPSClientWithBaseURL": fromBaseURL} {
+		wrapper, ok := client.(*psClientWrapper)
+		require.True(t, ok, name)
+		require.NotNil(t, wrapper.httpClient, name)
+		assert.Equal(t, planetScaleHTTPTimeout, wrapper.httpClient.Timeout, name)
+		assert.Equal(t, defaultKeyspaceListingTimeout, wrapper.keyspaceListingTimeout, name)
+	}
+}
+
+// A caller that passes its own HTTP client cannot displace the bounded client
+// or the service token: SDK calls still go out on the bounded client, and they
+// still authenticate.
+func TestCallerHTTPClientCannotDisplaceTheBoundOrTheToken(t *testing.T) {
+	var auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"main"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	callerTransport := &recordingTransport{}
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL,
+		ps.WithHTTPClient(&http.Client{Transport: callerTransport}),
+	)
+	require.NoError(t, err)
+
+	_, err = client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+	require.NoError(t, err)
+	assert.Zero(t, callerTransport.calls, "the SDK call must use the bounded client, not the caller's")
+	assert.Equal(t, "token-name:token-value", auth)
+}
+
+// A raw-HTTP call to an endpoint that accepts the request and never answers
+// returns an error once the client's timeout fires instead of blocking the
+// driver.
+func TestRawRequestReturnsWhenTheServerHangs(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	// Cleanups run last-registered-first: release the handler before Close
+	// waits for its connection.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	wrapper := &psClientWrapper{
+		httpClient: &http.Client{Timeout: 100 * time.Millisecond},
+		baseURL:    srv.URL,
+		tokenName:  "token-name",
+		tokenValue: "token-value",
+	}
+
+	start := time.Now()
+	_, err := wrapper.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read auto_cutover for block/orders deploy request #132")
+	assert.Less(t, time.Since(start), 10*time.Second, "the call must return at the client timeout")
+}
+
+// A database with more branches than fit on one page is listed in full from
+// the database's branches path, so a branch on a later page is not mistaken
+// for one that does not exist.
+func TestListBranchesReadsEveryPage(t *testing.T) {
+	var requested []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/organizations/block/databases/orders/branches", r.URL.Path)
+		page := r.URL.Query().Get("page")
+		requested = append(requested, page)
+		switch page {
+		case "1":
+			_, _ = w.Write([]byte(`{"type":"list","next_page":2,"data":[{"name":"main","production":true},{"name":"schemabot-orders-1a2b3c4d"}]}`))
+		case "2":
+			_, _ = w.Write([]byte(`{"type":"list","next_page":null,"data":[{"name":"schemabot-orders-5e6f7a8b","created_at":"2026-10-01T10:00:00Z"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	branches, err := client.ListBranches(t.Context(), &ps.ListDatabaseBranchesRequest{Organization: "block", Database: "orders"})
+
+	require.NoError(t, err)
+	require.Len(t, branches, 3)
+	assert.Equal(t, []string{"main", "schemabot-orders-1a2b3c4d", "schemabot-orders-5e6f7a8b"},
+		[]string{branches[0].Name, branches[1].Name, branches[2].Name})
+	assert.True(t, branches[0].Production)
+	assert.Equal(t, time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC), branches[2].CreatedAt.UTC())
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// A page that fails ends the listing with an error naming the database and the
+// page, rather than returning the branches read so far as the whole set.
+func TestListBranchesFailsOnALaterPage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "1" {
+			_, _ = w.Write([]byte(`{"type":"list","next_page":2,"data":[{"name":"main"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"branch listing unavailable"}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	branches, err := client.ListBranches(t.Context(), &ps.ListDatabaseBranchesRequest{Organization: "block", Database: "orders"})
+
+	require.Error(t, err)
+	assert.Nil(t, branches)
+	assert.Contains(t, err.Error(), "list branches for block/orders page 2")
+}

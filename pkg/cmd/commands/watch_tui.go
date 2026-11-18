@@ -10,8 +10,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -24,7 +22,6 @@ type WatchModel struct {
 	environment         string
 	applyID             string // When set, fetches progress by apply ID instead of database/environment
 	allowControlActions bool
-	maxTableNameLen     int
 	deployTriggered     bool
 	cutoverTriggered    bool
 	skipRevertTriggered bool
@@ -32,12 +29,23 @@ type WatchModel struct {
 	stopTriggered       bool
 
 	// State from API
-	state         string
-	tables        []tableProgress
-	operations    []templates.ProgressOperation
-	released      bool // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg      string
-	currentVolume int // Current volume (1-11)
+	state      string
+	tables     []templates.TableProgress
+	operations []templates.ProgressOperation
+	released   bool // apply-level release latch: a released pause runs degraded, not paused
+	// sharded is whether the apply is one change fanned out across its
+	// keyspaces' shards, so it renders without operation sections.
+	sharded bool
+	// deferCutover is whether the apply waits for an operator at each cutover.
+	deferCutover bool
+	// errorMsg is the error the view shows. It is display text only: a failed
+	// poll the watch is still retrying or a refused control request leaves it
+	// set while the watch carries on, so it does not decide the exit status.
+	errorMsg string
+	// followFailed is whether the watch ended because it could not follow the
+	// apply: the server answered with a permanent error, or polls kept failing
+	// until the watch gave up.
+	followFailed bool
 
 	// Engine metadata
 	engine           string // "Spirit", "PlanetScale", etc.
@@ -45,6 +53,9 @@ type WatchModel struct {
 	metadata         map[string]string // Full metadata from progress response
 
 	// UI state
+	// windowHeight is the terminal's height in rows, zero until the first
+	// window size message arrives.
+	windowHeight       int
 	pastPending        bool
 	detached           bool
 	quitting           bool
@@ -52,37 +63,10 @@ type WatchModel struct {
 	activityLabelFrame int
 	startedAt          time.Time
 	initialized        bool
-	volumeMode         bool // True when in volume adjustment mode
-	volumePending      int  // Pending volume change (0 = none)
-	volumeChanging     bool // True while volume change is in progress
-	consecutiveErrors  int  // Consecutive fetch failures (drives backoff)
-}
-
-// tableProgress represents progress for a single table.
-type tableProgress struct {
-	Name           string
-	Deployment     string
-	Keyspace       string
-	DDL            string
-	ChangeType     string
-	Status         string
-	RowsCopied     int64
-	RowsTotal      int64
-	Percent        int
-	ETASeconds     int64
-	ProgressDetail string
-	IsInstant      bool
-	Shards         []shardProgress
-}
-
-type shardProgress struct {
-	Shard           string
-	Status          string
-	RowsCopied      int64
-	RowsTotal       int64
-	Percent         int
-	ETASeconds      int64
-	CutoverAttempts int
+	consecutiveErrors  int // Consecutive fetch failures (drives backoff)
+	// requestedRetryDelay is the delay the last failed fetch asked for, which
+	// stretches the backoff before the next poll.
+	requestedRetryDelay time.Duration
 }
 
 var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -90,37 +74,22 @@ var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 // Messages
 type tickMsg time.Time
 
-// isRetryableFetchError reports whether a fetch error is retryable.
-//
-//   - ConnectionError (server unreachable): always retryable.
-//   - APIError with error code: classified by apitypes.IsRetryableErrorCode.
-//   - APIError without error code, or unknown error types: permanent.
-func isRetryableFetchError(err error) bool {
-	var connErr *client.ConnectionError
-	if errors.As(err, &connErr) {
-		return true
-	}
-	var apiErr *client.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode != "" {
-		return apitypes.IsRetryableErrorCode(apiErr.ErrorCode)
-	}
-	return false
-}
-
 type progressMsg struct {
-	state       string
-	tables      []tableProgress
-	operations  []templates.ProgressOperation
-	released    bool   // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg    string // Human-readable error message
-	failed      bool   // true when the API call didn't return usable progress data
-	retryable   bool   // when failed, whether the TUI should keep polling
-	volume      int
-	applyID     string            // Populated from progress responses
-	database    string            // Populated from apply-id progress responses
-	environment string            // Populated from apply-id progress responses
-	engine      string            // Engine name (e.g., "Spirit", "PlanetScale")
-	metadata    map[string]string // Engine metadata (e.g., deploy_request_url)
+	state        string
+	tables       []templates.TableProgress
+	operations   []templates.ProgressOperation
+	released     bool              // apply-level release latch: a released pause runs degraded, not paused
+	sharded      bool              // one change fanned out across its keyspaces' shards
+	deferCutover bool              // the apply waits for an operator at each cutover
+	errorMsg     string            // Human-readable error message
+	failed       bool              // true when the API call didn't return usable progress data
+	retryable    bool              // when failed, whether the TUI should keep polling
+	retryAfter   time.Duration     // when failed, the delay the response asked for before the next poll
+	applyID      string            // Populated from progress responses
+	database     string            // Populated from apply-id progress responses
+	environment  string            // Populated from apply-id progress responses
+	engine       string            // Engine name (e.g., "Spirit", "PlanetScale")
+	metadata     map[string]string // Engine metadata (e.g., deploy_request_url)
 }
 
 type cutoverResultMsg struct {
@@ -139,12 +108,6 @@ type stopResultMsg struct {
 	message string // Informational message from backend (e.g. "Schema change already completed")
 }
 
-type volumeResultMsg struct {
-	success   bool
-	newVolume int
-	err       error
-}
-
 // NewWatchModel creates a new WatchModel.
 func NewWatchModel(endpoint, database, environment string, allowControlActions bool) WatchModel {
 	s := spinner.New()
@@ -158,7 +121,6 @@ func NewWatchModel(endpoint, database, environment string, allowControlActions b
 		allowControlActions: allowControlActions,
 		spinner:             s,
 		startedAt:           time.Now(),
-		currentVolume:       4, // Default Spirit volume
 	}
 }
 
@@ -174,15 +136,11 @@ func (m WatchModel) Init() tea.Cmd {
 // Update implements tea.Model.
 func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.windowHeight = msg.Height
+		return m, nil
+
 	case tea.KeyMsg:
-		// During cutover, ignore all keyboard input except q to force quit
-		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
-
-		// Handle volume mode inputs
-		if m.volumeMode {
-			return m.handleVolumeKeys(msg)
-		}
-
 		if isEnterKey(msg) {
 			return m.handleEnterKey()
 		}
@@ -190,7 +148,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			// Don't allow detach during cutover
-			if isCuttingOver {
+			if m.cuttingOver() {
 				return m, nil
 			}
 			m.detached = true
@@ -199,20 +157,10 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "s", "c":
-			// Don't allow stop/cancel during cutover
-			if isCuttingOver {
-				return m, nil
-			}
 			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if state.IsState(m.state, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) && !m.stopTriggered {
+			if m.stopKeyAvailable() && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
-			}
-		case "v":
-			// Enter volume mode (only when running)
-			if state.IsRunningApplyState(m.state) && !isCuttingOver {
-				m.volumeMode = true
-				return m, nil
 			}
 		}
 
@@ -222,31 +170,40 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case progressMsg:
 		if msg.failed && msg.retryable {
 			// Transient error (connection refused, timeout, engine_unavailable).
-			// Preserve last known state and tables, keep polling with backoff.
+			// Preserve last known state and tables, keep polling with backoff
+			// until the same bound the non-interactive watches give up at.
 			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
+			m.requestedRetryDelay = msg.retryAfter
+			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
+				m.errorMsg = progressGiveUpMessage(m.applyID, m.environment, m.consecutiveErrors) + ": " + msg.errorMsg
+				m.initialized = true
+				m.followFailed = true
+				return m, tea.Quit
+			}
 			return m, nil
 		}
 		if msg.failed && !msg.retryable {
 			// Permanent error (not_found, invalid_request, deployment_not_found).
 			m.errorMsg = msg.errorMsg
 			m.initialized = true
+			m.followFailed = true
 			return m, tea.Quit
 		}
 
 		m.consecutiveErrors = 0
 		m.errorMsg = ""
+		m.requestedRetryDelay = 0
 		m.state = msg.state
 		if !state.IsState(m.state, state.Apply.Pending) {
 			m.pastPending = true
 		}
 
-		// Preserve last known tables during volume change to avoid visual reset
-		if !m.volumeChanging || len(m.tables) == 0 {
-			m.tables = msg.tables
-		}
+		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
+		m.sharded = msg.sharded
+		m.deferCutover = msg.deferCutover
 		m.errorMsg = msg.errorMsg
 
 		// Timeout skip-revert if state hasn't transitioned after 10s.
@@ -257,10 +214,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMsg = "skip-revert timed out — press Enter to retry"
 		}
 		m.initialized = true
-		// Update volume from API if not pending a change
-		if msg.volume > 0 && m.volumePending == 0 {
-			m.currentVolume = msg.volume
-		}
 		// Populate applyID/database/environment from response
 		if m.applyID == "" && msg.applyID != "" {
 			m.applyID = msg.applyID
@@ -291,23 +244,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Calculate max table name length for alignment
-		for _, t := range m.tables {
-			if len(t.Name) > m.maxTableNameLen {
-				m.maxTableNameLen = len(t.Name)
-			}
-		}
-
-		// Check for terminal states
-		if state.IsState(m.state, state.Apply.Completed, state.Apply.Failed) {
-			return m, tea.Quit
-		}
-		// Also quit on stopped/cancelled state
-		if state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled) {
-			return m, tea.Quit
-		}
-		// Quit if no active schema change
-		if state.IsState(m.state, state.NoActiveChange) {
+		if m.watchHasEnded() {
 			return m, tea.Quit
 		}
 
@@ -336,16 +273,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Continue polling - next tick will fetch updated state
 
-	case volumeResultMsg:
-		m.volumePending = 0      // Clear pending state
-		m.volumeChanging = false // Clear changing state
-		if msg.err != nil {
-			m.errorMsg = msg.err.Error()
-		} else if msg.success {
-			m.currentVolume = msg.newVolume
-			m.errorMsg = "" // Clear any previous error
-		}
-
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.activityLabelFrame = (m.activityLabelFrame + 1) % len(activityLabelFrames)
@@ -354,6 +281,21 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// cuttingOver reports whether a cutover is underway or was requested from this
+// watcher. During cutover the watcher ignores every key but q.
+func (m WatchModel) cuttingOver() bool {
+	return state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
+}
+
+// stopKeyAvailable reports whether the apply is in a state the s (or c) key
+// stops, so a footer advertises the key exactly where pressing it acts.
+func (m WatchModel) stopKeyAvailable() bool {
+	if m.cuttingOver() {
+		return false
+	}
+	return state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)
 }
 
 func isEnterKey(msg tea.KeyMsg) bool {
@@ -416,12 +358,28 @@ func runWatchModel(model WatchModel) (err error) {
 	// Don't use alt-screen - render inline for seamless experience
 	p := tea.NewProgram(model)
 	finalModel, err := p.Run()
-	if err != nil {
-		printExitContext(model.applyID, "", model.environment)
-		return err
-	}
+	return watchExit(model, finalModel, err)
+}
 
-	m := finalModel.(WatchModel)
+// watchExit is the result of a watch whose program has returned. An interrupt
+// signal reaches the program as a signal rather than a keystroke when stdin is
+// not a terminal, and ends it with tea.ErrInterrupted; that is the operator
+// leaving, the same as a Ctrl-C keystroke, so it exits as a detach rather than
+// as an error. Any other run error is reported as it is. Otherwise the final
+// model decides, as exitError says.
+func watchExit(started WatchModel, finalModel tea.Model, runErr error) error {
+	m, ok := finalModel.(WatchModel)
+	if !ok {
+		m = started
+	}
+	if errors.Is(runErr, tea.ErrInterrupted) {
+		printExitContext(m.applyID, m.deployRequestURL, m.environment)
+		return detachedFromWatch()
+	}
+	if runErr != nil {
+		printExitContext(started.applyID, "", started.environment)
+		return runErr
+	}
 
 	// Completed applies render their apply ID in the success line. Other exits
 	// need explicit context so operators can resume monitoring or investigate.
@@ -429,16 +387,28 @@ func runWatchModel(model WatchModel) (err error) {
 		printExitContext(m.applyID, m.deployRequestURL, m.environment)
 	}
 
-	// The TUI view already displays errors inline, so return ErrSilent
-	// to exit with code 1 without printing the error again.
-	if m.errorMsg != "" && !state.IsState(m.state, state.Apply.Completed) {
-		return ErrSilent
-	}
-	if state.IsState(m.state, state.Apply.Failed) {
-		return ErrSilent
-	}
+	return m.exitError()
+}
 
-	return nil
+// exitError is the watch's exit status for its final model, the same rule the
+// non-interactive watch follows. A watch that could not follow the apply fails.
+// A watch that followed the apply to its end exits as applyEndExit says: only a
+// completed apply succeeds, and the view already shows the outcome, including
+// the start command for a stopped apply. Anything else is the operator leaving
+// while the apply carries on (Esc, Ctrl-C, q, or SIGTERM), including leaving
+// before the first poll has answered: that is not an outcome, so it exits
+// ExitInterrupted, the status a Ctrl-C ends a log watch with, rather than 0,
+// which a script reads as the schema change being done, or 1, which it reads
+// as the apply having failed.
+func (m WatchModel) exitError() error {
+	switch {
+	case m.followFailed:
+		return ErrSilent
+	case m.initialized && m.watchHasEnded():
+		return applyEndExit(m.state)
+	default:
+		return detachedFromWatch()
+	}
 }
 
 // printExitContext prints apply context on any TUI exit so operators
@@ -462,11 +432,7 @@ func formatExitContext(applyID, deployRequestURL, environment string) string {
 	if deployRequestURL != "" {
 		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
 	}
-	cmd := fmt.Sprintf("schemabot progress %s", applyID)
-	if environment != "" {
-		cmd += " -e " + environment
-	}
-	fmt.Fprintf(&b, "  Resume:    %s\n", cmd)
+	fmt.Fprintf(&b, "  Resume:    %s\n", templates.ProgressCommand(applyID, environment))
 	b.WriteString("\n")
 	return b.String()
 }

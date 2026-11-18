@@ -79,9 +79,9 @@ func TestLocalClient_ResumeRefusesApplyOutsideDatabaseScope(t *testing.T) {
 	require.NoError(t, err)
 	apply.ID = applyID
 
-	// The claim itself succeeds — FindNextApply has no deployment filter, which
+	// The claim itself succeeds — claiming has no deployment filter, which
 	// is exactly why the drive has to be the fail-closed layer.
-	claimed, err := stor.Applies().FindNextApply(ctx, "test-operator-"+t.Name())
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-operator-"+t.Name())
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)

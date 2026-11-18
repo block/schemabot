@@ -7,11 +7,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -91,6 +89,12 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_PENDING
 	case state.Task.Running:
 		return ternv1.State_STATE_RUNNING
+	case state.Task.CatchingUp:
+		return ternv1.State_STATE_CATCHING_UP
+	case state.Task.Checksumming:
+		return ternv1.State_STATE_CHECKSUMMING
+	case state.Task.PostChecksum:
+		return ternv1.State_STATE_POST_CHECKSUM
 	case state.Task.WaitingForDeploy:
 		return ternv1.State_STATE_WAITING_FOR_DEPLOY
 	case state.Task.WaitingForCutover:
@@ -108,7 +112,7 @@ func storageStateToProto(ts string) ternv1.State {
 	case state.Task.Failed:
 		return ternv1.State_STATE_FAILED
 	case state.Task.FailedRetryable, state.Apply.FailedRetryable:
-		return ternv1.State_STATE_FAILED
+		return ternv1.State_STATE_FAILED_RETRYABLE
 	case state.Task.Stopped:
 		return ternv1.State_STATE_STOPPED
 	case state.Task.Cancelled:
@@ -132,48 +136,16 @@ func storageStateToProto(ts string) ternv1.State {
 	}
 }
 
-// changeTypeToProto converts a Spirit StatementType to the proto ChangeType enum.
-func changeTypeToProto(op statement.StatementType) ternv1.ChangeType {
-	switch op {
-	case statement.StatementCreateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case statement.StatementAlterTable:
-		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case statement.StatementDropTable:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP
-	default:
-		return ternv1.ChangeType_CHANGE_TYPE_OTHER
-	}
-}
-
-// ddlActionToProtoChangeType converts a task's DDLAction string to a proto ChangeType.
-// Handles vschema_update which doesn't come from Spirit's statement parser.
-func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
-	switch action {
-	case "vschema_update":
-		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
-	default:
-		return changeTypeToProto(ddl.OpToStatementType(action))
-	}
-}
-
 // protoChangeTypeToDDLAction converts a proto ChangeType back to the lowercase
 // DDLAction string used in storage. It is the inverse of
-// ddlActionToProtoChangeType and is used to rebuild a plan's table changes from
-// a dispatch request on a deployment that did not plan locally.
+// ternconv.OpToChangeType and is used to rebuild a plan's table changes from
+// a dispatch request on a deployment that did not plan locally. Unmapped values
+// use "unknown" so callers can recover the action from the authoritative DDL.
 func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
-	default:
-		return "unknown"
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
+	return "unknown"
 }
 
 // filterTasksByApply returns only tasks belonging to the specified apply, sorted by ID (execution order).
@@ -201,6 +173,12 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Pending
 	case ternv1.State_STATE_RUNNING:
 		return state.Apply.Running
+	case ternv1.State_STATE_CATCHING_UP:
+		return state.Apply.CatchingUp
+	case ternv1.State_STATE_CHECKSUMMING:
+		return state.Apply.Checksumming
+	case ternv1.State_STATE_POST_CHECKSUM:
+		return state.Apply.PostChecksum
 	case ternv1.State_STATE_WAITING_FOR_DEPLOY:
 		return state.Apply.WaitingForDeploy
 	case ternv1.State_STATE_WAITING_FOR_CUTOVER:
@@ -217,6 +195,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Completed
 	case ternv1.State_STATE_FAILED:
 		return state.Apply.Failed
+	case ternv1.State_STATE_FAILED_RETRYABLE:
+		return state.Apply.FailedRetryable
 	case ternv1.State_STATE_STOPPED:
 		return state.Apply.Stopped
 	case ternv1.State_STATE_CANCELLED:
@@ -403,13 +383,14 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 
 // PSDisplayMetadataStorageBlob converts a progress response's display
 // metadata — the map a data-plane progress poll returns (deploy_request_url, the
-// encoded VSchema status, instant/deferred flags) — back into the stored
-// psMetadataForStorage JSON that the PR comment's display projection
-// (resolveDisplayByOperation → PSDisplayMetadata) reads. For a remote (gRPC)
-// apply the engine runs in the data plane, so its resume metadata never lands on
-// the control-plane operation; mirroring these display fields is how the comment
-// surfaces the deploy-request link and VSchema status. Returns "" when there is
-// nothing worth storing, so callers leave the operation's metadata untouched.
+// encoded VSchema status, instant/deferred flags, the revert-window deadline) —
+// back into the stored psMetadataForStorage JSON that the PR comment's display
+// projection (resolveDisplayByOperation → PSDisplayMetadata) reads. For a remote
+// (gRPC) apply the engine runs in the data plane, so its resume metadata never
+// lands on the control-plane operation; mirroring these display fields is how
+// the comment surfaces the deploy-request link, VSchema status, and revert-window
+// countdown. Returns "" when there is nothing worth storing, so callers leave
+// the operation's metadata untouched.
 func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 	if len(md) == 0 {
 		return "", nil
@@ -419,6 +400,13 @@ func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 		DeployRequestURL: md["deploy_request_url"],
 		IsInstant:        md["is_instant"] == "true",
 		DeferredDeploy:   md["deferred_deploy"] == "true",
+	}
+	if raw := md["revert_expires_at"]; raw != "" {
+		expires, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return "", fmt.Errorf("parse revert_expires_at %q from display metadata: %w", raw, err)
+		}
+		m.RevertExpiresAt = &expires
 	}
 	changes, err := apitypes.ParseVSchemaChanges(md)
 	if err != nil {
@@ -430,7 +418,7 @@ func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 		}
 		m.VSchemaDiffs = append(m.VSchemaDiffs, vschemaKeyspaceDiff{Namespace: ch.Namespace, Diff: ch.Diff})
 	}
-	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 {
+	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 && m.RevertExpiresAt == nil {
 		return "", nil
 	}
 	encoded, err := json.Marshal(m)

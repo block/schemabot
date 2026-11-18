@@ -1,12 +1,243 @@
 package webhook
 
 import (
+	"errors"
+	"fmt"
+	"regexp"
 	"testing"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// An apply the database type refused for a requested feature is told which
+// feature was refused and the command to re-issue without the option that asked
+// for it, in the environment the refused command named, so the operator's next
+// action is in the comment rather than left to be inferred from the refusal.
+func TestApplyExecutionErrorMessage(t *testing.T) {
+	t.Run("unsupported feature names the command to re-issue without the option", func(t *testing.T) {
+		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover}
+		assert.Equal(t,
+			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
+				"Run `schemabot apply -e production` again without `--defer-cutover`.",
+			applyExecutionErrorMessage(action.Apply, "production", "", err))
+	})
+
+	t.Run("unsupported feature no command option requests has no remedy", func(t *testing.T) {
+		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureMultiTarget}
+		msg := applyExecutionErrorMessage(action.Apply, "staging", "", err)
+		assert.Equal(t, err.Error()+".", msg)
+		assert.NotContains(t, msg, "again without")
+	})
+
+	t.Run("lock intent change remains actionable", func(t *testing.T) {
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "staging", "", fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
+	})
+
+	// A refusal of one target's own plan names that target and the table, from
+	// fields SchemaBot controls, so the engine's reason and the plan identifier
+	// in the underlying error never reach the comment.
+	t.Run("member plan refusal names the target", func(t *testing.T) {
+		cause := errors.New("stored plan plan-7f3a contains a blocked change for table \"orders\": dial tcp 10.0.0.7:3306")
+		blocked := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanBlocked, Table: "orders", Err: cause,
+		})
+		msg := applyExecutionErrorMessage(action.Apply, "production", "", blocked)
+		assert.Equal(t, "Target `payments-002` has a change on table `orders` that its engine refuses to execute, so nothing was applied. Fix what that target's plan names as the reason, then run the command again.", msg)
+		assert.NotContains(t, msg, "10.0.0.7")
+		assert.NotContains(t, msg, "plan-7f3a")
+
+		unsafe := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Table: "legacy_orders", Err: cause,
+		})
+		msg = applyExecutionErrorMessage(action.Apply, "production", "", unsafe)
+		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders` that the plan comment never showed, so nothing was applied. Run apply again for this environment: its comment shows each target's own plan, and `--allow-unsafe` can then consent to this change.", msg)
+		assert.NotContains(t, msg, "10.0.0.7")
+		assert.NotContains(t, msg, "plan-7f3a")
+
+		vschema := &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Namespace: "ns_0", Err: cause,
+		}
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", "", vschema), "an unsafe change on the VSchema of namespace `ns_0` that the plan comment never showed")
+
+		unknown := &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanRefusal(99), Table: "orders", Err: cause,
+		}
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "production", "", unknown),
+			"a refusal kind with no line of its own never renders the error text")
+	})
+
+	// A stored plan the apply cannot run is named from the fields SchemaBot
+	// stored with it, followed by the apply that creates a new plan; the
+	// refusal's text, written for an API caller, never reaches the comment.
+	t.Run("plan refusals name the plan and the apply to re-plan", func(t *testing.T) {
+		const replan = "Run `schemabot apply -e production` to create a new plan."
+		tests := []struct {
+			name string
+			err  error
+			want string
+		}{
+			{
+				name: "not found",
+				err:  &api.PlanNotFoundError{PlanID: "plan-7f3a"},
+				want: "Plan `plan-7f3a` no longer exists, so nothing was applied. " + replan,
+			},
+			{
+				name: "environment mismatch",
+				err:  &api.PlanEnvironmentMismatchError{PlanID: "plan-7f3a", PlanEnvironment: "staging", RequestedEnvironment: "production"},
+				want: "Plan `plan-7f3a` was created for `staging`, not `production`, so nothing was applied. " + replan,
+			},
+			{
+				name: "missing routing",
+				err:  &api.PlanRoutingMetadataError{PlanID: "plan-7f3a", Field: "target"},
+				want: "Plan `plan-7f3a` was stored without its `target`, so SchemaBot cannot route it and nothing was applied. " + replan,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", "", tt.err)
+				assert.Equal(t, tt.want, msg)
+				assert.NotContains(t, msg, tt.err.Error())
+			})
+		}
+	})
+
+	t.Run("internal error remains sanitized", func(t *testing.T) {
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "staging", "", errors.New("secret DSN")))
+	})
+}
+
+// A rollback-confirm whose lock stopped pinning the confirmed plan is told that
+// nothing ran and to plan a fresh rollback, in SchemaBot's words rather than
+// the storage error's. A rollback the database type cannot run is told which
+// feature was refused and the rollback-confirm to re-issue without the option
+// that asked for it, because retrying the same command would be refused the
+// same way and the refusal left the pinned rollback in place for the re-issue.
+// Every other dispatch failure stays in server logs behind fixed guidance that
+// does not promise a retry will succeed.
+func TestRollbackExecutionErrorMessage(t *testing.T) {
+	t.Run("lock intent change coaches a fresh rollback", func(t *testing.T) {
+		msg := rollbackExecutionErrorMessage("staging", "", fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
+		assert.Equal(t, msgRollbackLockIntentChanged, msg)
+		assert.Contains(t, msg, "nothing was applied")
+		assert.Contains(t, msg, "run the rollback command again")
+		assert.NotContains(t, msg, storage.ErrLockIntentChanged.Error())
+	})
+
+	t.Run("unsupported feature names the refused feature and the rollback-confirm to re-issue", func(t *testing.T) {
+		err := fmt.Errorf("execute apply: %w", &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover})
+		assert.Equal(t,
+			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
+				"Run `schemabot rollback-confirm -e staging` again without `--defer-cutover`. "+
+				"The pending rollback stays pinned for it.",
+			rollbackExecutionErrorMessage("staging", "", err))
+	})
+
+	// A stored plan the dispatch cannot run is named from the fields SchemaBot
+	// stored with it, followed by the commands that replace it; the refusal's
+	// text, written for an API caller, never reaches the comment.
+	t.Run("plan refusals name the plan and the rollback to re-plan", func(t *testing.T) {
+		const replan = "Run `schemabot rollback -e staging` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`."
+		tests := []struct {
+			name string
+			err  error
+			want string
+		}{
+			{
+				name: "not found",
+				err:  &api.PlanNotFoundError{PlanID: "rbplan-1"},
+				want: "Plan `rbplan-1` no longer exists, so nothing was applied. " + replan,
+			},
+			{
+				name: "environment mismatch",
+				err:  &api.PlanEnvironmentMismatchError{PlanID: "rbplan-1", PlanEnvironment: "production", RequestedEnvironment: "staging"},
+				want: "Plan `rbplan-1` was created for `production`, not `staging`, so nothing was applied. " + replan,
+			},
+			{
+				name: "missing routing",
+				err:  &api.PlanRoutingMetadataError{PlanID: "rbplan-1", Field: "deployment"},
+				want: "Plan `rbplan-1` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. " + replan,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				msg := rollbackExecutionErrorMessage("staging", "", fmt.Errorf("execute apply: %w", tt.err))
+				assert.Equal(t, tt.want, msg)
+				assert.NotContains(t, msg, tt.err.Error())
+				assert.NotContains(t, msg, "execute apply")
+			})
+		}
+	})
+
+	t.Run("internal errors use fixed guidance without a retry promise", func(t *testing.T) {
+		err := errors.New("dial tcp storage.internal:3306: connection refused")
+		msg := rollbackExecutionErrorMessage("staging", "", err)
+		assert.Equal(t, "Failed to execute rollback. See SchemaBot server logs for details.", msg)
+		assert.NotContains(t, msg, err.Error())
+		assert.NotContains(t, msg, "retry")
+	})
+}
+
+// On a deployment with a tenant, every command a dispatch failure coaches
+// carries it, so a pasted command addresses this deployment instead of being
+// ignored as unscoped.
+func TestDispatchErrorMessagesCarryTenant(t *testing.T) {
+	refused := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover}
+	missing := &api.PlanNotFoundError{PlanID: "plan-7f3a"}
+
+	assert.Contains(t, applyExecutionErrorMessage(action.ApplyConfirm, "production", "acme", refused),
+		"Run `schemabot apply-confirm -e production --tenant acme` again without `--defer-cutover`.")
+	assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", "acme", missing),
+		"Run `schemabot apply -e production --tenant acme` to create a new plan.")
+	assert.Contains(t, rollbackExecutionErrorMessage("staging", "acme", refused),
+		"Run `schemabot rollback-confirm -e staging --tenant acme` again without `--defer-cutover`.")
+	assert.Equal(t,
+		"Plan `plan-7f3a` no longer exists, so nothing was applied. Run `schemabot rollback -e staging --tenant acme` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging --tenant acme`.",
+		rollbackExecutionErrorMessage("staging", "acme", missing))
+}
+
+// Every command a plan refusal coaches is answered when an operator pastes it
+// as written: the parser reads it as the command it names, never as a
+// sentence about SchemaBot that it stays silent on.
+func TestPlanRefusalReplanCommandsParseAsCommands(t *testing.T) {
+	refusal := &api.PlanRoutingMetadataError{PlanID: "rbplan-1", Field: "deployment"}
+	spans := regexp.MustCompile("`(schemabot [^`]+)`")
+	parser := NewCommandParser()
+	for name, msg := range map[string]string{
+		"apply":           applyExecutionErrorMessage(action.ApplyConfirm, "staging", "", refusal),
+		"apply tenant":    applyExecutionErrorMessage(action.ApplyConfirm, "staging", "acme", refusal),
+		"rollback":        rollbackExecutionErrorMessage("staging", "", refusal),
+		"rollback tenant": rollbackExecutionErrorMessage("staging", "acme", refusal),
+	} {
+		commands := spans.FindAllStringSubmatch(msg, -1)
+		require.NotEmpty(t, commands, name)
+		for _, c := range commands {
+			result := parser.ParseCommand(c[1])
+			assert.False(t, result.ProseMention, "%s: pasting %q is read as prose and goes unanswered", name, c[1])
+			assert.NotEmpty(t, result.Action, "%s: %q", name, c[1])
+		}
+	}
+}
+
+func TestPendingRollbackApplyRefusal(t *testing.T) {
+	t.Run("loaded plan offers confirmation in its environment", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", &storage.Plan{Environment: "staging"})
+		assert.Contains(t, msg, "schemabot rollback-confirm -e staging")
+		assert.Contains(t, msg, "schemabot unlock")
+	})
+
+	t.Run("unavailable plan only offers unlock", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", nil)
+		assert.Contains(t, msg, "rollback plan that is unavailable")
+		assert.Contains(t, msg, "schemabot unlock")
+		assert.NotContains(t, msg, "rollback-confirm")
+	})
+}
 
 func TestDDLMatchesStoredPlan(t *testing.T) {
 	tests := []struct {
@@ -197,4 +428,447 @@ func TestDDLMatchesStoredPlan(t *testing.T) {
 			assert.Equal(t, tt.wantMatch, ddlMatchesStoredPlan(tt.planResp, tt.storedPlan))
 		})
 	}
+}
+
+// The consent recorded on a pending confirmation only speaks for the apply the
+// operator was actually shown. The lock carries no environment, so a disclosure
+// earned confirming one environment must not disarm the copy gate in another,
+// and a confirmation whose plan cannot be loaded must count as no disclosure at
+// all rather than as consent.
+func TestDisclosureDescribesThisApply(t *testing.T) {
+	disclosed := []storage.DisclosedCopy{{Namespace: "app", Tables: []string{"events"}}}
+	tests := []struct {
+		name        string
+		lock        *storage.Lock
+		plan        *storage.Plan
+		environment string
+		want        []storage.DisclosedCopy
+	}{
+		{
+			name:        "disclosure shown for this environment is consent",
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
+			want:        disclosed,
+		},
+		{
+			name:        "disclosure shown for another environment is not consent",
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "production",
+		},
+		{
+			name:        "no disclosure is not consent",
+			lock:        &storage.Lock{PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
+		},
+		{
+			name:        "a flag without the copies it disclosed is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
+		},
+		{
+			name:        "a disclosure whose plan did not load is not consent",
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
+			plan:        nil,
+			environment: "staging",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, disclosureDescribesThisApply(tt.lock, tt.plan, tt.environment))
+		})
+	}
+}
+
+// Consent to discard is consent to the copies the comment named, on the
+// targets it named them on. A copy the re-plan would discard that the comment
+// did not name stops the apply, even when the comment disclosed another copy,
+// while a re-reading of a disclosed copy that lists its tables in another order
+// is the same copy.
+func TestUndisclosedDiscards(t *testing.T) {
+	euEvents := storage.DisclosedCopy{Target: "eu", Namespace: "app", Tables: []string{"events"}, Statement: "ALTER TABLE `events` ADD INDEX `idx_actor_id` (`actor_id`)"}
+	usEvents := euEvents
+	usEvents.Target = "us"
+	primaryEvents := euEvents
+	primaryEvents.Target = ""
+
+	tests := []struct {
+		name       string
+		discarding []storage.DisclosedCopy
+		disclosed  []storage.DisclosedCopy
+		want       int
+	}{
+		{name: "nothing discarded", disclosed: []storage.DisclosedCopy{euEvents}},
+		{name: "the disclosed copy", discarding: []storage.DisclosedCopy{euEvents}, disclosed: []storage.DisclosedCopy{euEvents}},
+		{name: "the same copy on another target", discarding: []storage.DisclosedCopy{euEvents, usEvents}, disclosed: []storage.DisclosedCopy{euEvents}, want: 1},
+		{name: "a copy on the primary target when only another target's was disclosed", discarding: []storage.DisclosedCopy{primaryEvents}, disclosed: []storage.DisclosedCopy{euEvents}, want: 1},
+		{name: "a discard with no disclosure", discarding: []storage.DisclosedCopy{euEvents}, want: 1},
+		{
+			name:       "another statement's copy of the same table",
+			discarding: []storage.DisclosedCopy{{Target: "eu", Namespace: "app", Tables: []string{"events"}, Statement: "ALTER TABLE `events` ADD COLUMN `region` varchar(16)"}},
+			disclosed:  []storage.DisclosedCopy{euEvents},
+			want:       1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, undisclosedDiscards(tt.discarding, tt.disclosed))
+		})
+	}
+
+	// The tables of a copy are sorted when it is named, so reading them in
+	// another order names the same copy.
+	a := disclosedCopyOf("eu", &apitypes.ExistingCopyResponse{Namespace: "app", Tables: []string{"orders", "events"}})
+	b := disclosedCopyOf("eu", &apitypes.ExistingCopyResponse{Namespace: "app", Tables: []string{"events", "orders"}})
+	assert.Equal(t, []string{"events", "orders"}, a.Tables)
+	assert.Zero(t, undisclosedDiscards([]storage.DisclosedCopy{a}, []storage.DisclosedCopy{b}))
+}
+
+// The drift disclosure names what moved, per table, so the operator can see it
+// without diffing two comments themselves. It reports both directions — a
+// change this plan added, and one the plan behind the apply had that this one
+// does not — since either is a reason to look again before confirming.
+func TestPlanDriftCause(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+				{TableName: "products", ChangeType: "alter", DDL: "ALTER TABLE `products` ADD INDEX `idx_sku` (`sku`)"},
+			}},
+		},
+	}
+	storedPlan := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+				{Table: "shipments", Operation: "create", DDL: "CREATE TABLE `shipments` (`id` bigint)"},
+			}},
+		},
+	}
+
+	cause := planDriftCause(planResp, storedPlan)
+
+	assert.Equal(t, "Schema changes differ from the plan this apply was started from", cause.Heading)
+	assert.Equal(t, []string{
+		"`products` (alter) is new",
+		"`shipments` (create) is no longer planned",
+	}, cause.Entries, "the unchanged `users` alter is not drift and is not listed")
+}
+
+// A rollout's cause says, per target, what moved in its plan. A table change is
+// named as on a single target; one changed target is named in the heading, so
+// its entries leave the name off, while entries spanning several targets each
+// start with theirs. A plan whose statements are the same but which differs in
+// how they run, or a target that gained or lost its only work, still gets one
+// entry, so no changed target goes unnamed.
+func TestTargetPlanDriftEntries(t *testing.T) {
+	alter := func(ddl string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{{Table: "users", Operation: "alter", DDL: ddl}}},
+		}}
+	}
+	addEmail := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	modifyEmail := "ALTER TABLE `users` MODIFY COLUMN `email` varchar(255)"
+	direct := alter(addEmail)
+	direct.Namespaces["mydb"].Tables[0].ExecutionMode = "direct"
+
+	assert.Equal(t, []string{"`users` (alter) now runs a different statement"},
+		targetPlanDriftEntries(alter(addEmail), alter(modifyEmail), ""))
+	assert.Equal(t, []string{"Target `us`: `users` (alter) now runs a different statement"},
+		targetPlanDriftEntries(alter(addEmail), alter(modifyEmail), "us"))
+	assert.Equal(t, []string{"Target `us`: `users` (alter) is new"},
+		targetPlanDriftEntries(nil, alter(addEmail), "us"))
+	assert.Equal(t, []string{"How its statements run changed"},
+		targetPlanDriftEntries(alter(addEmail), direct, ""))
+	assert.Equal(t, []string{"Target `us`: how its statements run changed"},
+		targetPlanDriftEntries(alter(addEmail), direct, "us"))
+	assert.Empty(t, targetPlanDriftEntries(alter(addEmail), alter(addEmail), "us"), "an unchanged plan has no entry")
+	assert.Empty(t, targetPlanDriftEntries(nil, &storage.Plan{}, "us"), "a target with nothing to do then or now has no entry")
+}
+
+// A re-plan that differs in dozens of changes has already made its point, and
+// listing every one buries the statements the operator came to read.
+func TestPlanDriftCauseCapsTheEntryList(t *testing.T) {
+	var tableChanges []*apitypes.TableChangeResponse
+	for i := range planDriftEntryCap + 3 {
+		tableChanges = append(tableChanges, &apitypes.TableChangeResponse{
+			TableName:  fmt.Sprintf("t%02d", i),
+			ChangeType: "create",
+			DDL:        fmt.Sprintf("CREATE TABLE `t%02d` (`id` bigint)", i),
+		})
+	}
+
+	cause := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{Namespace: "mydb", TableChanges: tableChanges}}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+	)
+
+	assert.Len(t, cause.Entries, planDriftEntryCap+1)
+	assert.Equal(t, "and 3 more changes", cause.Entries[planDriftEntryCap])
+}
+
+// The likeliest drift is an amended statement on a table both plans carry: a
+// commit lands between the plan and the apply that changes the same ALTER. The
+// entry names the table and the operation, so reporting that as an addition and
+// a removal would assert the same change is both present and absent, with the
+// statement that tells them apart left out by design.
+func TestPlanDriftCauseReportsAnAmendedStatementOnce(t *testing.T) {
+	cause := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` varchar(500)"},
+			}},
+		}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `notes` varchar(255)"},
+			}},
+		}},
+	)
+
+	assert.Equal(t, []string{
+		"`orders` (alter) now runs a different statement",
+	}, cause.Entries)
+}
+
+// Two keyspaces can carry the same table under the same operation, so an entry
+// that named the table alone would report one keyspace's change as another's
+// removal. The namespace appears only when the drift spans more than one.
+func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
+	sameTableTwoKeyspaces := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "shard_a", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
+			}},
+		}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"shard_b": {Tables: []storage.TableChange{
+				{Table: "orders", Operation: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
+			}},
+		}},
+	)
+	assert.Equal(t, []string{
+		"`orders` in `shard_a` (create) is new",
+		"`orders` in `shard_b` (create) is no longer planned",
+	}, sameTableTwoKeyspaces.Entries)
+
+	oneKeyspace := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "create", DDL: "CREATE TABLE `orders` (`id` bigint)"},
+			}},
+		}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+	)
+	assert.Equal(t, []string{
+		"`orders` (create) is new",
+	}, oneKeyspace.Entries)
+}
+
+// A re-plan can route a statement to direct execution that the plan behind the
+// apply's comment ran through the engine, with the same DDL. Only those
+// statements are newly direct: one already disclosed as direct, or one that
+// now runs through the engine instead, was not hidden from the operator.
+func TestNewlyDirectChanges(t *testing.T) {
+	const swap = "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"
+	const addColumn = "ALTER TABLE `orders` ADD COLUMN `notes` text"
+	replan := func(usersMode, ordersMode string) *apitypes.PlanResponse {
+		return &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", ChangeType: "alter", DDL: swap, ExecutionMode: usersMode},
+				{TableName: "orders", ChangeType: "alter", DDL: addColumn, ExecutionMode: ordersMode},
+			}},
+		}}
+	}
+	stored := func(usersMode string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", Operation: "alter", DDL: swap, ExecutionMode: usersMode},
+				{Table: "orders", Operation: "alter", DDL: addColumn},
+			}},
+		}}
+	}
+
+	t.Run("statement the plan ran through the engine is newly direct", func(t *testing.T) {
+		assert.Equal(t, []directChangeIdentity{{namespace: "mydb", table: "users", ddl: swap}},
+			newlyDirectChanges(replan("direct", ""), stored("")))
+	})
+	t.Run("statement the plan already disclosed as direct is not", func(t *testing.T) {
+		assert.Empty(t, newlyDirectChanges(replan("direct", ""), stored("direct")))
+	})
+	t.Run("statement that stops being direct is not", func(t *testing.T) {
+		assert.Empty(t, newlyDirectChanges(replan("", ""), stored("direct")))
+	})
+	t.Run("every newly direct statement is returned in table order", func(t *testing.T) {
+		assert.Equal(t, []directChangeIdentity{
+			{namespace: "mydb", table: "orders", ddl: addColumn},
+			{namespace: "mydb", table: "users", ddl: swap},
+		}, newlyDirectChanges(replan("direct", "direct"), stored("")))
+	})
+	t.Run("a shard newly direct is newly direct even when another shard was disclosed", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "ks", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			{Namespace: "ks", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+		}}
+		storedPlan := &storage.Plan{Shards: []storage.ShardPlan{
+			{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			{Namespace: "ks", Shard: "80-", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+		}}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", shard: "80-", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan))
+	})
+	t.Run("a sharded namespace is judged by its shard rows, not its namespace summary", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{
+				{Namespace: "ks", TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []*apitypes.ShardPlanResponse{
+				{Namespace: "ks", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+		}
+		storedPlan := &storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks": {Tables: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []storage.ShardPlan{
+				{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+			},
+		}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", shard: "-80", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan),
+			"one entry for the shard, and the namespace summary neither adds one nor counts as disclosure")
+	})
+	t.Run("a namespace summary the disclosed plan rendered per shard does not disclose an unsharded re-plan", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "ks", TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+		}}
+		storedPlan := &storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks": {Tables: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []storage.ShardPlan{
+				{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+			},
+		}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan))
+	})
+	t.Run("statement differing only in surrounding whitespace is the same statement", func(t *testing.T) {
+		storedPlan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", DDL: "\n" + swap + "\n", ExecutionMode: "direct"},
+				{Table: "orders", DDL: addColumn},
+			}},
+		}}
+		assert.Empty(t, newlyDirectChanges(replan("direct", ""), storedPlan))
+	})
+}
+
+func TestNewlyDirectCauseNamesEachTable(t *testing.T) {
+	cause := newlyDirectCause([]directChangeIdentity{
+		{namespace: "mydb", table: "users", ddl: "ALTER TABLE `users` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "-80", table: "events", ddl: "ALTER TABLE `events` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "80-", table: "events", ddl: "ALTER TABLE `events` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "80-", table: "orders", ddl: "ALTER TABLE `orders` DROP PRIMARY KEY"},
+	})
+	assert.Equal(t, "Changes run differently from the plan this apply was started from", cause.Heading)
+	assert.Equal(t, []string{
+		"`users` now runs as direct execution",
+		"`events` (shards `-80`, `80-`) now runs as direct execution",
+		"`orders` (shard `80-`) now runs as direct execution",
+	}, cause.Entries)
+}
+
+// A multi-target rollout shape refused at apply creation is named in the PR
+// comment with the command that runs instead. A refused --defer-cutover is
+// re-issued without the flag, and a rollback keeps its pin for that. A refused
+// multi-deployment shape is refused however the command is re-issued, so the
+// remedy is a fresh apply of one target, and a rollback, which cannot be
+// narrowed to a target, is told to revert in a new PR instead.
+func TestRolloutShapeRefusalMessage(t *testing.T) {
+	deferred := &api.RolloutShapeRefusedError{Database: "orders", Environment: "production", Refusal: api.RolloutDeferCutoverRefused, Targets: 2, Deployments: 1, FirstTarget: "orders-001"}
+	spanning := &api.RolloutShapeRefusedError{Database: "orders", Environment: "production", Refusal: api.RolloutMultiTargetDeploymentsRefused, Targets: 3, Deployments: 2, FirstTarget: "orders-001"}
+	wrapped := func(err error) error { return fmt.Errorf("create apply: %w", err) }
+
+	assert.Equal(t,
+		"`--defer-cutover` is not supported on an apply to more than one target: each target runs its cutover as its table finishes. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
+		applyExecutionErrorMessage(action.ApplyConfirm, "production", "", wrapped(deferred)))
+	assert.Equal(t,
+		"`--defer-cutover` is not supported on an apply to more than one target: each target runs its cutover as its table finishes. Run `schemabot rollback-confirm -e production` again without `--defer-cutover`. The pending rollback stays pinned for it.",
+		rollbackExecutionErrorMessage("production", "", wrapped(deferred)))
+	assert.Equal(t,
+		"An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with `schemabot apply -e production --target orders-001`.",
+		applyExecutionErrorMessage(action.ApplyConfirm, "production", "", wrapped(spanning)))
+	assert.Equal(t,
+		"A rollback to more than one deployment is not currently supported when a deployment has several targets. Release this PR's lock with `schemabot unlock`, then revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --target orders-001`.",
+		rollbackExecutionErrorMessage("production", "", wrapped(spanning)))
+
+	// A tenant deployment ignores a pasted command without its tenant, so
+	// every command the refusal names carries it.
+	assert.Contains(t, applyExecutionErrorMessage(action.ApplyConfirm, "production", "acme", wrapped(deferred)),
+		"Run `schemabot apply-confirm -e production --tenant acme` again without `--defer-cutover`.")
+	assert.Contains(t, rollbackExecutionErrorMessage("production", "acme", wrapped(spanning)),
+		"Release this PR's lock with `schemabot unlock --tenant acme`, then revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --tenant acme --target orders-001`.")
+}
+
+// A deferred apply refused for capacity tells the operator in plain words why
+// its cutover can't be deferred and names the command to re-issue without
+// --defer-cutover: `apply` for an apply, never `apply-confirm`, and
+// `rollback-confirm` for a rollback, whose pinned plan it re-confirms. An apply wider than max_drivers_per_apply names the setting, since
+// raising it is the other way to run the apply deferred, and only an apply
+// refused because no server has reported yet is told to try again.
+func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
+	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Drivers: 84, LiveServers: 12}
+	assert.Equal(t,
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot apply -e production --tenant acme` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(tooWide, action.ApplyConfirm, "production", "acme"))
+	assert.Equal(t,
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
+		applyExecutionErrorMessage(action.Apply, "production", "", tooWide))
+
+	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, PerApplyCap: 2}
+	msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", "", overCap)
+	assert.Equal(t,
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and one apply can use at most 2 (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to 128. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
+		msg)
+	assert.NotContains(t, msg, "apply-confirm")
+
+	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4}
+	assert.Equal(t,
+		"This apply can't defer its cutover: no SchemaBot server running drivers has checked in during the last minute. Apply again once SchemaBot's drivers are running, or run `schemabot apply -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
+
+	assert.Equal(t,
+		"This rollback can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
+}
+
+// A deferred apply refused by a deployment that runs its operations on another
+// plane names that deployment, so the operator knows whose drivers or setting
+// to look at. A deployment that does not report its drivers is told apart from
+// one with no live servers, since upgrading it is the remedy.
+func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
+	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Unreported: true, Operations: 4}
+	assert.Equal(t,
+		"This apply can't defer its cutover: the `east` deployment doesn't report its drivers. To defer it, upgrade SchemaBot there. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(unreported, action.Apply, "production", ""))
+
+	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 16, PerApplyCap: 8, LiveServers: 8}
+	assert.Equal(t,
+		"This apply can't defer its cutover: it would keep 16 drivers waiting for the cutover on the `east` deployment, and one apply can use at most 8 there (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` on that deployment to 16. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(overCap, action.Apply, "production", ""))
+
+	noServers := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 4}
+	assert.Equal(t,
+		"This apply can't defer its cutover: no SchemaBot server running drivers on the `east` deployment has checked in during the last minute. Apply again once its drivers are running, or run `schemabot apply -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(noServers, action.Apply, "production", ""))
+
+	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 40, Drivers: 32, LiveServers: 8}
+	assert.Equal(t,
+		"This rollback can't defer its cutover: it would keep 40 drivers waiting for the cutover on the `east` deployment, and its servers have 32 drivers that can wait. To defer it, give that deployment's servers 8 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
 }

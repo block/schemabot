@@ -1,0 +1,71 @@
+// Package glyph is the glyph vocabulary for operator-facing output: one glyph
+// per meaning, one meaning per glyph, shared by the CLI and the GitHub PR
+// comment surfaces. The glyph codepoints are identical on both surfaces —
+// everything that differs between them (ANSI color, cell padding, markdown
+// emphasis) is markup around the glyph and stays with the surface.
+//
+// Most of the vocabulary is severity: how urgently an operator should react
+// to the line beside the glyph. Docs and Tip are the members that are not —
+// one marks a pointer to documentation, the other advice nothing blocks on,
+// and neither carries urgency — and they live here so both surfaces render
+// the same glyph and the rules below cover them.
+//
+// Two rules keep the vocabulary unambiguous at the sites that could blur it:
+//
+//   - Refused attaches to the refusal, never to what was refused. An apply
+//     rejected over unsafe changes headlines with Refused because the apply is
+//     not proceeding; the same changes disclosed at plan time, before anything
+//     is refused, carry Attention.
+//   - Errors in the operator's own input (a database name that resolves to
+//     nothing, a config that fails validation) carry Attention — fixing the
+//     input and retrying can succeed. Refused is reserved for requests
+//     SchemaBot understood and will not perform, where retrying unchanged
+//     refuses again.
+//
+// Every glyph occupies two terminal cells (pinned by test against
+// ui.VisibleWidth), so any of them can share a padded CLI column without
+// misaligning it.
+//
+// Apply-operation states (completed, running, cancelled, ...) are a separate
+// vocabulary owned by pkg/presentation: a state glyph names where an operation
+// is in its lifecycle, not how urgently an operator should react. Where a
+// state is itself a severity — a failed operation — presentation takes the
+// glyph from this package so the two vocabularies cannot drift apart.
+package glyph
+
+const (
+	// Escalation marks destructive consent in effect: --allow-unsafe was
+	// given and data will be destroyed. The operator should confirm the
+	// intent — this is the last moment to stop.
+	Escalation = "🚨"
+
+	// Refused marks an operation that is not proceeding because SchemaBot or
+	// the schema change engine refused it: an engine-blocked change, a
+	// rejected apply, an apply blocked on a merged or closed PR. The operator
+	// should read the reason; the change or the situation must change before
+	// a retry can succeed.
+	Refused = "⛔"
+
+	// Failed marks an attempted operation that failed. The system already
+	// stopped on its own; the operator's job is triage.
+	Failed = "❌"
+
+	// Attention marks something the operator should look at and act on
+	// before proceeding — an unsafe change awaiting consent, drift, a config
+	// problem, a degraded condition. Nothing has been refused yet.
+	Attention = "⚠️"
+
+	// Info marks neutral information that requires nothing of the operator.
+	Info = "ℹ️"
+
+	// Docs marks a pointer to the documentation page that answers the
+	// question the surface beside it raises. It is not a severity: the line
+	// it introduces asks nothing of the operator beyond reading.
+	Docs = "📖"
+
+	// Tip marks advice that nothing blocks on: an advisory lint finding, or
+	// how to make the change beside it safe, such as what to deploy before a
+	// destructive drop. It is not a severity: following the advice is the
+	// operator's call, and a finding it accompanies carries its own.
+	Tip = "💡"
+)

@@ -32,7 +32,6 @@
 //	Cutover  → Complete the deploy request (maps to vtctldclient OnlineDDL complete)
 //	Revert   → Revert the deploy request during the revert window
 //	SkipRevert → Close the revert window, making changes permanent
-//	Volume   → Throttle/unthrottle the deploy request (maps to vtctldclient OnlineDDL throttle/unthrottle)
 //
 // # Deploy Request States
 //
@@ -43,7 +42,8 @@
 //	             in_progress_vschema, in_progress_cutover
 //	Complete:    complete, complete_pending_revert
 //	Error:       complete_error, error, failed
-//	Cancelled:   in_progress_cancel, complete_cancel, cancelled
+//	Cancelling:  in_progress_cancel
+//	Cancelled:   complete_cancel, cancelled
 //	Revert:      in_progress_revert, in_progress_revert_vschema,
 //	             complete_revert, complete_revert_error
 //
@@ -64,7 +64,7 @@
 //	complete_pending_revert   → StateRevertWindow         Deployment complete (revert available)
 //	complete_error, error     → StateFailed               Deployment failed
 //	failed                    → StateFailed               Deployment failed
-//	in_progress_cancel        → StateCancelled            Cancelling deploy...
+//	in_progress_cancel        → StateRunning              Cancelling deploy...
 //	cancelled, complete_cancel→ StateCancelled            Deployment cancelled
 //	in_progress_revert        → StateRunning              Revert in progress...
 //	in_progress_revert_vschema→ StateRunning              Reverting VSchema changes
@@ -136,15 +136,22 @@
 //  5. Start the deploy request
 //  6. Return — the tern layer polls Progress() to track to completion
 //
-// The deploy request runs inside Vitess. If SchemaBot crashes, the deploy continues.
-// On restart, the tern layer's operator calls Progress() and finds the deploy
-// still running — no special resume logic needed beyond polling.
+// The deploy request is created with PlanetScale's own auto-cutover disabled —
+// the drive is the sole cutover actor. The row copy runs inside Vitess, so it
+// continues if SchemaBot crashes, but the deploy request parks at
+// pending_cutover until a drive reclaims the apply and triggers cutover. On
+// restart, the tern layer's driver calls Progress() and resumes driving — no
+// special resume logic needed beyond polling.
 //
 // # Instant DDL
 //
-// PlanetScale auto-detects instant DDL eligibility. When eligible and neither
-// enableRevert nor deferCutover is set, instant DDL is used automatically.
-// Instant DDL completes immediately without a row copy phase.
+// PlanetScale auto-detects instant DDL eligibility. When eligible, instant DDL
+// is used automatically — unless the cutover was deferred (instant DDL swaps
+// the schema the moment the deploy runs, so there is no gate to hold) or the
+// change is unsafe in Spirit's vocabulary (DROP TABLE, DROP COLUMN, and other
+// data-destroying operations — instant DDL has no revert window, so an unsafe
+// change must take the row-copy path to stay revertible). Instant DDL
+// completes immediately without a row copy phase.
 //
 // # VSchema
 //
@@ -288,7 +295,7 @@
 //
 // Throttling:
 //
-//	user_throttle_ratio       User-set throttle ratio (0.0-1.0). Maps to Volume.
+//	user_throttle_ratio       User-set throttle ratio (0.0-1.0).
 //	                          0.85 means 85% throttled.
 //	last_throttled_timestamp  When last throttled on this shard.
 //	component_throttled       Which component caused throttling (e.g. "vplayer").
@@ -381,9 +388,10 @@ import (
 	"sync"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -401,22 +409,57 @@ const (
 	// maxRetries is the number of retry attempts per keyspace when applying DDL.
 	maxRetries = 3
 
-	// maxSnapshotRetries is used when a schema snapshot is in progress
-	// (e.g., after RefreshSchema or VSchema updates). With exponential
-	// backoff (20s, 40s, 60s, 60s) this gives ~3 minutes of total
-	// wait time before failing.
-	maxSnapshotRetries = 5
-
 	// deployRequestPollInterval is how long to wait between polls while a deploy
 	// request is pending PlanetScale's asynchronous schema diff computation.
 	deployRequestPollInterval = 500 * time.Millisecond
 )
 
+// deployValidationWait bounds how long a deploy keeps retrying while
+// PlanetScale is still validating the deploy request, and
+// deployValidationPollInterval paces those retries. Validation runs
+// asynchronously after the deploy request leaves the pending state, so the
+// deploy endpoint can keep rejecting for a while after the request reports
+// ready. Variables rather than constants so tests can compress the wait.
+var (
+	deployValidationWait         = 5 * time.Minute
+	deployValidationPollInterval = 5 * time.Second
+)
+
+// deployRequestPendingWait bounds how long an apply waits for PlanetScale to
+// finish computing a deploy request's schema diff. A variable so tests can
+// compress the wait.
+var deployRequestPendingWait = 30 * time.Minute
+
+// snapshotRetryWait bounds how long a keyspace keeps retrying while PlanetScale
+// rejects its changes because a schema snapshot of the branch is in progress,
+// measured from the first such rejection. It is a variable so tests can
+// shorten it.
+var snapshotRetryWait = 10 * time.Minute
+
+// branchPasswordHeadroom is the part of a branch password's lifetime that is
+// not spent on the keyspaces' snapshot windows: the transient retries, the DDL
+// and VSchema writes themselves, and the branch validation after them, which
+// can itself wait out a snapshot for snapshotRetryWait.
+const branchPasswordHeadroom = 30 * time.Minute
+
+// branchPasswordTTL is how long, in seconds, the branch password an apply
+// creates stays valid. One password carries every keyspace's changes and the
+// branch validation after them, keyspaces run maxConcurrentKeyspaces at a
+// time, and each can wait out a schema snapshot for snapshotRetryWait. A
+// password that expired partway would fail a late keyspace with an
+// authentication error on a branch that is otherwise fine, so the TTL covers
+// every batch's snapshot window plus headroom, and never drops below an hour.
+func branchPasswordTTL(keyspaces int) int {
+	batches := max((keyspaces+maxConcurrentKeyspaces-1)/maxConcurrentKeyspaces, 1)
+	ttl := max(time.Duration(batches)*snapshotRetryWait+branchPasswordHeadroom, time.Hour)
+	return int(ttl / time.Second)
+}
+
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
 
 // formatDeployRequestError builds a detailed error message for a failed deploy request,
-// including any lint errors from PlanetScale's validation.
+// including any lint errors from PlanetScale's validation. sadscan:disable kingfisher.planetscale.2
 func formatDeployRequestError(dr *ps.DeployRequest) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
@@ -437,12 +480,19 @@ type vschemaKeyspaceDiff struct {
 
 // psMetadata holds PlanetScale-specific state stored as JSON in ResumeState.Metadata.
 type psMetadata struct {
-	BranchName       string     `json:"branch_name"`
-	DeployRequestID  uint64     `json:"deploy_request_id"`
-	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
-	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
-	IsInstant        bool       `json:"is_instant,omitempty"`
-	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
+	BranchName       string `json:"branch_name"`
+	DeployRequestID  uint64 `json:"deploy_request_id"`
+	DeployRequestURL string `json:"deploy_request_url,omitempty"`
+	// DeployRequestAdopted is set when the deploy request was found open on
+	// the branch by a resume rather than created by this engine. An adopted
+	// deploy request was created by someone else with settings this engine
+	// did not choose, so its auto-cutover setting is read back before it is
+	// deployed, and on an operator-supplied branch it is left open rather than
+	// closed on the operator's behalf when the apply fails.
+	DeployRequestAdopted bool       `json:"deploy_request_adopted,omitempty"`
+	DeployedAt           *time.Time `json:"deployed_at,omitempty"`
+	IsInstant            bool       `json:"is_instant,omitempty"`
+	DeferredDeploy       bool       `json:"deferred_deploy,omitempty"`
 
 	// RevertExpiresAt is the deadline when the revert window closes, stamped by
 	// the data plane (deployed_at + the configured window). The engine does not
@@ -475,6 +525,11 @@ type psMetadata struct {
 	// only one that knows it. Map membership drives the baseline diff; the stored
 	// timestamp values are diagnostic only — the earliest-requested tie-break in
 	// discovery reads requested_timestamp from the current rows, not from these.
+	// The set is bounded at capture time: non-terminal contexts are always
+	// included, terminal history only within baselineContextRetention. Old
+	// terminal contexts absent from the baseline are still excluded from
+	// discovery by the requested-at-or-after-deploy check, because Vitess
+	// retries preserve the original requested_timestamp.
 	ExistingMigrationCtxs map[string]MigrationContextTimestamps `json:"existing_migration_contexts,omitempty"`
 }
 
@@ -564,6 +619,22 @@ type Engine struct {
 	vtgateDBsMu sync.Mutex
 	vtgateDBs   map[string]*sql.DB // dsn -> cached *sql.DB
 
+	// validationBranchSchema, when set, replaces the branch MySQL read that
+	// post-apply validation compares against the desired schema. Tests set
+	// it to drive validation without a branch to connect to.
+	validationBranchSchema func(ctx context.Context, password *ps.DatabaseBranchPassword, keyspaces []string) (map[string][]table.TableSchema, error)
+
+	// now, when set, replaces the wall clock for elapsed-time checks on
+	// deploy request state. Tests set it to place a poll at a chosen time.
+	now func() time.Time
+}
+
+// clock returns the engine's current time.
+func (e *Engine) clock() time.Time {
+	if e.now != nil {
+		return e.now()
+	}
+	return time.Now()
 }
 
 // Compile-time check that Engine implements the interface.
@@ -585,12 +656,10 @@ func New(logger *slog.Logger) *Engine {
 		logger = slog.Default()
 	}
 	return &Engine{
-		clientFunc: func(tokenName, tokenValue string) (psclient.PSClient, error) {
-			return psclient.NewPSClient(tokenName, tokenValue)
-		},
-		linter:    lint.New(),
-		logger:    logger,
-		vtgateDBs: make(map[string]*sql.DB),
+		clientFunc: psclient.NewPSClient,
+		linter:     lint.New(),
+		logger:     logger,
+		vtgateDBs:  make(map[string]*sql.DB),
 	}
 }
 
@@ -644,7 +713,7 @@ func (e *Engine) getVtgateDB(ctx context.Context, dsn string) (*sql.DB, error) {
 		return db, nil
 	}
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open vtgate: %w", err)
 	}
@@ -673,6 +742,31 @@ func credOrg(creds *engine.Credentials) string {
 		return creds.Metadata["organization"]
 	}
 	return ""
+}
+
+func credDatabase(creds *engine.Credentials) string {
+	if creds != nil {
+		return creds.Metadata["database"]
+	}
+	return ""
+}
+
+// resolveDatabase returns the PlanetScale database name for a request: the
+// "database" credential metadata when set, otherwise the request's database
+// identifier itself. The two differ when a database is registered under an
+// arbitrary identifier while the PlanetScale database keeps its own name.
+// Each exported engine method rewrites its request's Database with the
+// resolved name, so every PlanetScale API call, error, and log line in the
+// engine names the database as PlanetScale knows it; the debug log ties the
+// resolved name back to the registered identifier when they differ.
+func (e *Engine) resolveDatabase(creds *engine.Credentials, database string) string {
+	resolved := credDatabase(creds)
+	if resolved == "" || resolved == database {
+		return database
+	}
+	e.logger.Debug("using PlanetScale database name from credential metadata",
+		"database", database, "planetscale_database", resolved)
+	return resolved
 }
 
 func credTokenName(creds *engine.Credentials) string {
@@ -707,10 +801,28 @@ func isRetryableMySQLConnectionError(err error) bool {
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
-// running a schema snapshot (e.g., after RefreshSchema). VSchema updates
-// are blocked while the snapshot completes.
+// running a schema snapshot (e.g., after RefreshSchema or DDL on a branch).
+// VSchema updates are rejected while the snapshot completes ("schema snapshot
+// is in progress"), and VSchema reads are answered with "schema refreshing;
+// please try again in a few moments". Both clear on their own once the
+// snapshot finishes.
 func isSnapshotInProgress(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "schema snapshot is in progress") || strings.Contains(msg, "schema refreshing")
+}
+
+// isDeployStillValidatingError reports whether the PlanetScale API rejected a
+// deploy because the deploy request is still running its pre-deploy safety
+// validation ("We're currently validating that these changes are safe to
+// deploy"). The rejection clears on its own once validation completes, so the
+// deploy should be retried rather than failed. Message matching is required:
+// the API returns this rejection with a non-retryable error code, so the
+// SDK's typed codes cannot distinguish it from a permanent rejection.
+func isDeployStillValidatingError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "validating that these changes are safe to deploy")
 }
 
 // isRetryablePSError returns true if the error is a transient PlanetScale
@@ -733,8 +845,9 @@ func isRetryablePSError(err error) bool {
 
 // retryDelay returns the backoff duration for a retry attempt using
 // exponential backoff with full jitter. When a schema snapshot is in
-// progress the base delay is longer since snapshots can take 30-60s.
-func retryDelay(attempt int, lastErr error) time.Duration {
+// progress the base delay is longer since snapshots can take 30-60s. A
+// variable so tests can retry without waiting out the backoff.
+var retryDelay = func(attempt int, lastErr error) time.Duration {
 	if isSnapshotInProgress(lastErr) {
 		// Snapshot: 10s, 20s, 40s, 60s, 60s + up to 5s jitter
 		base := min(10*time.Second*(1<<min(attempt, 3)), 60*time.Second)
@@ -745,45 +858,41 @@ func retryDelay(attempt int, lastErr error) time.Duration {
 	return base + time.Duration(rand.IntN(2000))*time.Millisecond
 }
 
-func generateBranchName(database, planID string) string {
-	sanitized := strings.ReplaceAll(database, "_", "-")
-	if len(sanitized) > 20 {
-		sanitized = sanitized[:20]
-	}
-	// Use last 8 chars of plan ID for uniqueness
-	shortID := planID
-	if len(shortID) > 8 {
-		shortID = shortID[len(shortID)-8:]
-	}
-	return fmt.Sprintf("schemabot-%s-%s", sanitized, shortID)
-}
-
-func deployStateToEngineState(drState string) engine.State {
+// deployStateToEngineState maps a deploy request's deployment state to the
+// engine state, and reports whether SchemaBot recognized it. An unrecognized
+// state maps to running: the apply keeps polling and never settles on an
+// outcome PlanetScale did not report, and the caller logs the state so it can
+// be added here.
+func deployStateToEngineState(drState string) (engine.State, bool) {
 	switch drState {
 	case deployState.Pending, deployState.Ready:
-		return engine.StatePending
+		return engine.StatePending, true
 	case deployState.NoChanges, deployState.Complete:
-		return engine.StateCompleted
+		return engine.StateCompleted, true
 	case deployState.CompletePendingRevert:
-		return engine.StateRevertWindow
+		return engine.StateRevertWindow, true
 	case deployState.Queued, deployState.Submitting, deployState.InProgress, deployState.InProgressVSchema:
-		return engine.StateRunning
+		return engine.StateRunning, true
 	case deployState.PendingCutover:
-		return engine.StateWaitingForCutover
+		return engine.StateWaitingForCutover, true
 	case deployState.InProgressCutover:
-		return engine.StateCuttingOver
+		return engine.StateCuttingOver, true
 	case deployState.CompleteError, deployState.Error, deployState.Failed, deployState.CompleteRevertError:
-		return engine.StateFailed
+		return engine.StateFailed, true
 	case deployState.InProgressCancel:
-		return engine.StateCancelled
+		// PlanetScale has accepted the cancel but not confirmed it, and an
+		// unconfirmed cancel can still end the deploy in complete_error. The
+		// deploy request is still in motion, so it reads as running until it
+		// settles on cancelled or failed.
+		return engine.StateRunning, true
 	case deployState.CompleteCancel, deployState.Cancelled:
-		return engine.StateCancelled
+		return engine.StateCancelled, true
 	case deployState.InProgressRevert, deployState.InProgressRevertVSchema:
-		return engine.StateReverting
+		return engine.StateReverting, true
 	case deployState.CompleteRevert:
-		return engine.StateReverted
+		return engine.StateReverted, true
 	default:
-		return engine.StateRunning
+		return engine.StateRunning, false
 	}
 }
 

@@ -1,11 +1,18 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
-// handleSettingsList returns all settings.
+// handleSettingsList returns the operator settings. Rows that components keep
+// for their own state share the settings table but are not settings an
+// operator chooses, so the listing leaves them out; handleSettingsGet still
+// returns one by key. The route matches a single path segment, so a caller
+// percent-encodes a key that contains a slash.
 func (s *Service) handleSettingsList(w http.ResponseWriter, r *http.Request) {
 	settings, err := s.storage.Settings().List(r.Context())
 	if err != nil {
@@ -21,6 +28,9 @@ func (s *Service) handleSettingsList(w http.ResponseWriter, r *http.Request) {
 	}
 	result := make([]settingDTO, 0, len(settings))
 	for _, setting := range settings {
+		if storage.IsComponentStateSettingKey(setting.Key) {
+			continue
+		}
 		result = append(result, settingDTO{Key: setting.Key, Value: setting.Value})
 	}
 
@@ -71,6 +81,12 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Settings are deployment-wide, so there is no database to scope a grant
+	// to: admin-only.
+	if !s.authorizeDirectAdminWrite(w, r, "settings_set") {
+		return
+	}
+
 	err := s.storage.Settings().Set(r.Context(), req.Key, req.Value)
 	if err != nil {
 		s.logger.Error("set setting failed", "key", req.Key, "error", err)
@@ -79,7 +95,7 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("setting updated", "key", req.Key, "value", req.Value,
-		"caller", controlOperationCaller(resolveCaller(r.Context(), "")))
+		"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"key":   req.Key,

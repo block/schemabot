@@ -42,17 +42,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -62,7 +61,7 @@ func TestMain(m *testing.M) {
 	// Clean up SchemaBot's state tables to ensure fresh state
 	dsn := os.Getenv("E2E_SCHEMABOT_MYSQL_DSN")
 	if dsn != "" {
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err == nil {
 			rows, err := db.QueryContext(context.Background(), "SHOW TABLES")
 			if err == nil {
@@ -87,7 +86,7 @@ func TestMain(m *testing.M) {
 		if ternDSN == "" {
 			continue
 		}
-		db, err := sql.Open("mysql", ternDSN)
+		db, err := sql.Open("block-mysql", ternDSN)
 		if err != nil {
 			continue
 		}
@@ -290,7 +289,7 @@ func TestGRPC_StopStart_LocalStateSync(t *testing.T) {
 
 	// Seed enough rows that Spirit's copy phase takes a noticeable amount of time
 	grpcSeedRows(t, "staging", tableName, "name, data",
-		"CONCAT('user_', seq), REPEAT('x', 500)", 100000)
+		"CONCAT('user_', seq), REPEAT('x', 500)", 500000)
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 
@@ -349,55 +348,6 @@ func TestGRPC_StopStart_LocalStateSync(t *testing.T) {
 		return !state.IsState(p.State, state.Apply.Stopped)
 	}, 30*time.Second, 500*time.Millisecond,
 		"progress by apply_id must not show stopped after start")
-
-	// Wait for completion
-	grpcWaitForApplyState(t, apply.ApplyID, state.Apply.Completed, 5*time.Minute)
-
-	grpcEnsureNoActiveChange(t, "testapp", "staging")
-}
-
-// TestGRPC_Volume tests adjusting the schema change speed during an apply.
-// Uses MODIFY COLUMN (INT -> BIGINT) to force Spirit's copy-swap process (not instant DDL).
-func TestGRPC_Volume(t *testing.T) {
-	tableName := uniqueGRPCTableName("grpc_volume")
-	grpcCreateTestTable(t, "staging", tableName, fmt.Sprintf(
-		`CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)`, tableName))
-
-	grpcSeedRows(t, "staging", tableName, "name, data",
-		"CONCAT('user_', seq), REPEAT('x', 500)", 100000)
-
-	grpcEnsureNoActiveChange(t, "testapp", "staging")
-
-	// Plan: widen PK from INT to BIGINT (forces full table copy, not instant DDL)
-	schemaFiles := map[string]string{
-		tableName + ".sql": fmt.Sprintf(
-			`CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);`, tableName),
-	}
-	plan := grpcPlan(t, "testapp", "staging", schemaFiles)
-	apply := grpcApply(t, plan.PlanID, "staging", nil)
-	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
-
-	grpcWaitForApplyAnyState(t, apply.ApplyID, []string{state.Apply.Running, state.Apply.Completed}, 60*time.Second)
-
-	// Try to adjust volume (may fail if Spirit completed too fast -- that's OK)
-	prog := grpcProgressByApplyID(t, apply.ApplyID)
-	if !state.IsState(prog.State, state.Apply.Completed) {
-		resp := grpcPost(t, "/api/volume", map[string]any{ //nolint:bodyclose // closed via utils.CloseAndLog
-			"environment": "staging",
-			"apply_id":    apply.ApplyID,
-			"volume":      5,
-		})
-		defer utils.CloseAndLog(resp.Body)
-		if resp.StatusCode == http.StatusOK {
-			var volResp grpcVolumeResponse
-			grpcDecodeJSON(t, resp, &volResp)
-			t.Logf("volume adjustment accepted=%v", volResp.Accepted)
-		} else {
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			t.Logf("volume returned status %d (may have completed): %s", resp.StatusCode, string(body))
-		}
-	}
 
 	// Wait for completion
 	grpcWaitForApplyState(t, apply.ApplyID, state.Apply.Completed, 5*time.Minute)

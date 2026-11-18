@@ -1,11 +1,102 @@
 package github
 
 import (
+	"io"
+	"log/slog"
+	"slices"
 	"testing"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestEmptiedPRNamespaces covers the two steps that turn a pull request's
+// changed-file list into the namespaces it emptied: vacatedSchemaFiles picks
+// the schema paths the pull request deleted or renamed away, and
+// emptiedPRNamespaces keeps those whose namespace no file at head declares.
+func TestEmptiedPRNamespaces(t *testing.T) {
+	grouped := map[string]*ternv1.SchemaFiles{
+		"surviving": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint)"}},
+	}
+	tests := []struct {
+		name        string
+		ignored     []string
+		files       []PRFile
+		environment string
+		want        []string
+	}{
+		{name: "one namespace emptied among two", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "removed"}}, want: []string{"removed"}},
+		{name: "two namespaces emptied", files: []PRFile{{Filename: "schema/removed_b/orders.sql", Status: "removed"}, {Filename: "schema/removed_a/items.sql", Status: "removed"}}, want: []string{"removed_a", "removed_b"}},
+		{name: "removed file has surviving sibling", files: []PRFile{{Filename: "schema/surviving/orders.sql", Status: "removed"}}},
+		{name: "removed non-schema file", files: []PRFile{{Filename: "schema/notes/README.md", Status: "removed"}}},
+		{name: "removed empty-namespace declaration", files: []PRFile{{Filename: "schema/removed/empty.sql", Status: "removed"}}, want: []string{"removed"}},
+		{name: "removed file nested below a namespace", files: []PRFile{{Filename: "schema/payments/archive/backfill.sql", Status: "removed"}}},
+		{name: "outside schema root", files: []PRFile{{Filename: "other/removed/orders.sql", Status: "removed"}}},
+		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}},
+		{name: "ignored brace namespace", ignored: []string{"removed_{env}"}, environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}},
+		{name: "flat file", files: []PRFile{{Filename: "schema/orders.sql", Status: "removed"}}},
+		{name: "renamed out of its namespace", files: []PRFile{{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
+		{name: "renamed within its namespace", files: []PRFile{{Filename: "schema/surviving/orders_v2.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
+		{name: "renamed in from another namespace", files: []PRFile{{Filename: "schema/removed/orders.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
+		{name: "renamed without a previous path", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "renamed"}}},
+		{name: "renamed to a non-schema file", files: []PRFile{{Filename: "schema/removed/orders.txt", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
+		{name: "environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
+		{name: "brace environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
+		{name: "removed namespace symlink", files: []PRFile{{Filename: "schema/removed", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}, want: []string{"removed"}},
+		{name: "removed namespace symlink with an environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}, want: []string{"removed_test"}},
+		{name: "namespace symlink renamed away", files: []PRFile{{Filename: "archive/removed", PreviousFilename: "schema/removed", Status: "renamed", PreviousSymlink: true, VacatedDirectoryLink: true}}, want: []string{"removed"}},
+		{name: "removed symlink to a namespace head still declares", files: []PRFile{{Filename: "schema/surviving", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}},
+		{name: "removed symlink inside a namespace", files: []PRFile{{Filename: "schema/removed/link", Status: "removed", Symlink: true, VacatedDirectoryLink: true}}},
+		{name: "removed symlink to a file directly under the root", files: []PRFile{{Filename: "schema/README", Status: "removed", Symlink: true}}},
+		{name: "renamed regular file at a namespace path", files: []PRFile{{Filename: "archive/removed", PreviousFilename: "schema/removed", Status: "renamed"}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vacated := vacatedSchemaFiles(tt.files, "schema")
+			assert.Equal(t, tt.want, emptiedPRNamespaces(grouped, tt.ignored, vacated, "schema", tt.environment))
+		})
+	}
+}
+
+func TestGroupFilesByNamespace_BraceEnvironment(t *testing.T) {
+	files := []GitHubFile{
+		{Path: "schema/orders_{env}/users.sql", Name: "users.sql", Content: "CREATE TABLE users (id bigint);"},
+		{Path: "schema/fixtures_{env}/widgets.sql", Name: "widgets.sql", Content: "CREATE TABLE widgets (id bigint);"},
+	}
+	for _, env := range []string{"staging", "sandbox", "production"} {
+		t.Run(env, func(t *testing.T) {
+			grouped, ignored, err := groupFilesByNamespace(files, "schema", env, []string{"fixtures_{env}"})
+			require.NoError(t, err)
+			require.Len(t, grouped, 1)
+			assert.Contains(t, grouped, "orders_"+env)
+			assert.Equal(t, []string{"fixtures_" + env}, ignored)
+		})
+	}
+}
+
+// TestVacatedSchemaFilesReportsDeletionsOfTheVacatedPath pins the shape the
+// narrowing receives: a renamed file is reported as a deletion of its previous
+// path, not as the rename GitHub listed, and a nested path is dropped before
+// any tree read is spent on it.
+func TestVacatedSchemaFilesReportsDeletionsOfTheVacatedPath(t *testing.T) {
+	vacated := vacatedSchemaFiles([]PRFile{
+		{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"},
+		{Filename: "schema/removed/vschema.json", Status: "removed"},
+		{Filename: "schema/payments/archive/backfill.sql", Status: "removed"},
+		{Filename: "schema/added/new.sql", Status: "added"},
+		{Filename: "archive/linked", PreviousFilename: "schema/linked", Status: "renamed", PreviousSymlink: true, VacatedDirectoryLink: true},
+		{Filename: "schema/payments/link", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+		{Filename: "schema/README", Status: "removed", Symlink: true},
+	}, "schema/")
+
+	assert.Equal(t, []PRFile{
+		{Filename: "schema/removed/orders.sql", Status: "removed"},
+		{Filename: "schema/removed/vschema.json", Status: "removed"},
+		{Filename: "schema/linked", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+	}, vacated)
+}
 
 // Flat layout tests — the webhook strips the schemaPath prefix, leaving bare
 // filenames. path.Base(schemaPath) becomes the defaultNamespace.
@@ -21,7 +112,7 @@ func TestGroupFilesByNamespace_FlatLayout_UsesDirectoryName(t *testing.T) {
 		{Path: "schema/payments/refunds.sql", Name: "refunds.sql", Content: "CREATE TABLE refunds (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema/payments", "development")
+	result, _, err := groupFilesByNamespace(files, "schema/payments", "development", nil)
 
 	require.NoError(t, err)
 	require.Len(t, result, 1)
@@ -45,7 +136,7 @@ func TestGroupFilesByNamespace_FlatLayout_IssueScenario(t *testing.T) {
 		{Path: "schema/aurora_coffeeshop_exemplar/customers.sql", Name: "customers.sql", Content: "CREATE TABLE customers (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema/aurora_coffeeshop_exemplar", "development")
+	result, _, err := groupFilesByNamespace(files, "schema/aurora_coffeeshop_exemplar", "development", nil)
 
 	require.NoError(t, err)
 	require.Len(t, result, 1)
@@ -62,7 +153,7 @@ func TestGroupFilesByNamespace_FlatLayout_TopLevelSchemaDir(t *testing.T) {
 		{Path: "schema/orders.sql", Name: "orders.sql", Content: "CREATE TABLE orders (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema", "development")
+	result, _, err := groupFilesByNamespace(files, "schema", "development", nil)
 
 	require.NoError(t, err)
 	require.Len(t, result, 1)
@@ -88,7 +179,7 @@ func TestGroupFilesByNamespace_SubdirLayout_MultipleNamespaces(t *testing.T) {
 		{Path: "schema/payments_audit/audit_log.sql", Name: "audit_log.sql", Content: "CREATE TABLE audit_log (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema", "development")
+	result, _, err := groupFilesByNamespace(files, "schema", "development", nil)
 	require.NoError(t, err)
 
 	require.Len(t, result, 2)
@@ -106,7 +197,7 @@ func TestGroupFilesByNamespace_SubdirLayout_Monorepo(t *testing.T) {
 		{Path: "payments-service/mysql/schema/payments_audit/audit_log.sql", Name: "audit_log.sql", Content: "CREATE TABLE audit_log (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "payments-service/mysql/schema", "development")
+	result, _, err := groupFilesByNamespace(files, "payments-service/mysql/schema", "development", nil)
 	require.NoError(t, err)
 
 	require.Len(t, result, 2)
@@ -123,7 +214,7 @@ func TestGroupFilesByNamespace_SubdirLayout_VitessKeyspaces(t *testing.T) {
 		{Path: "schema/customers/users.sql", Name: "users.sql", Content: "CREATE TABLE users (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema", "development")
+	result, _, err := groupFilesByNamespace(files, "schema", "development", nil)
 	require.NoError(t, err)
 
 	require.Len(t, result, 2)
@@ -142,8 +233,27 @@ func TestGroupFilesByNamespace_MixedLayout_Rejected(t *testing.T) {
 		{Path: "schema/payments/transactions.sql", Name: "transactions.sql", Content: "CREATE TABLE transactions (...);"},
 	}
 
-	_, err := groupFilesByNamespace(files, "schema", "development")
+	_, _, err := groupFilesByNamespace(files, "schema", "development", nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "both flat files and namespace subdirectories")
+}
+
+// Removing an environment's own schema root symlink, such as
+// orders/schema/staging -> production, moves staging's schema root back to
+// the config directory. The link then sits directly under that root, but it
+// named the environment's root, not a namespace, so it empties nothing.
+// Another environment's link and namespace links are kept.
+func TestWithoutEnvironmentLinkDropsTheEnvironmentsOwnLink(t *testing.T) {
+	ic := NewInstallationClient(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	vacated := []PRFile{
+		{Filename: "orders/schema/staging", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+		{Filename: "orders/schema/production", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+		{Filename: "orders/schema/orders_archive", Status: "removed", Symlink: true, VacatedDirectoryLink: true},
+	}
+
+	assert.Equal(t, []string{"orders/schema/production", "orders/schema/orders_archive"},
+		filenames(ic.withoutEnvironmentLink("octocat/hello-world", 1, slices.Clone(vacated), "orders/schema", "staging")))
+	assert.Equal(t, filenames(vacated), filenames(ic.withoutEnvironmentLink("octocat/hello-world", 1, slices.Clone(vacated), "orders/schema", "")),
+		"a request with no environment has no environment link")
 }

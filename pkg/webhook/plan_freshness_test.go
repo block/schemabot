@@ -41,27 +41,6 @@ func TestAssertPlanStillCurrent_MatchProceeds(t *testing.T) {
 	}
 }
 
-func TestAssertPlanStillCurrent_NilPlanSkips(t *testing.T) {
-	h, comments, _ := newTestHandler(t)
-
-	rejected := h.assertPlanStillCurrent(
-		t.Context(),
-		"octocat/hello-world", 1, int64(12345),
-		nil,
-		"current-sha",
-		"staging",
-		"alice",
-	)
-
-	assert.False(t, rejected, "nil plan must skip (cannot evaluate the invariant)")
-
-	select {
-	case body := <-comments:
-		t.Fatalf("no comment should be posted when there is no stored plan; got: %s", body)
-	case <-time.After(100 * time.Millisecond):
-	}
-}
-
 func TestAssertPlanStillCurrent_EmptyHeadSHASkips(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 

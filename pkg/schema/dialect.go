@@ -8,11 +8,23 @@ import "strings"
 // underlying database family, not of the engine that drives it.
 type Dialect string
 
+// Feature identifies behavior that is not available on every database family.
+type Feature string
+
 const (
 	// DialectMySQL covers MySQL and every MySQL-protocol engine (Vitess, Strata).
 	DialectMySQL Dialect = "mysql"
 	// DialectPostgres covers PostgreSQL targets.
 	DialectPostgres Dialect = "postgres"
+
+	FeatureDeferredCutover Feature = "deferred cutover"
+	// FeatureMultiTarget covers addressing several distinct targets from one
+	// database entry, where each target holds its own schema and is planned and
+	// applied on its own. Every operator-facing surface — the plan comment,
+	// progress, the terminal summary — has to represent N targets rather than
+	// one, and that presentation is built per engine, so the feature is enabled
+	// per engine as the work lands rather than assumed available everywhere.
+	FeatureMultiTarget Feature = "multi-target"
 )
 
 // DialectForDatabaseType maps a database_type to its database family for
@@ -34,6 +46,19 @@ func DialectForDatabaseType(databaseType string) Dialect {
 	}
 }
 
+// SupportsFeature reports whether a database type supports a dialect-specific
+// feature. Unknown database types fail closed.
+func SupportsFeature(databaseType string, feature Feature) bool {
+	switch feature {
+	case FeatureDeferredCutover:
+		return databaseType == "mysql" || databaseType == "vitess"
+	case FeatureMultiTarget:
+		return databaseType == "mysql"
+	default:
+		return false
+	}
+}
+
 // schemabotReservedNamespaces are reserved regardless of dialect: SchemaBot's
 // own storage schema and its pending-drops quarantine. Any namespace beginning
 // with an underscore is also treated as SchemaBot-internal (see the prefix rule
@@ -46,6 +71,14 @@ var schemabotReservedNamespaces = map[string]struct{}{
 // systemSchemasByDialect maps a dialect to the database-managed schemas that
 // must never be treated as user schema for pull discovery.
 var systemSchemasByDialect = map[Dialect]map[string]struct{}{
+	// The MySQL set covers the server's own schemas, the administrative schemas
+	// a managed provider attaches, and the fixed-name schemas that standard
+	// operational tooling creates beside user schemas. slow_query_log is the
+	// latter: it is the query-review sink that Anemometer and the pt-query-digest
+	// workflows built on it create, and despite sharing a name with the server
+	// variable it is not a MySQL built-in. A tooling schema holds monitoring
+	// output rather than user schema, so pull must never offer it as an
+	// onboardable namespace.
 	DialectMySQL: {
 		"information_schema": {},
 		"innodb":             {},
@@ -54,21 +87,28 @@ var systemSchemasByDialect = map[Dialect]map[string]struct{}{
 		"sys":                {},
 		"rdsmon":             {},
 		"dbadmin":            {},
+		"slow_query_log":     {},
 		"polt":               {},
 		"tmp":                {},
 		"topo":               {},
 	},
-	// The Postgres set is provisional: it covers the always-present system
-	// schemas and RDS/Aurora's rdsadmin, but the managed-extension schemas
-	// (aws_commons, aws_s3, aws_lambda, aws_ml, ...) are deliberately not
-	// enumerated yet. It must be finalized when Postgres pull discovery is
-	// implemented so extension-owned schemas are not surfaced as pullable user
-	// namespaces.
+	// The Postgres set covers the always-present system schemas, RDS/Aurora's
+	// administrative schemas (rdsadmin, rds_tools), and the schemas owned by
+	// RDS/Aurora managed extensions: aws_commons (shared helper types),
+	// aws_s3/aws_lambda/aws_ml (AWS service integrations), and apg_plan_mgmt
+	// (Aurora query plan management). Extension-owned schemas are
+	// database-managed, so they must never surface as pullable user namespaces.
 	DialectPostgres: {
 		"information_schema": {},
 		"pg_catalog":         {},
 		"pg_toast":           {},
 		"rdsadmin":           {},
+		"rds_tools":          {},
+		"aws_commons":        {},
+		"aws_s3":             {},
+		"aws_lambda":         {},
+		"aws_ml":             {},
+		"apg_plan_mgmt":      {},
 	},
 }
 

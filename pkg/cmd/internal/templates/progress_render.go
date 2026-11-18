@@ -178,7 +178,13 @@ func FormatApplyCompleteWithSummary(summary, applyID string) string {
 
 // FormatApplyFailed returns the styled "Apply failed" message with recovery guidance.
 func FormatApplyFailed() string {
-	return fmt.Sprintf("%s%s✗ Apply failed%s\n\nFix the issue above, then run a new apply.\nThe new apply will only process tables that haven't completed.", ANSIBold, ANSIRed, ANSIReset)
+	return FormatApplyFailedHeadline() + "\n\nFix the issue above, then run a new apply.\nThe new apply will only process tables that haven't completed."
+}
+
+// FormatApplyFailedHeadline returns the styled "Apply failed" line alone, for
+// a view whose own footer names the command that recovers it.
+func FormatApplyFailedHeadline() string {
+	return fmt.Sprintf("%s%s✗ Apply failed%s", ANSIBold, ANSIRed, ANSIReset)
 }
 
 // FormatApplyStopped returns the styled "Apply stopped" message.
@@ -188,7 +194,7 @@ func FormatApplyStopped() string {
 
 // FormatWatchFooter returns the footer shown during apply watch mode.
 func FormatWatchFooter() string {
-	return fmt.Sprintf("%sESC detach • %s • v volume%s", ANSIDim, StopKeyHint, ANSIReset)
+	return fmt.Sprintf("%sESC detach • %s%s", ANSIDim, StopKeyHint, ANSIReset)
 }
 
 func colorWrap(code string) func(string) string {

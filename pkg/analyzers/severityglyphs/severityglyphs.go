@@ -1,0 +1,121 @@
+// Package severityglyphs provides a go/analysis analyzer that flags severity
+// glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️) in non-test source files. The project
+// convention is that the severity vocabulary lives in pkg/glyph — one glyph
+// per meaning, one meaning per glyph — and every rendering site references
+// the named constant, so the vocabulary cannot drift surface by surface.
+//
+// It also flags glyphs that are not vocabulary members but read as severity
+// beside them (🛑), naming the member each one collapses into, so a sixth
+// level cannot enter through a glyph the vocabulary never defined.
+//
+// The vocabulary's non-severity members, the documentation pointer 📖 and the
+// tip 💡, are flagged the same way: they share the package so every surface
+// renders the same glyph, and a literal spelled at a rendering site would let
+// them drift.
+//
+// The analyzer inspects decoded string values, so escape-spelled glyphs
+// (e.g. "❌") are caught the same as literal ones. It matches on the
+// base codepoints (⚠ U+26A0, ℹ U+2139), so variation-selector forms are
+// caught too. Apply-state glyphs (🚫 ⏹️ ⏸ ⏳ ↩️ 🔁 ✅) are a separate
+// vocabulary owned by pkg/presentation and are not flagged.
+//
+// The analyzer reports on every matching string literal in every package it
+// is invoked against — it does not filter by import path. Callers (Makefile,
+// CI, pre-commit script) are responsible for passing only the package set
+// where the rule should apply: everything except ./pkg/glyph, the vocabulary's
+// legitimate home.
+package severityglyphs
+
+import (
+	"go/ast"
+	"go/token"
+	"strconv"
+	"strings"
+
+	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/inspect"
+	"golang.org/x/tools/go/ast/inspector"
+)
+
+// severityGlyphs pairs each severity glyph's base codepoint with the
+// pkg/glyph constant that rendering code must use instead. Matching on the
+// base codepoint (not the emoji-presentation sequence) also catches literals
+// that omit or add the variation selector.
+//
+// The list also carries glyphs that are not vocabulary members but read as
+// severity to a reader — a near-synonym of one that is. Left unlisted, such a
+// glyph is invisible to this analyzer precisely because it names no existing
+// meaning, which is how one enters the vocabulary by accident: it renders
+// beside the real glyphs, at an apparent severity the reader has no way to
+// place. Each maps to the member it collapses into, so the fix is to use that
+// constant rather than to mint a sixth level.
+var severityGlyphs = []struct {
+	glyph    string
+	constant string
+}{
+	{"🚨", "glyph.Escalation"},
+	{"⛔", "glyph.Refused"},
+	{"❌", "glyph.Failed"},
+	{"⚠", "glyph.Attention"},
+	{"ℹ", "glyph.Info"},
+	{"🛑", "glyph.Attention"},
+}
+
+// vocabularyGlyphs are the package's members that are not severities. They
+// are reported under their own name so the diagnostic does not call a glyph a
+// severity when the vocabulary says it is not.
+var vocabularyGlyphs = []struct {
+	glyph    string
+	constant string
+	kind     string
+}{
+	{"📖", "glyph.Docs", "documentation"},
+	{"💡", "glyph.Tip", "tip"},
+}
+
+// Analyzer flags string literals containing a severity glyph in non-test
+// source files. Test files are skipped because assertions on rendered output
+// deliberately pin the literal glyphs — they must break when the vocabulary
+// drifts.
+var Analyzer = &analysis.Analyzer{
+	Name:     "severityglyphs",
+	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), glyphs that read as severity without being vocabulary members (🛑), and the documentation (📖) and tip (💡) glyphs, in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
+	Requires: []*analysis.Analyzer{inspect.Analyzer},
+	Run:      run,
+}
+
+func run(pass *analysis.Pass) (any, error) {
+	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+
+	nodeFilter := []ast.Node{(*ast.BasicLit)(nil)}
+
+	insp.Preorder(nodeFilter, func(n ast.Node) {
+		lit := n.(*ast.BasicLit)
+		if lit.Kind != token.STRING {
+			return
+		}
+		if isTestFile(pass, lit.Pos()) {
+			return
+		}
+		val, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return
+		}
+		for _, sg := range severityGlyphs {
+			if strings.Contains(val, sg.glyph) {
+				pass.Reportf(lit.Pos(), "severity glyph %s in string literal — use %s from pkg/glyph", sg.glyph, sg.constant)
+			}
+		}
+		for _, vg := range vocabularyGlyphs {
+			if strings.Contains(val, vg.glyph) {
+				pass.Reportf(lit.Pos(), "%s glyph %s in string literal — use %s from pkg/glyph", vg.kind, vg.glyph, vg.constant)
+			}
+		}
+	})
+
+	return nil, nil
+}
+
+func isTestFile(pass *analysis.Pass, pos token.Pos) bool {
+	return strings.HasSuffix(pass.Fset.Position(pos).Filename, "_test.go")
+}

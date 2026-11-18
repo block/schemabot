@@ -1,12 +1,48 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBlockedCauses(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  []string
+		joined string
+		want   []string
+	}{
+		{name: "empty", input: []string{"", "  "}, joined: "", want: nil},
+		{name: "single", input: []string{"planner refused the statement"}, joined: "planner refused the statement", want: []string{"planner refused the statement"}},
+		{name: "internal clauses", input: []string{"cause; step; remedy"}, joined: "cause; step; remedy", want: []string{"cause; step; remedy"}},
+		{name: "trims and drops", input: []string{" first cause ", "", " second cause\t"}, joined: "first cause ‖ second cause", want: []string{"first cause", "second cause"}},
+		// A cause that itself contains the separator — an identifier a schema
+		// author chose — is neutralized on the way in, so it cannot decode as
+		// causes the engine never issued.
+		{name: "separator inside one cause", input: []string{`table "left ‖ right" is refused`}, joined: `table "left // right" is refused`, want: []string{`table "left // right" is refused`}},
+		{name: "bare separator rune inside one cause", input: []string{"a‖b", "c"}, joined: "a//b ‖ c", want: []string{"a//b", "c"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			joined := JoinBlockedCauses(tt.input)
+			assert.Equal(t, tt.joined, joined)
+			assert.Equal(t, tt.want, BlockedCauses(joined))
+		})
+	}
+}
+
+// The decoder's contract does not depend on who encoded the reason: a bare
+// or doubled separator yields no empty cause.
+func TestBlockedCausesDropsEmptyParts(t *testing.T) {
+	assert.Equal(t, []string{"a", "b"}, BlockedCauses("a ‖  ‖ b"))
+	assert.Equal(t, []string{"a"}, BlockedCauses(" ‖ a ‖ "))
+	assert.Empty(t, BlockedCauses(" ‖ "))
+}
 
 func TestState_IsTerminal(t *testing.T) {
 	tests := []struct {
@@ -143,6 +179,100 @@ func TestIsRetryable(t *testing.T) {
 
 }
 
+func TestIsNotReady(t *testing.T) {
+	t.Run("plain error is not a not-ready condition", func(t *testing.T) {
+		assert.False(t, IsNotReady(fmt.Errorf("connection refused")))
+	})
+
+	t.Run("NotReadyError is a not-ready condition", func(t *testing.T) {
+		err := NewNotReadyError("deploy request has not staged its changes yet")
+		assert.True(t, IsNotReady(err))
+	})
+
+	t.Run("wrapped NotReadyError is a not-ready condition", func(t *testing.T) {
+		err := fmt.Errorf("cutover deploy request #7: %w", NewNotReadyError("not staged"))
+		assert.True(t, IsNotReady(err))
+	})
+
+	t.Run("NotReadyError stays retryable", func(t *testing.T) {
+		assert.True(t, IsRetryable(NewNotReadyError("not staged")))
+	})
+
+	t.Run("nil is not a not-ready condition", func(t *testing.T) {
+		assert.False(t, IsNotReady(nil))
+	})
+}
+
+func TestIsUnsupportedOperation(t *testing.T) {
+	t.Run("plain error is not an unsupported-operation decline", func(t *testing.T) {
+		assert.False(t, IsUnsupportedOperation(fmt.Errorf("connection refused")))
+	})
+
+	t.Run("UnsupportedOperationError is an unsupported-operation decline", func(t *testing.T) {
+		assert.True(t, IsUnsupportedOperation(NewUnsupportedOperationError("stop is not supported")))
+	})
+
+	t.Run("wrapped UnsupportedOperationError is an unsupported-operation decline", func(t *testing.T) {
+		err := fmt.Errorf("stop local engine for task t-1: %w", NewUnsupportedOperationError("stop is not supported"))
+		assert.True(t, IsUnsupportedOperation(err))
+	})
+
+	t.Run("UnsupportedOperationError stays retryable", func(t *testing.T) {
+		// The schema change itself is healthy — only the control operation is
+		// undeliverable — so the generic failure path must not record it as a
+		// permanent failure. Paths that can receive the decline resolve the
+		// control request terminally via IsUnsupportedOperation instead.
+		assert.True(t, IsRetryable(NewUnsupportedOperationError("stop is not supported")))
+	})
+
+	t.Run("nil is not an unsupported-operation decline", func(t *testing.T) {
+		assert.False(t, IsUnsupportedOperation(nil))
+	})
+
+	t.Run("zero-args decline message with a literal percent renders verbatim", func(t *testing.T) {
+		// Exercise the runtime contract directly: with no args the message is
+		// used as-is, never interpreted as a format string. The indirect call
+		// reflects a caller vet's printf checker cannot see.
+		construct := NewUnsupportedOperationError
+		err := construct("revert is capped at 100% for this engine")
+		assert.Equal(t, "revert is capped at 100% for this engine", err.Error())
+	})
+
+	t.Run("extractor returns the typed decline from a wrapped error", func(t *testing.T) {
+		wrapped := fmt.Errorf("stop local engine for task t-1: %w", NewUnsupportedOperationError("stop is not supported"))
+		unsupported, ok := AsUnsupportedOperation(wrapped)
+		assert.True(t, ok)
+		assert.Equal(t, "stop is not supported", unsupported.Error())
+	})
+
+	t.Run("extractor reports absence for a plain error", func(t *testing.T) {
+		unsupported, ok := AsUnsupportedOperation(fmt.Errorf("connection refused"))
+		assert.False(t, ok)
+		assert.Nil(t, unsupported)
+	})
+}
+
+// A settled-outcome refusal is its own type: it never reads as a gap in what
+// the engine supports or as a completion, and it stays retryable so no generic
+// failure path records an outcome the engine has not reported.
+func TestIsSettledOutcome(t *testing.T) {
+	refusal := NewSettledOutcomeError("stop rejected: the schema change on database %s failed before the stop arrived", "testdb")
+	wrapped := fmt.Errorf("stop local engine for task t-1: %w", refusal)
+
+	assert.True(t, IsSettledOutcome(refusal))
+	assert.True(t, IsSettledOutcome(wrapped))
+	settled, ok := AsSettledOutcome(wrapped)
+	require.True(t, ok)
+	assert.Equal(t, "stop rejected: the schema change on database testdb failed before the stop arrived", settled.Error())
+
+	assert.False(t, IsUnsupportedOperation(wrapped))
+	assert.False(t, IsAlreadyCompleted(wrapped))
+	assert.True(t, IsRetryable(wrapped))
+	assert.False(t, IsSettledOutcome(NewUnsupportedOperationError("stop is not supported")))
+	assert.False(t, IsSettledOutcome(fmt.Errorf("connection refused")))
+	assert.False(t, IsSettledOutcome(nil))
+}
+
 func TestIsTransientTransportError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -161,6 +291,141 @@ func TestIsTransientTransportError(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, IsTransientTransportError(tt.err))
+		})
+	}
+}
+
+// remoteWorkEngine models an engine whose schema change runs outside this
+// process: it declares no shutdown-halt capability because nothing it started
+// is affected by this process exiting.
+type remoteWorkEngine struct{ Engine }
+
+// haltableEngine models an engine that runs its schema change in this process.
+type haltableEngine struct {
+	Engine
+	haltErr    error
+	halts      int
+	ownedHalts []string
+}
+
+func (e *haltableEngine) HaltForShutdown(context.Context) error {
+	e.halts++
+	return e.haltErr
+}
+
+func (e *haltableEngine) HaltWorkOwnedBy(_ context.Context, owner string) error {
+	e.ownedHalts = append(e.ownedHalts, owner)
+	return e.haltErr
+}
+
+// Halting an engine on shutdown exists to release resources this process holds
+// on a target. An engine whose work runs elsewhere holds none, so shutdown must
+// report there is nothing to halt rather than treating the missing capability as
+// an error and blocking the process from exiting.
+func TestHaltEngineForShutdownSkipsEnginesWithNoInProcessWork(t *testing.T) {
+	supported, err := HaltEngineForShutdown(t.Context(), &remoteWorkEngine{})
+
+	require.NoError(t, err)
+	assert.False(t, supported, "an engine whose work runs elsewhere declares nothing to halt")
+}
+
+// An engine that runs its work in this process is halted, and a halt that does
+// not complete is reported to the caller rather than swallowed: the target may
+// still be held while the process stops renewing the apply's lease.
+func TestHaltEngineForShutdownReportsTheHaltResult(t *testing.T) {
+	t.Run("halted", func(t *testing.T) {
+		eng := &haltableEngine{}
+
+		supported, err := HaltEngineForShutdown(t.Context(), eng)
+
+		require.NoError(t, err)
+		assert.True(t, supported)
+		assert.Equal(t, 1, eng.halts)
+	})
+
+	t.Run("halt failed", func(t *testing.T) {
+		eng := &haltableEngine{haltErr: fmt.Errorf("runner still copying")}
+
+		supported, err := HaltEngineForShutdown(t.Context(), eng)
+
+		require.Error(t, err)
+		assert.True(t, supported)
+		assert.Contains(t, err.Error(), "runner still copying")
+	})
+}
+
+// A drive halts only the work it started. The owner the drive names reaches
+// the engine unchanged, and an engine whose work runs elsewhere still has
+// nothing to halt.
+func TestHaltEngineWorkOwnedByScopesTheHaltToTheOwner(t *testing.T) {
+	eng := &haltableEngine{}
+
+	supported, err := HaltEngineWorkOwnedBy(t.Context(), eng, "drive-a")
+
+	require.NoError(t, err)
+	assert.True(t, supported)
+	assert.Equal(t, []string{"drive-a"}, eng.ownedHalts)
+	assert.Zero(t, eng.halts, "an owner-scoped halt is not a halt of everything")
+
+	supported, err = HaltEngineWorkOwnedBy(t.Context(), &remoteWorkEngine{}, "drive-a")
+	require.NoError(t, err)
+	assert.False(t, supported)
+}
+
+// shutdownOnlyEngine runs its work in this process and halts it for shutdown,
+// but cannot halt one drive's work apart from another's.
+type shutdownOnlyEngine struct {
+	Engine
+	halts int
+}
+
+func (e *shutdownOnlyEngine) HaltForShutdown(context.Context) error {
+	e.halts++
+	return nil
+}
+
+// The owner-scoped halt is its own capability, so an engine that implements
+// only the shutdown halt keeps it. Its drives hand the apply back without
+// halting anything rather than losing the shutdown halt as well.
+func TestShutdownOnlyEngineKeepsItsShutdownHalt(t *testing.T) {
+	eng := &shutdownOnlyEngine{}
+
+	supported, err := HaltEngineForShutdown(t.Context(), eng)
+	require.NoError(t, err)
+	assert.True(t, supported, "the shutdown halt does not depend on the owner-scoped one")
+	assert.Equal(t, 1, eng.halts)
+
+	supported, err = HaltEngineWorkOwnedBy(t.Context(), eng, "drive-a")
+	require.NoError(t, err)
+	assert.False(t, supported, "an engine without the owner-scoped halt has nothing a drive can halt alone")
+	assert.Equal(t, 1, eng.halts, "a drive's exit never falls back to halting everything")
+}
+
+// The owner a drive attaches is the one the engine reads back, and a context
+// with none reads as the empty owner.
+func TestWorkOwnerRoundTripsThroughTheContext(t *testing.T) {
+	assert.Equal(t, "drive-a", WorkOwnerFromContext(WithWorkOwner(t.Context(), "drive-a")))
+	assert.Empty(t, WorkOwnerFromContext(t.Context()))
+}
+
+func TestSchemaChange_Sharded(t *testing.T) {
+	tests := []struct {
+		name      string
+		shard     string
+		sharded   bool
+		shardName string
+	}{
+		{name: "named shard", shard: "-80", sharded: true, shardName: "-80"},
+		{name: "named shard with surrounding whitespace", shard: " 80- \n", sharded: true, shardName: "80-"},
+		{name: "empty shard", shard: "", sharded: false, shardName: ""},
+		{name: "whitespace-only shard", shard: " \t\n", sharded: false, shardName: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := SchemaChange{Namespace: "payments", Shard: Shard{Name: tt.shard}}
+			assert.Equal(t, tt.sharded, sc.Sharded())
+			assert.Equal(t, tt.shardName, sc.ShardName())
 		})
 	}
 }

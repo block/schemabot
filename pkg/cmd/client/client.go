@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,8 +20,10 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // ResolveEndpoint returns the endpoint to use, checking in order:
@@ -55,15 +58,22 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 // ListDatabasesOptions controls database list request fields.
 type ListDatabasesOptions struct {
 	Type string
+	// Name keeps only databases whose name contains it, case-insensitively.
+	Name string
 }
 
 // ListDatabases fetches the configured databases known to the server.
 func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.DatabaseListResponse, error) {
 	requestPath := "/api/databases"
+	values := url.Values{}
 	if opts.Type != "" {
-		values := url.Values{}
 		values.Set("type", opts.Type)
-		requestPath += "?" + values.Encode()
+	}
+	if opts.Name != "" {
+		values.Set("name", opts.Name)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
 	}
 	var result apitypes.DatabaseListResponse
 	if err := doGetInto(endpoint, requestPath, &result); err != nil {
@@ -96,6 +106,22 @@ func ChecksSynthesize(ctx context.Context, endpoint string, req apitypes.ChecksS
 	return &result, nil
 }
 
+// ChecksInspect reads one pull request's stored check state beside the Check
+// Run on its head commit, with the disposition of each row.
+func ChecksInspect(ctx context.Context, endpoint string, req apitypes.ChecksInspectRequest) (*apitypes.ChecksInspectResponse, error) {
+	values := url.Values{}
+	values.Set("repo", req.Repo)
+	values.Set("pull_request", strconv.Itoa(req.PullRequest))
+	if req.Environment != "" {
+		values.Set("environment", req.Environment)
+	}
+	var result apitypes.ChecksInspectResponse
+	if err := doSlowGetIntoCtx(ctx, endpoint, "/api/checks/inspect?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // ChecksRepos lists the repositories declared in the server's repos config —
 // the inventory a fleet-wide checks scan iterates.
 func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposResponse, error) {
@@ -106,10 +132,60 @@ func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposRes
 	return &result, nil
 }
 
+// StorageSchemaPlan reads which storage DDL is outstanding on a SchemaBot
+// instance's own storage database — the server addressed by endpoint, or a data
+// plane reached through it when deployment is set.
+//
+// The server reads the live catalog and compares it against schema files:
+// its own embedded ones, or the ones in req.SchemaFiles when the caller is
+// asking about a release the server is not running. No version is sent, because
+// a version is the wrong input: it says what a release would converge to, not
+// what the storage actually converged to, and the two differ exactly when a
+// deploy has failed to converge.
+func StorageSchemaPlan(ctx context.Context, endpoint string, req apitypes.StorageSchemaPlanRequest) (*apitypes.StorageSchemaPlanResponse, error) {
+	var result apitypes.StorageSchemaPlanResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/storage/schema/plan", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// StorageSchemaApply converges a SchemaBot instance's own storage database by
+// running the startup bootstrap that instance would run on its next boot,
+// under the same advisory lock.
+//
+// The client waits out the budget the request named rather than the shared
+// operator timeout: a convergence is the one operator call whose duration the
+// caller chooses, so a fixed client deadline would abandon exactly the runs
+// that asked for longer.
+//
+// A request naming no budget is given the operator default here and sent with
+// it named, the way an empty Caller is filled in: the wire then always carries
+// the budget this client is about to wait for, and the server never has to
+// guess it. A server that receives no budget runs the boot's instead, which is
+// far shorter than the wait below — so leaving the field empty would have the
+// server stop at a ceiling this client never reported.
+func StorageSchemaApply(ctx context.Context, endpoint string, req apitypes.StorageSchemaApplyRequest) (*apitypes.StorageSchemaApplyResponse, error) {
+	if req.Caller == "" {
+		req.Caller = GenerateCLIOwner()
+	}
+	budget, err := apitypes.ResolveStorageApplyTimeout(req.TimeoutSeconds, apitypes.DefaultStorageApplyTimeout)
+	if err != nil {
+		return nil, err
+	}
+	req.TimeoutSeconds = int64(budget / time.Second)
+	var result apitypes.StorageSchemaApplyResponse
+	if err := doPostIntoWithClient(ctx, clientForBudget(budget), endpoint, "/api/storage/schema/apply", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // PullSchemaOptions controls optional live schema pull request fields.
 type PullSchemaOptions struct {
 	Namespaces    []string
 	CatalogDetail string
+	Lint          bool
 }
 
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
@@ -119,49 +195,129 @@ func CallPullSchemaAPI(endpoint, database, dbType, environment string, namespace
 
 // CallPullSchemaAPIWithOptions fetches live schema with optional namespace and catalog controls.
 func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string, opts PullSchemaOptions) (*apitypes.PullSchemaResponse, error) {
+	return CallPullSchemaAPIWithContext(context.Background(), endpoint, database, dbType, environment, opts)
+}
+
+// CallPullSchemaAPIWithContext cancels the live-schema request with its caller.
+func CallPullSchemaAPIWithContext(ctx context.Context, endpoint, database, dbType, environment string, opts PullSchemaOptions) (*apitypes.PullSchemaResponse, error) {
 	req := apitypes.PullSchemaRequest{
 		Database:      database,
 		Type:          dbType,
 		Environment:   environment,
 		Namespaces:    opts.Namespaces,
 		CatalogDetail: opts.CatalogDetail,
+		Lint:          opts.Lint,
 	}
 	var result apitypes.PullSchemaResponse
-	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {
+	if err := doPostIntoWithClient(ctx, httpClient, endpoint, "/api/pull", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
 }
 
-// CallPlanAPI calls the plan API by reading .sql files from schemaDir.
-// Files are grouped by namespace: subdirectories become namespace keys,
-// flat files use the directory name as the namespace.
-func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int) (*apitypes.PlanResponse, error) {
-	schemaFiles, err := ReadSchemaFiles(schemaDir, environment)
-	if err != nil {
-		return nil, fmt.Errorf("read schema files: %w", err)
-	}
-	if len(schemaFiles) == 0 {
-		return nil, fmt.Errorf("no .sql files found in %s", schemaDir)
-	}
-	return CallPlanAPIWithFiles(endpoint, database, dbType, environment, schemaFiles, repo, pr)
+// PlanExclusions carries the exclusions a repository's schemabot.yaml declares:
+// namespace directories the plan must not reconcile (ignore_namespaces) and
+// live tables it must not see (ignore_tables). They travel as one value so a
+// caller cannot hand the plan its tables as its namespaces.
+type PlanExclusions struct {
+	Namespaces []string
+	Tables     []string
 }
 
-// CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped schema files.
+// CallPlanAPI calls the plan API by reading .sql files from schemaDir.
+// Files are grouped by namespace: subdirectories become namespace keys,
+// flat files use the directory name as the namespace. Namespaces listed in
+// exclusions.Namespaces are excluded from the plan request. The second return
+// value lists the namespaces actually removed by them, so callers can disclose
+// the exclusion alongside the plan.
+//
+// exclusions.Tables cannot be resolved here: it names live tables on the
+// target, so the entries travel with the request and the response reports which
+// of them withheld anything (PlanResponse.WithheldTables).
+//
+// groupedExecution says whether the apply this plan is for hands the engine
+// every ALTER at once or one table at a time. It only affects what the plan
+// predicts about work already on the target; a caller that has not chosen yet
+// passes false, the shape an apply runs without asking for anything else.
+//
+// CallPlanAPI does not say it renders the rollout, so the server refuses it a
+// rollout-wide plan of an environment with more than one member. A caller that
+// reads the rollout block uses CallPlanAPIForTarget and says so.
+func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "", false)
+}
+
+// CallPlanAPIForTarget is CallPlanAPI narrowed to the one rollout member target
+// names, by its target or by deployment/target. An empty target plans the
+// whole rollout. rendersRollout says the caller reads the response's rollout
+// block and acts on every member's plan; see apitypes.PlanRequest.RendersRollout.
+func CallPlanAPIForTarget(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, target, rendersRollout)
+}
+
+// CallPlanAPIWithContext cancels baseline planning with its caller.
+// rendersRollout is as for CallPlanAPIForTarget.
+func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution, rendersRollout bool) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(ctx, endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "", rendersRollout)
+}
+
+func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	schemaRoot, err := ResolveEnvironmentSchemaRoot(schemaDir, environment)
+	if err != nil {
+		return nil, nil, err
+	}
+	schemaFiles, ignored, err := ReadSchemaFiles(schemaRoot, environment, exclusions.Namespaces)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read schema files: %w", err)
+	}
+	if len(schemaFiles) == 0 {
+		if len(ignored) > 0 {
+			return nil, ignored, fmt.Errorf("no .sql files found in %s after excluding ignored namespaces %v", schemaRoot, ignored)
+		}
+		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaRoot)
+	}
+	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target, rendersRollout)
+	if err != nil {
+		return nil, ignored, err
+	}
+	return resp, ignored, nil
+}
+
+// CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped
+// schema files. It does not say it renders the rollout, so the server refuses
+// it a rollout-wide plan of an environment with more than one member.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
+	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, false, "", false)
+}
+
+// postPlanRequestWithContext posts a plan request. ignoredNamespaces names the
+// namespaces removed from schemaFiles before the call — the server needs
+// them to refuse engine shapes that cannot honor the exclusion.
+// rendersRollout is the caller's own statement, never a default: a caller
+// that does not read the rollout block would present the primary's plan as
+// every member's.
+func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
-		Database:    database,
-		Type:        dbType,
-		Environment: environment,
-		SchemaFiles: schemaFiles,
-		Repository:  repo,
+		Database:          database,
+		Type:              dbType,
+		Environment:       environment,
+		SchemaFiles:       schemaFiles,
+		Repository:        repo,
+		IgnoredNamespaces: ignoredNamespaces,
+		IgnoreTables:      ignoreTables,
+		GroupedExecution:  groupedExecution,
+		Target:            target,
+		RendersRollout:    rendersRollout,
 	}
 	if pr != 0 {
 		prVal := int32(pr)
 		req.PullRequest = &prVal
 	}
 	var result apitypes.PlanResponse
-	if err := doPostInto(endpoint, "/api/plan", req, &result); err != nil {
+	if err := doPostIntoWithClient(ctx, httpClient, endpoint, "/api/plan", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -181,13 +337,28 @@ func CallRollbackPlanAPI(endpoint, applyID, environment string) (*apitypes.PlanR
 	return &result, nil
 }
 
-// CallApplyAPI calls the apply API and returns the typed result.
+// CallApplyAPI calls the apply API for the whole rollout and returns the typed
+// result. It does not declare that the client shows every rollout member's
+// plan, so the server refuses it a rollout-wide apply of an environment with more
+// than one member; see apitypes.ApplyRequest.RendersRollout. A caller that
+// showed every member's plan uses CallApplyAPIForTarget and says so.
 func CallApplyAPI(endpoint, planID, environment, caller string, options map[string]string) (*apitypes.ApplyResponse, error) {
+	return CallApplyAPIForTarget(endpoint, planID, environment, caller, "", false, options)
+}
+
+// CallApplyAPIForTarget is CallApplyAPI narrowed to the one rollout member
+// target names. An empty target applies the whole rollout. rendersRollout
+// declares that the caller shows the operator the plan every rollout member
+// runs, a client capability rather than consent; see
+// apitypes.ApplyRequest.RendersRollout.
+func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, rendersRollout bool, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{
-		PlanID:      planID,
-		Environment: environment,
-		Caller:      caller,
-		Options:     options,
+		PlanID:         planID,
+		Environment:    environment,
+		Caller:         caller,
+		Options:        options,
+		Target:         target,
+		RendersRollout: rendersRollout,
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {
@@ -248,24 +419,83 @@ type ActiveSchemaChange struct {
 }
 
 func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSchemaChange, error) {
+	return findActiveSchemaChange(endpoint, database, environment, "", func(*apitypes.ActiveApplyResponse) bool { return true })
+}
+
+// CheckActiveSchemaChangeOnDeployment is CheckActiveSchemaChange limited to
+// the active schema changes that hold the given deployment, for an apply that
+// reserves only that deployment. The server is asked for that deployment's
+// applies, since it reports an apply's deployment only when a status request
+// names one. An active apply whose deployment is still not reported is counted
+// as holding it, since nothing shows it does not. So is an apply whose
+// operation on the deployment has finished while the apply itself is still
+// running elsewhere: the apply keeps the deployment until it is terminal.
+func CheckActiveSchemaChangeOnDeployment(endpoint, database, environment, deployment string) (*ActiveSchemaChange, error) {
+	deployment = storage.CanonicalKey(deployment)
+	return findActiveSchemaChange(endpoint, database, environment, deployment, func(apply *apitypes.ActiveApplyResponse) bool {
+		return apply.Deployment == "" || storage.CanonicalKey(apply.Deployment) == deployment
+	})
+}
+
+func findActiveSchemaChange(endpoint, database, environment, deployment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
 	var result apitypes.StatusResponse
 	query := url.Values{}
 	query.Set("environment", environment)
+	if deployment != "" {
+		query.Set("deployment", deployment)
+	}
 	query.Set("limit", "1000")
+	// Ask only for applies still holding a target. This runs on every apply and
+	// rollback preflight, and the answer never depends on settled history, so
+	// scanning it would make every schema change pay for the environment's whole
+	// past to learn whether one database is busy.
+	query.Set("active", "true")
 	if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
 		return nil, err
 	}
 
+	// The operator's flags arrive in whatever case they were typed, and on
+	// MySQL a stored row written before storage folded its keys is still
+	// matched by the case-insensitive collation and returned in its original
+	// spelling, so fold both sides before comparing or a busy database slips
+	// past the preflight on a case mismatch. PostgreSQL compares bytes: the
+	// server filters by the folded environment, so such a row never reaches
+	// this client and only the one-time storage canonicalization brings it
+	// back into the preflight.
+	database = storage.CanonicalKey(database)
+	environment = storage.CanonicalKey(environment)
 	for _, apply := range result.Applies {
-		if apply.Database != database || apply.Environment != environment {
+		if storage.CanonicalKey(apply.Database) != database || storage.CanonicalKey(apply.Environment) != environment {
 			continue
 		}
-		if state.IsTerminalApplyState(apply.State) {
+		// The server already excluded terminal states; re-checking here keeps the
+		// answer correct if this ever reads a response that was not filtered.
+		activeState, active := activeStateOf(apply)
+		if !active {
 			continue
 		}
-		return &ActiveSchemaChange{State: apply.State, ApplyID: apply.ApplyID}, nil
+		if !holds(apply) {
+			continue
+		}
+		return &ActiveSchemaChange{State: activeState, ApplyID: apply.ApplyID}, nil
 	}
 	return nil, nil
+}
+
+// activeStateOf reports whether a listed apply still holds its targets, and
+// the state to show for it. A deployment-filtered status row reports the
+// deployment's operation state, but the apply keeps every deployment it
+// touches reserved until the apply itself is terminal, so a finished
+// operation under an apply still running elsewhere counts as active, under
+// the apply's state.
+func activeStateOf(apply *apitypes.ActiveApplyResponse) (string, bool) {
+	if !state.IsTerminalApplyState(apply.State) {
+		return apply.State, true
+	}
+	if apply.ApplyState != "" && !state.IsTerminalApplyState(apply.ApplyState) {
+		return apply.ApplyState, true
+	}
+	return "", false
 }
 
 // ReadSchemaFiles reads .sql files from a directory and groups them by namespace.
@@ -273,11 +503,81 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // namespace (the MySQL database name). Only one level of subdirectories is
 // supported (matching the webhook path behavior).
 //
-// The environment parameter enables $ENV substitution in namespace names.
-// If non-empty, any "$ENV" in directory names or the default namespace is
-// replaced with the environment value (e.g., "bikeshare_$ENV" → "bikeshare_staging").
-func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.SchemaFiles, error) {
-	// Collect all files as relativePath → content
+// The environment parameter enables {env} and legacy $ENV substitution in
+// namespace names. If non-empty, either token in directory names or the
+// default namespace is replaced with the environment value.
+//
+// Namespaces listed in ignoreNamespaces (schemabot.yaml ignore_namespaces) are
+// excluded from the result. The second return value lists the namespace keys
+// actually removed by ignoreNamespaces, sorted.
+func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) (map[string]*apitypes.SchemaFiles, []string, error) {
+	rawFiles, err := ReadSchemaFilesByPath(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Group by namespace using the shared helper.
+	// For flat files, the directory name is the database name.
+	grouped, ignored, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment, ignoreNamespaces)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Convert schema.SchemaFiles → apitypes.SchemaFiles
+	result := make(map[string]*apitypes.SchemaFiles, len(grouped))
+	for ns, nsFiles := range grouped {
+		result[ns] = &apitypes.SchemaFiles{Files: nsFiles.Files}
+	}
+	return result, ignored, nil
+}
+
+// ResolveEnvironmentSchemaRoot returns the directory on the local filesystem
+// holding environment's schema files for the schemabot.yaml in configDir: the
+// configDir/<environment> directory, or the directory inside configDir that a
+// configDir/<environment> symlink points to, or configDir itself when it has
+// no entry for the environment. These are the rules a pull request's plan
+// resolves the same tree by (schema.ResolveEnvironmentSchemaRoot), so a local
+// plan reads the schema the pull request plans.
+func ResolveEnvironmentSchemaRoot(configDir, environment string) (string, error) {
+	schemaRoot, _, err := schema.ResolveEnvironmentSchemaRoot(filepath.ToSlash(configDir), environment, localSchemaEntry)
+	if err != nil {
+		return "", err
+	}
+	return filepath.FromSlash(schemaRoot), nil
+}
+
+// localSchemaEntry reports what the local filesystem holds at a
+// slash-separated path, without following a symlink there.
+func localSchemaEntry(entryPath string) (schema.Entry, error) {
+	localPath := filepath.FromSlash(entryPath)
+	info, err := os.Lstat(localPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return schema.Entry{Kind: schema.EntryMissing}, nil
+		}
+		return schema.Entry{}, fmt.Errorf("inspect %s: %w", localPath, err)
+	}
+	switch {
+	case info.Mode()&fs.ModeSymlink != 0:
+		target, err := os.Readlink(localPath)
+		if err != nil {
+			return schema.Entry{}, fmt.Errorf("read symlink %s: %w", localPath, err)
+		}
+		return schema.Entry{Kind: schema.EntrySymlink, SymlinkTarget: filepath.ToSlash(target)}, nil
+	case info.IsDir():
+		return schema.Entry{Kind: schema.EntryDirectory}, nil
+	default:
+		return schema.Entry{Kind: schema.EntryOther}, nil
+	}
+}
+
+// ReadSchemaFilesByPath collects schema files from dir and one level of
+// subdirectories (symlinked directories included), returning them keyed by
+// their slash-separated path relative to dir, e.g. "users.sql" or
+// "orders/users.sql". It does not validate whether the collected paths form a
+// supported layout; GroupFilesByNamespace performs that validation. Callers
+// that must write a file back join the key onto dir.
+func ReadSchemaFilesByPath(dir string) (map[string]string, error) {
 	rawFiles := make(map[string]string)
 
 	entries, err := os.ReadDir(dir)
@@ -328,19 +628,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 		rawFiles[entry.Name()] = string(content)
 	}
 
-	// Group by namespace using the shared helper.
-	// For flat files, the directory name is the database name.
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment)
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert schema.SchemaFiles → apitypes.SchemaFiles
-	result := make(map[string]*apitypes.SchemaFiles, len(grouped))
-	for ns, nsFiles := range grouped {
-		result[ns] = &apitypes.SchemaFiles{Files: nsFiles.Files}
-	}
-	return result, nil
+	return rawFiles, nil
 }
 
 func isSchemaFile(name string) bool {
@@ -365,16 +653,6 @@ func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartRespons
 // CallReleaseAPI calls the release API and returns the typed result.
 func CallReleaseAPI(endpoint, environment, applyID string) (*apitypes.ReleaseResponse, error) {
 	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID)
-}
-
-// CallVolumeAPI calls the volume API and returns the typed result.
-func CallVolumeAPI(endpoint, environment, applyID string, volume int) (*apitypes.VolumeResponse, error) {
-	req := apitypes.VolumeRequest{Environment: environment, Volume: int32(volume), ApplyID: applyID}
-	var result apitypes.VolumeResponse
-	if err := doPostInto(endpoint, "/api/volume", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
 }
 
 // CallRevertAPI calls the revert API and returns the typed result.
@@ -414,8 +692,8 @@ type LockInfo struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// GenerateCLIOwner generates an owner identifier for CLI-based locks.
-// Format: "cli:username@hostname"
+// GenerateCLIOwner generates an owner identifier for CLI-based locks and the
+// caller attribution on CLI-driven requests: "cli:<user>@<host>".
 func GenerateCLIOwner() string {
 	username := "unknown"
 	if u, err := user.Current(); err == nil {
@@ -427,7 +705,29 @@ func GenerateCLIOwner() string {
 		hostname = h
 	}
 
-	return fmt.Sprintf("cli:%s@%s", username, hostname)
+	return cliOwner(username, hostname)
+}
+
+// cliOwner renders a CLI owner in the canonical spelling the lock API stores.
+// The lock API folds every caller-supplied owner before persisting or matching
+// it, so the CLI must fold the same value: an operator whose hostname or
+// username carries uppercase characters would otherwise compare unequal to
+// their own stored lock, and the pre-apply lock check would report the
+// database as locked by someone else.
+//
+// The same string is also the caller attribution on CLI-driven requests, which
+// the server does not fold. The hostname half is free — hostnames are
+// case-insensitive — and an authenticated server records the verified subject
+// in place of the claimed username, so nothing of the identity is lost there.
+// A server running without API auth records the claimed username lowercased:
+// a cosmetic loss on a display-only field, in exchange for an ownership
+// predicate that agrees with the one the lock is stored under.
+//
+// The fold belongs here rather than in caller.FormatCLI because the server
+// renders verified subjects through that same formatter, and a verified
+// identity must reach storage in the spelling its provider issued.
+func cliOwner(username, hostname string) string {
+	return storage.CanonicalKey(caller.FormatCLI(username, hostname))
 }
 
 // AcquireLock attempts to acquire a lock on a database.
@@ -502,7 +802,10 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
-			if apiErr.Status == http.StatusForbidden {
+			// A 403 can also be an authorization denial naming the groups
+			// that would grant access, so only the ownership error code maps
+			// to ErrLockNotOwned; other denials surface the server's message.
+			if apiErr.Status == http.StatusForbidden && apiErr.ErrorCode == apitypes.ErrCodeLockNotOwned {
 				return ErrLockNotOwned
 			}
 			if apiErr.Status == http.StatusNotFound {
@@ -565,7 +868,22 @@ type StatusOptions struct {
 	Limit       int
 	Environment string
 	Deployment  string
-	Failed      bool
+	// State restricts the list to one apply state; empty means all states.
+	State  string
+	Failed bool
+	// Last bounds the list to applies whose latest activity — on the apply or any
+	// of its operations — falls within this window; zero means unbounded.
+	Last time.Duration
+	// Active restricts the list to applies that have not reached a terminal
+	// state, so a caller asking whether a target is busy does not page through
+	// settled history.
+	Active bool
+	// Finished restricts the list to applies in a terminal state, the
+	// complement of Active. It is ignored when Active is set.
+	Finished bool
+	// After fetches the page that follows this apply ID, the last one an
+	// earlier page listed. The other options must repeat that page's filters.
+	After string
 }
 
 // GetStatus fetches recent schema changes.
@@ -583,8 +901,22 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		if opts[0].Deployment != "" {
 			values.Set("deployment", opts[0].Deployment)
 		}
+		if opts[0].State != "" {
+			values.Set("state", opts[0].State)
+		}
 		if opts[0].Failed {
 			values.Set("failed", "true")
+		}
+		if opts[0].Last > 0 {
+			values.Set("last", opts[0].Last.String())
+		}
+		if opts[0].Active {
+			values.Set("active", "true")
+		} else if opts[0].Finished {
+			values.Set("active", "false")
+		}
+		if opts[0].After != "" {
+			values.Set("starting_after", opts[0].After)
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded
@@ -596,12 +928,95 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 	return &result, nil
 }
 
+// PlansOptions filters the stored-plan listing.
+type PlansOptions struct {
+	Limit       int
+	Database    string
+	Environment string
+	// Repository restricts the listing to plans generated for PRs in that
+	// repository (owner/name).
+	Repository string
+	// PullRequest restricts the listing to plans generated for that PR
+	// number; the server requires Repository alongside it.
+	PullRequest int
+	// Last bounds the listing to plans created within this window; zero means
+	// unbounded.
+	Last time.Duration
+	// After requests the page that follows this plan ID, the last plan of the
+	// previous page. The other options must repeat that page's filters.
+	After string
+}
+
+// GetPlans retrieves recent stored plans as summaries, newest first.
+func GetPlans(endpoint string, opts PlansOptions) (*apitypes.PlansResponse, error) {
+	var result apitypes.PlansResponse
+	values := url.Values{}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.Database != "" {
+		values.Set("database", opts.Database)
+	}
+	if opts.Environment != "" {
+		values.Set("environment", opts.Environment)
+	}
+	if opts.Repository != "" {
+		values.Set("repository", opts.Repository)
+	}
+	if opts.PullRequest > 0 {
+		values.Set("pull_request", strconv.Itoa(opts.PullRequest))
+	}
+	if opts.Last > 0 {
+		values.Set("last", opts.Last.String())
+	}
+	if opts.After != "" {
+		values.Set("starting_after", opts.After)
+	}
+	requestPath := "/api/plans"
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
+	}
+	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStoredPlan retrieves one stored plan with its full content.
+func GetStoredPlan(endpoint, planID string) (*apitypes.StoredPlanResponse, error) {
+	var result apitypes.StoredPlanResponse
+	if err := doGetInto(endpoint, "/api/plans/"+url.PathEscape(planID), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 type LogEntry = apitypes.LogEntry
+
+// LogScope narrows a log read to one target, one shard of a sharded apply, or
+// one shard of one target (shard names repeat across targets). A narrowed read
+// still includes the entries about the apply as a whole. The zero scope reads
+// the whole apply.
+type LogScope struct {
+	Target string
+	Shard  string
+}
+
+func (scope LogScope) setQuery(values url.Values) {
+	if scope.Target != "" {
+		values.Set("target", scope.Target)
+	}
+	if scope.Shard != "" {
+		values.Set("shard", scope.Shard)
+	}
+}
 
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
 // Otherwise, it fetches logs for the most recent apply in the environment.
-func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*LogEntry, error) {
+// scope narrows the read to one target or shard. The response carries the
+// newest limit entries plus whether older ones exist beyond the window.
+func GetLogs(endpoint, database, environment, applyID string, scope LogScope, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -612,6 +1027,7 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 	} else if environment != "" {
 		values.Set("environment", environment)
 	}
+	scope.setQuery(values)
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
 	}
@@ -625,24 +1041,53 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		path += "?" + encoded
 	}
 
-	var result struct {
-		Logs []*LogEntry `json:"logs"`
-	}
+	var result apitypes.LogsResponse
 	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
-	return result.Logs, nil
+	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
-func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {
+// requireEchoed refuses a scoped read the server answered unscoped. A server
+// that predates scoped reads ignores the target or shard and serves the whole
+// apply's entries interleaved, which would read as the one target's or shard's
+// history.
+func (scope LogScope) requireEchoed(target, shard string) error {
+	if err := requireEchoedScope("target", "--target", scope.Target, target); err != nil {
+		return err
+	}
+	return requireEchoedScope("shard", "--shard", scope.Shard, shard)
+}
+
+func requireEchoedScope(kind, flag, requested, echoed string) error {
+	if requested == "" || echoed == requested {
+		return nil
+	}
+	if echoed == "" {
+		return fmt.Errorf("the server does not support reading one %s's logs and returned the whole apply's; upgrade the server or omit %s", kind, flag)
+	}
+	return fmt.Errorf("the server answered a read of %s %q with %s %q's logs", kind, requested, kind, echoed)
+}
+
+// GetDeploymentLogs retrieves an apply's logs from one data-plane deployment,
+// one source per remote read. scope keeps only the sources of one target or
+// shard, and each source's entries for it.
+func GetDeploymentLogs(endpoint, applyID, deployment string, scope LogScope, limit int) (*apitypes.DeploymentLogsResponse, error) {
 	values := url.Values{}
 	values.Set("apply_id", applyID)
 	values.Set("deployment", deployment)
+	scope.setQuery(values)
 	if limit > 0 {
 		values.Set("limit", strconv.Itoa(limit))
 	}
 	var result apitypes.DeploymentLogsResponse
 	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	if err := scope.requireEchoed(result.Target, result.Shard); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -671,7 +1116,7 @@ func GetSetting(endpoint, key string) (string, error) {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	}
-	err := doGetInto(endpoint, fmt.Sprintf("/api/settings/%s", key), &result)
+	err := doGetInto(endpoint, "/api/settings/"+url.PathEscape(key), &result)
 	if IsNotFound(err) {
 		return "", nil // Setting not found, return empty
 	}

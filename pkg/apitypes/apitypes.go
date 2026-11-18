@@ -5,6 +5,10 @@ package apitypes
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 )
@@ -24,21 +28,40 @@ type LogEntry struct {
 }
 
 type LogsResponse struct {
-	ApplyID string      `json:"apply_id,omitempty"`
-	Logs    []*LogEntry `json:"logs"`
+	ApplyID string `json:"apply_id,omitempty"`
+	// Target echoes the target the read was narrowed to, empty for a read of
+	// the whole apply. A server that predates scoped reads leaves it empty
+	// whatever was asked, which is how a client detects that it was ignored.
+	Target string `json:"target,omitempty"`
+	// Shard echoes the shard the read was narrowed to, as Target.
+	Shard string      `json:"shard,omitempty"`
+	Logs  []*LogEntry `json:"logs"`
+	// Truncated reports that entries older than Logs exist and were left
+	// outside the requested window. A reader that shows a full window without
+	// this signal reads as a complete lifecycle, which is the wrong conclusion
+	// when the interesting part scrolled past the limit.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type DeploymentLogsResponse struct {
-	ApplyID    string                 `json:"apply_id"`
-	Deployment string                 `json:"deployment"`
-	Sources    []*DeploymentLogSource `json:"sources"`
-	Errors     []*DeploymentLogError  `json:"errors"`
+	ApplyID    string `json:"apply_id"`
+	Deployment string `json:"deployment"`
+	// Target and Shard echo the scope the read was narrowed to, as in
+	// LogsResponse.
+	Target  string                 `json:"target,omitempty"`
+	Shard   string                 `json:"shard,omitempty"`
+	Sources []*DeploymentLogSource `json:"sources"`
+	Errors  []*DeploymentLogError  `json:"errors"`
 }
 
 type DeploymentLogSource struct {
 	ExternalID string                    `json:"external_id"`
 	Operations []*LogOperationProvenance `json:"operations"`
 	Logs       []*LogEntry               `json:"logs"`
+	// Truncated reports that this source has entries older than Logs. Each
+	// source is windowed independently, so one source can be truncated while
+	// another in the same response is complete.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type LogOperationProvenance struct {
@@ -64,16 +87,22 @@ type DeploymentLogError struct {
 // constants rather than parsing error_message strings or HTTP status codes.
 // Use IsRetryableErrorCode to determine whether a given code is retryable.
 const (
-	ErrCodeInvalidRequest       = "invalid_request"        // Malformed request (missing params, bad values)
-	ErrCodeNotFound             = "not_found"              // Resource doesn't exist (unknown apply ID, database)
-	ErrCodeDeploymentNotFound   = "deployment_not_found"   // No tern deployment configured for database/environment
-	ErrCodeEngineError          = "engine_error"           // Schema change engine failure during execution
-	ErrCodeEngineErrorRetryable = "engine_error_retryable" // Schema change engine failure that may recover on retry
-	ErrCodeStorageError         = "storage_error"          // Storage backend (MySQL) read/write failure
-	ErrCodeEngineUnavailable    = "engine_unavailable"     // Schema change engine (Tern) unreachable or RPC error
-	ErrCodeStateSyncFailed      = "state_sync_failed"      // Operation succeeded but local state sync failed
-	ErrCodeActiveApplyExists    = "active_apply_exists"    // Another active apply already exists for the target
-	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
+	ErrCodeInvalidRequest          = "invalid_request"           // Malformed request (missing params, bad values)
+	ErrCodeNotFound                = "not_found"                 // Resource doesn't exist (unknown apply ID, database)
+	ErrCodeDeploymentNotFound      = "deployment_not_found"      // No tern deployment configured for database/environment
+	ErrCodeEngineError             = "engine_error"              // Schema change engine failure during execution
+	ErrCodeEngineErrorRetryable    = "engine_error_retryable"    // Schema change engine failure that may recover on retry
+	ErrCodeStorageError            = "storage_error"             // Storage backend (MySQL) read/write failure
+	ErrCodeEngineUnavailable       = "engine_unavailable"        // Schema change engine (Tern) unreachable or RPC error
+	ErrCodeStateSyncFailed         = "state_sync_failed"         // Operation succeeded but local state sync failed
+	ErrCodeActiveApplyExists       = "active_apply_exists"       // Another active apply already exists for the target
+	ErrCodeSourcePolicyDenied      = "source_policy_denied"      // Source repo/path is not authorized for the database
+	ErrCodeLockNotOwned            = "lock_not_owned"            // Lock release denied because the caller is not the owner
+	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
+	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
+	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
+	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
+	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -81,10 +110,16 @@ var retryableErrorCodes = map[string]bool{
 	ErrCodeStorageError:         true,
 	ErrCodeEngineUnavailable:    true,
 	ErrCodeStateSyncFailed:      true,
+	ErrCodeRateLimited:          true,
 }
 
 // IsRetryableErrorCode reports whether the given API error code represents a
 // transient failure that clients should retry with backoff.
+//
+// A code says whether to retry but never when. When the whole response is in
+// hand, prefer ErrorResponse.RetryAfter, which answers both together: some
+// refusals carry a delay the server expects a client to observe, and retrying
+// on the code alone ignores it.
 func IsRetryableErrorCode(code string) bool {
 	return retryableErrorCodes[code]
 }
@@ -94,6 +129,70 @@ func IsRetryableErrorCode(code string) bool {
 type ErrorResponse struct {
 	Error     string `json:"error"`
 	ErrorCode string `json:"error_code"`
+
+	// RetryAfterSeconds is how long the client should wait before retrying,
+	// set only on responses that carry a Retry-After header. It repeats the
+	// header in the body so a client that reads only the error body, such as
+	// an older CLI, still sees the wait.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+}
+
+// RetryAfter reports whether a client should retry this error and how long it
+// must wait before doing so.
+//
+// The two answers belong together. A retryable code on its own invites a
+// client to retry at whatever cadence it likes, which for a refusal that
+// carries a delay turns one bounded rejection into sustained rejected traffic
+// against the very thing the delay is protecting. A zero delay means the code
+// is retryable with no wait the server can name, and the client picks its own
+// backoff.
+func (e ErrorResponse) RetryAfter() (retry bool, after time.Duration) {
+	if !IsRetryableErrorCode(e.ErrorCode) {
+		return false, 0
+	}
+	return true, time.Duration(e.RetryAfterSeconds) * time.Second
+}
+
+// The reasons a pull is refused for exceeding a request budget. Each names the
+// budget that ran out, so a client reading only the message can tell whether it
+// is being limited for its own request rate or for the load every client is
+// putting on one database.
+const (
+	PullRateLimitCallerReason = "too many pull requests from this caller"
+	PullRateLimitTargetReason = "too many pull requests for this database and environment"
+
+	// PullRateLimitSharedReason replaces the per-caller reason on a server that
+	// does not authenticate callers. There every request arrives as the same
+	// anonymous subject, so the budget that ran out belongs to all clients at
+	// once: a refused operator has not made the requests being counted, and a
+	// message blaming "this caller" would send them looking for a fault in
+	// their own tooling instead of at the server's auth configuration.
+	PullRateLimitSharedReason = "too many pull requests; this server does not authenticate callers, so every client shares one request budget"
+)
+
+// The reasons a check inspection is refused for exceeding its request budget,
+// split the same way as the pull reasons: the shared form replaces the
+// per-caller one on a server that does not authenticate callers.
+const (
+	ChecksInspectRateLimitCallerReason = "too many check inspections from this caller"
+	ChecksInspectRateLimitSharedReason = "too many check inspections; this server does not authenticate callers, so every client shares one request budget"
+)
+
+// NewRateLimitedResponse builds the body of a 429 refusal from the budget that
+// ran out and how long the caller must wait.
+//
+// The wait is rounded up to whole seconds, the only unit Retry-After can
+// express, and is never reported as less than one: "retry in 0s" reads as an
+// invitation to retry immediately, which is exactly what the budget is
+// refusing. The same rounded value goes in the message and in the field, so a
+// client that reads either sees one delay.
+func NewRateLimitedResponse(reason string, retryAfter time.Duration) ErrorResponse {
+	seconds := max(int(math.Ceil(retryAfter.Seconds())), 1)
+	return ErrorResponse{
+		Error:             fmt.Sprintf("%s; retry in %ds", reason, seconds),
+		ErrorCode:         ErrCodeRateLimited,
+		RetryAfterSeconds: seconds,
+	}
 }
 
 type WebhookRedriveRequest struct {
@@ -164,6 +263,23 @@ type ChecksScanRequest struct {
 	// the scan stops paging as soon as it crosses the cutoff — bounding an
 	// incident-window sweep by the window instead of the repo's PR count.
 	UpdatedSince string `json:"updated_since,omitempty"`
+	// StuckAfter, when set (a Go duration such as "1h"), limits the stored-row
+	// annotation on uncompleted Check Runs to runs that have been sitting at
+	// least this long. Every uncompleted run is still reported; a young one
+	// simply comes back unannotated, since the annotation costs a storage read
+	// per pull request and one per apply behind it, and a caller that drops
+	// young runs before rendering never shows the result.
+	//
+	// A run whose start time is missing, unparseable, or in the future is
+	// annotated: a start time that cannot prove a run is young must not be
+	// read as deciding that it is.
+	StuckAfter string `json:"stuck_after,omitempty"`
+	// ReportAppNotInstalled declares that the caller understands
+	// ChecksScanResponse.AppNotInstalled. Only then does a repository whose
+	// GitHub App is not installed come back as that skip; any other caller
+	// gets an error, so a client that predates the field never reads an unread
+	// repository as one scanned clean.
+	ReportAppNotInstalled bool `json:"report_app_not_installed,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -176,6 +292,15 @@ type ChecksScanResponse struct {
 	// PR would trivially be missing a check the server refuses to create.
 	// When set, no PRs were scanned and the other fields are zero.
 	ChecksDisabled bool `json:"checks_disabled,omitempty"`
+	// AppNotInstalled reports that GitHub has no installation of the
+	// repository's configured GitHub App (the installation lookup answered
+	// 404), so the scan was skipped: the App can neither read nor publish the
+	// repository's Check Runs. GitHubApp names the configured App. When set, no
+	// PRs were scanned and the other fields are zero. Any other lookup failure
+	// is an error response, never this flag, and so is this one unless the
+	// request set ReportAppNotInstalled.
+	AppNotInstalled bool   `json:"app_not_installed,omitempty"`
+	GitHubApp       string `json:"github_app,omitempty"`
 	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
 	// reports it for this page's listing — an upper bound while more pages
 	// remain, exact on the final page. Recomputed every page so the caller
@@ -187,6 +312,14 @@ type ChecksScanResponse struct {
 	// decides how old is old enough to call stuck, because an uncompleted
 	// check is legitimate while an apply or plan is genuinely in flight.
 	Stuck []StuckCheckPR `json:"stuck,omitempty"`
+	// ObservedAt is the clock this page's runs were aged against, RFC3339. The
+	// stuck threshold is applied on both sides — here to decide which runs to
+	// annotate with their stored rows, and by the caller to decide which to
+	// render — and two clocks a round trip apart disagree at the boundary. A
+	// caller that ages the runs against this instead of its own reaches the
+	// same verdict the annotation was written for. Empty from a server that
+	// does not annotate at all, where the caller's own clock is all there is.
+	ObservedAt string `json:"observed_at,omitempty"`
 	// RateLimit reports the GitHub budget left on the installation that
 	// served this page, so the caller can pace itself instead of starving
 	// the live webhook path that shares the same budget. Nil when the rate
@@ -264,6 +397,12 @@ type StuckCheckPR struct {
 	Checks  []IncompleteCheckRun `json:"checks"`
 }
 
+// Values for IncompleteCheckRun.WaitingOn.
+const (
+	WaitingOnSchemaBot = "schemabot"
+	WaitingOnOperator  = "operator"
+)
+
 // IncompleteCheckRun describes one Check Run that exists on the PR head but
 // has not completed.
 type IncompleteCheckRun struct {
@@ -272,6 +411,153 @@ type IncompleteCheckRun struct {
 	Status     string `json:"status"`
 	// StartedAt is RFC3339; empty when GitHub did not report a start time.
 	StartedAt string `json:"started_at,omitempty"`
+	// StoredRows is the stored check state behind this uncompleted run, read
+	// against the PR's head and narrowed to the environment this run reports
+	// on. An uncompleted Check Run says only that the gate is open; these
+	// rows say what it is open on, and whether that is something SchemaBot
+	// resolves or something a person has to.
+	//
+	// A PR carries one run per environment and each gates merge on its own,
+	// so the rows are per run rather than per PR: attributing another
+	// environment's rows to this run would name a cause that has nothing to
+	// do with why it is sitting.
+	//
+	// Empty when the scan could not read stored state. That is reported as
+	// absence rather than as a failed scan: the Check Run findings are the
+	// part the backfill acts on, and they are already in hand.
+	StoredRows []InspectedCheck `json:"stored_rows,omitempty"`
+	// WaitingOn classifies the rows: "operator" when any of them needs a
+	// person, "schemabot" when they all resolve on their own, and empty when
+	// no row explains the run — whether because none was read, none blocks
+	// once scoped to this run's environment, or the only blocking one is the
+	// aggregate. It is the field that decides whether a stuck entry in a
+	// fleet sweep is worth opening.
+	WaitingOn string `json:"waiting_on,omitempty"`
+}
+
+// ChecksInspectRequest asks for the stored check state one pull request holds,
+// read against the commit that pull request is currently gated on.
+type ChecksInspectRequest struct {
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
+	// Environment, when set, selects that environment's rows and unresolved
+	// local prerequisites explaining its gate. Missing prerequisite results are
+	// represented as pending evidence.
+	Environment string `json:"environment,omitempty"`
+}
+
+// ChecksInspectResponse is the stored check state for one pull request beside
+// the Check Run GitHub currently shows, so an operator can see where the two
+// disagree without reading server logs or the database.
+type ChecksInspectResponse struct {
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
+	// HeadSHA is the commit the pull request is gated on, read uncached.
+	HeadSHA string `json:"head_sha"`
+	PRState string `json:"pr_state,omitempty"`
+	// Environment echoes the environment the response was narrowed to, empty
+	// when it covers every one. A narrowed response cannot speak for the
+	// environments it left out, so anything reported over the whole response
+	// has to say which environment it is reporting on.
+	Environment string `json:"environment,omitempty"`
+	// ChecksEnabled reports whether this deployment publishes Check Runs for
+	// the repository at all. When it is false the absence of a Check Run is a
+	// configuration choice, not a gap to backfill, and saying otherwise would
+	// send an operator after an incident that is not happening.
+	ChecksEnabled bool `json:"checks_enabled"`
+	// CheckRunsOnHead is every Check Run this deployment publishes that was
+	// found on the head, one per expected name.
+	CheckRunsOnHead []InspectedCheckRun `json:"check_runs_on_head,omitempty"`
+	// CoverageError explains why expected Check Run names could not be resolved.
+	// Rows remain available, but empty run lists make no claim about GitHub.
+	CoverageError string `json:"coverage_error,omitempty"`
+
+	// MissingCheckRunNames is every expected Check Run name GitHub was read
+	// for and reported no run on the head. Branch protection requires each
+	// name on its own, so one present run never says the gate is clear while
+	// another name is absent.
+	//
+	// Empty on a deployment that publishes no checks for the repository:
+	// there the absence is the configuration, and naming it as a gap would
+	// send an operator after an incident that is not happening.
+	MissingCheckRunNames []string `json:"missing_check_run_names,omitempty"`
+	// UnreadableCheckRunNames is every expected name whose lookup failed.
+	// Such a name is neither present nor missing, and the difference decides
+	// what an operator does: a missing run is recreated, an unreadable one is
+	// read again. Reporting it as absent would recommend recreating a Check
+	// Run that may be sitting on the head, and treating the empty result as
+	// "no gap" would report a GitHub outage as a clear gate.
+	UnreadableCheckRunNames []string `json:"unreadable_check_run_names,omitempty"`
+	// UntrustedConflictNames is every expected name a same-named Check Run
+	// from an app SchemaBot does not trust is also sitting under, whether or
+	// not the trusted run exists. The operator has something to resolve either
+	// way: the run branch protection reads may not be the one SchemaBot
+	// writes, and no backfill touches the other app's. When the name is also
+	// missing, reporting only the absence would send them to recreate a run
+	// and leave them puzzled when the gate does not move; when the trusted run
+	// is present, dropping the conflict would report a clear gate over a
+	// duplicate holding it closed.
+	//
+	// Empty on a deployment that publishes no checks for the repository, for
+	// the same reason MissingCheckRunNames is: a conflict is a claim that
+	// another app's run competes with SchemaBot's, and there is no SchemaBot
+	// run there to compete with. What sits under the name is simply another
+	// app's. A consumer reading this field to find a squatting app should read
+	// ChecksEnabled first, since an empty list there means the question was
+	// not asked rather than answered no.
+	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
+	// Rows is the stored check state, one entry per environment and database.
+	Rows []InspectedCheck `json:"rows"`
+}
+
+// InspectedCheckRun is the state of a Check Run on the pull request head.
+type InspectedCheckRun struct {
+	Name       string `json:"name"`
+	CheckRunID int64  `json:"check_run_id"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion,omitempty"`
+	// StartedAt is RFC3339; empty when GitHub did not report a start time.
+	StartedAt string `json:"started_at,omitempty"`
+}
+
+// InspectedCheck is one stored check row and what it means for the commit the
+// pull request is gated on.
+type InspectedCheck struct {
+	Environment  string `json:"environment"`
+	DatabaseType string `json:"database_type"`
+	Database     string `json:"database"`
+	// Aggregate marks the rollup row rather than a database's own row. The
+	// rollup restates the rows beside it, so it is never an independent
+	// cause: a reader looking for what is holding the gate open reads the
+	// database rows and lets this one alone.
+	Aggregate bool `json:"aggregate,omitempty"`
+	// RecordedSHA is the commit this row was recorded for, which is not always
+	// the commit the pull request is gated on. It is deliberately not named
+	// head_sha: the response carries that too, for the pull request's actual
+	// head, and one name for the two would read as agreement wherever the row
+	// is stale, which is the case worth seeing.
+	RecordedSHA string `json:"recorded_sha"`
+	// CoversHead reports whether this row speaks for the pull request's head.
+	CoversHead     bool   `json:"covers_head"`
+	Status         string `json:"status"`
+	Conclusion     string `json:"conclusion,omitempty"`
+	BlockingReason string `json:"blocking_reason,omitempty"`
+	CheckRunID     int64  `json:"check_run_id,omitempty"`
+	// ApplyIdentifier names the apply that owns this row, empty when none
+	// does. Ownership is what keeps a plan for a newer commit from replacing
+	// the row, so it is the first thing to look at on a row that will not move.
+	ApplyIdentifier string `json:"apply_identifier,omitempty"`
+	ApplyState      string `json:"apply_state,omitempty"`
+	UpdatedAt       string `json:"updated_at,omitempty"`
+	// Reason is the stable diagnosis code for this row; see pkg/checkstate.
+	Reason  string `json:"reason"`
+	Summary string `json:"summary"`
+	Remedy  string `json:"remedy"`
+	// Blocking reports whether this row keeps the aggregate from passing.
+	Blocking bool `json:"blocking"`
+	// SelfConverging reports whether SchemaBot reaches the resolved state on
+	// its own. False means the row is waiting on a person.
+	SelfConverging bool `json:"self_converging"`
 }
 
 // =============================================================================
@@ -293,6 +579,11 @@ type PulledNamespace struct {
 	Artifacts        map[string]string        `json:"artifacts,omitempty"`
 	NamespaceCatalog *NamespaceCatalog        `json:"namespace_catalog,omitempty"`
 	TableCatalog     map[string]*TableCatalog `json:"table_catalog,omitempty"`
+	// Lint holds the schema lint violations for this namespace's tables,
+	// populated only when the pull request asked for linting. A namespace
+	// with no violations serializes as an explicit empty list so a clean
+	// audit is distinguishable from lint not being requested (omitted).
+	Lint []*LintViolationResponse `json:"lint,omitzero"`
 }
 
 // NamespaceCatalog contains structured metadata for a pulled namespace.
@@ -348,20 +639,105 @@ type ForeignKeyCatalog struct {
 
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
 type PullSchemaRequest struct {
-	Database      string   `json:"database"`
-	Environment   string   `json:"environment"`
-	Type          string   `json:"type"`
+	Database    string `json:"database"`
+	Environment string `json:"environment"`
+	Type        string `json:"type"`
+	// App selects the database by its configured app identifier instead of
+	// its name. Exactly one of Database or App must be set, and App must
+	// resolve to exactly one configured database: a pull reads one database,
+	// so an app declared by several databases is an error naming the
+	// candidates, never an arbitrary pick. The pull endpoint enforces the
+	// exactly-one rule and resolves App to a database before execution;
+	// callers invoking the execution layer directly must set Database.
+	App           string   `json:"app,omitempty"`
 	Namespaces    []string `json:"namespaces,omitempty"`
 	CatalogDetail string   `json:"catalog_detail,omitempty"`
+	// Lint runs the schema linters over every pulled table and attaches the
+	// violations to each namespace, so a caller can audit a database's lint
+	// debt without planning a change. Off by default.
+	Lint bool `json:"lint,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
+//
+// Namespaces holds the live schema a caller materializes. Targets is populated
+// only for an environment whose targets each hold their own schema. It names
+// every target the environment addresses, including the primary, and describes
+// how each differs from the schema in Namespaces. There, each namespace's schema
+// is its baseline target's (see BaselineTarget): the primary's for every
+// namespace it holds, and for a namespace placed on other targets only, the
+// first of them.
 type PullSchemaResponse struct {
-	Database    string                      `json:"database"`
-	Type        string                      `json:"type"`
-	Environment string                      `json:"environment"`
-	Namespaces  map[string]*PulledNamespace `json:"namespaces"`
-	TableCount  int32                       `json:"table_count"`
+	Database    string `json:"database"`
+	Type        string `json:"type"`
+	Environment string `json:"environment"`
+	// App is the database's configured app identifier, echoed whether the
+	// request selected the database by name or by app. Empty when the
+	// database declares no app.
+	App        string                      `json:"app,omitempty"`
+	Namespaces map[string]*PulledNamespace `json:"namespaces"`
+	TableCount int32                       `json:"table_count"`
+	Targets    []*TargetDivergence         `json:"targets,omitempty"`
+}
+
+// Difference values for DivergedTable.
+const (
+	// DivergenceDiffers means both targets hold the table with different DDL.
+	DivergenceDiffers = "differs"
+	// DivergenceOnlyOnPrimary means only the namespace's baseline target holds
+	// the table. The baseline is the primary for every namespace the primary
+	// holds.
+	DivergenceOnlyOnPrimary = "only_on_primary"
+	// DivergenceOnlyOnTarget means only this target holds the table.
+	DivergenceOnlyOnTarget = "only_on_target"
+)
+
+// TargetDivergence reports how one target's live schema differs from the
+// schema in PullSchemaResponse.Namespaces, namespace by namespace: each
+// namespace the target holds is compared with that namespace's baseline target.
+// An empty DivergedTables means the target agrees with every baseline it is
+// compared with; it never means the comparison was skipped, since a target that
+// could not be pulled or compared fails the pull instead.
+//
+// Exactly one entry carries Primary. It is listed alongside the others so the
+// response names the environment's whole member set: a caller reconciling
+// shards against its own inventory can read the members off the payload instead
+// of having to know which target was left out for being the baseline.
+type TargetDivergence struct {
+	Deployment string `json:"deployment"`
+	Target     string `json:"target"`
+	TableCount int32  `json:"table_count"`
+	// Primary marks the first target in rollout order. It is the baseline for
+	// every namespace it holds, so it never carries diverged tables.
+	Primary bool `json:"primary,omitempty"`
+	// Namespaces are the namespaces this target's entry selects. Empty when it
+	// selects none, in which case the target holds every namespace.
+	Namespaces     []string        `json:"namespaces,omitempty"`
+	DivergedTables []DivergedTable `json:"diverged_tables,omitempty"`
+}
+
+// Holds reports whether the target holds a namespace: exactly the namespaces
+// its entry selects, or every namespace when it selects none.
+func (t *TargetDivergence) Holds(namespace string) bool {
+	return len(t.Namespaces) == 0 || slices.Contains(t.Namespaces, namespace)
+}
+
+// BaselineTarget returns the index of a namespace's baseline target: the first
+// target, in the order given, that holds it. The baseline's schema for the
+// namespace is the one a pull returns, and every later target holding the
+// namespace is compared with it. It returns -1 when no target holds the
+// namespace.
+func BaselineTarget(targets []*TargetDivergence, namespace string) int {
+	return slices.IndexFunc(targets, func(target *TargetDivergence) bool {
+		return target.Holds(namespace)
+	})
+}
+
+// DivergedTable names one table two targets do not agree on, and how.
+type DivergedTable struct {
+	Namespace  string `json:"namespace"`
+	Table      string `json:"table"`
+	Difference string `json:"difference"`
 }
 
 // DatabaseListResponse is the HTTP response body for GET /api/databases.
@@ -372,8 +748,12 @@ type DatabaseListResponse struct {
 // DatabaseResponse describes one server-side database without
 // exposing connection strings, opaque execution targets, or endpoint addresses.
 type DatabaseResponse struct {
-	Database     string                         `json:"database"`
-	Type         string                         `json:"type"`
+	Database string `json:"database"`
+	Type     string `json:"type"`
+	// App is the database's configured app identifier, so callers can group
+	// databases into applications and join this inventory against systems
+	// that know only the app. Empty when the database declares no app.
+	App          string                         `json:"app,omitempty"`
 	Environments []*DatabaseEnvironmentResponse `json:"environments"`
 }
 
@@ -397,6 +777,36 @@ type PlanRequest struct {
 	// cross-delivery race where HEAD advances between plan and confirm.
 	// Optional — absent for non-webhook callers (e.g. CLI plan invocations without a PR).
 	HeadSHA *string `json:"head_sha,omitempty"`
+	// IgnoredNamespaces lists the namespaces the caller removed from
+	// SchemaFiles per the config's ignore_namespaces, resolved for the
+	// environment. The data plane refuses engine shapes that diff the whole
+	// target as one unit (a database-scoped MySQL DSN), where a withheld
+	// namespace's live tables would otherwise be planned as drops.
+	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
+	// IgnoreTables lists the live tables the config's ignore_tables withholds
+	// from the planner, so a live table no schema file declares is not proposed
+	// for DROP TABLE. Unlike ignored namespaces the exclusion cannot be
+	// expressed by leaving files out of the request — the tables are on the
+	// target, not in the repository — so the data plane applies it and reports
+	// what it actually withheld through ExemptTables on the response.
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
+	// GroupedExecution reports whether an apply of this plan will hand the
+	// engine every ALTER at once or one table at a time. Engines predicting what
+	// an apply will do to unfinished work already on the target need the
+	// grouping the apply will actually run under.
+	GroupedExecution bool `json:"grouped_execution,omitempty"`
+	// Target narrows the plan to one rollout member of the environment, named
+	// by its target or by deployment/target. Empty plans the rollout primary.
+	Target string `json:"target,omitempty"`
+	// RendersRollout is a client capability flag: it says this client reads
+	// the plan's rollout block, shows the operator what applies on every
+	// member, and refuses an apply for the members the rollout lists as
+	// needing attention or as refused. It is not operator consent, since any
+	// caller can set it. The server refuses a rollout-wide plan of an
+	// environment with more than one member from a caller that does not set
+	// it, since such a caller would present the primary's plan as the whole
+	// rollout's.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -405,6 +815,20 @@ type ApplyRequest struct {
 	Environment string            `json:"environment"`
 	Caller      string            `json:"caller,omitempty"`
 	Options     map[string]string `json:"options,omitempty"`
+	// Target narrows the apply to one rollout member, named by its target or
+	// by deployment/target. Empty applies the whole rollout.
+	Target string `json:"target,omitempty"`
+	// RendersRollout is a client capability flag: it says this client shows
+	// the plan every rollout member runs before applying, each member's plan
+	// from the rollout block (see PlanRequest.RendersRollout), or for a
+	// rollback its one rollback plan, which every member of a mirrored
+	// environment runs and which the server refuses to run rollout-wide where
+	// members are planned on their own. It is not operator consent: any
+	// caller can set it, so it only keeps a client that shows the primary's
+	// plan as the whole rollout's from applying one. The server refuses a
+	// rollout-wide apply of an environment with more than one member from a
+	// caller that does not set it.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
@@ -413,13 +837,6 @@ type ControlRequest struct {
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
 	Caller      string `json:"caller,omitempty"`
-}
-
-// VolumeRequest is the HTTP request body for POST /api/volume.
-type VolumeRequest struct {
-	ApplyID     string `json:"apply_id"`
-	Environment string `json:"environment"`
-	Volume      int32  `json:"volume"`
 }
 
 // =============================================================================
@@ -432,12 +849,28 @@ type PlanResponse struct {
 	Database     string `json:"database,omitempty"`
 	DatabaseType string `json:"database_type,omitempty"`
 	Environment  string `json:"environment,omitempty"`
-	// Deployment is the primary deployment this plan was created against
-	// (rollout index 0 at plan time). The review-time drift rollup carries it
-	// forward so it can verify the plan's baseline still maps to the primary at
-	// rollup time, rather than trusting that current config re-resolves the same
-	// primary.
-	Deployment  string                   `json:"deployment,omitempty"`
+	// Deployment and Target together identify the rollout member this plan was
+	// created against: the primary (rollout index 0 at plan time), or for a
+	// narrowed plan the member it names. The review-time
+	// drift rollup carries both forward so it can verify the plan's baseline
+	// still maps to the primary at rollup time, rather than trusting that
+	// current config re-resolves the same primary. The deployment alone is not
+	// sufficient: one deployment can address several targets, so a member is
+	// identified by the pair.
+	Deployment string `json:"deployment,omitempty"`
+	Target     string `json:"target,omitempty"`
+	// SelectedNamespaces is the namespace selection of the targets entry this
+	// plan was created under (the primary's, or for a narrowed plan the named
+	// member's), empty when the entry selects every declared namespace. The
+	// rollup checks it against the primary's selection at rollup time alongside
+	// Deployment and Target, so a reloaded placement cannot pair this plan with
+	// members resolved under a different one.
+	SelectedNamespaces []string `json:"selected_namespaces,omitempty"`
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed plan was made for. Empty for a plan of the whole rollout. A
+	// narrowed plan says nothing about the environment's other members, so it
+	// is applied to that member alone and never passes a check.
+	NarrowedTo  string                   `json:"narrowed_to,omitempty"`
 	Engine      string                   `json:"engine"`
 	Changes     []*SchemaChangeResponse  `json:"changes"`
 	LintResults []*LintViolationResponse `json:"lint_violations"`
@@ -447,6 +880,291 @@ type PlanResponse struct {
 	// keyspace to one entry, so a keyspace whose shards diverge is represented
 	// faithfully only here. Empty for non-sharded plans.
 	Shards []*ShardPlanResponse `json:"shards,omitempty"`
+	// ExistingCopies carries the unfinished copies already on the target that
+	// applying this plan will adopt or discard, one entry per namespace holding
+	// any. Empty when the target is clean, which is the ordinary case.
+	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
+	// ExemptTables lists live tables that no schema file declares and the
+	// planner left in place instead of dropping, one entry per namespace
+	// holding any. Like
+	// ExistingCopies it describes the target at planning time and is carried
+	// on the response to the plan request only; a stored plan does not retain
+	// it. Empty when nothing was exempted, which is the ordinary case.
+	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// Rollout describes the plan of every member of the rollout when the
+	// environment fans out to more than one: the members grouped by the plan
+	// each runs, and the members that need attention before an apply can run
+	// on them. Nil when the environment has a single member. The top-level
+	// Changes and Shards are the primary member's plan.
+	Rollout *PlanRolloutResponse `json:"rollout,omitempty"`
+}
+
+// PlanRolloutResponse is the plan of every member of a rollout.
+type PlanRolloutResponse struct {
+	// Members is how many members the rollout has.
+	Members int `json:"members"`
+	// Independent is true when each member was planned against its own live
+	// schema, so members are expected to differ. False means every member is
+	// expected to run the primary's plan.
+	Independent bool `json:"independent,omitempty"`
+	// MultiTarget is true when some deployment of the rollout addresses more
+	// than one target. An apply of such a rollout refuses --defer-cutover.
+	MultiTarget bool `json:"multi_target,omitempty"`
+	// ShapeRefusal is why apply creation refuses an apply of the whole rollout
+	// whatever options it carries, naming the apply to run instead. It is
+	// empty when the rollout's shape admits one.
+	ShapeRefusal string `json:"shape_refusal,omitempty"`
+	// Groups holds one entry per distinct plan, naming the members that run
+	// it, with the primary's group first.
+	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
+	// Attention lists the members an apply cannot run on as planned: a member
+	// that could not be planned, every member but the primary when the
+	// primary's plan reported errors and so no other member was planned, or
+	// one that diverged from the plan it is expected to mirror.
+	Attention []*PlanMemberAttentionResponse `json:"attention,omitempty"`
+	// Refused lists the members whose own plans apply creation refuses when
+	// this plan is applied rollout-wide through the API, which refuses the
+	// whole apply. Set only when no member needs attention.
+	Refused []*PlanMemberRefusalResponse `json:"refused,omitempty"`
+	// TableSizes is each member's size estimate for each existing table its
+	// own plan copies, rebuilds, or scans, in rollout order, primary first.
+	// A group's changes are its first member's plan, so sizes are listed per
+	// member rather than read from a group: each member applies to its own
+	// data. Members listed for attention are not included.
+	TableSizes []*PlanMemberTableSizeResponse `json:"table_sizes,omitempty"`
+}
+
+// PlanMemberTableSizeResponse is one rollout member's plan-time size estimate
+// for one table its plan changes.
+type PlanMemberTableSizeResponse struct {
+	// Member is the member's operator-facing display name, as Groups and
+	// Attention name it: the deployment alone for a single-target deployment,
+	// deployment/target when a deployment addresses several targets.
+	Member    string `json:"member"`
+	Namespace string `json:"namespace"`
+	Table     string `json:"table"`
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes) on this member, summed across shards for a sharded member.
+	// Nil when the engine reported no estimate.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+}
+
+// PlanMemberRefusalResponse is a rollout member whose own plan a rollout-wide
+// apply through the API refuses, and how to run it instead.
+type PlanMemberRefusalResponse struct {
+	// Member is the member's operator-facing name, as in Groups.
+	Member string `json:"member"`
+	// Target is the selector that names the member in a plan or apply
+	// request's target, and in the CLI's --target. It can differ from Member:
+	// a deployment with one target is named by its deployment, and selected by
+	// its target.
+	Target string `json:"target"`
+	// Reason is PlanMemberNeedsTarget or PlanMemberBlocked.
+	Reason string `json:"reason"`
+	// Detail is a short description of the refused change, naming only
+	// tables and namespaces.
+	Detail string `json:"detail"`
+	// AllowUnsafe is true when the member's own plan carries an unsafe
+	// change, so an apply narrowed to it needs the unsafe opt-in.
+	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
+}
+
+// Rollout member refusal reasons.
+const (
+	// PlanMemberNeedsTarget is a member whose own plan runs when the apply is
+	// narrowed to it, where its own plan is the one the operator reviews and
+	// consents to.
+	PlanMemberNeedsTarget = "needs_target"
+	// PlanMemberBlocked is a member whose own plan carries work no apply
+	// runs, the one narrowed to it included: a change its engine refuses, or
+	// work the apply has no operation to run from.
+	PlanMemberBlocked = "blocked"
+)
+
+// PlanMemberGroupResponse is the rollout members that run one plan.
+type PlanMemberGroupResponse struct {
+	// Members are the members' operator-facing names, in rollout order.
+	Members []string `json:"members"`
+	// Primary is true for the group holding the rollout's primary member,
+	// whose plan is the response's own.
+	Primary bool                    `json:"primary,omitempty"`
+	Changes []*SchemaChangeResponse `json:"changes"`
+	Shards  []*ShardPlanResponse    `json:"shards,omitempty"`
+}
+
+// PlanMemberAttentionResponse is a rollout member an apply cannot run on as
+// planned, and why.
+type PlanMemberAttentionResponse struct {
+	Member string `json:"member"`
+	// Reason is PlanMemberDiverged or PlanMemberUnplanned.
+	Reason string `json:"reason"`
+	// Detail is a short, sanitized description of the reason.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Rollout member attention reasons.
+const (
+	PlanMemberDiverged  = "diverged"
+	PlanMemberUnplanned = "unplanned"
+)
+
+// UnmarshalJSON refuses a rollout block that lists a null group, attention
+// entry, refusal or table size. Each list is read as the members an apply
+// runs on, needs attention for, or refuses, or as what each member's tables
+// weigh, so a null entry is a malformed response rather than an empty one,
+// and decoding it fails instead of handing a reader an entry it would have
+// to guess the meaning of.
+func (r *PlanRolloutResponse) UnmarshalJSON(data []byte) error {
+	type plain PlanRolloutResponse
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("decode rollout block: %w", err)
+	}
+	if i := slices.Index(decoded.Groups, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: group %d is null", i)
+	}
+	if i := slices.Index(decoded.Attention, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: attention entry %d is null", i)
+	}
+	if i := slices.Index(decoded.Refused, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: refusal %d is null", i)
+	}
+	if i := slices.Index(decoded.TableSizes, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: table size %d is null", i)
+	}
+	*r = PlanRolloutResponse(decoded)
+	return nil
+}
+
+// WholeRollout returns the plan of every rollout member the response
+// describes, or nil when it describes one member: an environment with a single
+// member, or a plan narrowed to one member. A narrowed plan says nothing about
+// the other members, so it is never read as the rollout's plan even if it
+// carries a rollout block.
+func (r *PlanResponse) WholeRollout() *PlanRolloutResponse {
+	if r == nil || r.NarrowedTo != "" {
+		return nil
+	}
+	return r.Rollout
+}
+
+// MemberPlans returns the plan of each group of rollout members, in the
+// order of Rollout.Groups, or the response itself when it covers one member.
+// Each group's plan carries the response's identity and engine with the
+// group's own changes; lint results and errors describe the schema files and
+// stay on the response.
+func (r *PlanResponse) MemberPlans() []*PlanResponse {
+	if r == nil {
+		return nil
+	}
+	rollout := r.WholeRollout()
+	if rollout == nil || len(rollout.Groups) == 0 {
+		return []*PlanResponse{r}
+	}
+	plans := make([]*PlanResponse, 0, len(rollout.Groups))
+	for _, g := range rollout.Groups {
+		plans = append(plans, &PlanResponse{
+			PlanID:       r.PlanID,
+			Database:     r.Database,
+			DatabaseType: r.DatabaseType,
+			Environment:  r.Environment,
+			Engine:       r.Engine,
+			Changes:      g.Changes,
+			Shards:       g.Shards,
+		})
+	}
+	return plans
+}
+
+// RolloutHasChanges reports whether an apply of the rollout would run work on
+// any member, not only the primary.
+func (r *PlanResponse) RolloutHasChanges() bool {
+	return slices.ContainsFunc(r.MemberPlans(), (*PlanResponse).HasChanges)
+}
+
+// RolloutUnsafeChanges returns the unsafe changes of every plan in the
+// rollout, each once however many groups of members run it. A change is the
+// same when it is the same namespace's table, statement and reason, so one
+// table dropped in two namespaces is two changes.
+func (r *PlanResponse) RolloutUnsafeChanges() []UnsafeChange {
+	var result []UnsafeChange
+	seen := make(map[string]bool)
+	for _, plan := range r.MemberPlans() {
+		plan.eachUnsafeChange(func(namespace string, c UnsafeChange) {
+			key := strings.Join([]string{namespace, c.Table, c.DDL, c.Reason}, "\x00")
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			result = append(result, c)
+		})
+	}
+	return result
+}
+
+// ExemptTablesResponse describes live tables in one namespace that no schema
+// file declares and the planner left in place, and why.
+type ExemptTablesResponse struct {
+	Namespace string   `json:"namespace"`
+	Tables    []string `json:"tables"`
+	Reason    string   `json:"reason"`
+}
+
+// ExemptReasonIgnoreTables is the exemption reason a plan carries for a live
+// table the repository's ignore_tables config withheld from the planner. It
+// mirrors the engine's own vocabulary on the wire; this package holds its own
+// copy because it is dependency-free by design. A test pins the two together.
+const ExemptReasonIgnoreTables = "ignore_tables"
+
+// WithheldTables returns the live tables this plan reports it withheld on the
+// repository's instruction, across every namespace and sorted. The planner
+// exempts tables for reasons of its own as well — an engine's archive naming
+// convention — and only the config's own exclusions answer whether a
+// configured ignore_tables entry matched anything.
+func (r *PlanResponse) WithheldTables() []string {
+	if r == nil {
+		return nil
+	}
+	var tables []string
+	for _, group := range r.ExemptTables {
+		if group == nil || group.Reason != ExemptReasonIgnoreTables {
+			continue
+		}
+		tables = append(tables, group.Tables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
+}
+
+// Dispositions an ExistingCopyResponse can carry. These mirror the engine's
+// own vocabulary on the wire; this package holds its own copy because it is
+// dependency-free by design. A test pins the two together.
+const (
+	ExistingCopyAdopt   = "adopt"
+	ExistingCopyDiscard = "discard"
+)
+
+// ExistingCopyResponse is an unfinished copy sitting on the target and what
+// applying the plan will do to it: adopt it and resume, or discard it and copy
+// again from the start.
+type ExistingCopyResponse struct {
+	Namespace   string   `json:"namespace,omitempty"`
+	Disposition string   `json:"disposition"`
+	Reason      string   `json:"reason,omitempty"`
+	Tables      []string `json:"tables,omitempty"`
+	AgeSeconds  int64    `json:"age_seconds,omitempty"`
+	Statement   string   `json:"statement,omitempty"`
+	// Running reports that the copy is still being made right now rather than
+	// left behind by an apply that is over. It changes both what applying does
+	// — joins the copy instead of resuming it — and what AgeSeconds means, which
+	// for a running copy is the interval between checkpoints rather than how
+	// stale the work is.
+	//
+	// It reports stored state rather than a live probe, so a task row left in
+	// flight by a crashed server reads as running until recovery clears it.
+	// Treat it as how to describe the copy, never as proof that work is live:
+	// what applying does to the copy is carried by Disposition.
+	Running bool `json:"running,omitempty"`
 }
 
 // ShardPlanResponse is one changing shard's plan: the keyspace it belongs to and
@@ -455,6 +1173,73 @@ type ShardPlanResponse struct {
 	Namespace string                 `json:"namespace,omitempty"`
 	Shard     string                 `json:"shard"`
 	Changes   []*TableChangeResponse `json:"changes,omitempty"`
+}
+
+// PlanSummaryResponse is one stored plan in the GET /api/plans listing: its
+// provenance plus change counts derived from the stored plan data, without
+// the plan content itself.
+type PlanSummaryResponse struct {
+	PlanID       string `json:"plan_id"`
+	Database     string `json:"database"`
+	DatabaseType string `json:"database_type"`
+	Deployment   string `json:"deployment,omitempty"`
+	Environment  string `json:"environment"`
+	// Repository and PullRequest identify the PR the plan was generated for.
+	// Both empty means an ad-hoc plan, such as a CLI plan invocation without
+	// a PR.
+	Repository  string    `json:"repository,omitempty"`
+	PullRequest int       `json:"pull_request,omitempty"`
+	HeadSHA     string    `json:"head_sha,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	// ChangeCounts maps a change operation ("create", "alter", "drop", ...) to
+	// how many table changes of that operation the plan carries across every
+	// namespace. Empty for a no-change plan.
+	ChangeCounts map[string]int `json:"change_counts,omitempty"`
+	// UnsafeCount is how many of those table changes the planner marked
+	// unsafe.
+	UnsafeCount int `json:"unsafe_count,omitempty"`
+	// BlockedCount is how many of those table changes the engine will
+	// deterministically refuse (execution mode "blocked").
+	BlockedCount int `json:"blocked_count,omitempty"`
+	// VSchemaChangeCount is how many namespaces show a VSchema change. A
+	// VSchema change the engine generates entirely from the plan's DDL is
+	// shown as that DDL, so it is not counted here.
+	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
+	// FinalizeCount is how many namespaces have nothing to run but the
+	// finalize the engine asked for. A finalize beside a namespace's DDL or
+	// VSchema change is part of that work and is not counted. A finalize is
+	// work an apply runs, so a plan whose only work is a finalize is not a
+	// no-change plan.
+	FinalizeCount int `json:"finalize_count,omitempty"`
+}
+
+// PlansResponse is the HTTP response for GET /api/plans.
+type PlansResponse struct {
+	Limit    int `json:"limit"`
+	MaxLimit int `json:"max_limit"`
+	// HasMore reports that more plans match than this page holds. Request the
+	// next page with the same filters and starting_after set to the last
+	// plan's ID.
+	HasMore bool `json:"has_more"`
+	// Last echoes the requested creation window, when one was given.
+	Last string `json:"last,omitempty"`
+	// StartingAfter echoes the starting_after plan the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string                 `json:"starting_after,omitempty"`
+	Plans         []*PlanSummaryResponse `json:"plans"`
+}
+
+// StoredPlanResponse is the HTTP response for GET /api/plans/{plan_identifier}:
+// the summary plus the full stored plan content, reconstructed in the same
+// shape POST /api/plan returns so plan rendering is shared. Lint results and
+// errors are not persisted with a plan, so Plan carries changes only —
+// their absence means "not stored", not "clean".
+type StoredPlanResponse struct {
+	PlanSummaryResponse
+	SchemaPath string        `json:"schema_path,omitempty"`
+	Target     string        `json:"target,omitempty"`
+	Plan       *PlanResponse `json:"plan"`
 }
 
 // HasErrors returns true if any lint result has error severity.
@@ -469,31 +1254,216 @@ func (r *PlanResponse) HasErrors() bool {
 
 // UnsafeChange represents a table change that is potentially destructive.
 type UnsafeChange struct {
-	Table      string
-	Reason     string
+	Table  string
+	Reason string
+	// Reasons is the change's findings, already separated. Renderers list and
+	// count these when they are set.
+	//
+	// It exists because Reason carries the engine-reported form, which joins a
+	// table's findings with "; ", so a renderer given only that has to split it
+	// back apart to list them. A reason written for one change is one sentence,
+	// and splitting it renders half of it as a finding of its own. Setting this
+	// is how a producer that knows its own findings says what they are; leaving
+	// it unset keeps the splitting, which is what an engine's plan needs.
+	Reasons    []string `json:",omitempty"`
 	DDL        string
 	ChangeType string
 }
 
-// UnsafeChanges returns all table changes marked as unsafe across all
-// namespaces. DROP table changes are treated as unsafe even when an engine omits
-// IsUnsafe, so destructive table deletion fails closed.
+// UnsafeChanges returns all changes marked as unsafe across all namespaces:
+// unsafe table changes, VSchema removals, and in-place vindex mutations. DROP
+// table changes are treated as unsafe even when an engine omits IsUnsafe, so
+// destructive table deletion fails closed.
+//
+// Per-shard changes are walked too. The namespace-level Changes list each
+// table once, taken from one shard, so a change only a divergent sibling shard
+// needs lives in Shards alone; the server's unsafe gate judges those as well
+// (`Plan.UnsafeDDLChanges`), and a consent gate on this type has to see the
+// same set or it consents to a change it never showed. A shard change that
+// repeats a namespace-level one, the uniform case, is reported once.
 func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	if r == nil {
 		return nil
 	}
 	var result []UnsafeChange
+	r.eachUnsafeChange(func(_ string, c UnsafeChange) {
+		result = append(result, c)
+	})
+	return result
+}
+
+// eachUnsafeChange calls fn with each unsafe change in the plan and the
+// namespace it is in, in plan order: the namespace-level changes, then the
+// per-shard changes that do not repeat one of them.
+func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange)) {
+	if r == nil {
+		return
+	}
+	type statement struct{ namespace, table, ddl string }
+	seen := make(map[statement]struct{})
+	add := func(namespace string, t *TableChangeResponse) {
+		unsafeChange, ok := t.UnsafeChange()
+		if !ok {
+			return
+		}
+		key := statement{namespace: namespace, table: unsafeChange.Table, ddl: unsafeChange.DDL}
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		fn(namespace, unsafeChange)
+	}
 	for _, sc := range r.Changes {
 		if sc == nil {
 			continue
 		}
 		for _, t := range sc.TableChanges {
-			if unsafeChange, ok := t.UnsafeChange(); ok {
-				result = append(result, unsafeChange)
+			add(sc.Namespace, t)
+		}
+		for _, c := range sc.VSchemaUnsafeChanges() {
+			fn(sc.Namespace, c)
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			add(sp.Namespace, t)
+		}
+	}
+}
+
+// HasBlockedChanges reports whether any planned change carries the blocked
+// execution-mode verdict, across namespace-level and per-shard changes. A
+// blocked change guarantees the apply fails, so gates use this to reject the
+// apply before it starts.
+func (r *PlanResponse) HasBlockedChanges() bool {
+	return r.FirstBlockedChange() != nil
+}
+
+// FirstBlockedChange returns the first planned change carrying the blocked
+// execution-mode verdict, namespace-level changes before per-shard ones, or
+// nil when there is none. A refusal names this change and its engine's reason,
+// which says what has to change before an apply can run it.
+func (r *PlanResponse) FirstBlockedChange() *TableChangeResponse {
+	if r == nil {
+		return nil
+	}
+	for _, t := range r.FlatTables() {
+		if t.EngineBlocked() {
+			return t
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.EngineBlocked() {
+				return t
+			}
+		}
+	}
+	return nil
+}
+
+// DiscardedCopies returns the unfinished copies on the target that applying
+// this plan will throw away and re-copy from the start.
+//
+// A copy whose disposition this build does not recognize counts as discarded:
+// the caller uses this to decide whether an operator must confirm before work
+// already done is destroyed, and an unrecognized verdict is not a reason to
+// skip that confirmation.
+func (r *PlanResponse) DiscardedCopies() []*ExistingCopyResponse {
+	if r == nil {
+		return nil
+	}
+	var result []*ExistingCopyResponse
+	for _, c := range r.ExistingCopies {
+		if c == nil {
+			continue
+		}
+		if c.Disposition == ExistingCopyAdopt {
+			continue
+		}
+		result = append(result, c)
+	}
+	return result
+}
+
+// DirectChanges returns all table changes the planner routed to direct
+// execution, across namespace-level and per-shard changes.
+func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
+	if r == nil {
+		return nil
+	}
+	var result []*TableChangeResponse
+	for _, t := range r.FlatTables() {
+		if t.DirectExecution() {
+			result = append(result, t)
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.DirectExecution() {
+				result = append(result, t)
 			}
 		}
 	}
 	return result
+}
+
+// AllChangesDirect reports whether every planned change is a direct-execution
+// change (and at least one exists). Options that only affect engine-driven
+// statements — like a deferred cutover — have nothing to act on in such a
+// plan, so their commands are rejected rather than silently ignored. A
+// namespace whose shards carry changes of their own runs as those shard
+// changes, so its namespace-level table changes, a collapsed view of them, are
+// not consulted.
+func (r *PlanResponse) AllChangesDirect() bool {
+	if r == nil {
+		return false
+	}
+	carriedByShards := map[string]bool{}
+	for _, sp := range r.Shards {
+		if sp != nil && len(sp.Changes) > 0 {
+			carriedByShards[sp.Namespace] = true
+		}
+	}
+	total := 0
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		if sc.HasVSchemaChange() || sc.NeedsFinalizer() {
+			return false
+		}
+		if carriedByShards[sc.Namespace] {
+			continue
+		}
+		total += len(sc.TableChanges)
+		for _, t := range sc.TableChanges {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		total += len(sp.Changes)
+		for _, t := range sp.Changes {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	return total > 0
 }
 
 // LintWarnings returns lint results with warning severity.
@@ -538,9 +1508,108 @@ func (r *PlanResponse) LintErrors() []LintViolationResponse {
 func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 	var tables []*TableChangeResponse
 	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
 		tables = append(tables, sc.TableChanges...)
 	}
 	return tables
+}
+
+// RenderedTables returns the table changes an operator surface shows and
+// counts. The namespace-level Changes keep one change per table so a keyspace
+// reads as one entry, and that hides what a divergent shard adds: a shard that
+// creates a table its siblings alter, or a second index on one table. So for a
+// namespace with shard rows, those rows are the set, deduplicated by statement
+// in first-seen order so a change uniform across shards appears once, as it
+// renders once. A namespace without shard rows contributes its namespace-level
+// changes as received. A shard-row change that omits its namespace is returned
+// with the namespace filled in, so a shard's change is never attributed to the
+// plan's default database. A shard change with no DDL is not rendered because
+// both UX-6 selections must count only statements their surface can show.
+// Results mix aliases and copies; callers must not mutate them.
+//
+// The PR plan comment walks the same set from its rendered data
+// (keyspaceStatements in pkg/webhook/templates); the two selections must agree
+// for the summaries to.
+func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
+	if r == nil {
+		return nil
+	}
+	shardsByNamespace := make(map[string][]*ShardPlanResponse)
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		shardsByNamespace[sp.Namespace] = append(shardsByNamespace[sp.Namespace], sp)
+	}
+
+	var tables []*TableChangeResponse
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		shards, sharded := shardsByNamespace[sc.Namespace]
+		if !sharded {
+			tables = append(tables, sc.TableChanges...)
+			continue
+		}
+		seen := make(map[string]struct{})
+		for _, sp := range shards {
+			for _, t := range sp.Changes {
+				if t == nil || t.DDL == "" {
+					continue
+				}
+				if _, dup := seen[t.DDL]; dup {
+					continue
+				}
+				seen[t.DDL] = struct{}{}
+				if t.Namespace != "" {
+					tables = append(tables, t)
+					continue
+				}
+				withNamespace := *t
+				withNamespace.Namespace = sc.Namespace
+				tables = append(tables, &withNamespace)
+			}
+		}
+	}
+	return tables
+}
+
+// FinalizesOnly reports whether a namespace's only work in the plan is the
+// finalize its engine asked for: no VSchema change to show and no DDL, whether
+// the namespace carries its DDL itself or on its shards. A namespace with DDL
+// finalizes as part of that work, so surfaces name the finalize on its own line
+// only when this holds.
+func (r *PlanResponse) FinalizesOnly(sc *SchemaChangeResponse) bool {
+	if sc == nil || !sc.NeedsFinalizer() || sc.ShowsVSchemaChange() || len(sc.TableChanges) > 0 {
+		return false
+	}
+	return !slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && sp.Namespace == sc.Namespace && len(sp.Changes) > 0
+	})
+}
+
+// HasChanges reports whether the plan carries any work an apply would execute:
+// table DDL in any namespace or on any shard, a VSchema update, or a finalizer
+// the engine asked for. Gates that decide whether a plan is actionable must use
+// this rather than counting table changes alone — a VSchema-only or
+// finalizer-only plan has zero table changes but still requires an apply. A
+// shard row's DDL is work even when the namespace view carries none, since the
+// shard rows are the authoritative representation of a sharded namespace.
+func (r *PlanResponse) HasChanges() bool {
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		if len(sc.TableChanges) > 0 || sc.HasVSchemaChange() || sc.NeedsFinalizer() {
+			return true
+		}
+	}
+	return slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && len(sp.Changes) > 0
+	})
 }
 
 // SchemaChangeResponse groups changes for a single namespace.
@@ -558,10 +1627,95 @@ type TableChangeResponse struct {
 	ChangeType   string `json:"change_type"`
 	IsUnsafe     bool   `json:"is_unsafe,omitempty"`
 	UnsafeReason string `json:"unsafe_reason,omitempty"`
+	// ExecutionMode is the planner's execution-mode verdict. Empty means the
+	// engine's default path; "blocked" means the engine deterministically
+	// refuses the statement and the apply will fail; "direct" means the
+	// database's direct execution policy routes the refused statement to
+	// native DDL on the target instead.
+	ExecutionMode string `json:"execution_mode,omitempty"`
+	// ModeReason is the engine's reason for any non-empty ExecutionMode
+	// verdict.
+	ModeReason string `json:"mode_reason,omitempty"`
+
+	// EstimatedRows is the planner's approximate row count for the table,
+	// summed across shards for sharded targets. Display only — estimates come
+	// from engine statistics and may be stale. Nil when no estimate was
+	// available at plan time.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int `json:"shard_count,omitempty"`
+
+	// LargestShardRows is the approximate row count of the largest single
+	// shard. Nil when the target is not sharded or no estimate was available.
+	LargestShardRows *int64 `json:"largest_shard_rows,omitempty"`
+
+	// EstimatedBytes is the planner's approximate on-disk footprint for the
+	// table (data plus indexes), summed across shards for sharded targets.
+	// Display only, like EstimatedRows. Nil when no estimate was available.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, with how each move changes the way values compare. Empty when
+	// the change re-collates no column, or the engine does not report it.
+	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
 }
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string `json:"column"`
+	// From is the collation the column compares under now; To is the one it
+	// compares under once the change applies, empty when the change leaves it
+	// to a server default the plan cannot read.
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// Case and TrailingSpaces say how the comparison of values differing only
+	// in letter case, and only in trailing spaces, moves: "unchanged",
+	// "becomes_sensitive", "becomes_insensitive", or "unknown" when either
+	// collation's properties are not known. "unknown" is a possible change.
+	Case           string `json:"case"`
+	TrailingSpaces string `json:"trailing_spaces"`
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool `json:"can_merge_values"`
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
+	UniqueIndexes []string `json:"unique_indexes,omitempty"`
+}
+
+// Execution-mode verdicts a planner records on a table change. These mirror
+// the engine-side constants (pkg/engine); apitypes keeps its own copies so
+// this package stays dependency-free.
+const (
+	executionModeBlocked = "blocked"
+	executionModeDirect  = "direct"
+)
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
+
+// EngineBlocked reports whether the planner's execution-mode verdict says the
+// engine deterministically refuses this change: an apply will fail on it.
+func (t *TableChangeResponse) EngineBlocked() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeBlocked)
+}
+
+// DirectExecution reports whether the planner's execution-mode verdict routes
+// this change to direct execution: it runs synchronously as native MySQL DDL
+// and blocks writes to the table while it runs.
+func (t *TableChangeResponse) DirectExecution() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
+}
+
+// DropsTable reports whether this change removes the table from the target.
+func (t *TableChangeResponse) DropsTable() bool {
+	return t != nil && strings.EqualFold(t.ChangeType, "drop")
+}
 
 // UnsafeChange returns the unsafe-change view for table changes that require
 // explicit operator opt-in. Engines should mark unsafe table changes directly;
@@ -571,11 +1725,11 @@ func (t *TableChangeResponse) UnsafeChange() (UnsafeChange, bool) {
 	if t == nil {
 		return UnsafeChange{}, false
 	}
-	if !t.IsUnsafe && !strings.EqualFold(t.ChangeType, "drop") {
+	if !t.IsUnsafe && !t.DropsTable() {
 		return UnsafeChange{}, false
 	}
 	reason := t.UnsafeReason
-	if reason == "" && strings.EqualFold(t.ChangeType, "drop") {
+	if reason == "" && t.DropsTable() {
 		reason = "DROP TABLE removes all data"
 	}
 	return UnsafeChange{
@@ -615,6 +1769,10 @@ type ControlResponse struct {
 const (
 	ControlStatusAlreadyInProgress = "already_in_progress"
 	ControlStatusAlreadyRequested  = "already_requested"
+	// ControlStatusStartWithdrawn answers a stop that arrived while the
+	// schema change was stopped with a start queued that had not taken effect:
+	// the stop withdrew the start, and the schema change stays stopped.
+	ControlStatusStartWithdrawn = "start_withdrawn"
 )
 
 // StopResponse is the HTTP response for POST /api/stop.
@@ -652,25 +1810,18 @@ type ReleaseResponse struct {
 	Status       string `json:"status,omitempty"`
 }
 
-// VolumeResponse is the HTTP response for POST /api/volume.
-type VolumeResponse struct {
-	Accepted       bool   `json:"accepted"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-	PreviousVolume int32  `json:"previous_volume"`
-	NewVolume      int32  `json:"new_volume"`
-}
-
 // ProgressResponse is the HTTP response for GET /api/progress/apply/{apply_id}.
 type ProgressResponse struct {
-	State       string `json:"state"`
-	Engine      string `json:"engine"`
-	ApplyID     string `json:"apply_id,omitempty"`
-	Database    string `json:"database,omitempty"`     // Included in apply-id lookups
-	Environment string `json:"environment,omitempty"`  // Included in apply-id lookups
-	Caller      string `json:"caller,omitempty"`       // Included in apply-id lookups
-	PullRequest string `json:"pull_request,omitempty"` // PR URL (blank for CLI context)
-	StartedAt   string `json:"started_at,omitempty"`
-	CompletedAt string `json:"completed_at,omitempty"`
+	State        string `json:"state"`
+	Engine       string `json:"engine"`
+	ApplyID      string `json:"apply_id,omitempty"`
+	Database     string `json:"database,omitempty"`      // Included in apply-id lookups
+	DatabaseType string `json:"database_type,omitempty"` // Included in apply-id lookups
+	Environment  string `json:"environment,omitempty"`   // Included in apply-id lookups
+	Caller       string `json:"caller,omitempty"`        // Included in apply-id lookups
+	PullRequest  string `json:"pull_request,omitempty"`  // PR URL (blank for CLI context)
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
 	// Operations carries per-deployment operation rows for multi-deployment applies.
 	// Empty for single-deployment applies.
 	Operations   []*ProgressOperationResponse `json:"operations,omitempty"`
@@ -678,7 +1829,6 @@ type ProgressResponse struct {
 	ErrorCode    string                       `json:"error_code,omitempty"`
 	ErrorMessage string                       `json:"error_message,omitempty"`
 	Summary      string                       `json:"summary,omitempty"`  // Combined status with ETA
-	Volume       int32                        `json:"volume,omitempty"`   // Current volume setting (1-11)
 	Options      map[string]string            `json:"options,omitempty"`  // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata     map[string]string            `json:"metadata,omitempty"` // Engine-specific data
 	// Released is true when an operator has released a paused rollout open via a
@@ -686,11 +1836,23 @@ type ProgressResponse struct {
 	// on_failure=pause no longer holds later deployments — the rollout proceeds
 	// like continue. Apply-level: it applies to every operation of the apply.
 	Released bool `json:"released,omitempty"`
+	// Sharded is true when the apply is one change fanned out across its
+	// keyspaces' shards. Tables then carries one row per keyspace table with
+	// its shards listed under it (a table on its keyspace's only shard keeps
+	// its own row and names no shard), and Metadata carries each finalizer's
+	// VSchema change. Operations still lists every shard and finalizer row,
+	// but a client renders the apply as one change, the way its PR comments do.
+	Sharded bool `json:"sharded,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.
 type ProgressOperationResponse struct {
 	Deployment string `json:"deployment"`
+	// OperationKey disambiguates multiple execution operations in the same
+	// apply and deployment, correlating this row with the stored
+	// apply_operation and its data-plane work. Empty is the legacy
+	// single-operation key.
+	OperationKey string `json:"operation_key,omitempty"`
 	// ExternalID is the remote data plane's stable apply identifier.
 	ExternalID string `json:"external_id,omitempty"`
 	// ExternalOperationID is the remote data plane's numeric operation row ID.
@@ -704,8 +1866,29 @@ type ProgressOperationResponse struct {
 	OnFailure    string `json:"on_failure,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CompletedAt  string `json:"completed_at,omitempty"`
+	// AlreadyConverged is true for an operation recorded completed when the
+	// apply was created, because its target already held the change and
+	// nothing ran there.
+	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// EndedBy is set on a failed operation that did not fail on its own: it
+	// waited at a deferred cutover that another operation's end meant could
+	// never run, so SchemaBot stopped it, saved its copy, and failed it. It
+	// names that other operation of the same apply.
+	EndedBy *ProgressOperationRef `json:"ended_by,omitempty"`
+	// RolloutStep is the table step this operation runs, numbered from 1, when
+	// the rollout runs table by table: one operation per target and table.
+	// Omitted for an operation that runs its member's whole change.
+	RolloutStep int    `json:"rollout_step,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
+}
+
+// ProgressOperationRef names one operation of an apply by its deployment and
+// operation key, which together identify it. An empty reference ({}) says the
+// operation was failed for another whose row the apply no longer lists.
+type ProgressOperationRef struct {
+	Deployment   string `json:"deployment,omitempty"`
+	OperationKey string `json:"operation_key,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.
@@ -714,7 +1897,12 @@ type TableProgressResponse struct {
 	DDL       string `json:"ddl"`
 	// Deployment attributes this table/task to a deployment in a multi-deployment apply.
 	// Empty for single-deployment applies.
-	Deployment      string `json:"deployment,omitempty"`
+	Deployment string `json:"deployment,omitempty"`
+	// Target attributes this table/task to a target within that deployment. One
+	// deployment can address several targets, each running its own copy of the
+	// change, so the deployment alone does not say which member's progress this
+	// row reports.
+	Target          string `json:"target,omitempty"`
 	Keyspace        string `json:"keyspace,omitempty"`
 	ChangeType      string `json:"change_type,omitempty"` // create, alter, drop
 	Status          string `json:"status"`
@@ -722,16 +1910,37 @@ type TableProgressResponse struct {
 	RowsTotal       int64  `json:"rows_total"`
 	PercentComplete int32  `json:"percent_complete"`
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
+	// EstimatedBytes is the plan's approximate on-disk footprint of the table
+	// (data plus indexes), for display beside the row counts. It is the
+	// table's size when planned, not a measure of copy progress. Absent when
+	// the plan had no estimate and for a task scoped to one shard, since the
+	// estimate covers the whole table. A sharded table rolled up across its
+	// shards carries it, covering every shard.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// EstimatedRows is the plan's approximate row count for the table, so a
+	// table that has not started copying can show how much it will copy.
+	// rows_total replaces it once the engine reports. Absent under the same
+	// rules as EstimatedBytes.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
+	// count and for a table not rolled up across shards.
+	PlannedShards int32 `json:"planned_shards,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
-	ChecksumRowsChecked int64                    `json:"checksum_rows_checked,omitempty"`
-	ChecksumRowsTotal   int64                    `json:"checksum_rows_total,omitempty"`
-	IsInstant           bool                     `json:"is_instant,omitempty"`
-	ProgressDetail      string                   `json:"progress_detail,omitempty"`
-	TaskID              string                   `json:"task_id,omitempty"`
-	StartedAt           string                   `json:"started_at,omitempty"`
-	CompletedAt         string                   `json:"completed_at,omitempty"`
-	Shards              []*ShardProgressResponse `json:"shards,omitempty"`
+	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
+	// The engine's throttler is pausing this table's active phase (row copy or
+	// checksum verify). ThrottleReason names the signal for display and is
+	// empty when Throttled is false.
+	Throttled      bool                     `json:"throttled,omitempty"`
+	ThrottleReason string                   `json:"throttle_reason,omitempty"`
+	IsInstant      bool                     `json:"is_instant,omitempty"`
+	ProgressDetail string                   `json:"progress_detail,omitempty"`
+	TaskID         string                   `json:"task_id,omitempty"`
+	StartedAt      string                   `json:"started_at,omitempty"`
+	CompletedAt    string                   `json:"completed_at,omitempty"`
+	Shards         []*ShardProgressResponse `json:"shards,omitempty"`
 }
 
 // ShardProgressResponse contains per-shard progress for Vitess schema changes.
@@ -743,6 +1952,10 @@ type ShardProgressResponse struct {
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
 	PercentComplete int32  `json:"percent_complete"`
 	CutoverAttempts int32  `json:"cutover_attempts,omitempty"`
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the shard is checksumming (verifying copied data).
+	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
 }
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
@@ -777,22 +1990,50 @@ type ActiveApplyResponse struct {
 	Database            string `json:"database"`
 	Environment         string `json:"environment"`
 	Deployment          string `json:"deployment,omitempty"`
-	State               string `json:"state"`
-	Engine              string `json:"engine"`
-	Caller              string `json:"caller"`
-	ErrorMessage        string `json:"error_message,omitempty"`
-	StartedAt           string `json:"started_at,omitempty"`
-	CompletedAt         string `json:"completed_at,omitempty"`
-	UpdatedAt           string `json:"updated_at"`
-	Volume              int    `json:"volume,omitempty"`
+	// State is the apply's state, or the named deployment's operation state
+	// when the status request filters by deployment.
+	State string `json:"state"`
+	// ApplyState is the parent apply's own state, set only when State reports
+	// a deployment's operation. An apply holds every deployment it touches
+	// until the apply itself is terminal, so a deployment whose operation has
+	// finished stays reserved while ApplyState is not terminal.
+	ApplyState   string `json:"apply_state,omitempty"`
+	Engine       string `json:"engine"`
+	Caller       string `json:"caller"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int                    `json:"active_count"`
-	Limit        int                    `json:"limit,omitempty"`
-	MaxLimit     int                    `json:"max_limit,omitempty"`
-	HasMore      bool                   `json:"has_more,omitempty"`
-	FailuresOnly bool                   `json:"failures_only,omitempty"`
-	Applies      []*ActiveApplyResponse `json:"applies"`
+	ActiveCount int `json:"active_count"`
+	Limit       int `json:"limit,omitempty"`
+	MaxLimit    int `json:"max_limit,omitempty"`
+	// HasMore reports that more applies match than this page holds. Request
+	// the next page with the same filters and starting_after set to the last
+	// apply's ID.
+	HasMore      bool `json:"has_more,omitempty"`
+	FailuresOnly bool `json:"failures_only,omitempty"`
+	// Last echoes the window bounding the list to applies updated within it;
+	// empty means the list is bounded by limit alone.
+	Last string `json:"last,omitempty"`
+	// State echoes the canonical form of the state filter restricting the
+	// list; empty means no state filter.
+	State string `json:"state,omitempty"`
+	// StartingAfter echoes the starting_after apply the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string `json:"starting_after,omitempty"`
+	// Active echoes the active filter: true lists only applies that have not
+	// reached a terminal state, false only the terminal ones, and absent means
+	// no filter. A client that asked for active=false and finds it absent is
+	// talking to a server that lists everything regardless.
+	Active *bool `json:"active,omitempty"`
+	// StateCounts tallies every apply matching the request's filters by state,
+	// unbounded by limit — the applies list may be a truncated page, but these
+	// counts never are.
+	StateCounts map[string]int         `json:"state_counts,omitempty"`
+	Applies     []*ActiveApplyResponse `json:"applies"`
 }

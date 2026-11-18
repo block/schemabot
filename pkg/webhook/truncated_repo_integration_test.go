@@ -14,6 +14,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
+	"strconv"
 	"testing"
 	"time"
 
@@ -32,7 +34,7 @@ import (
 func newE2EHandlerWithConfigDirHints(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	installClient.SetConfigDirHints(svc.Config())
 	factory := &fakeClientFactory{client: installClient}
 	return NewHandler(svc, factory, nil, logger)
@@ -77,8 +79,10 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{{
-			Filename: new("docs/readme.md"),
-			Status:   new("modified"),
+			Filename:  new("docs/readme.md"),
+			Status:    new("modified"),
+			Additions: new(4),
+			Deletions: new(2),
 		}})
 	})
 
@@ -182,22 +186,30 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
+	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id := checkRunState.create(body)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id, err := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid check run id", http.StatusBadRequest)
+			return
+		}
+		checkRunState.update(id, body)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
-	registerCheckStatusRESTHandlersForAnyRef(mux, func() []checkStatusNode { return nil })
+	registerCheckStatusRESTHandlersForAnyRef(mux, func() []checkStatusNode { return nil }, checkRunState)
 
 	return result
 }
@@ -210,7 +222,7 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 // `schemabot plan -e staging` to recover. The command must recreate the
 // aggregate check as passing on the current head and say so in a comment —
 // even in a repository whose recursive tree listing GitHub truncates, since
-// converging the checks for a no-schema-changes PR requires no whole-repo
+// converging the checks for a PR with no schema changes requires no whole-repo
 // config scan.
 func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 	dbName := "webhook_truncated_repo_converge"
@@ -238,12 +250,12 @@ func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "No Schema Files Changed")
 		assert.Contains(t, body, "abc123")
 		assert.NotContains(t, body, "truncated repository tree")
 		assert.NotContains(t, body, "Plan Failed")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for no-managed-schema-changes comment")
+		t.Fatal(`timed out waiting for the "No Schema Files Changed" comment`)
 	}
 
 	select {
@@ -383,8 +395,10 @@ func TestE2EPlanCommandOnTruncatedRepoWithoutConfiguredDirsFailsClosed(t *testin
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Plan Failed")
+		assert.Contains(t, body, "Repository Too Large to Search")
 		assert.Contains(t, body, "truncated repository tree")
+		assert.Contains(t, body, "`allowed_dirs`")
+		assert.NotContains(t, body, "Database Not Found")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for failure comment")
 	}

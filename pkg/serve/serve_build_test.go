@@ -3,16 +3,25 @@ package serve
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -27,9 +36,13 @@ type stubTernClient struct{ tern.Client }
 // Run own the listener.
 func TestServerRegisterGRPCRegistersTernService(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{}
+	store := mysqlstore.New(nil)
 	srv := &Server{
+		cfg:             cfg,
 		dataPlaneClient: stubTernClient{},
-		svc:             api.New(mysqlstore.New(nil), &api.ServerConfig{}, nil, logger),
+		svc:             api.New(store, cfg, nil, logger),
+		storage:         store,
 		logger:          logger,
 	}
 
@@ -49,7 +62,7 @@ func TestServerMetricsHandlerSeparateFromAPIHandler(t *testing.T) {
 
 	webhook, err := buildWebhookRuntime(cfg, svc, logger)
 	require.NoError(t, err)
-	authz, err := buildAuthorizer(t.Context(), cfg.Auth, nil, logger)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
 	require.NoError(t, err)
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
@@ -101,7 +114,7 @@ func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
 	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
 	webhook, err := buildWebhookRuntime(cfg, svc, logger)
 	require.NoError(t, err)
-	authz, err := buildAuthorizer(t.Context(), cfg.Auth, nil, logger)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
 	require.NoError(t, err)
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
@@ -148,4 +161,363 @@ func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
 		// that a write-group member is permitted to perform the write.
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
+}
+
+// Configuring the service-caller lane (trusted_gateway_spiffe +
+// read_service_spiffe + caller_spiffe_header) wires all three settings through
+// buildAuthorizer into the real HTTP handler: a listed caller arriving through
+// a listed gateway under the configured header gets read access, and stays
+// read-only. This proves the config-to-middleware plumbing end to end, so a
+// dropped or swapped field in the authorizer construction fails behaviorally.
+func TestForwardAuthServiceCallerLaneThroughServerHandler(t *testing.T) {
+	const (
+		gatewaySVID  = "spiffe://example.org/ns/service-ingress/sa/gateway"
+		callerSVID   = "spiffe://example.org/ns/reporting/sa/reporting"
+		callerHeader = "X-Custom-Caller-Id"
+	)
+	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{
+		Auth: api.AuthConfig{
+			Type: "forward_auth",
+			ForwardAuth: api.ForwardAuthSettings{
+				TrustedProxySPIFFE:   []string{"spiffe://example.org/ns/ingress/sa/proxy"},
+				WriteGroups:          []string{"owners"},
+				TrustedGatewaySPIFFE: []string{gatewaySVID},
+				ReadServiceSPIFFE:    []string{callerSVID},
+				CallerSPIFFEHeader:   callerHeader,
+			},
+		},
+	}
+	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	webhook, err := buildWebhookRuntime(cfg, svc, logger)
+	require.NoError(t, err)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	telemetry, err := api.SetupTelemetry(logger)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		_ = telemetry.Shutdown(shutdownCtx)
+	})
+
+	srv := &Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, telemetry: telemetry, authz: authz}
+	handler := srv.Handler()
+
+	gatewayRequest := func(t *testing.T, method, path string) *http.Request {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), method, path, nil)
+		req.RemoteAddr = "203.0.113.5:1234"
+		req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+		req.Header.Set(callerHeader, callerSVID)
+		return req
+	}
+
+	t.Run("listed service caller passes the auth gate on a read", func(t *testing.T) {
+		// The read is authorized — not rejected at auth — so it reaches the
+		// pull handler, which rejects this empty body with 400.
+		req := gatewayRequest(t, http.MethodPost, "/api/pull")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
+	t.Run("service caller is denied a write with 403", func(t *testing.T) {
+		req := gatewayRequest(t, http.MethodPost, "/api/plan")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "read-only")
+	})
+
+	t.Run("caller under the default header name is rejected when a custom header is configured", func(t *testing.T) {
+		req := gatewayRequest(t, http.MethodGet, "/api/status")
+		req.Header.Del(callerHeader)
+		req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+}
+
+// Per-database operator scoping only works if the server wires the
+// operator-group union from database config into the forward-auth middleware.
+// This drives the real server handler with a caller who is in an operator
+// group but no write group: the middleware must admit them to the write tier
+// (the union wiring), the handler must allow their granted database and deny
+// another — so a build that drops the union, or a handler that skips the
+// scope check, fails behaviorally.
+func TestForwardAuthOperatorScopingThroughServerHandler(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{
+		Auth: api.AuthConfig{
+			Type: "forward_auth",
+			ForwardAuth: api.ForwardAuthSettings{
+				// httptest's default RemoteAddr (192.0.2.1) falls in this range,
+				// so it is the trusted proxy; other sources are untrusted.
+				TrustedProxyCIDRs:    []string{"192.0.2.0/24"},
+				GroupsHeader:         "X-Forwarded-Capabilities",
+				WriteGroups:          []string{"owners"},
+				OperatorEnvironments: []string{"staging"},
+			},
+		},
+		Databases: map[string]api.DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/payments"},
+				},
+				OperatorGroups: []string{"payments-team"},
+			},
+			"orders": {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/orders"},
+				},
+			},
+		},
+	}
+	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	webhook, err := buildWebhookRuntime(cfg, svc, logger)
+	require.NoError(t, err)
+	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	telemetry, err := api.SetupTelemetry(logger)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		_ = telemetry.Shutdown(shutdownCtx)
+	})
+
+	srv := &Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, telemetry: telemetry, authz: authz}
+	handler := srv.Handler()
+
+	operatorRequest := func(t *testing.T, method, path, body string) *http.Request {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+		req.RemoteAddr = "192.0.2.1:1234"
+		req.Header.Set("X-Forwarded-User", "bob")
+		req.Header.Set("X-Forwarded-Capabilities", "users,payments-team")
+		return req
+	}
+
+	planBody := func(database string) string {
+		return `{"database":"` + database + `","environment":"staging","type":"mysql","schema_files":{"default":{"files":{"t.sql":"CREATE TABLE t (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"}}}}`
+	}
+
+	t.Run("operator is admitted to the write tier and allowed on their granted database", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, operatorRequest(t, http.MethodPost, "/api/plan", planBody("payments")))
+		// Both authorization layers pass — middleware admission via the
+		// operator-group union, handler scope via the payments grant — so the
+		// request reaches plan execution, which fails downstream in this
+		// harness (no engine wired). Any 401/403 means an auth layer denied.
+		assert.NotEqual(t, http.StatusUnauthorized, rec.Code, "middleware must authenticate the operator: %s", rec.Body.String())
+		assert.NotEqual(t, http.StatusForbidden, rec.Code, "both authorization layers must allow the granted database: %s", rec.Body.String())
+	})
+
+	t.Run("the same operator is denied another database at the handler", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, operatorRequest(t, http.MethodPost, "/api/plan", planBody("orders")))
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "owners", "the denial names the write groups that could act instead")
+	})
+
+	t.Run("operator gets the read tier deployment-wide", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, operatorRequest(t, http.MethodGet, "/api/databases", ""))
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+}
+
+// A GitHub App ID that resolves to something other than a non-negative integer
+// fails server startup with an error naming the setting, instead of the server
+// coming up with the webhook endpoint quietly disabled. Every other way the
+// credentials are unusable — not configured at all, the placeholder 0 the
+// deployment templates seed before an App exists, or a secret reference that
+// does not resolve yet — still starts the server, with the webhook endpoint
+// answering 503 until the credentials arrive.
+func TestBuildWebhookRuntimeGitHubAppID(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	t.Run("malformed app-id fails startup", func(t *testing.T) {
+		cfg := &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "abc", PrivateKey: "some-key", WebhookSecret: "secret"}}
+		svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+
+		_, err := buildWebhookRuntime(cfg, svc, logger)
+		require.ErrorIs(t, err, api.ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "github: app-id must be a positive integer")
+		assert.NotContains(t, err.Error(), "abc", "the resolved value must not appear in the error")
+	})
+
+	startsDisabled := func(t *testing.T, cfg *api.ServerConfig) {
+		t.Helper()
+		svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+
+		runtime, err := buildWebhookRuntime(cfg, svc, logger)
+		require.NoError(t, err)
+		require.NotNil(t, runtime.handler)
+
+		rec := httptest.NewRecorder()
+		runtime.handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", nil))
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	}
+
+	t.Run("unset app-id starts with the webhook endpoint disabled", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		startsDisabled(t, &api.ServerConfig{})
+	})
+
+	t.Run("placeholder zero app-id starts with the webhook endpoint disabled", func(t *testing.T) {
+		startsDisabled(t, &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "0", PrivateKey: "some-key", WebhookSecret: "secret"}})
+	})
+
+	t.Run("unresolvable app-id reference starts with the webhook endpoint disabled", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		startsDisabled(t, &api.ServerConfig{GitHub: api.GitHubConfig{AppID: "file:" + nonexistent, PrivateKey: "some-key", WebhookSecret: "secret"}})
+	})
+}
+
+// staticStorageSchemaService stands in for the adapter bound to an instance's
+// own storage, answering with a report no other source could have produced.
+type staticStorageSchemaService struct{ database string }
+
+func (s staticStorageSchemaService) StorageSchemaPlan(context.Context, *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
+	return &ternv1.StorageSchemaPlanResponse{Report: &ternv1.StorageSchemaReport{Database: s.database}}, nil
+}
+
+func (s staticStorageSchemaService) StorageSchemaApply(context.Context, *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
+	return &ternv1.StorageSchemaApplyResponse{
+		Planned:   &ternv1.StorageSchemaReport{Database: s.database},
+		Remaining: &ternv1.StorageSchemaReport{Database: s.database},
+	}, nil
+}
+
+// The gRPC endpoint answers for this instance's own storage only when
+// RegisterGRPC hands the adapter to the Tern server. Registering the service
+// and then dropping the option leaves a data plane that is reachable, healthy,
+// and refuses every storage schema request as Unimplemented — which a caller
+// reads as a release too old to serve them, and an operator chases as a version
+// skew that does not exist. So the RPC is driven over a real connection, and
+// both wirings are checked: with an adapter the instance's own report comes
+// back, and without one the refusal is the Unimplemented that means what it
+// says.
+func TestServerRegisterGRPCThreadsStorageSchemaService(t *testing.T) {
+	const database = "schemabot_storage_fixture"
+	for _, tc := range []struct {
+		name          string
+		storageSchema tern.StorageSchemaService
+		wantCode      codes.Code
+	}{
+		{name: "adapter registered", storageSchema: staticStorageSchemaService{database: database}, wantCode: codes.OK},
+		{name: "no adapter", wantCode: codes.Unimplemented},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := slog.New(slog.DiscardHandler)
+			cfg := &api.ServerConfig{}
+			store := mysqlstore.New(nil)
+			srv := &Server{
+				cfg:             cfg,
+				dataPlaneClient: stubTernClient{},
+				svc:             api.New(store, cfg, nil, logger),
+				storage:         store,
+				logger:          logger,
+				storageSchema:   tc.storageSchema,
+			}
+
+			client := dialRegisteredTernServer(t, srv)
+			resp, err := client.StorageSchemaPlan(t.Context(), &ternv1.StorageSchemaPlanRequest{})
+
+			require.Equal(t, tc.wantCode, status.Code(err), "unexpected gRPC code (error: %v)", err)
+			if tc.wantCode != codes.OK {
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, database, resp.GetReport().GetDatabase(),
+				"the plan must come from the adapter bound to this instance's storage")
+		})
+	}
+}
+
+// driverPoolsStorage is storage whose driver pools answer
+// ListLive with fixed servers.
+type driverPoolsStorage struct {
+	storage.Storage
+	servers []*storage.DriverPool
+}
+
+func (s driverPoolsStorage) DriverPools() storage.DriverPoolStore {
+	return liveDriverPools{servers: s.servers}
+}
+
+type liveDriverPools struct {
+	storage.DriverPoolStore
+	servers []*storage.DriverPool
+}
+
+func (s liveDriverPools) ListLive(context.Context) ([]*storage.DriverPool, error) {
+	return s.servers, nil
+}
+
+// A control plane checks a deferred apply against what this instance reports
+// over gRPC, so the registration an embedder gets reports the live servers of
+// its own storage and the max_drivers_per_apply its own drivers run one apply
+// under, the default when the config leaves it unset.
+func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		maxDriversPerApply int
+		want               int32
+	}{
+		{name: "configured", maxDriversPerApply: 6, want: 6},
+		{name: "unset", want: storage.DefaultMaxDriversPerApply},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := slog.New(slog.DiscardHandler)
+			cfg := &api.ServerConfig{MaxDriversPerApply: tc.maxDriversPerApply}
+			store := driverPoolsStorage{servers: []*storage.DriverPool{
+				{ServerID: "host-a/1/operator", Drivers: 4},
+			}}
+			srv := &Server{
+				cfg:             cfg,
+				dataPlaneClient: stubTernClient{},
+				svc:             api.New(mysqlstore.New(nil), cfg, nil, logger),
+				storage:         store,
+				logger:          logger,
+			}
+
+			resp, err := dialRegisteredTernServer(t, srv).DriverCapacity(t.Context(), &ternv1.DriverCapacityRequest{})
+
+			require.NoError(t, err)
+			assert.Equal(t, int32(1), resp.GetLiveServers())
+			assert.Equal(t, int32(4), resp.GetDrivers())
+			assert.Equal(t, int32(3), resp.GetDeferredCutoverDrivers())
+			assert.Equal(t, tc.want, resp.GetMaxDriversPerApply())
+		})
+	}
+}
+
+// dialRegisteredTernServer serves srv's own RegisterGRPC registration on a
+// loopback listener and returns a client for it, so what is exercised is the
+// registration an embedder gets rather than a hand-built server.
+func dialRegisteredTernServer(t *testing.T, srv *Server) ternv1.TernClient {
+	t.Helper()
+
+	gs := grpc.NewServer()
+	require.NoError(t, srv.RegisterGRPC(t.Context(), gs))
+
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err)
+	go func() {
+		_ = gs.Serve(lis)
+	}()
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		utils.CloseAndLog(conn)
+		gs.Stop()
+	})
+	return ternv1.NewTernClient(conn)
 }

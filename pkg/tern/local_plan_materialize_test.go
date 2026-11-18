@@ -9,11 +9,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // fakePlanStore lets a test script the plan Get/Create behavior the plan
@@ -21,6 +21,7 @@ import (
 type fakePlanStore struct {
 	storage.PlanStore
 	getFn     func(planIdentifier string) (*storage.Plan, error)
+	getByIDFn func(id int64) (*storage.Plan, error)
 	createID  int64
 	createErr error
 	created   *storage.Plan
@@ -28,6 +29,10 @@ type fakePlanStore struct {
 
 func (f *fakePlanStore) Get(_ context.Context, planIdentifier string) (*storage.Plan, error) {
 	return f.getFn(planIdentifier)
+}
+
+func (f *fakePlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	return f.getByIDFn(id)
 }
 
 func (f *fakePlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {
@@ -84,7 +89,7 @@ func alterUsersEmailPlan() *engine.PlanResult {
 			Namespace: "testapp",
 			TableChanges: []engine.TableChange{{
 				Table:     "users",
-				Operation: statement.StatementAlterTable,
+				Operation: ddl.StatementAlterTable,
 				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 			}},
 		}},
@@ -98,13 +103,14 @@ func TestPlanForApplyRequest_LocalPlanWins(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return existing, nil }}
 	c := newPlanMaterializeClient(store)
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, replanned, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:     "plan_local",
 		DdlChanges: []*ternv1.TableChange{{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}},
 	})
 
 	require.NoError(t, err)
 	assert.Same(t, existing, got)
+	assert.False(t, replanned, "a stored plan row is returned without checking the dispatch against live schema")
 	assert.Nil(t, store.created, "must not materialize when a local plan exists")
 }
 
@@ -117,7 +123,7 @@ func TestPlanForApplyRequest_MaterializesFromRequest(t *testing.T) {
 	}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, replanned, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:      "plan_remote",
 		Environment: "staging",
 		Target:      "testapp-us",
@@ -131,6 +137,7 @@ func TestPlanForApplyRequest_MaterializesFromRequest(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, got)
+	assert.True(t, replanned, "materializing checks the dispatch against live schema")
 	assert.Equal(t, int64(42), got.ID)
 	assert.Equal(t, "plan_remote", got.PlanIdentifier)
 	assert.Equal(t, "testapp", got.Database)
@@ -153,7 +160,7 @@ func TestPlanForApplyRequest_NoPayloadResolvesNil(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClient(store)
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{PlanId: "plan_missing"})
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{PlanId: "plan_missing"})
 
 	require.NoError(t, err)
 	assert.Nil(t, got)
@@ -177,7 +184,7 @@ func TestPlanForApplyRequest_DuplicateCreateReloads(t *testing.T) {
 	}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
-	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
 		PlanId:     "plan_race",
 		DdlChanges: []*ternv1.TableChange{{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"}},
 	})
@@ -198,7 +205,7 @@ func TestNamespacesFromApplyRequest(t *testing.T) {
 		{TableName: "VSchema: shop", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "shop"},
 	}
 	schemaFiles := schema.SchemaFiles{
-		"shop": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+		"shop": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 	}
 
 	got, err := c.namespacesFromApplyRequest(changes, schemaFiles)
@@ -213,7 +220,7 @@ func TestNamespacesFromApplyRequest(t *testing.T) {
 	assert.Equal(t, "alter", shop.Tables[0].Operation)
 	assert.True(t, shop.Tables[0].IsUnsafe)
 	assert.Equal(t, "DROP COLUMN removes data", shop.Tables[0].UnsafeReason)
-	assert.Equal(t, `{"sharded":true}`, shop.Artifacts[vSchemaArtifactName])
+	assert.Equal(t, `{"sharded":true}`, shop.Artifacts[storage.VSchemaArtifactName])
 
 	fallback := got["testapp"]
 	require.Len(t, fallback.Tables, 1)
@@ -230,14 +237,14 @@ func TestNamespacesFromApplyRequest_DDLOnlyOmitsVSchemaArtifact(t *testing.T) {
 		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "shop"},
 	}
 	schemaFiles := schema.SchemaFiles{
-		"shop": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+		"shop": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 	}
 
 	got, err := c.namespacesFromApplyRequest(changes, schemaFiles)
 	require.NoError(t, err)
 
 	require.Contains(t, got, "shop")
-	assert.Empty(t, got["shop"].Artifacts[vSchemaArtifactName], "DDL-only request must not materialize a vschema artifact")
+	assert.Empty(t, got["shop"].Artifacts[storage.VSchemaArtifactName], "DDL-only request must not materialize a vschema artifact")
 }
 
 // A vschema change with no vschema.json artifact in the schema files fails
@@ -285,4 +292,193 @@ func TestNamespacesFromApplyRequest_UnmappedChangeTypeClassifiesDDL(t *testing.T
 	require.Contains(t, got, "testapp")
 	require.Len(t, got["testapp"].Tables, 1)
 	assert.Equal(t, "create", got["testapp"].Tables[0].Operation)
+}
+
+// A deployment materializes dispatched changes with its own dialect's parser: a
+// PostgreSQL deployment recovers the operation for an unmapped change type from
+// Postgres-only DDL that the MySQL-family grammar cannot parse.
+func TestNamespacesFromApplyRequest_UnmappedChangeTypeUsesTargetDialectParser(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	c.config.Type = storage.DatabaseTypePostgres
+	changes := []*ternv1.TableChange{
+		{TableName: "orders", Ddl: "CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_OTHER, Namespace: ""},
+	}
+
+	got, err := c.namespacesFromApplyRequest(changes, schema.SchemaFiles{})
+	require.NoError(t, err)
+
+	require.Contains(t, got, "testapp")
+	require.Len(t, got["testapp"].Tables, 1)
+	assert.Equal(t, "create", got["testapp"].Tables[0].Operation)
+}
+
+// The materialized plan is where this deployment's task rows come from, so the
+// statement it stores is the statement the engine will be asked to run. Once
+// the drift comparison has proven the dispatched change and this deployment's
+// re-plan the same under canonicalization, the stored statement is the
+// re-plan's — the text this target's own engine emitted — not the primary's.
+func TestMaterializedPlanCarriesLocalReplannedStatement(t *testing.T) {
+	recomputed := alterUsersEmailPlan()
+	recomputed.Changes[0].TableChanges[0].DDL = "ALTER TABLE users ADD COLUMN email varchar(255)"
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 31}
+	c := newPlanMaterializeClientWithPlan(store, recomputed)
+
+	got, _, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_local_statement"))
+
+	require.NoError(t, err)
+	require.NotNil(t, store.created)
+	change := store.created.Namespaces["testapp"].Tables[0]
+	assert.Equal(t, "ALTER TABLE users ADD COLUMN email varchar(255)", change.DDL)
+	flat := got.FlatDDLChanges()
+	require.Len(t, flat, 1)
+	assert.Equal(t, "ALTER TABLE users ADD COLUMN email varchar(255)", flat[0].DDL, "task rows are built from the flattened plan")
+}
+
+// A namespace can map to a differently named physical schema on each
+// deployment, and a PostgreSQL engine qualifies every statement it plans with
+// the schema it planned against. The dispatched text therefore names the
+// primary's schema, which this target does not have; the materialized plan
+// carries this target's re-planned statement, qualified with its own schema,
+// so the apply names the schema it preflighted.
+func TestMaterializedPostgresPlanNamesThisDeploymentsSchema(t *testing.T) {
+	const dispatched = `ALTER TABLE "svc-database-qa".users ADD COLUMN email text`
+	const local = `ALTER TABLE "svc-database-us-qa".users ADD COLUMN email text`
+	fake := &namespaceCaptureEngine{planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+		Namespace: "svc-database-us-qa",
+		TableChanges: []engine.TableChange{{
+			Table:         "users",
+			Operation:     ddl.StatementAlterTable,
+			DDL:           local,
+			ExecutionMode: engine.ExecutionModeDirect,
+			ModeReason:    "metadata-only change",
+		}},
+	}}}}
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 32}
+	c := postgresOverrideClient(fake)
+	c.config.SchemaOverrides = map[string]string{"svc": "svc-database-us-qa"}
+	c.storage = &fakePlanStorage{plans: store}
+
+	got, _, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan_pg_schema",
+		Environment: "qa",
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: dispatched, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "svc"},
+		},
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"svc": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint, email text);"}},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, store.created)
+	assert.Contains(t, fake.planRequest.SchemaFiles, "svc-database-us-qa", "the re-plan runs against this target's physical schema")
+	ns := store.created.Namespaces["svc"]
+	require.NotNil(t, ns)
+	require.Len(t, ns.Tables, 1)
+	assert.Equal(t, local, ns.Tables[0].DDL)
+	assert.Equal(t, "svc", ns.Tables[0].Namespace, "the stored namespace stays canonical; only the statement is this target's")
+	assert.Equal(t, engine.ExecutionModeDirect, ns.Tables[0].ExecutionMode)
+	flat := got.FlatDDLChanges()
+	require.Len(t, flat, 1)
+	assert.Equal(t, local, flat[0].DDL)
+}
+
+// A dispatched change that already arrives blocked is never run here, so it
+// keeps the reviewed text it was refused with rather than taking a statement
+// from a re-plan that would have run it.
+func TestMaterializedPlanKeepsDispatchedTextForBlockedChange(t *testing.T) {
+	recomputed := alterUsersEmailPlan()
+	recomputed.Changes[0].TableChanges[0].DDL = "ALTER TABLE users ADD COLUMN email varchar(255)"
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 33}
+	c := newPlanMaterializeClientWithPlan(store, recomputed)
+	req := alterUsersEmailDispatch("plan_blocked_text")
+	req.DdlChanges[0].ExecutionMode = engine.ExecutionModeBlocked
+	req.DdlChanges[0].ModeReason = "the primary's engine refuses this statement"
+
+	_, _, err := c.planForApplyRequest(t.Context(), req)
+
+	require.NoError(t, err)
+	change := store.created.Namespaces["testapp"].Tables[0]
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", change.DDL)
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+}
+
+// A shard-scoped dispatch builds its task rows from the dispatched changes
+// rather than from the plan row, so the statement this deployment's re-plan
+// produced has to be carried onto the dispatch scope as well: the task rows
+// and the plan row of one apply must hold the same statement and verdict.
+func TestShardScopedDispatchScopeCarriesLocalReplannedStatement(t *testing.T) {
+	const local = "ALTER TABLE users ADD COLUMN email varchar(255)"
+	recomputed := alterUsersEmailShardPlan("-80")
+	recomputed.Changes[0].TableChanges[0].DDL = local
+	recomputed.Changes[0].TableChanges[0].ExecutionMode = engine.ExecutionModeDirect
+	recomputed.Changes[0].TableChanges[0].ModeReason = "metadata-only change"
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 34}
+	c := newPlanMaterializeClientWithPlan(store, recomputed)
+	req := alterUsersEmailDispatch("plan_shard_local_statement", "-80")
+
+	plan, _, err := c.planForApplyRequest(t.Context(), req)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	assert.Equal(t, local, plan.Namespaces["testapp"].Tables[0].DDL)
+
+	scope, err := c.dispatchScopeForApply(plan, req)
+	require.NoError(t, err)
+	assert.Equal(t, "-80", scope.shard)
+	require.Len(t, scope.ddlChanges, 1)
+	assert.Equal(t, local, scope.ddlChanges[0].DDL, "the task row runs the same statement the plan row stores")
+	assert.Equal(t, engine.ExecutionModeDirect, scope.ddlChanges[0].ExecutionMode)
+	assert.Equal(t, "metadata-only change", scope.ddlChanges[0].ModeReason)
+}
+
+// A dispatched change with no counterpart in the plan row keeps the dispatched
+// statement: the plan row was materialized by a sibling dispatch of the same
+// plan and holds only that dispatch's changes, so the text this dispatch
+// carries is the one it was reviewed and dispatched with. Nothing here
+// re-planned it, so it is marked unsafe for admission to require the opt-in.
+func TestShardScopedDispatchScopeKeepsDispatchedTextWithoutCounterpart(t *testing.T) {
+	const dispatched = "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)"
+	plan := &storage.Plan{
+		ID:             35,
+		PlanIdentifier: "plan_shard_sibling",
+		Namespaces: map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{
+			{Namespace: "testapp", Table: "users", Operation: "alter", DDL: "ALTER TABLE users ADD COLUMN email varchar(255)"},
+		}}},
+	}
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	req := &ternv1.ApplyRequest{
+		PlanId:       "plan_shard_sibling",
+		TargetShards: []string{"80-"},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "orders", Ddl: dispatched, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	}
+
+	scope, err := c.dispatchScopeForApply(plan, req)
+	require.NoError(t, err)
+	require.Len(t, scope.ddlChanges, 1)
+	assert.Equal(t, dispatched, scope.ddlChanges[0].DDL)
+	assert.Empty(t, scope.ddlChanges[0].ExecutionMode)
+	assert.True(t, scope.ddlChanges[0].IsUnsafe)
+	assert.Equal(t, unconfirmedUnsafeReason, scope.ddlChanges[0].UnsafeReason)
+}
+
+// A whole-deployment dispatch already builds its scope from the plan row, so
+// the stamped statement reaches the task rows without substitution.
+func TestWholeDeploymentDispatchScopeIsThePlanRow(t *testing.T) {
+	const local = "ALTER TABLE users ADD COLUMN email varchar(255)"
+	recomputed := alterUsersEmailPlan()
+	recomputed.Changes[0].TableChanges[0].DDL = local
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 36}
+	c := newPlanMaterializeClientWithPlan(store, recomputed)
+	req := alterUsersEmailDispatch("plan_whole_local_statement")
+
+	plan, _, err := c.planForApplyRequest(t.Context(), req)
+	require.NoError(t, err)
+
+	scope, err := c.dispatchScopeForApply(plan, req)
+	require.NoError(t, err)
+	assert.Empty(t, scope.shard)
+	require.Len(t, scope.ddlChanges, 1)
+	assert.Equal(t, local, scope.ddlChanges[0].DDL)
 }

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -22,9 +23,8 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
-	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
 	gh "github.com/google/go-github/v86/github"
 	"golang.org/x/sync/errgroup"
 )
@@ -68,6 +68,12 @@ type Client struct {
 	// construction; never mutated afterwards. Nil when the embedder has no
 	// directory configuration to offer.
 	configDirHints ConfigDirHints
+
+	// listenOnlyRepos names the repositories whose GitHub writes the
+	// installation transport refuses to send. Static configuration set at
+	// construction; never mutated afterwards. Nil when every repository may
+	// be written to.
+	listenOnlyRepos ListenOnlyRepos
 
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
@@ -226,6 +232,29 @@ func (c *Client) fetchAppSlug() {
 	c.logger.Info("fetched GitHub App slug", "slug", slug)
 }
 
+// newInstallationBaseTransport builds the HTTP transport an installation
+// client and its token exchanges send through. The rate-limit transport wraps
+// the metrics transport directly, because it reads the App and installation
+// identity for its cooldown telemetry from that transport.
+func newInstallationBaseTransport(installationID int64, appSlug func() string) http.RoundTripper {
+	return newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, installationID, appSlug))
+}
+
+// newInstallationTransport builds the transport an installation client sends
+// API requests through. The listen-only guard wraps the installation token
+// transport rather than sitting under it, so a token exchange never reaches
+// the guard. A token exchange carries the context of the API request that
+// triggered it, which names that request's repository, so a guard under it
+// would refuse the exchange and with it every read of a listen-only
+// repository.
+func newInstallationTransport(appID, installationID int64, privateKey []byte, appSlug func() string, listenOnlyRepos ListenOnlyRepos) (http.RoundTripper, error) {
+	installationTransport, err := ghinstallation.New(newInstallationBaseTransport(installationID, appSlug), appID, installationID, privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
+	}
+	return newListenOnlyTransport(installationTransport, listenOnlyRepos, installationID, appSlug), nil
+}
+
 // ForInstallation returns a GitHub client scoped to a specific installation,
 // reusing the cached client for that installationID when one already exists.
 // The ghinstallation library handles JWT generation, token exchange, caching,
@@ -267,10 +296,9 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		return existing, nil
 	}
 
-	baseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, installationID, c.loadAppSlug))
-	installationTransport, err := ghinstallation.New(baseTransport, c.appID, installationID, c.privateKey)
+	installationTransport, err := newInstallationTransport(c.appID, installationID, c.privateKey, c.loadAppSlug, c.listenOnlyRepos)
 	if err != nil {
-		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
+		return nil, err
 	}
 	httpc := &http.Client{Transport: installationTransport, Timeout: 30 * time.Second}
 	ghClient := gh.NewClient(httpc)
@@ -282,6 +310,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		trustedCheckAppSlugs:    c.trustedCheckAppSlugs,
 		configDirHints:          c.configDirHints,
 		checkStatusSingleflight: c.checkStatusSingleflight,
+		treeLevels:              newTreeLevelCache(),
 	}
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
@@ -318,7 +347,7 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 
 	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
 	if err != nil {
-		return 0, fmt.Errorf("find installation for %s: %w", repo, err)
+		return 0, findInstallationError(repo, err)
 	}
 	id := installation.GetID()
 	if id == 0 {
@@ -330,6 +359,25 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 	c.repoInstallationsMu.Unlock()
 	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
 	return id, nil
+}
+
+// ErrAppNotInstalled reports that GitHub has no installation of this App
+// covering the repository: GET /repos/{owner}/{repo}/installation answered
+// 404. GitHub gives the same answer when the repository does not exist, since
+// an App cannot see a repository it is not installed on. Either way the App can
+// neither read nor publish the repository's Check Runs until it is installed.
+var ErrAppNotInstalled = errors.New("GitHub App is not installed on the repository")
+
+// findInstallationError wraps a failed installation lookup for repo. Only a 404
+// from the lookup itself carries ErrAppNotInstalled; every other failure (5xx,
+// rate limit, auth, transport) stays a plain error, because the App's coverage
+// of the repository is then unknown rather than known to be absent.
+func findInstallationError(repo string, err error) error {
+	var errResp *gh.ErrorResponse
+	if errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("find installation for %s: %w: %w", repo, ErrAppNotInstalled, err)
+	}
+	return fmt.Errorf("find installation for %s: %w", repo, err)
 }
 
 // NewInstallationClient creates an InstallationClient from a pre-configured go-github client.
@@ -345,6 +393,7 @@ func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSl
 		client:               client,
 		logger:               logger,
 		trustedCheckAppSlugs: trustedCheckAppSlugs,
+		treeLevels:           newTreeLevelCache(),
 	}
 	ic.storeAppSlug(appSlug)
 	return ic
@@ -385,6 +434,10 @@ type InstallationClient struct {
 	// Optional: when nil, GetPRCheckStatuses bypasses the coalescer
 	// (e.g. tests).
 	checkStatusSingleflight *CheckStatusSingleflight
+
+	// treeLevels holds tree levels read by SHA across calls, so the
+	// listings and comparisons a delivery repeats read each level once.
+	treeLevels *treeLevelCache
 }
 
 // InstallationID returns the GitHub App installation this client is scoped
@@ -426,12 +479,6 @@ func NewRateLimitedTransport(base http.RoundTripper) http.RoundTripper {
 	return newGitHubRateLimitTransport(base)
 }
 
-func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
-	return github_ratelimit.New(base,
-		github_secondary_ratelimit.WithSingleSleepLimit(githubSecondaryRateLimitMaxSleep, nil),
-	)
-}
-
 // GitHub read retries are deliberately generous: transient edge failures
 // (5xx, empty-body 400s, dropped connections, short rate-limit windows) can
 // last several seconds, and a failed read on a webhook path surfaces to the
@@ -455,8 +502,9 @@ func SetUnavailableReadRetryDelayForTest(delay time.Duration) (restore func()) {
 	return func() { githubUnavailableReadRetryDelay = original }
 }
 
-func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger, operation string, logAttrs []any, read func(context.Context) (T, error)) (T, error) {
+func retryGitHubUnavailableRead[T any](ctx context.Context, ic *InstallationClient, metricOperation, operation string, logAttrs []any, read func(context.Context) (T, error)) (T, error) {
 	var zero T
+	logger := ic.logger
 	for attempt := 1; attempt <= githubUnavailableReadRetryMaxAttempts; attempt++ {
 		result, err := read(ctx)
 		if err == nil {
@@ -474,12 +522,8 @@ func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger,
 			logger.Warn("retrying unavailable GitHub read",
 				append(logAttrs, "operation", operation, "attempt", attempt, "max_attempts", githubUnavailableReadRetryMaxAttempts, "delay", delay, "error", err)...)
 		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return zero, fmt.Errorf("wait to retry GitHub read %s: %w", operation, ctx.Err())
-		case <-timer.C:
+		if err := waitToRetryGitHubRead(ctx, ic.readWaitMetricContext(metricOperation), delay, err); err != nil {
+			return zero, fmt.Errorf("wait to retry GitHub read %s: %w", operation, err)
 		}
 	}
 	return zero, fmt.Errorf("retry GitHub read %s: exhausted attempts", operation)
@@ -640,7 +684,7 @@ func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo strin
 // GetIssueComment returns the current body of an existing PR/issue comment.
 func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
 	owner, repoName := splitRepo(repo)
-	comment, err := retryGitHubUnavailableRead(ctx, ic.logger, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
+	comment, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "get issue comment", []any{"repo", repo, "comment_id", commentID}, func(ctx context.Context) (*gh.IssueComment, error) {
 		c, _, callErr := ic.client.Issues.GetComment(ctx, owner, repoName, commentID)
 		if callErr != nil {
 			return nil, classifyGitHubAPIError(callErr)
@@ -661,6 +705,24 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 	})
 	if err != nil {
 		return fmt.Errorf("edit issue comment: %w", err)
+	}
+	return nil
+}
+
+// DeleteIssueComment removes an existing PR/issue comment from the timeline.
+// A comment GitHub no longer has (404) counts as deleted: retirement sweeps
+// retry failed deletes, and a retry after a crash — or after a human removed
+// the comment first — must converge instead of failing forever.
+func (ic *InstallationClient) DeleteIssueComment(ctx context.Context, repo string, commentID int64) error {
+	owner, repoName := splitRepo(repo)
+	resp, err := ic.client.Issues.DeleteComment(ctx, owner, repoName, commentID)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			ic.logger.Info("issue comment already gone on GitHub; treating delete as complete",
+				"repo", repo, "comment_id", commentID)
+			return nil
+		}
+		return fmt.Errorf("delete issue comment %d: %w", commentID, err)
 	}
 	return nil
 }
@@ -752,10 +814,21 @@ type PullRequestInfo struct {
 	HeadRef string
 	HeadSHA string
 	BaseRef string
-	User    string
+	// DefaultBranch is the default branch of the repository the PR targets,
+	// read from the same response as BaseRef.
+	DefaultBranch string
+	User          string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
+	// Merged reports whether the PR was merged. GitHub folds merged PRs into
+	// State "closed", so callers that message operators differently for a
+	// merged PR versus an abandoned one must consult this alongside IsClosed.
+	Merged bool
+	// BaseSHA is the base branch commit GitHub recorded for the PR. GitHub
+	// does not advance it as the base branch moves, so it is not the base
+	// branch's tip.
+	BaseSHA string
 }
 
 // OpenPullRequest holds the PR metadata needed for operator scans.
@@ -799,7 +872,7 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		},
 	}
 	var resp *gh.Response
-	ghPRs, err := retryGitHubUnavailableRead(ctx, ic.logger, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+	ghPRs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
 		list, listResp, listErr := ic.client.PullRequests.List(ctx, owner, repoName, opts)
 		if listErr != nil {
 			return nil, classifyGitHubAPIError(listErr)
@@ -848,6 +921,13 @@ func (ic *InstallationClient) CoreRateLimit(ctx context.Context) (remaining, lim
 // that only makes sense on an open PR.
 func (pri *PullRequestInfo) IsClosed() bool {
 	return pri.State == "closed"
+}
+
+// IsOpen reports whether the PR is open. A PR whose state is neither open nor
+// closed is reported by neither method, so callers that act on one answer can
+// fail closed on an unrecognized state.
+func (pri *PullRequestInfo) IsOpen() bool {
+	return pri.State == "open"
 }
 
 // FetchPullRequest is the dedupe-friendly variant. It honours the
@@ -904,7 +984,7 @@ func (ic *InstallationClient) FetchPullRequestNoCache(ctx context.Context, repo 
 
 func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string, pr int) (*PullRequestInfo, error) {
 	owner, repoName := splitRepo(repo)
-	ghPR, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*gh.PullRequest, error) {
+	ghPR, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*gh.PullRequest, error) {
 		ghPR, _, err := ic.client.PullRequests.Get(ctx, owner, repoName, pr)
 		if err != nil {
 			return nil, fmt.Errorf("fetch pull request %s#%d: %w", repo, pr, classifyGitHubAPIError(err))
@@ -915,11 +995,14 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		return nil, err
 	}
 	return &PullRequestInfo{
-		HeadRef: ghPR.GetHead().GetRef(),
-		HeadSHA: ghPR.GetHead().GetSHA(),
-		BaseRef: ghPR.GetBase().GetRef(),
-		User:    ghPR.GetUser().GetLogin(),
-		State:   ghPR.GetState(),
+		HeadRef:       ghPR.GetHead().GetRef(),
+		HeadSHA:       ghPR.GetHead().GetSHA(),
+		BaseRef:       ghPR.GetBase().GetRef(),
+		DefaultBranch: ghPR.GetBase().GetRepo().GetDefaultBranch(),
+		User:          ghPR.GetUser().GetLogin(),
+		State:         ghPR.GetState(),
+		Merged:        ghPR.GetMerged(),
+		BaseSHA:       ghPR.GetBase().GetSHA(),
 	}, nil
 }
 
@@ -928,6 +1011,26 @@ type PRFile struct {
 	Filename         string
 	PreviousFilename string
 	Status           string // added, removed, modified, renamed
+	// Additions and Deletions are the line counts GitHub reports for the
+	// change to this file.
+	Additions int
+	Deletions int
+	// Symlink is true when Filename names a schema symlink (see
+	// isSchemaSymlink) at the head or at the base, so a change that adds,
+	// repoints, removes, or replaces one counts. PreviousSymlink is true when
+	// a rename's PreviousFilename named one at the base. GitHub's file
+	// listings carry no file mode, so the fetchers read it from the change's
+	// diff for every path that could be a symlink (see symlinkCandidates and
+	// SymlinkModes). A symlink named like a schema file is a schema input by
+	// name already, so it is not read.
+	Symlink         bool
+	PreviousSymlink bool
+	// VacatedDirectoryLink is true when the path this change vacated, the
+	// Filename it removes or replaces with something that is not a schema
+	// symlink, or the PreviousFilename it renames away, was a schema symlink
+	// at the base that declared a namespace: one to a directory holding a
+	// schema file, or to a target the read could not resolve.
+	VacatedDirectoryLink bool
 }
 
 // GitHub caps pull request file listings at this documented maximum and does
@@ -941,13 +1044,42 @@ const maxGitHubPRFiles = 3000
 const maxGitHubCompareFiles = 300
 
 // FetchPRFiles gets the list of files changed in a PR.
+//
+// Like FetchPullRequest, it honours the request-scoped cache attached to ctx
+// via WithPRInfoCache, so the discovery, safety-check, and per-environment
+// schema reads within one webhook delivery share a single listing and by
+// construction see the same one. Callers without a cache on ctx fetch on every
+// call. Only a complete listing is cached: a capped one is an error, and the
+// caller that meets it fails closed rather than planning from it.
+//
+// When the PR changes more files than GitHub will report (ErrPRFilesIncomplete),
+// the returned slice still carries the visible prefix of the listing alongside
+// the error. That prefix must never be planned from — the withheld tail could
+// hold a schema change — but callers may inspect it to describe the cap, e.g.
+// whether the PR visibly touches schema at all.
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
+	cache := prInfoCacheFromContext(ctx)
+	if cache == nil {
+		return ic.fetchPRFiles(ctx, repo, pr)
+	}
+	if files, ok := cache.getFiles(repo, pr); ok {
+		return slices.Clone(files), nil
+	}
+	files, err := ic.fetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		return files, err
+	}
+	cache.setFiles(repo, pr, files)
+	return files, nil
+}
+
+func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.ListOptions{PerPage: 100}
 	var allFiles []PRFile
 
 	for {
-		readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "list PR files", []any{"repo", repo, "pr", pr, "page", opts.Page}, func(ctx context.Context) (struct {
+		readResult, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListPRFiles, "list PR files", []any{"repo", repo, "pr", pr, "page", opts.Page}, func(ctx context.Context) (struct {
 			files []*gh.CommitFile
 			resp  *gh.Response
 		}, error) {
@@ -971,10 +1103,12 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 				Filename:         f.GetFilename(),
 				PreviousFilename: f.GetPreviousFilename(),
 				Status:           f.GetStatus(),
+				Additions:        f.GetAdditions(),
+				Deletions:        f.GetDeletions(),
 			})
 		}
 		if len(allFiles) >= maxGitHubPRFiles {
-			return nil, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
+			return allFiles, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
 		}
 		if readResult.resp.NextPage == 0 {
 			break
@@ -982,13 +1116,38 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 		opts.Page = readResult.resp.NextPage
 	}
 
+	scope := ic.schemaSymlinkScope(repo)
+	if !slices.ContainsFunc(allFiles, func(file PRFile) bool { return mayBeSchemaSymlink(file, scope) }) {
+		// Every path is named like a schema input, changed by more than one
+		// line, or outside every configured schema directory, so none can be
+		// a schema symlink and no mode is read.
+		return allFiles, nil
+	}
+	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("read PR %s#%d to find which changed files are symlinks: %w", repo, pr, err)
+	}
+	// The listing diffs the head against its merge base with the base
+	// branch, so a path's mode before the change is read there.
+	tip, err := ic.prBaseCommit(ctx, repo, pr, prInfo)
+	if err != nil {
+		return nil, err
+	}
+	mergeBase, err := ic.mergeBaseSHA(ctx, repo, tip, prInfo.HeadSHA)
+	if err != nil {
+		return nil, fmt.Errorf("find the merge base of PR %s#%d to read which changed files are symlinks: %w", repo, pr, err)
+	}
+	change := ChangeRange{PR: pr, Base: mergeBase, Head: prInfo.HeadSHA}
+	if err := ic.markSymlinks(ctx, repo, change, allFiles, scope); err != nil {
+		return nil, fmt.Errorf("find which files PR %s#%d changes are symlinks: %w", repo, pr, err)
+	}
 	return allFiles, nil
 }
 
 // FetchChangedFilesBetween gets the files changed between two refs.
 func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo string, base, head string) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
-	readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "compare commits", []any{"repo", repo, "base", base, "head", head}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+	readResult, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "compare commits", []any{"repo", repo, "base", base, "head", head}, func(ctx context.Context) (*gh.CommitsComparison, error) {
 		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, base, head, nil)
 		if err != nil {
 			return nil, fmt.Errorf("compare commits %s...%s: %w", base, head, classifyGitHubAPIError(err))
@@ -998,6 +1157,10 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 	if err != nil {
 		return nil, err
 	}
+	status := readResult.GetStatus()
+	if status != "ahead" && status != "identical" {
+		return nil, fmt.Errorf("compare commits %s...%s for %s cannot prove linear history: status %q", base, head, repo, status)
+	}
 
 	files := make([]PRFile, 0, len(readResult.Files))
 	for _, f := range readResult.Files {
@@ -1005,17 +1168,378 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 			Filename:         f.GetFilename(),
 			PreviousFilename: f.GetPreviousFilename(),
 			Status:           f.GetStatus(),
+			Additions:        f.GetAdditions(),
+			Deletions:        f.GetDeletions(),
 		})
 	}
 	if len(files) >= maxGitHubCompareFiles {
 		return nil, fmt.Errorf("compare commits %s...%s for %s reached GitHub API file limit: %w", base, head, repo, ErrPRFilesIncomplete)
 	}
+	// The comparison is linear, so base is the commit the change was made
+	// from.
+	if err := ic.markSymlinks(ctx, repo, ChangeRange{Base: base, Head: head}, files, ic.schemaSymlinkScope(repo)); err != nil {
+		return nil, fmt.Errorf("find which files changed between %s and %s in %s are symlinks: %w", base, head, repo, err)
+	}
 	return files, nil
 }
 
-// SchemaPathsChangedSinceMergeBase reports whether any schema path has a
-// different Git object on the current tip of the PR's base branch than it had
-// at the PR's merge base. Paths may name directories or symlinks. Comparing
+// prBaseCommit returns the base-side commit the PR's merge base is computed
+// from. An open PR uses the base branch's current tip. A merged PR uses the
+// base commit GitHub recorded for it instead: a merge commit puts the head
+// itself on the base branch, so the tip's merge base with the head is the
+// head, and nothing the PR removed would be read at it.
+func (ic *InstallationClient) prBaseCommit(ctx context.Context, repo string, pr int, prInfo *PullRequestInfo) (string, error) {
+	if prInfo.Merged && prInfo.BaseSHA != "" {
+		ic.logger.Debug("PR is merged, so its changed files' base modes are read from its recorded base commit",
+			"repo", repo, "pr", pr, "base_sha", prInfo.BaseSHA, "head_sha", prInfo.HeadSHA)
+		return prInfo.BaseSHA, nil
+	}
+	tip, err := ic.branchTipSHA(ctx, repo, prInfo.BaseRef)
+	if err != nil {
+		return "", fmt.Errorf("resolve base branch %s of PR %s#%d: %w", prInfo.BaseRef, repo, pr, err)
+	}
+	return tip, nil
+}
+
+// pathScope is the set of directories a changed path must sit in or under
+// to be a schema symlink. An unbounded scope admits every path.
+type pathScope struct {
+	dirs    []string
+	bounded bool
+}
+
+func (s pathScope) contains(p string) bool {
+	return !s.bounded || pathInsideAny(p, s.dirs)
+}
+
+// schemaSymlinkScope returns where a changed path can be a schema symlink in
+// repo. A schema symlink sits in a config directory or under its schema root,
+// which stays inside the config directory, and every config directory a
+// database accepts from the repo lies in one of the database's configured
+// schema directories. So when the server's directory configuration provably
+// covers every config location for the repo, a path outside those
+// directories is not a schema symlink, and its mode is never read. Without
+// such configuration every path is admitted.
+func (ic *InstallationClient) schemaSymlinkScope(repo string) pathScope {
+	if ic.configDirHints == nil {
+		return pathScope{}
+	}
+	dirs, exhaustive := ic.configDirHints.SchemaDirHintsForRepo(repo)
+	if !exhaustive {
+		ic.logger.Debug("a database accepts configs from the repository outside any configured schema directory, so every changed path that could be a symlink is read",
+			"repo", repo, "schema_dirs", len(dirs))
+		return pathScope{}
+	}
+	return pathScope{dirs: dirs, bounded: true}
+}
+
+// mayBeSchemaSymlink reports whether any of a changed file's paths could name
+// a schema symlink (see schemaSymlinkCandidates).
+func mayBeSchemaSymlink(file PRFile, scope pathScope) bool {
+	atHead, atBase, previousAtBase := schemaSymlinkCandidates(file, scope)
+	return atHead || atBase || previousAtBase
+}
+
+// schemaSymlinkCandidates narrows symlinkCandidates to the paths inside
+// scope, where a symlink can be a schema input.
+func schemaSymlinkCandidates(file PRFile, scope pathScope) (atHead, atBase, previousAtBase bool) {
+	atHead, atBase, previousAtBase = symlinkCandidates(file)
+	if !scope.contains(file.Filename) {
+		atHead, atBase = false, false
+	}
+	if !scope.contains(file.PreviousFilename) {
+		previousAtBase = false
+	}
+	return atHead, atBase, previousAtBase
+}
+
+// symlinkCandidates reports which of a changed file's paths could name a
+// symlink: its current path at the head, the same path at the base, and the
+// path a rename vacated, at the base. A symlink's content is its target on
+// one line, so a path that is a symlink after the change has at most one line
+// added, and one that was a symlink before it has at most one line deleted.
+// An added symlink adds its target line and a removed one deletes it, so an
+// added file with no line added, or a removed one with no line deleted, is a
+// binary file. Every other path is skipped without reading its mode. A path
+// named like a schema input is one already.
+func symlinkCandidates(file PRFile) (atHead, atBase, previousAtBase bool) {
+	if file.Filename != "" && !isSchemaInputFile(file.Filename) {
+		removed, renamed, added := isRemovedPRFile(file.Status), isRenamedPRFile(file.Status), isAddedPRFile(file.Status)
+		atHead = !removed && file.Additions <= 1 && (!added || file.Additions != 0)
+		atBase = !renamed && !added && file.Deletions <= 1 && (!removed || file.Deletions != 0)
+	}
+	if isRenamedPRFile(file.Status) && file.PreviousFilename != "" && !isSchemaInputFile(file.PreviousFilename) {
+		previousAtBase = file.Deletions <= 1
+	}
+	return atHead, atBase, previousAtBase
+}
+
+// markSymlinks sets Symlink, PreviousSymlink, and VacatedDirectoryLink on
+// every file in files whose paths name a schema symlink (see PRFile). The
+// modes of every path schemaSymlinkCandidates admits (the current path at
+// head and at the base, and a vacated path at the base) come from one
+// SymlinkModes call, so the cost does not grow with the number of candidates.
+// Only a path that is a symlink is then read from the tree, to classify its
+// target. A path absent at its commit is not a symlink.
+func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, change ChangeRange, files []PRFile, scope pathScope) error {
+	var probes []SymlinkProbe
+	for _, file := range files {
+		atHead, atBase, previousAtBase := schemaSymlinkCandidates(file, scope)
+		if atHead || atBase {
+			probes = append(probes, SymlinkProbe{Path: file.Filename, AtHead: atHead, AtBase: atBase})
+		}
+		if previousAtBase {
+			probes = append(probes, SymlinkProbe{Path: file.PreviousFilename, AtBase: true})
+		}
+	}
+	if len(probes) == 0 {
+		ic.logger.Debug("no changed file could be a schema symlink, so no file modes are read",
+			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "scoped_to_schema_dirs", scope.bounded)
+		return nil
+	}
+	modes, err := ic.SymlinkModes(ctx, repo, change, probes, scope.bounded)
+	if err != nil {
+		return fmt.Errorf("read the modes of %d changed paths: %w", len(probes), err)
+	}
+
+	levelCache := make(map[string][]TreeEntry)
+	// classify reads a path the diff showed as a symlink from the tree, to
+	// learn whether it can name a schema root or a namespace.
+	classify := func(ref, filePath string, symlink bool) (schemaSymlinkKind, string, error) {
+		if !symlink {
+			return notSchemaSymlink, "", nil
+		}
+		kind, targetDir, err := ic.schemaSymlinkKind(ctx, repo, ref, filePath, levelCache)
+		if err != nil {
+			return notSchemaSymlink, "", fmt.Errorf("classify symlink %s at %s: %w", filePath, ref, err)
+		}
+		return kind, targetDir, nil
+	}
+	// vacates reports whether the change takes a directory symlink at the
+	// base out of the namespaces the base declared.
+	vacates := func(linkPath string, kind schemaSymlinkKind, targetDir string) (bool, error) {
+		if kind != directorySchemaSymlink {
+			return false, nil
+		}
+		return ic.directoryLinkDeclaresNamespace(ctx, repo, change.Base, linkPath, targetDir, levelCache)
+	}
+	for i := range files {
+		file := &files[i]
+		atHead, atBase, previousAtBase := schemaSymlinkCandidates(*file, scope)
+		if atHead {
+			kind, _, err := classify(change.Head, file.Filename, modes[file.Filename].Head)
+			if err != nil {
+				return err
+			}
+			file.Symlink = kind != notSchemaSymlink
+		}
+		if !file.Symlink && atBase {
+			kind, targetDir, err := classify(change.Base, file.Filename, modes[file.Filename].Base)
+			if err != nil {
+				return err
+			}
+			file.Symlink = kind != notSchemaSymlink
+			if file.VacatedDirectoryLink, err = vacates(file.Filename, kind, targetDir); err != nil {
+				return err
+			}
+		}
+		if previousAtBase {
+			kind, targetDir, err := classify(change.Base, file.PreviousFilename, modes[file.PreviousFilename].Base)
+			if err != nil {
+				return err
+			}
+			file.PreviousSymlink = kind != notSchemaSymlink
+			if file.VacatedDirectoryLink, err = vacates(file.PreviousFilename, kind, targetDir); err != nil {
+				return err
+			}
+		}
+		if file.Symlink || file.PreviousSymlink {
+			ic.logger.Debug("changed file is or was a schema symlink, so it counts as a schema input",
+				"repo", repo, "path", file.Filename, "previous_path", file.PreviousFilename, "status", file.Status,
+				"symlink", file.Symlink, "previous_symlink", file.PreviousSymlink, "vacated_directory_link", file.VacatedDirectoryLink)
+		}
+	}
+	return nil
+}
+
+// schemaSymlinkKind classifies what a path's tree entry can do to the schema
+// an environment plans.
+type schemaSymlinkKind int
+
+const (
+	// notSchemaSymlink is a path that is absent, not a symlink, or a symlink
+	// to a file outside an environment position.
+	notSchemaSymlink schemaSymlinkKind = iota
+	// directorySchemaSymlink is a symlink to a directory, or to a target the
+	// read cannot resolve, so it may name an environment's schema root or a
+	// namespace.
+	directorySchemaSymlink
+	// environmentSchemaSymlink is a symlink to a file directly in a config
+	// directory, where an environment's schema root is named. Planning fails
+	// on it rather than reading it as a schema root.
+	environmentSchemaSymlink
+)
+
+// maxSymlinkHops bounds how many symlinks schemaSymlinkKind follows to reach
+// a target. A longer chain is treated as unresolved.
+const maxSymlinkHops = 8
+
+// schemaSymlinkKind reports whether filePath at ref is a schema symlink: one
+// that names an environment's schema root or a namespace, or sits where one
+// would. Both sit under a config directory: an environment's schema root
+// symlink directly in it, and a namespace symlink directly in a schema root,
+// which schema.ResolveEnvironmentSchemaRoot keeps inside the config
+// directory. A symlink with no config file in any directory above it is
+// therefore not one, and its target is never read. Environment and namespace
+// symlinks name directories, so a symlink whose target is a file, such as a
+// link between two documentation files or a tool's bin link, is not one,
+// unless it sits directly in a config directory, where planning reads it as
+// an environment's schema root and fails. A target that cannot be resolved
+// (outside the repository, missing, reached through another symlinked
+// directory, or behind a long chain) is treated as a directory, so an
+// unreadable link is never mistaken for one that changes nothing.
+//
+// targetDir is the repository-relative directory a directorySchemaSymlink
+// resolves to, or "" when the target could not be resolved.
+func (ic *InstallationClient) schemaSymlinkKind(ctx context.Context, repo, ref, filePath string, levelCache map[string][]TreeEntry) (kind schemaSymlinkKind, targetDir string, err error) {
+	entry, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, filePath, levelCache)
+	if errors.Is(err, errGitPathThroughNonTree) {
+		// A path below a file is not an entry of its own at ref.
+		return notSchemaSymlink, "", nil
+	}
+	if err != nil {
+		return notSchemaSymlink, "", err
+	}
+	if !found || entry.Mode != gitSymlinkMode {
+		return notSchemaSymlink, "", nil
+	}
+
+	configDir, underConfigDir, err := ic.nearestConfigDir(ctx, repo, ref, path.Dir(filePath), levelCache)
+	if err != nil {
+		return notSchemaSymlink, "", err
+	}
+	if !underConfigDir {
+		ic.logger.Debug("changed symlink has no config file above it, so it is not a schema input and its target is not read",
+			"repo", repo, "ref", ref, "path", filePath)
+		return notSchemaSymlink, "", nil
+	}
+
+	targetIsDirectory, targetDir, err := ic.symlinkTargetIsDirectory(ctx, repo, ref, filePath, entry, levelCache)
+	if err != nil {
+		return notSchemaSymlink, "", err
+	}
+	if targetIsDirectory {
+		return directorySchemaSymlink, targetDir, nil
+	}
+	if configDir == path.Dir(filePath) {
+		return environmentSchemaSymlink, "", nil
+	}
+	ic.logger.Debug("changed symlink points to a file and sits below, not in, a config directory, so it is not a schema input",
+		"repo", repo, "ref", ref, "path", filePath, "config_dir", configDir)
+	return notSchemaSymlink, "", nil
+}
+
+// nearestConfigDir returns the closest directory at or above dir that holds
+// a config file at ref, walking up to the repository root. Every level on the
+// way is one shallow tree read, cached for the rest of the change, so the
+// walk costs nothing once a sibling path has been resolved.
+func (ic *InstallationClient) nearestConfigDir(ctx context.Context, repo, ref, dir string, levelCache map[string][]TreeEntry) (configDir string, found bool, err error) {
+	for dir = path.Clean(dir); ; dir = path.Dir(dir) {
+		_, _, found, err := ic.resolveGitObjectSHA(ctx, repo, ref, path.Join(dir, ConfigFileName), levelCache)
+		if err != nil {
+			return "", false, fmt.Errorf("look for %s in %s: %w", ConfigFileName, dir, err)
+		}
+		if found {
+			return dir, true, nil
+		}
+		if dir == "." {
+			return "", false, nil
+		}
+	}
+}
+
+// symlinkTargetIsDirectory follows the symlink entry at linkPath to its
+// target and reports whether that is a directory, or a target the read
+// cannot resolve (see schemaSymlinkKind). targetDir is the resolved
+// directory, or "" when the target could not be resolved.
+func (ic *InstallationClient) symlinkTargetIsDirectory(ctx context.Context, repo, ref, linkPath string, entry TreeEntry, levelCache map[string][]TreeEntry) (isDirectory bool, targetDir string, err error) {
+	for range maxSymlinkHops {
+		target, err := ic.FetchBlobContent(ctx, repo, entry.SHA)
+		if err != nil {
+			return false, "", fmt.Errorf("read the target of symlink %s: %w", linkPath, err)
+		}
+		resolved := path.Clean(path.Join(path.Dir(linkPath), target))
+		if path.IsAbs(target) || resolved == ".." || strings.HasPrefix(resolved, "../") {
+			ic.logger.Debug("symlink target leaves the repository, so it is treated as a directory",
+				"repo", repo, "ref", ref, "path", linkPath, "target", target)
+			return true, "", nil
+		}
+		next, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, resolved, levelCache)
+		if errors.Is(err, errGitPathThroughNonTree) {
+			ic.logger.Debug("symlink target is reached through another symlink, so it is treated as a directory",
+				"repo", repo, "ref", ref, "path", linkPath, "target", resolved)
+			return true, "", nil
+		}
+		if err != nil {
+			return false, "", fmt.Errorf("resolve the target %s of symlink %s: %w", resolved, linkPath, err)
+		}
+		switch {
+		case !found:
+			ic.logger.Debug("symlink target is missing, so it is treated as a directory",
+				"repo", repo, "ref", ref, "path", linkPath, "target", resolved)
+			return true, "", nil
+		case next.Type == "tree":
+			return true, resolved, nil
+		case next.Mode == gitSymlinkMode:
+			linkPath, entry = resolved, next
+		default:
+			return false, "", nil
+		}
+	}
+	ic.logger.Debug("symlink chain is longer than the hop limit, so it is treated as a directory",
+		"repo", repo, "ref", ref, "path", linkPath, "max_hops", maxSymlinkHops)
+	return true, "", nil
+}
+
+// directoryLinkDeclaresNamespace reports whether the directory symlink at
+// linkPath declared a namespace at ref: whether targetDir held a schema file
+// directly inside it, which is what discovery reads through a namespace
+// symlink. Removing a link whose target held none empties no namespace, so
+// planning must not read the removal as one, or it would propose dropping
+// every table in a namespace the base never declared. A target that could not
+// be resolved (targetDir "") counts as declaring one, so an unreadable link is
+// never mistaken for one that changes nothing.
+func (ic *InstallationClient) directoryLinkDeclaresNamespace(ctx context.Context, repo, ref, linkPath, targetDir string, levelCache map[string][]TreeEntry) (bool, error) {
+	if targetDir == "" {
+		ic.logger.Debug("vacated directory symlink has an unresolved target, so it is treated as declaring a namespace",
+			"repo", repo, "ref", ref, "path", linkPath)
+		return true, nil
+	}
+	treeSHA, found, err := ic.resolveGitTreeSHA(ctx, repo, ref, targetDir, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve the target %s of symlink %s: %w", targetDir, linkPath, err)
+	}
+	if !found {
+		return false, fmt.Errorf("resolve the target %s of symlink %s: it resolved to a directory but is no longer one", targetDir, linkPath)
+	}
+	entries, err := ic.treeLevel(ctx, repo, treeSHA, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("list the target %s of symlink %s: %w", targetDir, linkPath, err)
+	}
+	for _, entry := range entries {
+		if entry.Type == "blob" && entry.Mode != gitSymlinkMode && isManagedSchemaFile(entry.Path) {
+			return true, nil
+		}
+	}
+	ic.logger.Debug("vacated directory symlink pointed at a directory with no schema file, so it declared no namespace",
+		"repo", repo, "ref", ref, "path", linkPath, "target", targetDir)
+	return false, nil
+}
+
+// SchemaPathsChangedSinceMergeBase returns the schema paths that have a
+// different Git object on the current tip of the PR's base branch than they had
+// at the PR's merge base, in the order given. Paths may name directories or
+// symlinks. Comparing
 // object IDs keeps the guard scoped to schema inputs: commits elsewhere in a
 // busy repository do not make the PR stale.
 //
@@ -1026,57 +1550,964 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 // resolved to a pinned tip SHA up front — returned for operator logs — so a
 // base branch advancing mid-check cannot make the merge-base lookup and the
 // tree reads observe different commits.
-func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed bool, baseTipSHA string, err error) {
-	owner, repoName := splitRepo(repo)
-	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve base branch tip", []any{"repo", repo, "base_ref", baseRef}, func(ctx context.Context) (*gh.Reference, error) {
-		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+baseRef)
-		if err != nil {
-			return nil, fmt.Errorf("get ref heads/%s: %w", baseRef, classifyGitHubAPIError(err))
-		}
-		return ref, nil
-	})
+//
+// A read that fails on one path still returns the paths already found
+// changed, beside the error: a path proven changed makes the branch stale
+// whatever the paths after it would have shown.
+func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed []string, baseTipSHA string, err error) {
+	baseTipSHA, err = ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
-		return false, "", err
+		return nil, "", err
 	}
-	baseTipSHA = tip.GetObject().GetSHA()
-	if baseTipSHA == "" {
-		return false, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", baseRef, repo)
-	}
-
-	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find pull request merge base", []any{"repo", repo, "base_ref", baseRef, "base_tip_sha", baseTipSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
-		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseTipSHA, headSHA, nil)
-		if err != nil {
-			return nil, fmt.Errorf("compare commits %s...%s: %w", baseTipSHA, headSHA, classifyGitHubAPIError(err))
-		}
-		return comparison, nil
-	})
+	mergeBaseSHA, err := ic.mergeBaseSHA(ctx, repo, baseTipSHA, headSHA)
 	if err != nil {
-		return false, baseTipSHA, err
-	}
-	mergeBaseSHA := comparison.GetMergeBaseCommit().GetSHA()
-	if mergeBaseSHA == "" {
-		return false, baseTipSHA, fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseTipSHA, headSHA, repo)
+		return nil, baseTipSHA, err
 	}
 
 	levelCache := make(map[string][]TreeEntry)
 	for _, schemaPath := range schemaPaths {
 		mergeBaseObjectSHA, mergeBaseObjectType, mergeBaseFound, err := ic.resolveGitObjectSHA(ctx, repo, mergeBaseSHA, schemaPath, levelCache)
 		if err != nil {
-			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
+			return changed, baseTipSHA, fmt.Errorf("resolve schema path %s at merge base %s: %w", schemaPath, mergeBaseSHA, err)
 		}
 		baseObjectSHA, baseObjectType, baseFound, err := ic.resolveGitObjectSHA(ctx, repo, baseTipSHA, schemaPath, levelCache)
 		if err != nil {
-			return false, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
+			return changed, baseTipSHA, fmt.Errorf("resolve schema path %s at base tip %s: %w", schemaPath, baseTipSHA, err)
 		}
 
-		if mergeBaseFound != baseFound {
-			return true, baseTipSHA, nil
-		}
-		if mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType) {
-			return true, baseTipSHA, nil
+		if mergeBaseFound != baseFound || (mergeBaseFound && (mergeBaseObjectSHA != baseObjectSHA || mergeBaseObjectType != baseObjectType)) {
+			changed = append(changed, schemaPath)
 		}
 	}
-	return false, baseTipSHA, nil
+	return changed, baseTipSHA, nil
+}
+
+// maxSchemaSymlinkReads bounds how many distinct symlinks a schema change
+// comparison reads, so a directory full of links or a chain of them cannot
+// turn one comparison into an unbounded number of GitHub reads. Links with
+// the same target text share one read. The value is a safety valve, not a
+// measured limit: schema directories normally hold a handful of links (an
+// environment link, a few shared namespaces), so it leaves wide headroom
+// while keeping a comparison's reads small. A comparison that passes half of
+// it logs a warning, so a repository growing toward it is visible before its
+// earlier approvals stop counting.
+const maxSchemaSymlinkReads = 64
+
+// maxSchemaStatementComparisons bounds how many schema files a schema change
+// comparison reads to compare their statements, each costing up to four blob
+// reads. Only files that both the pull request and the base branch edited are
+// compared this way, which a rebase normally produces for a handful of files,
+// so the value leaves wide headroom. Past it, a file counts as changed.
+const maxSchemaStatementComparisons = 16
+
+// SchemaFileChangeComparer reports whether a pull request's edit to the
+// schema file at filePath generates the same schema change on two bases:
+// approvedBase to approved at the approved commit, and headBase to head at
+// the head. The
+// change is the same when the head generates only DDL the approved commit
+// generates, and skips only DDL the head's base already made. It is supplied
+// by the database's dialect, since only the dialect can understand the file,
+// and it may run the files on the database's target to do so. same is false,
+// with reason saying why for operator logs, when the head generates DDL the
+// approved commit does not, or skips approved DDL its base has not made. An
+// error means the files could not be compared, which proves nothing.
+type SchemaFileChangeComparer func(ctx context.Context, filePath, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
+
+// SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
+type SchemaChangeComparison struct {
+	// Unchanged is true when the pull request's change to the schema paths is
+	// the same at both commits.
+	Unchanged bool
+	// DifferingPath names the first path where the change differs.
+	DifferingPath string
+	// DifferingPathBaseOnly means that path has the same object at the
+	// approved commit and the head, but different objects at their merge
+	// bases. The rejection must not claim the file itself changed.
+	DifferingPathBaseOnly bool
+	// BaseTipSHA, ApprovedMergeBaseSHA, and HeadMergeBaseSHA are the commits
+	// the comparison was measured against, for operator logs.
+	BaseTipSHA           string
+	ApprovedMergeBaseSHA string
+	HeadMergeBaseSHA     string
+	// BaseMovedForward is true when the head's merge base is the approved
+	// commit's merge base or a descendant of it.
+	BaseMovedForward bool
+	// BaseIsDefaultBranch is true when the pull request targets the
+	// repository's default branch. It is false when the default branch is
+	// unknown, so unknown base content is never trusted.
+	BaseIsDefaultBranch bool
+	// StatementComparedPaths are the schema files whose content differs
+	// between the approved commit and the head but whose statements were
+	// proved the same, for operator logs.
+	StatementComparedPaths []string
+	// DifferingFile names the differing path's blob at each side, so a
+	// caller can show how the pull request's change to it differs. It is nil
+	// when the path is a directory or a symlink at any side.
+	DifferingFile *SchemaFileBlobs
+}
+
+// SchemaFileBlobs names a schema file's blob at the approved commit, the
+// head, and the merge base of each. An empty SHA means the file is absent
+// there. Content holds the text of the blobs the comparison already read,
+// keyed by blob SHA, so a caller reads only the rest.
+type SchemaFileBlobs struct {
+	ApprovedBase, Approved, HeadBase, Head string
+	Content                                map[string]string
+}
+
+// PRSchemaChangeUnchangedSince reports whether the change a pull request
+// makes to paths is the same at approvedSHA as at headSHA, so an approval of
+// approvedSHA still describes the change at the head.
+//
+// Each commit is measured against its merge base with the base branch's
+// current tip: the base branch content it was built on. A path is unchanged
+// when the pull request turns the same base content into the same result at
+// both commits, or when it leaves the path as its base branch has it at both
+// commits, so any difference came from the base branch rather than from the
+// pull request. A path the pull request no longer touches at the head is also
+// unchanged when the base branch changed it since the approved commit's base:
+// what the pull request did there has been replaced by base branch content,
+// as when a stacked pull request below this one merges and this one is
+// rebased. Both rules hold only when baseRef is defaultBranch, the
+// repository's default branch, whose changes are expected to have had their
+// own review, and only when the head's base content is newer than the
+// approved commit's: the head's merge base must descend from the approved
+// commit's. A head rebuilt on older base content would otherwise carry an
+// older version of a path the pull request never touched, which nobody
+// approved for this change. Identical content on different bases is not
+// unchanged either: the head would undo or overwrite the base branch's
+// change. Rebasing onto, or merging in, a newer base branch therefore leaves
+// the change unchanged; a
+// path the pull request edits, adds, deletes, or resolves differently at the
+// head does not. Directories that satisfy neither are compared entry by entry.
+//
+// A schema file the pull request and the base branch both edited, as a
+// rebase that combines the two in one file produces, still differs by
+// content. When compareStatements is set, such a file is unchanged if the
+// dialect proves the head generates only DDL the approved commit generates,
+// and skips only DDL the head's base already made (see
+// SchemaFileChangeComparer). The file must be a schema file (a .sql file or a
+// vschema.json) that is a regular file at all four commits, or one the pull
+// request adds, absent at both bases. When the two bases differ the same
+// default-branch rule applies, since the head's DDL then rests on base
+// content. A nil compareStatements, an ineligible file, a comparer that
+// cannot prove the change is the same, or more such files than
+// maxSchemaStatementComparisons all leave the file changed.
+//
+// Git objects are content-addressed, so content is compared by object SHA,
+// type, and mode, and a path absent at a commit is compared as absent. A
+// symlink's object holds only its target, so every symlink at or inside a
+// path is followed and its target compared by the same rule. A symlink whose
+// target differs between the commits is compared by the regular file it
+// resolves to at each commit instead, so one a rebase repointed at a renamed
+// directory keeps the approval when it still resolves to the same change; a
+// target that is not a regular file leaves the symlink changed.
+//
+// An error means the comparison could not be completed and proves nothing:
+// GitHub was unavailable, a commit or tree could not be read, a directory was
+// too large to list completely, a path runs through a symlink, a symlink
+// points outside the repository, or there were more distinct symlinks to read
+// than maxSchemaSymlinkReads.
+func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, defaultBranch, approvedSHA, headSHA string, paths []string, compareStatements SchemaFileChangeComparer) (SchemaChangeComparison, error) {
+	result := SchemaChangeComparison{BaseIsDefaultBranch: defaultBranch != "" && baseRef == defaultBranch}
+	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
+	if err != nil {
+		return result, err
+	}
+	result.BaseTipSHA = baseTipSHA
+	if result.ApprovedMergeBaseSHA, err = ic.mergeBaseSHA(ctx, repo, baseTipSHA, approvedSHA); err != nil {
+		return result, err
+	}
+	if result.HeadMergeBaseSHA, err = ic.mergeBaseSHA(ctx, repo, baseTipSHA, headSHA); err != nil {
+		return result, err
+	}
+	if result.BaseMovedForward, err = ic.isAncestorOrSame(ctx, repo, result.ApprovedMergeBaseSHA, result.HeadMergeBaseSHA); err != nil {
+		return result, err
+	}
+
+	comparer := &schemaChangeComparer{
+		ic:                  ic,
+		repo:                repo,
+		commits:             [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
+		baseContentReviewed: result.BaseIsDefaultBranch && result.BaseMovedForward,
+		levelCache:          make(map[string][]TreeEntry),
+		symlinkText:         make(map[string]string),
+		compareStatements:   compareStatements,
+		blobText:            make(map[string]string),
+	}
+	differingPath, err := comparer.compare(ctx, paths)
+	result.StatementComparedPaths = comparer.statementComparedPaths
+	if err != nil {
+		return result, fmt.Errorf("compare schema change in %s between approved commit %s and head %s: %w", repo, approvedSHA, headSHA, err)
+	}
+	result.DifferingPath = differingPath
+	result.DifferingPathBaseOnly = comparer.differingPathBaseOnly
+	result.DifferingFile = comparer.differingFile
+	result.Unchanged = differingPath == ""
+	return result, nil
+}
+
+// Sides of a schema change comparison, indexing schemaChangeComparer.commits.
+const (
+	sideApproved = iota
+	sideApprovedBase
+	sideHead
+	sideHeadBase
+)
+
+// gitSide is a path's tree entry at one commit; found is false when the path
+// is absent there.
+type gitSide struct {
+	entry TreeEntry
+	found bool
+}
+
+func sameGitObject(x, y gitSide) bool {
+	if x.found != y.found {
+		return false
+	}
+	return !x.found || (x.entry.SHA == y.entry.SHA && x.entry.Type == y.entry.Type && x.entry.Mode == y.entry.Mode)
+}
+
+type schemaChangeComparer struct {
+	ic      *InstallationClient
+	repo    string
+	commits [4]string
+	// baseContentReviewed is true when the pull request targets the default
+	// branch and the head's merge base descends from the approved commit's, so
+	// base content that differs between the two is newer default branch
+	// content that had its own review.
+	baseContentReviewed bool
+	levelCache          map[string][]TreeEntry
+	// symlinkText caches each symlink object's target text by blob SHA, so
+	// links with the same target text cost one read.
+	symlinkText map[string]string
+	// warnedSymlinkBudget is set once the comparison has logged that it read
+	// more than half of maxSchemaSymlinkReads.
+	warnedSymlinkBudget bool
+	// compareStatements is the dialect's statement comparison, or nil when
+	// files are compared by content alone.
+	compareStatements SchemaFileChangeComparer
+	// blobText caches schema file content by blob SHA for statement
+	// comparisons.
+	blobText map[string]string
+	// statementComparedPaths are the files proved unchanged by their
+	// statements; each one used up part of maxSchemaStatementComparisons.
+	statementComparedPaths []string
+	differingPathBaseOnly  bool
+	differingFile          *SchemaFileBlobs
+}
+
+type schemaChangeItem struct {
+	path  string
+	sides [4]gitSide
+	// resolved is false for a top-level path or symlink target, whose sides
+	// are resolved from the commits when the item is processed.
+	resolved bool
+	// throughSymlink is true when a symlink at path was replaced by its
+	// target on at least one side, so the sides are not the path's own.
+	throughSymlink bool
+}
+
+// compare walks paths and returns the first one where the pull request's
+// change differs, or "" when it is unchanged everywhere.
+func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (string, error) {
+	var pending []schemaChangeItem
+	for _, p := range paths {
+		pending = append(pending, schemaChangeItem{path: path.Clean(p)})
+	}
+	visited := make(map[string]bool)
+	var unchangedDirs []string
+	for len(pending) > 0 {
+		item := pending[0]
+		pending = pending[1:]
+		if !item.resolved {
+			// An unchanged directory's verdict holds for everything inside it.
+			if visited[item.path] || pathInsideAny(item.path, unchangedDirs) {
+				continue
+			}
+			visited[item.path] = true
+			for i, commit := range c.commits {
+				entry, found, err := c.ic.resolveGitTreeEntry(ctx, c.repo, commit, item.path, c.levelCache)
+				if err != nil {
+					return "", fmt.Errorf("resolve %s at %s: %w", item.path, commit, err)
+				}
+				item.sides[i] = gitSide{entry: entry, found: found}
+			}
+		}
+
+		s := item.sides
+		identical := sameGitObject(s[sideApproved], s[sideHead])
+		switch {
+		case c.pathUnchanged(s):
+			sides := []gitSide{s[sideHead]}
+			if !identical {
+				sides = append(sides, s[sideApproved])
+			}
+			targets, err := c.symlinkTargets(ctx, item.path, sides)
+			if err != nil {
+				return "", err
+			}
+			for _, target := range targets {
+				pending = append(pending, schemaChangeItem{path: target})
+			}
+			if s[sideHead].entry.Type == "tree" || s[sideApproved].entry.Type == "tree" {
+				unchangedDirs = append(unchangedDirs, item.path)
+			}
+		case onlyTrees(s):
+			children, err := c.children(ctx, item.path, s)
+			if err != nil {
+				return "", err
+			}
+			pending = append(pending, children...)
+		default:
+			followed, ok, err := c.followSymlinkSides(ctx, item)
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				// The followed sides are already resolved: re-resolving the
+				// path would read the symlinks again, and a top-level path is
+				// already visited, so it would be skipped uncompared.
+				followed.resolved = true
+				followed.throughSymlink = true
+				pending = append(pending, followed)
+				continue
+			}
+			same, err := c.sameStatements(ctx, item)
+			if err != nil {
+				return "", err
+			}
+			if !same {
+				// Equal objects on equal bases already passed pathUnchanged.
+				c.differingPathBaseOnly = identical
+				c.differingFile = c.fileBlobs(item)
+				return item.path, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// sameStatements reports whether a file whose content differs between the
+// approved commit and the head still generates the same schema change
+// statements (see PRSchemaChangeUnchangedSince). Anything short of proof
+// returns false, so any doubt counts as a change; an error means GitHub could
+// not serve the file's content, or the evaluation was cancelled while the
+// dialect compared the file.
+func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaChangeItem) (bool, error) {
+	logAttrs := []any{"repo", c.repo, "path", item.path,
+		"approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead]}
+	if c.compareStatements == nil {
+		c.ic.logger.Debug("review gate comparison: schema path differs and its dialect has no statement comparison", logAttrs...)
+		return false, nil
+	}
+	if !statementComparable(item) {
+		c.ic.logger.Debug("review gate comparison: schema path differs and is not a regular schema file at every commit, so its statements are not compared", logAttrs...)
+		return false, nil
+	}
+	if !sameGitObject(item.sides[sideApprovedBase], item.sides[sideHeadBase]) && !c.baseContentReviewed {
+		c.ic.logger.Info("review gate comparison: schema file differs on two bases that are not both default branch content in order, so its statements are not compared", logAttrs...)
+		return false, nil
+	}
+	if len(c.statementComparedPaths) >= maxSchemaStatementComparisons {
+		c.ic.logger.Warn("review gate comparison reached its statement comparison budget; the schema file counts as changed and the approval on the earlier commit does not count",
+			append(logAttrs, "statement_comparison_budget", maxSchemaStatementComparisons)...)
+		return false, nil
+	}
+	var contents [4]string
+	for i, side := range item.sides {
+		// A base the file is absent from is passed as "", which the dialect
+		// reads as a file the pull request adds.
+		if !side.found {
+			continue
+		}
+		text, ok := c.blobText[side.entry.SHA]
+		if !ok {
+			var err error
+			text, err = c.ic.FetchBlobContent(ctx, c.repo, side.entry.SHA)
+			if err != nil {
+				return false, fmt.Errorf("read schema file %s at %s in repo %s: %w", item.path, c.commits[i], c.repo, err)
+			}
+			c.blobText[side.entry.SHA] = text
+		}
+		contents[i] = text
+	}
+	same, reason, err := c.compareStatements(ctx, item.path, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
+	if err != nil {
+		// A comparison cut short by the evaluation's own cancellation proves
+		// nothing about the file, so the evaluation fails instead of
+		// recording the file as changed.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, fmt.Errorf("compare statements of schema file %s in repo %s: evaluation cancelled: %w",
+				item.path, c.repo, errors.Join(ctxErr, err))
+		}
+		c.ic.logger.Info("review gate comparison: cannot compare a schema file's statements, so it counts as changed",
+			append(logAttrs, "error", err)...)
+		return false, nil
+	}
+	if !same {
+		c.ic.logger.Info("review gate comparison: schema file generates different statements at the approved commit and the head",
+			append(logAttrs, "reason", reason)...)
+		return false, nil
+	}
+	c.ic.logger.Info("review gate comparison: schema file's content differs but it generates the same statements at the approved commit and the head", logAttrs...)
+	c.statementComparedPaths = append(c.statementComparedPaths, item.path)
+	return true, nil
+}
+
+// statementComparable reports whether item is a schema file whose content at
+// each commit is one the dialect can parse: a regular file at all
+// four commits, or a file the pull request adds, absent at both bases and a
+// regular file at the approved commit and the head.
+func statementComparable(item schemaChangeItem) bool {
+	if !isManagedSchemaFile(item.path) {
+		return false
+	}
+	added := !item.sides[sideApprovedBase].found && !item.sides[sideHeadBase].found
+	for i, side := range item.sides {
+		if added && (i == sideApprovedBase || i == sideHeadBase) {
+			continue
+		}
+		if !regularFile(side) {
+			return false
+		}
+	}
+	return true
+}
+
+// regularFile reports whether side is a regular file, not a directory, a
+// symlink, or absent.
+func regularFile(side gitSide) bool {
+	return side.found && side.entry.Type == "blob" && side.entry.Mode != gitSymlinkMode
+}
+
+// fileBlobs names the blob at each side of a path that is a regular file or
+// absent at every side, with the text of those the comparison already read.
+// It returns nil when the path is a directory or a symlink at any side,
+// including a symlink whose sides were replaced by its target's.
+func (c *schemaChangeComparer) fileBlobs(item schemaChangeItem) *SchemaFileBlobs {
+	if item.throughSymlink {
+		return nil
+	}
+	var shas [4]string
+	content := make(map[string]string)
+	for i, side := range item.sides {
+		if !side.found {
+			continue
+		}
+		if !regularFile(side) {
+			return nil
+		}
+		shas[i] = side.entry.SHA
+		if text, ok := c.blobText[side.entry.SHA]; ok {
+			content[side.entry.SHA] = text
+		}
+	}
+	return &SchemaFileBlobs{
+		ApprovedBase: shas[sideApprovedBase],
+		Approved:     shas[sideApproved],
+		HeadBase:     shas[sideHeadBase],
+		Head:         shas[sideHead],
+		Content:      content,
+	}
+}
+
+// pathUnchanged reports whether the pull request's change to a path is the
+// same at the approved commit and the head, or differs only by base branch
+// content that had its own review: the pull request makes the same change on
+// the same base, it leaves the path alone at both commits, or it no longer
+// touches a path the base branch has changed since the approval. The last two
+// trust base branch content, so they hold only when that content is newer
+// default branch content (see baseContentReviewed).
+//
+// supersededByBase never decides a directory on every side: inside it, a file
+// the pull request dropped without the base branch changing it must still
+// count as a change, so the directory is compared entry by entry instead.
+func (c *schemaChangeComparer) pathUnchanged(s [4]gitSide) bool {
+	if sameChange(s) {
+		return true
+	}
+	if !c.baseContentReviewed {
+		return false
+	}
+	return untouchedByPR(s) || (supersededByBase(s) && !onlyTrees(s))
+}
+
+// sameChange reports whether the pull request turns the same base content
+// into the same result at both commits. Identical results on different bases
+// are not the same change: the head would then undo, or overwrite, what the
+// base branch changed there.
+func sameChange(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideApprovedBase], sides[sideHeadBase]) && sameGitObject(sides[sideApproved], sides[sideHead])
+}
+
+// untouchedByPR reports whether the pull request leaves the path as its base
+// branch has it at both commits, so any difference between them came from the
+// base branch.
+func untouchedByPR(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideApproved], sides[sideApprovedBase]) && sameGitObject(sides[sideHead], sides[sideHeadBase])
+}
+
+// supersededByBase reports whether the pull request leaves the path as its
+// base branch has it at the head, and the base branch has changed the path
+// since the approved commit's base. Whatever the pull request did to the path
+// when it was approved has been replaced by base branch content that reached
+// the base branch through its own review, as when a stacked pull request
+// below this one merges and this one is rebased onto it. A path the pull
+// request stopped changing that the base branch did not change is not
+// superseded: dropping part of a change is a different change.
+func supersededByBase(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideHead], sides[sideHeadBase]) && !sameGitObject(sides[sideApprovedBase], sides[sideHeadBase])
+}
+
+// onlyTrees reports whether every side where the path exists is a directory,
+// so its entries can be compared one by one.
+func onlyTrees(sides [4]gitSide) bool {
+	for _, side := range sides {
+		if side.found && side.entry.Type != "tree" {
+			return false
+		}
+	}
+	return true
+}
+
+// children lists dir's entries on every side and pairs them by name, so each
+// entry is compared at all four commits.
+func (c *schemaChangeComparer) children(ctx context.Context, dir string, sides [4]gitSide) ([]schemaChangeItem, error) {
+	byName := make(map[string]*schemaChangeItem)
+	var names []string
+	for i, side := range sides {
+		if !side.found {
+			continue
+		}
+		entries, cached := c.levelCache[side.entry.SHA]
+		if !cached {
+			var err error
+			entries, _, err = c.ic.fetchGitTreeShallow(ctx, c.repo, side.entry.SHA)
+			if err != nil {
+				return nil, fmt.Errorf("list %s at %s: %w", dir, c.commits[i], err)
+			}
+			c.levelCache[side.entry.SHA] = entries
+		}
+		for _, entry := range entries {
+			child, ok := byName[entry.Path]
+			if !ok {
+				child = &schemaChangeItem{path: path.Join(dir, entry.Path), resolved: true}
+				byName[entry.Path] = child
+				names = append(names, entry.Path)
+			}
+			child.sides[i] = gitSide{entry: entry, found: true}
+		}
+	}
+	sort.Strings(names)
+	items := make([]schemaChangeItem, 0, len(names))
+	for _, name := range names {
+		items = append(items, *byName[name])
+	}
+	return items, nil
+}
+
+// followSymlinkSides returns item with every symlink side replaced by the
+// regular file its target names at that side's commit, so a symlink the pull
+// request repointed is compared by the file it resolves to, as when a rebase
+// moves the target to a directory the base branch renamed. ok is false, and
+// the item is compared as it is, when no side is a symlink or a target is not
+// a regular file at its commit: absent, a directory, another symlink, or a
+// path that runs through one.
+func (c *schemaChangeComparer) followSymlinkSides(ctx context.Context, item schemaChangeItem) (schemaChangeItem, bool, error) {
+	followed := item
+	hasSymlink := false
+	for i, side := range item.sides {
+		if !side.found || side.entry.Mode != gitSymlinkMode {
+			continue
+		}
+		hasSymlink = true
+		targets, err := c.resolveSymlinks(ctx, []TreeEntry{{Path: item.path, Mode: side.entry.Mode, Type: side.entry.Type, SHA: side.entry.SHA}})
+		if err != nil {
+			return item, false, err
+		}
+		logAttrs := []any{"repo", c.repo, "path", item.path, "target", targets[0], "commit", c.commits[i],
+			"approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead]}
+		entry, found, err := c.ic.resolveGitTreeEntry(ctx, c.repo, c.commits[i], targets[0], c.levelCache)
+		if errors.Is(err, errGitPathThroughNonTree) {
+			c.ic.logger.Debug("review gate comparison: schema symlink's target runs through another symlink, so the symlink is compared as it is", logAttrs...)
+			return item, false, nil
+		}
+		if err != nil {
+			return item, false, fmt.Errorf("resolve symlink %s target %s at %s in repo %s: %w", item.path, targets[0], c.commits[i], c.repo, err)
+		}
+		target := gitSide{entry: entry, found: found}
+		if !regularFile(target) {
+			c.ic.logger.Debug("review gate comparison: schema symlink's target is not a regular file, so the symlink is compared as it is",
+				append(logAttrs, "target_found", found, "target_type", entry.Type, "target_mode", entry.Mode)...)
+			return item, false, nil
+		}
+		followed.sides[i] = target
+	}
+	return followed, hasSymlink, nil
+}
+
+// symlinkTargets returns the repo-relative target of the symlink at p, or of
+// every symlink inside the directory at p, on each of sides.
+func (c *schemaChangeComparer) symlinkTargets(ctx context.Context, p string, sides []gitSide) ([]string, error) {
+	var links []TreeEntry
+	listed := make(map[string]bool)
+	for _, side := range sides {
+		if !side.found || listed[side.entry.SHA] {
+			continue
+		}
+		listed[side.entry.SHA] = true
+		switch {
+		case side.entry.Type == "tree":
+			dirLinks, err := c.ic.symlinksInTree(ctx, c.repo, p, side.entry.SHA)
+			if err != nil {
+				return nil, err
+			}
+			links = append(links, dirLinks...)
+		case side.entry.Mode == gitSymlinkMode:
+			links = append(links, TreeEntry{Path: p, Mode: side.entry.Mode, Type: side.entry.Type, SHA: side.entry.SHA})
+		}
+	}
+	return c.resolveSymlinks(ctx, links)
+}
+
+// resolveSymlinks returns the repo-relative target of each link. Every link
+// whose target text has not been read yet costs a blob read, so the budget is
+// checked for all of them before any is read.
+func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []TreeEntry) ([]string, error) {
+	unread := make(map[string]bool)
+	for _, link := range links {
+		if _, ok := c.symlinkText[link.SHA]; !ok {
+			unread[link.SHA] = true
+		}
+	}
+	distinct := len(c.symlinkText) + len(unread)
+	if distinct > maxSchemaSymlinkReads {
+		return nil, fmt.Errorf("schema paths in repo %s hold %d distinct symlinks, more than the %d a comparison reads",
+			c.repo, distinct, maxSchemaSymlinkReads)
+	}
+	if distinct > maxSchemaSymlinkReads/2 && !c.warnedSymlinkBudget {
+		c.warnedSymlinkBudget = true
+		c.ic.logger.Warn("review gate comparison read more than half of its symlink budget; past the budget, approvals on earlier commits stop counting",
+			"repo", c.repo, "approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead],
+			"distinct_symlinks", distinct, "symlink_budget", maxSchemaSymlinkReads)
+	}
+	targets := make([]string, 0, len(links))
+	for _, link := range links {
+		text, ok := c.symlinkText[link.SHA]
+		if !ok {
+			var err error
+			text, err = c.ic.FetchBlobContent(ctx, c.repo, link.SHA)
+			if err != nil {
+				return nil, fmt.Errorf("read symlink %s in repo %s: %w", link.Path, c.repo, err)
+			}
+			c.symlinkText[link.SHA] = text
+		}
+		target, err := symlinkTargetPath(c.repo, link.Path, text)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+// repositoryDefaultBranch returns the name of repo's default branch.
+func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	repository, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
+		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
+		if err != nil {
+			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
+		}
+		return repository, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defaultBranch := repository.GetDefaultBranch()
+	if defaultBranch == "" {
+		return "", fmt.Errorf("repository %s reports no default branch", repo)
+	}
+	return defaultBranch, nil
+}
+
+// branchTipSHA resolves branch to the commit it points at now.
+func (ic *InstallationClient) branchTipSHA(ctx context.Context, repo, branch string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+branch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", branch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	tipSHA := tip.GetObject().GetSHA()
+	if tipSHA == "" {
+		return "", fmt.Errorf("ref heads/%s for %s resolved to no commit", branch, repo)
+	}
+	return tipSHA, nil
+}
+
+// isAncestorOrSame reports whether ancestorSHA is descendantSHA or one of its
+// ancestors: their merge base is ancestorSHA itself.
+func (ic *InstallationClient) isAncestorOrSame(ctx context.Context, repo, ancestorSHA, descendantSHA string) (bool, error) {
+	if ancestorSHA == descendantSHA {
+		return true, nil
+	}
+	mergeBase, err := ic.mergeBaseSHA(ctx, repo, ancestorSHA, descendantSHA)
+	if err != nil {
+		return false, err
+	}
+	return mergeBase == ancestorSHA, nil
+}
+
+// mergeBaseSHA returns the merge base of baseSHA and headSHA.
+func (ic *InstallationClient) mergeBaseSHA(ctx context.Context, repo, baseSHA, headSHA string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	comparison, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "find merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseSHA, headSHA, &gh.ListOptions{PerPage: 1})
+		if err != nil {
+			return nil, fmt.Errorf("compare commits %s...%s: %w", baseSHA, headSHA, classifyGitHubAPIError(err))
+		}
+		return comparison, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	mergeBase := comparison.GetMergeBaseCommit().GetSHA()
+	if mergeBase == "" {
+		return "", fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseSHA, headSHA, repo)
+	}
+	return mergeBase, nil
+}
+
+// symlinksInTree lists the directory tree treeSHA at dir and returns every
+// symlink inside it, with repo-relative paths.
+func (ic *InstallationClient) symlinksInTree(ctx context.Context, repo, dir, treeSHA string) ([]TreeEntry, error) {
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, treeSHA)
+	if err != nil {
+		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, ErrGitTreeTruncated)
+	}
+	var symlinks []TreeEntry
+	for _, entry := range entries {
+		if entry.Mode == gitSymlinkMode {
+			entry.Path = path.Join(dir, entry.Path)
+			symlinks = append(symlinks, entry)
+		}
+	}
+	return symlinks, nil
+}
+
+// symlinkTargetPath returns the target of the symlink at linkPath, whose
+// object holds text, as a repo-relative path. A target is relative to the
+// directory holding the link; one that is absolute or escapes the repository
+// is an error.
+func symlinkTargetPath(repo, linkPath, text string) (string, error) {
+	target := strings.TrimSpace(text)
+	if target == "" {
+		return "", fmt.Errorf("symlink %s in repo %s has an empty target", linkPath, repo)
+	}
+	if strings.HasPrefix(target, "/") {
+		return "", fmt.Errorf("symlink %s in repo %s points to absolute path %s", linkPath, repo, target)
+	}
+	resolved := path.Clean(path.Join(path.Dir(linkPath), target))
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		return "", fmt.Errorf("symlink %s in repo %s points outside the repository: %s", linkPath, repo, target)
+	}
+	return resolved, nil
+}
+
+// pathInsideAny reports whether p is one of dirs or lies beneath one.
+func pathInsideAny(p string, dirs []string) bool {
+	for _, dir := range dirs {
+		if dir == "." || p == dir || strings.HasPrefix(p, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// PRFilesProposedAgainstDefaultBranch narrows a pull request's changed files to
+// the ones it actually proposes, and returns the pinned default branch tip the
+// narrowing was measured against for operator logs.
+//
+// GitHub computes a pull request's file list against its base branch, so a
+// branch whose base lags — or briefly points at the wrong branch, as a stacked
+// pull request's does while it is being restacked — carries files that belong
+// to the history it has not caught up with, not to the change under review.
+// Discovery treats one changed schema file as enough to make a pull request
+// that database's pull request, so an inherited file is enough to plan a
+// database the author never touched.
+//
+// A file is kept when its object at headSHA differs from the object at the
+// default branch tip, which is what "this pull request proposes it" means: if
+// the content already matches what the default branch declares, merging changes
+// nothing for that file. A rename is also kept when it vacates a schema or
+// config path the default branch still holds, since merging it stops declaring
+// that file's tables or that config's database. The default branch is the
+// right yardstick because it is the one SchemaBot already privileges — the
+// post-merge reconcile runs for it alone, and a registered repository cannot be
+// pointed at another ref.
+//
+// Every kept file is one of files, unchanged except that a rename the default
+// branch already holds has its PreviousFilename cleared, so this can only ever
+// narrow discovery: it cannot surface a database that was not already
+// discovered.
+// Only the files discovery keys on are compared, so a pull request that touches
+// no schema costs no API calls.
+func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Context, repo, headSHA string, files []PRFile) (proposed []PRFile, defaultTipSHA string, err error) {
+	if !HasDiscoveryInputFiles(files) {
+		return files, "", nil
+	}
+
+	owner, repoName := splitRepo(repo)
+	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Pin the tip up front so a commit landing on the default branch mid-pass
+	// cannot leave some files compared against one commit and some against the
+	// next.
+	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	defaultTipSHA = tip.GetObject().GetSHA()
+	if defaultTipSHA == "" {
+		return nil, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
+	}
+
+	// One cache serves both refs: it is keyed by tree SHA, and the two refs
+	// share the subtrees they have in common.
+	levelCache := make(map[string][]TreeEntry)
+	proposed = make([]PRFile, 0, len(files))
+	for _, file := range files {
+		if !isDiscoveryInputPRFile(file) {
+			proposed = append(proposed, file)
+			continue
+		}
+		// The current path and the vacated path are separate claims, so each
+		// is measured on its own: a pull request can edit the destination of a
+		// rename the default branch already holds without proposing the
+		// removal again.
+		keep := false
+		if file.Symlink || isDiscoveryInputFile(file.Filename) {
+			differs, err := ic.pathDiffersFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, file.Filename, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			keep = differs
+		}
+		// A rename proposes vacating its previous schema or config path only
+		// when the head lacks that path and the default branch still declares
+		// it; a rename the default branch already holds is inherited history,
+		// so its previous path is cleared and discovery does not resolve the
+		// config that managed it.
+		if vacated, ok := renamedAwayDiscoveryInputPath(file); ok {
+			removes, err := ic.pathRemovedFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, vacated, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			if removes {
+				keep = true
+			} else {
+				file.PreviousFilename = ""
+			}
+		}
+		if keep {
+			proposed = append(proposed, file)
+		}
+	}
+	return proposed, defaultTipSHA, nil
+}
+
+// renamedAwayDiscoveryInputPath reports the path a rename vacated when that
+// path is a discovery input other than the file's current path: a schema file,
+// as renamedAwaySchemaPath reports, or a SchemaBot config. Moving a config
+// away stops the default branch declaring the database it configured, so the
+// narrowing measures that vacated path the same way as a schema file's.
+func renamedAwayDiscoveryInputPath(file PRFile) (string, bool) {
+	if vacated, ok := renamedAwaySchemaPath(file); ok {
+		return vacated, true
+	}
+	if isRenamedPRFile(file.Status) && isConfigFile(file.PreviousFilename) && file.PreviousFilename != file.Filename {
+		return file.PreviousFilename, true
+	}
+	return "", false
+}
+
+// pathDiffersFromDefaultBranch reports whether objectPath at headSHA differs
+// from the default branch tip: added, deleted, changed in content or type, or
+// turned into or out of a symlink, so a regular file turned into a symlink
+// with the same bytes differs.
+func (ic *InstallationClient) pathDiffersFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	headEntry, headFound, err := ic.resolveComparableTreeEntry(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at head %s: %w", objectPath, headSHA, err)
+	}
+	defaultEntry, defaultFound, err := ic.resolveComparableTreeEntry(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	if headFound != defaultFound {
+		// Added by this pull request, or deleted by it.
+		return true, nil
+	}
+	if !headFound {
+		return false, nil
+	}
+	return headEntry.SHA != defaultEntry.SHA || headEntry.Type != defaultEntry.Type || symlinkModeChanged(headEntry, defaultEntry), nil
+}
+
+// symlinkModeChanged reports whether exactly one of two tree entries is a
+// symlink. A symlink and a regular file holding the same bytes share a blob
+// SHA, so only the mode tells them apart. Other mode changes, such as making
+// a schema file executable, change nothing a plan reads.
+func symlinkModeChanged(a, b TreeEntry) bool {
+	return (a.Mode == gitSymlinkMode) != (b.Mode == gitSymlinkMode)
+}
+
+// resolveComparableTreeEntry resolves objectPath at ref like
+// resolveGitTreeEntry, reporting a path that runs through a file or symlink
+// as absent, as resolveGitObjectSHA does.
+func (ic *InstallationClient) resolveComparableTreeEntry(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (TreeEntry, bool, error) {
+	entry, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, objectPath, levelCache)
+	if errors.Is(err, errGitPathThroughNonTree) {
+		return TreeEntry{}, false, nil
+	}
+	return entry, found, err
+}
+
+// pathRemovedFromDefaultBranch reports whether merging headSHA removes
+// objectPath: the default branch tip holds it and the head does not.
+func (ic *InstallationClient) pathRemovedFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	_, _, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at head %s: %w", objectPath, headSHA, err)
+	}
+	if headFound {
+		return false, nil
+	}
+	_, _, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	return defaultFound, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.
@@ -1188,6 +2619,8 @@ type CheckRunResult struct {
 	Name       string
 	Status     string // "queued", "in_progress", "completed"
 	Conclusion string // "success", "failure", "neutral", "action_required"
+	// Title is the run's output title; empty when the run has none.
+	Title string
 	// StartedAt is when the Check Run was started; zero when GitHub did not
 	// report a start time. Lets callers judge how long a run that never
 	// completed has been sitting.
@@ -1228,7 +2661,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	seenUntrusted := make(map[string]struct{})
 	for {
 		var resp *gh.Response
-		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs by name", []any{"repo", repo, "head_sha", headSHA, "check_name", checkName}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+		result, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListCheckRunsForRef, "list check runs by name", []any{"repo", repo, "head_sha", headSHA, "check_name", checkName}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
 			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -1258,6 +2691,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 						Name:       run.GetName(),
 						Status:     run.GetStatus(),
 						Conclusion: run.GetConclusion(),
+						Title:      run.GetOutput().GetTitle(),
 						StartedAt:  run.GetStartedAt().Time,
 					}
 				}
@@ -1272,10 +2706,14 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	return newest, untrustedApps, nil
 }
 
-// PRCheckStatus represents the status of a single PR check (check run or commit status).
+// PRCheckStatus represents the status of a single PR check (check run or commit
+// status). Status is "completed" once the check has concluded; any other value
+// ("in_progress", "queued", "pending", "waiting", "requested", or one GitHub
+// adds later) means it has not, and callers must treat it as unfinished rather
+// than match a fixed list.
 type PRCheckStatus struct {
 	Name        string
-	Status      string // "completed", "in_progress", "queued"
+	Status      string // "completed", or any other status GitHub reports for an unfinished check
 	Conclusion  string // "success", "failure", "neutral", "skipped", etc.
 	AppSlug     string // creating GitHub App slug; empty for commit statuses
 	IsSchemaBot bool   // true if this check was created by a trusted SchemaBot GitHub App
@@ -1443,7 +2881,7 @@ func (ic *InstallationClient) fetchCommitStatusRows(ctx context.Context, owner, 
 	var out []CheckStatusRow
 	for {
 		var resp *gh.Response
-		combined, err := retryGitHubUnavailableRead(ctx, ic.logger, "get combined commit status", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.CombinedStatus, error) {
+		combined, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationGetCombinedStatus, "get combined commit status", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.CombinedStatus, error) {
 			res, statusResp, statusErr := ic.client.Repositories.GetCombinedStatus(ctx, owner, repoName, ref, opts)
 			if statusErr != nil {
 				return nil, classifyGitHubAPIError(statusErr)
@@ -1479,7 +2917,7 @@ func (ic *InstallationClient) fetchCheckRunRows(ctx context.Context, owner, repo
 	var out []CheckStatusRow
 	for {
 		var resp *gh.Response
-		result, err := retryGitHubUnavailableRead(ctx, ic.logger, "list check runs", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
+		result, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationListCheckRunsForRef, "list check runs", []any{"repo", repo, "ref", ref}, func(ctx context.Context) (*gh.ListCheckRunsResults, error) {
 			res, listResp, listErr := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, ref, opts)
 			if listErr != nil {
 				return nil, classifyGitHubAPIError(listErr)
@@ -1561,10 +2999,13 @@ type TreeEntry struct {
 // as "blob" tree entries with this mode; their content is the target path.
 const gitSymlinkMode = "120000"
 
+// gitTreeMode is the git tree file mode for a directory.
+const gitTreeMode = "040000"
+
 // FetchGitTree fetches the entire directory tree in one API call using recursive mode.
 func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA string) ([]TreeEntry, bool, error) {
 	owner, repoName := splitRepo(repo)
-	ghTree, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch git tree", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
+	ghTree, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchGitTree, "fetch git tree", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
 		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, true)
 		if err != nil {
 			return nil, fmt.Errorf("fetch git tree: %w", classifyGitHubAPIError(err))
@@ -1595,7 +3036,7 @@ func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA st
 // than let the caller act on an incomplete listing.
 func (ic *InstallationClient) fetchGitTreeShallow(ctx context.Context, repo, treeSHA string) ([]TreeEntry, string, error) {
 	owner, repoName := splitRepo(repo)
-	ghTree, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch git tree level", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
+	ghTree, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchGitTree, "fetch git tree level", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
 		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, false)
 		if err != nil {
 			return nil, fmt.Errorf("fetch git tree level: %w", classifyGitHubAPIError(err))
@@ -1668,60 +3109,98 @@ func (ic *InstallationClient) resolveGitTreeSHA(ctx context.Context, repo, ref, 
 }
 
 func (ic *InstallationClient) resolveGitObjectSHA(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (objectSHA, objectType string, found bool, err error) {
+	entry, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, objectPath, levelCache)
+	if errors.Is(err, errGitPathThroughNonTree) {
+		return "", "", false, nil
+	}
+	if err != nil || !found {
+		return "", "", found, err
+	}
+	return entry.SHA, entry.Type, true, nil
+}
+
+// errGitPathThroughNonTree reports that a path cannot be resolved in the git
+// tree because a segment before its last is a file or symlink, not a
+// directory. The path may still reach content through that symlink, so it is
+// not the same answer as "absent".
+var errGitPathThroughNonTree = errors.New("path passes through a non-directory entry")
+
+// resolveGitTreeEntry resolves objectPath at ref to the tree entry naming it,
+// mode included, walking one shallow tree level per path segment. The repo
+// root resolves to a synthetic tree entry for the ref's root tree. found is
+// false when any path segment is absent. A non-final segment that is not a
+// tree is errGitPathThroughNonTree.
+func (ic *InstallationClient) resolveGitTreeEntry(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (entry TreeEntry, found bool, err error) {
 	cleanPath := path.Clean(objectPath)
 	if cleanPath == "." {
 		_, rootTreeSHA, err := ic.fetchGitTreeShallow(ctx, repo, ref)
 		if err != nil {
-			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
+			return TreeEntry{}, false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
 		}
 		if rootTreeSHA == "" {
-			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
+			return TreeEntry{}, false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
 		}
-		return rootTreeSHA, "tree", true, nil
+		return TreeEntry{Path: ".", Mode: gitTreeMode, Type: "tree", SHA: rootTreeSHA}, true, nil
 	}
 	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
-		return "", "", false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
+		return TreeEntry{}, false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
 	}
 
 	treeSHA := ref
 	segments := strings.Split(cleanPath, "/")
 	for i, segment := range segments {
-		levelEntries, cached := levelCache[treeSHA]
-		if !cached {
-			levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
-			if err != nil {
-				return "", "", false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
-			}
-			if levelCache != nil {
-				levelCache[treeSHA] = levelEntries
-			}
+		levelEntries, err := ic.treeLevel(ctx, repo, treeSHA, levelCache)
+		if err != nil {
+			return TreeEntry{}, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
 		}
 		var matched *TreeEntry
-		for _, entry := range levelEntries {
-			if entry.Path == segment {
-				entryCopy := entry
+		for _, levelEntry := range levelEntries {
+			if levelEntry.Path == segment {
+				entryCopy := levelEntry
 				matched = &entryCopy
 				break
 			}
 		}
 		if matched == nil {
-			return "", "", false, nil
+			return TreeEntry{}, false, nil
 		}
 		if i == len(segments)-1 {
-			return matched.SHA, matched.Type, true, nil
+			return *matched, true, nil
 		}
 		if matched.Type != "tree" {
-			return "", "", false, nil
+			return TreeEntry{}, false, fmt.Errorf("resolve %s in repo %s ref %s: %s is a %s: %w", objectPath, repo, ref, path.Join(segments[:i+1]...), matched.Type, errGitPathThroughNonTree)
 		}
 		treeSHA = matched.SHA
 	}
-	return "", "", false, nil
+	return TreeEntry{}, false, nil
+}
+
+// treeLevel returns the entries directly in the tree treeSHA names (a tree
+// SHA, or a ref for its root tree), from the per-change levelCache, then the
+// client's cache of immutable tree levels, then one shallow tree read.
+func (ic *InstallationClient) treeLevel(ctx context.Context, repo, treeSHA string, levelCache map[string][]TreeEntry) ([]TreeEntry, error) {
+	levelEntries, cached := levelCache[treeSHA]
+	if !cached {
+		levelEntries, cached = ic.treeLevels.get(repo, treeSHA)
+	}
+	if !cached {
+		var err error
+		levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
+		if err != nil {
+			return nil, err
+		}
+		ic.treeLevels.put(repo, treeSHA, levelEntries)
+	}
+	if levelCache != nil {
+		levelCache[treeSHA] = levelEntries
+	}
+	return levelEntries, nil
 }
 
 // FetchBlobContent fetches file content using the Git Blob API.
 func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSHA string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	blob, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch blob", []any{"repo", repo, "blob_sha", blobSHA}, func(ctx context.Context) (*gh.Blob, error) {
+	blob, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchBlob, "fetch blob", []any{"repo", repo, "blob_sha", blobSHA}, func(ctx context.Context) (*gh.Blob, error) {
 		blob, _, err := ic.client.Git.GetBlob(ctx, owner, repoName, blobSHA)
 		if err != nil {
 			return nil, fmt.Errorf("fetch blob: %w", classifyGitHubAPIError(err))
@@ -1747,7 +3226,7 @@ func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSH
 func (ic *InstallationClient) FetchFileContent(ctx context.Context, repo, filePath, ref string) (string, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	fileContent, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch file content", []any{"repo", repo, "path", filePath, "ref", ref}, func(ctx context.Context) (*gh.RepositoryContent, error) {
+	fileContent, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchFileContent, "fetch file content", []any{"repo", repo, "path", filePath, "ref", ref}, func(ctx context.Context) (*gh.RepositoryContent, error) {
 		fileContent, _, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, filePath, opts)
 		if err != nil {
 			return nil, fmt.Errorf("fetch file content: %w", classifyGitHubAPIError(err))
@@ -1802,7 +3281,7 @@ type repositoryContents struct {
 func (ic *InstallationClient) getRepositoryContents(ctx context.Context, repo, contentPath, ref, operation string) (repositoryContents, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	return retryGitHubUnavailableRead(ctx, ic.logger, operation, []any{"repo", repo, "path", contentPath, "ref", ref}, func(ctx context.Context) (repositoryContents, error) {
+	return retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchFileContent, operation, []any{"repo", repo, "path", contentPath, "ref", ref}, func(ctx context.Context) (repositoryContents, error) {
 		fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, contentPath, opts)
 		if err != nil {
 			return repositoryContents{}, fmt.Errorf("%s at %s: %w", operation, contentPath, classifyGitHubAPIError(err))
@@ -2142,7 +3621,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		return nil, fmt.Errorf("schema namespace symlink %s points to absolute path %s", entry.GetPath(), target)
 	}
 	resolved := path.Clean(path.Join(schemaPath, target))
-	if !schemaPathWithinDirectory(".", resolved) {
+	if !schema.PathWithinDirectory(".", resolved) {
 		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
 	}
 	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(entry.GetPath()) {

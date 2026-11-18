@@ -1,0 +1,426 @@
+package tern
+
+import (
+	"log/slog"
+	"testing"
+
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func planNamespacesTestClient() *LocalClient {
+	return &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		logger: slog.New(slog.DiscardHandler),
+	}
+}
+
+// TestNormalizeSchemaFilesKeepsEmptyNamespace proves a namespace that
+// declares no schema files reaches the engine on every database type, so the
+// engine can surface each live table it still holds as a DROP TABLE change
+// instead of the plan reporting nothing to change.
+func TestNormalizeSchemaFilesKeepsEmptyNamespace(t *testing.T) {
+	for _, databaseType := range []string{storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres} {
+		t.Run(databaseType, func(t *testing.T) {
+			client := &LocalClient{config: LocalConfig{Database: "commerce", Type: databaseType}}
+
+			normalized, err := client.normalizeSchemaFiles(schema.SchemaFiles{"orders": {Files: map[string]string{}}})
+
+			require.NoError(t, err)
+			require.Len(t, normalized, 1)
+			for _, files := range normalized {
+				assert.Empty(t, files.Files)
+			}
+		})
+	}
+}
+
+// TestNamespacesFromEngineChangesPersistsVSchemaMetadata verifies the local
+// plan-persistence path stores the same apply-time VSchema change-metadata as
+// the gRPC path: the changed flag, the recorded deletions and mutations the
+// unsafe gate reads, and the rendered diff apply-time display shows survive
+// into the namespace's plan data, alongside the desired-VSchema artifact.
+func TestNamespacesFromEngineChangesPersistsVSchemaMetadata(t *testing.T) {
+	client := planNamespacesTestClient()
+	metadata := map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
+		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
+		"branch":                             "engine-internal detail",
+	}
+	desiredVSchema := `{"sharded":true,"tables":{"users":{}}}`
+
+	namespaces, shardPlans := client.namespacesFromEngineChanges([]engine.SchemaChange{{
+		Namespace: "payments",
+		TableChanges: []engine.TableChange{{
+			Table:     "users",
+			DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			Operation: ddl.StatementAlterTable,
+		}},
+		Metadata: metadata,
+	}}, schema.SchemaFiles{
+		"payments": {Files: map[string]string{storage.VSchemaArtifactName: desiredVSchema}},
+	})
+
+	assert.Empty(t, shardPlans)
+	require.Contains(t, namespaces, "payments")
+	nsData := namespaces["payments"]
+	require.Len(t, nsData.Tables, 1)
+	assert.Equal(t, "users", nsData.Tables[0].Table)
+	assert.Equal(t, desiredVSchema, nsData.Artifacts[storage.VSchemaArtifactName])
+	assert.Equal(t, map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
+		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
+	}, nsData.Metadata, "only the VSchema plan keys persist; engine-internal metadata does not leak")
+}
+
+// TestNamespacesFromEngineChangesSiblingShardKeepsVSchemaMetadata verifies a
+// sharded keyspace's per-shard changes cannot erode its persisted VSchema
+// change-metadata: the shards share one namespace record, so a sibling shard
+// carrying no metadata — or only the changed flag without the deletion record
+// — must not clear or overwrite what another shard already persisted.
+func TestNamespacesFromEngineChangesSiblingShardKeepsVSchemaMetadata(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	metadata := map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"table","name":"users","reason":"removing table users from the VSchema stops routing its queries"}]`,
+	}
+
+	namespaces, shardPlans := client.namespacesFromEngineChanges([]engine.SchemaChange{
+		{
+			Namespace:    "payments",
+			Shard:        engine.Shard{Name: "-80"},
+			TableChanges: []engine.TableChange{alterUsers},
+			Metadata:     metadata,
+		},
+		{
+			Namespace:    "payments",
+			Shard:        engine.Shard{Name: "80-"},
+			TableChanges: []engine.TableChange{alterUsers},
+		},
+		{
+			Namespace:    "payments",
+			Shard:        engine.Shard{Name: "c0-"},
+			TableChanges: []engine.TableChange{alterUsers},
+			Metadata:     map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+		},
+	}, schema.SchemaFiles{
+		"payments": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+	})
+
+	require.Contains(t, namespaces, "payments")
+	nsData := namespaces["payments"]
+	assert.Equal(t, storage.VSchemaPlanMetadata(metadata), nsData.Metadata)
+
+	// Namespace-level tables dedupe across shards; per-shard rows keep each
+	// shard's own changes.
+	require.Len(t, nsData.Tables, 1)
+	assert.Equal(t, "users", nsData.Tables[0].Table)
+	require.Len(t, nsData.Shards, 3)
+	require.Len(t, shardPlans, 3)
+	assert.Equal(t, "-80", shardPlans[0].Shard)
+	assert.Equal(t, "80-", shardPlans[1].Shard)
+	assert.Equal(t, "c0-", shardPlans[2].Shard)
+	for _, sp := range shardPlans {
+		assert.Equal(t, "payments", sp.Namespace)
+		require.Len(t, sp.Changes, 1)
+		assert.Equal(t, "users", sp.Changes[0].Table)
+	}
+}
+
+// TestNamespacesFromEngineChangesMergesDisjointSiblingMetadata verifies that
+// per-shard changes contributing different pieces of a namespace's VSchema
+// change-metadata all land in the persisted record: a shard recording only
+// deletions and a sibling recording only mutations must merge into one record
+// carrying both, so the apply-time gate sees every disclosure.
+func TestNamespacesFromEngineChangesMergesDisjointSiblingMetadata(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	deletions := `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`
+	mutations := `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`
+
+	namespaces, _ := client.namespacesFromEngineChanges([]engine.SchemaChange{
+		{
+			Namespace:    "payments",
+			Shard:        engine.Shard{Name: "-80"},
+			TableChanges: []engine.TableChange{alterUsers},
+			Metadata: map[string]string{
+				storage.PlanMetadataVSchemaChanged:   "true",
+				storage.PlanMetadataVSchemaDeletions: deletions,
+			},
+		},
+		{
+			Namespace:    "payments",
+			Shard:        engine.Shard{Name: "80-"},
+			TableChanges: []engine.TableChange{alterUsers},
+			Metadata: map[string]string{
+				storage.PlanMetadataVSchemaChanged:   "true",
+				storage.PlanMetadataVSchemaMutations: mutations,
+			},
+		},
+	}, schema.SchemaFiles{
+		"payments": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+	})
+
+	require.Contains(t, namespaces, "payments")
+	assert.Equal(t, map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: deletions,
+		storage.PlanMetadataVSchemaMutations: mutations,
+	}, namespaces["payments"].Metadata)
+}
+
+// TestNamespacesFromApplyRequestCarriesVSchemaMetadata verifies a deployment
+// materializing a plan from a dispatch request recovers the namespace's
+// VSchema change-metadata from the request's VSchema change, so its apply
+// admission gate reads the same recorded deletions and mutations as a
+// deployment loading its own stored plan — an additive change queues freely
+// while a recorded deletion still requires opt-in.
+func TestNamespacesFromApplyRequestCarriesVSchemaMetadata(t *testing.T) {
+	client := planNamespacesTestClient()
+	metadata := map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+	}
+
+	namespaces, err := client.namespacesFromApplyRequest([]*ternv1.TableChange{{
+		Namespace:  "payments",
+		TableName:  "VSchema: payments",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+		Metadata:   metadata,
+	}}, schema.SchemaFiles{
+		"payments": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+	})
+	require.NoError(t, err)
+
+	require.Contains(t, namespaces, "payments")
+	nsData := namespaces["payments"]
+	assert.Equal(t, `{"sharded":true}`, nsData.Artifacts[storage.VSchemaArtifactName])
+	assert.Equal(t, metadata, nsData.Metadata)
+}
+
+// TestPlanResultToProtoChangesSiblingShardKeepsVSchemaMetadata verifies the
+// wire conversion gives sharded keyspaces the same guarantee as plan
+// persistence: the per-shard changes collapse into one proto SchemaChange, and
+// the namespace's VSchema change-metadata survives no matter which shard's
+// change carries it — a metadata-free first shard must not drop a later
+// sibling's recorded deletions.
+func TestPlanResultToProtoChangesSiblingShardKeepsVSchemaMetadata(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	metadata := map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+	}
+
+	changes, violations, shards := client.planResultToProtoChanges(&engine.PlanResult{
+		Changes: []engine.SchemaChange{
+			{
+				Namespace:    "payments",
+				Shard:        engine.Shard{Name: "-80"},
+				TableChanges: []engine.TableChange{alterUsers},
+			},
+			{
+				Namespace:    "payments",
+				Shard:        engine.Shard{Name: "80-"},
+				TableChanges: []engine.TableChange{alterUsers},
+				Metadata:     metadata,
+			},
+		},
+	})
+
+	assert.Empty(t, violations)
+	require.Len(t, shards, 2)
+	require.Len(t, changes, 1)
+	assert.Equal(t, "payments", changes[0].Namespace)
+	assert.Equal(t, metadata, changes[0].Metadata)
+}
+
+// TestNamespacesFromEngineChangesWithoutVSchemaWork verifies a DDL-only change
+// persists no VSchema change-metadata and no artifact, so the stored plan's
+// unsafe-VSchema gate has nothing to inspect for it.
+func TestNamespacesFromEngineChangesWithoutVSchemaWork(t *testing.T) {
+	client := planNamespacesTestClient()
+
+	namespaces, shardPlans := client.namespacesFromEngineChanges([]engine.SchemaChange{{
+		Namespace: "payments",
+		TableChanges: []engine.TableChange{{
+			Table:     "users",
+			DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			Operation: ddl.StatementAlterTable,
+		}},
+	}}, schema.SchemaFiles{
+		"payments": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+	})
+
+	assert.Empty(t, shardPlans)
+	require.Contains(t, namespaces, "payments")
+	nsData := namespaces["payments"]
+	assert.Nil(t, nsData.Metadata)
+	assert.Empty(t, nsData.Artifacts)
+}
+
+// nonShardedMultiStatementChange is a non-sharded engine change whose table
+// appears in three ordered statements — its CREATE TABLE followed by two index
+// builds — the shape a PostgreSQL greenfield table plans as.
+func nonShardedMultiStatementChange() engine.SchemaChange {
+	return engine.SchemaChange{
+		Namespace: "payments",
+		TableChanges: []engine.TableChange{
+			{
+				Table:     "users",
+				DDL:       `CREATE TABLE "users" ("id" bigint PRIMARY KEY, "email" text, "org" text)`,
+				Operation: ddl.StatementCreateTable,
+			},
+			{
+				Table:     "users",
+				DDL:       `CREATE UNIQUE INDEX "users_email_idx" ON "users" ("email")`,
+				Operation: ddl.StatementCreateIndex,
+			},
+			{
+				Table:     "users",
+				DDL:       `CREATE INDEX "users_org_idx" ON "users" ("org")`,
+				Operation: ddl.StatementCreateIndex,
+			},
+		},
+	}
+}
+
+// TestNamespacesFromEngineChangesKeepsNonShardedStatementOrder verifies the
+// stored plan keeps every statement of a non-sharded change even when one
+// table appears more than once: a table's CREATE TABLE and each of its index
+// builds must all survive into the plan the apply executes, in plan order.
+func TestNamespacesFromEngineChangesKeepsNonShardedStatementOrder(t *testing.T) {
+	client := planNamespacesTestClient()
+
+	namespaces, shardPlans := client.namespacesFromEngineChanges(
+		[]engine.SchemaChange{nonShardedMultiStatementChange()}, schema.SchemaFiles{})
+
+	assert.Empty(t, shardPlans)
+	require.Contains(t, namespaces, "payments")
+	tables := namespaces["payments"].Tables
+	require.Len(t, tables, 3)
+	assert.Contains(t, tables[0].DDL, "CREATE TABLE")
+	assert.Contains(t, tables[1].DDL, `"users_email_idx"`)
+	assert.Contains(t, tables[2].DDL, `"users_org_idx"`)
+	for _, tc := range tables {
+		assert.Equal(t, "users", tc.Table)
+	}
+}
+
+// A sharded keyspace's generated-only VSchema marker reaches the plan response
+// when every shard that reports VSchema work carries it, including when only
+// one shard reports the keyspace's VSchema work at all. When a shard reports
+// VSchema work without the marker, the merged keyspace drops it, so the plan
+// comment never claims a keyspace has no hand-written VSchema change on the
+// word of one shard alone.
+func TestPlanResultToProtoChangesKeepsGeneratedOnlyMarkerOnlyWhenShardsAgree(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	generated := map[string]string{
+		storage.PlanMetadataVSchemaChanged:  "true",
+		engine.MetadataVSchemaGeneratedOnly: "true",
+	}
+	plan := func(first, second map[string]string) map[string]string {
+		t.Helper()
+		changes, _, _ := client.planResultToProtoChanges(&engine.PlanResult{
+			Changes: []engine.SchemaChange{
+				{Namespace: "payments", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: first},
+				{Namespace: "payments", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: second},
+			},
+		})
+		require.Len(t, changes, 1)
+		return changes[0].Metadata
+	}
+
+	assert.Equal(t, "true", plan(generated, generated)[engine.MetadataVSchemaGeneratedOnly], "every shard agrees")
+	assert.Equal(t, "true", plan(nil, generated)[engine.MetadataVSchemaGeneratedOnly], "the only shard reporting VSchema work carries the marker")
+
+	unexplained := plan(map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, generated)
+	assert.NotContains(t, unexplained, engine.MetadataVSchemaGeneratedOnly, "a shard reports VSchema work without the marker")
+	assert.Equal(t, "true", unexplained[storage.PlanMetadataVSchemaChanged], "the VSchema change itself still reaches the plan")
+
+	diffed := plan(generated, map[string]string{storage.PlanMetadataVSchemaDiff: "+    \"refunds\": {}"})
+	assert.NotContains(t, diffed, engine.MetadataVSchemaGeneratedOnly, "a shard renders a VSchema diff")
+}
+
+// The stored plan keeps a sharded keyspace's generated-only VSchema marker by
+// the same rule as the plan response: only when every shard that reports
+// VSchema work carries it.
+func TestNamespacesFromEngineChangesKeepsGeneratedOnlyMarkerOnlyWhenShardsAgree(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	generated := map[string]string{
+		storage.PlanMetadataVSchemaChanged:  "true",
+		engine.MetadataVSchemaGeneratedOnly: "true",
+	}
+	stored := func(first, second map[string]string) map[string]string {
+		t.Helper()
+		namespaces, _ := client.namespacesFromEngineChanges([]engine.SchemaChange{
+			{Namespace: "payments", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: first},
+			{Namespace: "payments", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: second},
+		}, nil)
+		require.Contains(t, namespaces, "payments")
+		return namespaces["payments"].Metadata
+	}
+
+	assert.Equal(t, generated, stored(generated, generated), "every shard agrees")
+	assert.Equal(t, generated, stored(nil, generated), "the only shard reporting VSchema work carries the marker")
+	assert.Equal(t, map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, stored(map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, generated), "a shard reports VSchema work without the marker")
+}
+
+// TestPlanResultToProtoChangesKeepsNonShardedStatementOrder verifies the plan
+// response carries every statement of a non-sharded change even when one table
+// appears more than once, so the plan an operator reviews shows the same
+// ordered statement list the apply will execute.
+func TestPlanResultToProtoChangesKeepsNonShardedStatementOrder(t *testing.T) {
+	client := planNamespacesTestClient()
+
+	changes, violations, shards := client.planResultToProtoChanges(&engine.PlanResult{
+		Changes: []engine.SchemaChange{nonShardedMultiStatementChange()},
+	})
+
+	assert.Empty(t, violations)
+	assert.Empty(t, shards)
+	require.Len(t, changes, 1)
+	tableChanges := changes[0].TableChanges
+	require.Len(t, tableChanges, 3)
+	assert.Contains(t, tableChanges[0].Ddl, "CREATE TABLE")
+	assert.Contains(t, tableChanges[1].Ddl, `"users_email_idx"`)
+	assert.Contains(t, tableChanges[2].Ddl, `"users_org_idx"`)
+	for _, tc := range tableChanges {
+		assert.Equal(t, "users", tc.TableName)
+	}
+}

@@ -12,18 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
-	"github.com/block/schemabot/pkg/testutil"
 )
 
 // TestOperatorMultiOperationMatrix proves the DORMANT multi-deployment fan-out
@@ -51,7 +47,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	db := startMatrixContainer(t, ctx)
+	db := openMatrixStorage(t)
 	stor := mysqlstore.New(db)
 
 	t.Run("RollingHaltCompletesInOrder", func(t *testing.T) {
@@ -111,8 +107,8 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workAID))
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workBID))
 		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID))
-		assert.Equal(t, state.Apply.Pending, getApply(t, ctx, stor, seed.applyID).State,
-			"completed shard work plus a pending finalizer must remain non-terminal")
+		assert.Equal(t, state.Apply.Running, getApply(t, ctx, stor, seed.applyID).State,
+			"completed shard work plus a pending finalizer must remain running, not terminal")
 
 		driveNextOperation(t, ctx, svc, 3)
 
@@ -241,11 +237,113 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, rec2, rec.resumeOrder(), "parked barrier operations must not be re-leased by the copy claim")
 	})
 
+	// RollingOnFailureGatesLaterTargets drives a rolling rollout over one
+	// deployment's targets list, payments-001..003, whose first target fails.
+	// Each target is a rollout member of its own, so on_failure governs the later
+	// targets exactly as it governs later deployments: halt and pause leave
+	// payments-002 and payments-003 pending and never hand them to a driver, and
+	// continue drives them in list order. Pause is the case only the member gate
+	// can hold: the parent stays paused rather than terminal, so the later
+	// targets remain claimable in every respect but their turn.
+	t.Run("RollingOnFailureGatesLaterTargets", func(t *testing.T) {
+		targets := []string{"payments-001", "payments-002", "payments-003"}
+		for _, tc := range []struct {
+			name        string
+			onFailure   string
+			parentState string
+			driven      []string
+		}{
+			{name: "halt", onFailure: storage.OnFailureHalt, parentState: state.Apply.Failed, driven: targets[:1]},
+			{name: "pause", onFailure: storage.OnFailurePause, parentState: state.Apply.Paused, driven: targets[:1]},
+			{name: "continue", onFailure: storage.OnFailureContinue, parentState: state.Apply.Failed, driven: targets},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resetMatrixTables(t, ctx, db)
+				seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+					applyIdentifier: "matrix-targets-" + tc.name,
+					parentState:     state.Apply.Pending,
+					cutoverPolicy:   storage.CutoverPolicyRolling,
+					onFailure:       tc.onFailure,
+					deployments:     []string{"region-a"},
+					targets:         targets,
+					opState:         state.ApplyOperation.Pending,
+					taskState:       state.Task.Pending,
+				})
+
+				rec := &driveRecorder{}
+				svc := newMatrixService(t, stor, matrixTargetClients(stor, rec, "region-a", map[string]matrixOutcome{
+					"payments-001": {taskState: state.Task.Failed, errMsg: "duplicate key name 'idx_orders_source'"},
+					"payments-002": {taskState: state.Task.Completed},
+					"payments-003": {taskState: state.Task.Completed},
+				}))
+
+				for driver := 1; driver <= len(targets); driver++ {
+					driveNextOperation(t, ctx, svc, driver)
+				}
+
+				assert.Equal(t, tc.driven, rec.resumeTargets(),
+					"on_failure %s decides which targets are driven after payments-001 fails", tc.onFailure)
+				assert.Equal(t, state.ApplyOperation.Failed, opState(t, ctx, stor, seed.opID("payments-001")))
+				for _, target := range targets[1:] {
+					want := state.ApplyOperation.Pending
+					if len(tc.driven) == len(targets) {
+						want = state.ApplyOperation.Completed
+					}
+					assert.Equal(t, want, opState(t, ctx, stor, seed.opID(target)), "operation for %s", target)
+				}
+				assert.Equal(t, tc.parentState, getApply(t, ctx, stor, seed.applyID).State)
+			})
+		}
+	})
+
+	// TableStepsHoldTheNextTableBehindAFailure drives a parallel rollout over
+	// payments-001 and payments-002 that runs `stations` and then `docks`, table
+	// by table, under continue. payments-002 fails `stations`. Continue lets the
+	// rest of the step run, but no target starts `docks` on a fleet where one
+	// target is missing `stations`, and the apply settles failed rather than
+	// waiting on the `docks` rows nothing will start.
+	t.Run("TableStepsHoldTheNextTableBehindAFailure", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		targets := []string{"payments-001", "payments-002"}
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-table-steps",
+			parentState:     state.Apply.Pending,
+			cutoverPolicy:   storage.CutoverPolicyParallel,
+			onFailure:       storage.OnFailureContinue,
+			deployments:     []string{"region-a"},
+			targets:         targets,
+			tables:          []string{"stations", "docks"},
+			opState:         state.ApplyOperation.Pending,
+			taskState:       state.Task.Pending,
+		})
+
+		rec := &driveRecorder{}
+		svc := newMatrixService(t, stor, matrixTargetClients(stor, rec, "region-a", map[string]matrixOutcome{
+			"payments-001": {taskState: state.Task.Completed},
+			"payments-002": {taskState: state.Task.Failed, errMsg: "duplicate key name 'idx_stations_note'"},
+		}))
+
+		for driver := 1; driver <= 4; driver++ {
+			driveNextOperation(t, ctx, svc, driver)
+		}
+
+		assert.Equal(t, []string{"payments-001/step-1", "payments-002/step-1"}, rec.resumeOperationKeys(),
+			"only stations is driven once payments-002 fails it")
+		for _, key := range []string{"payments-001/step-2", "payments-002/step-2"} {
+			assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.opID(key)), "operation %s", key)
+		}
+		assert.Equal(t, state.Apply.Failed, getApply(t, ctx, stor, seed.applyID).State)
+	})
+
 	t.Run("PendingStopStopsPendingSiblingsAndCompletesStop", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		// A continue rollout that already failed one deployment and still has a
 		// pending sibling, with a queued stop: the stop must halt the pending
-		// sibling and settle the apply rather than starting more deployments.
+		// sibling rather than starting more deployments. The stopped sibling
+		// still holds its deployment, so the rollout holds running_degraded
+		// instead of settling, and the stop request completes anyway. The
+		// operator's next start is accepted and runs that sibling, and the
+		// rollout then settles from both members' outcomes.
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "matrix-pending-stop",
 			parentState:     state.Apply.RunningDegraded,
@@ -264,27 +362,329 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		requestPendingStop(t, ctx, stor, seed.applyID)
 
 		rec := &driveRecorder{}
-		// Stop reconciliation drives the data-plane stop through the apply's
-		// deployment client before terminalizing the pending siblings, so every
-		// deployment must resolve to a client — as it always does in production,
-		// where Config.Validate ties each deployment to a configured tern
-		// deployment. No operation is driven under a pending stop (the claim gate
-		// blocks the pending sibling and the stop path uses the whole-apply drive),
-		// so these outcomes are never reached via ResumeApplyOperation.
-		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+		// The pending sibling never started, so stop reconciliation stops it in
+		// storage without any drive: no operation is driven under a pending
+		// stop, and the whole-apply drive, which would read the rollout's
+		// missing parent remote apply as an ambiguous dispatch, never runs.
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
 			"region-a": {taskState: state.Task.Failed},
 			"region-b": {taskState: state.Task.Pending},
-		}))
+		})
+		svc := newMatrixService(t, stor, clients)
 
-		svc.recoverApplies(ctx, 1)
+		svc.recoverApplies(ctx, 1, openClaimGate())
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
+		for deployment, client := range clients {
+			assert.Nil(t, client.(*matrixTernClient).resumeApply,
+				"%s: a never-started member is stopped in storage, without a whole-apply drive", deployment)
+		}
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID("region-b")),
 			"the pending sibling must be stopped, not started, under a pending stop")
 		apply := getApply(t, ctx, stor, seed.applyID)
-		assert.Equal(t, state.Apply.Failed, apply.State, "failed + stopped settles the rollout to failed")
-		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID), "the pending stop request must be completed")
-		assert.Equal(t, 1, svc.matrixSummary.count(), "the settled rollout still owes exactly one terminal summary")
+		assert.Equal(t, state.Apply.RunningDegraded, apply.State,
+			"a stopped sibling holds its deployment, so the rollout holds instead of settling")
+		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID),
+			"the stop reached every operation, so its request must be completed rather than left to refuse the resuming start")
+		assert.Equal(t, 0, svc.matrixSummary.count(), "a rollout that has not settled owes no terminal summary")
+
+		clients["region-b/staging"].(*matrixTernClient).outcome.taskState = state.Task.Completed
+		resp, _, err := svc.executeStartForApply(ctx, clients["region-b/staging"], apply, "cli:alice")
+		require.NoError(t, err, "the stopped member never started, so its work is what the start resumes")
+		require.NotNil(t, resp)
+		assert.True(t, resp.Accepted)
+
+		driveNextOperation(t, ctx, svc, 2)
+
+		assert.Equal(t, []string{"region-b"}, rec.resumeOrder(), "the start runs the member the stop caught before it began")
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID("region-b")))
+		assert.Equal(t, state.Apply.Failed, getApply(t, ctx, stor, seed.applyID).State,
+			"with region-a failed and region-b completed, the continue rollout settles failed")
+		start, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, start)
+		assert.Equal(t, storage.ControlRequestFailed, start.Status,
+			"the rollout settled failed rather than completed, so the start did not reach the outcome it asked for")
+	})
+
+	t.Run("StoredStopOnEngineThatCannotPauseCancelsPendingSiblings", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A rollout on an engine whose stop is permanent carries a stop an
+		// earlier release stored, with region-a done and region-b not yet
+		// started. The stop settles region-b in storage, and settles it
+		// cancelled rather than stopped, so nothing reports as resumable a
+		// change the engine could never resume.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-legacy-vitess-stop",
+			databaseType:    storage.DatabaseTypeVitess,
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"region-a", "region-b"},
+			perOpState: map[string]string{
+				"region-a": state.ApplyOperation.Completed,
+				"region-b": state.ApplyOperation.Pending,
+			},
+			perTaskState: map[string]string{
+				"region-a": state.Task.Completed,
+				"region-b": state.Task.Pending,
+			},
+		})
+		requestPendingStop(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Completed},
+			"region-b": {taskState: state.Task.Pending},
+		}))
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
+		assert.Equal(t, state.ApplyOperation.Cancelled, opState(t, ctx, stor, seed.opID("region-b")),
+			"a stop on an engine that cannot pause settles the never-started member cancelled")
+		assert.NotEqual(t, state.Apply.Stopped, getApply(t, ctx, stor, seed.applyID).State,
+			"the rollout must not read as stopped on an engine that cannot resume it")
+		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID))
+	})
+
+	t.Run("StopAtFinalizerHandoffResumesOnStart", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A sharded apply whose shard work has completed, with its taskless
+		// finalizer not yet started, takes a stop. The stop settles the
+		// finalizer in storage, and the operator's start is accepted and runs
+		// the finalizer, so the change still publishes.
+		seed := seedShardedFinalizerApply(t, ctx, stor)
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Completed},
+		})
+		svc := newMatrixService(t, stor, clients)
+		driveNextOperation(t, ctx, svc, 1)
+		driveNextOperation(t, ctx, svc, 2)
+		require.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID))
+		requestPendingStop(t, ctx, stor, seed.applyID)
+
+		svc.recoverApplies(ctx, 3, openClaimGate())
+
+		require.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.finalizerID),
+			"the stop caught the finalizer before it began")
+		require.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID))
+		apply := getApply(t, ctx, stor, seed.applyID)
+		resp, _, err := svc.executeStartForApply(ctx, clients["region-a/staging"], apply, "cli:alice")
+		require.NoError(t, err, "the stopped finalizer is work the start resumes")
+		require.NotNil(t, resp)
+		assert.True(t, resp.Accepted)
+
+		driveNextOperation(t, ctx, svc, 4)
+
+		assert.Equal(t, []string{
+			"commerce/-80/users",
+			"commerce/80-/users",
+			"commerce/group_finalizer",
+		}, rec.resumeOperationKeys())
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.finalizerID))
+		assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
+	})
+
+	t.Run("PendingCancelAtMemberHandoffCancelsPendingSiblings", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A rolling rollout whose first deployment completed and whose next one
+		// has not started yet, with a queued cancel: nothing is active to carry
+		// the cancel, and the claim gate keeps the next member from starting.
+		// Stop reconciliation settles it instead: the pending sibling is
+		// cancelled without ever reaching the engine, the rollout settles
+		// cancelled, and the cancel request completes.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-pending-cancel",
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"region-a", "region-b"},
+			perOpState: map[string]string{
+				"region-a": state.ApplyOperation.Completed,
+				"region-b": state.ApplyOperation.Pending,
+			},
+			perTaskState: map[string]string{
+				"region-a": state.Task.Completed,
+				"region-b": state.Task.Pending,
+			},
+		})
+		requestPendingCancel(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Completed},
+			"region-b": {taskState: state.Task.Completed},
+		})
+		svc := newMatrixService(t, stor, clients)
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.Empty(t, rec.resumeOrder(), "a pending cancel must not start the next member")
+		for deployment, client := range clients {
+			assert.Nil(t, client.(*matrixTernClient).resumeApply,
+				"%s: a never-started member is cancelled in storage, without a whole-apply drive that would misread the rollout's dispatch state", deployment)
+		}
+		assert.Equal(t, state.ApplyOperation.Cancelled, opState(t, ctx, stor, seed.opID("region-b")),
+			"the pending sibling must be cancelled, not started, under a pending cancel")
+		apply := getApply(t, ctx, stor, seed.applyID)
+		assert.Equal(t, state.Apply.Cancelled, apply.State)
+		pending, err := stor.ControlRequests().GetPending(ctx, seed.applyID, storage.ControlOperationCancel)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "the rollout settled, so its cancel request must be completed")
+	})
+
+	t.Run("CancelDuringStopReconciliationStaysDeliverable", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// Stop reconciliation picks up a continue rollout with a queued stop
+		// whose pending sibling's task the data plane has already started, so
+		// it drives the stop through the data plane, and the operator escalates
+		// to cancel while that drive is running. The drive delivered the stop
+		// but not the cancel, so the sibling's engine work is stopped, not
+		// cancelled: the sibling settles stopped, and the cancel stays pending
+		// until a drive delivers it to the data plane, which the next claim of
+		// the stopped sibling does.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-stop-then-cancel",
+			parentState:     state.Apply.RunningDegraded,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureContinue,
+			deployments:     []string{"region-a", "region-b"},
+			perOpState: map[string]string{
+				"region-a": state.ApplyOperation.Failed,
+				"region-b": state.ApplyOperation.Pending,
+			},
+			perTaskState: map[string]string{
+				"region-a": state.Task.Failed,
+				"region-b": state.Task.Running,
+			},
+		})
+		requestPendingStop(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Failed},
+			"region-b": {taskState: state.Task.Running},
+		})
+		for deployment, client := range clients {
+			clients[deployment] = &cancelDuringDriveClient{matrixTernClient: client.(*matrixTernClient)}
+		}
+		svc := newMatrixService(t, stor, clients)
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
+		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID("region-b")),
+			"the drive delivered the stop, not the cancel, so the sibling's work is stopped")
+		assert.Equal(t, state.Apply.RunningDegraded, getApply(t, ctx, stor, seed.applyID).State)
+		assert.False(t, controlRequestCompleted(t, ctx, stor, seed.applyID, storage.ControlOperationCancel),
+			"a cancel no drive has delivered stays pending")
+
+		driveNextOperation(t, ctx, svc, 2)
+
+		assert.Equal(t, []string{"region-b"}, rec.resumeOrder(),
+			"the stopped sibling is claimed and driven to deliver the pending cancel")
+	})
+
+	t.Run("CancelOfSingleOperationApplyDrivesThroughDataPlane", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A single-operation apply whose operation is still pending, with a
+		// queued cancel. Its pending operation can carry a task the data plane
+		// already started, so stop reconciliation drives the cancel through the
+		// data plane before it settles the operation cancelled.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-single-cancel",
+			parentState:     state.Apply.Pending,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"region-a"},
+			opState:         state.ApplyOperation.Pending,
+			taskState:       state.Task.Pending,
+		})
+		requestPendingCancel(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Pending},
+		})
+		delivering := &deliverCancelDuringDriveClient{matrixTernClient: clients["region-a/staging"].(*matrixTernClient)}
+		clients["region-a/staging"] = delivering
+		svc := newMatrixService(t, stor, clients)
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.Empty(t, rec.resumeOrder(), "a pending cancel must not start the operation")
+		assert.NotNil(t, delivering.resumeApply,
+			"a single-operation apply is driven through the data plane before its operation settles")
+		assert.Equal(t, state.ApplyOperation.Cancelled, opState(t, ctx, stor, seed.opID("region-a")))
+		assert.Equal(t, state.Apply.Cancelled, getApply(t, ctx, stor, seed.applyID).State)
+		assert.True(t, controlRequestCompleted(t, ctx, stor, seed.applyID, storage.ControlOperationCancel),
+			"the apply settled cancelled, so its cancel request must be completed")
+	})
+
+	t.Run("UndeliveredCancelStaysPendingForTheNextDrive", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A single-operation apply with a queued cancel whose drive returns
+		// without the data plane acting on the cancel. The cancel has not taken
+		// effect, so the operation is not recorded cancelled: it stays pending
+		// with the cancel, and the next pass drives the cancel again.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-undelivered-cancel",
+			parentState:     state.Apply.Pending,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"region-a"},
+			opState:         state.ApplyOperation.Pending,
+			taskState:       state.Task.Pending,
+		})
+		requestPendingCancel(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Pending},
+		})
+		svc := newMatrixService(t, stor, clients)
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.NotNil(t, clients["region-a/staging"].(*matrixTernClient).resumeApply)
+		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.opID("region-a")),
+			"a cancel the drive did not deliver must not settle the operation cancelled")
+		assert.NotEqual(t, state.Apply.Cancelled, getApply(t, ctx, stor, seed.applyID).State)
+		assert.False(t, controlRequestCompleted(t, ctx, stor, seed.applyID, storage.ControlOperationCancel),
+			"the undelivered cancel stays pending for the next drive")
+	})
+
+	t.Run("RefusedCancelLeavesPendingOperationsToRun", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A single-operation apply with a queued cancel that the data plane
+		// refuses during the drive. The cancel did not take effect and no stop
+		// is pending, so the operation stays pending for the operation claim
+		// instead of reading cancelled while its work goes on.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-refused-cancel",
+			parentState:     state.Apply.Pending,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"region-a"},
+			opState:         state.ApplyOperation.Pending,
+			taskState:       state.Task.Pending,
+		})
+		requestPendingCancel(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Pending},
+		})
+		clients["region-a/staging"] = &refuseCancelDuringDriveClient{matrixTernClient: clients["region-a/staging"].(*matrixTernClient)}
+		svc := newMatrixService(t, stor, clients)
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.opID("region-a")),
+			"a refused cancel must not settle the operation cancelled")
+		assert.NotEqual(t, state.Apply.Cancelled, getApply(t, ctx, stor, seed.applyID).State)
 	})
 
 	t.Run("ConcurrentSiblingCompletionsPublishOneSummary", func(t *testing.T) {
@@ -368,8 +768,8 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workBID))
 		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID),
 			"the finalizer must remain pending until both shard work siblings complete")
-		assert.Equal(t, state.Apply.Pending, getApply(t, ctx, stor, seed.applyID).State,
-			"the parent must stay non-terminal while the finalizer is pending")
+		assert.Equal(t, state.Apply.Running, getApply(t, ctx, stor, seed.applyID).State,
+			"the parent must stay running while the finalizer is pending")
 
 		// The finalizer is now claimable; drive it and the parent terminalizes.
 		driveNextOperation(t, ctx, svc, 1)
@@ -393,7 +793,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 			"region-a": {taskState: state.Task.Pending},
 		}))
 
-		svc.recoverApplies(ctx, 1)
+		svc.recoverApplies(ctx, 1, openClaimGate())
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any shard work")
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.workAID),
@@ -408,32 +808,14 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 
 // --- harness ------------------------------------------------------------
 
-func startMatrixContainer(t *testing.T, ctx context.Context) *sql.DB {
+// openMatrixStorage gives the test a schema-bootstrapped storage database on
+// the shared MySQL server and a handle the test owns. The matrix services built
+// over this handle (newMatrixService) are never closed, so the test's cleanup
+// is the handle's only closer; a harness that starts closing its service must
+// open the handle itself instead.
+func openMatrixStorage(t *testing.T) *sql.DB {
 	t.Helper()
-	container, err := mysql.Run(ctx,
-		"mysql:8.0",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
-
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err, "failed to open database")
-	require.NoError(t, db.PingContext(ctx), "failed to ping database")
-	t.Cleanup(func() { utils.CloseAndLog(db) })
-	return db
+	return openStorageDB(t, newStorageDatabaseWithSchema(t).DSN)
 }
 
 // resetMatrixTables clears the rows the matrix touches so each subtest shares one
@@ -454,10 +836,26 @@ type multiOpSeed struct {
 	cutoverPolicy   string
 	onFailure       string
 	deployments     []string
+	// targets, when set, seeds one operation per target of deployments[0], the
+	// shape a deployment's targets list resolves to. Per-member maps and opID
+	// are then keyed by target instead of by deployment.
+	targets []string
+	// tables, when set with targets, seeds the rollout table by table: one
+	// operation per (table, target), in that order, each stamped with its table
+	// step. Per-member maps and opID are then keyed by operation key.
+	tables []string
+	// shards, when set, seeds one operation per shard of the one target
+	// "payments-" + deployments[0], keyed as a sharded apply keys its per-shard
+	// work, so every shard is a member of the same rollout member. Per-member
+	// maps and opID are then keyed by shard.
+	shards []string
+	// databaseType is the apply's and its tasks' database type; MySQL when
+	// unset.
+	databaseType string
 	// opState / taskState set a uniform initial state for every operation/task.
 	opState   string
 	taskState string
-	// perOpState / perTaskState override the uniform state per deployment.
+	// perOpState / perTaskState override the uniform state per member.
 	perOpState   map[string]string
 	perTaskState map[string]string
 }
@@ -468,7 +866,68 @@ type seededMultiOpApply struct {
 	ops         map[string]int64
 }
 
-func (s seededMultiOpApply) opID(deployment string) int64 { return s.ops[deployment] }
+// opID returns the operation seeded for a member: a deployment, or a target
+// when the seed named targets.
+func (s seededMultiOpApply) opID(member string) int64 { return s.ops[member] }
+
+// matrixSeedMember is one operation seedGroupedApply creates: the member name
+// that keys the per-member maps, and the operation's deployment, target and key.
+type matrixSeedMember struct {
+	name, deployment, target, operationKey, table string
+	rolloutStep                                   int
+}
+
+// tableName is the table the member's one task alters.
+func (m matrixSeedMember) tableName() string {
+	if m.table == "" {
+		return "widgets"
+	}
+	return m.table
+}
+
+func (spec multiOpSeed) members() []matrixSeedMember {
+	if len(spec.shards) > 0 {
+		members := make([]matrixSeedMember, 0, len(spec.shards))
+		for _, shard := range spec.shards {
+			members = append(members, matrixSeedMember{
+				name:         shard,
+				deployment:   spec.deployments[0],
+				target:       "payments-" + spec.deployments[0],
+				operationKey: storage.ShardOperationKey("payments", shard, "widgets"),
+			})
+		}
+		return members
+	}
+	if len(spec.targets) == 0 {
+		members := make([]matrixSeedMember, 0, len(spec.deployments))
+		for _, dep := range spec.deployments {
+			members = append(members, matrixSeedMember{name: dep, deployment: dep, target: "payments-" + dep})
+		}
+		return members
+	}
+	if len(spec.tables) > 0 {
+		members := make([]matrixSeedMember, 0, len(spec.tables)*len(spec.targets))
+		for i, table := range spec.tables {
+			for _, target := range spec.targets {
+				key := storage.TargetOperationKey(target, storage.RolloutStepOperationKey(i+1))
+				members = append(members, matrixSeedMember{
+					name: key, deployment: spec.deployments[0], target: target, operationKey: key, table: table, rolloutStep: i + 1,
+				})
+			}
+		}
+		return members
+	}
+	members := make([]matrixSeedMember, 0, len(spec.targets))
+	for _, target := range spec.targets {
+		members = append(members, matrixSeedMember{
+			name:         target,
+			deployment:   spec.deployments[0],
+			target:       target,
+			operationKey: storage.TargetOperationKey(target, ""),
+		})
+	}
+	return members
+}
 
 type seededShardedFinalizerApply struct {
 	applyID     int64
@@ -480,37 +939,44 @@ type seededShardedFinalizerApply struct {
 func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, spec multiOpSeed) seededMultiOpApply {
 	t.Helper()
 	require.NotEmpty(t, spec.deployments, "seedGroupedApply requires at least one deployment")
+	databaseType := spec.databaseType
+	if databaseType == "" {
+		databaseType = storage.DatabaseTypeMySQL
+	}
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: spec.applyIdentifier,
 		Database:        "payments",
-		DatabaseType:    storage.DatabaseTypeMySQL,
+		DatabaseType:    databaseType,
 		Repository:      "octocat/hello-world",
 		PullRequest:     1,
 		Environment:     "staging",
 		Deployment:      spec.deployments[0],
 		Caller:          "matrix-test",
-		Engine:          storage.EngineForType(storage.DatabaseTypeMySQL),
+		Engine:          storage.EngineForType(databaseType),
 		State:           spec.parentState,
 		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{}),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
 
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(spec.deployments))
-	for _, dep := range spec.deployments {
+	members := spec.members()
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
+	for _, member := range members {
 		opState := spec.opState
-		if s, ok := spec.perOpState[dep]; ok {
+		if s, ok := spec.perOpState[member.name]; ok {
 			opState = s
 		}
 		taskState := spec.taskState
-		if s, ok := spec.perTaskState[dep]; ok {
+		if s, ok := spec.perTaskState[member.name]; ok {
 			taskState = s
 		}
 		groups = append(groups, &storage.ApplyOperationWithTasks{
 			Operation: &storage.ApplyOperation{
-				Deployment:    dep,
-				Target:        "payments-" + dep,
+				Deployment:    member.deployment,
+				OperationKey:  member.operationKey,
+				Target:        member.target,
+				RolloutStep:   member.rolloutStep,
 				State:         opState,
 				CutoverPolicy: spec.cutoverPolicy,
 				OnFailure:     spec.onFailure,
@@ -518,18 +984,18 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 				UpdatedAt:     now,
 			},
 			Tasks: []*storage.Task{{
-				TaskIdentifier: spec.applyIdentifier + "-" + dep,
+				TaskIdentifier: spec.applyIdentifier + "-" + member.name,
 				Database:       "payments",
-				DatabaseType:   storage.DatabaseTypeMySQL,
-				Engine:         storage.EngineForType(storage.DatabaseTypeMySQL),
+				DatabaseType:   databaseType,
+				Engine:         storage.EngineForType(databaseType),
 				Repository:     "octocat/hello-world",
 				PullRequest:    1,
 				Environment:    "staging",
 				State:          taskState,
 				Options:        storage.MarshalApplyOptions(storage.ApplyOptions{}),
 				Namespace:      "payments",
-				TableName:      "widgets",
-				DDL:            "ALTER TABLE widgets ADD COLUMN c int",
+				TableName:      member.tableName(),
+				DDL:            "ALTER TABLE " + member.tableName() + " ADD COLUMN c int",
 				DDLAction:      "alter",
 				CreatedAt:      now,
 				UpdatedAt:      now,
@@ -541,8 +1007,8 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 	require.NoError(t, err, "seed grouped apply")
 
 	ops := make(map[string]int64, len(groups))
-	for _, group := range groups {
-		ops[group.Operation.Deployment] = group.Operation.ID
+	for i, group := range groups {
+		ops[members[i].name] = group.Operation.ID
 	}
 	return seededMultiOpApply{applyID: applyID, deployments: spec.deployments, ops: ops}
 }
@@ -646,6 +1112,79 @@ func requestPendingStop(t *testing.T, ctx context.Context, stor storage.Storage,
 	require.NoError(t, err, "request pending stop")
 }
 
+func requestPendingCancel(t *testing.T, ctx context.Context, stor storage.Storage, applyID int64) {
+	t.Helper()
+	_, _, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "matrix-test",
+	})
+	require.NoError(t, err, "request pending cancel")
+}
+
+// cancelDuringDriveClient records a cancel request when a whole-apply drive
+// begins, as an operator's cancel accepted after stop reconciliation has read
+// the apply's pending requests.
+type cancelDuringDriveClient struct {
+	*matrixTernClient
+}
+
+func (c *cancelDuringDriveClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	if _, _, err := c.stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "matrix-test",
+	}); err != nil {
+		return fmt.Errorf("matrix fake: request cancel during drive: %w", err)
+	}
+	return c.matrixTernClient.ResumeApply(ctx, apply)
+}
+
+// deliverCancelDuringDriveClient cancels the apply and completes its pending
+// cancel request when a whole-apply drive runs, as the data plane does when it
+// acts on the cancel.
+type deliverCancelDuringDriveClient struct {
+	*matrixTernClient
+}
+
+func (c *deliverCancelDuringDriveClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	stored, err := c.stor.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("matrix fake: load apply to deliver cancel: %w", err)
+	}
+	stored.State = state.Apply.Cancelled
+	if err := c.stor.Applies().Update(ctx, stored); err != nil {
+		return fmt.Errorf("matrix fake: cancel apply during drive: %w", err)
+	}
+	if err := c.stor.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationCancel); err != nil {
+		return fmt.Errorf("matrix fake: complete cancel during drive: %w", err)
+	}
+	return c.matrixTernClient.ResumeApply(ctx, apply)
+}
+
+// refuseCancelDuringDriveClient fails the pending cancel request when a
+// whole-apply drive runs, as the drive does when the data plane refuses the
+// cancel, and leaves the apply's own state untouched.
+type refuseCancelDuringDriveClient struct {
+	*matrixTernClient
+}
+
+func (c *refuseCancelDuringDriveClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	if err := c.stor.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationCancel, "the data plane refused the cancel"); err != nil {
+		return fmt.Errorf("matrix fake: refuse cancel during drive: %w", err)
+	}
+	return c.matrixTernClient.ResumeApply(ctx, apply)
+}
+
+func controlRequestCompleted(t *testing.T, ctx context.Context, stor storage.Storage, applyID int64, operation storage.ControlOperation) bool {
+	t.Helper()
+	pending, err := stor.ControlRequests().GetPending(ctx, applyID, operation)
+	require.NoError(t, err)
+	return pending == nil
+}
+
 func stalenessBackdate(t *testing.T, ctx context.Context, db *sql.DB, applyID int64) {
 	t.Helper()
 	_, err := db.ExecContext(ctx,
@@ -658,8 +1197,7 @@ func stalenessBackdate(t *testing.T, ctx context.Context, db *sql.DB, applyID in
 func newMatrixService(t *testing.T, stor storage.Storage, clients map[string]tern.Client) *matrixService {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	cfg := &ServerConfig{OperatorClaimOperations: new(true)}
-	svc := New(stor, cfg, clients, logger)
+	svc := New(stor, &ServerConfig{}, clients, logger)
 
 	summary := &matrixSummaryRecorder{}
 	svc.OnApplyTerminalSummary = func(_ context.Context, apply *storage.Apply, tasks []*storage.Task) error {
@@ -714,11 +1252,29 @@ func matrixClients(stor storage.Storage, rec *driveRecorder, outcomes map[string
 	return clients
 }
 
+// matrixTargetClients builds the one deterministic tern.Client a targets list
+// routes to, since every target shares the deployment, and has it choose each
+// drive's outcome by the operation's target.
+func matrixTargetClients(stor storage.Storage, rec *driveRecorder, deployment string, outcomes map[string]matrixOutcome) map[string]tern.Client {
+	return map[string]tern.Client{
+		deployment + "/staging": &matrixTernClient{
+			mockTernClient: &mockTernClient{},
+			stor:           stor,
+			deployment:     deployment,
+			rec:            rec,
+			targetOutcomes: outcomes,
+		},
+	}
+}
+
 type matrixOutcome struct {
 	taskState        string
 	errMsg           string
 	gate             *driveGate
 	probeParentWrite bool
+	// returnErr, when set, is what the drive returns after it writes the task
+	// rows, as a real drive returns the reason it ended.
+	returnErr error
 }
 
 // matrixTernClient is a deterministic tern.Client that simulates one
@@ -732,6 +1288,20 @@ type matrixTernClient struct {
 	deployment string
 	rec        *driveRecorder
 	outcome    matrixOutcome
+	// targetOutcomes, when set, replaces outcome with the entry for the
+	// driven operation's target.
+	targetOutcomes map[string]matrixOutcome
+}
+
+func (m *matrixTernClient) outcomeFor(op *storage.ApplyOperation) (matrixOutcome, error) {
+	if m.targetOutcomes == nil {
+		return m.outcome, nil
+	}
+	outcome, ok := m.targetOutcomes[op.Target]
+	if !ok {
+		return matrixOutcome{}, fmt.Errorf("matrix fake: no outcome for target %q of operation %d", op.Target, op.ID)
+	}
+	return outcome, nil
 }
 
 func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
@@ -743,14 +1313,18 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 		return fmt.Errorf("matrix fake: operation %d not found", applyOperationID)
 	}
 	m.rec.recordResume(m.deployment, op)
+	outcome, err := m.outcomeFor(op)
+	if err != nil {
+		return err
+	}
 
 	// The gate proves work drives run concurrently; the group_finalizer drives
 	// only after its work siblings settle, so it never participates in the gate.
-	if m.outcome.gate != nil && op.OperationKind != storage.ApplyOperationKindGroupFinalizer {
-		m.outcome.gate.arriveAndWait()
+	if outcome.gate != nil && op.OperationKind != storage.ApplyOperationKindGroupFinalizer {
+		outcome.gate.arriveAndWait()
 	}
 
-	if m.outcome.probeParentWrite {
+	if outcome.probeParentWrite {
 		// A direct parent write under the operation-only lease must fail closed:
 		// the parent applies row is owned solely by the projection CAS.
 		probe := *apply
@@ -762,10 +1336,10 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 	// applies the namespace VSchema and marks the operation row directly. Simulate
 	// that outcome here rather than transitioning task rows it does not have.
 	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
-		if state.IsState(m.outcome.taskState, state.Task.Failed) {
-			return m.stor.ApplyOperations().MarkFailed(ctx, op.ID, m.outcome.errMsg)
+		if state.IsState(outcome.taskState, state.Task.Failed) {
+			return m.stor.ApplyOperations().MarkFailed(ctx, op.ID, outcome.errMsg)
 		}
-		if state.IsState(m.outcome.taskState, state.Task.Completed) {
+		if state.IsState(outcome.taskState, state.Task.Completed) {
 			return m.stor.ApplyOperations().MarkCompleted(ctx, op.ID)
 		}
 		return nil
@@ -776,11 +1350,11 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 		return fmt.Errorf("matrix fake: load tasks for operation %d: %w", applyOperationID, err)
 	}
 	for _, task := range tasks {
-		task.State = m.outcome.taskState
-		if state.IsState(m.outcome.taskState, state.Task.Failed) {
-			task.ErrorMessage = m.outcome.errMsg
+		task.State = outcome.taskState
+		if state.IsState(outcome.taskState, state.Task.Failed) {
+			task.ErrorMessage = outcome.errMsg
 		}
-		if state.IsTerminalTaskState(m.outcome.taskState) {
+		if state.IsTerminalTaskState(outcome.taskState) {
 			now := time.Now()
 			task.CompletedAt = &now
 		}
@@ -788,7 +1362,7 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 			return fmt.Errorf("matrix fake: update task %d for deployment %s: %w", task.ID, m.deployment, err)
 		}
 	}
-	return nil
+	return outcome.returnErr
 }
 
 // --- recorders ----------------------------------------------------------
@@ -796,6 +1370,7 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 type driveRecorder struct {
 	mu          sync.Mutex
 	order       []string
+	targets     []string
 	opKeys      []string
 	opKinds     []string
 	parentWrite []error
@@ -805,6 +1380,7 @@ func (r *driveRecorder) recordResume(deployment string, op *storage.ApplyOperati
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.order = append(r.order, deployment)
+	r.targets = append(r.targets, op.Target)
 	r.opKeys = append(r.opKeys, op.OperationKey)
 	r.opKinds = append(r.opKinds, op.OperationKind)
 }
@@ -819,6 +1395,12 @@ func (r *driveRecorder) resumeOrder() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.order...)
+}
+
+func (r *driveRecorder) resumeTargets() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.targets...)
 }
 
 func (r *driveRecorder) resumeCount() int {

@@ -71,7 +71,7 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	require.NoError(t, err)
 
 	// Stamp the operation lease the operator drive holds.
-	leaseDB, err := sql.Open("mysql", dsn)
+	leaseDB, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(leaseDB)
 	require.NoError(t, leaseDB.PingContext(ctx))
@@ -96,6 +96,8 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 		TableName:        "users",
 		DDL:              "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
 		DDLAction:        "alter",
+		ExecutionMode:    "direct",
+		ModeReason:       "fits the direct-execution bound",
 	}
 	tp := &engine.TableProgress{
 		Namespace: "resolute",
@@ -111,7 +113,7 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	})
 
 	// Under the lease, both shards are persisted as per-shard tasks.
-	client.writeShardProgress(leaseCtx, perTable, tp, now)
+	client.writeShardProgress(leaseCtx, client.logger, perTable, tp, now)
 
 	got, err := stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
@@ -134,12 +136,14 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	assert.Equal(t, int64(500000), byShard["-80"].RowsTotal)
 	assert.Equal(t, 720, byShard["-80"].ETASeconds)
 	assert.Equal(t, 1, byShard["-80"].CutoverAttempts)
+	assert.Equal(t, "direct", byShard["-80"].ExecutionMode, "the admitting verdict travels onto every per-shard row")
+	assert.Equal(t, "fits the direct-execution bound", byShard["-80"].ModeReason)
 	assert.Equal(t, 60, byShard["80-"].ProgressPercent)
 
 	// A later drive pass updates in place — no duplicate rows.
 	tp.Shards[0].Progress = 100
 	tp.Shards[0].RowsCopied = 500000
-	client.writeShardProgress(leaseCtx, perTable, tp, time.Now())
+	client.writeShardProgress(leaseCtx, client.logger, perTable, tp, time.Now())
 	got, err = stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "re-running the drive updates shards in place, no duplicates")
@@ -163,14 +167,14 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	applyLeaseCtx := storage.WithApplyLease(ctx, storage.ApplyLease{
 		ApplyID: applyID, Owner: "driver", Token: "apply-token",
 	})
-	client.writeShardProgress(applyLeaseCtx, perTable, tp, time.Now())
+	client.writeShardProgress(applyLeaseCtx, client.logger, perTable, tp, time.Now())
 	got, err = stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	assert.Len(t, got, 2, "the apply lease alone persists per-shard tasks for a single-operation drive")
 
 	// A read-path caller (no drive lease) must not write.
 	cleanupTasks(t, dsn)
-	client.writeShardProgress(ctx, perTable, tp, time.Now())
+	client.writeShardProgress(ctx, client.logger, perTable, tp, time.Now())
 	got, err = stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	assert.Empty(t, got, "without a drive lease the write-through is a no-op")

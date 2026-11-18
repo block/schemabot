@@ -2,11 +2,13 @@ package github
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/stretchr/testify/assert"
@@ -23,15 +25,32 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestGitHubRateLimitTransportRecordsHeaders(t *testing.T) {
+// newGitHubMetricsTestReader installs an isolated manual-reader meter provider
+// for the test's lifetime and returns the reader to collect from.
+func newGitHubMetricsTestReader(t *testing.T) *sdkmetric.ManualReader {
+	t.Helper()
+
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	require.NoError(t, metrics.RegisterGitHubRateLimitMetrics(mp))
 	prevMP := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
 		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
 	})
+	return reader
+}
+
+// The diff fetch and the GraphQL directory listing only read, so they are
+// counted against the read category rather than falling into unknown.
+func TestGitHubRequestCategoryClassifiesSymlinkModeOperationsAsReads(t *testing.T) {
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, gitHubRequestCategory(metrics.GitHubOperationFetchDiff))
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, gitHubRequestCategory(metrics.GitHubOperationGraphQLTreeEntries))
+}
+
+func TestGitHubRateLimitTransportRecordsHeaders(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
 
 	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		header := http.Header{}
@@ -67,14 +86,7 @@ func TestGitHubRateLimitTransportRecordsHeaders(t *testing.T) {
 }
 
 func TestGitHubRateLimitTransportInfersGraphQLResourceAndUsed(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	prevMP := otel.GetMeterProvider()
-	otel.SetMeterProvider(mp)
-	t.Cleanup(func() {
-		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
-	})
+	reader := newGitHubMetricsTestReader(t)
 
 	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		header := http.Header{}
@@ -105,6 +117,190 @@ func TestGitHubRateLimitTransportInfersGraphQLResourceAndUsed(t *testing.T) {
 	assert.Equal(t, metrics.GitHubRateLimitResourceGraphQL, attrs["resource"])
 	assert.Equal(t, "schemabot-block-staging", attrs["github_app"])
 	assert.NotContains(t, attrs, "installation_id")
+}
+
+// A request that never produces an HTTP response (dial failure, TLS error,
+// context deadline) must still be counted as a GitHub request, with a status
+// that distinguishes transport failure from an HTTP error response. Rate-limit
+// gauges must not be recorded since no headers exist.
+func TestGitHubRateLimitTransportRecordsTransportFailures(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
+
+	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}), 12345, func() string { return "schemabot-block" })
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/pulls/1", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	require.Nil(t, resp)
+
+	count, attrs := collectGitHubRequestCounter(t, reader)
+	assert.Equal(t, int64(1), count)
+	assert.Equal(t, metrics.GitHubRequestStatusTransportError, attrs["status"])
+	assert.Equal(t, metrics.GitHubOperationFetchPullRequest, attrs["operation"])
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, attrs["category"])
+	assert.Equal(t, metrics.GitHubRateLimitResourceCore, attrs["resource"])
+	assert.Equal(t, "octocat/hello-world", attrs["repository"])
+	assert.Equal(t, "schemabot-block", attrs["github_app"])
+
+	rateLimitValues := collectGitHubRateLimitMetricValues(t, reader)
+	assert.Empty(t, rateLimitValues)
+}
+
+// A transport failure on a GraphQL request must be attributed like a
+// successful one: the operation and repository come from the rate-limit
+// context the caller attached, and the resource is inferred from the request
+// path since no rate-limit headers exist.
+func TestGitHubRateLimitTransportAttributesTransportFailuresFromContext(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
+
+	dialErr := errors.New("dial tcp 140.82.112.6:443: connect: connection refused")
+	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, dialErr
+	}), 0, func() string { return "schemabot-block-staging" })
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://api.github.com/graphql", nil)
+	require.NoError(t, err)
+	req = req.WithContext(withGitHubRateLimitContext(req.Context(), metrics.GitHubOperationGraphQLStatusCheckRollup, "octocat/hello-world"))
+
+	resp, err := rt.RoundTrip(req)
+	require.ErrorIs(t, err, dialErr)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	require.Nil(t, resp)
+
+	count, attrs := collectGitHubRequestCounter(t, reader)
+	assert.Equal(t, int64(1), count)
+	assert.Equal(t, metrics.GitHubRequestStatusTransportError, attrs["status"])
+	assert.Equal(t, metrics.GitHubOperationGraphQLStatusCheckRollup, attrs["operation"])
+	assert.Equal(t, metrics.GitHubRateLimitResourceGraphQL, attrs["resource"])
+	assert.Equal(t, "octocat/hello-world", attrs["repository"])
+	assert.Equal(t, "schemabot-block-staging", attrs["github_app"])
+}
+
+// A request SchemaBot cancelled itself (context cancellation, e.g. graceful
+// shutdown) is not evidence GitHub is unreachable. It must still be counted —
+// exactly one sample per attempt — but under its own status so deploys do not
+// blip the transport_error signal operators alert on.
+func TestGitHubRateLimitTransportRecordsCancelledRequests(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
+
+	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, context.Canceled
+	}), 12345, func() string { return "schemabot-block" })
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/pulls/1", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.ErrorIs(t, err, context.Canceled)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	require.Nil(t, resp)
+
+	count, attrs := collectGitHubRequestCounter(t, reader)
+	assert.Equal(t, int64(1), count)
+	assert.Equal(t, metrics.GitHubRequestStatusCancelled, attrs["status"])
+	assert.Equal(t, metrics.GitHubOperationFetchPullRequest, attrs["operation"])
+
+	rateLimitValues := collectGitHubRateLimitMetricValues(t, reader)
+	assert.Empty(t, rateLimitValues)
+}
+
+// A 404 is only a semantic "no" for read operations. On an auth operation it
+// is a genuine failure — a suspended App installation answers every token
+// exchange with 404 — and must stay labeled error so error-rate alerts see the
+// outage.
+func TestGitHubRateLimitTransportKeepsAuthNotFoundAsError(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
+
+	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(`{"message":"Not Found"}`)),
+			Request:    req,
+		}, nil
+	}), 0, func() string { return "schemabot-block" })
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://api.github.com/app/installations/123/access_tokens", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	count, attrs := collectGitHubRequestCounter(t, reader)
+	assert.Equal(t, int64(1), count)
+	assert.Equal(t, metrics.GitHubRequestStatusError, attrs["status"])
+	assert.Equal(t, metrics.GitHubOperationCreateInstallationAccessToken, attrs["operation"])
+	assert.Equal(t, metrics.GitHubRequestCategoryAuth, attrs["category"])
+}
+
+// A 404 is a semantic answer, not an API failure: SchemaBot routinely probes
+// paths (schemabot.yaml config lookups, reloading deleted PRs) whose expected
+// answer is "not there". The request counter must label these not_found so
+// error dashboards and alerts see only real GitHub failures.
+func TestGitHubRateLimitTransportRecordsNotFoundStatus(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
+
+	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(`{"message":"Not Found"}`)),
+			Request:    req,
+		}, nil
+	}), 12345, func() string { return "schemabot-block" })
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/contents/service/schemabot.yaml", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	count, attrs := collectGitHubRequestCounter(t, reader)
+	assert.Equal(t, int64(1), count)
+	assert.Equal(t, metrics.GitHubRequestStatusNotFound, attrs["status"])
+	assert.Equal(t, metrics.GitHubOperationFetchFileContent, attrs["operation"])
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, attrs["category"])
+	assert.Equal(t, "octocat/hello-world", attrs["repository"])
+	assert.Equal(t, "schemabot-block", attrs["github_app"])
+}
+
+func collectGitHubRequestCounter(t *testing.T, reader *sdkmetric.ManualReader) (int64, map[string]string) {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	attrs := make(map[string]string)
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.github.requests_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "%s should be an int64 sum", m.Name)
+			require.Len(t, sum.DataPoints, 1, "%s should have one data point", m.Name)
+			dp := sum.DataPoints[0]
+			total = dp.Value
+			for _, kv := range dp.Attributes.ToSlice() {
+				attrs[string(kv.Key)] = attributeValueString(kv.Value)
+			}
+		}
+	}
+	return total, attrs
 }
 
 func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
@@ -214,6 +410,12 @@ func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
 			repository: "octocat/hello-world",
 		},
 		{
+			name:      "get team",
+			method:    http.MethodGet,
+			url:       "https://api.github.com/orgs/octocat/teams/db-team",
+			operation: metrics.GitHubOperationGetTeam,
+		},
+		{
 			name:      "list team members",
 			method:    http.MethodGet,
 			url:       "https://api.github.com/orgs/octocat/teams/db-team/members",
@@ -272,14 +474,7 @@ func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
 }
 
 func TestGitHubRateLimitTransportSkipsGaugeWhenRequiredHeadersAreMissing(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	prevMP := otel.GetMeterProvider()
-	otel.SetMeterProvider(mp)
-	t.Cleanup(func() {
-		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
-	})
+	reader := newGitHubMetricsTestReader(t)
 
 	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		header := http.Header{}
@@ -355,6 +550,110 @@ func attributeValueString(value attribute.Value) string {
 	case attribute.INT64:
 		return strconv.FormatInt(value.AsInt64(), 10)
 	default:
-		return value.Emit()
+		return value.String()
+	}
+}
+
+// Paging snapshots require complete, valid quota headers and an installation
+// identity. Diagnostic samples remain available when reset metadata is absent.
+func TestGitHubTransportQuotaSnapshots(t *testing.T) {
+	tests := []struct {
+		name         string
+		change       func(http.Header)
+		installation int64
+		app          string
+		wantSnapshot bool
+	}{
+		{name: "valid", installation: 42, app: "example-app", wantSnapshot: true},
+		{name: "zero remaining", installation: 42, app: "example-app", wantSnapshot: true, change: func(h http.Header) { h.Set(headerRateLimitRemaining, "0") }},
+		{name: "missing reset", installation: 42, app: "example-app", change: func(h http.Header) { h.Del(headerRateLimitReset) }},
+		{name: "malformed reset", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitReset, "tomorrow") }},
+		{name: "expired reset", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitReset, "1") }},
+		{name: "malformed remaining", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "unknown") }},
+		{name: "negative remaining", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "-1") }},
+		{name: "over limit", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitRemaining, "15001") }},
+		{name: "zero limit", installation: 42, app: "example-app", change: func(h http.Header) { h.Set(headerRateLimitLimit, "0") }},
+		{name: "zero limit and remaining", installation: 42, app: "example-app", change: func(h http.Header) {
+			h.Set(headerRateLimitLimit, "0")
+			h.Set(headerRateLimitRemaining, "0")
+		}},
+		{name: "app JWT", app: "example-app"},
+		{name: "missing app", installation: 42},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newGitHubMetricsTestReader(t)
+			rt := NewMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				header := http.Header{}
+				header.Set(headerRateLimitLimit, "15000")
+				header.Set(headerRateLimitRemaining, "1999")
+				// Use the wire header name independently of the production constant.
+				header.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+				header.Set(headerRateLimitResource, "core")
+				if tt.change != nil {
+					tt.change(header)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader("{}")), Request: req}, nil
+			}), tt.installation, func() string { return tt.app })
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/pulls/1", nil)
+			require.NoError(t, err)
+			beforeResponse := time.Now()
+			resp, err := rt.RoundTrip(req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			var data metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &data))
+			maxAge := time.Since(beforeResponse).Seconds()
+			var snapshots, ages int
+			for _, scope := range data.ScopeMetrics {
+				for _, m := range scope.Metrics {
+					if m.Name == "schemabot.github.rate_limit.observation_age_seconds" {
+						gauge, ok := m.Data.(metricdata.Gauge[float64])
+						require.True(t, ok)
+						for _, point := range gauge.DataPoints {
+							ages++
+							op, _ := point.Attributes.Value("operation")
+							assert.Equal(t, metrics.GitHubOperationRateLimitSnapshot, op.AsString())
+							app, _ := point.Attributes.Value("github_app")
+							assert.Equal(t, tt.app, app.AsString())
+							installation, _ := point.Attributes.Value("installation_id")
+							assert.Equal(t, strconv.FormatInt(tt.installation, 10), installation.AsString())
+							resource, _ := point.Attributes.Value("resource")
+							assert.Equal(t, "core", resource.AsString())
+							_, hasRepository := point.Attributes.Value("repository")
+							assert.False(t, hasRepository)
+							assert.GreaterOrEqual(t, point.Value, float64(0))
+							assert.LessOrEqual(t, point.Value, maxAge)
+						}
+					}
+					if m.Name != "schemabot.github.rate_limit.remaining" {
+						continue
+					}
+					gauge, ok := m.Data.(metricdata.Gauge[int64])
+					require.True(t, ok)
+					for _, point := range gauge.DataPoints {
+						op, _ := point.Attributes.Value("operation")
+						if op.AsString() != metrics.GitHubOperationRateLimitSnapshot {
+							continue
+						}
+						snapshots++
+						_, hasRepository := point.Attributes.Value("repository")
+						assert.False(t, hasRepository)
+						if tt.name == "zero remaining" {
+							assert.Zero(t, point.Value)
+						} else {
+							assert.Equal(t, int64(1999), point.Value)
+						}
+					}
+				}
+			}
+			if tt.wantSnapshot {
+				assert.Equal(t, 1, snapshots)
+				assert.Equal(t, 1, ages)
+			} else {
+				assert.Zero(t, snapshots)
+				assert.Zero(t, ages)
+			}
+		})
 	}
 }

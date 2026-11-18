@@ -19,20 +19,24 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Tern_PullSchema_FullMethodName = "/tern.v1.Tern/PullSchema"
-	Tern_Plan_FullMethodName       = "/tern.v1.Tern/Plan"
-	Tern_PlanDiff_FullMethodName   = "/tern.v1.Tern/PlanDiff"
-	Tern_Apply_FullMethodName      = "/tern.v1.Tern/Apply"
-	Tern_Progress_FullMethodName   = "/tern.v1.Tern/Progress"
-	Tern_Logs_FullMethodName       = "/tern.v1.Tern/Logs"
-	Tern_Cutover_FullMethodName    = "/tern.v1.Tern/Cutover"
-	Tern_Revert_FullMethodName     = "/tern.v1.Tern/Revert"
-	Tern_SkipRevert_FullMethodName = "/tern.v1.Tern/SkipRevert"
-	Tern_Health_FullMethodName     = "/tern.v1.Tern/Health"
-	Tern_Stop_FullMethodName       = "/tern.v1.Tern/Stop"
-	Tern_Cancel_FullMethodName     = "/tern.v1.Tern/Cancel"
-	Tern_Start_FullMethodName      = "/tern.v1.Tern/Start"
-	Tern_Volume_FullMethodName     = "/tern.v1.Tern/Volume"
+	Tern_PullSchema_FullMethodName              = "/tern.v1.Tern/PullSchema"
+	Tern_Plan_FullMethodName                    = "/tern.v1.Tern/Plan"
+	Tern_PlanDiff_FullMethodName                = "/tern.v1.Tern/PlanDiff"
+	Tern_CompareSchemaFileChange_FullMethodName = "/tern.v1.Tern/CompareSchemaFileChange"
+	Tern_Apply_FullMethodName                   = "/tern.v1.Tern/Apply"
+	Tern_Progress_FullMethodName                = "/tern.v1.Tern/Progress"
+	Tern_BatchProgress_FullMethodName           = "/tern.v1.Tern/BatchProgress"
+	Tern_Logs_FullMethodName                    = "/tern.v1.Tern/Logs"
+	Tern_Cutover_FullMethodName                 = "/tern.v1.Tern/Cutover"
+	Tern_Revert_FullMethodName                  = "/tern.v1.Tern/Revert"
+	Tern_SkipRevert_FullMethodName              = "/tern.v1.Tern/SkipRevert"
+	Tern_Health_FullMethodName                  = "/tern.v1.Tern/Health"
+	Tern_DriverCapacity_FullMethodName          = "/tern.v1.Tern/DriverCapacity"
+	Tern_Stop_FullMethodName                    = "/tern.v1.Tern/Stop"
+	Tern_Cancel_FullMethodName                  = "/tern.v1.Tern/Cancel"
+	Tern_Start_FullMethodName                   = "/tern.v1.Tern/Start"
+	Tern_StorageSchemaPlan_FullMethodName       = "/tern.v1.Tern/StorageSchemaPlan"
+	Tern_StorageSchemaApply_FullMethodName      = "/tern.v1.Tern/StorageSchemaApply"
 )
 
 // TernClient is the client API for Tern service.
@@ -47,7 +51,7 @@ const (
 // rather than silently returning "unimplemented".
 //
 // Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
-// Control:   Stop, Start, Volume (can be called during Apply execution)
+// Control:   Stop, Start (can be called during Apply execution)
 //
 // State machine (per apply):
 //
@@ -87,6 +91,18 @@ type TernClient interface {
 	// plan_id — its result is intentionally not applyable. It is idempotent and
 	// safe to retry.
 	PlanDiff(ctx context.Context, in *PlanRequest, opts ...grpc.CallOption) (*PlanDiffResponse, error)
+	// CompareSchemaFileChange reports whether a pull request's edit to one
+	// schema file generates the same schema change on two different bases. The
+	// review gate asks it when a rebase combined the pull request's edit with a
+	// default branch edit to the same file, for a database type whose schema
+	// files can only be understood by running them, so an approval given before
+	// the rebase can keep counting.
+	//
+	// It is read-only: each version of the file is run inside a transaction
+	// that is always rolled back, so nothing persists on the target. An engine
+	// that cannot compare files returns UNIMPLEMENTED, and the caller treats the
+	// file as changed.
+	CompareSchemaFileChange(ctx context.Context, in *CompareSchemaFileChangeRequest, opts ...grpc.CallOption) (*CompareSchemaFileChangeResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -119,6 +135,19 @@ type TernClient interface {
 	//
 	// Unknown apply IDs return NOT_FOUND.
 	Progress(ctx context.Context, in *ProgressRequest, opts ...grpc.CallOption) (*ProgressResponse, error)
+	// BatchProgress answers Progress for several operations of one apply in a
+	// single call. The rollout members of one deployment share its apply, each
+	// with its own operation, so a caller driving many of them asks once per
+	// poll instead of once per member, and the apply, its tasks, and its
+	// operations are read once for all of them.
+	//
+	// Each entry of the answer is what Progress scoped to that operation would
+	// return, or the error it would fail with. An error that concerns the whole
+	// apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+	//
+	// A deployment that answers Unimplemented predates the RPC, and the caller
+	// asks Progress once per operation.
+	BatchProgress(ctx context.Context, in *BatchProgressRequest, opts ...grpc.CallOption) (*BatchProgressResponse, error)
 	// Logs returns a bounded recent window of durable apply logs. It is read-only.
 	Logs(ctx context.Context, in *LogsRequest, opts ...grpc.CallOption) (*LogsResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
@@ -147,6 +176,15 @@ type TernClient interface {
 	SkipRevert(ctx context.Context, in *SkipRevertRequest, opts ...grpc.CallOption) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
+	// DriverCapacity reports the drivers this deployment's operators run, so a
+	// caller can refuse up front an apply that could never have all its
+	// operations here waiting at a deferred cutover at once.
+	//
+	// A deployment that answers also runs the cutover of every operation a
+	// CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+	// must not send an apply started with defer_cutover to a deployment that
+	// answers Unimplemented.
+	DriverCapacity(ctx context.Context, in *DriverCapacityRequest, opts ...grpc.CallOption) (*DriverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -175,18 +213,32 @@ type TernClient interface {
 	//
 	// Execution resumes asynchronously (same as Apply). Use Progress to track.
 	Start(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*StartResponse, error)
-	// Volume adjusts the schema change speed/concurrency while running.
+	// StorageSchemaPlan reports the DDL outstanding between the embedded storage
+	// schema of the binary serving this RPC and the live storage database that
+	// binary uses. Unlike every other RPC here, it is about the serving
+	// instance's own bookkeeping database rather than a target database an
+	// operator asked to change.
 	//
-	// Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
-	// throughput). Affects chunk size, lock hold time, and throttle parameters.
+	// It is strictly read-only: it reads the live catalog and computes a diff,
+	// executing no DDL and taking no lock, so it is safe to call at any time,
+	// including while the same storage is being converged.
 	//
-	// Can be called multiple times during a running schema change. The engine
-	// is stopped and restarted internally to apply the new settings.
+	// The answer comes from the serving binary's own embedded files, which is the
+	// whole point of routing it here rather than computing it from a release pin
+	// on the caller's side: a caller's pin says which release it was built
+	// against, not what this storage converged to, and those diverge exactly when
+	// a deploy has failed to converge.
+	StorageSchemaPlan(ctx context.Context, in *StorageSchemaPlanRequest, opts ...grpc.CallOption) (*StorageSchemaPlanResponse, error)
+	// StorageSchemaApply converges the serving instance's own storage schema and
+	// reports what it found and what it left behind.
 	//
-	// Preconditions:
-	//   - Active schema change must exist for the database.
-	//   - Volume must be 1-11 inclusive.
-	Volume(ctx context.Context, in *VolumeRequest, opts ...grpc.CallOption) (*VolumeResponse, error)
+	// The convergence is the serving binary's startup bootstrap, called
+	// unchanged: the same differ, the same destructive-statement refusal, and the
+	// same advisory lock that serializes it against every other instance of that
+	// deployment. Destructive statements are refused unless the serving
+	// instance's storage config allows them or allow_destructive opts in for this
+	// call.
+	StorageSchemaApply(ctx context.Context, in *StorageSchemaApplyRequest, opts ...grpc.CallOption) (*StorageSchemaApplyResponse, error)
 }
 
 type ternClient struct {
@@ -227,6 +279,16 @@ func (c *ternClient) PlanDiff(ctx context.Context, in *PlanRequest, opts ...grpc
 	return out, nil
 }
 
+func (c *ternClient) CompareSchemaFileChange(ctx context.Context, in *CompareSchemaFileChangeRequest, opts ...grpc.CallOption) (*CompareSchemaFileChangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompareSchemaFileChangeResponse)
+	err := c.cc.Invoke(ctx, Tern_CompareSchemaFileChange_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *ternClient) Apply(ctx context.Context, in *ApplyRequest, opts ...grpc.CallOption) (*ApplyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ApplyResponse)
@@ -241,6 +303,16 @@ func (c *ternClient) Progress(ctx context.Context, in *ProgressRequest, opts ...
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProgressResponse)
 	err := c.cc.Invoke(ctx, Tern_Progress_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) BatchProgress(ctx context.Context, in *BatchProgressRequest, opts ...grpc.CallOption) (*BatchProgressResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchProgressResponse)
+	err := c.cc.Invoke(ctx, Tern_BatchProgress_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +369,16 @@ func (c *ternClient) Health(ctx context.Context, in *HealthRequest, opts ...grpc
 	return out, nil
 }
 
+func (c *ternClient) DriverCapacity(ctx context.Context, in *DriverCapacityRequest, opts ...grpc.CallOption) (*DriverCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DriverCapacityResponse)
+	err := c.cc.Invoke(ctx, Tern_DriverCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *ternClient) Stop(ctx context.Context, in *StopRequest, opts ...grpc.CallOption) (*StopResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StopResponse)
@@ -327,10 +409,20 @@ func (c *ternClient) Start(ctx context.Context, in *StartRequest, opts ...grpc.C
 	return out, nil
 }
 
-func (c *ternClient) Volume(ctx context.Context, in *VolumeRequest, opts ...grpc.CallOption) (*VolumeResponse, error) {
+func (c *ternClient) StorageSchemaPlan(ctx context.Context, in *StorageSchemaPlanRequest, opts ...grpc.CallOption) (*StorageSchemaPlanResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(VolumeResponse)
-	err := c.cc.Invoke(ctx, Tern_Volume_FullMethodName, in, out, cOpts...)
+	out := new(StorageSchemaPlanResponse)
+	err := c.cc.Invoke(ctx, Tern_StorageSchemaPlan_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) StorageSchemaApply(ctx context.Context, in *StorageSchemaApplyRequest, opts ...grpc.CallOption) (*StorageSchemaApplyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StorageSchemaApplyResponse)
+	err := c.cc.Invoke(ctx, Tern_StorageSchemaApply_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +441,7 @@ func (c *ternClient) Volume(ctx context.Context, in *VolumeRequest, opts ...grpc
 // rather than silently returning "unimplemented".
 //
 // Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
-// Control:   Stop, Start, Volume (can be called during Apply execution)
+// Control:   Stop, Start (can be called during Apply execution)
 //
 // State machine (per apply):
 //
@@ -389,6 +481,18 @@ type TernServer interface {
 	// plan_id — its result is intentionally not applyable. It is idempotent and
 	// safe to retry.
 	PlanDiff(context.Context, *PlanRequest) (*PlanDiffResponse, error)
+	// CompareSchemaFileChange reports whether a pull request's edit to one
+	// schema file generates the same schema change on two different bases. The
+	// review gate asks it when a rebase combined the pull request's edit with a
+	// default branch edit to the same file, for a database type whose schema
+	// files can only be understood by running them, so an approval given before
+	// the rebase can keep counting.
+	//
+	// It is read-only: each version of the file is run inside a transaction
+	// that is always rolled back, so nothing persists on the target. An engine
+	// that cannot compare files returns UNIMPLEMENTED, and the caller treats the
+	// file as changed.
+	CompareSchemaFileChange(context.Context, *CompareSchemaFileChangeRequest) (*CompareSchemaFileChangeResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -421,6 +525,19 @@ type TernServer interface {
 	//
 	// Unknown apply IDs return NOT_FOUND.
 	Progress(context.Context, *ProgressRequest) (*ProgressResponse, error)
+	// BatchProgress answers Progress for several operations of one apply in a
+	// single call. The rollout members of one deployment share its apply, each
+	// with its own operation, so a caller driving many of them asks once per
+	// poll instead of once per member, and the apply, its tasks, and its
+	// operations are read once for all of them.
+	//
+	// Each entry of the answer is what Progress scoped to that operation would
+	// return, or the error it would fail with. An error that concerns the whole
+	// apply, such as an unknown apply ID (NOT_FOUND), fails the call instead.
+	//
+	// A deployment that answers Unimplemented predates the RPC, and the caller
+	// asks Progress once per operation.
+	BatchProgress(context.Context, *BatchProgressRequest) (*BatchProgressResponse, error)
 	// Logs returns a bounded recent window of durable apply logs. It is read-only.
 	Logs(context.Context, *LogsRequest) (*LogsResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
@@ -449,6 +566,15 @@ type TernServer interface {
 	SkipRevert(context.Context, *SkipRevertRequest) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
+	// DriverCapacity reports the drivers this deployment's operators run, so a
+	// caller can refuse up front an apply that could never have all its
+	// operations here waiting at a deferred cutover at once.
+	//
+	// A deployment that answers also runs the cutover of every operation a
+	// CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
+	// must not send an apply started with defer_cutover to a deployment that
+	// answers Unimplemented.
+	DriverCapacity(context.Context, *DriverCapacityRequest) (*DriverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -477,18 +603,32 @@ type TernServer interface {
 	//
 	// Execution resumes asynchronously (same as Apply). Use Progress to track.
 	Start(context.Context, *StartRequest) (*StartResponse, error)
-	// Volume adjusts the schema change speed/concurrency while running.
+	// StorageSchemaPlan reports the DDL outstanding between the embedded storage
+	// schema of the binary serving this RPC and the live storage database that
+	// binary uses. Unlike every other RPC here, it is about the serving
+	// instance's own bookkeeping database rather than a target database an
+	// operator asked to change.
 	//
-	// Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
-	// throughput). Affects chunk size, lock hold time, and throttle parameters.
+	// It is strictly read-only: it reads the live catalog and computes a diff,
+	// executing no DDL and taking no lock, so it is safe to call at any time,
+	// including while the same storage is being converged.
 	//
-	// Can be called multiple times during a running schema change. The engine
-	// is stopped and restarted internally to apply the new settings.
+	// The answer comes from the serving binary's own embedded files, which is the
+	// whole point of routing it here rather than computing it from a release pin
+	// on the caller's side: a caller's pin says which release it was built
+	// against, not what this storage converged to, and those diverge exactly when
+	// a deploy has failed to converge.
+	StorageSchemaPlan(context.Context, *StorageSchemaPlanRequest) (*StorageSchemaPlanResponse, error)
+	// StorageSchemaApply converges the serving instance's own storage schema and
+	// reports what it found and what it left behind.
 	//
-	// Preconditions:
-	//   - Active schema change must exist for the database.
-	//   - Volume must be 1-11 inclusive.
-	Volume(context.Context, *VolumeRequest) (*VolumeResponse, error)
+	// The convergence is the serving binary's startup bootstrap, called
+	// unchanged: the same differ, the same destructive-statement refusal, and the
+	// same advisory lock that serializes it against every other instance of that
+	// deployment. Destructive statements are refused unless the serving
+	// instance's storage config allows them or allow_destructive opts in for this
+	// call.
+	StorageSchemaApply(context.Context, *StorageSchemaApplyRequest) (*StorageSchemaApplyResponse, error)
 }
 
 // UnimplementedTernServer should be embedded to have
@@ -507,11 +647,17 @@ func (UnimplementedTernServer) Plan(context.Context, *PlanRequest) (*PlanRespons
 func (UnimplementedTernServer) PlanDiff(context.Context, *PlanRequest) (*PlanDiffResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PlanDiff not implemented")
 }
+func (UnimplementedTernServer) CompareSchemaFileChange(context.Context, *CompareSchemaFileChangeRequest) (*CompareSchemaFileChangeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompareSchemaFileChange not implemented")
+}
 func (UnimplementedTernServer) Apply(context.Context, *ApplyRequest) (*ApplyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Apply not implemented")
 }
 func (UnimplementedTernServer) Progress(context.Context, *ProgressRequest) (*ProgressResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Progress not implemented")
+}
+func (UnimplementedTernServer) BatchProgress(context.Context, *BatchProgressRequest) (*BatchProgressResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchProgress not implemented")
 }
 func (UnimplementedTernServer) Logs(context.Context, *LogsRequest) (*LogsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Logs not implemented")
@@ -528,6 +674,9 @@ func (UnimplementedTernServer) SkipRevert(context.Context, *SkipRevertRequest) (
 func (UnimplementedTernServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Health not implemented")
 }
+func (UnimplementedTernServer) DriverCapacity(context.Context, *DriverCapacityRequest) (*DriverCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DriverCapacity not implemented")
+}
 func (UnimplementedTernServer) Stop(context.Context, *StopRequest) (*StopResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Stop not implemented")
 }
@@ -537,8 +686,11 @@ func (UnimplementedTernServer) Cancel(context.Context, *CancelRequest) (*CancelR
 func (UnimplementedTernServer) Start(context.Context, *StartRequest) (*StartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
 }
-func (UnimplementedTernServer) Volume(context.Context, *VolumeRequest) (*VolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Volume not implemented")
+func (UnimplementedTernServer) StorageSchemaPlan(context.Context, *StorageSchemaPlanRequest) (*StorageSchemaPlanResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StorageSchemaPlan not implemented")
+}
+func (UnimplementedTernServer) StorageSchemaApply(context.Context, *StorageSchemaApplyRequest) (*StorageSchemaApplyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StorageSchemaApply not implemented")
 }
 func (UnimplementedTernServer) testEmbeddedByValue() {}
 
@@ -614,6 +766,24 @@ func _Tern_PlanDiff_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Tern_CompareSchemaFileChange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompareSchemaFileChangeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).CompareSchemaFileChange(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_CompareSchemaFileChange_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).CompareSchemaFileChange(ctx, req.(*CompareSchemaFileChangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Tern_Apply_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ApplyRequest)
 	if err := dec(in); err != nil {
@@ -646,6 +816,24 @@ func _Tern_Progress_Handler(srv interface{}, ctx context.Context, dec func(inter
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TernServer).Progress(ctx, req.(*ProgressRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_BatchProgress_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchProgressRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).BatchProgress(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_BatchProgress_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).BatchProgress(ctx, req.(*BatchProgressRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -740,6 +928,24 @@ func _Tern_Health_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Tern_DriverCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DriverCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).DriverCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_DriverCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).DriverCapacity(ctx, req.(*DriverCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Tern_Stop_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StopRequest)
 	if err := dec(in); err != nil {
@@ -794,20 +1000,38 @@ func _Tern_Start_Handler(srv interface{}, ctx context.Context, dec func(interfac
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Tern_Volume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(VolumeRequest)
+func _Tern_StorageSchemaPlan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StorageSchemaPlanRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(TernServer).Volume(ctx, in)
+		return srv.(TernServer).StorageSchemaPlan(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Tern_Volume_FullMethodName,
+		FullMethod: Tern_StorageSchemaPlan_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(TernServer).Volume(ctx, req.(*VolumeRequest))
+		return srv.(TernServer).StorageSchemaPlan(ctx, req.(*StorageSchemaPlanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_StorageSchemaApply_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StorageSchemaApplyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).StorageSchemaApply(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_StorageSchemaApply_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).StorageSchemaApply(ctx, req.(*StorageSchemaApplyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -832,12 +1056,20 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Tern_PlanDiff_Handler,
 		},
 		{
+			MethodName: "CompareSchemaFileChange",
+			Handler:    _Tern_CompareSchemaFileChange_Handler,
+		},
+		{
 			MethodName: "Apply",
 			Handler:    _Tern_Apply_Handler,
 		},
 		{
 			MethodName: "Progress",
 			Handler:    _Tern_Progress_Handler,
+		},
+		{
+			MethodName: "BatchProgress",
+			Handler:    _Tern_BatchProgress_Handler,
 		},
 		{
 			MethodName: "Logs",
@@ -860,6 +1092,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Tern_Health_Handler,
 		},
 		{
+			MethodName: "DriverCapacity",
+			Handler:    _Tern_DriverCapacity_Handler,
+		},
+		{
 			MethodName: "Stop",
 			Handler:    _Tern_Stop_Handler,
 		},
@@ -872,8 +1108,12 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Tern_Start_Handler,
 		},
 		{
-			MethodName: "Volume",
-			Handler:    _Tern_Volume_Handler,
+			MethodName: "StorageSchemaPlan",
+			Handler:    _Tern_StorageSchemaPlan_Handler,
+		},
+		{
+			MethodName: "StorageSchemaApply",
+			Handler:    _Tern_StorageSchemaApply_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

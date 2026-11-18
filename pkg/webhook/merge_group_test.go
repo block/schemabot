@@ -56,19 +56,12 @@ func buildMergeGroupWebhookRequest(t *testing.T, action, headSHA string, secret 
 	return req
 }
 
-type createdCheckRun struct {
-	Name       string `json:"name"`
-	HeadSHA    string `json:"head_sha"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-}
-
-func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig) (*Handler, chan createdCheckRun) {
+func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig) (*Handler, chan checkRunCapture) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
-	created := make(chan createdCheckRun, 10)
+	created := make(chan checkRunCapture, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var c createdCheckRun
+		var c checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
 		created <- c
 		w.WriteHeader(http.StatusCreated)
@@ -107,7 +100,7 @@ func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "merge_group checks posted")
 
-	got := map[string]createdCheckRun{}
+	got := map[string]checkRunCapture{}
 	for range []int{0, 1} {
 		select {
 		case c := <-created:
@@ -148,6 +141,7 @@ func TestWebhookMergeGroupIgnoresNonChecksRequested(t *testing.T) {
 // A merge_group event for a repository SchemaBot does not manage gets no check:
 // SchemaBot's check is not required on that repo, so there is nothing to unblock.
 func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	h, created := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"org/allowed-repo": {}})
 
 	rr := httptest.NewRecorder()
@@ -161,6 +155,7 @@ func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
 		t.Fatalf("unexpected check run created for unregistered repo: %q", c.Name)
 	case <-time.After(100 * time.Millisecond):
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "merge_group", "checks_requested")
 }
 
 // A webhook redelivery for the same merge group must not create a duplicate
@@ -184,7 +179,7 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 7})
 	})
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var c createdCheckRun
+		var c checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
 		created <- c.Name
 		w.WriteHeader(http.StatusCreated)

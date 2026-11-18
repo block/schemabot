@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 
@@ -16,10 +17,13 @@ type ServeCmd struct{}
 // Run loads the server configuration from the environment and starts the
 // server. The command is a thin wrapper over serve.Run, which holds the server
 // implementation so it can also be embedded by other processes.
-func (cmd *ServeCmd) Run(g *Globals) error {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel(),
-	})).With("schemabot_version", g.Version)
+//
+// ctx is the CLI's signal-scoped context, and passing it is what makes the
+// process stop when it is told to: the CLI traps SIGINT and SIGTERM for every
+// command and cancels this context on the first one. A server running on a
+// context of its own would leave that signal with nothing to act on.
+func (cmd *ServeCmd) Run(ctx context.Context, g *Globals) error {
+	logger := newServerLogger(os.Stdout, g.Version)
 	slog.SetDefault(logger)
 
 	// Load server configuration from YAML file
@@ -28,10 +32,21 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	return serve.Run(context.Background(), serverConfig,
+	return serve.Run(ctx, serverConfig,
 		serve.WithLogger(logger),
 		serve.WithBuildInfo(g.Version, g.Commit, g.Date),
 	)
+}
+
+// newServerLogger builds the logger a server entrypoint installs as the process
+// default. The entrypoint owns the schemabot_version field: serve derives the
+// field itself only for a caller that supplies no build info, so an entrypoint
+// that does supply it has to attach the field here or the server's records name
+// no version at all.
+func newServerLogger(w io.Writer, version string) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
+		Level: logLevel(),
+	})).With("schemabot_version", version)
 }
 
 func logLevel() slog.Level {

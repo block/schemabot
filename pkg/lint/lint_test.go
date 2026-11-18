@@ -1,9 +1,11 @@
 package lint
 
 import (
+	"strings"
 	"sync"
 	"testing"
 
+	spiritlint "github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -78,6 +80,58 @@ func TestLintStatements_DropIndex(t *testing.T) {
 	assert.True(t, found, "expected invisible_index_before_drop error for DROP INDEX, got: %+v", results)
 }
 
+// The default linter classifies a destructive change by what it does, never
+// by the table's name: dropping a column and a unique index requires
+// --allow-unsafe on a table called schema_version exactly as on users.
+func TestPlanChangesDefaultConfigFlagsDropsOnEveryTableName(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `checksum` int, `script` varchar(100), " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_script` (`script`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+			desired := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `script` varchar(100), PRIMARY KEY (`id`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			require.Len(t, plan.Changes, 1)
+
+			change := plan.Changes[0]
+			assert.Equal(t, name, change.TableName)
+			assert.Contains(t, change.Statement, "DROP COLUMN `checksum`")
+			assert.Contains(t, change.Statement, "DROP INDEX `u_script`")
+			reason, unsafe := PlannedChangeUnsafeReason(change)
+			assert.True(t, unsafe, "dropping a column and an index on %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, reason)
+		})
+	}
+}
+
+// The default linter judges a table named schema_version the same way as any
+// other on every entry point: dropping it outright requires --allow-unsafe, and
+// a PostgreSQL schema that declares it gets the same findings as users.
+func TestDefaultConfigLintsSchemaVersionOnEveryPath(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			results, unsafe, err := New().LintStatements([]string{"DROP TABLE `" + name + "`"})
+			require.NoError(t, err)
+			assert.True(t, unsafe, "dropping %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, results)
+
+			pgResults, err := New().LintPostgresSchema(map[string]string{
+				name: "CREATE TABLE " + name + " (version integer);",
+			})
+			require.NoError(t, err)
+			require.NotEmpty(t, pgResults, "the default config must not exempt the PostgreSQL table %s", name)
+			for _, r := range pgResults {
+				assert.Equal(t, name, r.Table)
+			}
+		})
+	}
+}
+
 func TestLintStatements_SafeAlter(t *testing.T) {
 	linter := New()
 
@@ -143,6 +197,29 @@ func TestLintSchema_InvalidSQL(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// A schema file that declares two tables has both of them linted: the
+// `orders` table with an INT primary key and the `events` table with a latin1
+// charset each report their own finding against their own table.
+func TestLintSchema_MultipleCreateTablesInOneFile(t *testing.T) {
+	linter := New()
+
+	results, err := linter.LintSchema(map[string]string{
+		"tables.sql": "CREATE TABLE `orders` (`id` int NOT NULL, PRIMARY KEY (`id`)) " +
+			"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n" +
+			"CREATE TABLE `events` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) " +
+			"ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
+	})
+	require.NoError(t, err)
+
+	byTable := make(map[string][]string)
+	for _, r := range results {
+		byTable[r.Table] = append(byTable[r.Table], r.Linter)
+	}
+	assert.Equal(t, []string{"primary_key"}, byTable["orders"], "results: %+v", results)
+	assert.Equal(t, []string{"allow_charset"}, byTable["events"], "results: %+v", results)
+	assert.Len(t, byTable, 2, "results: %+v", results)
+}
+
 func TestPlanChangesConcurrent(t *testing.T) {
 	current := []table.TableSchema{{
 		Name:   "users",
@@ -182,4 +259,221 @@ func TestToEngineWarnings(t *testing.T) {
 	assert.Equal(t, "users", warnings[0].Table)
 	assert.Equal(t, "email", warnings[0].Column)
 	assert.Equal(t, "orders", warnings[1].Table)
+}
+
+// A declared column written as `boolean NOT NULL DEFAULT FALSE` is stored by
+// MySQL as `tinyint(1) NOT NULL DEFAULT '0'`, so the planner has to read the
+// keyword and the integer as the same default. Reading them as different is the
+// worst shape of planner bug in front of a live database: every plan emits an
+// ALTER that re-stores the value it already holds, the ALTER succeeds, and the
+// next plan emits it again — a schema that never converges and a merge gate
+// that never clears on its own.
+//
+// Integer columns are the ones that store the keyword as exactly 1/0, and they
+// are the only ones that converge here. Other types read the keyword through
+// their own rules — a `year` stores TRUE as 2001, a scaled `decimal` pads it to
+// '1.00', a `bit` stores b'1' — so on those the declared keyword and the stored
+// value stay genuinely different.
+func TestPlanChangesBooleanKeywordDefaultConverges(t *testing.T) {
+	converges := []struct {
+		name     string
+		declared string
+		live     string
+	}{
+		{
+			name:     "FALSE against the stored 0",
+			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "TRUE against the stored 1",
+			declared: "`flag` boolean NOT NULL DEFAULT TRUE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
+		},
+		{
+			name:     "the keyword in lower case",
+			declared: "`flag` boolean not null default false",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "the bool synonym",
+			declared: "`flag` bool NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "a wider integer type",
+			declared: "`flag` int NOT NULL DEFAULT FALSE",
+			live:     "`flag` int NOT NULL DEFAULT '0'",
+		},
+	}
+	for _, tt := range converges {
+		t.Run(tt.name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.live)}}
+			desired := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.declared)}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			assert.Empty(t, plan.Statements())
+		})
+	}
+
+	// Reading the keyword and the integer as the same default must not go so far
+	// as to read two genuinely different defaults as the same one. That failure
+	// skips a required ALTER instead of emitting a spurious one, so the column
+	// keeps a value the schema no longer declares — worse than the loop above,
+	// and invisible, because nothing is left for a later plan to re-emit.
+	plans := []struct {
+		name     string
+		declared string
+		live     string
+		want     string
+	}{
+		{
+			name:     "a default that really did change",
+			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
+			want:     "MODIFY COLUMN `flag` tinyint(1) NOT NULL DEFAULT FALSE",
+		},
+		{
+			name:     "a quoted string default against the stored 0",
+			declared: "`flag` varchar(8) NOT NULL DEFAULT 'FALSE'",
+			live:     "`flag` varchar(8) NOT NULL DEFAULT '0'",
+			want:     "MODIFY COLUMN `flag` varchar(8) NOT NULL DEFAULT 'FALSE'",
+		},
+	}
+	for _, tt := range plans {
+		t.Run(tt.name+" still plans an alter", func(t *testing.T) {
+			current := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.live)}}
+			desired := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.declared)}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			require.Len(t, plan.Statements(), 1)
+			assert.Contains(t, plan.Statements()[0], tt.want)
+		})
+	}
+}
+
+// tableWithColumn wraps the column definition under test in a table with a
+// primary key, so each case states only the column it is about.
+func tableWithColumn(column string) string {
+	return "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + column +
+		", PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+}
+
+// Every table SchemaBot creates must stay changeable through an online schema
+// change later. The MySQL and Vitess engines both plan through PlanChanges with
+// this linter's Spirit config, so a CREATE TABLE that Spirit could not alter is
+// reported there at error severity, which blocks the apply unless the operator
+// passes --allow-unsafe. A table with a usable primary key and no foreign keys
+// is not flagged.
+func TestPlanChangesFlagsTablesSpiritCannotAlter(t *testing.T) {
+	const suffix = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	current := []table.TableSchema{{
+		Name:   "customers",
+		Schema: "CREATE TABLE `customers` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))" + suffix,
+	}}
+	incompatible := []struct {
+		name   string
+		create string
+	}{
+		{
+			name:   "no primary key",
+			create: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL, `note` varchar(64) NOT NULL)" + suffix,
+		},
+		{
+			name:   "a FLOAT primary key",
+			create: "CREATE TABLE `events` (`id` float NOT NULL, PRIMARY KEY (`id`))" + suffix,
+		},
+		{
+			name: "a foreign key",
+			create: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `customer_id` bigint unsigned NOT NULL, " +
+				"PRIMARY KEY (`id`), KEY `customer_id` (`customer_id`), " +
+				"CONSTRAINT `events_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`))" + suffix,
+		},
+	}
+	for _, tt := range incompatible {
+		t.Run(tt.name, func(t *testing.T) {
+			desired := append(append([]table.TableSchema{}, current...), table.TableSchema{Name: "events", Schema: tt.create})
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			assert.Equal(t, []string{"error"}, spiritCompatibleSeverities(plan, "events"))
+		})
+	}
+
+	t.Run("a bigint primary key and no foreign keys", func(t *testing.T) {
+		desired := append(append([]table.TableSchema{}, current...), table.TableSchema{
+			Name:   "events",
+			Schema: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))" + suffix,
+		})
+		plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+		require.NoError(t, err)
+		require.Len(t, plan.Statements(), 1)
+		assert.Contains(t, plan.Statements()[0], "CREATE TABLE `events`")
+		assert.Empty(t, spiritCompatibleSeverities(plan, "events"))
+	})
+}
+
+// Narrowing a non-key column's type, or removing an ENUM or SET value, plans
+// with no error-severity finding, so the change does not need --allow-unsafe;
+// whether it loses data is left to the apply. Narrowing the primary key is
+// unsafe only through the key type policy, when the new type is not an
+// allowed key type.
+func TestPlanChangesNarrowingIsNotUnsafe(t *testing.T) {
+	const suffix = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	plan := func(t *testing.T, live, desired string) spiritlint.PlannedChange {
+		t.Helper()
+		current := []table.TableSchema{{Name: "t", Schema: "CREATE TABLE `t` (" + live + ")" + suffix}}
+		wanted := []table.TableSchema{{Name: "t", Schema: "CREATE TABLE `t` (" + desired + ")" + suffix}}
+		p, err := PlanChanges(current, wanted, nil, New().SpiritConfig())
+		require.NoError(t, err)
+		require.Len(t, p.Changes, 1)
+		return p.Changes[0]
+	}
+	withPK := func(col string) string {
+		return "`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + col + ", PRIMARY KEY (`id`)"
+	}
+
+	notUnsafe := []struct{ name, live, desired, wantDDL string }{
+		{"varchar shortened", "`c` varchar(255) NOT NULL", "`c` varchar(10) NOT NULL", "MODIFY COLUMN `c` varchar(10)"},
+		{"bigint to tinyint", "`c` bigint NOT NULL", "`c` tinyint NOT NULL", "MODIFY COLUMN `c` tinyint"},
+		{"enum value removed", "`c` enum('a','b','c') NOT NULL", "`c` enum('a','b') NOT NULL", "MODIFY COLUMN `c` enum('a','b')"},
+		{"set value removed", "`c` set('a','b','c') NOT NULL", "`c` set('a','b') NOT NULL", "MODIFY COLUMN `c` set('a','b')"},
+	}
+	for _, tt := range notUnsafe {
+		t.Run(tt.name, func(t *testing.T) {
+			change := plan(t, withPK(tt.live), withPK(tt.desired))
+			assert.Contains(t, change.Statement, tt.wantDDL)
+			reason, unsafe := PlannedChangeUnsafeReason(change)
+			assert.False(t, unsafe, "reason: %q", reason)
+			assert.Empty(t, change.Errors())
+		})
+	}
+
+	t.Run("primary key narrowed to a type outside the key type policy", func(t *testing.T) {
+		change := plan(t,
+			"`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)",
+			"`id` int unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)")
+		assert.Contains(t, change.Statement, "MODIFY COLUMN `id` int unsigned")
+		reason, unsafe := PlannedChangeUnsafeReason(change)
+		assert.True(t, unsafe)
+		assert.Contains(t, reason, `Primary key column "id" has type "int"`)
+	})
+}
+
+// spiritCompatibleSeverities returns the severity of each spirit_compatible
+// violation the plan reports against tableName.
+func spiritCompatibleSeverities(plan *spiritlint.Plan, tableName string) []string {
+	var severities []string
+	for _, change := range plan.Changes {
+		if change.TableName != tableName {
+			continue
+		}
+		for _, v := range change.Violations {
+			if v.Linter.Name() == "spirit_compatible" {
+				severities = append(severities, strings.ToLower(v.Severity.String()))
+			}
+		}
+	}
+	return severities
 }

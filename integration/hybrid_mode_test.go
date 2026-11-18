@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -13,14 +12,12 @@ import (
 	"testing"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/block/schemabot/e2e/testutil"
 	schemabotapi "github.com/block/schemabot/pkg/api"
@@ -51,7 +48,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	// Create two target databases: one for local mode, one for gRPC mode
 	// =========================================================================
 
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
 
@@ -92,7 +89,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	// Set up SchemaBot with hybrid config: databases + tern_deployments
 	// =========================================================================
 
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, schemabotDB)
 	schemabotStorage := mysqlstore.New(schemabotDB)
@@ -148,9 +145,6 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	t.Cleanup(func() { utils.CloseAndLog(server) })
 
 	addr := listener.Addr().String()
-
-	// Wait for server readiness
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
 
 	// =========================================================================
 	// Test 1: Plan for local-mode database (uses LocalClient)
@@ -320,7 +314,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	// Test 8: Verify the actual tables exist in their respective databases
 	// =========================================================================
 
-	localDB, err := sql.Open("mysql", localDSN)
+	localDB, err := sql.Open("block-mysql", localDSN)
 	require.NoError(t, err, "open local target db")
 	t.Cleanup(func() { utils.CloseAndLog(localDB) })
 
@@ -329,7 +323,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	require.NoError(t, err, "local_items table should exist in local database")
 	assert.Equal(t, "local_items", localTableName)
 
-	grpcTargetDB, err := sql.Open("mysql", grpcTargetDSN)
+	grpcTargetDB, err := sql.Open("block-mysql", grpcTargetDSN)
 	require.NoError(t, err, "open grpc target db")
 	t.Cleanup(func() { utils.CloseAndLog(grpcTargetDB) })
 
@@ -388,7 +382,7 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	// Open Tern storage (reuse the shared tern storage container)
-	storageDB, err := sql.Open("mysql", ternStorageDSN)
+	storageDB, err := sql.Open("block-mysql", ternStorageDSN)
 	if err != nil {
 		return "", fmt.Errorf("open tern storage: %w", err)
 	}
@@ -407,10 +401,11 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	t.Cleanup(func() { utils.CloseAndLog(localClient) })
 
 	// A dispatch queues the apply in Tern storage for the data plane's own
-	// operator; without this loop a dispatched apply would sit pending forever.
-	registerRemoteTern(dbName, localClient)
-	stopOperator := startRemoteTernOperator(storage, logger, "remote-tern-"+dbName)
-	t.Cleanup(stopOperator)
+	// operator; the shared remote-tern operator (started at package setup)
+	// claims it and routes the drive to this client by deployment.
+	if err := registerRemoteTern(storage, logger, dbName, localClient); err != nil {
+		return "", fmt.Errorf("register remote tern %s: %w", dbName, err)
+	}
 
 	// Wrap in gRPC server
 	grpcSrv := grpc.NewServer()
@@ -421,26 +416,13 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("listen grpc: %w", err)
 	}
+	// The listener is bound before Serve starts, so the address is usable as
+	// soon as this returns: a dial waits in the listen backlog until Serve
+	// accepts it, and an RPC waits while its connection is still connecting,
+	// until gRPC's connect timeout or the caller's deadline, whichever is
+	// first.
 	go func() { _ = grpcSrv.Serve(grpcListener) }()
 	t.Cleanup(func() { grpcSrv.GracefulStop() })
 
-	grpcAddress := grpcListener.Addr().String()
-
-	// Wait for server ready
-	conn, err := grpc.NewClient(grpcAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return "", fmt.Errorf("create grpc client: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	readyCtx, readyCancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer readyCancel()
-	conn.Connect()
-	for conn.GetState() != connectivity.Ready {
-		if !conn.WaitForStateChange(readyCtx, conn.GetState()) {
-			return "", fmt.Errorf("gRPC server not ready: context expired")
-		}
-	}
-
-	return grpcAddress, nil
+	return grpcListener.Addr().String(), nil
 }

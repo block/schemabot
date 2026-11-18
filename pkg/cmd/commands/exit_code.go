@@ -1,0 +1,95 @@
+package commands
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+// Process exit statuses beyond the CLI's usual 0 for success and 1 for
+// failure. A status is a distinct number only when a script would branch on it:
+// an operator reading the output can tell a converged database from an
+// outstanding one, but a pre-deploy job or a monitor cannot, and telling them
+// apart is the whole reason to run the command unattended.
+const (
+	// ExitStorageSchemaOutstanding says a storage schema diff succeeded and
+	// found work: statements are outstanding, refused, or waiting on manual
+	// remediation. The read itself worked, so it is not a failure — a caller
+	// that treated it as one could not distinguish it from an unreachable
+	// database, which is the distinction that matters when deciding whether to
+	// proceed with a deploy.
+	ExitStorageSchemaOutstanding = 2
+
+	// ExitInterrupted says the operator ended the command before it reached its
+	// usual outcome: a watch was stopped by Ctrl-C, SIGTERM, or the interactive
+	// watcher's detach key while its apply carries on, a schema change was
+	// never submitted, a checks backfill or webhook redrive stopped part-way
+	// through its sweep, a storage apply stopped while it waited on its
+	// convergence, or an init setup was cancelled. It is the status a shell
+	// reports for a process the interrupt signal ended, and the one the CLI
+	// exits with on a second signal, so a script sees one status for an
+	// interrupt however the command took it, and never mistakes it for the
+	// apply having failed or for it having completed.
+	ExitInterrupted = 130
+)
+
+// interrupted is the error a command returns once the operator's signal has
+// ended it and the command has already said so: silent, so the status is all
+// that is left to report, and carrying the cancellation for callers that
+// match on it.
+func interrupted(ctx context.Context) error {
+	return &ExitCodeError{Code: ExitInterrupted, Err: fmt.Errorf("%w: %w", ErrSilent, ctx.Err())}
+}
+
+// endedByInterrupt reports whether err is the operator's signal ending the
+// command: a cancellation that arrived once the command's own context was
+// done. A cancellation error under a context that is still live came from
+// something other than the operator, so it stays an ordinary failure.
+func endedByInterrupt(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && errors.Is(err, context.Canceled)
+}
+
+// detachedFromWatch is the error the interactive watcher returns once the
+// operator has left it while the apply carries on. Its view has already said
+// how to reattach, so the status is all that is left to report.
+func detachedFromWatch() error {
+	return &ExitCodeError{Code: ExitInterrupted, Err: ErrSilent}
+}
+
+// ExitCodeError carries the process exit status a command wants, alongside its
+// error. main honors the status and prints the error unless it is silent, so a
+// command chooses its status without reaching for os.Exit and skipping the
+// signal teardown around the run.
+type ExitCodeError struct {
+	Code int
+	Err  error
+}
+
+func (e *ExitCodeError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("exit status %d", e.Code)
+	}
+	return e.Err.Error()
+}
+
+func (e *ExitCodeError) Unwrap() error { return e.Err }
+
+// ExitCodeFor returns the process exit status an error asks for, defaulting to
+// 1 for an error that asks for nothing in particular. A nil error is status 0.
+func ExitCodeFor(err error) int {
+	if err == nil {
+		return 0
+	}
+	var coded *ExitCodeError
+	if errors.As(err, &coded) && coded.Code != 0 {
+		return coded.Code
+	}
+	return 1
+}
+
+// exitStorageSchemaOutstanding asks for that status without printing anything
+// further: the diff has already rendered everything the operator needs to see,
+// and an "Error:" line under a report that is not an error would misread it.
+func exitStorageSchemaOutstanding() error {
+	return &ExitCodeError{Code: ExitStorageSchemaOutstanding, Err: ErrSilent}
+}

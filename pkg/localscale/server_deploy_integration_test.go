@@ -10,23 +10,20 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/pkg/psclient"
-	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/e2e/testutil"
 )
-
-var drState = state.DeployRequest
 
 // TestDeployRequestDiffNoChanges verifies that CreateDeployRequest returns no_changes
 // when branch schema matches main schema (no DDL applied to branch).
 func TestDeployRequestDiffNoChanges(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "no-changes")
 
@@ -50,7 +47,7 @@ func TestDeployRequestDiffNoChanges(t *testing.T) {
 // DDL for CREATE TABLE operations and deploys them successfully.
 func TestDeployRequestDiffCreateTable(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 	branchName := createBranchWithDDL(t, ctx, "diff-ct",
 		map[string][]string{
@@ -79,7 +76,7 @@ func TestDeployRequestDiffCreateTable(t *testing.T) {
 // starts from a clean state and can apply successfully.
 func TestResetStateCanRunImmediatelyAfterDeploySubmit(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 
 	indexName := fmt.Sprintf("idx_reset_%d", time.Now().UnixNano())
@@ -124,7 +121,7 @@ func TestResetStateCanRunImmediatelyAfterDeploySubmit(t *testing.T) {
 // after skip-revert closes the revert window.
 func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 	branchName := createBranchWithDDL(t, ctx, "cleanup",
 		map[string][]string{
@@ -171,7 +168,7 @@ func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
 // and VSchema diff at deploy request creation.
 func TestBranchVSchemaSnapshotAndDiff(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "vschema-diff")
 
@@ -210,7 +207,7 @@ func TestBranchVSchemaSnapshotAndDiff(t *testing.T) {
 // in various terminal/non-actionable states (ready, complete, cancelled).
 func TestStateValidation(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	tests := []struct {
 		name    string
 		ddlCol  string
@@ -308,7 +305,7 @@ func TestStateValidation(t *testing.T) {
 // TestMultiKeyspaceDDLDeploy verifies DDL changes across both keyspaces in a single deploy.
 func TestMultiKeyspaceDDLDeploy(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 
 	// Cancel any pending Vitess migrations from earlier tests to avoid
@@ -341,7 +338,7 @@ func TestMultiKeyspaceDDLDeploy(t *testing.T) {
 // TestBranchDDLError verifies that invalid DDL fails via MySQL connection and the branch recovers.
 func TestBranchDDLError(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "ddl-error")
 
@@ -355,7 +352,7 @@ func TestBranchDDLError(t *testing.T) {
 
 	// Apply invalid DDL — table doesn't exist
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s", pw.Username, pw.PlainText, pw.Hostname, "testapp_sharded")
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open branch MySQL")
 	require.NoError(t, db.PingContext(ctx), "ping branch MySQL")
 	_, err = db.ExecContext(ctx, "ALTER TABLE nonexistent_table ADD COLUMN x INT")
@@ -374,73 +371,12 @@ func TestBranchDDLError(t *testing.T) {
 	require.Greater(t, len(result.Rows), 0, "expected 'ddl_error_recovery_col' in branch DB after recovery")
 }
 
-// TestThrottleRatioBoundary verifies throttle ratio boundary validation.
-func TestThrottleRatioBoundary(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
-	ctx := t.Context()
-	branchName := createBranchWithDDL(t, ctx, "throttle-bounds",
-		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE orders ADD COLUMN throttle_bounds_col varchar(50)"},
-		},
-		nil,
-	)
-
-	dr := createDeploy(t, ctx, branchName, false)
-	deploy(t, ctx, dr.Number, false)
-
-	// Valid: ratio 0.0 (full speed)
-	err := testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 0.0,
-	})
-	assert.NoError(t, err, "throttle ratio 0.0 should succeed")
-
-	// Valid: ratio 0.95 (max throttle per PlanetScale)
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 0.95,
-	})
-	assert.NoError(t, err, "throttle ratio 0.95 should succeed")
-
-	// Invalid: ratio 1.0 (exceeds PlanetScale max of 0.95)
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 1.0,
-	})
-	assert.Error(t, err, "throttle ratio 1.0 should fail")
-
-	// Invalid: ratio -0.1
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: -0.1,
-	})
-	assert.Error(t, err, "throttle ratio -0.1 should fail")
-
-	// Invalid: ratio 1.5
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 1.5,
-	})
-	assert.Error(t, err, "throttle ratio 1.5 should fail")
-}
-
 // TestRevertWindowExpiration verifies that the revert window auto-expires after
 // the configured RevertWindowDuration (5s in test config), transitioning from
 // complete_pending_revert to complete without manual intervention.
 func TestRevertWindowExpiration(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -497,7 +433,7 @@ func TestRevertWindowExpiration(t *testing.T) {
 // immediately and asynchronously transitions to "ready" when changes are detected.
 func TestDeployRequestPendingToReady(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -534,11 +470,152 @@ func TestDeployRequestPendingToReady(t *testing.T) {
 	})
 }
 
+// A deferred cutover is only as good as the setting the backend actually holds.
+// The setting is settled when the deploy request is created and no later call can
+// change it, so SchemaBot reads it back before deploying a deferred change and
+// refuses when it reads auto-cutover on or cannot read it at all. That read is
+// only meaningful if the deploy request reports the setting, so LocalScale has to
+// report it the way the PlanetScale API does: nested under the deployment.
+func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
+		cleanupActiveDeployRequests(t, cleanupCtx)
+	})
+
+	tests := []struct {
+		name        string
+		autoCutover bool
+	}{
+		{name: "cutover held for the operator", autoCutover: false},
+		{name: "cutover left automatic", autoCutover: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+
+			branchName := createBranchWithDDL(t, ctx, "cutover-setting",
+				map[string][]string{
+					"testapp_sharded": {"ALTER TABLE users ADD COLUMN cutover_setting_col VARCHAR(50) NULL"},
+				},
+				nil,
+			)
+
+			dr, err := testClient.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Branch:       branchName,
+				IntoBranch:   "main",
+				AutoCutover:  tt.autoCutover,
+			})
+			require.NoError(t, err, "CreateDeployRequest")
+			t.Cleanup(func() {
+				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				defer cancel()
+				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
+					Organization: testOrg,
+					Database:     testDB,
+					Number:       dr.Number,
+				})
+			})
+
+			autoCutover, err := testClient.DeployRequestAutoCutover(ctx, testOrg, testDB, dr.Number)
+			require.NoError(t, err, "DeployRequestAutoCutover")
+			assert.Equal(t, tt.autoCutover, autoCutover,
+				"deploy request should report the cutover setting it was created with")
+		})
+	}
+}
+
+// An instant-eligible change whose cutover the operator deferred is deployed
+// with a row copy so it has a gate to park at, and it stays eligible the whole
+// time. Progress therefore reads what the deployment ran as rather than what it
+// was eligible for, and that only works if the deploy request reports the two
+// separately — otherwise a change still copying rows and waiting for the
+// operator renders as already swapped.
+func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
+		cleanupActiveDeployRequests(t, cleanupCtx)
+	})
+
+	tests := []struct {
+		name       string
+		instantDDL bool
+		column     string
+	}{
+		// Each subtest deploys to the shared main branch, so each adds its
+		// own column — an earlier subtest's completed deploy is visible to
+		// the branches later subtests create.
+		{name: "deployed instantly", instantDDL: true, column: "instant_report_col_instant"},
+		{name: "eligible but deployed with a row copy", instantDDL: false, column: "instant_report_col_copy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+
+			branchName := createBranch(t, ctx, "instant-report")
+			applyBranchSchemaHTTP(t, ctx, branchName, map[string][]string{
+				"testapp_sharded": {fmt.Sprintf("ALTER TABLE users ADD COLUMN %s VARCHAR(50) NULL", tt.column)},
+			})
+
+			dr := createDeploy(t, ctx, branchName, true)
+			require.Equal(t, drState.Ready, dr.DeploymentState)
+			require.NotNil(t, dr.Deployment)
+			require.True(t, dr.Deployment.InstantDDLEligible, "ADD COLUMN NULL should be instant-eligible")
+			// Leak safety for the failure path only: a subtest that fails before
+			// it settles would otherwise leave this deploy active, and only one
+			// deploy can be active per database, so the next subtest could not
+			// create its own and would fail for a reason that hides the first
+			// failure. On the passing path the deploy is already complete and
+			// this cancel is refused — hence the discarded result.
+			t.Cleanup(func() {
+				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				defer cancel()
+				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
+					Organization: testOrg,
+					Database:     testDB,
+					Number:       dr.Number,
+				})
+			})
+
+			_, err := testClient.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Number:       dr.Number,
+				InstantDDL:   tt.instantDDL,
+			})
+			require.NoError(t, err, "DeployDeployRequest")
+
+			read, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Number:       dr.Number,
+			})
+			require.NoError(t, err, "GetDeployRequest")
+			require.NotNil(t, read.Deployment)
+			assert.Equal(t, tt.instantDDL, read.Deployment.InstantDDL,
+				"deploy request should report whether it was deployed instantly")
+			assert.True(t, read.Deployment.InstantDDLEligible,
+				"eligibility should stay reported independently of how the deploy ran")
+
+			// Only one deploy can be active per database — settle this deploy
+			// request so it cannot block the next subtest's deploy.
+			settleDeploy(t, ctx, dr.Number)
+		})
+	}
+}
+
 // TestDeployRequestPendingToNoChanges verifies that CreateDeployRequest returns "pending"
 // and transitions to "no_changes" when branch matches main.
 func TestDeployRequestPendingToNoChanges(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -567,7 +644,7 @@ func TestDeployRequestPendingToNoChanges(t *testing.T) {
 // immediately and asynchronously transitions to "queued" after DDL submission.
 func TestDeploySubmittingToQueued(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	cancelAllVitessMigrations(t, t.Context())
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -604,7 +681,7 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 // Uses the /apply-schema HTTP endpoint which tests ALGORITHM=INSTANT.
 func TestInstantDDLEligibility(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 
 	// ADD COLUMN NULL is instant in MySQL 8.4.
@@ -637,7 +714,7 @@ func TestInstantDDLEligibility(t *testing.T) {
 // transitions through in_progress_cancel → complete_cancel via the state processor.
 func TestCancelInProgressToCompleteCancel(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	cancelAllVitessMigrations(t, t.Context())
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -682,7 +759,7 @@ func TestCancelInProgressToCompleteCancel(t *testing.T) {
 // transitions through in_progress_revert_vschema.
 func TestRevertWithVSchemaTransitionalState(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	cleanupActiveDeployRequests(t, ctx)
@@ -725,7 +802,7 @@ func TestRevertWithVSchemaTransitionalState(t *testing.T) {
 // instead of complete_error.
 func TestCompleteRevertError(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	cleanupActiveDeployRequests(t, ctx)
@@ -764,7 +841,7 @@ func TestCompleteRevertError(t *testing.T) {
 // TestRefreshSchema verifies that syncing a branch re-snapshots schema from main.
 func TestRefreshSchema(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	ctx := t.Context()
 
 	// Create a branch and apply DDL to it
@@ -802,7 +879,7 @@ func TestRefreshSchema(t *testing.T) {
 // create branch once, then sync + apply DDL multiple times.
 func TestRefreshSchemaAndApply(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	deferCleanupActiveDeployRequests(t)
 	cancelAllVitessMigrations(t, t.Context())
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -818,14 +895,7 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	require.Equal(t, drState.Ready, dr.DeploymentState)
 
 	deploy(t, ctx, dr.Number, false)
-	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert, drState.Complete)
-	if dr.DeploymentState == drState.CompletePendingRevert {
-		_, err := testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-			Organization: testOrg, Database: testDB, Number: dr.Number,
-		})
-		require.NoError(t, err, "SkipRevert")
-		waitForDeployState(t, ctx, dr.Number, drState.Complete)
-	}
+	settleDeploy(t, ctx, dr.Number)
 
 	// Refresh schema for reuse
 	err := testClient.RefreshSchema(ctx, testOrg, testDB, branchName)
@@ -840,14 +910,7 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	require.Equal(t, drState.Ready, dr2.DeploymentState)
 
 	deploy(t, ctx, dr2.Number, false)
-	dr2 = waitForDeployState(t, ctx, dr2.Number, drState.CompletePendingRevert, drState.Complete)
-	if dr2.DeploymentState == drState.CompletePendingRevert {
-		_, err = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-			Organization: testOrg, Database: testDB, Number: dr2.Number,
-		})
-		require.NoError(t, err, "SkipRevert")
-		waitForDeployState(t, ctx, dr2.Number, drState.Complete)
-	}
+	settleDeploy(t, ctx, dr2.Number)
 
 	// Verify both columns exist on main
 	verifyColumnExists(t, "users", "reuse_col_1")

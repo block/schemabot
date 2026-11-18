@@ -5,6 +5,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
+
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -20,6 +23,7 @@ func previewDeferRunningOutput() {
 		Tables: []TableProgress{
 			{
 				TableName:       "orders",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)",
 				RowsCopied:      1800000,
 				RowsTotal:       2500000,
@@ -28,6 +32,7 @@ func previewDeferRunningOutput() {
 			},
 			{
 				TableName:       "products",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
 				RowsCopied:      450000,
 				RowsTotal:       1000000,
@@ -36,6 +41,7 @@ func previewDeferRunningOutput() {
 			},
 			{
 				TableName:       "users",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				RowsCopied:      6400000,
 				RowsTotal:       7200000,
@@ -63,6 +69,7 @@ func previewDeferSingleOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
@@ -88,16 +95,19 @@ func previewDeferWaitingOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
 			{
 				TableName: "products",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
 			{
 				TableName: "users",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
@@ -124,16 +134,19 @@ func previewDeferSeqWaitOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users",
+				Dialect:   schema.DialectMySQL,
 				DDL:       seqDDLs[0].ddl,
 				Status:    state.Apply.Completed,
 			},
 			{
 				TableName: "orders",
+				Dialect:   schema.DialectMySQL,
 				DDL:       seqDDLs[1].ddl,
 				Status:    state.Apply.WaitingForCutover,
 			},
 			{
 				TableName: "products",
+				Dialect:   schema.DialectMySQL,
 				DDL:       seqDDLs[2].ddl,
 				Status:    state.Apply.Pending,
 			},
@@ -160,6 +173,7 @@ func previewDeferStoppedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName:       "orders",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      1800000,
@@ -168,6 +182,7 @@ func previewDeferStoppedOutput() {
 			},
 			{
 				TableName:       "products",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      450000,
@@ -176,6 +191,7 @@ func previewDeferStoppedOutput() {
 			},
 			{
 				TableName:       "users",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      6400000,
@@ -186,7 +202,7 @@ func previewDeferStoppedOutput() {
 	}
 	WriteProgress(data)
 
-	fmt.Println("Use 'schemabot start -e staging <apply_id>' to resume.")
+	fmt.Print(FormatNextCommand(ResumeLabel, ControlCommand("start", "<apply_id>", "staging")))
 }
 
 func previewDeferDetachedOutput() {
@@ -198,18 +214,18 @@ func previewDeferDetachedOutput() {
 	fmt.Println("Row copy is complete and the shadow table is kept in sync.")
 	fmt.Println()
 	fmt.Println("To check status:")
-	fmt.Println("  schemabot status <apply_id>")
+	fmt.Printf("  %s status <apply_id>\n", cliname.Name())
 	fmt.Println()
 	fmt.Println("To proceed with cutover:")
-	fmt.Println("  schemabot cutover -e staging <apply_id>")
+	fmt.Printf("  %s cutover <apply_id> -e staging\n", cliname.Name())
 	fmt.Println()
 	fmt.Println("To abort the schema change:")
-	fmt.Println("  schemabot stop -e staging <apply_id>")
+	fmt.Printf("  %s stop <apply_id> -e staging\n", cliname.Name())
 }
 
 func previewDeferCuttingOutput() {
 	fmt.Println("Defer cutover: Cutting over in progress")
-	fmt.Println("(After user pressed Enter or ran `schemabot cutover`)")
+	fmt.Printf("(After user pressed Enter or ran `%s cutover`)\n", cliname.Name())
 	fmt.Println()
 
 	data := ProgressData{
@@ -218,14 +234,13 @@ func previewDeferCuttingOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-15 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)", Status: state.Apply.CuttingOver},
-			{TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)", Status: state.Apply.CuttingOver},
-			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)", Status: state.Apply.CuttingOver},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)", Status: state.Apply.CuttingOver},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)", Status: state.Apply.CuttingOver},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)", Status: state.Apply.CuttingOver},
 		},
 	}
 	WriteProgress(data)
 
-	fmt.Println("Cutover in progress. This typically completes within seconds.")
 	fmt.Println("Tables are being renamed atomically...")
 }
 
@@ -247,7 +262,7 @@ func previewDeferAllOutput() {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Println("---", s.name, strings.Repeat("-", 50-len(s.name)))
+		fmt.Println("---", s.name, strings.Repeat("-", max(50-len(s.name), 3)))
 		fmt.Println()
 		s.fn()
 	}

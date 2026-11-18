@@ -1,9 +1,11 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -23,7 +25,7 @@ func TestRenderPlanComment_LintShownOnPlanNotOnApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⚠️ **Lint Warnings**:", "the plan comment surfaces lint for review")
+	assert.Contains(t, plan, "💡 **Lint Warnings**:", "the plan comment surfaces lint for review")
 	assert.Contains(t, plan, "Column added without DEFAULT value")
 
 	data.IsLocked = true
@@ -32,11 +34,11 @@ func TestRenderPlanComment_LintShownOnPlanNotOnApply(t *testing.T) {
 	assert.NotContains(t, apply, "Column added without DEFAULT value")
 }
 
-// Unsafe-change warnings belong on the plan comment, where the operator reviews
-// them before applying. Unsafe changes only reach an apply after the operator
-// acknowledged them with --allow-unsafe (apply-confirm re-checks and blocks
-// otherwise), so the locked apply comment omits the warning block as noise.
-func TestRenderPlanComment_UnsafeShownOnPlanNotOnApply(t *testing.T) {
+// Unsafe-change warnings appear on the plan comment, where the operator reviews
+// them before applying with --allow-unsafe. The comment of an apply already
+// running leaves them out: the operator consented to them, and the DDL on
+// that comment shows what the apply runs.
+func TestRenderPlanComment_UnsafeShownOnPlanNotOnRunningApply(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
 		Changes: []KeyspaceChangeData{{
@@ -51,15 +53,16 @@ func TestRenderPlanComment_UnsafeShownOnPlanNotOnApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "**Issues**: **1** unsafe change detected", "the plan comment surfaces unsafe changes for review")
+	assert.Contains(t, plan, "**Issues**: 1 unsafe change detected", "the plan comment surfaces unsafe changes for review")
 	assert.Contains(t, plan, "DROP COLUMN is destructive")
 
 	data.IsLocked = true
 	apply := RenderPlanComment(data)
-	assert.NotContains(t, apply, "**Issues**: **1** unsafe change detected", "the locked apply comment omits the unsafe warning as noise")
+	assert.NotContains(t, apply, "**Issues**", "the running apply comment leaves the consented unsafe changes out")
 	assert.NotContains(t, apply, "DROP COLUMN is destructive")
-	assert.NotContains(t, apply, "Destructive drop guidance", "the drop guidance rides inside the unsafe block and is omitted with it")
+	assert.NotContains(t, apply, glyph.Tip+" Before allowing a destructive drop")
 	assert.Contains(t, apply, "DROP COLUMN `email`", "the DDL itself stays visible on the apply comment")
+	assert.Contains(t, apply, "**Applying automatically**")
 }
 
 // A sharded plan whose shards diverge renders "what applies where": one DDL
@@ -105,7 +108,8 @@ func TestRenderPlanComment_ShardedPartiallyApplied(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "Shards diverge — what applies where:", "a partially-applied keyspace is divergent")
-	assert.Contains(t, out, "Already applied — no change.", "satisfied shards are surfaced, not hidden")
+	assert.Contains(t, out, "**shard `-40`**\n\nNo schema changes detected\n\n", "satisfied shards are surfaced, not hidden")
+	assert.NotContains(t, out, "✅", "a keyspace with shards left to change is not all clear")
 	assert.Contains(t, out, "**shard `-40`**", "the satisfied shard is named")
 	assert.Contains(t, out, "**shards `40-80`, `80-c0`, `c0-`**", "the changing shards share one group")
 	assert.Equal(t, 1, strings.Count(out, "```sql"), "the satisfied group shows no empty code block")
@@ -153,6 +157,177 @@ func TestRenderPlanComment_ShardedOnlyPerShardDDLNotMiscounted(t *testing.T) {
 	assert.Contains(t, out, "```sql", "the per-shard DDL is rendered")
 }
 
+// A plan whose DDL is only per-shard is classified in the summary like any
+// other, and the count stays next to the vschema clause — a vschema update
+// must not hide DDL the plan will run.
+func TestRenderPlanComment_PerShardDDLCountedAlongsideVSchema(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	out := RenderPlanComment(PlanCommentData{
+		Database: "orders", Environment: "staging", DatabaseType: "vitess",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "orders_sharded",
+			// No namespace-level Statements — only per-shard.
+			Shards: []KeyspaceShardChange{
+				{Shard: "-80", Statements: []string{stmt}},
+				{Shard: "80-", Statements: []string{stmt}},
+			},
+			VSchemaChanged: true,
+			VSchemaDiff:    `{"tables": {"mutes": {}}}`,
+		}},
+	})
+
+	assert.Contains(t, out, "📋 **Plan**: **1** table to alter, **1** vschema update")
+}
+
+// A uniform plan across a wide keyspace leads with how much of the keyspace
+// the change covers instead of walling the comment with every range: the
+// heading reads "all N shards" and the names stay reachable behind a
+// collapsed block.
+func TestRenderPlanComment_ShardedUniformManyShardsCollapse(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	shards := make([]KeyspaceShardChange, 0, 32)
+	for i := range 32 {
+		shards = append(shards, KeyspaceShardChange{Shard: fmt.Sprintf("s%02d", i), Statements: []string{stmt}})
+	}
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "cdb_resolute_sharded",
+			Statements: []string{stmt},
+			Shards:     shards,
+		}},
+	})
+
+	assert.Contains(t, out, "<summary><b>all 32 shards</b></summary>", "a uniform wide keyspace leads with its coverage on one collapsed line")
+	assert.NotContains(t, out, "**shards `", "the heading does not enumerate ranges inline")
+	assert.Contains(t, out, "<summary><b>all 32 shards</b></summary>\n\n```\n"+
+		"s00  s01  s02  s03  s04  s05  s06  s07  s08  s09  s10  s11  s12  s13  s14  s15\n"+
+		"s16  s17  s18  s19  s20  s21  s22  s23  s24  s25  s26  s27  s28  s29  s30  s31\n"+
+		"```\n\n</details>",
+		"the collapsed block lists every shard name in a grid of as many columns as fit the row")
+	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown once")
+}
+
+// A divergent plan whose larger group is still a subset of the keyspace names
+// its coverage as a fraction ("N of M shards"), so the operator can tell at a
+// glance how much of the keyspace each change set touches.
+func TestRenderPlanComment_ShardedDivergentWideGroupShowsFraction(t *testing.T) {
+	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	drift := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255)"
+	shards := make([]KeyspaceShardChange, 0, 16)
+	for i := range 15 {
+		shards = append(shards, KeyspaceShardChange{Shard: fmt.Sprintf("s%02d", i), Statements: []string{idx}})
+	}
+	shards = append(shards, KeyspaceShardChange{Shard: "s15", Statements: []string{drift}})
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "cdb_resolute_sharded",
+			Statements: []string{idx},
+			Shards:     shards,
+		}},
+	})
+
+	assert.Contains(t, out, "Shards diverge — what applies where:")
+	assert.Contains(t, out, "<summary><b>15 of 16 shards</b></summary>", "a wide subset names its coverage as a fraction on one collapsed line")
+	assert.Contains(t, out, "**shard `s15`**", "a small group still names its shards inline")
+	assert.Contains(t, out, "ADD COLUMN `reason`", "the divergent statement is shown")
+}
+
+// An unsafe change spanning a wide set of shards states its keyspace coverage
+// on the finding line — the line the reviewer consents against must never
+// leave a subset reading like whole-keyspace coverage — while the full names
+// stay reachable in the DDL section's collapsed shard groups.
+func TestRenderPlanComment_UnsafeChangeWideShardsStatesCoverage(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN `x`"
+	names := make([]string, 0, 12)
+	shards := make([]KeyspaceShardChange, 0, 12)
+	for i := range 12 {
+		name := fmt.Sprintf("s%02d", i)
+		names = append(names, name)
+		shards = append(shards, KeyspaceShardChange{Shard: name, Statements: []string{stmt}})
+	}
+	cases := []struct {
+		name        string
+		totalShards int
+		want        string
+	}{
+		{name: "a subset states its fraction of the keyspace", totalShards: 32, want: "`mutes` (12 of 32 shards)"},
+		{name: "whole-keyspace coverage says all", totalShards: 12, want: "`mutes` (all 12 shards)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RenderPlanComment(PlanCommentData{
+				Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+				HasUnsafeChanges: true,
+				UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data", Shards: names, TotalShards: tc.totalShards}},
+				Changes: []KeyspaceChangeData{{
+					Keyspace: "cdb_resolute_sharded",
+					Shards:   shards,
+				}},
+			})
+
+			assert.Contains(t, out, tc.want, "the finding line states coverage against the keyspace")
+			assert.NotContains(t, out, "(shards `s00`", "the finding line does not enumerate ranges")
+		})
+	}
+}
+
+// The gate-line shard suffix reads inline names when few, and keyspace
+// coverage when wide; with no known total it falls back to a bare count
+// rather than overstating coverage.
+func TestPlanShardList(t *testing.T) {
+	wide := make([]string, 12)
+	for i := range wide {
+		wide[i] = fmt.Sprintf("s%02d", i)
+	}
+	cases := []struct {
+		name        string
+		shards      []string
+		totalShards int
+		want        string
+	}{
+		{name: "one shard reads inline", shards: []string{"-40"}, totalShards: 4, want: "shard `-40`"},
+		{name: "few shards read inline", shards: []string{"-40", "40-80"}, totalShards: 4, want: "shards `-40`, `40-80`"},
+		{name: "a wide subset states its fraction", shards: wide, totalShards: 32, want: "12 of 32 shards"},
+		{name: "a wide whole keyspace says all", shards: wide, totalShards: 12, want: "all 12 shards"},
+		{name: "an unknown total falls back to a bare count", shards: wide, totalShards: 0, want: "12 shards"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, planShardList(tc.shards, tc.totalShards))
+		})
+	}
+}
+
+// The inline/collapsed pivot sits exactly at shardNamesInlineLimit: a group
+// at the limit still names every shard inline, one past it leads with its
+// coverage on a collapsed line.
+func TestWriteShardGroupHeading_InlineLimitBoundary(t *testing.T) {
+	shardNames := func(n int) []string {
+		names := make([]string, n)
+		for i := range names {
+			names[i] = fmt.Sprintf("s%02d", i)
+		}
+		return names
+	}
+
+	t.Run("at the limit the shards read inline", func(t *testing.T) {
+		var sb strings.Builder
+		writeShardGroupHeading(&sb, shardNames(shardNamesInlineLimit), shardNamesInlineLimit)
+		assert.Contains(t, sb.String(), "**shards `s00`", "the heading names shards inline")
+		assert.Contains(t, sb.String(), fmt.Sprintf("`s%02d`**", shardNamesInlineLimit-1), "every shard is named")
+		assert.NotContains(t, sb.String(), "<details>", "no collapsed block at the limit")
+	})
+
+	t.Run("past the limit the heading collapses to coverage", func(t *testing.T) {
+		var sb strings.Builder
+		writeShardGroupHeading(&sb, shardNames(shardNamesInlineLimit+1), shardNamesInlineLimit+1)
+		assert.Contains(t, sb.String(), fmt.Sprintf("<summary><b>all %d shards</b></summary>", shardNamesInlineLimit+1), "the heading leads with coverage")
+		assert.Contains(t, sb.String(), "```\ns00  s01  s02  s03  s04  s05  s06  s07  s08\n```", "the collapsed block lists the names in a grid")
+	})
+}
+
 // An unsafe change confined to one shard is flagged with that shard in the
 // unsafe-changes warning.
 func TestRenderPlanComment_UnsafeShardChangeShowsShard(t *testing.T) {
@@ -172,7 +347,64 @@ func TestRenderPlanComment_UnsafeShardChangeShowsShard(t *testing.T) {
 		}},
 	})
 
-	assert.Contains(t, out, "**Issues**: **1** unsafe change detected")
+	assert.Contains(t, out, "**Issues**: 1 unsafe change detected")
 	assert.Contains(t, out, "`mutes` (shard `40-80`)", "the unsafe change names the shard it applies to")
 	assert.Contains(t, out, "DROP COLUMN `x`", "the drop is shown in that shard's combined ALTER")
+}
+
+// Plan errors can carry raw engine text with internal endpoints and newlines.
+// Each rendered error bullet must redact endpoints and stay on one Markdown
+// line so an error cannot escape its list item.
+func TestRenderPlanComment_ErrorsSanitized(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{"dial tcp db-primary.internal:3306: refused\nsecond line"},
+	})
+
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, out, "- dial tcp [endpoint redacted]: refused second line\n",
+		"the error bullet stays on one line")
+}
+
+// An error entry that sanitizes to nothing renders no bullet, and a plan whose
+// errors all sanitize to nothing renders no Errors section at all.
+func TestRenderPlanComment_EmptyErrorsRenderNothing(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{" \n\t ", "real failure"},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "- real failure\n")
+	assert.NotContains(t, out, "- \n", "a whitespace-only error renders no bullet")
+
+	data.Errors = []string{" \n\t "}
+	out = RenderPlanComment(data)
+	assert.NotContains(t, out, "**Errors**:", "an all-empty errors list renders no section")
+}
+
+// HTML in an error is escaped after sanitization, so a message quoting markup
+// (e.g. a parse error echoing a <details> tag) renders as text instead of
+// folding the rest of the comment into an unlabeled collapse.
+func TestRenderPlanComment_ErrorsEscapeHTML(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{"read <nil> & retry"},
+	})
+
+	assert.Contains(t, out, "- read &lt;nil&gt; &amp; retry\n",
+		"HTML metacharacters are escaped after sanitization")
+	assert.NotContains(t, out, "<nil>")
 }

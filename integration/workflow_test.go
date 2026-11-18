@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +22,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -33,27 +36,37 @@ import (
 // testServer holds the address and storage of a running SchemaBot HTTP server.
 type testServer struct {
 	Addr    string
-	Storage *mysqlstore.Storage
+	Storage storage.Storage
 	Service *schemabotapi.Service
 }
+
+// testDBSeq disambiguates databases created by createTestDB within one run.
+var testDBSeq atomic.Int64
 
 // createTestDB creates a uniquely-named test database and returns its name and DSN.
 // Cleanup is registered via t.Cleanup.
 func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
 	t.Helper()
 
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 
-	appDBName = prefix + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
-	_, err = targetDB.ExecContext(t.Context(), "CREATE DATABASE IF NOT EXISTS "+appDBName)
-	require.NoError(t, err, "create app database")
+	// The sequence number keeps names unique when the clock does not advance
+	// between calls. CREATE DATABASE without IF NOT EXISTS fails loudly rather
+	// than handing a test a database another test already populated.
+	appDBName = fmt.Sprintf("%s%d_%d", prefix, time.Now().UnixNano(), testDBSeq.Add(1))
+	_, err = targetDB.ExecContext(t.Context(), "CREATE DATABASE `"+appDBName+"`")
+	require.NoError(t, err, "create app database %s", appDBName)
 
 	appDSN = strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
 
 	t.Cleanup(func() {
-		_, _ = targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+appDBName)
-		_ = targetDB.Close()
+		// t.Context() is already cancelled when cleanup runs.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		_, err := targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS `"+appDBName+"`")
+		assert.NoError(t, err, "drop app database %s", appDBName)
+		assert.NoError(t, targetDB.Close(), "close target db")
 	})
 
 	return appDBName, appDSN
@@ -69,35 +82,22 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 
 func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration) testServer {
 	t.Helper()
-	return startTestServerWithOptions(t, appDBName, appDSN, operatorInterval, false)
-}
-
-// startTestServerOperator starts a test server whose operator claims work at
-// the apply_operations level (operator_claim_operations enabled).
-func startTestServerOperator(t *testing.T, appDBName, appDSN string) testServer {
-	t.Helper()
-	return startTestServerWithOptions(t, appDBName, appDSN, 200*time.Millisecond, true)
-}
-
-func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration, operatorClaimOperations bool) testServer {
-	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, schemabotDB)
-	storage := mysqlstore.New(schemabotDB)
+	store := mysqlstore.New(schemabotDB)
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
 		Type:      "mysql",
 		TargetDSN: appDSN,
-	}, storage, logger)
+	}, store, logger)
 	require.NoError(t, err, "create local client")
 
 	serverConfig := &schemabotapi.ServerConfig{
-		OperatorClaimOperations: &operatorClaimOperations,
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			appDBName: {
 				Type: "mysql",
@@ -107,7 +107,7 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operator
 			},
 		},
 	}
-	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
+	svc := schemabotapi.New(store, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
 	startTestOperatorWithInterval(t, svc, operatorInterval)
@@ -121,9 +121,6 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operator
 
 	addr := listener.Addr().String()
 
-	// Wait for HTTP server readiness
-	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
-
 	t.Cleanup(func() {
 		_ = server.Close()
 		_ = svc.Close()
@@ -131,7 +128,7 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operator
 		_ = schemabotDB.Close()
 	})
 
-	return testServer{Addr: addr, Storage: storage, Service: svc}
+	return testServer{Addr: addr, Storage: store, Service: svc}
 }
 
 func startTestOperator(t *testing.T, svc *schemabotapi.Service) {
@@ -298,7 +295,7 @@ func TestFullWorkflow_Spirit_PlanApplyVerify(t *testing.T) {
 	waitForState(t, "http://"+ts.Addr, applyID, "completed", 10*time.Second)
 
 	// Step 3: Verify the table exists in the target database
-	targetConn, err := sql.Open("mysql", appDSN)
+	targetConn, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open target connection")
 	defer func() { _ = targetConn.Close() }()
 
@@ -368,7 +365,7 @@ func TestFullWorkflow_Spirit_DDLScenarios(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for verification queries
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -648,7 +645,7 @@ func TestFullWorkflow_Spirit_UnsafeChangeDetection(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for setup
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -819,7 +816,7 @@ func TestCLI_PlanApply(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for verification
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -976,7 +973,7 @@ func TestFullWorkflow_Spirit_DDLWithProgress(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for seeding and verification
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -1271,16 +1268,18 @@ func TestFullWorkflow_Spirit_MySQLFailure(t *testing.T) {
 
 	endpoint := "http://" + ts.Addr
 
-	// Schema with foreign key to non-existent table - passes TiDB parser but fails MySQL
+	// Schema with a unique key longer than InnoDB's 3072-byte limit - passes the
+	// parser and lint but fails MySQL. A unique key cannot be shortened to a
+	// prefix, so MySQL rejects it in every sql_mode.
 	schemaSQL := `
 CREATE TABLE orders (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-	user_id BIGINT NOT NULL,
+	note VARCHAR(4000) NOT NULL,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-	FOREIGN KEY (user_id) REFERENCES users(id)
+	UNIQUE KEY idx_note (note)
 );`
 
-	// Step 1: Plan - should succeed (we don't validate FK references)
+	// Step 1: Plan - should succeed (index key length is not validated)
 	planResp := postJSON(t, endpoint+"/api/plan", map[string]any{
 		"database":    appDBName,
 		"environment": "staging",
@@ -1340,11 +1339,18 @@ CREATE TABLE orders (
 
 	// Verify the MySQL error was surfaced in Progress.ErrorMessage.
 	assert.NotEmpty(t, errorMessage, "expected error_message to be set")
-	// MySQL error for FK to non-existent table should mention "users" or "referenced"
-	lowerErr := strings.ToLower(errorMessage)
-	assert.True(t,
-		strings.Contains(lowerErr, "users") || strings.Contains(lowerErr, "referenced") || strings.Contains(lowerErr, "foreign"),
-		"error message should mention FK issue, got: %s", errorMessage)
+
+	// A unique key longer than InnoDB's limit fails with error 1071. What the
+	// operator reads is SchemaBot's account of that code, not the target's —
+	// target error text can carry internal detail, and this message is
+	// rendered on a pull request.
+	//
+	// The reason is asserted as a substring because the apply layer prefixes
+	// the failing table, and which of the two the poll catches depends on when
+	// it lands relative to the task being recorded.
+	assert.Contains(t, errorMessage, mysqlerr.ReasonFromText("(errno 1071)"))
+	assert.NotContains(t, errorMessage, "Specified key was too long",
+		"the target's own wording must not reach the pull request")
 	t.Logf("Correctly captured MySQL error: %s", errorMessage)
 }
 
@@ -1377,8 +1383,8 @@ CREATE TABLE aaa_first (
 		"bbb_fails.sql": `
 CREATE TABLE bbb_fails (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-	ref_id BIGINT NOT NULL,
-	FOREIGN KEY (ref_id) REFERENCES nonexistent_table(id)
+	note VARCHAR(4000) NOT NULL,
+	UNIQUE KEY idx_note (note)
 );`,
 		"ccc_cancelled.sql": `
 CREATE TABLE ccc_cancelled (
@@ -1467,7 +1473,7 @@ CREATE TABLE ccc_cancelled (
 	assert.Equal(t, state.Task.Pending, tableStates["ccc_cancelled"], "ccc_cancelled")
 
 	// Verify aaa_first table was actually created in DB (partial success committed)
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	defer func() { _ = targetDB.Close() }()
 

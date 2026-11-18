@@ -14,8 +14,13 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+env:
+  # The installed minikube and the key of its cached node image and preload
+  # read this one value, so a version bump cannot leave a stale cache entry
+  # that exactly matches the old key.
+  MINIKUBE_VERSION: "1.39.0"
 jobs:
-  # Detect whether the change touches anything other than *.md / docs/**.
+  # Detect whether the change touches any non-markdown file.
   # PRs that touch only docs skip the heavy jobs below; pushes (main/tags)
   # always run. Fails open: if detection fails, treat as code change.
   changes:
@@ -33,11 +38,19 @@ jobs:
         continue-on-error: true
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
         with:
+          # The action's default quantifier ORs the patterns, and '**'
+          # matches every file, so without 'every' this filter reports
+          # code=true on every PR and the docs-only skip never fires.
+          # 'every' ANDs them: skip only Markdown, the docs TOC manifest,
+          # and documentation images. Keep image exclusions scoped to docs/
+          # and assets/ so scripts and Go files there still count as code.
+          predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
               - '!**/*.md'
-              - '!docs/**'
+              - '!docs/.toc-manifest'
+              - '!{docs,assets}/**/*.{svg,png,jpg,jpeg,gif,webp,ico}'
       - name: "Resolve code-change and coverage flags"
         id: out
         shell: bash
@@ -91,7 +104,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build"
         run: go build -v ./...
@@ -100,13 +113,24 @@ jobs:
           go vet ./...
           go vet -tags=integration ./...
           go vet -tags=e2e ./e2e/...
+      # Compile (without running) the consumer module's test binary so the
+      # saved cache covers its dependency delta — the module resolves newer
+      # versions than the root go.sum, which the cache key also hashes.
+      - name: "Warm consumer-module cache"
+        working-directory: e2e/consumermodule
+        run: go test -race -run '^$' ./...
+      # The e2e and LocalScale jobs build static linux binaries, and turning
+      # cgo off changes the build of every package, so none of the builds above
+      # cover them. Compiling them here puts that build in the saved cache.
+      - name: "Warm static-binary cache"
+        run: CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./pkg/cmd ./cmd/localscale
       - name: "Save Go cache"
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
 
   unit:
     name: "Unit Tests"
@@ -127,17 +151,73 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # At the end of a build the go command deletes build cache entries it
+      # has not used for several days, unless trim.txt in the cache records a
+      # recent trim. Every file in a restored cache is as old as the day the
+      # cache was saved, and some tests run a go build of their own. On an old
+      # cache the first of those builds would delete entries that later tests
+      # load packages from, and those tests would then compile their
+      # dependencies from source inside their own deadlines. This job never
+      # saves the cache, so nothing is lost by keeping it whole.
+      - name: "Keep the restored Go build cache"
+        run: |
+          set -euo pipefail
+          gocache="$(go env GOCACHE)"
+          mkdir -p "$gocache"
+          date +%s > "$gocache/trim.txt"
       - name: "Test"
         run: make test-unit
+      - name: "Consumer-module startup test"
+        run: make test-consumer-module
 
   integration:
-    name: "Integration Tests"
+    name: "Integration Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # ubuntu-26.04 ships Docker 29, which stops publishing a container's ports
+    # for good after a start fails on a taken port, so the sample database in
+    # TestSampleDatabaseLifecycle never comes back. Return to ubuntu-latest
+    # once a Docker release keeps the container's network after a failed start.
+    runs-on: ubuntu-24.04
+    # Sized so setup (checkout, Go, cache restore, image prepull — about two
+    # minutes) plus go test's own per-binary timeout below can land inside
+    # the job budget: a hung binary that starts early in the shard then
+    # panics with its goroutine dump instead of the runner cancelling the
+    # job first. The Test step's comment covers when that dump is and is not
+    # guaranteed.
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shard names are the answer to "which shard ran my test?", so they
+          # name the packages they select rather than describing the split.
+          # Each name maps to a selector in the "Test" step below; per-package
+          # is derived there as the exact inverse of the dedicated selectors,
+          # so the partition cannot drift and an unmapped shard fails loudly.
+          #
+          # The cross-package suite under ./integration is the longest single
+          # shard and cannot be shortened by package parallelism, so it gets its
+          # own runner rather than setting the wall time for everything else.
+          - shard: ./integration
+          # The two dominant per-package binaries (~2 min and ~1.7 min), peeled
+          # onto their own runner so the long tail keeps headroom under the job
+          # budget.
+          - shard: tern-webhook
+          # The service package: its storage-backed tests share one MySQL
+          # testcontainer and start a PostgreSQL testcontainer each, on top of
+          # a large body of unit tests in the same binary. Running it beside
+          # other container-heavy binaries contends on the shared Docker
+          # daemon, so it keeps an uncontended runner; fold it back into
+          # per-package once its wall clock has settled well below the other
+          # shards' for a stretch of main runs.
+          - shard: pkg/api
+          # Every other integration-tagged package: tests that live beside the
+          # code they cover, spread across ./pkg, ./cmd and ./e2e. A newly
+          # added package is picked up here without touching this file.
+          - shard: per-package
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -151,14 +231,95 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so transient registry outages
+      # surface here as a named, retryable, fail-fast step instead of as many
+      # parallel testcontainer "context deadline exceeded" test failures.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            mysql:8.4 \
+            postgres:16 \
+            postgres:17 \
+            ministackorg/ministack:1.5.10 \
+            testcontainers/ryuk:0.13.0
+      - name: "Pre-pull Supabase PostgreSQL"
+        if: matrix.shard == 'per-package'
+        run: scripts/ci/prepull-images.sh supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
       - name: "Test"
         # Cap package-level parallelism: the integration suite runs many heavy
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
         # MySQL, starving operator claim loops and causing spurious pending-apply
-        # timeouts. Two lanes keeps wall time within the job budget.
-        run: go test -tags=integration -timeout=10m -count=1 -p=2 $(go list -tags=integration ./... | grep -v /localscale)
+        # timeouts. Two packages at a time keeps wall time within the job budget.
+        #
+        # Go's own timeout sits below the job's so a hung test panics with a
+        # goroutine dump naming the culprit, instead of the runner cancelling the
+        # job and leaving a bare "cancelled" that reads like a plain failure. It
+        # is per test binary and starts when that binary does, so the dump is
+        # guaranteed only where a binary's own deadline lands inside the job's:
+        # one starting late in a long shard can still be cancelled without one.
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          # Dedicated shard selectors, keyed by shard name. per-package greps
+          # with the inverse of this map's union, so every integration-tagged
+          # package lands in exactly one shard by construction: a new entry
+          # here is excluded from per-package automatically, and narrowing or
+          # widening a selector moves packages between shards — it can never
+          # run one twice or drop one from all of them. The one edge this
+          # cannot enforce: an entry here without a matching matrix leg above
+          # silently drops its packages from every shard (the reverse, a leg
+          # without an entry, fails loudly below) — add both together.
+          #
+          # ./integration is anchored at the module root so only the top-level
+          # cross-package suite takes that shard. A future nested package named
+          # `integration` belongs beside the code it covers, in per-package.
+          # pkg/tern, pkg/webhook and pkg/api are `$`-anchored so their
+          # subpackages stay in per-package.
+          declare -A selectors=(
+            ["./integration"]='^github\.com/block/schemabot/integration(/|$)'
+            ["tern-webhook"]='^github\.com/block/schemabot/pkg/(tern|webhook)$'
+            ["pkg/api"]='^github\.com/block/schemabot/pkg/api$'
+          )
+          if [ "$SHARD" = "per-package" ]; then
+            match="-vE"
+            selector="($(IFS='|'; echo "${selectors[*]}"))"
+          elif [ -n "${selectors[$SHARD]:-}" ]; then
+            match="-E"
+            selector="${selectors[$SHARD]}"
+          else
+            echo "::error::shard '$SHARD' has no selector mapping; add one here"
+            exit 1
+          fi
+          all=$(go list -tags=integration ./...)
+          set +e
+          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$match" "$selector")
+          selector_status=$?
+          set -e
+          # grep exits 1 when a shard matches nothing and 2 when the selector
+          # itself is unusable. Under `set -e` either would abort here with a
+          # bare exit status, so both are absorbed and reported apart: a broken
+          # selector says so rather than being described as an empty shard.
+          if [ "$selector_status" -gt 1 ]; then
+            echo "::error::shard '$SHARD' selector $selector is unusable (grep exited $selector_status)"
+            exit 1
+          fi
+          # An empty shard would hand `go test` no packages and silently test the
+          # working directory instead, reporting success for work never run.
+          if [ -z "$pkgs" ]; then
+            echo "::error::shard '$SHARD' selected no packages"
+            exit 1
+          fi
+          # Print the selection so a reader can confirm which shard owns a given
+          # test from the log itself, rather than inferring it from the shard
+          # name and this file's grep expressions.
+          echo "::group::shard '$SHARD' runs $(echo "$pkgs" | wc -l | tr -d ' ') packages"
+          echo "$pkgs" | sed 's|^github.com/block/schemabot|.|'
+          echo "::endgroup::"
+          go test -tags=integration -timeout=8m -count=1 -p=2 $pkgs
 
   localscale-matrix:
     name: "LocalScale Matrix"
@@ -171,7 +332,18 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # Only the tree the discovery below reads. A full checkout of this
+      # repository takes most of the job's one-minute budget on a slow runner
+      # and cancels the job; a sparse, blobless one takes seconds.
+      # The sparse path must cover every path the discovery step greps: a
+      # path outside it is absent from the checkout, so grep exits 2 and the
+      # job fails as an unusable tree rather than discovering nothing. The
+      # filter is spelled out, rather than left to the action's default for
+      # a sparse checkout, so the clone stays blobless across action bumps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: pkg/localscale
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -181,7 +353,30 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -h -o 'func Test[^(]*' pkg/localscale/*_test.go | sed 's/func //' | grep -v '/' | sort)
+          # Searched recursively: the shard runner tests every package under
+          # pkg/localscale that carries test files, so a test in a nested
+          # package that no shard filter names would be run by nobody.
+          # grep exits 1 when no test file matches and 2 when the tree is
+          # unusable. Under `set -e` either would abort here with a bare exit
+          # status, so both are absorbed and reported apart: a missing or
+          # unreadable tree says so rather than being described as an empty
+          # test set. The status check below is the fail-closed gate, not
+          # just the label: with `set +e` in force, grep still prints the
+          # matches from every file it could read, so without the check one
+          # unreadable test file's tests would drop out of every shard filter
+          # and the job would pass with nobody running them.
+          # A Go identifier cannot contain `/`, so a match carrying
+          # one came from prose that mentions `func Test`, not from a
+          # declaration, and is dropped after discovery.
+          set +e
+          matches=$(grep -r --include='*_test.go' -h -o 'func Test[^(]*' pkg/localscale)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::pkg/localscale is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed -e 's/func //' -e '/\//d' | sort -u)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no localscale tests discovered"
@@ -208,7 +403,11 @@ jobs:
 
   localscale:
     name: "LocalScale Tests (${{ matrix.shard }})"
-    needs: [changes, build, localscale-matrix]
+    # Restores the Go cache directly, like the Integration and E2E jobs, rather
+    # than waiting for Build to save it. The cache already on the default
+    # branch covers everything but this change's own packages, and compiling
+    # those here costs far less than waiting for Build to finish.
+    needs: [changes, localscale-matrix]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -229,23 +428,44 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the image
+      # build or the testcontainer-based tests below. The metadata tests start
+      # mysql:8.0 under a per-operation deadline that has no room for a pull.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            testcontainers/ryuk:0.13.0 \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Build LocalScale image"
         run: |
           CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale
           docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
       - name: "Compile tests"
         run: go test -tags=integration -c -o /dev/null ./pkg/localscale/...
+      # The script streams per-test output and spends a time budget that keeps
+      # Go's own timeout below this job's timeout-minutes, so a shard that
+      # hangs panics with a dump naming the test it is stuck on instead of
+      # being killed with an empty log. Its budget is derived from the
+      # timeout-minutes above; see the script header before changing either.
       - name: "Test"
-        run: go test -tags=integration -timeout=8m -count=1 -v -run "${{ matrix.run_filter }}" ./pkg/localscale/... 2>&1 | tee /dev/stderr | tail -50
+        run: scripts/ci/run-localscale-shard.sh "${{ matrix.run_filter }}"
 
   e2e-mysql:
     name: "E2E MySQL Tests"
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (checkout, Go, cache restore, image pulls and compose
+    # startup — measured between three and a half and four and a half minutes)
+    # plus the E2E_TEST_TIMEOUT passed to make on the Test step lands inside
+    # the job budget with room for the goroutine dump and the log-capture step:
+    # a hung test panics with its dump instead of the runner cancelling the job
+    # first.
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -259,20 +479,112 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
-        run: make test-e2e-mysql test-e2e-grpc
-      - name: "Container logs on failure"
+        run: make test-e2e-mysql E2E_TEST_TIMEOUT=10m
+      - name: "Capture container logs on failure"
         if: failure()
         run: |
-          docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+          mkdir -p e2e-logs
+          # test-e2e-mysql (test-e2e-local) leaves its stack up, so capture it here.
+          docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/mysql-containers.log 2>&1 || true
+          if [ -s e2e-logs/mysql-containers.log ]; then
+            echo "=== tail of MySQL container logs (full logs in the uploaded e2e-mysql-logs artifact) ==="
+            tail -n 200 e2e-logs/mysql-containers.log || true
+          else
+            echo "no container logs captured (stack failed before containers started; see the job log above)"
+          fi
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-mysql-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  e2e-grpc:
+    name: "E2E gRPC Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # Sized so setup (including the server image build and compose startup)
+    # plus the E2E_TEST_TIMEOUT passed to make on the Test step lands inside
+    # the job budget: a hung test panics with its goroutine dump instead of
+    # the runner cancelling the job first.
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev
+      - name: "Test"
+        run: make test-e2e-grpc E2E_TEST_TIMEOUT=10m
+      - name: "Capture container logs on failure"
+        if: failure()
+        run: |
+          # test-e2e-grpc tears its own stack down, so it captures
+          # e2e-logs/grpc-containers.log itself before teardown (test
+          # failures and health-wait timeouts). If the target failed before
+          # those handlers ran (e.g. a compose build failure), the stack may
+          # still be up — capture whatever exists so the artifact is never
+          # empty for a diagnosable failure.
+          mkdir -p e2e-logs
+          if [ ! -f e2e-logs/grpc-containers.log ]; then
+            docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps > e2e-logs/grpc-containers.log 2>&1 || true
+          fi
+          if [ -s e2e-logs/grpc-containers.log ]; then
+            echo "=== tail of gRPC container logs (full logs in the uploaded e2e-grpc-logs artifact) ==="
+            tail -n 200 e2e-logs/grpc-containers.log || true
+          else
+            echo "no container logs captured (stack failed before containers started; see the job log above)"
+          fi
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-grpc-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   e2e-grpc-multideploy:
     name: "E2E gRPC Multi-Deployment Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # Sized so setup (about two and a half minutes including the server image
+    # build and compose startup) plus the E2E_TEST_TIMEOUT passed to make on
+    # the Test step lands inside the job budget: a hung test panics with its
+    # goroutine dump instead of the runner cancelling the job first.
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -281,7 +593,9 @@ jobs:
           - shard: ordered
             run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability|BarrierReleaseBounded)$$
           - shard: failure-policy
-            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue)$$
+            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue|OnFailurePauseRelease)$$
+          - shard: targets
+            run: TestGRPCMultiDeploy_(TargetsRolloutThroughCLI)$$
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -295,14 +609,45 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev
       - name: "Test"
-        run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}'
-      - name: "Container logs on failure"
+        run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}' E2E_TEST_TIMEOUT=10m
+      - name: "Show captured container logs on failure"
         if: failure()
         run: |
-          docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --tail=300 2>/dev/null || true
+          # test-e2e-grpc-multideploy tears its own stack down, so it captures
+          # grpc-multideploy-containers.log itself before teardown (test
+          # failures and health-wait timeouts). If the target failed before
+          # those handlers ran (e.g. a compose build failure), the stack may
+          # still be up — capture whatever exists so the artifact is never
+          # empty for a diagnosable failure.
+          mkdir -p e2e-logs
+          if [ ! -f e2e-logs/grpc-multideploy-containers.log ]; then
+            docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps > e2e-logs/grpc-multideploy-containers.log 2>&1 || true
+          fi
+          if [ -s e2e-logs/grpc-multideploy-containers.log ]; then
+            echo "=== tail of container logs (full logs in the uploaded e2e-grpc-md-logs-shard-${{ matrix.shard }} artifact) ==="
+            tail -n 200 e2e-logs/grpc-multideploy-containers.log || true
+          else
+            echo "no container logs captured (stack failed before containers started; see the job log above)"
+          fi
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-grpc-md-logs-shard-${{ matrix.shard }}
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   e2e-vitess-matrix:
     name: "E2E Vitess Matrix"
@@ -315,7 +660,12 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # Sparse and blobless for the reasons given on the LocalScale Matrix job;
+      # the sparse path must cover what the discovery step below greps.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/local
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -325,7 +675,20 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go | sed 's/func //' | sort)
+          # grep exits 1 when the file has no matching test and 2 when the
+          # file itself is unusable. Under `set -e` either would abort here
+          # with a bare exit status, so both are absorbed and reported apart:
+          # a missing or unreadable file says so rather than being described
+          # as an empty test set.
+          set +e
+          matches=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::e2e/local/vitess_test.go is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed 's/func //' | sort)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no vitess e2e tests discovered"
@@ -355,7 +718,15 @@ jobs:
     needs: [changes, e2e-vitess-matrix]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (about three and a half minutes including the image
+    # builds and compose startup) plus the E2E_TEST_TIMEOUT passed to make on
+    # the Test step (8m for these shards, not the 10m the other e2e jobs use)
+    # lands inside the job budget with room for the goroutine dump and the
+    # log-capture step: a hung test panics with its dump instead of the runner
+    # cancelling the job first. The seed applies before the tests are bounded
+    # by E2E_SEED_APPLY_TIMEOUT in the Makefile, so a stalled one fails the
+    # setup inside this budget, where the log-capture steps still run.
+    timeout-minutes: 14
     strategy:
       fail-fast: false
       matrix:
@@ -373,22 +744,53 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
         run: |
           echo "Vitess e2e shard ${{ matrix.shard }}: ${{ matrix.run_filter }}"
           make test-e2e-local RUN="${{ matrix.run_filter }}" E2E_TEST_TIMEOUT=8m E2E_TEST_FLAGS=-v
-      - name: "Container logs on failure"
+      - name: "Capture container logs on failure"
         if: failure()
         run: |
-          docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+          mkdir -p e2e-logs
+          docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/containers.log 2>&1 || true
+          echo "=== tail of container logs (full logs in the uploaded e2e-vitess-logs-shard-${{ matrix.shard }} artifact) ==="
+          tail -n 200 e2e-logs/containers.log || true
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-vitess-logs-shard-${{ matrix.shard }}
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
   e2e-k8s:
     name: "E2E K8s Tests"
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
+    # Sized so setup (checkout, Go, cache restore, minikube start, plus the
+    # script's own image build and deploy — measured at about four minutes)
+    # plus the E2E_TEST_TIMEOUT set on the Deploy and test step lands inside
+    # the job budget with room left for the goroutine dump, the script's exit
+    # trap, and the pod-log capture step: a hung test panics with its dump
+    # instead of the runner cancelling the job first. The dump is guaranteed
+    # only where the binary's own deadline lands inside the job's — an
+    # unusually slow setup can still push it out.
+    timeout-minutes: 17
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -402,22 +804,53 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 2048
-      - name: "Build and load image"
-        run: |
-          CGO_ENABLED=0 GOOS=linux go build -o bin/schemabot-linux ./pkg/cmd
-          cp bin/schemabot-linux deploy/local/schemabot-dev
-          eval $(minikube docker-env)
-          docker build -t schemabot:test -f deploy/local/Dockerfile.dev deploy/local/
-          rm -f deploy/local/schemabot-dev
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      # The script builds the schemabot image into minikube's docker daemon
+      # under its own per-run tag, so no separate build step is needed here.
       - name: "Deploy and test"
+        # Pin the namespace so the failure log dump below reads the same stack
+        # the script deployed, and keep it on exit so there is a stack left to
+        # read; the runner is ephemeral, so there is nothing to clean up after.
+        env:
+          E2E_K8S_NAMESPACE: schemabot-e2e
+          KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-test.sh
       - name: "Pod logs on failure"
         if: failure()
@@ -437,8 +870,22 @@ jobs:
     name: "E2E K8s Etre Tests"
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
+    # Sized so setup (checkout, Go, cache restore, minikube start, plus the
+    # script's own build of both images and the deploy — typically a little
+    # over five minutes, but measured as high as six and a half) plus the
+    # E2E_TEST_TIMEOUT set on the Deploy and test step lands inside the job
+    # budget with room left for the goroutine dump, the script's exit trap,
+    # and the pod-log capture step: a hung test panics with its dump instead
+    # of the runner cancelling the job first. The budget is sized from the
+    # slowest setup seen, not the typical one, because the run that needs its
+    # pod logs is the one that must not lose them. The dump is guaranteed only
+    # where the binary's own deadline lands inside the job's — an unusually
+    # slow setup can still push it out.
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -452,17 +899,51 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 4096
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds both the schemabot and etre images into minikube's
       # docker daemon, so no separate build step is needed here.
       - name: "Deploy and test"
+        # Keep the namespace on exit so the failure log dump below can read pod
+        # logs; the runner is ephemeral, so there is nothing to clean up after.
+        env:
+          KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-etre-test.sh
       - name: "Pod logs on failure"
         if: failure()
@@ -481,12 +962,76 @@ jobs:
           echo "=== All pods ==="
           kubectl get pods -n schemabot-e2e-etre -o wide 2>/dev/null || true
 
-  e2e-k8s-vitess:
-    name: "E2E K8s Vitess Tests"
+  e2e-k8s-multi-target-matrix:
+    name: "E2E K8s Multi-Target Matrix"
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 1
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+    steps:
+      # Sparse and blobless for the reasons given on the LocalScale Matrix job;
+      # the sparse path must cover what the discovery step below greps.
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/k8s
+          filter: blob:none
+      - name: "Generate shard matrix"
+        id: gen
+        run: |
+          set -euo pipefail
+          NUM_SHARDS=2
+          # Deterministic order so a test always lands in the same bucket, and
+          # a new multi-target test joins a bucket without a list to update.
+          # Anchoring on the line start matches declarations, not prose that
+          # mentions a test. grep exits 1 when nothing matches and 2 when the
+          # tree is unusable; the status check below is the fail-closed gate,
+          # so an unreadable test file cannot drop its tests out of every
+          # shard while the job passes.
+          set +e
+          matches=$(grep -r --include='*_test.go' -h -o '^func TestK8sMultiTarget_[A-Za-z0-9_]*' e2e/k8s)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::e2e/k8s is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed 's/^func //' | sort -u)
+          count=$(printf '%s\n' "$tests" | grep -c . || true)
+          if [ "$count" -lt "$NUM_SHARDS" ]; then
+            echo "::error::discovered $count multi-target tests, fewer than the $NUM_SHARDS shards"
+            exit 1
+          fi
+          # Each filter is anchored so a test name that prefixes another
+          # cannot also run in the other shard.
+          shards=$(printf '%s\n' "$tests" | awk -v n="$NUM_SHARDS" '
+            { bucket[NR % n] = bucket[NR % n] (bucket[NR % n] ? "|" : "") $0 }
+            END { for (i=0; i<n; i++) printf "{\"shard\":\"%d\",\"run_filter\":\"^(%s)$\"}\n", i+1, bucket[i] }
+          ' | jq -cs '.')
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "$count tests across $NUM_SHARDS shards"
+
+  e2e-k8s-multi-target:
+    name: "E2E K8s Multi-Target Tests (${{ matrix.shard }})"
+    needs: [changes, e2e-k8s-multi-target-matrix]
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
+    # Sized so setup (checkout, Go, cache restore, minikube start, the script's
+    # own image builds, and standing up one MySQL server per target beside Etre
+    # and ministack) plus the E2E_TEST_TIMEOUT set on the Deploy and test step
+    # lands inside the job budget with room left for the goroutine dump, the
+    # script's exit trap, and the pod-log capture step.
+    timeout-minutes: 30
+    # Each shard stands up the whole stack, so the split pays the setup on
+    # every runner to run the tests across them.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.e2e-k8s-multi-target-matrix.outputs.shards) }}
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -500,7 +1045,98 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: "Start minikube"
+        uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
+        with:
+          driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
+          # One MySQL server per target plus the control and data plane
+          # stores, Etre and ministack: sized to the script's own minikube.
+          cpus: 4
+          memory: 6144
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      # The script builds the schemabot and etre images into minikube's docker
+      # daemon, so no separate build step is needed here.
+      - name: "Deploy and test"
+        # Keep the namespace on exit so the failure log dump below can read pod
+        # logs; the runner is ephemeral, so there is nothing to clean up after.
+        env:
+          KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 18m
+          E2E_TEST_RUN: ${{ matrix.run_filter }}
+        run: make test-e2e-k8s-multi-target
+      - name: "Pod logs on failure"
+        if: failure()
+        run: |
+          echo "=== Control Plane ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app.kubernetes.io/instance=control-plane-mt --tail=300 2>/dev/null || true
+          echo "=== Data Plane ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app.kubernetes.io/instance=data-plane-mt --tail=300 2>/dev/null || true
+          echo "=== Etre ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app=etre --tail=100 2>/dev/null || true
+          echo "=== ministack ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app=ministack --tail=100 2>/dev/null || true
+          echo "=== Seed jobs ==="
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-mongo-init --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-seed --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=ministack-seed --tail=50 2>/dev/null || true
+          echo "=== All pods ==="
+          kubectl get pods -n schemabot-e2e-multi-target -o wide 2>/dev/null || true
+
+  e2e-k8s-vitess:
+    name: "E2E K8s Vitess Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
+    # minikube refuses its docker driver on ubuntu-26.04 (DRV_UNSUPPORTED_OS),
+    # so minikube never starts and no test runs. Return to ubuntu-latest once
+    # a minikube release supports the docker driver there.
+    runs-on: ubuntu-24.04
+    # Most of the budget is vtcombo coming up: it initializes a sidecar database
+    # per shard of every keyspace the stack declares before the suite can start.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # The runner ships a preinstalled MySQL whose AppArmor profile confines
       # /usr/sbin/mysqld to its packaged data dirs. LocalScale runs vtcombo's
@@ -513,12 +1149,39 @@ jobs:
             sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mysqld || true
             sudo ln -sf /etc/apparmor.d/usr.sbin.mysqld /etc/apparmor.d/disable/ || true
           fi
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 6144
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds the schemabot, etre, and localscale images into
       # minikube's docker daemon, so no separate build step is needed here.
       - name: "Deploy and test"
@@ -526,18 +1189,31 @@ jobs:
         # logs; the runner is ephemeral, so there is nothing to clean up after.
         env:
           KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-vitess-test.sh
       - name: "Pod logs on failure"
         if: failure()
         run: |
+          # The operator's per-tick debug lines and the suite's progress polling
+          # fill a short tail on their own, so a deeper window is what keeps the
+          # drive that dispatched the work — the part worth reading — in the dump.
           echo "=== Control Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=3000 2>/dev/null || true
           echo "=== Data Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=1000 2>/dev/null || true
           echo "=== Etre ==="
           kubectl logs -n schemabot-e2e-vitess -l app=etre --tail=100 2>/dev/null || true
           echo "=== LocalScale ==="
           kubectl logs -n schemabot-e2e-vitess -l app=localscale --tail=200 2>/dev/null || true
+          # A restarted LocalScale serves the whole suite connection-refused, and
+          # the surviving container's logs show none of it — the reason the first
+          # one exited is only in the previous container and the pod's state.
+          echo "=== LocalScale (previous container) ==="
+          kubectl logs -n schemabot-e2e-vitess -l app=localscale --previous --tail=200 2>/dev/null || true
+          echo "=== LocalScale pod state ==="
+          kubectl describe pod -n schemabot-e2e-vitess -l app=localscale 2>/dev/null || true
           echo "=== Seed jobs ==="
           kubectl logs -n schemabot-e2e-vitess -l job-name=etre-seed --tail=50 2>/dev/null || true
           echo "=== All pods ==="
@@ -551,7 +1227,7 @@ jobs:
   # skipped or failed upstream is treated as failure.
   e2e-rollup:
     name: "E2E Tests"
-    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-grpc-multideploy, e2e-vitess]
+    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-grpc, e2e-grpc-multideploy, e2e-vitess]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -564,6 +1240,7 @@ jobs:
           VITESS_MODE: ${{ needs.e2e-vitess-matrix.outputs.mode }}
           VITESS_SHARD_COUNT: ${{ needs.e2e-vitess-matrix.outputs.shard_count }}
           E2E_MYSQL_RESULT: ${{ needs.e2e-mysql.result }}
+          E2E_GRPC_RESULT: ${{ needs.e2e-grpc.result }}
           E2E_MULTIDEPLOY_RESULT: ${{ needs.e2e-grpc-multideploy.result }}
           E2E_VITESS_RESULT: ${{ needs.e2e-vitess.result }}
         run: |
@@ -595,6 +1272,10 @@ jobs:
             echo "::error::e2e-mysql result=$E2E_MYSQL_RESULT"
             exit 1
           fi
+          if [ "$E2E_GRPC_RESULT" != "success" ]; then
+            echo "::error::e2e-grpc result=$E2E_GRPC_RESULT"
+            exit 1
+          fi
           if [ "$E2E_MULTIDEPLOY_RESULT" != "success" ]; then
             echo "::error::e2e-grpc-multideploy result=$E2E_MULTIDEPLOY_RESULT"
             exit 1
@@ -606,7 +1287,10 @@ jobs:
 
   localscale-rollup:
     name: "LocalScale Tests"
-    needs: [changes, localscale-matrix, localscale]
+    # Build is not a required check of its own; no test job waits for it, so
+    # this rollup is what keeps a change that fails to compile out of the
+    # merge queue.
+    needs: [changes, build, localscale-matrix, localscale]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -616,6 +1300,7 @@ jobs:
           CHANGES_CODE: ${{ needs.changes.outputs.code }}
           EVENT_NAME: ${{ github.event_name }}
           FULL: ${{ needs.changes.outputs.full }}
+          BUILD_RESULT: ${{ needs.build.result }}
           LS_MODE: ${{ needs.localscale-matrix.outputs.mode }}
           LS_SHARD_COUNT: ${{ needs.localscale-matrix.outputs.shard_count }}
           LOCALSCALE_RESULT: ${{ needs.localscale.result }}
@@ -628,6 +1313,10 @@ jobs:
           if [ "$CHANGES_CODE" != "true" ]; then
             echo "Docs-only PR; LocalScale intentionally skipped."
             exit 0
+          fi
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::build result=$BUILD_RESULT"
+            exit 1
           fi
           # Fail closed: a merge-gating event must run the full matrix, and the
           # matrix that was actually instantiated must match the claimed mode.
@@ -648,13 +1337,41 @@ jobs:
             exit 1
           fi
 
+  integration-rollup:
+    name: "Integration Tests"
+    needs: [changes, integration]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; integration intentionally skipped."
+            exit 0
+          fi
+          # A matrix result is success only when every shard succeeded, so this
+          # cannot pass on a partial run.
+          if [ "$INTEGRATION_RESULT" != "success" ]; then
+            echo "::error::integration result=$INTEGRATION_RESULT"
+            exit 1
+          fi
+
   # Stable rollup for the k8s e2e jobs so a single check name can gate a merge.
   # On a PR running the smoke subset these jobs are intentionally skipped and the
   # full k8s coverage runs on push / in the merge queue; on any merge-gating
-  # event all three must succeed.
+  # event all of them must succeed.
   k8s-rollup:
     name: "K8s E2E Tests"
-    needs: [changes, e2e-k8s, e2e-k8s-etre, e2e-k8s-vitess]
+    needs: [changes, e2e-k8s, e2e-k8s-etre, e2e-k8s-vitess, e2e-k8s-multi-target]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -667,6 +1384,7 @@ jobs:
           K8S_RESULT: ${{ needs.e2e-k8s.result }}
           K8S_ETRE_RESULT: ${{ needs.e2e-k8s-etre.result }}
           K8S_VITESS_RESULT: ${{ needs.e2e-k8s-vitess.result }}
+          K8S_MULTI_TARGET_RESULT: ${{ needs.e2e-k8s-multi-target.result }}
         run: |
           set -euo pipefail
           if [ "$CHANGES_RESULT" != "success" ]; then
@@ -682,9 +1400,9 @@ jobs:
             echo "PR smoke run; full K8s E2E deferred to the merge queue."
             exit 0
           fi
-          for r in "$K8S_RESULT" "$K8S_ETRE_RESULT" "$K8S_VITESS_RESULT"; do
+          for r in "$K8S_RESULT" "$K8S_ETRE_RESULT" "$K8S_VITESS_RESULT" "$K8S_MULTI_TARGET_RESULT"; do
             if [ "$r" != "success" ]; then
-              echo "::error::k8s e2e results: k8s=$K8S_RESULT etre=$K8S_ETRE_RESULT vitess=$K8S_VITESS_RESULT"
+              echo "::error::k8s e2e results: k8s=$K8S_RESULT etre=$K8S_ETRE_RESULT vitess=$K8S_VITESS_RESULT multi-target=$K8S_MULTI_TARGET_RESULT"
               exit 1
             fi
           done

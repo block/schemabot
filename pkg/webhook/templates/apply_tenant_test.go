@@ -14,13 +14,14 @@ import (
 // flag; single-tenant deployments render the same command unchanged.
 func TestApplyStatusCommentHintsCarryTenant(t *testing.T) {
 	cases := []struct {
-		name     string
-		state    string
-		engine   string
-		commands []string
+		name         string
+		state        string
+		engine       string
+		deferCutover bool
+		commands     []string
 	}{
 		{name: "waiting_for_deploy cutover", state: state.Apply.WaitingForDeploy, commands: []string{"schemabot cutover apply-x -e production"}},
-		{name: "waiting_for_cutover cutover", state: state.Apply.WaitingForCutover, commands: []string{"schemabot cutover apply-x -e production"}},
+		{name: "waiting_for_cutover cutover", state: state.Apply.WaitingForCutover, deferCutover: true, commands: []string{"schemabot cutover apply-x -e production"}},
 		{name: "running stop", state: state.Apply.Running, commands: []string{"schemabot stop apply-x -e production"}},
 		{name: "running planetscale cancel", state: state.Apply.Running, engine: storage.EnginePlanetScale, commands: []string{"schemabot cancel apply-x -e production"}},
 		{name: "failed_retryable stop", state: state.Apply.FailedRetryable, commands: []string{"schemabot stop apply-x -e production"}},
@@ -34,11 +35,12 @@ func TestApplyStatusCommentHintsCarryTenant(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			data := ApplyStatusCommentData{
-				ApplyID:     "apply-x",
-				Database:    "orders",
-				Environment: "production",
-				State:       tc.state,
-				Engine:      tc.engine,
+				ApplyID:      "apply-x",
+				Database:     "orders",
+				Environment:  "production",
+				State:        tc.state,
+				Engine:       tc.engine,
+				DeferCutover: tc.deferCutover,
 			}
 
 			untenanted := RenderApplyStatusComment(data)

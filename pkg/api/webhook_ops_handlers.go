@@ -17,7 +17,9 @@ import (
 	gh "github.com/google/go-github/v86/github"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
@@ -51,15 +53,75 @@ func webhookOpsRequestErrorf(format string, args ...any) error {
 	return &webhookOpsRequestError{err: fmt.Errorf(format, args...)}
 }
 
+// requireRepoFullName refuses a repository an operator endpoint could never
+// answer for. The shape is checked up front rather than left to the first thing
+// that trips over it: a repository that is not an owner/name pair is the
+// caller's mistake, and letting the installation lookup fail on it reports a
+// server error for a request that was never answerable. Every endpoint taking a
+// repository asks through here, so the same typo reads the same way on all of
+// them; the endpoints where a repository is an optional filter rather than the
+// subject decide for themselves whether it was given, and ask only then.
+func requireRepoFullName(repo string) error {
+	if repo == "" {
+		return webhookOpsRequestErrorf("repo is required")
+	}
+	if !caller.IsRepoFullName(repo) {
+		return webhookOpsRequestErrorf("repo %q is not an owner/name pair", repo)
+	}
+	return nil
+}
+
+// canonicalEnvironment folds an environment the way everything it will be
+// compared against is already folded: configured names are validated lowercase,
+// stored check rows canonicalize theirs on write and on lookup, and the Check
+// Run name is interpolated from that same folded value. An operator who types
+// "Production" is naming the environment the instance handles, not a different
+// one. Every operator endpoint taking an environment folds through here, so one
+// spelling cannot be answered on one command and refused on another.
+func canonicalEnvironment(environment string) string {
+	return storage.CanonicalKey(strings.TrimSpace(environment))
+}
+
+// canonicalRepo trims an operator-supplied repository. The owner/name shape
+// check tolerates surrounding whitespace — a trailing space lands inside the
+// name half and the pair still parses — but every use of the value afterwards
+// is an exact comparison, against a configured repository or against the one a
+// delivery names. A padded repository therefore clears the guard and then
+// matches nothing, which is the silent answer the guard exists to prevent.
+func canonicalRepo(repo string) string {
+	return strings.TrimSpace(repo)
+}
+
+// requireNarrowableEnvironment refuses an environment this instance cannot
+// narrow a checks query by.
+//
+// An instance with no configured environments publishes one check that is not
+// environment-scoped and stores one aggregate beside it, so there is no
+// environment to select: narrowing by any name looks for a Check Run that
+// instance never creates. An instance that does scope its checks refuses a name
+// it does not handle for the same reason. Either way the query would be
+// answered from a name that cannot exist — every pull request reported as
+// missing its check, and on a sweep that acts, every one of them re-planned.
+//
+// An empty environment is always allowed; it is what asks for the unscoped check.
+func requireNarrowableEnvironment(cfg *ServerConfig, environment string) error {
+	if environment == "" {
+		return nil
+	}
+	if len(cfg.AllowedEnvironments) == 0 {
+		return webhookOpsRequestErrorf("this instance publishes one check for every environment, so there is no environment to narrow to; omit the environment")
+	}
+	if !cfg.IsEnvironmentAllowed(environment) {
+		return webhookOpsRequestErrorf("environment %q is not one this instance handles", environment)
+	}
+	return nil
+}
+
 // extendWebhookOpsDeadline lifts the server-wide write timeout for a webhook
 // operator request and returns a context bounded to the same budget, so the
 // crawl can outlive the default timeout without running unbounded.
 func (s *Service) extendWebhookOpsDeadline(w http.ResponseWriter, r *http.Request) (context.Context, context.CancelFunc) {
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(webhookOpsRequestTimeout)); err != nil {
-		s.logger.Warn("failed to extend webhook ops write deadline; the server-wide write timeout still applies",
-			"path", r.URL.Path, "error", err)
-	}
-	return context.WithTimeout(r.Context(), webhookOpsRequestTimeout)
+	return s.extendOperatorWriteDeadline(w, r, webhookOpsRequestTimeout)
 }
 
 func (s *Service) writeWebhookOpsError(w http.ResponseWriter, err error) {
@@ -104,6 +166,9 @@ const checksSynthesizeMaxPRsPerRequest = 10
 const checksDisabledSkipOutcome = "skipped: Check Runs are disabled for this repository (enable_checks: false)"
 
 func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_synthesize") {
+		return
+	}
 	var req ChecksSynthesizeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -123,8 +188,8 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	if req.Repo == "" {
-		return nil, webhookOpsRequestErrorf("repo is required")
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return nil, err
 	}
 	if len(req.PRs) == 0 {
 		return nil, webhookOpsRequestErrorf("prs is required")
@@ -209,6 +274,9 @@ type webhookRedriveApp struct {
 }
 
 func (s *Service) handleWebhookRedrive(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "webhook_redrive") {
+		return
+	}
 	var req WebhookRedriveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -225,6 +293,9 @@ func (s *Service) handleWebhookRedrive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_scan") {
+		return
+	}
 	var req ChecksScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -232,7 +303,7 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := s.extendWebhookOpsDeadline(w, r)
 	defer cancel()
-	response, err := executeChecksScan(ctx, s.config, req, s.logger)
+	response, err := executeChecksScan(ctx, s.config, s.storage, req, s.logger)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
 		return
@@ -241,11 +312,22 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRedriveRequest, logger *slog.Logger) (*WebhookRedriveResponse, error) {
+	req.Repo = canonicalRepo(req.Repo)
 	if len(req.DeliveryIDs) > 0 {
 		return executeWebhookRedriveByIDs(ctx, cfg, req, logger)
 	}
 	if req.MaxPages <= 0 {
 		return nil, webhookOpsRequestErrorf("max_pages must be positive")
+	}
+	// The repository is an optional filter here rather than the subject of the
+	// request, but a malformed one is still the caller's mistake and a costly
+	// one: it matches no delivery, so the crawl walks the whole window a page
+	// at a time, fetching every candidate's detail, and answers 200 with
+	// nothing selected — indistinguishable from a window that really is empty.
+	if req.Repo != "" {
+		if err := requireRepoFullName(req.Repo); err != nil {
+			return nil, err
+		}
 	}
 	windowStart, err := time.Parse(time.RFC3339, req.WindowStart)
 	if err != nil {
@@ -287,21 +369,46 @@ func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRe
 	return response, nil
 }
 
-func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
+// checksScanClient is the GitHub surface a checks scan reads through: the
+// repository's open PRs, the Check Runs on their heads, and the installation's
+// remaining budget.
+type checksScanClient interface {
+	webhookMissingCheckScanClient
+	CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error)
+}
+
+// checksScanClientResolver returns the GitHub client a scan of repo reads
+// through, using app's installation on the repository.
+type checksScanClientResolver func(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (checksScanClient, error)
+
+// installationChecksScanClient reads through app's installation on repo, the
+// same one SchemaBot publishes the repository's Check Runs through.
+func installationChecksScanClient(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (checksScanClient, error) {
+	client, _, err := resolveAppInstallationClient(ctx, app, repo, logger)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
+	return executeChecksScanWith(ctx, cfg, store, req, logger, installationChecksScanClient)
+}
+
+func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger, resolve checksScanClientResolver) (*ChecksScanResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	if req.Repo == "" {
-		return nil, webhookOpsRequestErrorf("repo is required")
+	req.Repo = canonicalRepo(req.Repo)
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return nil, err
 	}
 	if req.Page < 0 {
 		return nil, webhookOpsRequestErrorf("page must be non-negative")
 	}
-	// A stale or mistyped environment would otherwise scan for a check name
-	// that can never exist and report every PR as missing it; reject it as a
-	// request error instead.
-	if req.Environment != "" && !cfg.IsEnvironmentAllowed(req.Environment) {
-		return nil, webhookOpsRequestErrorf("environment %q is not one this instance handles", req.Environment)
+	req.Environment = canonicalEnvironment(req.Environment)
+	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+		return nil, err
 	}
 	var updatedSince time.Time
 	if req.UpdatedSince != "" {
@@ -309,6 +416,17 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 		updatedSince, err = time.Parse(time.RFC3339, req.UpdatedSince)
 		if err != nil {
 			return nil, webhookOpsRequestErrorf("parse updated_since %q as RFC3339: %v", req.UpdatedSince, err)
+		}
+	}
+	var annotateAfter time.Duration
+	if req.StuckAfter != "" {
+		var err error
+		annotateAfter, err = time.ParseDuration(req.StuckAfter)
+		if err != nil {
+			return nil, webhookOpsRequestErrorf("parse stuck_after %q as a duration: %v", req.StuckAfter, err)
+		}
+		if annotateAfter < 0 {
+			return nil, webhookOpsRequestErrorf("stuck_after must not be negative")
 		}
 	}
 	if logger == nil {
@@ -322,11 +440,26 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 		logger.Info("checks scan skipping repository with checks disabled", "repo", req.Repo)
 		return &ChecksScanResponse{Repo: req.Repo, ChecksDisabled: true}, nil
 	}
-	installationClient, _, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
+	app, err := cfg.ResolveGitHubAppForRepo(req.Repo)
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince)
+	installationClient, err := resolve(ctx, app, req.Repo, logger)
+	if errors.Is(err, ghclient.ErrAppNotInstalled) && req.ReportAppNotInstalled {
+		// GitHub confirmed the App has no installation covering the repo, so
+		// there is nothing this App can scan or recreate there. Report the
+		// skip as a normal response so a fleet sweep keeps going. A caller
+		// that did not ask for the skip gets the error below instead: it
+		// would ignore the flag and read the repo as scanned clean. Every
+		// other lookup failure leaves coverage unknown and stays an error.
+		logger.Warn("checks scan skipping repository: its GitHub App is not installed on it; install the App on the repository or remove the repository from the repos config",
+			"operation", "checks_scan", "repo", req.Repo, "environment", req.Environment, "github_app", app.Name, "error", err)
+		return &ChecksScanResponse{Repo: req.Repo, AppNotInstalled: true, GitHubApp: app.Name}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger, checkScanScope{config: cfg, environment: req.Environment, override: req.CheckName})
 	if err != nil {
 		return nil, err
 	}
@@ -335,6 +468,9 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 }
 
 func (s *Service) handleChecksRepos(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_repos") {
+		return
+	}
 	response, err := executeChecksRepos(s.config)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
@@ -377,22 +513,22 @@ func resolveRepoInstallationClient(ctx context.Context, cfg *ServerConfig, repo 
 	if err != nil {
 		return nil, 0, err
 	}
-	appID := app.Config.ResolveAppID()
-	if appID == 0 {
-		return nil, 0, fmt.Errorf("app %q has empty or unparseable app-id", app.Name)
-	}
-	privateKey, err := app.Config.ResolvePrivateKey()
+	return resolveAppInstallationClient(ctx, app, repo, logger, ghclient.WithListenOnlyRepos(cfg))
+}
+
+// resolveAppInstallationClient builds an installation-scoped GitHub client for
+// app's installation on repo. An error wrapping ghclient.ErrAppNotInstalled
+// means GitHub confirmed app has no installation covering repo.
+func resolveAppInstallationClient(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger, opts ...ghclient.ClientOption) (*ghclient.InstallationClient, int64, error) {
+	creds, err := app.Config.ResolveCredentials()
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolve private key for app %q: %w", app.Name, err)
+		return nil, 0, fmt.Errorf("app %q: %w", app.Name, err)
 	}
-	if privateKey == "" {
-		return nil, 0, fmt.Errorf("app %q private key resolved to empty value", app.Name)
-	}
-	client := ghclient.NewClient(appID, []byte(privateKey), logger,
-		ghclient.WithTrustedCheckAppSlugs(app.Config.TrustedCheckAppSlugs))
+	opts = append([]ghclient.ClientOption{ghclient.WithTrustedCheckAppSlugs(app.Config.TrustedCheckAppSlugs)}, opts...)
+	client := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger, opts...)
 	installationID, err := client.InstallationIDForRepo(ctx, repo)
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolve GitHub App installation for %s: %w", repo, err)
+		return nil, 0, fmt.Errorf("resolve GitHub App %q installation for %s: %w", app.Name, repo, err)
 	}
 	installationClient, err := client.ForInstallation(installationID)
 	if err != nil {
@@ -413,6 +549,14 @@ func executeWebhookRedriveByIDs(ctx context.Context, cfg *ServerConfig, req Webh
 	}
 	if req.DryRun {
 		return nil, webhookOpsRequestErrorf("delivery_ids redelivery has no dry run; the listing pass already reported the selection")
+	}
+	// delivery_ids names the deliveries exactly, so the crawl's filters have
+	// nothing left to narrow and this path never reads them. Refusing them is
+	// how a typo in one reads as a mistake on both shapes: honored silently
+	// here, the same malformed repository that the crawl refuses outright would
+	// answer 200 with every named delivery redelivered regardless of it.
+	if req.Repo != "" || req.PR != 0 {
+		return nil, webhookOpsRequestErrorf("delivery_ids names the deliveries to redrive, so the repo and pr filters have nothing to narrow")
 	}
 	apps, err := webhookRedriveApps(cfg, req.App)
 	if err != nil {
@@ -448,15 +592,18 @@ func webhookRedriveApps(cfg *ServerConfig, onlyApp string) ([]webhookRedriveApp,
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	configured := cfg.Apps
-	if len(configured) == 0 {
-		if !cfg.GitHub.Configured() {
-			return nil, fmt.Errorf("no GitHub App is configured")
+	if len(cfg.Apps) == 0 {
+		creds, err := cfg.GitHub.ResolveCredentials()
+		if err != nil {
+			return nil, fmt.Errorf("default GitHub App: %w", err)
 		}
-		configured = map[string]GitHubAppConfig{"default": cfg.GitHub}
+		if onlyApp != "" && onlyApp != "default" {
+			return nil, webhookOpsRequestErrorf("no configured GitHub App named %q", onlyApp)
+		}
+		return []webhookRedriveApp{{name: "default", id: creds.AppID, config: cfg.GitHub}}, nil
 	}
-	names := make([]string, 0, len(configured))
-	for name := range configured {
+	names := make([]string, 0, len(cfg.Apps))
+	for name := range cfg.Apps {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -465,10 +612,13 @@ func webhookRedriveApps(cfg *ServerConfig, onlyApp string) ([]webhookRedriveApp,
 		if onlyApp != "" && name != onlyApp {
 			continue
 		}
-		appConfig := configured[name]
-		appID := appConfig.ResolveAppID()
+		appConfig := cfg.Apps[name]
+		appID, err := appConfig.ResolveAppID()
+		if err != nil {
+			return nil, fmt.Errorf("app %q: %w", name, err)
+		}
 		if appID == 0 {
-			return nil, fmt.Errorf("app %q has empty or unparseable app-id", name)
+			return nil, fmt.Errorf("app %q has no app-id configured (empty or 0)", name)
 		}
 		apps = append(apps, webhookRedriveApp{name: name, id: appID, config: appConfig})
 	}
@@ -486,15 +636,19 @@ func newWebhookRedriveGitHubClient(app webhookRedriveApp, logger *slog.Logger) (
 	if privateKey == "" {
 		return nil, fmt.Errorf("app %q private key resolved to empty value", app.name)
 	}
-	appsTransport, err := ghinstallation.NewAppsTransport(http.DefaultTransport, app.id, []byte(privateKey))
+	// A crawl issues many list/detail/redeliver calls per run, so the base
+	// transport composes the same layers every other GitHub client here uses:
+	// the metrics transport innermost so each attempt lands in the request
+	// metrics (labeled with the configured app name), wrapped by the shared
+	// secondary-rate-limit handling (bounded sleep on a 403 secondary limit)
+	// rather than issuing bare requests that would trip the limit mid-crawl.
+	baseTransport := ghclient.NewRateLimitedTransport(
+		ghclient.NewMetricsTransport(http.DefaultTransport, 0, func() string { return app.name }))
+	appsTransport, err := ghinstallation.NewAppsTransport(baseTransport, app.id, []byte(privateKey))
 	if err != nil {
 		return nil, fmt.Errorf("create GitHub App transport for app %q: %w", app.name, err)
 	}
-	// A crawl issues many list/detail/redeliver calls per run, so wrap the
-	// transport with the shared secondary-rate-limit handling (bounded sleep
-	// on a 403 secondary limit) that every other GitHub client here uses,
-	// rather than issuing bare requests that would trip the limit mid-crawl.
-	client := gh.NewClient(&http.Client{Transport: ghclient.NewRateLimitedTransport(appsTransport), Timeout: 30 * time.Second})
+	client := gh.NewClient(&http.Client{Transport: appsTransport, Timeout: 30 * time.Second})
 	logger.Info("created GitHub App webhook redrive client", "app_name", app.name, "app_id", app.id)
 	return client, nil
 }
@@ -739,22 +893,46 @@ func webhookRedrivePayloadMetadata(delivery *gh.HookDelivery) (webhookRedrivePay
 	return webhookRedrivePayload{repo: payload.Repository.FullName, prs: prs}, nil
 }
 
-func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override string) []string {
+// webhookExpectedCheckName is one Check Run name this deployment publishes,
+// together with the environment it reports on. Environment is empty when the
+// name is not scoped to one, which is what lets a caller tell "this run
+// covers everything" apart from "this run covers production".
+type webhookExpectedCheckName struct {
+	Name        string
+	Environment string
+}
+
+func webhookExpectedCheckNames(cfg *ServerConfig, repo, environment, override string) []webhookExpectedCheckName {
 	if override != "" {
-		return []string{override}
+		// An operator-supplied name carries no environment of its own, so the
+		// scope is the one the caller asked for, and nothing when they asked
+		// for nothing. Dropping an environment they did name would hand the
+		// override every environment's rows, which is the mis-attribution
+		// this scoping exists to prevent.
+		return []webhookExpectedCheckName{{Name: override, Environment: environment}}
 	}
 	base := cfg.GitHubCheckNameBaseForRepo(repo)
 	if environment != "" {
-		return []string{fmt.Sprintf("%s (%s)", base, environment)}
+		return []webhookExpectedCheckName{{Name: fmt.Sprintf("%s (%s)", base, environment), Environment: environment}}
 	}
 	if len(cfg.AllowedEnvironments) > 0 {
-		out := make([]string, 0, len(cfg.AllowedEnvironments))
-		for _, env := range cfg.AllowedEnvironments {
-			out = append(out, fmt.Sprintf("%s (%s)", base, env))
+		environments, _ := cfg.CheckEnvironmentsForRepo(context.Background(), nil, repo, "")
+		out := make([]webhookExpectedCheckName, 0, len(environments))
+		for _, env := range environments {
+			out = append(out, webhookExpectedCheckName{Name: fmt.Sprintf("%s (%s)", base, env), Environment: env})
 		}
 		return out
 	}
-	return []string{base}
+	return []webhookExpectedCheckName{{Name: base}}
+}
+
+func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override string) []string {
+	expected := webhookExpectedCheckNames(cfg, repo, environment, override)
+	names := make([]string, 0, len(expected))
+	for _, name := range expected {
+		names = append(names, name.Name)
+	}
+	return names
 }
 
 type webhookMissingCheckScanClient interface {
@@ -762,16 +940,76 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, repo string, checkNames []string, page int, updatedSince time.Time) (*ChecksScanResponse, error) {
+// scanObservedNow is the clock a scan page ages its runs against, at the
+// precision the page reports it.
+//
+// The threshold is applied on both sides: here, to decide which runs are worth
+// reading stored rows for, and by the caller against this same clock, to decide
+// which to render. Judging against a finer instant than is reported would make
+// the caller's copy of the clock trail the one the decision was made on, and a
+// run inside that fraction of a threshold finer than a second would be
+// annotated here and dropped there — losing the annotation on the only surface
+// that shows it.
+func scanObservedNow() time.Time {
+	return time.Now().UTC().Truncate(time.Second)
+}
+
+// checkRunAgedForAnnotation reports an uncompleted run's start time as the
+// caller will read it, and whether it has been sitting long enough to be worth
+// reading the stored rows that explain it.
+//
+// The two answers come from one value on purpose. The caller applies the same
+// threshold to the start time it reads back, to decide what to render, and the
+// wire format carries whole seconds — so a run judged here against the
+// untruncated instant GitHub reported is measured from a fraction of a second
+// later than the caller measures it from. At the boundary that is a run left
+// unannotated and rendered anyway, with an empty waiting-on column that means
+// no stored row was blocking rather than that none was read.
+func checkRunAgedForAnnotation(run *ghclient.CheckRunResult, threshold time.Duration, now time.Time) (startedAt string, sittingLongEnough bool) {
+	asSent := run.StartedAt.UTC().Truncate(time.Second)
+	return formatCheckRunStartedAt(asSent), checkRunSittingLongEnough(asSent, threshold, now)
+}
+
+// checkRunSittingLongEnough reports whether an uncompleted Check Run has been
+// sitting at least as long as the caller's threshold.
+//
+// A start time that is absent or in the future proves nothing about the run's
+// age, so it counts as long enough. The threshold exists to skip work the
+// caller will not display, and a run whose age cannot be established is one
+// the caller displays.
+func checkRunSittingLongEnough(startedAt time.Time, threshold time.Duration, now time.Time) bool {
+	if threshold <= 0 || startedAt.IsZero() || startedAt.After(now) {
+		return true
+	}
+	return now.Sub(startedAt) >= threshold
+}
+
+type checkScanScope struct {
+	config      *ServerConfig
+	environment string
+	override    string
+}
+
+func (s checkScanScope) requiresCoverageDiscovery() bool {
+	return s.override == "" && len(s.config.AllowedEnvironments) > 0
+}
+
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger, scopes ...checkScanScope) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
+	}
+	now := scanObservedNow()
+	checkNames := make([]string, 0, len(expectedNames))
+	for _, expected := range expectedNames {
+		checkNames = append(checkNames, expected.Name)
 	}
 	result := &ChecksScanResponse{
 		Repo:             repo,
 		CheckNames:       checkNames,
 		NextPage:         nextPage,
 		EstimatedOpenPRs: estimateOpenPRCount(page, lastPage, len(prs)),
+		ObservedAt:       now.Format(time.RFC3339),
 	}
 	for _, pr := range prs {
 		if !updatedSince.IsZero() && pr.UpdatedAt.Before(updatedSince) {
@@ -784,34 +1022,89 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		var missing []string
 		var untrustedConflicts []string
 		var incomplete []IncompleteCheckRun
-		for _, checkName := range checkNames {
-			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, checkName)
+		// The environment each uncompleted run reports on, positionally
+		// aligned with incomplete, so its rows can be narrowed to it once the
+		// PR's stored state has been read.
+		var incompleteEnvironments []string
+		// Whether each uncompleted run has been sitting long enough for the
+		// caller to render it, positionally aligned with incomplete. A run
+		// that has not is not worth annotating, since the caller drops it
+		// before it reaches an operator.
+		//
+		// The decision is per run, not per pull request: a PR can carry an old
+		// run beside a young one, and the old one is exactly what the caller
+		// is about to render. Letting the young one speak for both would send
+		// back the run an operator is looking at with nothing explaining it.
+		var annotate []bool
+		prNames := expectedNames
+		var stored []*storage.Check
+		storedRead := false
+		// Fixed names need no retained coverage. Storage is only an optional
+		// source of annotations for their stuck runs.
+		if len(scopes) > 0 && scopes[0].requiresCoverageDiscovery() {
+			stored, err = store.Checks().GetByPR(ctx, repo, pr.Number)
 			if err != nil {
-				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, checkName, pr.HeadSHA, err)
+				return nil, fmt.Errorf("read retained check coverage %s#%d: %w", repo, pr.Number, err)
+			}
+			storedRead = true
+			prNames, err = resolvedWebhookCheckNames(ctx, scopes[0].config, client, repo, pr.HeadSHA, scopes[0].environment, scopes[0].override, stored)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, expected := range prNames {
+			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
+			if err != nil {
+				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, expected.Name, pr.HeadSHA, err)
 			}
 			if run != nil {
 				if !checkRunCompleted(run) {
+					startedAt, sittingLongEnough := checkRunAgedForAnnotation(run, annotateAfter, now)
 					incomplete = append(incomplete, IncompleteCheckRun{
 						Name:       run.Name,
 						CheckRunID: run.ID,
 						Status:     run.Status,
-						StartedAt:  formatCheckRunStartedAt(run.StartedAt),
+						StartedAt:  startedAt,
 					})
+					incompleteEnvironments = append(incompleteEnvironments, expected.Environment)
+					annotate = append(annotate, sittingLongEnough)
 				}
 				continue
 			}
-			missing = append(missing, checkName)
+			missing = append(missing, expected.Name)
 			// No trusted check exists, but a same-named one from an untrusted
 			// app does: backfill will still create the trusted check, yet the
 			// operator likely also needs to resolve the conflicting check.
 			if len(untrustedApps) > 0 {
-				untrustedConflicts = append(untrustedConflicts, checkName)
+				untrustedConflicts = append(untrustedConflicts, expected.Name)
 			}
 		}
 		if len(incomplete) > 0 {
+			// One read serves every run on this PR that earned an annotation,
+			// so it is made once and only when at least one did; each run then
+			// keeps only the rows for the environment it gates.
+			if slices.Contains(annotate, true) && !storedRead {
+				stored = storedChecksBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
+			}
+			for i := range incomplete {
+				if !annotate[i] {
+					logger.Debug("checks scan reporting an uncompleted Check Run without its stored rows: it has not been sitting long enough for the caller to render",
+						"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "check_name", incomplete[i].Name)
+					continue
+				}
+				var checks []*storage.Check
+				if len(scopes) > 0 {
+					checks = scopes[0].config.CheckRowsForEnvironment(stored, incompleteEnvironments[i], repo, pr.Number, pr.HeadSHA)
+				} else {
+					checks = checkRowsForScanEnvironment(stored, incompleteEnvironments[i])
+				}
+				scoped := inspectRowsBehindStuckCheck(ctx, store, checks, pr.HeadSHA, logger)
+				incomplete[i].StoredRows = scoped
+				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
+			}
 			result.Stuck = append(result.Stuck, StuckCheckPR{
 				Number:  pr.Number,
-				URL:     fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+				URL:     caller.PullRequestURL(repo, pr.Number),
 				Title:   pr.Title,
 				HeadSHA: pr.HeadSHA,
 				HeadRef: pr.HeadRef,
@@ -823,7 +1116,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		}
 		result.Missing = append(result.Missing, MissingCheckPR{
 			Number:                 pr.Number,
-			URL:                    fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+			URL:                    caller.PullRequestURL(repo, pr.Number),
 			Title:                  pr.Title,
 			HeadSHA:                pr.HeadSHA,
 			HeadRef:                pr.HeadRef,
@@ -848,6 +1141,97 @@ func estimateOpenPRCount(page, lastPage, pageLen int) int {
 		page = 1
 	}
 	return (page-1)*webhookScanPRPageSize + pageLen
+}
+
+// storedChecksBehindStuckCheck reads the stored check state behind a Check Run
+// that exists on an open PR's head and never completed.
+//
+// The run alone says the gate is open and nothing else: not which database,
+// not whether an apply owns it, not whether anything will ever close it. The
+// rows say all three, which is what turns a fleet sweep's stuck list from a
+// list of PRs to open into a list of PRs to act on.
+//
+// A read failure costs the entry its rows and nothing else. The Check Run
+// findings are what the backfill acts on and they are already in hand, so
+// failing the whole scan over the explanation would trade the answer for the
+// annotation.
+func storedChecksBehindStuckCheck(ctx context.Context, store storage.Storage, repo string, pr int, headSHA string, logger *slog.Logger) []*storage.Check {
+	if store == nil {
+		logger.Warn("checks scan reports a stuck Check Run without the stored state behind it: storage is not configured",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return nil
+	}
+	stored, err := store.Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		logger.Warn("checks scan reports a stuck Check Run without the stored state behind it: reading stored check state failed",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		return nil
+	}
+	if len(stored) == 0 {
+		logger.Debug("no stored check state behind this stuck Check Run",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return nil
+	}
+	return stored
+}
+
+func inspectRowsBehindStuckCheck(ctx context.Context, store storage.Storage, checks []*storage.Check, headSHA string, logger *slog.Logger) []InspectedCheck {
+	rows := make([]InspectedCheck, 0, len(checks))
+	for _, check := range checks {
+		rows = append(rows, inspectedCheck(ctx, store, check, headSHA, logger))
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Environment != rows[j].Environment {
+			return rows[i].Environment < rows[j].Environment
+		}
+		if rows[i].Database != rows[j].Database {
+			return rows[i].Database < rows[j].Database
+		}
+		return rows[i].DatabaseType < rows[j].DatabaseType
+	})
+	return rows
+}
+
+// checkRowsForScanEnvironment narrows a PR's stored rows to the ones a single
+// Check Run gates on. An unscoped run keeps all of them: the deployment
+// publishes one run covering every environment, so every row is its own.
+func checkRowsForScanEnvironment(rows []*storage.Check, environment string) []*storage.Check {
+	if environment == "" {
+		return rows
+	}
+	var scoped []*storage.Check
+	for _, row := range rows {
+		if row.Environment == environment {
+			scoped = append(scoped, row)
+		}
+	}
+	return scoped
+}
+
+// waitingOnForStoredRows reduces a stuck run's rows to the one answer that
+// decides whether an operator opens it. One row needing a person makes the
+// whole run need one: a run reported as self-converging when part of it is
+// not would be read as safe to leave alone.
+//
+// No blocking row means no stored row explains the run, which is reported as
+// no answer. Calling that "schemabot" would promise a convergence nothing
+// recorded is going to deliver, and that is the reading that leaves a wedged
+// gate sitting.
+//
+// The rollup is a projection of the rows beside it and never a cause of its
+// own, so it decides nothing here.
+func waitingOnForStoredRows(rows []InspectedCheck) string {
+	waiting := ""
+	for _, row := range rows {
+		if row.Aggregate || !row.Blocking {
+			continue
+		}
+		if !row.SelfConverging {
+			return apitypes.WaitingOnOperator
+		}
+		waiting = apitypes.WaitingOnSchemaBot
+	}
+	return waiting
 }
 
 // checkRunCompleted reports whether the Check Run's status is "completed".

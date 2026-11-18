@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
@@ -15,7 +16,7 @@ import (
 var dr = state.DeployRequest
 
 // vitessCancelledSignal is the transient value returned by deriveDeployState when Vitess
-// migrations are cancelled. It is not a real PlanetScale deploy state — the processor
+// schema changes are cancelled. It is not a real PlanetScale deploy state — the processor
 // routes it through InProgressCancel → CompleteCancel.
 const vitessCancelledSignal = "cancelled"
 
@@ -32,8 +33,70 @@ var terminalDeployStates = map[string]bool{
 	dr.NoChanges:           true,
 }
 
+// IsTerminalDeployState reports whether a deploy request in this state will
+// make no further progress. It is what the deploy gate consults to decide
+// whether an earlier request still occupies the database's one active deploy,
+// so anything that needs to ask the same question asks it here rather than
+// keeping a second copy of the set.
+func IsTerminalDeployState(deployState string) bool {
+	return terminalDeployStates[deployState]
+}
+
+// alreadyCancelling reports whether a deploy request in this state is already
+// on its way to a terminal one, so a cancel has nothing left to ask for.
+var alreadyCancelling = map[string]bool{
+	dr.InProgressCancel:        true,
+	dr.InProgressRevert:        true,
+	dr.InProgressRevertVSchema: true,
+}
+
+// CanCancelDeployRequest reports whether a cancel can still reach a deploy
+// request in this state.
+//
+// A cancel is accepted for as long as the request holds the database's one
+// active deploy and nothing else is already retiring it. Cutover is included
+// deliberately: it is the phase a deploy is most likely to be stuck in, and a
+// phase that refuses the only command that frees the slot leaves the database
+// with no way back short of a restart.
+//
+// Pending and Ready precede the deploy, so they hold nothing to cancel.
+func CanCancelDeployRequest(deployState string) bool {
+	switch deployState {
+	case dr.Pending, dr.Ready:
+		return false
+	}
+	return !IsTerminalDeployState(deployState) && !alreadyCancelling[deployState]
+}
+
+// cancelResolveTimeout bounds how long a deploy request waits in
+// in_progress_cancel for the engine to confirm the cancel. A cancel the engine
+// has accepted lands in well under a second; one it never answers would
+// otherwise hold the database's single active deploy for as long as the server
+// runs, which is the wedge a cancel exists to undo.
+const cancelResolveTimeout = 10 * time.Second
+
+// cancelTimeRemaining reports how long a cancel recorded at the given stored
+// timestamp has left before its deadline, and whether that deadline can be
+// measured at all. Both the stored value and now are UTC, written and read by
+// the same Go clock, so the answer does not depend on the database session's
+// time zone.
+//
+// A request in in_progress_cancel with no readable timestamp was written by a
+// path that does not record one. It is left to the engine rather than resolved
+// against a deadline that cannot be measured.
+func cancelTimeRemaining(cancelRequestedAt sql.NullString, now time.Time) (time.Duration, bool) {
+	if !cancelRequestedAt.Valid || cancelRequestedAt.String == "" {
+		return 0, false
+	}
+	requestedAt, err := time.Parse(storedTimestampLayout, cancelRequestedAt.String)
+	if err != nil {
+		return 0, false
+	}
+	return cancelResolveTimeout - now.Sub(requestedAt), true
+}
+
 // runStateProcessor is a background goroutine that drives deploy request state
-// transitions by polling Vitess migration statuses every 500ms. This replaces
+// transitions by polling Vitess schema change statuses every 500ms. This replaces
 // the previous approach of deriving state lazily on each GET request.
 func (s *Server) runStateProcessor(ctx context.Context) {
 	defer close(s.processorDone)
@@ -67,15 +130,17 @@ type activeDeployRow struct {
 	instantDDLRequested    bool
 	branch                 string
 	revertExpiresAtStr     sql.NullString
+	cancelRequestedAtStr   sql.NullString
 	createdAtStr           string
 }
 
 // processActiveDeployRequests queries deploy requests in active (non-terminal)
-// states and advances their state based on Vitess migration progress.
+// states and advances their state based on Vitess schema change progress.
 func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	rows, err := s.metadataDB.QueryContext(ctx,
 		`SELECT org, database_name, number, deployment_state, migration_context, revert_migration_context,
-		        vschema_data, vschema_applied, auto_cutover, instant_ddl, branch, revert_expires_at, created_at
+		        vschema_data, vschema_applied, auto_cutover, instant_ddl, branch, revert_expires_at,
+		        cancel_requested_at, created_at
 		 FROM localscale_deploy_requests
 		 WHERE deployment_state IN ('submitting','queued','in_progress','pending_cutover','in_progress_cutover','in_progress_vschema','in_progress_cancel','in_progress_revert','in_progress_revert_vschema','complete_pending_revert')
 		 AND deployed = TRUE`)
@@ -88,7 +153,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	for rows.Next() {
 		var r activeDeployRow
 		if err := rows.Scan(&r.org, &r.database, &r.number, &r.deployState, &r.migrationContext, &r.revertMigrationContext,
-			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.instantDDLRequested, &r.branch, &r.revertExpiresAtStr, &r.createdAtStr); err != nil {
+			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.instantDDLRequested, &r.branch, &r.revertExpiresAtStr, &r.cancelRequestedAtStr, &r.createdAtStr); err != nil {
 			s.logger.Warn("processor: scan deploy request row", "error", err)
 			continue
 		}
@@ -115,10 +180,10 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 		case dr.Submitting:
 			// Crash recovery: if the background goroutine panicked or exited without
 			// advancing the state, detect stale "submitting" rows and transition to error.
-			if createdAt, err := time.Parse("2006-01-02 15:04:05", r.createdAtStr); err == nil {
+			if createdAt, err := time.Parse(storedTimestampLayout, r.createdAtStr); err == nil {
 				if time.Since(createdAt) > 2*time.Minute {
 					s.logger.Error("deploy request stuck in submitting (possible crash)", "number", r.number)
-					if err := s.updateDeployState(ctx, ref, dr.Error); err != nil {
+					if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.Error); err != nil {
 						s.logger.Error("processor: failed to transition stuck deploy to error", "number", r.number, "error", err)
 					}
 				}
@@ -127,63 +192,54 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 
 		case dr.PendingCutover:
-			// Auto-cutover: issue COMPLETE for all migrations so Vitess completes the cutover.
-			// Without this, Vitess may leave migrations in ready_to_complete indefinitely
-			// (e.g. after previous cancelled migrations affect executor state in vtcombo).
+			// Auto-cutover: issue COMPLETE for all schema changes so Vitess completes the cutover.
+			// Without this, Vitess may leave schema changes in ready_to_complete indefinitely
+			// (e.g. after previous cancelled schema changes affect executor state in vtcombo).
 			if r.autoCutover && r.migrationContext != "" {
-				if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, "COMPLETE"); err != nil {
+				if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, migrationActionComplete); err != nil {
 					s.logger.Error("processor: auto-cutover COMPLETE failed", "number", r.number, "error", err)
 					continue
 				}
-				if err := s.updateDeployState(ctx, ref, dr.InProgressCutover); err != nil {
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.InProgressCutover); err != nil {
 					s.logger.Error("processor: failed to transition to in_progress_cutover", "number", r.number, "error", err)
 				}
 			}
 
 		case dr.Queued, dr.InProgress, dr.InProgressCutover:
-			// DDL phase: derive state from Vitess migrations
+			// DDL phase: derive state from Vitess schema changes
 			if r.migrationContext == "" {
-				// VSchema-only deploys have no migration context. If VSchema is
+				// VSchema-only deploys have no migration_context. If VSchema is
 				// already applied and we're in cutover, transition to complete.
 				if r.vschemaApplied && r.deployState == dr.InProgressCutover {
-					if err := s.updateDeployState(ctx, ref, dr.CompletePendingRevert); err != nil {
+					if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.CompletePendingRevert); err != nil {
 						s.logger.Error("processor: failed to complete vschema-only deploy", "number", r.number, "error", err)
 					}
 				} else {
-					s.logger.Warn("processor: deploy request has no migration context", "number", r.number, "state", r.deployState)
+					s.logger.Warn("processor: deploy request has no migration_context", "number", r.number, "state", r.deployState)
 				}
 				continue
 			}
 			migrations := s.getMigrationInfos(ctx, backend, r.migrationContext)
 			if len(migrations) == 0 {
-				s.logger.Debug("processor: no migrations visible yet", "number", r.number, "migration_context", r.migrationContext)
+				s.logger.Debug("processor: no schema changes visible yet", "number", r.number, "migration_context", r.migrationContext)
 				continue
 			}
 			cutoverRequested := r.deployState == dr.InProgressCutover
 
-			// Issue COMPLETE for migrations that are newly ready_to_complete.
-			// With --in-order-completion, migrations become ready_to_complete
+			// Issue COMPLETE for schema changes that are newly ready_to_complete.
+			// With --in-order-completion, schema changes become ready_to_complete
 			// one at a time — each needs its own COMPLETE command issued.
 			// alterVitessMigrations issues per-UUID commands, so already-completed
-			// migrations are safely ignored by Vitess.
-			if cutoverRequested {
-				hasWaiting := false
-				for _, m := range migrations {
-					if m.readyToComplete && m.status != state.Vitess.Complete {
-						hasWaiting = true
-						break
-					}
-				}
-				if hasWaiting {
-					if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, "COMPLETE"); err != nil {
-						s.logger.Error("processor: COMPLETE migrations failed", "number", r.number, "error", err)
-					}
+			// schema changes are safely ignored by Vitess.
+			if cutoverRequested && anyWaitingCutover(migrations) {
+				if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, migrationActionComplete); err != nil {
+					s.logger.Error("processor: COMPLETE schema changes failed", "number", r.number, "error", err)
 				}
 			}
 
 			newState := deriveDeployState(migrations, cutoverRequested, r.instantDDLRequested)
 
-			// If the processor detects cancelled migrations while the deploy is
+			// If the processor detects cancelled schema changes while the deploy is
 			// still in queued/in_progress, route through the cancel flow instead
 			// of setting "cancelled" directly. This avoids a race where the
 			// processor beats the cancel handler's DB update to in_progress_cancel.
@@ -191,10 +247,10 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 				newState = dr.InProgressCancel
 			}
 
-			// Log migration details on failure for debugging
+			// Log Vitess schema change details on failure for debugging
 			if newState == dr.CompleteError {
 				for _, m := range migrations {
-					s.logger.Warn("migration failed", "number", r.number, "status", m.status, "message", m.message)
+					s.logger.Warn("vitess schema change failed", "number", r.number, "vitess_status", m.status, "vitess_message", m.message)
 				}
 			}
 
@@ -204,7 +260,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 
 			if newState != r.deployState {
-				if err := s.updateDeployState(ctx, ref, newState); err != nil {
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, newState); err != nil {
 					s.logger.Error("processor: failed to update deploy state", "number", r.number, "new_state", newState, "error", err)
 				}
 			}
@@ -213,66 +269,94 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			// VSchema phase: apply pending VSchema
 			if err := s.applyPendingVSchema(ctx, backend, ref, r.vschemaDataSQL.String); err != nil {
 				s.logger.Error("apply vschema failed", "number", r.number, "error", err)
-				if err := s.updateDeployState(ctx, ref, dr.CompleteError); err != nil {
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.CompleteError); err != nil {
 					s.logger.Error("processor: failed to transition to complete_error", "number", r.number, "error", err)
 				}
 			} else {
-				if err := s.updateDeployState(ctx, ref, dr.CompletePendingRevert); err != nil {
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.CompletePendingRevert); err != nil {
 					s.logger.Error("processor: failed to transition to complete_pending_revert", "number", r.number, "error", err)
 				}
 			}
 
 		case dr.InProgressCancel:
-			// Cancel phase: wait for all Vitess migrations to reach terminal state.
+			// The shard a cancel waits on is the one that has stopped
+			// answering, so the engine calls below are this branch's slowest
+			// part and must not be what decides whether the deadline passed.
+			// The deadline is read first, and then spent: what is left of it
+			// bounds this tick's engine work, so a shard that never answers
+			// costs the remainder of the deadline and not a statement timeout
+			// on top of it.
+			cancelCtx := ctx
+			if remaining, measurable := cancelTimeRemaining(r.cancelRequestedAtStr, time.Now().UTC()); measurable {
+				if remaining <= 0 {
+					s.logger.Error("cancel not confirmed by the engine within its deadline; "+
+						"reporting the deploy request failed and freeing the active deploy",
+						"number", r.number, "org", r.org, "database", r.database,
+						"migration_context", r.migrationContext, "deadline", cancelResolveTimeout)
+					if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.CompleteError); err != nil {
+						s.logger.Error("processor: failed to resolve unconfirmed cancel",
+							"number", r.number, "error", err)
+					}
+					continue
+				}
+				var cancelDeadline context.CancelFunc
+				cancelCtx, cancelDeadline = context.WithTimeout(ctx, remaining)
+				defer cancelDeadline()
+			}
+			// Cancel phase: wait for all Vitess schema changes to reach terminal state.
 			if r.migrationContext == "" {
-				// No migrations to cancel (e.g., cancelled during submitting)
-				if err := s.execLog(ctx,
-					`UPDATE localscale_deploy_requests
-					 SET cancelled = TRUE, deployment_state = ?
-					 WHERE org = ? AND database_name = ? AND number = ?`,
-					dr.CompleteCancel, ref.org, ref.database, r.number); err != nil {
+				// No schema changes to cancel (e.g., cancelled during submitting)
+				if err := s.completeCancel(ctx, ref); err != nil {
 					s.logger.Error("processor: update cancel state", "number", r.number, "error", err)
-				} else {
-					s.logger.Info("deploy state transition", "number", r.number, "new_state", dr.CompleteCancel)
 				}
 				continue
 			}
-			// Re-issue CANCEL on every tick to handle the race where migrations
+			// Re-issue CANCEL on every tick to handle the race where schema changes
 			// become visible after the initial cancel request.
-			if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, "CANCEL"); err != nil {
-				s.logger.Warn("processor: re-cancel migrations", "number", r.number, "error", err)
+			if err := s.alterVitessMigrations(cancelCtx, backend, r.migrationContext, migrationActionCancel); err != nil {
+				s.logger.Warn("processor: re-cancel schema changes", "number", r.number, "error", err)
 			}
-			migrations := s.getMigrationInfos(ctx, backend, r.migrationContext)
+			migrations := s.getMigrationInfos(cancelCtx, backend, r.migrationContext)
 			if len(migrations) == 0 {
-				s.logger.Debug("processor: cancel waiting for migrations to appear", "number", r.number, "migration_context", r.migrationContext)
+				s.logger.Debug("processor: cancel waiting for schema changes to appear", "number", r.number, "migration_context", r.migrationContext)
 				continue
 			}
-			allTerminal := true
-			for _, m := range migrations {
-				switch m.status {
-				case state.Vitess.Complete, state.Vitess.Failed, state.Vitess.Cancelled:
-					// terminal
-				default:
-					allTerminal = false
-				}
-			}
-			if allTerminal {
-				if err := s.execLog(ctx,
-					`UPDATE localscale_deploy_requests
-					 SET cancelled = TRUE, deployment_state = ?
-					 WHERE org = ? AND database_name = ? AND number = ?`,
-					dr.CompleteCancel, ref.org, ref.database, r.number); err != nil {
+			outcome := cancelOutcome(migrations)
+			switch outcome {
+			case cancelPending:
+				s.logger.Debug("processor: cancel waiting for schema changes to settle", "number", r.number, "migration_context", r.migrationContext)
+			case cancelConfirmed:
+				if err := s.completeCancel(ctx, ref); err != nil {
 					s.logger.Error("processor: update cancel state", "number", r.number, "error", err)
-				} else {
-					s.logger.Info("deploy state transition", "number", r.number, "new_state", dr.CompleteCancel)
+				}
+			case cancelLostToCompletion:
+				// Every schema change completed before the cancel reached it,
+				// so the deploy request settles as the completed deploy it is.
+				newState := deriveDeployState(migrations, true, r.instantDDLRequested)
+				if newState == dr.CompletePendingRevert && hasVSchema && !r.vschemaApplied {
+					newState = dr.InProgressVSchema
+				}
+				s.logger.Warn("cancel arrived after every schema change completed; settling the deploy request as completed",
+					"number", r.number, "org", r.org, "database", r.database, "migration_context", r.migrationContext, "new_state", newState)
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, newState); err != nil {
+					s.logger.Error("processor: failed to settle completed deploy after cancel", "number", r.number, "error", err)
+				}
+			case cancelPartiallyApplied:
+				for _, m := range migrations {
+					s.logger.Error("cancel settled with part of the schema change applied; reporting the deploy request failed",
+						"number", r.number, "org", r.org, "database", r.database, "migration_context", r.migrationContext,
+						"vitess_status", m.status, "ddl_action", m.ddlAction)
+				}
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.CompleteError); err != nil {
+					s.logger.Error("processor: failed to report partially applied cancel", "number", r.number, "error", err)
 				}
 			}
 
 		case dr.InProgressRevert:
-			// Revert phase: track reverse DDL progress by revert migration context
+			// Revert phase: track reverse DDL progress by revert_migration_context
 			newState := s.deriveRevertState(ctx, backend, r.revertMigrationContext)
 			if newState != r.deployState {
-				if err := s.updateDeployState(ctx, ref, newState); err != nil {
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, newState); err != nil {
 					s.logger.Error("processor: failed to update revert state", "number", r.number, "new_state", newState, "error", err)
 				}
 			}
@@ -284,35 +368,45 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 		case dr.CompletePendingRevert:
 			// Auto-expire the revert window after the configured duration
 			if r.revertExpiresAtStr.Valid {
-				if expiresAt, err := time.Parse("2006-01-02 15:04:05", r.revertExpiresAtStr.String); err == nil && time.Now().After(expiresAt) {
+				if expiresAt, err := time.Parse(storedTimestampLayout, r.revertExpiresAtStr.String); err == nil && time.Now().After(expiresAt) {
 					s.logger.Info("revert window expired", "number", r.number)
-					if err := s.updateDeployState(ctx, ref, dr.Complete); err != nil {
+					if err := s.completeExpiredRevertWindow(ctx, backend, ref, r.deployState, r.branch); err != nil {
 						s.logger.Error("processor: failed to complete expired revert", "number", r.number, "error", err)
-						continue
 					}
-					s.dropBranchDatabases(ctx, backend, r.branch)
 				}
 			}
 		}
 	}
 }
 
-func (s *Server) updateDeployState(ctx context.Context, ref deployRequest, newState string) error {
-	var err error
-	if newState == dr.CompletePendingRevert {
-		_, err = s.metadataDB.ExecContext(ctx,
-			`UPDATE localscale_deploy_requests
-			 SET deployment_state = ?, revert_expires_at = DATE_ADD(NOW(), INTERVAL ? SECOND)
-			 WHERE org = ? AND database_name = ? AND number = ?`,
-			newState, int(s.revertWindowDuration.Seconds()), ref.org, ref.database, ref.number)
-	} else {
-		_, err = s.metadataDB.ExecContext(ctx,
-			`UPDATE localscale_deploy_requests
-			 SET deployment_state = ?
-			 WHERE org = ? AND database_name = ? AND number = ?`,
-			newState, ref.org, ref.database, ref.number)
-	}
+// completeExpiredRevertWindow closes a deploy request's expired revert window
+// and drops its branch databases. The databases are dropped only when this
+// call moved the request to complete: a revert recorded after the processor
+// read complete_pending_revert still needs them, so it keeps both its state
+// and its databases.
+func (s *Server) completeExpiredRevertWindow(ctx context.Context, backend *databaseBackend, ref deployRequest, readState, branch string) error {
+	applied, err := s.advanceDeployState(ctx, ref, readState, dr.Complete)
 	if err != nil {
+		return err
+	}
+	if !applied {
+		s.logger.Info("revert window closed by a newer state; keeping the branch databases",
+			"number", ref.number, "branch", branch)
+		return nil
+	}
+	s.dropBranchDatabases(ctx, backend, branch)
+	return nil
+}
+
+// updateDeployState records a deploy request's state unconditionally, for a
+// transition no other writer can race: a failed diff before the request can be
+// deployed.
+func (s *Server) updateDeployState(ctx context.Context, ref deployRequest, newState string) error {
+	set, setArgs := deployStateAssignment(newState, int(s.revertWindowDuration.Seconds()))
+	if _, err := s.metadataDB.ExecContext(ctx,
+		`UPDATE localscale_deploy_requests SET `+set+`
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		append(setArgs, ref.org, ref.database, ref.number)...); err != nil {
 		s.logger.Error("update deploy state failed", "number", ref.number, "new_state", newState, "error", err)
 		return fmt.Errorf("update deploy state to %s for %d: %w", newState, ref.number, err)
 	}
@@ -320,7 +414,111 @@ func (s *Server) updateDeployState(ctx context.Context, ref deployRequest, newSt
 	return nil
 }
 
-// migrationInfo holds the key fields from a Vitess migration needed for state derivation.
+// advanceDeployState moves a deploy request from the state its writer read to
+// the next one, only while the request still reads that state. The processor,
+// the deploy goroutine, and the action handlers (cancel, revert, skip-revert)
+// all write the same row, and an unconditional write puts a stale transition
+// back over a newer one: a cancelled request would return to pending_cutover
+// and never reach complete_cancel. It reports whether the transition was
+// applied.
+func (s *Server) advanceDeployState(ctx context.Context, ref deployRequest, from, to string) (bool, error) {
+	set, setArgs := deployStateAssignment(to, int(s.revertWindowDuration.Seconds()))
+	res, err := s.metadataDB.ExecContext(ctx,
+		`UPDATE localscale_deploy_requests SET `+set+`
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployment_state = ?`,
+		append(setArgs, ref.org, ref.database, ref.number, from)...)
+	if err != nil {
+		s.logger.Error("advance deploy state failed", "number", ref.number, "from_state", from, "new_state", to, "error", err)
+		return false, fmt.Errorf("advance deploy state from %s to %s for %d: %w", from, to, ref.number, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected advancing deploy state from %s to %s for %d: %w", from, to, ref.number, err)
+	}
+	if rows == 0 {
+		s.logger.Info("deploy state changed after it was read; keeping the newer state",
+			"number", ref.number, "from_state", from, "derived_state", to)
+		return false, nil
+	}
+	s.logger.Info("deploy state transition", "number", ref.number, "from_state", from, "new_state", to)
+	return true, nil
+}
+
+// deployStateAssignment is the SET clause recording newState. Entering the
+// revert window also starts its clock.
+func deployStateAssignment(newState string, revertWindowSeconds int) (string, []any) {
+	if newState == dr.CompletePendingRevert {
+		return "deployment_state = ?, revert_expires_at = DATE_ADD(NOW(), INTERVAL ? SECOND)", []any{newState, revertWindowSeconds}
+	}
+	return "deployment_state = ?", []any{newState}
+}
+
+// completeCancel settles a cancel the engine confirmed, while the request
+// still reads in_progress_cancel.
+func (s *Server) completeCancel(ctx context.Context, ref deployRequest) error {
+	res, err := s.metadataDB.ExecContext(ctx,
+		`UPDATE localscale_deploy_requests
+		 SET cancelled = TRUE, deployment_state = ?
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployment_state = ?`,
+		dr.CompleteCancel, ref.org, ref.database, ref.number, dr.InProgressCancel)
+	if err != nil {
+		return fmt.Errorf("record confirmed cancel for %d: %w", ref.number, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected recording confirmed cancel for %d: %w", ref.number, err)
+	}
+	if rows == 0 {
+		s.logger.Info("deploy request left in_progress_cancel before its cancel was recorded; keeping the newer state", "number", ref.number)
+		return nil
+	}
+	s.logger.Info("deploy state transition", "number", ref.number, "from_state", dr.InProgressCancel, "new_state", dr.CompleteCancel)
+	return nil
+}
+
+// cancelSettlement is what a cancelled deploy request's schema changes ended
+// up doing.
+type cancelSettlement int
+
+const (
+	// cancelPending: a schema change has not reached a terminal status yet.
+	cancelPending cancelSettlement = iota
+	// cancelConfirmed: no schema change completed, so none of the deploy
+	// request's DDL is on the target.
+	cancelConfirmed
+	// cancelLostToCompletion: every schema change completed before the cancel
+	// reached it, so the deploy request's whole schema change is applied.
+	cancelLostToCompletion
+	// cancelPartiallyApplied: some schema changes completed and others were
+	// cancelled or failed, so part of the deploy request's DDL is applied.
+	cancelPartiallyApplied
+)
+
+// cancelOutcome classifies a cancelled deploy request's schema changes once
+// they settle. A terminal status alone does not mean the cancel took effect: a
+// schema change can complete before the cancel reaches it, and reporting that
+// as complete_cancel would claim the target was left unchanged when it was not.
+func cancelOutcome(migrations []migrationInfo) cancelSettlement {
+	complete := 0
+	for _, m := range migrations {
+		if !state.IsTerminalVitessState(m.status) {
+			return cancelPending
+		}
+		if strings.EqualFold(m.status, state.Vitess.Complete) {
+			complete++
+		}
+	}
+	switch complete {
+	case 0:
+		return cancelConfirmed
+	case len(migrations):
+		return cancelLostToCompletion
+	default:
+		return cancelPartiallyApplied
+	}
+}
+
+// migrationInfo holds the key fields from a Vitess schema change needed for state derivation.
 type migrationInfo struct {
 	status          string
 	readyToComplete bool
@@ -328,30 +526,42 @@ type migrationInfo struct {
 	message         string
 }
 
-// deriveDeployState maps a set of Vitess migration statuses to a single PlanetScale
+// anyWaitingCutover reports whether any schema change is waiting for its
+// cutover — its effective state resolves to ready_to_complete. A terminal
+// schema change with a stale ready_to_complete flag is never waiting, so no
+// COMPLETE command is issued against a finished, failed, or cancelled schema
+// change.
+func anyWaitingCutover(migrations []migrationInfo) bool {
+	for _, m := range migrations {
+		if state.EffectiveVitessState(m.status, m.readyToComplete) == state.Vitess.ReadyToComplete {
+			return true
+		}
+	}
+	return false
+}
+
+// deriveDeployState maps a set of Vitess schema change statuses to a single PlanetScale
 // deploy request state. This provides realistic deploy request status tracking that
 // reflects what Vitess is actually doing.
 //
 // PlanetScale deploy request states:
 // https://planetscale.com/docs/api/reference/create_deploy_request#response-deployment-state
 //
-// Vitess migration statuses (from vitess.io/vitess/go/vt/schema):
+// Vitess schema change statuses (from vitess.io/vitess/go/vt/schema):
 //
-//	requested        → Migration submitted to tablet, not yet picked up by operator
+//	requested        → Schema change submitted to tablet, not yet picked up by operator
 //	queued           → Picked up by operator, waiting for execution slot
 //	ready            → Ready to execute but waiting (e.g., for --in-order-completion)
 //	running          → Actively copying rows (or cutting over if ready_to_complete=true)
 //	ready_to_complete→ Row copy done, waiting for cutover (explicit or auto)
-//	complete         → Migration finished successfully
-//	failed           → Migration failed
-//	cancelled        → Migration was cancelled
+//	complete         → Schema change finished successfully
+//	failed           → Schema change failed
+//	cancelled        → Schema change was cancelled
 //
-// The readyToComplete field is the authoritative signal for whether a migration is
-// waiting for cutover — it is true even when migration_status is still "running"
-// (brief race) or "queued" (immediate operations like CREATE/DROP TABLE).
-// Instant DDL (ALGORITHM=INSTANT) skips ready_to_complete entirely and goes
-// straight to complete. Terminal states (complete, failed, cancelled) take
-// precedence over readyToComplete, which can remain true after cancel/fail.
+// state.EffectiveVitessState applies the authoritative readyToComplete cutover-
+// readiness signal while preserving terminal statuses. Instant DDL
+// (ALGORITHM=INSTANT) skips ready_to_complete entirely and goes straight to
+// complete.
 //
 // cutoverRequested tracks whether apply-deploy (cutover) has been triggered, enabling
 // the distinction between pending_cutover and in_progress_cutover states.
@@ -360,42 +570,33 @@ func deriveDeployState(migrations []migrationInfo, cutoverRequested bool, instan
 	var failed, cancelled, complete, running, waitingCutover, queued int
 
 	for _, m := range migrations {
-		switch m.status {
+		effective := state.EffectiveVitessState(m.status, m.readyToComplete)
+		if !state.IsKnownVitessState(m.status) {
+			slog.Warn("unknown vitess schema change status", "vitess_status", m.status, "effective_state", effective, "ddl_action", m.ddlAction)
+		}
+		switch effective {
 		case state.Vitess.Complete:
 			complete++
 		case state.Vitess.Failed:
 			failed++
 		case state.Vitess.Cancelled:
 			cancelled++
-		case state.Vitess.Running:
-			if m.readyToComplete {
-				waitingCutover++
-			} else {
-				running++
-			}
 		case state.Vitess.ReadyToComplete:
 			waitingCutover++
+		case state.Vitess.Running:
+			running++
 		case state.Vitess.Queued, state.Vitess.Requested, state.Vitess.Ready:
-			// Early states. Immediate operations (CREATE/DROP TABLE) set
-			// ready_to_complete=true before transitioning out of queued.
-			// Instant DDL (ALGORITHM=INSTANT ALTER) skips this entirely
-			// and goes straight to complete.
-			if m.readyToComplete {
-				waitingCutover++
-			} else {
-				queued++
-			}
+			queued++
 		default:
-			// Unknown Vitess status — count as queued so the processor keeps
-			// polling until Vitess resolves it to a known status.
-			slog.Warn("unknown vitess migration status, treating as pending", "status", m.status, "ddl_action", m.ddlAction)
+			// Unknown status without the cutover-ready flag — count as queued
+			// so the processor keeps polling until Vitess resolves it.
 			queued++
 		}
 	}
 
 	total := len(migrations)
 
-	// Map aggregate Vitess migration state to PlanetScale deploy request state.
+	// Map aggregate Vitess schema change state to PlanetScale deploy request state.
 	// Priority matches PlanetScale's real behavior.
 	switch {
 	case failed > 0:

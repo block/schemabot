@@ -7,10 +7,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // PlanDiff is the read-only producer for review-time drift detection: it must
@@ -54,6 +54,33 @@ func TestPlanDiff_SurfacesPerShardMembership(t *testing.T) {
 	require.Len(t, byShard["-80"].Changes, 1)
 	assert.Equal(t, "ALTER TABLE `users` ADD INDEX (`created_at`)", byShard["-80"].Changes[0].Ddl)
 	assert.Equal(t, "ALTER TABLE `users` ADD INDEX (`updated_at`)", byShard["80-"].Changes[0].Ddl)
+}
+
+// A member's diff reports its copies only when the engine read the target for
+// every one. An engine whose copy lookup failed, or that never looked, leaves
+// the member's copies unknown, and the flag is what lets the caller refuse to
+// discard a copy nobody disclosed instead of reading the silence as a clean
+// target.
+func TestPlanDiff_ReportsExistingCopiesOnlyWhenTheEngineCheckedThem(t *testing.T) {
+	for name, tc := range map[string]struct {
+		checked bool
+		want    bool
+	}{
+		"engine checked every copy":       {checked: true, want: true},
+		"engine lookup failed or skipped": {checked: false, want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := alterUsersEmailPlan()
+			result.ExistingCopiesChecked = tc.checked
+			store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+			c := newPlanMaterializeClientWithPlan(store, result)
+
+			resp, err := c.PlanDiff(t.Context(), &ternv1.PlanRequest{Database: "testapp"})
+			require.NoError(t, err)
+			assert.Empty(t, resp.ExistingCopies, "the engine disclosed no copy in either case")
+			assert.Equal(t, tc.want, resp.ExistingCopiesReported)
+		})
+	}
 }
 
 // The rollup's primary member comes from Plan and its non-primary members from
@@ -102,7 +129,7 @@ func shardedAlterPlan() *engine.PlanResult {
 				Shard:     engine.Shard{Name: "-80"},
 				TableChanges: []engine.TableChange{{
 					Table:     "users",
-					Operation: statement.StatementAlterTable,
+					Operation: ddl.StatementAlterTable,
 					DDL:       "ALTER TABLE `users` ADD INDEX (`created_at`)",
 				}},
 			},
@@ -111,7 +138,7 @@ func shardedAlterPlan() *engine.PlanResult {
 				Shard:     engine.Shard{Name: "80-"},
 				TableChanges: []engine.TableChange{{
 					Table:     "users",
-					Operation: statement.StatementAlterTable,
+					Operation: ddl.StatementAlterTable,
 					DDL:       "ALTER TABLE `users` ADD INDEX (`updated_at`)",
 				}},
 			},

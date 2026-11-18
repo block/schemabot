@@ -26,5 +26,6 @@ CREATE TABLE `webhook_events` (
   KEY `idx_claimable` (`state`,`retry_after`,`lease_expires_at`,`created_at`),
   KEY `idx_provider_repo_pr` (`provider`,`repository`,`pull_request`),
   KEY `idx_head_sha` (`head_sha`),
-  KEY `idx_received_at` (`received_at`)
+  KEY `idx_received_at` (`received_at`),
+  KEY `idx_created_id` (`created_at`,`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

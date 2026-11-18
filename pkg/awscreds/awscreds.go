@@ -4,7 +4,9 @@
 // the resolved target and its entity attributes, so one configuration can locate
 // per-target or per-cluster secrets. By default it reads from the caller's own
 // AWS account; when a role ARN is configured it assumes a per-target role first,
-// so a single data plane can read secrets across many AWS accounts.
+// so a single data plane can read secrets across many AWS accounts. Secrets are
+// read in the data plane's home region, or in the region of the target's own
+// cluster when that region is one the data plane is configured to reach.
 //
 // The fetched secret is interpreted in one of three ways: by a configured decoder
 // (for example a PlanetScale token); as a JSON {username, password} payload (the
@@ -17,7 +19,9 @@ package awscreds
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,6 +31,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	smtypes "github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/block/schemabot/pkg/inventory"
@@ -53,9 +58,24 @@ type Config struct {
 	// AWSConfig is the base AWS config used to assume roles and build Secrets
 	// Manager clients.
 	AWSConfig aws.Config
-	// Region is the region for Secrets Manager (and assumed-role sessions, when a
-	// role is configured).
+	// Region is the data plane's home region, and is required. Roles are assumed
+	// through STS here, and a target's secret is read here unless its cluster is
+	// in one of ReachableRegions.
 	Region string
+	// RegionAttribute names the entity attribute holding the region of each
+	// target's cluster (e.g. "aws_region"). Setting it lets a target whose
+	// cluster is in one of ReachableRegions have its secret read in that region,
+	// and lets a secret missing from the home region be reported against the
+	// cluster's region. With ReachableRegions set, a target whose entity has no
+	// value for it, or a value that is not a region name, fails resolution;
+	// without, such a target's secret is read in Region.
+	RegionAttribute string
+	// ReachableRegions lists the regions, besides Region, whose Secrets Manager
+	// this data plane can call. They must be in Region's AWS partition. A target whose cluster is in one of them has its
+	// secret read there; a target whose cluster is in any other region has its
+	// secret read in Region, so the secret must be replicated there. Requires
+	// RegionAttribute.
+	ReachableRegions []string
 	// RoleARN is the IAM role assumed in the target account. When empty, secrets
 	// are read from the caller's own account without assuming a role. When set, it
 	// may contain an "{account}" placeholder, replaced with the target's AWS
@@ -94,6 +114,9 @@ type Config struct {
 // assumed roles.
 type Resolver struct {
 	accountAttr    string
+	region         string
+	regionAttr     string
+	reachable      map[string]bool
 	secretName     string
 	usernameTmpl   string
 	fetch          secretFetcher
@@ -103,15 +126,42 @@ type Resolver struct {
 
 var _ inventory.CredentialResolver = (*Resolver)(nil)
 
-// secretFetcher reads a raw secret value, optionally scoped to a target AWS
-// account (ignored by backends that read from the caller's own account).
+// secretFetcher reads a raw secret value from a region, optionally scoped to a
+// target AWS account (ignored by backends that read from the caller's own
+// account).
 type secretFetcher interface {
-	FetchSecret(ctx context.Context, accountID, secretName string) (string, error)
+	FetchSecret(ctx context.Context, accountID, region, secretName string) (string, error)
 }
 
 // New builds a Resolver. With a role ARN it assumes a per-account role to read
 // secrets across accounts; without one it reads from the caller's own account.
 func New(cfg Config) (*Resolver, error) {
+	// No role: read from the caller's own account, with no STS call. A role
+	// switches on per-account assume-role so one data plane can read secrets
+	// across many accounts; the target account then comes from an attribute.
+	// Building a fetcher makes no AWS call; newResolver validates cfg first.
+	// The base config carries the home region, which is where roles are assumed.
+	awsCfg := cfg.AWSConfig
+	awsCfg.Region = cfg.Region
+	var fetch secretFetcher
+	if cfg.RoleARN == "" {
+		fetch = &ownAccountFetcher{awsCfg: awsCfg, clients: make(map[string]*secretsmanager.Client)}
+	} else {
+		fetch = &assumeRoleFetcher{
+			awsCfg:     awsCfg,
+			roleARN:    cfg.RoleARN,
+			externalID: cfg.ExternalID,
+			creds:      make(map[string]aws.CredentialsProvider),
+			clients:    make(map[accountRegion]*secretsmanager.Client),
+		}
+	}
+	return newResolver(cfg, fetch)
+}
+
+// newResolver validates cfg and constructs a Resolver over a given fetcher, so
+// tests can inject a fake that does not call AWS while building the resolver
+// exactly as New does.
+func newResolver(cfg Config, fetch secretFetcher) (*Resolver, error) {
 	switch {
 	case cfg.Region == "":
 		return nil, fmt.Errorf("region is required")
@@ -119,43 +169,100 @@ func New(cfg Config) (*Resolver, error) {
 		return nil, fmt.Errorf("secret name is required")
 	case cfg.Username != "" && cfg.Decode != nil:
 		return nil, fmt.Errorf("username template and decode are mutually exclusive")
+	case len(cfg.ReachableRegions) > 0 && cfg.RegionAttribute == "":
+		return nil, fmt.Errorf("reachable regions require a region attribute naming each target's cluster region")
+	}
+	reachable, err := reachableRegions(cfg.Region, cfg.ReachableRegions)
+	if err != nil {
+		return nil, err
 	}
 	accountAttr := cfg.AccountAttribute
 	if accountAttr == "" {
 		accountAttr = defaultAccountAttribute
 	}
-
-	// No role: read from the caller's own account with a single client. A role
-	// switches on per-account assume-role so one data plane can read secrets
-	// across many accounts; the target account then comes from an attribute.
-	if cfg.RoleARN == "" {
-		regionalCfg := cfg.AWSConfig
-		regionalCfg.Region = cfg.Region
-		fetch := &ownAccountFetcher{client: secretsmanager.NewFromConfig(regionalCfg)}
-		return newResolver(accountAttr, cfg.SecretName, cfg.Username, fetch, cfg.Decode, false), nil
-	}
-
-	fetch := &assumeRoleFetcher{
-		awsCfg:     cfg.AWSConfig,
-		region:     cfg.Region,
-		roleARN:    cfg.RoleARN,
-		externalID: cfg.ExternalID,
-		clients:    make(map[string]*secretsmanager.Client),
-	}
-	return newResolver(accountAttr, cfg.SecretName, cfg.Username, fetch, cfg.Decode, true), nil
-}
-
-// newResolver constructs a Resolver over a given fetcher, so tests can inject a
-// fake that does not call AWS.
-func newResolver(accountAttr, secretName, usernameTmpl string, fetch secretFetcher, decode inventory.SecretDecoder, requireAccount bool) *Resolver {
 	return &Resolver{
 		accountAttr:    accountAttr,
-		secretName:     secretName,
-		usernameTmpl:   usernameTmpl,
+		region:         cfg.Region,
+		regionAttr:     cfg.RegionAttribute,
+		reachable:      reachable,
+		secretName:     cfg.SecretName,
+		usernameTmpl:   cfg.Username,
 		fetch:          fetch,
-		decode:         decode,
-		requireAccount: requireAccount,
+		decode:         cfg.Decode,
+		requireAccount: cfg.RoleARN != "",
+	}, nil
+}
+
+// regionNameRe matches the shape of an AWS region name across partitions:
+// "us-east-1", "us-gov-west-1", "cn-north-1".
+var regionNameRe = regexp.MustCompile(`^[a-z]{2,}(-[a-z]+)+-[0-9]+$`)
+
+// isRegionName reports whether s has the shape of an AWS region name. A value
+// that does not would otherwise surface later as an opaque endpoint or signing
+// failure from the SDK.
+func isRegionName(s string) bool {
+	return regionNameRe.MatchString(s)
+}
+
+// partitionPrefixes maps the region-name prefixes of the AWS partitions other
+// than the commercial one to their partition. A region matching none of them is
+// in the commercial "aws" partition. Longer prefixes come first so "us-isob-"
+// is not taken for "us-iso-".
+var partitionPrefixes = []struct{ prefix, partition string }{
+	{"us-gov-", "aws-us-gov"},
+	{"cn-", "aws-cn"},
+	{"us-isob-", "aws-iso-b"},
+	{"us-isof-", "aws-iso-f"},
+	{"us-iso-", "aws-iso"},
+	{"eu-isoe-", "aws-iso-e"},
+	{"eusc-", "aws-eusc"},
+}
+
+// partitionOf returns the AWS partition a region belongs to.
+func partitionOf(region string) string {
+	for _, p := range partitionPrefixes {
+		if strings.HasPrefix(region, p.prefix) {
+			return p.partition
+		}
 	}
+	return "aws"
+}
+
+// ValidateRegions checks a home region and the reachable regions listed beside
+// it, with the same rules New applies. It makes no AWS call, so a caller can
+// report a mistyped region before loading AWS config, which may wait on a slow
+// credential chain.
+func ValidateRegions(home string, reachable []string) error {
+	_, err := reachableRegions(home, reachable)
+	return err
+}
+
+// reachableRegions returns the set of regions a secret may be read in: the home
+// region and every listed one. The home region must be a region name, and each
+// listed region a region name in the home region's partition, other than the
+// home region, and listed once. Roles are assumed in the home region, and
+// credentials from one partition cannot authenticate in another, so a region in
+// another partition could never be read.
+func reachableRegions(home string, listed []string) (map[string]bool, error) {
+	if !isRegionName(home) {
+		return nil, fmt.Errorf("region %q is not an AWS region name", home)
+	}
+	reachable := map[string]bool{home: true}
+	homePartition := partitionOf(home)
+	for i, region := range listed {
+		switch {
+		case !isRegionName(region):
+			return nil, fmt.Errorf("reachable region %q at index %d is not an AWS region name", region, i)
+		case partitionOf(region) != homePartition:
+			return nil, fmt.Errorf("reachable region %q at index %d is in partition %s, not the home region %s's partition %s; credentials from one partition cannot read secrets in another", region, i, partitionOf(region), home, homePartition)
+		case region == home:
+			return nil, fmt.Errorf("reachable region %q at index %d is the home region; list only the other regions this data plane can call", region, i)
+		case reachable[region]:
+			return nil, fmt.Errorf("reachable region %q at index %d is listed more than once", region, i)
+		}
+		reachable[region] = true
+	}
+	return reachable, nil
 }
 
 // TemplateAttributes returns the entity attribute names referenced by a template
@@ -181,6 +288,10 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 	if r.requireAccount && accountID == "" {
 		return nil, fmt.Errorf("target %q has no %q attribute for assume-role credential resolution", req.Target, r.accountAttr)
 	}
+	region, clusterRegion, err := r.readRegion(req.Target, attrs)
+	if err != nil {
+		return nil, err
+	}
 
 	secretName, err := renderTemplate("secret name", r.secretName, req.Target, attrs)
 	if err != nil {
@@ -196,9 +307,12 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 		}
 	}
 
-	where := targetContext(req.Target, accountID)
-	raw, err := r.fetch.FetchSecret(ctx, accountID, secretName)
+	where := targetContext(req.Target, accountID, region)
+	raw, err := r.fetch.FetchSecret(ctx, accountID, region, secretName)
 	if err != nil {
+		if missingReplica(err, clusterRegion, region) {
+			return nil, fmt.Errorf("fetch secret %q for %s: %w; %s", secretName, where, err, missingReplicaFix(clusterRegion, region))
+		}
 		return nil, fmt.Errorf("fetch secret %q for %s: %w", secretName, where, err)
 	}
 
@@ -238,14 +352,88 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 	return &inventory.Credentials{Username: parsed.Username, Password: parsed.Password}, nil
 }
 
-// targetContext describes the target for error messages, including its AWS
-// account id when assume-role mode resolved one (own-account mode has none), so
-// cross-account failures stay diagnosable.
-func targetContext(target, accountID string) string {
-	if accountID != "" {
-		return fmt.Sprintf("target %q in account %s", target, accountID)
+// readRegion returns the region to read the target's secret in, and the region
+// of the target's cluster when a region attribute names one. The secret is read
+// in the cluster's region when that region is reachable, and in the home region
+// otherwise.
+//
+// A missing or malformed cluster region fails when reachable regions are
+// configured, because the attribute then chooses the region and reading in the
+// home region would be a guess about where the target runs. With only the home
+// region reachable every read lands there whatever the attribute says, so such a
+// target is read in the home region and only loses the cluster region from a
+// missing-secret error.
+func (r *Resolver) readRegion(target string, attrs map[string]string) (read, cluster string, err error) {
+	if r.regionAttr == "" {
+		return r.region, "", nil
 	}
-	return fmt.Sprintf("target %q", target)
+	cluster = attrs[r.regionAttr]
+	if cluster == "" {
+		if r.attributeChoosesRegion() {
+			return "", "", fmt.Errorf("target %q has no %q attribute naming the region of its cluster", target, r.regionAttr)
+		}
+		slog.Debug("target has no cluster region attribute; reading its credential secret in the home region",
+			"target", target, "region_attribute", r.regionAttr, "home_region", r.region)
+		return r.region, "", nil
+	}
+	if !isRegionName(cluster) {
+		if r.attributeChoosesRegion() {
+			return "", "", fmt.Errorf("target %q has %q attribute %q, which is not an AWS region name", target, r.regionAttr, cluster)
+		}
+		slog.Warn("target's cluster region attribute is not an AWS region name; reading its credential secret in the home region",
+			"target", target, "region_attribute", r.regionAttr, "value", cluster, "home_region", r.region)
+		return r.region, "", nil
+	}
+	if r.reachable[cluster] {
+		return cluster, cluster, nil
+	}
+	return r.region, cluster, nil
+}
+
+// attributeChoosesRegion reports whether a target's cluster region can change
+// where its secret is read: only when a region besides the home region is
+// reachable.
+func (r *Resolver) attributeChoosesRegion() bool {
+	return len(r.reachable) > 1
+}
+
+// missingReplica reports whether a fetch failed because the secret is missing
+// from the home region it was read in on behalf of a cluster in an unreachable
+// region: the case where the secret is expected as a replica in the home region.
+func missingReplica(err error, clusterRegion, readRegion string) bool {
+	readInHomeForUnreachableCluster := clusterRegion != "" && clusterRegion != readRegion
+	if !readInHomeForUnreachableCluster {
+		return false
+	}
+	var notFound *smtypes.ResourceNotFoundException
+	return errors.As(err, &notFound)
+}
+
+// missingReplicaFix explains a secret missing from the home region for a
+// cluster in an unreachable region, and names the fix that can work. In the home
+// region's partition the secret can be replicated there or the cluster's region
+// made reachable. A cluster in another partition admits neither, since secrets
+// do not replicate across partitions and startup refuses a reachable region in
+// one, so it has to be served by a data plane in its own partition.
+func missingReplicaFix(clusterRegion, homeRegion string) string {
+	clusterPartition := partitionOf(clusterRegion)
+	if clusterPartition != partitionOf(homeRegion) {
+		return fmt.Sprintf("the target's cluster is in %s, in partition %s, whose secrets this data plane's credentials cannot read: serve the target from a data plane in partition %s",
+			clusterRegion, clusterPartition, clusterPartition)
+	}
+	return fmt.Sprintf("the target's cluster is in %s, which is not a reachable region, so its secret is read in %s: replicate the secret to %s, or list %s as a reachable region if this data plane can call Secrets Manager there",
+		clusterRegion, homeRegion, homeRegion, clusterRegion)
+}
+
+// targetContext describes the target for error messages, including its AWS
+// account id when assume-role mode resolved one (own-account mode has none) and
+// the region the secret was read from, so a secret missing from one region of
+// one account is diagnosable from the error alone.
+func targetContext(target, accountID, region string) string {
+	if accountID != "" {
+		return fmt.Sprintf("target %q in account %s, region %s", target, accountID, region)
+	}
+	return fmt.Sprintf("target %q in region %s", target, region)
 }
 
 // renderTemplate replaces "{target}" with the request target and every other
@@ -313,58 +501,93 @@ func getSecretValue(ctx context.Context, client *secretsmanager.Client, secretNa
 	return secrets.ValueFromGetSecretOutput(resp, secretName)
 }
 
-// ownAccountFetcher reads secrets from the caller's own account using a single
-// Secrets Manager client — no STS AssumeRole. The account id is ignored.
+// ownAccountFetcher reads secrets from the caller's own account — no STS
+// AssumeRole — caching one Secrets Manager client per region. The account id is
+// ignored.
 type ownAccountFetcher struct {
-	client *secretsmanager.Client
-}
-
-// FetchSecret returns the raw secret string from the caller's own account.
-func (f *ownAccountFetcher) FetchSecret(ctx context.Context, _ string, secretName string) (string, error) {
-	return getSecretValue(ctx, f.client, secretName)
-}
-
-// assumeRoleFetcher reads secrets via Secrets Manager using per-account
-// assumed-role credentials, caching one client per account to avoid repeated
-// STS AssumeRole calls.
-type assumeRoleFetcher struct {
-	awsCfg     aws.Config
-	region     string
-	roleARN    string
-	externalID string
+	awsCfg aws.Config
 
 	mu      sync.Mutex
 	clients map[string]*secretsmanager.Client
 }
 
-// FetchSecret returns the raw secret string from the target account.
-func (f *assumeRoleFetcher) FetchSecret(ctx context.Context, accountID, secretName string) (string, error) {
-	return getSecretValue(ctx, f.clientForAccount(accountID), secretName)
+// FetchSecret returns the raw secret string from the caller's own account.
+func (f *ownAccountFetcher) FetchSecret(ctx context.Context, _, region, secretName string) (string, error) {
+	return getSecretValue(ctx, f.clientForRegion(region), secretName)
 }
 
-func (f *assumeRoleFetcher) clientForAccount(accountID string) *secretsmanager.Client {
+func (f *ownAccountFetcher) clientForRegion(region string) *secretsmanager.Client {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if c, ok := f.clients[accountID]; ok {
+	if c, ok := f.clients[region]; ok {
+		return c
+	}
+	regionalCfg := f.awsCfg
+	regionalCfg.Region = region
+	c := secretsmanager.NewFromConfig(regionalCfg)
+	f.clients[region] = c
+	return c
+}
+
+// accountRegion keys an assumed-role client: the role is per account and the
+// Secrets Manager endpoint is per region.
+type accountRegion struct {
+	accountID string
+	region    string
+}
+
+// assumeRoleFetcher reads secrets via Secrets Manager using per-account
+// assumed-role credentials. It caches one credential provider per account, so a
+// role is assumed once however many regions its secrets are read in, and one
+// client per account and region.
+type assumeRoleFetcher struct {
+	// awsCfg carries the home region, where every role is assumed. Credentials
+	// from a regional STS endpoint are valid in every region of the same
+	// partition, and reachable regions are confined to the home region's
+	// partition, so reading a secret in another region needs that region's
+	// Secrets Manager but not its STS.
+	awsCfg     aws.Config
+	roleARN    string
+	externalID string
+
+	mu      sync.Mutex
+	creds   map[string]aws.CredentialsProvider
+	clients map[accountRegion]*secretsmanager.Client
+}
+
+// FetchSecret returns the raw secret string from the target account.
+func (f *assumeRoleFetcher) FetchSecret(ctx context.Context, accountID, region, secretName string) (string, error) {
+	return getSecretValue(ctx, f.clientFor(accountID, region), secretName)
+}
+
+func (f *assumeRoleFetcher) clientFor(accountID, region string) *secretsmanager.Client {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	key := accountRegion{accountID: accountID, region: region}
+	if c, ok := f.clients[key]; ok {
 		return c
 	}
 
-	// Make the configured region authoritative for both the STS and Secrets
-	// Manager clients, regardless of the base config's region.
-	regionalCfg := f.awsCfg
-	regionalCfg.Region = f.region
-
-	roleARN := strings.ReplaceAll(f.roleARN, "{account}", accountID)
-	c := secretsmanager.NewFromConfig(regionalCfg, func(o *secretsmanager.Options) {
-		o.Credentials = aws.NewCredentialsCache(
-			stscreds.NewAssumeRoleProvider(sts.NewFromConfig(regionalCfg), roleARN, func(aro *stscreds.AssumeRoleOptions) {
+	creds, ok := f.creds[accountID]
+	if !ok {
+		roleARN := strings.ReplaceAll(f.roleARN, "{account}", accountID)
+		creds = aws.NewCredentialsCache(
+			stscreds.NewAssumeRoleProvider(sts.NewFromConfig(f.awsCfg), roleARN, func(aro *stscreds.AssumeRoleOptions) {
 				if f.externalID != "" {
 					aro.ExternalID = aws.String(f.externalID)
 				}
 			}),
 		)
+		f.creds[accountID] = creds
+	}
+
+	regionalCfg := f.awsCfg
+	regionalCfg.Region = region
+	c := secretsmanager.NewFromConfig(regionalCfg, func(o *secretsmanager.Options) {
+		o.Credentials = creds
 	})
-	f.clients[accountID] = c
+	f.clients[key] = c
 	return c
 }

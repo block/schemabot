@@ -1,11 +1,16 @@
 package templates
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/schema"
+)
 
 // previewVSchemaPlanOutput shows a plan with both DDL and VSchema changes in one keyspace.
 func previewVSchemaPlanOutput() {
 	fmt.Println("Vitess plan: DDL + VSchema changes in a sharded keyspace")
-	fmt.Println("(schemabot plan -s examples/vitess/schema -e staging)")
+	fmt.Printf("(%s plan -s examples/vitess/schema -e staging)\n", cliname.Name())
 	fmt.Println()
 
 	WritePlanHeader(PlanHeaderData{
@@ -61,14 +66,14 @@ func previewVSchemaPlanOutput() {
 			VSchemaDiff:    vschemaChanges[0].Diff,
 		},
 	}
-	WriteNamespaceChanges(namespaces, false, "testapp-vitess")
+	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
 	WritePlanSummaryWithVSchema(changes, vschemaChanges)
 }
 
 // previewVSchemaOnlyOutput shows a plan with only VSchema changes (no DDL).
 func previewVSchemaOnlyOutput() {
 	fmt.Println("Vitess plan: VSchema-only update (no table DDL changes)")
-	fmt.Println("(schemabot plan -s examples/vitess/schema -e staging)")
+	fmt.Printf("(%s plan -s examples/vitess/schema -e staging)\n", cliname.Name())
 	fmt.Println()
 
 	WritePlanHeader(PlanHeaderData{
@@ -107,14 +112,14 @@ func previewVSchemaOnlyOutput() {
 			VSchemaDiff:    vschemaChanges[0].Diff,
 		},
 	}
-	WriteNamespaceChanges(namespaces, false, "testapp-vitess")
+	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
 	WritePlanSummaryWithVSchema(nil, vschemaChanges)
 }
 
 // previewMultiKeyspacePlanOutput shows a plan spanning multiple keyspaces with VSchema.
 func previewMultiKeyspacePlanOutput() {
 	fmt.Println("Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces")
-	fmt.Println("(schemabot plan -s examples/vitess/schema -e staging)")
+	fmt.Printf("(%s plan -s examples/vitess/schema -e staging)\n", cliname.Name())
 	fmt.Println()
 
 	WritePlanHeader(PlanHeaderData{
@@ -184,6 +189,6 @@ func previewMultiKeyspacePlanOutput() {
 			VSchemaDiff:    vsDiffByKS["testapp"],
 		},
 	}
-	WriteNamespaceChanges(namespaces, false, "testapp-vitess")
+	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
 	WritePlanSummaryWithVSchema(changes, vschemaChanges)
 }

@@ -1,195 +1,20 @@
 package spirit
 
 import (
+	"context"
+	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
 )
-
-func TestVolumeToSpiritSettings(t *testing.T) {
-	// Volumes 1-5 use fixed thread counts regardless of CPU hint.
-
-	t.Run("volume 1 - minimal", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(1, 20)
-		assert.Equal(t, 1, threads)
-		assert.Equal(t, 100*time.Millisecond, chunkTime)
-		assert.Equal(t, 10*time.Second, lockTimeout)
-	})
-
-	t.Run("volume 2 - conservative", func(t *testing.T) {
-		// CPUs not factored, always 2
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(2, 20)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 500*time.Millisecond, chunkTime)
-		assert.Equal(t, 15*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(2, 48)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 500*time.Millisecond, chunkTime)
-		assert.Equal(t, 15*time.Second, lockTimeout)
-	})
-
-	t.Run("volume 3 - default", func(t *testing.T) {
-		// CPUs not factored, always 2
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(3, 20)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 30*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(3, 48)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 30*time.Second, lockTimeout)
-	})
-
-	t.Run("volume 4", func(t *testing.T) {
-		// CPUs not factored, always 4
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(4, 20)
-		assert.Equal(t, 4, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(4, 48)
-		assert.Equal(t, 4, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-	})
-
-	t.Run("volume 5", func(t *testing.T) {
-		// CPUs not factored, always 8
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(5, 20)
-		assert.Equal(t, 8, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(5, 48)
-		assert.Equal(t, 8, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-	})
-
-	// Volumes 6-11 use CPU-scaled thread counts, capped at maxThreads.
-	// Thread counts are capped at maxThreads (16).
-
-	t.Run("volume 6 - ceil(cpus/16)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(6, 20)
-		assert.Equal(t, 2, threads) // ceil(20/16) = 2
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(6, 48)
-		assert.Equal(t, 3, threads) // ceil(48/16) = 3
-
-		threads, _, _ = volumeToSpiritSettings(6, 128)
-		assert.Equal(t, 8, threads) // ceil(128/16) = 8
-	})
-
-	t.Run("volume 7 - ceil(cpus/12)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(7, 20)
-		assert.Equal(t, 2, threads) // ceil(20/12) = 2
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(7, 48)
-		assert.Equal(t, 4, threads) // ceil(48/12) = 4
-
-		threads, _, _ = volumeToSpiritSettings(7, 128)
-		assert.Equal(t, 11, threads) // ceil(128/12) = 11
-	})
-
-	t.Run("volume 8 - ceil(cpus/8)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(8, 20)
-		assert.Equal(t, 3, threads) // ceil(20/8) = 3
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(8, 48)
-		assert.Equal(t, 6, threads) // ceil(48/8) = 6
-
-		threads, _, _ = volumeToSpiritSettings(8, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/8) = 16
-	})
-
-	t.Run("volume 9 - ceil(cpus/6)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(9, 20)
-		assert.Equal(t, 4, threads) // ceil(20/6) = 4
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(9, 48)
-		assert.Equal(t, 8, threads) // ceil(48/6) = 8
-
-		// ceil(128/6) = 22, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(9, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/6) = 22, capped
-	})
-
-	t.Run("volume 10 - ceil(cpus/4)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(10, 20)
-		assert.Equal(t, 5, threads) // ceil(20/4) = 5
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 600*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(10, 48)
-		assert.Equal(t, 12, threads) // ceil(48/4) = 12
-
-		// ceil(128/4) = 32, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(10, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/4) = 32, capped
-	})
-
-	t.Run("volume 11 - ceil(cpus/2)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(11, 20)
-		assert.Equal(t, 10, threads) // ceil(20/2) = 10
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 600*time.Second, lockTimeout)
-
-		// ceil(48/2) = 24, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(11, 48)
-		assert.Equal(t, maxThreads, threads) // ceil(48/2) = 24, capped
-
-		// ceil(128/2) = 64, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(11, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/2) = 64, capped
-	})
-}
-
-func TestVolumeToSpiritSettings_NoCPUHint(t *testing.T) {
-	// When cpuHint is 0, volumes 6-11 fall back to fixed thread counts.
-	t.Run("fallback thread counts", func(t *testing.T) {
-		threads, _, _ := volumeToSpiritSettings(6, 0)
-		assert.Equal(t, 8, threads)
-
-		threads, _, _ = volumeToSpiritSettings(7, 0)
-		assert.Equal(t, 8, threads)
-
-		threads, _, _ = volumeToSpiritSettings(8, 0)
-		assert.Equal(t, 12, threads)
-
-		threads, _, _ = volumeToSpiritSettings(9, 0)
-		assert.Equal(t, 12, threads)
-
-		threads, _, _ = volumeToSpiritSettings(10, 0)
-		assert.Equal(t, maxThreads, threads)
-
-		threads, _, _ = volumeToSpiritSettings(11, 0)
-		assert.Equal(t, maxThreads, threads)
-	})
-}
-
-func TestVolumeToSpiritSettings_ThreadCap(t *testing.T) {
-	// Even with very high CPU hints, threads never exceed maxThreads.
-	for vol := int32(6); vol <= 11; vol++ {
-		threads, _, _ := volumeToSpiritSettings(vol, 256)
-		require.LessOrEqual(t, threads, maxThreads, "volume %d with 256 CPUs exceeded max threads", vol)
-		require.GreaterOrEqual(t, threads, 2, "volume %d returned fewer than 2 threads", vol)
-	}
-}
 
 func TestCancelMarksRunningSchemaChangeCancelled(t *testing.T) {
 	eng := New(Config{})
@@ -210,47 +35,10 @@ func TestCancelMarksRunningSchemaChangeCancelled(t *testing.T) {
 	assert.Equal(t, engine.StateCancelled, eng.runningSchemaChange.state)
 }
 
-func TestCPUScaledThreads(t *testing.T) {
-	t.Run("uses fallback when no CPU hint", func(t *testing.T) {
-		assert.Equal(t, 8, cpuScaledThreads(0, 16, 8))
-		assert.Equal(t, 12, cpuScaledThreads(0, 8, 12))
-	})
-
-	t.Run("scales with CPU hint", func(t *testing.T) {
-		assert.Equal(t, 2, cpuScaledThreads(20, 16, 8))                   // ceil(20/16) = 2
-		assert.Equal(t, 3, cpuScaledThreads(48, 16, 8))                   // ceil(48/16) = 3
-		assert.Equal(t, 10, cpuScaledThreads(20, 2, maxThreads))          // ceil(20/2) = 10
-		assert.Equal(t, maxThreads, cpuScaledThreads(128, 2, maxThreads)) // ceil(128/2) = 64, capped
-	})
-
-	t.Run("minimum 2 threads", func(t *testing.T) {
-		// Ensure floor of 2 so CPU-scaled volumes don't regress below volume 2
-		assert.Equal(t, 2, cpuScaledThreads(1, 100, 0))
-		assert.Equal(t, 2, cpuScaledThreads(1, 100, 1))
-	})
-
-	t.Run("capped at maxThreads", func(t *testing.T) {
-		assert.Equal(t, maxThreads, cpuScaledThreads(1000, 2, maxThreads))
-		assert.Equal(t, maxThreads, cpuScaledThreads(256, 4, maxThreads))
-	})
-}
-
-func TestSettingsToVolume(t *testing.T) {
-	assert.Equal(t, int32(1), settingsToVolume(1, 100*time.Millisecond))
-	assert.Equal(t, int32(2), settingsToVolume(2, 500*time.Millisecond))
-	assert.Equal(t, int32(3), settingsToVolume(2, 2*time.Second))
-	assert.Equal(t, int32(4), settingsToVolume(4, 2*time.Second))
-	assert.Equal(t, int32(5), settingsToVolume(8, 2*time.Second))
-	assert.Equal(t, int32(6), settingsToVolume(8, 5*time.Second))
-	assert.Equal(t, int32(8), settingsToVolume(12, 5*time.Second))
-	assert.Equal(t, int32(10), settingsToVolume(maxThreads, 5*time.Second))
-}
-
-// Volume adjustments store a stopped state so Spirit can resume from checkpoint
-// with new settings. Progress should still report running during that window so
-// the operator keeps polling the active schema change.
-func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
-	eng := New(Config{})
+// registerRunningSchemaChange installs a simulated running schema change on the
+// engine the same way Apply initializes one. The caller drives the change's
+// lifecycle through rm.wg.
+func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
 	rm := &runningSchemaChange{
 		database:       "testdb",
 		tableNamespace: map[string]string{},
@@ -258,216 +46,736 @@ func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 		host:           "127.0.0.1:1",
 		username:       "root",
 	}
-	rm.wg.Add(1)
-	eng.mu.Lock()
-	eng.runningSchemaChange = rm
-	eng.mu.Unlock()
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := eng.Volume(t.Context(), &engine.VolumeRequest{
-			Database: "testdb",
-			Volume:   4,
-			Credentials: &engine.Credentials{
-				DSN: "root@tcp(127.0.0.1:1)/testdb",
-			},
-		})
-		errCh <- err
-	}()
-
-	require.Eventually(t, func() bool {
-		eng.mu.Lock()
-		defer eng.mu.Unlock()
-		return rm.state == engine.StateStopped && rm.volumeRestartInProgress
-	}, time.Second, 10*time.Millisecond)
-
-	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
-	require.NoError(t, err)
-	assert.Equal(t, engine.StateRunning, progress.State)
-
-	rm.wg.Done()
-	select {
-	case err := <-errCh:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for volume change")
-	}
-	eng.Drain()
-}
-
-// registerRunningSchemaChange installs a simulated running schema change on the
-// engine, carrying the engine's configured default copy settings the same way
-// Apply initializes a change. The caller drives the change's lifecycle through
-// rm.wg.
-func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
-	rm := &runningSchemaChange{
-		database:        "testdb",
-		tableNamespace:  map[string]string{},
-		state:           engine.StateRunning,
-		host:            "127.0.0.1:1",
-		username:        "root",
-		threads:         eng.threads,
-		targetChunkTime: eng.targetChunkTime,
-		lockWaitTimeout: eng.lockWaitTimeout,
-	}
-	eng.mu.Lock()
-	eng.runningSchemaChange = rm
-	eng.mu.Unlock()
+	eng.installRunningSchemaChange(rm)
 	return rm
 }
 
-// adjustVolume drives a Volume call through its stop/retune/restart sequence
-// against a schema change whose driver goroutine is simulated via rm.wg, and
-// returns the volume result.
-func adjustVolume(t *testing.T, eng *Engine, rm *runningSchemaChange, volume int32) *engine.VolumeResult {
+// assertSettledOutcomeRefusal checks that err is the typed refusal for a
+// control operation that found the schema change already settled: the durable
+// request resolves on it, it never reads as a gap in what the engine supports or
+// as a completion, and its reason tells the operator how to recover.
+func assertSettledOutcomeRefusal(t *testing.T, err error, wantReason string) {
 	t.Helper()
-	rm.wg.Add(1)
+	require.Error(t, err)
+	assert.True(t, engine.IsSettledOutcome(err), "the durable request must resolve terminally on the settled outcome")
+	assert.False(t, engine.IsUnsupportedOperation(err), "a settled outcome is not a control operation the engine lacks")
+	assert.False(t, engine.IsAlreadyCompleted(err), "a change that did not complete must never reconcile as completed")
+	assert.Contains(t, err.Error(), wantReason)
+	assert.Contains(t, err.Error(), "plan and apply again to retry")
+}
 
-	type volumeOutcome struct {
-		result *engine.VolumeResult
-		err    error
+// A stop that reaches a schema change which has already failed leaves the
+// failure in place. A failed change cannot be paused or resumed, so recording it
+// as stopped would tell the operator to resume a change that is dead; the stop
+// is refused permanently instead, the change is not cancelled again, and it
+// keeps its failed state and the reason it failed.
+func TestStopLeavesFailedSchemaChangeFailed(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	cancelCalled := false
+	rm.cancelFunc = func() { cancelCalled = true }
+	eng.setSchemaChangeFailed(engine.OperatorErrorf(nil, "copy of users hit a duplicate key"))
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	assert.Nil(t, result)
+	assertSettledOutcomeRefusal(t, err, "failed before the stop arrived; the failure stands")
+	assert.False(t, cancelCalled)
+	assert.Equal(t, engine.StateFailed, rm.state)
+	assert.Equal(t, "copy of users hit a duplicate key", rm.errorMessage)
+}
+
+func TestStopLeavesCancelledSchemaChangeCancelled(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.state = engine.StateCancelled
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	assert.Nil(t, result)
+	assertSettledOutcomeRefusal(t, err, "was already cancelled before the stop arrived")
+	assert.Equal(t, engine.StateCancelled, rm.state)
+}
+
+// A cancel that reaches a schema change which has already failed leaves the
+// failure in place, the same way a stop does: recording it as cancelled would
+// replace the failure and its reason with an outcome the operator chose. The
+// change is not cancelled again and its artifacts are not touched.
+func TestCancelLeavesFailedSchemaChangeFailed(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	cancelCalled := false
+	rm.cancelFunc = func() { cancelCalled = true }
+	eng.setSchemaChangeFailed(engine.OperatorErrorf(nil, "copy of users hit a duplicate key"))
+
+	result, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
+	assert.Nil(t, result)
+	assertSettledOutcomeRefusal(t, err, "failed before the cancel arrived; the failure stands")
+	assert.False(t, cancelCalled)
+	assert.Equal(t, engine.StateFailed, rm.state)
+	assert.Equal(t, "copy of users hit a duplicate key", rm.errorMessage)
+	assert.Same(t, rm, eng.runningSchemaChange, "a refused cancel must leave the failed change tracked so progress keeps reporting it")
+}
+
+// A stop checkpoints the copy before it cancels, and the schema change can
+// settle on its own while that checkpoint is being written. Whatever it settles
+// on wins over the stop: a failure that lands during the checkpoint stays a
+// failure rather than being relabelled as a resumable stop, and a completion
+// that lands there stays completed, with the stop answered by the typed
+// already-completed rejection its caller reconciles from.
+func TestStopKeepsOutcomeThatLandsDuringCheckpoint(t *testing.T) {
+	tests := []struct {
+		name      string
+		settle    func(eng *Engine)
+		wantState engine.State
+		checkErr  func(t *testing.T, err error)
+	}{
+		{
+			name: "failure",
+			settle: func(eng *Engine) {
+				eng.setSchemaChangeFailed(engine.OperatorErrorf(nil, "copy of users hit a duplicate key"))
+			},
+			wantState: engine.StateFailed,
+			checkErr: func(t *testing.T, err error) {
+				assertSettledOutcomeRefusal(t, err, "failed before the stop arrived; the failure stands")
+			},
+		},
+		{
+			name:      "completion",
+			settle:    func(eng *Engine) { eng.setSchemaChangeCompleted() },
+			wantState: engine.StateCompleted,
+			checkErr: func(t *testing.T, err error) {
+				assert.True(t, engine.IsAlreadyCompleted(err))
+			},
+		},
 	}
-	outCh := make(chan volumeOutcome, 1)
-	go func() {
-		result, err := eng.Volume(t.Context(), &engine.VolumeRequest{
-			Database:    rm.database,
-			Volume:      volume,
-			Credentials: &engine.Credentials{DSN: "root@tcp(127.0.0.1:1)/testdb"},
-		})
-		outCh <- volumeOutcome{result: result, err: err}
-	}()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			cancelCalled := false
+			rm.cancelFunc = func() { cancelCalled = true }
+			eng.stopCheckpointWindow = func() { tc.settle(eng) }
 
-	// Volume stops the change and waits for its driver goroutine before
-	// restarting; release the simulated goroutine once the stop is observed.
+			result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+			require.Error(t, err)
+			assert.Nil(t, result)
+			tc.checkErr(t, err)
+			assert.False(t, cancelCalled, "a change that already settled has nothing left to cancel")
+			assert.Equal(t, tc.wantState, rm.state)
+		})
+	}
+}
+
+// An operator stops or cancels a schema change whose Spirit cutover commits
+// just before the cancel reaches the runner. The runner then returns having
+// finished the change, and the run records it completed. Once the runner has
+// returned, the stop or cancel reads that outcome and answers that the change
+// completed, so the caller reconciles to the completed outcome rather than
+// recording a stop or cancel of a change the target already holds. A runner
+// that returns without finishing leaves the stop or cancel in effect.
+func TestControlKeepsACompletionThatLandsAfterTheCancel(t *testing.T) {
+	controls := map[string]struct {
+		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+		wantState engine.State
+	}{
+		"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Stop(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Cancel(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateCancelled},
+	}
+	for name, control := range controls {
+		t.Run(name+"/the change completes after the cancel", func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			runCtx, cancelRun := context.WithCancel(t.Context())
+			rm.cancelFunc = cancelRun
+			rm.wg.Go(func() {
+				<-runCtx.Done()
+				eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
+			})
+
+			result, err := control.run(eng, t.Context())
+
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.True(t, engine.IsAlreadyCompleted(err), "the caller reconciles to the completed outcome, got %v", err)
+			assert.Contains(t, err.Error(), "completed before the "+name+" took effect")
+			assert.Equal(t, engine.StateCompleted, rm.state)
+		})
+
+		t.Run(name+"/the runner returns without finishing", func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			runCtx, cancelRun := context.WithCancel(t.Context())
+			rm.cancelFunc = cancelRun
+			rm.wg.Go(func() { <-runCtx.Done() })
+
+			_, err := control.run(eng, t.Context())
+
+			if name == "cancel" {
+				// The cancel goes on to release artifacts against a target this
+				// fixture does not run, so only the state it settled matters here.
+				assert.False(t, engine.IsAlreadyCompleted(err))
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, control.wantState, rm.state)
+		})
+	}
+}
+
+// A stop that arrives while an earlier stop is still waiting for the runner
+// finds the change marked stopped, but that mark is provisional until the
+// runner returns: the runner can still finish the change on its way out. The
+// second stop waits the runner out and answers from its outcome, so a change
+// that lands is rejected as completed by both stops rather than reported
+// stopped by the second.
+func TestSecondStopDuringFirstStopWaitDoesNotReportAlreadyStopped(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	rm.cancelFunc = cancelRun
+	release := make(chan struct{})
+	rm.wg.Go(func() {
+		<-runCtx.Done()
+		<-release
+		eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
+	})
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+		first <- err
+	}()
 	require.Eventually(t, func() bool {
 		eng.mu.Lock()
 		defer eng.mu.Unlock()
-		return rm.state == engine.StateStopped && rm.volumeRestartInProgress
-	}, 5*time.Second, 10*time.Millisecond, "volume change did not stop the schema change")
-	rm.wg.Done()
+		return rm.state == engine.StateStopped
+	}, 5*time.Second, 5*time.Millisecond, "the first stop marks the change stopped before waiting for the runner")
 
+	second := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+		second <- err
+	}()
+	// The second stop must not answer from the provisional mark: it is still
+	// waiting when the runner has not returned.
 	select {
-	case out := <-outCh:
-		require.NoError(t, out.err)
-		return out.result
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for volume change to complete")
-		return nil
+	case err := <-second:
+		t.Fatalf("the second stop answered %v before the runner returned", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+
+	assert.True(t, engine.IsAlreadyCompleted(<-first), "the first stop reconciles to the completed outcome")
+	assert.True(t, engine.IsAlreadyCompleted(<-second), "the second stop reconciles to the completed outcome too")
+	assert.Equal(t, engine.StateCompleted, rm.state)
+}
+
+// A runner that will not return after an operator's stop or cancel must not
+// hold the control call past its caller's context. The call fails with a
+// retryable error, never a permanent or settled one, so the durable request
+// stays pending. The schema change stays tracked with the state the operator
+// asked for and its runner alive, and a cancel releases no artifacts. Once the
+// runner returns, the same operation succeeds.
+func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
+	controls := map[string]struct {
+		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+		wantState engine.State
+	}{
+		"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Stop(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Cancel(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateCancelled},
+	}
+	for name, control := range controls {
+		t.Run(name, func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			rm.cancelFunc = func() {}
+			stuck := make(chan struct{})
+			var releaseRunner sync.Once
+			release := func() { releaseRunner.Do(func() { close(stuck) }) }
+			t.Cleanup(release)
+			rm.goRun(func() { <-stuck })
+
+			expiring := func() error {
+				ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+				defer cancel()
+				returned := make(chan error, 1)
+				go func() {
+					_, err := control.run(eng, ctx)
+					returned <- err
+				}()
+				select {
+				case err := <-returned:
+					return err
+				case <-time.After(controlDuringConnectDeadline):
+					require.FailNow(t, "the "+name+" did not end at its caller's context while the runner was stuck")
+					return nil
+				}
+			}
+
+			for attempt := 1; attempt <= 2; attempt++ {
+				err := expiring()
+				require.Error(t, err, "attempt %d", attempt)
+				assert.ErrorIs(t, err, context.DeadlineExceeded)
+				assert.Contains(t, err.Error(), "the runner has not returned")
+				assert.Contains(t, err.Error(), "testdb")
+				assert.True(t, engine.IsRetryable(err), "an expired wait must leave the request pending, not failed")
+				assert.False(t, engine.IsAlreadyCompleted(err))
+				assert.False(t, engine.IsSettledOutcome(err))
+				assert.False(t, engine.IsUnsupportedOperation(err))
+				assert.Equal(t, control.wantState, rm.state)
+				assert.Same(t, rm, eng.runningSchemaChange, "the change stays tracked while its runner is alive")
+				assert.EqualValues(t, 1, rm.active.Load(), "the runner is still alive")
+			}
+
+			release()
+			rm.wg.Wait()
+
+			result, err := control.run(eng, t.Context())
+			if name == "stop" {
+				require.NoError(t, err)
+				assert.True(t, result.Accepted)
+				assert.Equal(t, "Already stopped", result.Message)
+			} else {
+				// The cancel gets past the wait and goes on to release the
+				// artifacts, which fails at the connection because this fixture
+				// runs no target. The change stays tracked for the next cancel.
+				require.Error(t, err)
+				assert.Nil(t, result)
+				assert.Contains(t, err.Error(), "connect to database testdb to clean up cancelled schema change artifacts")
+				assert.NotContains(t, err.Error(), "the runner has not returned")
+				assert.Same(t, rm, eng.runningSchemaChange, "a cancel that could not release the artifacts stays tracked")
+			}
+			assert.Equal(t, control.wantState, rm.state)
+		})
 	}
 }
 
-// A volume set while a schema change is running is scoped to that change: the
-// engine's configured defaults are untouched, and the next schema change starts
-// from the defaults again rather than inheriting the earlier retune.
-func TestVolumeScopedToRunningSchemaChange(t *testing.T) {
-	eng := New(Config{})
-	rm := registerRunningSchemaChange(eng)
-
-	result := adjustVolume(t, eng, rm, 11)
-	assert.Equal(t, int32(11), result.NewVolume)
-
-	wantThreads, wantChunkTime, wantLockTimeout := volumeToSpiritSettings(11, 0)
+// assertStartRefusedWhileRunnerAlive sends a start for a stopped change whose
+// runner has not returned and checks that it is refused with an error the
+// caller retries, leaving the change stopped and no second run started.
+func assertStartRefusedWhileRunnerAlive(t *testing.T, eng *Engine, rm *runningSchemaChange) {
+	t.Helper()
+	result, err := eng.Start(t.Context(), &engine.ControlRequest{})
+	require.Error(t, err, "a second run must not start while the first has not returned")
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "the stopped runner has not returned")
+	assert.Contains(t, err.Error(), "testdb")
+	assert.True(t, engine.IsRetryable(err), "the start succeeds once the runner has returned, so it must stay retryable")
 	eng.mu.Lock()
-	assert.Equal(t, wantThreads, rm.threads)
-	assert.Equal(t, wantChunkTime, rm.targetChunkTime)
-	assert.Equal(t, wantLockTimeout, rm.lockWaitTimeout)
-	assert.Equal(t, int32(11), rm.volume)
+	state := rm.state
 	eng.mu.Unlock()
-
-	// The engine's configured defaults are not modified by the adjustment.
-	assert.Equal(t, DefaultThreads, eng.threads)
-	assert.Equal(t, DefaultTargetChunkTime, eng.targetChunkTime)
-	assert.Equal(t, DefaultLockWaitTimeout, eng.lockWaitTimeout)
-
-	eng.Drain()
-
-	// A new schema change starts from the configured defaults. The apply
-	// targets an unreachable host, so execution fails immediately — the copy
-	// settings are snapshotted when the change is registered, which is what
-	// this scenario verifies.
-	_, err := eng.Apply(t.Context(), &engine.ApplyRequest{
-		Database:    "testdb",
-		Credentials: &engine.Credentials{DSN: "root@tcp(127.0.0.1:1)/testdb"},
-		Changes: []engine.SchemaChange{{
-			Namespace: "testdb",
-			TableChanges: []engine.TableChange{{
-				Table: "users",
-				DDL:   "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-			}},
-		}},
-	})
-	require.NoError(t, err)
-	defer eng.Drain()
-
-	threads, chunkTime, lockTimeout := eng.copySettings()
-	assert.Equal(t, DefaultThreads, threads)
-	assert.Equal(t, DefaultTargetChunkTime, chunkTime)
-	assert.Equal(t, DefaultLockWaitTimeout, lockTimeout)
-	eng.mu.Lock()
-	assert.Equal(t, int32(0), eng.runningSchemaChange.volume)
-	eng.mu.Unlock()
+	assert.Equal(t, engine.StateStopped, state, "a refused start leaves the change stopped")
+	assert.EqualValues(t, 1, rm.active.Load(), "no second run was started")
 }
 
-// Volume reporting reflects the explicit volume set for the running schema
-// change, including neighboring levels that derive the same Spirit settings.
-func TestVolumeReportingUsesExplicitPerChangeValue(t *testing.T) {
+// A stop whose wait expired leaves the change stopped with its runner still
+// alive. A start must not resume it yet: the resumed run would work the same
+// tables beside the runner that has not returned. The start is refused with an
+// error the caller retries.
+func TestStartIsRefusedAfterAStopWhoseWaitExpired(t *testing.T) {
 	eng := New(Config{})
 	rm := registerRunningSchemaChange(eng)
+	rm.cancelFunc = func() {}
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	rm.goRun(func() { <-stuck })
 
-	// The change starts on the configured defaults, which map to volume 3.
-	result := adjustVolume(t, eng, rm, 7)
-	assert.Equal(t, int32(3), result.PreviousVolume)
-	assert.Equal(t, int32(7), result.NewVolume)
+	stopCtx, cancelStop := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelStop()
+	_, err := eng.Stop(stopCtx, &engine.ControlRequest{})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, engine.StateStopped, rm.state)
+	require.EqualValues(t, 1, rm.active.Load(), "the stopped runner is still alive")
 
-	// Without a CPU hint, volumes 6 and 7 derive the same Spirit settings, so
-	// no restart is needed — and the reported previous volume is the explicit
-	// value set for this change.
-	result, err := eng.Volume(t.Context(), &engine.VolumeRequest{
-		Database:    "testdb",
-		Volume:      6,
-		Credentials: &engine.Credentials{DSN: "root@tcp(127.0.0.1:1)/testdb"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, int32(7), result.PreviousVolume)
-	assert.Equal(t, int32(6), result.NewVolume)
-	assert.Contains(t, result.Message, "no restart")
-
-	eng.mu.Lock()
-	assert.Equal(t, int32(6), rm.volume)
-	eng.mu.Unlock()
-
-	eng.Drain()
+	assertStartRefusedWhileRunnerAlive(t, eng, rm)
 }
 
-// Copy settings are shared between volume adjustments, progress pollers, and
-// the schema change execution path; adjusting volume while the settings are
-// read concurrently must be safe.
-func TestVolumeConcurrentWithSettingsReads(t *testing.T) {
+// A start that arrives while a stop is still waiting for the runner finds the
+// change marked stopped with its runner alive, and is refused the same way.
+// Once the runner has returned and the stop has answered, the start is
+// accepted and resumes the change.
+func TestStartIsAcceptedOnceTheStoppedRunnerHasReturned(t *testing.T) {
 	eng := New(Config{})
 	rm := registerRunningSchemaChange(eng)
+	rm.cancelFunc = func() {}
+	stuck := make(chan struct{})
+	var releaseRunner sync.Once
+	release := func() { releaseRunner.Do(func() { close(stuck) }) }
+	t.Cleanup(release)
+	rm.goRun(func() { <-stuck })
 
-	stopReaders := make(chan struct{})
-	var readers sync.WaitGroup
-	readers.Go(func() {
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), controlDuringConnectDeadline)
+	defer cancelWait()
+	stopped := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(waitCtx, &engine.ControlRequest{})
+		stopped <- err
+	}()
+	require.Eventually(t, func() bool {
+		eng.mu.Lock()
+		defer eng.mu.Unlock()
+		return rm.state == engine.StateStopped
+	}, controlDuringConnectDeadline, 5*time.Millisecond, "the stop marks the change stopped before waiting for the runner")
+
+	assertStartRefusedWhileRunnerAlive(t, eng, rm)
+
+	release()
+	require.NoError(t, <-stopped, "the stop answers once the runner has returned")
+
+	result, err := eng.Start(t.Context(), &engine.ControlRequest{})
+	require.NoError(t, err, "a start is accepted once the stopped runner has returned")
+	require.NotNil(t, result)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "Resumed from checkpoint", result.Message)
+	// The resumed run fails at the connection because this fixture runs no
+	// target; wait it out so it does not outlive the test.
+	require.NoError(t, waitForRunExit(waitCtx, rm), "the resumed run returns")
+}
+
+// A stop or cancel whose caller has already given up, on a change with no
+// runner alive, has no runner to wait out. It must not report a runner that
+// has not returned: the stop answers that the change is already stopped, and
+// the cancel goes on to release the artifacts.
+func TestControlWithAnEndedCallerAndNoRunnerDoesNotReportAStuckRunner(t *testing.T) {
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	t.Run("stop of a stopped change", func(t *testing.T) {
+		eng := New(Config{})
+		rm := registerRunningSchemaChange(eng)
+		rm.state = engine.StateStopped
+
+		result, err := eng.Stop(ended, &engine.ControlRequest{})
+		require.NoError(t, err)
+		assert.True(t, result.Accepted)
+		assert.Equal(t, "Already stopped", result.Message)
+		assert.Equal(t, engine.StateStopped, rm.state)
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		eng := New(Config{})
+		rm := registerRunningSchemaChange(eng)
+		rm.cancelFunc = func() {}
+
+		// The cancel gets past the wait and fails releasing the artifacts,
+		// because this fixture runs no target.
+		result, err := eng.Cancel(ended, &engine.ControlRequest{})
+		require.Error(t, err)
+		assert.Nil(t, result)
+		assert.Contains(t, err.Error(), "connect to database testdb to clean up cancelled schema change artifacts")
+		assert.NotContains(t, err.Error(), "the runner has not returned")
+		assert.Equal(t, engine.StateCancelled, rm.state)
+	})
+}
+
+// A stop that finds the change stopped with no runner alive answers at once:
+// there is nothing to wait out, and the change really is paused.
+func TestStopOfAStoppedChangeWithNoRunnerAnswersAlreadyStopped(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.state = engine.StateStopped
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "Already stopped", result.Message)
+	assert.Equal(t, engine.StateStopped, rm.state)
+}
+
+// silentTarget returns the address of a TCP listener that accepts connections
+// and never sends the MySQL handshake, so any connection attempt against it
+// blocks until its context is cancelled. The returned channel closes once the
+// first connection has been accepted.
+func silentTarget(t *testing.T) (string, <-chan struct{}) {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	accepted := make(chan struct{})
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
 		for {
-			select {
-			case <-stopReaders:
+			conn, err := ln.Accept()
+			if err != nil {
 				return
-			default:
 			}
-			threads, chunkTime, lockTimeout := eng.copySettings()
-			assert.Positive(t, threads)
-			assert.Positive(t, chunkTime)
-			assert.Positive(t, lockTimeout)
-			_, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
-			assert.NoError(t, err)
+			mu.Lock()
+			if len(conns) == 0 {
+				close(accepted)
+			}
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		utils.CloseAndLog(ln)
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			utils.CloseAndLog(conn)
 		}
 	})
+	return ln.Addr().String(), accepted
+}
 
-	result := adjustVolume(t, eng, rm, 11)
-	assert.Equal(t, int32(11), result.NewVolume)
+// deadTarget returns the address of a TCP port nothing listens on, so any
+// connection attempt against it is refused at once.
+func deadTarget(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+	return addr
+}
 
-	close(stopReaders)
-	readers.Wait()
-	eng.Drain()
+// controlDuringConnectDeadline bounds each wait in the tests that interrupt a
+// connection attempt with a control: for the phase to reach the target, and
+// for the stop or cancel to return once it has interrupted the connection.
+const controlDuringConnectDeadline = 30 * time.Second
+
+// connectPhases runs each phase of a schema change that connects to the target
+// before it executes anything: the ALTER routing that reads the current table
+// definitions, and the connect that opens the pool a direct-routed ALTER runs
+// on. Each returns whether the caller may proceed to later phases.
+func connectPhases() map[string]func(eng *Engine, ctx context.Context, host string) bool {
+	return map[string]func(eng *Engine, ctx context.Context, host string) bool{
+		"ALTER routing": func(eng *Engine, ctx context.Context, host string) bool {
+			return eng.executeAlterPhase(ctx, host, "root", "", "testdb", []string{connectPhaseAlter}, false, directPolicy{})
+		},
+		"direct execution connect": func(eng *Engine, ctx context.Context, host string) bool {
+			target := &lazyTargetDB{dsn: targetDSN(host, "root", "", "testdb")}
+			defer target.close()
+			stmts := []directRouted{{stmt: connectPhaseAlter, table: "users", reason: "refused by the schema change engine"}}
+			return eng.executeDirectStatements(ctx, target, "testdb", stmts, directPolicy{Enabled: true})
+		},
+	}
+}
+
+const connectPhaseAlter = "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL"
+
+// An operator stops or cancels a schema change while the engine is still
+// connecting to the target, either to read the current table definitions it
+// routes each ALTER by or to open the pool a direct-routed ALTER runs on. The
+// connection attempt returns because the stop or cancel cancelled its context,
+// not because the target failed, so the change keeps the stopped or cancelled
+// state the operator asked for: progress never reports it as a retryable
+// failure.
+func TestControlDuringTargetConnectionKeepsTheControlOutcome(t *testing.T) {
+	controls := map[string]struct {
+		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+		wantState engine.State
+	}{
+		"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Stop(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Cancel(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateCancelled},
+	}
+	for phaseName, runPhase := range connectPhases() {
+		for controlName, control := range controls {
+			t.Run(controlName+" during "+phaseName, func(t *testing.T) {
+				host, accepted := silentTarget(t)
+				eng := New(Config{})
+				rm := registerRunningSchemaChange(eng)
+				runCtx, cancelRun := context.WithCancel(t.Context())
+				rm.cancelFunc = cancelRun
+				finished := make(chan bool, 1)
+				rm.wg.Go(func() {
+					finished <- runPhase(eng, runCtx, host)
+				})
+				select {
+				case <-accepted:
+				case <-time.After(controlDuringConnectDeadline):
+					t.Fatal("the phase never connected to the target")
+				}
+
+				type controlOutcome struct {
+					result *engine.ControlResult
+					err    error
+				}
+				controlled := make(chan controlOutcome, 1)
+				go func() {
+					result, err := control.run(eng, t.Context())
+					controlled <- controlOutcome{result: result, err: err}
+				}()
+				var result *engine.ControlResult
+				var err error
+				select {
+				case outcome := <-controlled:
+					result, err = outcome.result, outcome.err
+				case <-time.After(controlDuringConnectDeadline):
+					require.FailNow(t, "the "+controlName+" did not return after interrupting the "+phaseName)
+				}
+
+				if controlName == "cancel" {
+					// The cancel settles the state and then goes on to release
+					// artifacts against the registered host, which nothing
+					// listens on, so it fails at that cleanup and nowhere earlier.
+					assert.ErrorContains(t, err, "clean up cancelled schema change artifacts")
+				} else {
+					require.NoError(t, err)
+					assert.True(t, result.Accepted)
+				}
+				assert.False(t, <-finished, "a phase interrupted by a "+controlName+" must not let later phases run")
+				progress := pollProgress(t, eng)
+				assert.Equal(t, control.wantState, progress.State)
+				assert.Empty(t, progress.ErrorMessage)
+				assert.False(t, progress.Retryable)
+			})
+		}
+	}
+}
+
+// The target refuses the connection while the schema change is running
+// undisturbed. That is the target failing, not a control taking effect, so the
+// change fails with a reason and does not sit in running with nothing behind it.
+func TestRefusedTargetConnectionFailsTheChange(t *testing.T) {
+	for phaseName, runPhase := range connectPhases() {
+		t.Run(phaseName, func(t *testing.T) {
+			eng := New(Config{})
+			registerRunningSchemaChange(eng)
+			assert.False(t, runPhase(eng, t.Context(), deadTarget(t)))
+			progress := pollProgress(t, eng)
+			assert.Equal(t, engine.StateFailed, progress.State)
+			assert.NotEmpty(t, progress.ErrorMessage)
+		})
+	}
+}
+
+// A stop or cancel has taken effect, and the run then records a failure on
+// its way out: the control's outcome stands, so an accepted stop never turns
+// into a failure the drive would retry.
+func TestFailureAfterControlKeepsTheControlOutcome(t *testing.T) {
+	controls := map[string]struct {
+		run       func(t *testing.T, eng *Engine)
+		wantState engine.State
+	}{
+		"stop": {run: func(t *testing.T, eng *Engine) {
+			result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+			require.NoError(t, err)
+			assert.True(t, result.Accepted)
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(t *testing.T, eng *Engine) {
+			// The cancel settles the state and then fails releasing artifacts
+			// against the registered host, which nothing listens on.
+			_, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
+			assert.ErrorContains(t, err, "clean up cancelled schema change artifacts")
+		}, wantState: engine.StateCancelled},
+	}
+	for name, control := range controls {
+		t.Run(name, func(t *testing.T) {
+			eng := New(Config{})
+			registerRunningSchemaChange(eng)
+			control.run(t, eng)
+
+			eng.setSchemaChangeFailed(errors.New("connection reset by peer"))
+
+			progress := pollProgress(t, eng)
+			assert.Equal(t, control.wantState, progress.State)
+			assert.Empty(t, progress.ErrorMessage)
+			assert.False(t, progress.Retryable)
+		})
+	}
+}
+
+// Stateless control operations (cutover, deferred cutover sentinel lookup)
+// must address the schema the DSN connects to: under per-deployment schema
+// overrides the DSN carries the physical schema name while the request carries
+// the logical (canonical) database name. The request database is only a
+// fallback for DSNs without a schema.
+func TestStatelessControlDatabase(t *testing.T) {
+	t.Run("DSN database wins over request database", func(t *testing.T) {
+		got, err := statelessControlDatabase("root@tcp(localhost:3306)/bikeshare_eu_qa", "bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "bikeshare_eu_qa", got)
+	})
+
+	t.Run("request database is the fallback for a namespace-free DSN", func(t *testing.T) {
+		got, err := statelessControlDatabase("root@tcp(localhost:3306)/", "bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "bikeshare", got)
+	})
+
+	t.Run("empty when neither names a schema", func(t *testing.T) {
+		got, err := statelessControlDatabase("root@tcp(localhost:3306)/", "")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("invalid DSN is an error", func(t *testing.T) {
+		_, err := statelessControlDatabase("not a dsn", "bikeshare")
+		require.Error(t, err)
+	})
+}
+
+// A sentinel drop whose connection broke while the statement was in flight may
+// have run, so it is reported as an unknown outcome; a drop the database refused
+// is a plain failure. Either way the driver's error stays reachable.
+func TestSentinelDropErrorReportsAnUnknownOutcomeOnlyForABrokenConnection(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		unknown bool
+	}{
+		{name: "invalid connection", err: mysql.ErrInvalidConn, unknown: true},
+		{name: "connection reset", err: errors.New("read tcp 10.0.0.1:3306: connection reset by peer"), unknown: true},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, unknown: true},
+		{name: "access denied", err: &mysql.MySQLError{Number: 1142, Message: "DROP command denied to user"}, unknown: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sentinelDropError(tc.err)
+			assert.Equal(t, tc.unknown, engine.IsOutcomeUnknown(err))
+			assert.ErrorIs(t, err, tc.err, "the driver error stays reachable for triage")
+			assert.Contains(t, err.Error(), "drop sentinel table")
+		})
+	}
+}
+
+// The revert-window controls decline with a typed unsupported-operation error.
+// Spirit copies into a shadow table and swaps it in, so once a change cuts over
+// there is no engine phase left to revert from and no window to close. The typed
+// decline is what lets a durable control request resolve terminally instead of
+// retrying a rejection that can never succeed while the schema change keeps
+// executing.
+func TestRevertWindowControlsDeclineAsUnsupported(t *testing.T) {
+	eng := New(Config{})
+
+	tests := []struct {
+		name   string
+		call   func(t *testing.T) error
+		reason string
+	}{
+		{"revert", func(t *testing.T) error {
+			result, err := eng.Revert(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}, "no revert window to undo it from"},
+		{"skip-revert", func(t *testing.T) error {
+			result, err := eng.SkipRevert(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}, "no revert window to close"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call(t)
+			require.Error(t, err)
+			assert.True(t, engine.IsUnsupportedOperation(err),
+				"the decline must be typed so durable control consumers resolve it terminally")
+			assert.Contains(t, err.Error(), tc.reason,
+				"the decline reason reaches operator-facing surfaces and must say why")
+		})
+	}
 }

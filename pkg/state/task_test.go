@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"testing"
 
 	spiritstatus "github.com/block/spirit/pkg/status"
@@ -14,11 +15,11 @@ func TestNormalizeTaskStatus_SpiritStates(t *testing.T) {
 	}{
 		{spiritstatus.Initial.String(), Task.Running},
 		{spiritstatus.CopyRows.String(), Task.Running},
-		{spiritstatus.ApplyChangeset.String(), Task.Running},
+		{spiritstatus.ApplyChangeset.String(), Task.CatchingUp},
 		{spiritstatus.RestoreSecondaryIndexes.String(), Task.Running},
 		{spiritstatus.AnalyzeTable.String(), Task.Running},
 		{spiritstatus.Checksum.String(), Task.Checksumming},
-		{spiritstatus.PostChecksum.String(), Task.Running},
+		{spiritstatus.PostChecksum.String(), Task.PostChecksum},
 		{spiritstatus.ErrCleanup.String(), Task.Running},
 		{spiritstatus.WaitingOnSentinelTable.String(), Task.WaitingForCutover},
 		{spiritstatus.CutOver.String(), Task.CuttingOver},
@@ -53,7 +54,7 @@ func TestNormalizeTaskStatus_VitessStates(t *testing.T) {
 
 func TestNormalizeTaskStatus_PassThrough(t *testing.T) {
 	for _, s := range []string{
-		Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
+		Task.Pending, Task.Running, Task.CatchingUp, Task.Checksumming, Task.PostChecksum, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering, Task.CuttingOver, Task.Cancelled,
 	} {
@@ -76,6 +77,18 @@ func TestNormalizeTaskStatus_StorageCompleted(t *testing.T) {
 
 func TestNormalizeTaskStatus_UnknownDefaultsToRunning(t *testing.T) {
 	assert.Equal(t, Task.Running, NormalizeTaskStatus("something_unknown"))
+}
+
+func TestRecognizedTaskStatus(t *testing.T) {
+	for _, s := range []string{
+		Task.Running, Task.FailedRetryable, "copyRows", "complete",
+		"STATE_FAILED_RETRYABLE", "STATE_running",
+	} {
+		assert.True(t, RecognizedTaskStatus(s), "RecognizedTaskStatus(%q)", s)
+	}
+	for _, s := range []string{"something_unknown", "someNewEngineState", ""} {
+		assert.False(t, RecognizedTaskStatus(s), "RecognizedTaskStatus(%q)", s)
+	}
 }
 
 func TestIsInFlightTaskState(t *testing.T) {
@@ -110,4 +123,18 @@ func TestIsInFlightTaskState_NormalizesProtoPrefix(t *testing.T) {
 	assert.True(t, IsInFlightTaskState("WAITING_FOR_CUTOVER"))
 	assert.False(t, IsInFlightTaskState("STATE_STOPPED"))
 	assert.False(t, IsInFlightTaskState("FAILED_RETRYABLE"))
+}
+
+// Task states arrive in proto form ("STATE_COMPLETED") as well as canonical
+// lowercase, so the terminal test must compare them normalized — a terminal
+// row that fails it is treated as work still owed a driver.
+func TestIsTerminalTaskState_NormalizesProtoPrefix(t *testing.T) {
+	for _, s := range TerminalTaskStates {
+		assert.True(t, IsTerminalTaskState(s), "IsTerminalTaskState(%q)", s)
+		proto := "STATE_" + strings.ToUpper(s)
+		assert.True(t, IsTerminalTaskState(proto), "IsTerminalTaskState(%q)", proto)
+	}
+	assert.False(t, IsTerminalTaskState("STATE_STOPPED"), "stopped rests, it does not end")
+	assert.False(t, IsTerminalTaskState("STATE_FAILED_RETRYABLE"), "retryable work is still claimable")
+	assert.False(t, IsTerminalTaskState(Task.Running))
 }

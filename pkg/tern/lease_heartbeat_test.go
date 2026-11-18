@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -54,6 +56,230 @@ func (s *failingHeartbeatApplyStore) callCount() int {
 	return s.calls
 }
 
+// recordingHeartbeatOperationStore records the operation IDs heartbeated so a
+// test can assert which row a drive kept alive.
+type recordingHeartbeatOperationStore struct {
+	storage.ApplyOperationStore
+	mu           sync.Mutex
+	heartbeatIDs []int64
+}
+
+func (s *recordingHeartbeatOperationStore) Heartbeat(_ context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heartbeatIDs = append(s.heartbeatIDs, id)
+	return nil
+}
+
+func (s *recordingHeartbeatOperationStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.heartbeatIDs)
+}
+
+func (s *recordingHeartbeatOperationStore) lastID() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.heartbeatIDs) == 0 {
+		return 0
+	}
+	return s.heartbeatIDs[len(s.heartbeatIDs)-1]
+}
+
+// hangingHeartbeatApplyStore and hangingHeartbeatOperationStore are stores
+// whose heartbeat write is stuck on a half-open storage connection: it returns
+// only once its context ends, the way the SQL driver unblocks a read when its
+// context is done.
+type hangingHeartbeatApplyStore struct {
+	storage.ApplyStore
+	attempts atomic.Int32
+}
+
+func (s *hangingHeartbeatApplyStore) Heartbeat(ctx context.Context, id int64) error {
+	s.attempts.Add(1)
+	<-ctx.Done()
+	return fmt.Errorf("heartbeat apply %d: %w", id, ctx.Err())
+}
+
+type hangingHeartbeatOperationStore struct {
+	storage.ApplyOperationStore
+	attempts atomic.Int32
+}
+
+func (s *hangingHeartbeatOperationStore) Heartbeat(ctx context.Context, id int64) error {
+	s.attempts.Add(1)
+	<-ctx.Done()
+	return fmt.Errorf("heartbeat apply_operation %d: %w", id, ctx.Err())
+}
+
+// TestStartApplyHeartbeatThatHangsStopsTheDrive covers a local drive whose
+// storage connection has gone half-open: every heartbeat write hangs instead
+// of failing. A peer reclaims the row once its heartbeat is older than the
+// staleness window, so the drive must stop by then too, whichever row it
+// heartbeats. Each hung write is cut off and counted as a failed heartbeat, and
+// the drive is cancelled no later than the end of the window, so two drivers
+// never run the same engine work at once.
+func TestStartApplyHeartbeatThatHangsStopsTheDrive(t *testing.T) {
+	apply := leaseHeartbeatTestApply()
+
+	cases := []struct {
+		name         string
+		operationCtx bool
+	}{
+		{name: "a drive holding the parent apply lease", operationCtx: false},
+		{name: "an operation-scoped drive", operationCtx: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				applies := &hangingHeartbeatApplyStore{}
+				operations := &hangingHeartbeatOperationStore{}
+				client := &LocalClient{
+					storage:           &exactProgressStorage{applies: applies, applyOperations: operations},
+					logger:            discardLogger(),
+					heartbeatInterval: defaultHeartbeatInterval,
+				}
+
+				driveCtx, cancelDrive := context.WithCancel(t.Context())
+				defer cancelDrive()
+				leaseCtx := storage.WithApplyLease(driveCtx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-1", Token: "apply-token"})
+				if tc.operationCtx {
+					leaseCtx = storage.WithOperationLease(driveCtx, storage.OperationLease{
+						ApplyID: apply.ID, OperationID: 77, Owner: "driver-1", Token: "op-token",
+					})
+				}
+				driveStart := time.Now()
+				stop := client.startApplyHeartbeat(leaseCtx, apply, cancelDrive)
+				defer stop()
+
+				select {
+				case <-driveCtx.Done():
+				case <-time.After(2 * storage.ApplyLeaseStaleAfter):
+					require.Fail(t, "a drive whose heartbeat writes hang must stop once a peer can reclaim its work")
+				}
+				assert.LessOrEqual(t, time.Since(driveStart), storage.ApplyLeaseStaleAfter,
+					"the drive must stop no later than a peer may reclaim the row")
+				assert.GreaterOrEqual(t, applies.attempts.Load()+operations.attempts.Load(), int32(2),
+					"each hung write is cut off and retried")
+			})
+		})
+	}
+}
+
+// hangingControlRequestStore is a control request store whose pending read is
+// stuck on a half-open storage connection, returning only once its context
+// ends.
+type hangingControlRequestStore struct {
+	storage.ControlRequestStore
+	reads atomic.Int32
+}
+
+func (s *hangingControlRequestStore) ListPending(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	s.reads.Add(1)
+	<-ctx.Done()
+	return nil, fmt.Errorf("list pending control requests for apply %d: %w", applyID, ctx.Err())
+}
+
+// hangingStorage serves the stores a gRPC drive's poll loop reads first, each
+// stuck the way a half-open storage connection leaves them.
+type hangingStorage struct {
+	storage.Storage
+	applies         *hangingHeartbeatApplyStore
+	controlRequests *hangingControlRequestStore
+}
+
+func (s *hangingStorage) Applies() storage.ApplyStore                  { return s.applies }
+func (s *hangingStorage) ControlRequests() storage.ControlRequestStore { return s.controlRequests }
+
+// TestGRPCPollWithHungStorageEndsTheDrive covers a gRPC drive whose storage
+// connection has gone half-open: its heartbeat writes time out, and its poll
+// loop is blocked in the pending control request read, which never returns.
+// The heartbeat runs apart from the poll, so the blocked read cannot hold it
+// up. Once the heartbeat has failed for the whole staleness window the drive
+// ends with ErrApplyLeasePresumedLost, no later than a peer may reclaim the
+// row, so two drivers never supervise the same remote apply at once.
+func TestGRPCPollWithHungStorageEndsTheDrive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		apply := leaseHeartbeatTestApply()
+		store := &hangingStorage{
+			applies:         &hangingHeartbeatApplyStore{},
+			controlRequests: &hangingControlRequestStore{},
+		}
+		client := &GRPCClient{storage: store, logger: discardLogger()}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 2*storage.ApplyLeaseStaleAfter)
+		defer cancel()
+		driveStart := time.Now()
+		err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
+
+		require.ErrorIs(t, err, ErrApplyLeasePresumedLost,
+			"a drive whose storage hangs must end once a peer can reclaim its work")
+		assert.ErrorIs(t, err, storage.ErrLeaseHeartbeatTimedOut)
+		assert.LessOrEqual(t, time.Since(driveStart), storage.ApplyLeaseStaleAfter,
+			"the drive must end no later than a peer may reclaim the row")
+		assert.Equal(t, int32(1), store.controlRequests.reads.Load(), "the poll stayed blocked in its first read")
+		assert.GreaterOrEqual(t, store.applies.attempts.Load(), int32(2), "each hung heartbeat is cut off and retried")
+	})
+}
+
+// TestStartApplyHeartbeatFollowsTheDriveScope covers which row a local drive
+// keeps alive. An operation-scoped drive holds only its operation lease — the
+// parent applies row belongs to the parent lease and the rollout projection —
+// so it must heartbeat its operation row and leave the parent untouched. Any
+// other drive carries the parent apply lease and heartbeats the parent. Sending
+// the heartbeat to the wrong row is not merely misattributed: storage refuses
+// the write, and the refusal reads as a lost lease that cancels the drive.
+func TestStartApplyHeartbeatFollowsTheDriveScope(t *testing.T) {
+	apply := leaseHeartbeatTestApply()
+
+	t.Run("an operation-scoped drive heartbeats its operation row", func(t *testing.T) {
+		applies := &failingHeartbeatApplyStore{err: storage.ErrApplyLeaseLost}
+		operations := &recordingHeartbeatOperationStore{}
+		client := &LocalClient{
+			storage:           &exactProgressStorage{applies: applies, applyOperations: operations},
+			logger:            discardLogger(),
+			heartbeatInterval: 5 * time.Millisecond,
+		}
+
+		driveCtx, cancelDrive := context.WithCancel(t.Context())
+		defer cancelDrive()
+		opLeaseCtx := storage.WithOperationLease(driveCtx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: 77, Owner: "driver-1", Token: "op-token",
+		})
+		stop := client.startApplyHeartbeat(opLeaseCtx, apply, cancelDrive)
+		defer stop()
+
+		require.Eventually(t, func() bool {
+			return operations.callCount() >= 2
+		}, time.Second, 10*time.Millisecond, "the drive must heartbeat its operation row")
+		assert.Equal(t, int64(77), operations.lastID(), "the claimed operation row is the one kept alive")
+		assert.Zero(t, applies.callCount(), "the parent applies row must not be heartbeated by an operation-scoped drive")
+		assert.NoError(t, driveCtx.Err(), "heartbeating the right row must not cancel the drive")
+	})
+
+	t.Run("a drive holding both leases heartbeats the parent apply", func(t *testing.T) {
+		applies := &failingHeartbeatApplyStore{}
+		operations := &recordingHeartbeatOperationStore{}
+		client := &LocalClient{
+			storage:           &exactProgressStorage{applies: applies, applyOperations: operations},
+			logger:            discardLogger(),
+			heartbeatInterval: 5 * time.Millisecond,
+		}
+
+		dualLeaseCtx := storage.WithOperationLease(
+			storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-1", Token: "apply-token"}),
+			storage.OperationLease{ApplyID: apply.ID, OperationID: 77, Owner: "driver-1", Token: "op-token"},
+		)
+		stop := client.startApplyHeartbeat(dualLeaseCtx, apply)
+		defer stop()
+
+		require.Eventually(t, func() bool {
+			return applies.callCount() >= 2
+		}, time.Second, 10*time.Millisecond, "a drive that still holds the parent lease heartbeats the parent")
+		assert.Zero(t, operations.callCount(), "the single-operation drive's liveness is reported on the parent row")
+	})
+}
+
 // TestApplyHeartbeatFailureStopsDrive verifies how a local drive reacts to a
 // failed apply heartbeat write: a definitively lost lease stops the drive
 // immediately, a transient storage error inside the lease staleness window
@@ -66,18 +292,23 @@ func TestApplyHeartbeatFailureStopsDrive(t *testing.T) {
 
 	t.Run("lost lease stops the drive immediately", func(t *testing.T) {
 		hbErr := fmt.Errorf("heartbeat apply %d: %w", apply.ID, storage.ErrApplyLeaseLost)
-		assert.True(t, client.applyHeartbeatFailureStopsDrive(t.Context(), apply, hbErr, time.Now()))
+		assert.True(t, client.applyHeartbeatFailureStopsDrive(t.Context(), apply, hbErr, time.Now(), false))
 	})
 
 	t.Run("transient failure inside the window keeps driving", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
-		assert.False(t, client.applyHeartbeatFailureStopsDrive(t.Context(), apply, hbErr, time.Now()))
+		assert.False(t, client.applyHeartbeatFailureStopsDrive(t.Context(), apply, hbErr, time.Now(), false))
 	})
 
 	t.Run("failures spanning the staleness window stop the drive", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
 		lastSuccess := time.Now().Add(-storage.ApplyLeaseStaleAfter)
-		assert.True(t, client.applyHeartbeatFailureStopsDrive(t.Context(), apply, hbErr, lastSuccess))
+		assert.True(t, client.applyHeartbeatFailureStopsDrive(t.Context(), apply, hbErr, lastSuccess, false))
+	})
+
+	t.Run("an operation-scoped drive classifies its own lease the same way", func(t *testing.T) {
+		hbErr := fmt.Errorf("apply_operation %d is no longer owned by its operation lease: %w", 9, storage.ErrApplyLeaseLost)
+		assert.True(t, client.applyHeartbeatFailureStopsDrive(t.Context(), apply, hbErr, time.Now(), true))
 	})
 }
 
@@ -86,26 +317,41 @@ func TestApplyHeartbeatFailureStopsDrive(t *testing.T) {
 // a transient storage error inside the lease staleness window keeps the drive
 // polling so the heartbeat is retried on the next tick, and failures that have
 // persisted for the full window end the drive because a peer driver can
-// already have reclaimed the stale row.
+// already have reclaimed the stale row. A write that timed out is classified
+// the same way as one that returned an error.
 func TestDriveEndingHeartbeatFailure(t *testing.T) {
 	apply := leaseHeartbeatTestApply()
 
 	t.Run("lost lease ends the drive immediately", func(t *testing.T) {
 		hbErr := fmt.Errorf("heartbeat apply %d: %w", apply.ID, storage.ErrApplyLeaseLost)
-		stopErr := driveEndingHeartbeatFailure(apply, hbErr, time.Now())
+		stopErr := driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, time.Now())
 		require.Error(t, stopErr)
 		assert.ErrorIs(t, stopErr, storage.ErrApplyLeaseLost)
 	})
 
 	t.Run("transient failure inside the window keeps driving", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
-		assert.NoError(t, driveEndingHeartbeatFailure(apply, hbErr, time.Now()))
+		assert.NoError(t, driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, time.Now()))
+	})
+
+	t.Run("a timed-out write inside the window keeps driving", func(t *testing.T) {
+		hbErr := fmt.Errorf("%w after 15s: %w", storage.ErrLeaseHeartbeatTimedOut, context.DeadlineExceeded)
+		assert.NoError(t, driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, time.Now()))
+	})
+
+	t.Run("timed-out writes spanning the staleness window end the drive", func(t *testing.T) {
+		hbErr := fmt.Errorf("%w after 15s: %w", storage.ErrLeaseHeartbeatTimedOut, context.DeadlineExceeded)
+		lastSuccess := time.Now().Add(-storage.ApplyLeaseStaleAfter)
+		stopErr := driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, lastSuccess)
+		require.Error(t, stopErr)
+		assert.ErrorIs(t, stopErr, ErrApplyLeasePresumedLost)
+		assert.ErrorIs(t, stopErr, storage.ErrLeaseHeartbeatTimedOut)
 	})
 
 	t.Run("failures spanning the staleness window end the drive", func(t *testing.T) {
 		hbErr := errors.New("connection refused")
 		lastSuccess := time.Now().Add(-storage.ApplyLeaseStaleAfter)
-		stopErr := driveEndingHeartbeatFailure(apply, hbErr, lastSuccess)
+		stopErr := driveEndingHeartbeatFailure(slog.Default(), apply, hbErr, lastSuccess)
 		require.Error(t, stopErr)
 		assert.ErrorIs(t, stopErr, hbErr)
 		assert.ErrorIs(t, stopErr, ErrApplyLeasePresumedLost,

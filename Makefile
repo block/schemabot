@@ -22,7 +22,17 @@ E2E_TEST_TIMEOUT ?= 10m
 E2E_TEST_FLAGS ?=
 E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 
-.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+# Disable Buildx Bake: Compose delegates `up --build` and `compose build` to a
+# bake subprocess that can lose its stdio pipe (docker/compose#13243), failing
+# the build with `read |0: file already closed`. Every image composed here is
+# COPY-only over prebuilt binaries, so the classic builder costs nothing.
+# Exported so it reaches every compose recipe in this file — e2e, dev and demo
+# targets alike. Scripts invoked directly (not via make) carry their own
+# export. Drop this once that issue is fixed upstream and the flake stops
+# reproducing on CI runners.
+export COMPOSE_BAKE := false
+
+.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-k8s-multi-target test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -126,9 +136,11 @@ help: ## Show this help message
 	@echo "$$HELP_HEADER"
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-lint: check-closeandlog check-webhookheaders ## Run all linters (golangci-lint + custom analyzers)
+lint: check-closeandlog check-webhookheaders check-severityglyphs ## Run all linters (golangci-lint + custom analyzers)
 	@echo "Running golangci-lint..."
 	@docker run --rm -v $$(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint run --timeout=5m
+	@echo "Running golangci-lint (consumer module)..."
+	@docker run --rm -v $$(pwd):/app -w /app/e2e/consumermodule golangci/golangci-lint:latest golangci-lint run --timeout=5m
 
 check-closeandlog: ## Run closeandlog analyzer (flags _ = x.Close() patterns)
 	@echo "Running closeandlog analyzer..."
@@ -138,6 +150,23 @@ check-closeandlog: ## Run closeandlog analyzer (flags _ = x.Close() patterns)
 check-webhookheaders: ## Run webhookheaders analyzer (flags inline `## ...` markdown headers in pkg/webhook handlers)
 	@echo "Running webhookheaders analyzer..."
 	@go run ./cmd/webhookheaders-check $$(go list ./pkg/webhook/... | grep -v '/templates$$')
+
+# pkg/glyph is the vocabulary's home and pkg/analyzers/severityglyphs names the
+# glyphs in its own diagnostics, so both are excluded the same way the
+# pre-commit hook excludes them.
+#
+# A build only analyzes the files its constraints select, so one pass is not the
+# whole surface. The default build leaves out the packages whose non-test files
+# all sit behind a test build tag, which the second pass picks up by carrying
+# both tags. The tags have to travel in GOFLAGS: the checker's own -tags flag is
+# registered by the analysis driver as deprecated and does nothing. What stays
+# unchecked either way is a file that only builds for another GOOS, since the
+# constraint excludes it from every pass the host can run.
+check-severityglyphs: ## Run severityglyphs analyzer (flags severity glyph literals outside pkg/glyph)
+	@echo "Running severityglyphs analyzer..."
+	@go run ./cmd/severityglyphs-check $$(go list ./... | grep -v '/pkg/glyph$$' | grep -v '/pkg/analyzers/severityglyphs')
+	@echo "Running severityglyphs analyzer (test build tags)..."
+	@GOFLAGS=-tags=e2e,integration go run ./cmd/severityglyphs-check $$(GOFLAGS=-tags=e2e,integration go list ./... | grep -v '/pkg/glyph$$' | grep -v '/pkg/analyzers/severityglyphs')
 
 lint-fix: ## Run golangci-lint with auto-fix enabled
 	@echo "Running golangci-lint with auto-fix..."
@@ -152,8 +181,31 @@ clean: ## Clean build artifacts
 	@rm -rf bin/
 	@rm -f coverage.out
 
-docs-toc: ## Regenerate the Table of Contents in docs/*.md
+docs-toc: ## Refresh the Table of Contents in docs files that have TOC markers
 	@python3 scripts/gen-doc-toc.py
+
+check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
+	@python3 -B -m unittest discover -s scripts -p 'test_gen_doc_toc.py'
+	@python3 scripts/gen-doc-toc.py --check
+
+docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
+	@python3 scripts/prepare-pr-demo.py
+	@python3 scripts/prepare-pr-multi-target-demo.py
+	@python3 scripts/render-pr-mockups.py --prepared
+	@bash scripts/render-pr-demo.sh
+	@python3 scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
+
+templates: build ## Regenerate TEMPLATES.md from the current binary
+	@scripts/update-templates.sh
+
+check-templates: build ## Fail if TEMPLATES.md is stale
+	@scripts/update-templates.sh --check
+
+check-terminology: ## Fail if "schema change" is hyphenated in prose or "cutover" is split in the docs
+	@scripts/check-terminology.sh
+
+check-vulnerabilities: ## Fail if the code calls into a known vulnerability
+	@scripts/check-vulnerabilities.sh
 
 # Generate protobuf code (only if .proto is newer than generated .pb.go)
 proto: ## Generate protobuf code
@@ -190,11 +242,23 @@ ifeq ($(FRESH),1)
 endif
 	docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.telemetry.yml up --build
 
-# Start services, apply testapp schema, then show logs (full demo workflow)
-#   make demo              # Start and apply MySQL + Vitess schema (wipes data)
-#   make demo KEEP_DATA=1  # Restart without wiping data (preserves seeded rows)
-#   make demo SKIP_APPLY=1 # Start server only, skip schema applies (for debugging)
-demo:
+# Start a sample through the same onboarding path as an installed CLI.
+#   make demo                 # Create a sample MySQL project
+#   make demo ENGINE=postgres # Create a sample PostgreSQL project
+# Reuses one project per engine under .schemabot-demo/.
+demo: build
+	@engine="$(or $(ENGINE),mysql)"; \
+	case "$$engine" in mysql|postgres) ;; *) echo "Choose ENGINE=mysql or ENGINE=postgres"; exit 1 ;; esac; \
+	demo_dir="$(if $(DEMO_DIR),$(abspath $(DEMO_DIR)),$(CURDIR)/.schemabot-demo/$$engine)"; \
+	mkdir -p "$$demo_dir"; \
+	echo "Demo project: $$demo_dir"; \
+	cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type "$$engine"
+
+# Full developer environment, including LocalScale and multiple deployments.
+#   make demo-full              # Start and apply MySQL + Vitess schema (wipes data)
+#   make demo-full KEEP_DATA=1   # Preserve seeded rows
+#   make demo-full SKIP_APPLY=1  # Start services without applying schemas
+demo-full:
 	@# Reset schema files to baseline so the demo starts clean.
 	@./scripts/generate-schema-change.sh reset 2>/dev/null || true
 	@./scripts/generate-schema-change.sh reset --vitess 2>/dev/null || true
@@ -289,6 +353,13 @@ test-e2e: test-e2e-local test-e2e-grpc ## Run all e2e tests
 # E2E local environment shorthand
 E2E_DC = docker compose -f deploy/e2e/docker-compose.yml
 
+# Bound on each seed apply test-e2e-local runs before the tests. A healthy seed
+# apply finishes in seconds; the bound turns a stalled one into a setup failure
+# that prints the LocalScale logs while the CI job still has time to collect
+# them, instead of a runner cancellation that captures nothing.
+E2E_SEED_APPLY_TIMEOUT ?= 180
+E2E_SEED_APPLY = scripts/e2e-seed-apply.sh $(E2E_SEED_APPLY_TIMEOUT)
+
 # Run local e2e tests in an isolated environment (no conflicts with make demo)
 # Keeps containers alive between runs for fast iteration. Use FRESH=1 to rebuild from scratch.
 # Use `make test-e2e-local-down` to tear down manually.
@@ -320,8 +391,8 @@ endif
 		sleep 1; \
 	done
 	@echo "Applying schemas (MySQL + Vitess in parallel)..."
-	@( ./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
-	   ./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
+	@( $(E2E_SEED_APPLY) mysql-staging -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
+	   $(E2E_SEED_APPLY) mysql-production -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
 	MYSQL_PID=$$!; \
 	for ks in testapp testapp_sharded; do \
 		if [ -f examples/vitess/schema/$$ks/vschema.json ]; then \
@@ -333,10 +404,10 @@ endif
 				-d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
 		fi; \
 	done; \
-	./bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
-	./bin/schemabot apply -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
+	$(E2E_SEED_APPLY) vitess-staging -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
+	$(E2E_SEED_APPLY) vitess-production -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
 	wait $$MYSQL_PID
 	@echo "Running e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:14370 \
@@ -387,7 +458,8 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 		fi; \
 		if [ $$i -eq 90 ]; then \
 			echo "Timeout waiting for SchemaBot gRPC e2e environment"; \
-			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs; \
+			mkdir -p e2e-logs; \
+			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps 2>&1 | tee e2e-logs/grpc-containers.log; \
 			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 			exit 1; \
 		fi; \
@@ -399,8 +471,13 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_PRODUCTION_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
-	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m ./e2e/grpc/... ; \
+	$(GOTEST) -count=1 -v -tags=e2e -timeout=$(E2E_TEST_TIMEOUT) ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
+	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
+		echo "Capturing gRPC e2e container logs before teardown..."; \
+		mkdir -p e2e-logs; \
+		$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps > e2e-logs/grpc-containers.log 2>&1 || true; \
+	fi; \
 	echo "Tearing down gRPC e2e environment..."; \
 	$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 	exit $$TEST_EXIT_CODE
@@ -438,7 +515,8 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 		if [ $$i -eq 90 ]; then \
 			echo "Timeout waiting for multi-deployment SchemaBot gRPC e2e environment"; \
 			echo "(expected until the server supports deployments maps with more than one entry)"; \
-			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs; \
+			mkdir -p e2e-logs; \
+			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps 2>&1 | tee e2e-logs/grpc-multideploy-containers.log; \
 			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 			exit 1; \
 		fi; \
@@ -451,8 +529,13 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_EU_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_US_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
-	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m -run '$(E2E_GRPC_MD_RUN)' ./e2e/grpc/... ; \
+	$(GOTEST) -count=1 -v -tags=e2e -timeout=$(E2E_TEST_TIMEOUT) -run '$(E2E_GRPC_MD_RUN)' ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
+	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
+		echo "Capturing multi-deployment gRPC e2e container logs before teardown..."; \
+		mkdir -p e2e-logs; \
+		$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps > e2e-logs/grpc-multideploy-containers.log 2>&1 || true; \
+	fi; \
 	echo "Tearing down multi-deployment gRPC e2e environment..."; \
 	$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 	exit $$TEST_EXIT_CODE
@@ -470,6 +553,12 @@ test-e2e-k8s-etre: ## Run the etre-resolver k8s e2e on minikube
 
 test-e2e-k8s-vitess: ## Run the vitess-resolver k8s e2e on minikube
 	@e2e/k8s/e2e-vitess-test.sh
+
+# Run the multi-target k8s e2e on minikube: one data plane serves several
+# targets, each resolved through Etre to its own MySQL server, and every apply
+# rolls out table by table across them over gRPC.
+test-e2e-k8s-multi-target: ## Run the multi-target rollout k8s e2e on minikube
+	@e2e/k8s/e2e-multi-target-test.sh
 
 # Start local dev environment with gRPC backend (separate Tern server)
 up-grpc:
@@ -569,11 +658,18 @@ cli: build ## Install schemabot CLI to /usr/local/bin
 	cp bin/schemabot /usr/local/bin/schemabot
 
 # Run all tests (unit with race detection + integration + e2e)
-test: proto test-unit test-integration test-e2e ## Run all tests
+test: proto test-unit test-consumer-module test-integration test-e2e ## Run all tests
 
 # Run unit tests only (with race detection, no testcontainers)
 test-unit: ## Run unit tests with race detection
 	$(GOTEST) -race ./...
+
+# Verify schemabot's startup surface from a consumer module that pins a newer
+# OpenTelemetry SDK than this repo. Host binaries embedding schemabot resolve
+# their own dependency versions, so this catches conflicts (such as semconv
+# schema URL mismatches) that cannot reproduce inside this module.
+test-consumer-module: ## Run consumer-module startup tests
+	cd e2e/consumermodule && $(GOTEST) -race ./...
 
 # Run integration tests (uses testcontainers for MySQL)
 # Note: -race is omitted because Spirit (upstream) has known data races in

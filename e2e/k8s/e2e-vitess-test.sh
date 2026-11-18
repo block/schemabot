@@ -10,6 +10,11 @@
 #
 # Usage:
 #   e2e/k8s/e2e-vitess-test.sh
+#
+# Environment:
+#   E2E_TEST_TIMEOUT   go test's own timeout (default 10m); CI sets it on the
+#                      job whose budget must exceed it plus setup, so the two
+#                      numbers are read and changed together
 
 set -euo pipefail
 
@@ -25,8 +30,11 @@ done
 
 if ! minikube status > /dev/null 2>&1; then
     echo "Starting minikube..."
-    minikube start --driver=docker --cpus=4 --memory=4096
+    minikube start --driver=docker --container-runtime=docker --cpus=4 --memory=4096
 fi
+
+# shellcheck source=e2e/k8s/pin-minikube-kubeconfig.sh
+source "$REPO_ROOT/e2e/k8s/pin-minikube-kubeconfig.sh"
 
 # --- Build images into minikube's docker daemon ---
 
@@ -43,6 +51,7 @@ docker build -t localscale:test -f "$REPO_ROOT/deploy/local/Dockerfile.localscal
 
 PIDS=()
 cleanup() {
+    rm -f "$PINNED_KUBECONFIG"
     echo "Cleaning up port-forwards..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
@@ -95,8 +104,11 @@ kubectl apply -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/vitess-stack.yaml"
 wait_for_ready_pods "app=mysql-control-plane"
 wait_for_ready_pods "app=mysql-data-plane"
 wait_for_ready_pods "app=etre"
-# vtcombo takes about a minute to start, so allow a little more than the others.
-wait_for_ready_pods "app=localscale" 240
+# vtcombo takes about a minute to boot, and only then does LocalScale start
+# waiting out its own 3-minute budget for every shard's sidecar to accept a DDL
+# submission — /health stays red until both finish. Wait past their sum, or a
+# cluster that was merely slow to come up reads as a broken stack.
+wait_for_ready_pods "app=localscale" 300
 
 echo "Waiting for seed jobs..."
 kubectl wait --for=condition=complete job/etre-mongo-init -n "$NAMESPACE" --timeout=180s
@@ -136,7 +148,7 @@ echo "Running vitess-resolver k8s e2e..."
 TEST_EXIT_CODE=0
 E2E_SCHEMABOT_URL=http://localhost:8080 \
 E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:3307)/schemabot?parseTime=true&multiStatements=true" \
-go test -count=1 -v -tags=e2e -timeout=10m -run TestK8sVitess ./e2e/k8s/... || TEST_EXIT_CODE=$?
+go test -count=1 -v -tags=e2e -timeout="${E2E_TEST_TIMEOUT:-10m}" -run TestK8sVitess ./e2e/k8s/... || TEST_EXIT_CODE=$?
 
 teardown_namespace
 exit "$TEST_EXIT_CODE"

@@ -3,10 +3,13 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,8 +21,12 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Globals holds flags shared by all commands.
@@ -27,6 +34,10 @@ type Globals struct {
 	Endpoint string `help:"SchemaBot API endpoint (overrides profile)"`
 	Profile  string `help:"Configuration profile"`
 	Token    string `help:"Bearer token for authenticating to an auth-enabled server (or set SCHEMABOT_TOKEN)"`
+	// CLIName is declared so kong accepts the flag at any position; main.go
+	// consumes the value from the raw args before parsing, since it feeds
+	// kong's own usage text.
+	CLIName string `name:"cli-name" hidden:"" help:"Tool name rendered in command hints (for CLI wrappers)"`
 
 	// Build info (set by main.go from ldflags)
 	Version string `kong:"-"`
@@ -37,6 +48,43 @@ type Globals struct {
 // Resolve resolves the API endpoint from the global flags.
 func (g *Globals) Resolve() (string, error) {
 	return resolveEndpoint(g.Endpoint, g.Profile)
+}
+
+// RouteFlags returns the global flags that select which server a command
+// talks to, as the operator passed them, for cliname.SetRoute. Call it after
+// parsing and before anything rewrites Endpoint with a resolved one. The token
+// is never included, and the endpoint is stripped of any credentials, query,
+// or fragment, because hints are printed to the terminal and to CI logs.
+func (g *Globals) RouteFlags() []cliname.Flag {
+	var flags []cliname.Flag
+	if g.Profile != "" {
+		flags = append(flags, cliname.Flag{Name: "--profile", Value: g.Profile})
+	}
+	if endpoint := endpointForHint(g.Endpoint); endpoint != "" {
+		flags = append(flags, cliname.Flag{Name: "--endpoint", Value: endpoint})
+	}
+	return flags
+}
+
+// endpointForHint is the endpoint as a hint may print it: scheme, host, and
+// path only. An endpoint that does not parse as a URL is left out rather than
+// printed, since there is no way to tell which part of it is a credential.
+// The parse error is not logged for the same reason: it quotes the endpoint.
+func endpointForHint(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		slog.Debug("leaving an unparseable endpoint out of command hints")
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
 }
 
 // ControlFlags holds flags for commands that target a specific schema change.
@@ -64,10 +112,29 @@ func (cf *ControlFlags) RequireApplyID() error {
 var ErrSilent = errors.New("silent error")
 
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
+// Database and Type are row-identity keys: LoadCLIConfig folds them with
+// storage.CanonicalKey so the CLI names the same identity the server stores,
+// whatever case the file was written in.
 type CLIConfig struct {
-	Database  string `yaml:"database"`
-	Type      string `yaml:"type"`
-	SchemaDir string `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	Database string `yaml:"database"`
+	Type     string `yaml:"type"`
+	// IgnoreNamespaces lists namespace subdirectories of the schema root that
+	// SchemaBot must not reconcile against the live database.
+	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
+	// IgnoreTables lists live tables SchemaBot must not reconcile, by name or,
+	// wrapped in slashes, by a regular expression over the whole name. Without
+	// the exclusion a live table no schema file declares is planned as DROP
+	// TABLE, which blocks the merge.
+	IgnoreTables []string `yaml:"ignore_tables"`
+	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+}
+
+// PlanExclusions returns the config's declared exclusions in the form the plan
+// API takes them. Both lists are exclusions the repository recorded, and they
+// are passed as one value so a caller cannot hand the plan its tables as its
+// namespaces.
+func (c *CLIConfig) PlanExclusions() client.PlanExclusions {
+	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables}
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -82,7 +149,7 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			absDir, _ := filepath.Abs(dir)
-			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  schemabot plan -s ./path/to/schema\n  schemabot apply -s ./path/to/schema -e staging", absDir)
+			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  %s plan -s ./path/to/schema\n  %s apply -s ./path/to/schema -e staging", absDir, cliname.Name(), cliname.Name())
 		}
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
@@ -93,9 +160,17 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
+	cfg.Database = storage.CanonicalKey(cfg.Database)
+	cfg.Type = storage.CanonicalKey(cfg.Type)
 
 	if cfg.Database == "" {
 		return nil, fmt.Errorf("schemabot.yaml: database is required")
+	}
+	if err := schema.ValidateIgnoreNamespaces(cfg.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
+	}
+	if err := schema.ValidateIgnoreTables(cfg.IgnoreTables); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml
 	cfg.SchemaDir = dir
@@ -113,14 +188,52 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 		return "", fmt.Errorf("resolve endpoint: %w", err)
 	}
 	if ep == "" {
-		return "", fmt.Errorf("no endpoint configured (run 'schemabot configure' to set up a profile)")
+		return "", fmt.Errorf("no endpoint configured (run '%s configure' to set up a profile)", cliname.Name())
 	}
 	return ep, nil
 }
 
 // confirmAction prompts the user for "yes" confirmation. Returns true if confirmed.
 func confirmAction(prompt, cancelMsg string) (bool, error) {
-	fmt.Print(prompt)
+	return confirmActionOn(os.Stdout, prompt, cancelMsg)
+}
+
+// writeToTerminal runs fn with the human-facing renderers writing to stderr
+// instead of stdout, when the command was asked for machine-readable output.
+// With divert false it just runs fn, so a caller can wrap unconditionally.
+//
+// A command under --json owes stdout to the program reading it, and still owes
+// a person at the terminal everything they are being asked to approve. Those
+// are two audiences, not a choice between them: the plan goes to one and the
+// response to the other. The renderers print through fmt.Print, which resolves
+// os.Stdout per call, so pointing it at stderr for the duration is what moves
+// them; nothing writes the response until after it is restored.
+func writeToTerminal(divert bool, fn func() error) error {
+	if !divert {
+		return fn()
+	}
+	restore := os.Stdout
+	os.Stdout = os.Stderr
+	defer func() { os.Stdout = restore }()
+	return fn()
+}
+
+// confirmActionOn is confirmAction with the prompt written somewhere other than
+// stdout. A command asked for machine-readable output owes stdout to the
+// program reading it, and still has to ask a person before it converges, so the
+// conversation goes to stderr and the answer stays parseable.
+func confirmActionOn(out io.Writer, prompt, cancelMsg string) (bool, error) {
+	// A prompt nobody can be shown is not a prompt, so a write that fails is
+	// an error rather than an unanswered question read from stdin anyway.
+	if _, err := fmt.Fprint(out, prompt); err != nil {
+		return false, fmt.Errorf("write confirmation prompt: %w", err)
+	}
+	cancelled := func() error {
+		if _, err := fmt.Fprintln(out, cancelMsg); err != nil {
+			return fmt.Errorf("write cancellation notice: %w", err)
+		}
+		return nil
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
@@ -139,8 +252,7 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 
 	select {
 	case <-sigCh:
-		fmt.Println(cancelMsg)
-		return false, nil
+		return false, cancelled()
 	case r := <-resultCh:
 		// EOF with data is valid (e.g., echo -n yes | schemabot apply)
 		if r.err != nil && !errors.Is(r.err, io.EOF) {
@@ -148,12 +260,10 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 		}
 		response := strings.TrimSpace(strings.ToLower(r.response))
 		if errors.Is(r.err, io.EOF) && response == "" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		if response != "yes" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		return true, nil
 	}
@@ -171,10 +281,7 @@ var (
 	loadingSpinnerInterval           = 100 * time.Millisecond
 	loadingSpinnerFrames             = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	loadingSpinnerWriter   io.Writer = os.Stderr
-	loadingSpinnerTerminal           = func() bool {
-		info, err := os.Stderr.Stat()
-		return err == nil && info.Mode()&os.ModeCharDevice != 0
-	}
+	loadingSpinnerTerminal           = func() bool { return ui.IsTerminal(os.Stderr) }
 )
 
 func withLoading(message string, show bool, fn func() error) error {
@@ -348,11 +455,6 @@ type releaseResponseWrapper struct{ r *apitypes.ReleaseResponse }
 func (w releaseResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
 func (w releaseResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
 
-type volumeResponseWrapper struct{ r *apitypes.VolumeResponse }
-
-func (w volumeResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
-func (w volumeResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
-
 // checkAccepted checks that an API response has accepted=true.
 // Returns a formatted error using the operation name if not accepted.
 func checkAccepted(result acceptedResponse, operation string) error {
@@ -395,13 +497,33 @@ func resolveControlFlags(endpoint, profile, applyID, environment string) (string
 	return ep, nil
 }
 
+// writeNarrowedTo tells the operator a plan covers one rollout member, so a
+// plan with no changes is not read as the whole environment being up to date.
+func writeNarrowedTo(planResult *apitypes.PlanResponse) {
+	if planResult == nil || planResult.NarrowedTo == "" {
+		return
+	}
+	fmt.Printf("Target: %s (this plan covers only this rollout member)\n", planResult.NarrowedTo)
+}
+
 // applyAndWatch extracts a plan ID, calls the apply API, prints status, and
-// optionally watches progress. Used by both RunApply and RunRollback.
-func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) error {
+// optionally watches progress. It returns the apply ID the server assigned,
+// which is empty when the server accepted the apply without naming one. Used by
+// both RunApply and RunRollback.
+//
+// rendersRollout says whether this caller shows the operator the plan every
+// rollout member runs, the client capability the server checks before a
+// rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
+// decides it for its own output, so a new caller has to decide it rather than
+// inherit it.
+func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
-		return fmt.Errorf("no plan_id in response")
+		return "", fmt.Errorf("no plan_id in response")
+	}
+	if ctx.Err() != nil {
+		return "", stoppedBeforeSubmit(ctx, operation)
 	}
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
@@ -409,15 +531,17 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	var applyResult *apitypes.ApplyResponse
 	err := withLoading("Submitting schema change...", format != OutputFormatJSON, func() error {
 		var applyErr error
-		applyResult, applyErr = client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
+		// A narrowed plan is applied to the member it was made for and nowhere
+		// else; the server refuses to run it rollout-wide.
+		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, options)
 		return applyErr
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if err := checkAccepted(applyResponseWrapper{applyResult}, operation); err != nil {
-		return err
+		return "", err
 	}
 
 	applyID := applyResult.ApplyID
@@ -430,7 +554,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		}
 		enc := json.NewEncoder(os.Stdout)
 		_ = enc.Encode(result)
-		return nil
+		return applyID, nil
 	}
 
 	label := strings.ToUpper(operation[:1]) + operation[1:]
@@ -442,15 +566,26 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 
 	if !watch {
 		printWatchInstructions(applyID, database, environment)
-		return nil
+		return applyID, nil
 	}
 
 	fmt.Println("Watching progress...")
-	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
-		return err
+	if err := WatchApplyProgressWithFormat(ctx, ep, applyID, environment, true, format, logHeartbeat); err != nil {
+		return applyID, err
 	}
 
-	return nil
+	return applyID, nil
+}
+
+// stoppedBeforeSubmit ends a command whose operator pressed Ctrl-C before its
+// schema change was submitted. The signal arrived while the command was still
+// planning or taking the lock, so nothing that starts a schema change has
+// reached the server; the notice says so, because the command would otherwise
+// answer the signal by starting the schema change and stopping its watch at
+// once, which reads as a deliberate stop of something that ran.
+func stoppedBeforeSubmit(ctx context.Context, operation string) error {
+	fmt.Fprintf(os.Stderr, "Stopped before the %s was submitted; nothing was started.\n", operation)
+	return interrupted(ctx)
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {
@@ -479,22 +614,49 @@ func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDep
 // printWatchInstructions prints the "To watch and manage" hint.
 func printWatchInstructions(applyID, database, environment string) {
 	if applyID != "" {
-		fmt.Printf("To watch and manage: schemabot progress %s\n", applyID)
+		fmt.Printf("To watch and manage: %s\n", templates.ProgressCommand(applyID, environment))
 	} else {
-		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
+		fmt.Printf("To watch and manage: %s\n", cliname.Command("status", "-d", database, "-e", environment))
 	}
 }
 
+// applyChangeCounts tallies the apply's tasks by change type for the
+// completion summary. Index builds and drops are counted in their own buckets,
+// matching the plan summary, so an apply made only of index tasks does not
+// complete with an empty summary and an index task is never reported as a
+// table alteration. Every task lands in some bucket: a change type outside the
+// named ones — including an empty one — counts as other DDL, so the summary
+// never omits work the apply ran.
 type applyChangeCounts struct {
 	created        int
 	altered        int
 	dropped        int
+	indexesCreated int
+	indexesDropped int
+	other          int
 	vschemaUpdates int
 }
 
-func countTableProgressChanges(tables []tableProgress) applyChangeCounts {
+func countTableProgressChanges(tables []templates.TableProgress) applyChangeCounts {
 	var counts applyChangeCounts
 	for _, table := range tables {
+		counts.add(table.ChangeType)
+	}
+	return counts
+}
+
+// countRolloutTableChanges counts a rollout's changes once each, however
+// many targets ran them: one table altered on four targets is one alter. Two
+// different statements on one table, such as two new indexes, count as two.
+func countRolloutTableChanges(tables []templates.TableProgress) applyChangeCounts {
+	var counts applyChangeCounts
+	seen := make(map[[4]string]bool)
+	for _, table := range tables {
+		key := [4]string{table.Namespace, table.TableName, table.ChangeType, table.DDL}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		counts.add(table.ChangeType)
 	}
 	return counts
@@ -516,8 +678,14 @@ func (c *applyChangeCounts) add(changeType string) {
 		c.altered++
 	case "DROP", "CHANGE_TYPE_DROP":
 		c.dropped++
+	case "CREATE_INDEX", "CHANGE_TYPE_CREATE_INDEX":
+		c.indexesCreated++
+	case "DROP_INDEX", "CHANGE_TYPE_DROP_INDEX":
+		c.indexesDropped++
 	case "VSCHEMA", "VSCHEMA_UPDATE", "CHANGE_TYPE_VSCHEMA":
 		c.vschemaUpdates++
+	default:
+		c.other++
 	}
 }
 
@@ -531,6 +699,15 @@ func (c applyChangeCounts) summary() string {
 	}
 	if c.dropped > 0 {
 		parts = append(parts, fmt.Sprintf("%d dropped", c.dropped))
+	}
+	if c.indexesCreated > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s created", c.indexesCreated, ui.PluralizeNoun("index", c.indexesCreated)))
+	}
+	if c.indexesDropped > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s dropped", c.indexesDropped, ui.PluralizeNoun("index", c.indexesDropped)))
+	}
+	if c.other > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", c.other, ui.PluralizeNoun("statement", c.other)))
 	}
 	if c.vschemaUpdates > 0 {
 		word := "updates"
