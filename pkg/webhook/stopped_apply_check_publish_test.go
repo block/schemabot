@@ -151,6 +151,19 @@ type stoppedApplyCheckFixture struct {
 	// onPublish, when set, runs as GitHub receives the nth aggregate publish,
 	// before it answers, standing in for whatever else happens meanwhile.
 	onPublish func(n int)
+
+	requestsMu sync.Mutex
+	requests   []string
+}
+
+// takeGitHubRequests returns the GitHub requests made since the last call, as
+// "METHOD path", and starts counting afresh.
+func (f *stoppedApplyCheckFixture) takeGitHubRequests() []string {
+	f.requestsMu.Lock()
+	defer f.requestsMu.Unlock()
+	got := f.requests
+	f.requests = nil
+	return got
 }
 
 func newStoppedApplyCheckFixture(t *testing.T, repo string, pr int, applySHA, headSHA string) *stoppedApplyCheckFixture {
@@ -172,7 +185,13 @@ func newStoppedApplyCheckFixture(t *testing.T, repo string, pr int, applySHA, he
 	t.Cleanup(func() { clear(context.WithoutCancel(ctx)) })
 
 	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
+	f := &stoppedApplyCheckFixture{headSHA: headSHA, published: make(chan checkRunCapture, 4)}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.requestsMu.Lock()
+		f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+		f.requestsMu.Unlock()
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(server.Close)
 
 	mux.HandleFunc(fmt.Sprintf("GET /repos/%s/pulls/%d", repo, pr), func(w http.ResponseWriter, _ *http.Request) {
@@ -189,10 +208,15 @@ func newStoppedApplyCheckFixture(t *testing.T, repo string, pr int, applySHA, he
 		newestID  int64
 		publishes int
 	)
-	f := &stoppedApplyCheckFixture{headSHA: headSHA, published: make(chan checkRunCapture, 4)}
 	record := func(got checkRunCapture) {
 		mu.Lock()
-		newest = got
+		// An update that sends only output leaves the run's status and
+		// conclusion as they were, the way GitHub applies it.
+		published := got
+		if published.Status == "" {
+			published.Status, published.Conclusion = newest.Status, newest.Conclusion
+		}
+		newest = published
 		publishes++
 		n := publishes
 		mu.Unlock()

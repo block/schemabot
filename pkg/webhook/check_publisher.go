@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -644,6 +645,16 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 	if maps.Equal(currentProgress, folded.progress) {
 		return nil
 	}
+	refresh, err := h.refreshAggregateRolloutCounts(ctx, client, repo, pr, environment, checkName)
+	if err != nil {
+		h.logger.Warn("aggregate check not refreshed with the rollout target that moved while the fold published; the published counts stand until the next fold",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA, "error", err)
+		return nil
+	}
+	if refresh != rolloutCountsNeedFold {
+		return nil
+	}
 	h.logger.Info("re-folding aggregate check: a rollout target moved while the fold published",
 		"repo", repo, "pr", pr, "check_name", checkName,
 		"environment", environment, "head_sha", headSHA)
@@ -732,20 +743,22 @@ func (h *Handler) foldAggregateCheckRun(
 			ownContributions = append(ownContributions, contribution)
 		}
 	}
-	progress := h.rolloutProgressForPR(ctx, repo, pr, ownContributions)
-	title, summary := aggregateSummary(ownContributions, conclusion, stopped, progress)
-	if notice := prerequisiteSummary(contributions, h.aggregateCheckNameForRepo(repo), repo, headSHA); notice != "" {
-		title = "Waiting for prerequisite environments"
-		summary = appendPrerequisiteSummary(summary, notice)
+	render := aggregateRender{
+		HeadSHA:            headSHA,
+		Status:             status,
+		Conclusion:         conclusion,
+		Contributions:      ownContributions,
+		Stopped:            stopped,
+		Progress:           h.rolloutProgressForPR(ctx, repo, pr, ownContributions),
+		PrerequisiteNotice: prerequisiteSummary(contributions, h.aggregateCheckNameForRepo(repo), repo, headSHA),
 	}
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
 			"repo", repo, "pr", pr, "check_name", checkName,
 			"environment", environment, "head_sha", headSHA, "stale_rows", staleCount)
-		if status == checkStatusInProgress && !anyInProgressOnCommit(dbChecks, headSHA) {
-			title = awaitingCurrentCommitTitle
-		}
+		render.AwaitingCurrentCommit = status == checkStatusInProgress && !anyInProgressOnCommit(dbChecks, headSHA)
 	}
+	title, summary := render.text()
 
 	currentHead, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
@@ -880,6 +893,16 @@ func (h *Handler) foldAggregateCheckRun(
 		checkRunID = id
 	}
 
+	// The render is stored with the state it was published with, in the same
+	// write, so a refresh never pairs this run with another fold's text.
+	render.CheckRunID = checkRunID
+	renderJSON, err := json.Marshal(render)
+	if err != nil {
+		h.logger.Warn("aggregate check state stored without its render; the next rollout count refresh folds in full",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "check_run_id", checkRunID, "error", err)
+		renderJSON = nil
+	}
 	aggCheck := &storage.Check{
 		Repository:   repo,
 		PullRequest:  pr,
@@ -891,6 +914,8 @@ func (h *Handler) foldAggregateCheckRun(
 		HasChanges:   conclusion != checkConclusionSuccess,
 		Status:       status,
 		Conclusion:   conclusion,
+
+		AggregateRender: renderJSON,
 	}
 	if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -918,7 +943,7 @@ func (h *Handler) foldAggregateCheckRun(
 		"environment", environment, "check_run_id", checkRunID,
 		"check_status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
-	return aggregateFold{contributions: contributions, stopped: stopped, progress: progress}, nil
+	return aggregateFold{contributions: contributions, stopped: stopped, progress: render.Progress}, nil
 }
 
 // rewindsConcludedCheckRun reports whether publishing the recomputed status to

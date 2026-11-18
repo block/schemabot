@@ -249,31 +249,53 @@ func (h *Handler) rolloutTargetsFinishedHook() func(*storage.Apply) bool {
 	}
 }
 
-// refreshRolloutCheckRun republishes the aggregate Check Run of a rollout
-// still in progress so it shows how many targets have finished. The stored
-// check state is not written.
+// refreshRolloutCheckRun rewrites the aggregate Check Run of a rollout still
+// in progress so it shows how many targets have finished. It renders from what
+// the last fold stored and spends two GitHub requests, however large the PR;
+// when the stored render cannot be trusted for the run, it folds in full
+// instead. The stored check state is not written.
 //
-// The refresh folds from stored check state it read before publishing, so the
-// apply can finish while it publishes: the terminal path writes the stored
-// check state, publishes, and then this refresh's in-progress run lands last
-// and holds the PR blocked. To converge, the refresh re-reads the stored check
-// state once it has published and, if it is no longer in progress, publishes
-// again. Whoever settled the row wrote it before publishing, so either that
-// publish follows this re-read, or this second publish carries the settled
-// state.
+// The apply can finish while the refresh publishes: the terminal path writes
+// the stored check state, publishes, and then this refresh's text lands last.
+// The refresh sends no status, so the run still gates on the terminal outcome,
+// but its text would describe the rollout as running. To converge, the refresh
+// re-reads the apply's stored check state once it has published and, if it is
+// no longer in progress, folds again. Whoever settled the row wrote it before
+// publishing, so either that publish follows this re-read, or this fold
+// carries the settled state.
 func (h *Handler) refreshRolloutCheckRun(ctx context.Context, a *storage.Apply) {
 	fields := applyCheckLogFields(a, "rollout target finished")
-	if _, _, published := h.publishApplyAggregate(ctx, a, fields, true); !published {
+	client, err := h.clientForRepo(a.Repository, a.InstallationID)
+	if err != nil {
+		h.logger.Warn("rollout counts not refreshed on the aggregate check run; cannot resolve GitHub App client",
+			append(fields(), "error", err)...)
 		return
+	}
+	target := h.aggregateTargetForEnvironment(a.Repository, a.Environment)
+	refresh, err := h.refreshAggregateRolloutCounts(ctx, client, a.Repository, a.PullRequest, target.environment, target.name)
+	if err != nil {
+		h.logger.Warn("rollout counts not refreshed on the aggregate check run; the run shows the previous counts until the next fold",
+			append(fields(), "check_name", target.name, "error", err)...)
+		return
+	}
+	switch refresh {
+	case rolloutCountsUnchanged:
+		return
+	case rolloutCountsNeedFold:
+		h.logger.Info("folding the aggregate check in full to show the rollout counts",
+			append(fields(), "check_name", target.name)...)
+		h.publishApplyAggregate(ctx, a, fields, true)
+		return
+	case rolloutCountsPublished:
 	}
 	check, err := h.service.Storage().Checks().Get(ctx, a.Repository, a.PullRequest, a.Environment, a.DatabaseType, a.Database)
 	if err != nil {
-		h.logger.Warn("rollout Check Run refresh not re-checked against stored check state; if the apply finished while it published, the Check Run shows in progress until the next fold",
+		h.logger.Warn("rollout Check Run refresh not re-checked against stored check state; if the apply finished while it published, the Check Run text shows it in progress until the next fold",
 			append(fields(), "error", err)...)
 		return
 	}
 	if check == nil {
-		h.logger.Warn("rollout Check Run refresh found no stored check state after publishing; the Check Run shows in progress until the next fold",
+		h.logger.Warn("rollout Check Run refresh found no stored check state after publishing; the Check Run text shows the apply in progress until the next fold",
 			fields()...)
 		return
 	}
@@ -281,7 +303,7 @@ func (h *Handler) refreshRolloutCheckRun(ctx context.Context, a *storage.Apply) 
 		h.logger.Debug("rollout Check Run refreshed; the stored check state is still in progress", fields()...)
 		return
 	}
-	h.logger.Info("republishing aggregate check: the stored check state settled while the rollout progress refresh published",
+	h.logger.Info("republishing aggregate check: the stored check state settled while the rollout counts refresh published",
 		append(fields(), "check_status", check.Status, "check_conclusion", check.Conclusion)...)
 	h.publishApplyAggregate(ctx, a, fields, false)
 }

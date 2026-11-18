@@ -1198,6 +1198,38 @@ func TestChecks(t *testing.T, h Harness) {
 		}
 	})
 
+	t.Run("AggregateRenderTravelsWithUpsert", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		missing, err := store.Checks().GetAggregateRender(ctx, "octocat/render", 7, "staging", checkstate.AggregateSentinel, checkstate.AggregateSentinel)
+		require.NoError(t, err)
+		assert.Nil(t, missing, "a missing row has no render")
+
+		aggregate := &storage.Check{
+			Repository: "octocat/render", PullRequest: 7, HeadSHA: "abc123",
+			Environment: "Staging", DatabaseType: checkstate.AggregateSentinel, DatabaseName: checkstate.AggregateSentinel,
+			CheckRunID: 99, Status: "in_progress",
+			AggregateRender: []byte(`{"CheckRunID":99,"Status":"in_progress"}`),
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, aggregate))
+		render, err := store.Checks().GetAggregateRender(ctx, "OCTOCAT/RENDER", 7, "STAGING", checkstate.AggregateSentinel, checkstate.AggregateSentinel)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"CheckRunID":99,"Status":"in_progress"}`, string(render))
+
+		stored, err := store.Checks().Get(ctx, "octocat/render", 7, "staging", checkstate.AggregateSentinel, checkstate.AggregateSentinel)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Nil(t, stored.AggregateRender, "other reads do not load the render")
+
+		aggregate.AggregateRender = nil
+		aggregate.Status = "completed"
+		aggregate.Conclusion = "success"
+		require.NoError(t, store.Checks().Upsert(ctx, aggregate))
+		cleared, err := store.Checks().GetAggregateRender(ctx, "octocat/render", 7, "staging", checkstate.AggregateSentinel, checkstate.AggregateSentinel)
+		require.NoError(t, err)
+		assert.Nil(t, cleared, "an upsert without a render clears the stored one")
+	})
+
 	t.Run("ClearAggregateBlock", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1349,6 +1381,10 @@ func TestChecks(t *testing.T, h Harness) {
 	})
 	t.Run("Get_DBError", func(t *testing.T) {
 		_, err := h.NewUnreachableStorage(t).Checks().Get(t.Context(), "org/repo", 123, "staging", storage.DatabaseTypeMySQL, "errors_db")
+		require.Error(t, err)
+	})
+	t.Run("GetAggregateRender_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().GetAggregateRender(t.Context(), "octocat/render", 7, "staging", checkstate.AggregateSentinel, checkstate.AggregateSentinel)
 		require.Error(t, err)
 	})
 	t.Run("GetByCheckRunID_DBError", func(t *testing.T) {

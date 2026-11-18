@@ -1157,16 +1157,25 @@ When the apply reaches a terminal state:
   publish fails, the run keeps saying the apply is stopped until the next
   aggregate publish for the PR; merge stays blocked either way.
 
-While an apply across several targets runs, SchemaBot republishes the
-aggregate each time one more target finishes, at most as often as it edits the
-progress comment. The title and the database row count the finished targets
-("Apply in progress on all 32 targets: 5 done"), and a line under the table
-counts every target by state and links the progress comment. The counts are
-read from the apply's stored operations and never change the Check Run's status
-or conclusion. If they cannot be read, the Check Run is published without them.
-An apply can finish while one of these refreshes publishes, so the refresh
-reads the stored check state again once it has published, and publishes once
-more if the apply has settled. That keeps the refresh's in-progress run from
+While an apply across several targets runs, SchemaBot rewrites the aggregate
+Check Run's text each time one more target finishes, at most as often as it
+edits the progress comment. The title and the database row count the finished
+targets ("Apply in progress on all 32 targets: 5 done"), and a line under the
+table counts every target by state and links the progress comment. The counts
+are read from the apply's stored operations and never change the Check Run's
+status or conclusion. If they cannot be read, the Check Run is published
+without them.
+
+Each aggregate publish stores what its text was rendered from on the stored
+aggregate check state, in the same write as the status it published. A
+target finishing re-renders that text with the new counts and sends only the
+text, so it costs two GitHub requests however many files and databases the PR
+has: one to find the newest run and one to rewrite it. When the stored render
+does not match the stored state or the newest run, or an apply stopped or
+started again since, SchemaBot publishes the aggregate in full instead. An
+apply can finish while one of these refreshes publishes, so the refresh reads
+the stored check state again once it has published, and publishes the
+aggregate in full if the apply has settled. That keeps the refresh's text from
 being the last one GitHub shows.
 
 Completion is conditional on ownership: the watcher can only update the row if

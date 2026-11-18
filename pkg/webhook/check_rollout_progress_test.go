@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -129,4 +130,37 @@ func TestObserverOffersCheckRunRefreshWhenATargetFinishes(t *testing.T) {
 	})
 	single.reportFinishedTargets(apply, []*storage.ApplyOperation{targetOp("eu", done)})
 	assert.Equal(t, 3, offered, "a single target is left to the terminal refresh")
+}
+
+// A fold stores its render as JSON and a refresh renders from what it reads
+// back, so the round trip must give the same text: the counts' map keys, the
+// stopped set, the prerequisite notice, and the stale-commit title included.
+func TestAggregateRenderTextSurvivesStorage(t *testing.T) {
+	render := aggregateRender{
+		CheckRunID: 7, HeadSHA: "headsha1", Status: checkStatusInProgress,
+		Contributions: []*storage.Check{
+			{
+				Repository: "octocat/shop", PullRequest: 12, ApplyID: 3,
+				DatabaseType: "mysql", DatabaseName: "orders", HasChanges: true, Status: checkStatusInProgress,
+				ChangeSummary: "1 alter · all 3 targets", RolloutTargets: 3, RolloutTargetsWithWork: 3,
+			},
+			{DatabaseType: "mysql", DatabaseName: "payments", ApplyID: 4, HasChanges: true, Status: checkStatusInProgress, ChangeSummary: "1 alter"},
+		},
+		Stopped:            stoppedApplyIDs{4: true},
+		Progress:           rolloutProgress{3: {Total: 3, Complete: 1, InProgress: 2, ProgressCommentID: 4242}},
+		PrerequisiteNotice: "Waiting on staging.",
+	}
+	for _, awaiting := range []bool{false, true} {
+		render.AwaitingCurrentCommit = awaiting
+		raw, err := json.Marshal(render)
+		require.NoError(t, err)
+		var stored aggregateRender
+		require.NoError(t, json.Unmarshal(raw, &stored))
+
+		wantTitle, wantSummary := render.text()
+		gotTitle, gotSummary := stored.text()
+		assert.Equal(t, wantTitle, gotTitle)
+		assert.Equal(t, wantSummary, gotSummary)
+		assert.Contains(t, gotSummary, "1 of 3 done")
+	}
 }

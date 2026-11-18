@@ -49,35 +49,104 @@ func (f *stoppedApplyCheckFixture) startRollout(t *testing.T) {
 	require.NoError(t, f.store.Checks().Upsert(ctx, stored))
 }
 
-// One of a rollout's three targets finishes. The aggregate Check Run is
-// republished to say so, in its title and in a line that counts the targets
-// and links the progress comment. The stored check state is not written.
-func TestRolloutCheckRunCountsFinishedTargets(t *testing.T) {
-	f := newStoppedApplyCheckFixture(t, "octocat/rollout-progress", 41, "headsha1", "headsha1")
-	f.startRollout(t)
+// fold publishes the aggregate in full, the way any event that folds it does,
+// and returns what it published.
+func (f *stoppedApplyCheckFixture) fold(t *testing.T, step string) checkRunCapture {
+	t.Helper()
+	f.handler.publishApplyAggregate(t.Context(), f.apply, applyCheckLogFields(f.apply, step), false)
+	return f.requirePublished(t, step)
+}
 
+// finishTarget completes one of the rollout's targets.
+func (f *stoppedApplyCheckFixture) finishTarget(t *testing.T, target string) {
+	t.Helper()
+	_, err := f.db.ExecContext(t.Context(), "UPDATE apply_operations SET state = ? WHERE apply_id = ? AND target = ?",
+		state.ApplyOperation.Completed, f.apply.ID, target)
+	require.NoError(t, err)
+}
+
+// One of a rollout's three targets finishes after the aggregate was folded.
+// The refresh rewrites the Check Run's text to count it, in the title and in a
+// line that counts the targets and links the progress comment. It spends two
+// GitHub requests, sends no status, writes no stored check state, and its text
+// is the text a full fold publishes for the same counts.
+func TestRolloutCheckRunCountsFinishedTargets(t *testing.T) {
+	const repo = "octocat/rollout-progress"
+	f := newStoppedApplyCheckFixture(t, repo, 41, "headsha1", "headsha1")
+	f.startRollout(t)
+	before := f.fold(t, "the fold before the target finishes")
+	assert.Equal(t, "Apply in progress on all 3 targets: 1 done", before.Output.Title)
+
+	f.finishTarget(t, "shop-002")
+	f.takeGitHubRequests()
 	f.handler.refreshRolloutCheckRun(t.Context(), f.apply)
 
 	got := f.requirePublished(t, "a target finishing")
-	assert.Equal(t, checkStatusInProgress, got.Status)
-	assert.Equal(t, "Apply in progress on all 3 targets: 1 done", got.Output.Title)
-	assert.Contains(t, got.Output.Summary, "In progress · 1 of 3 done")
+	assert.Empty(t, got.Status, "the refresh sends no status, so it cannot change what the run gates")
+	assert.Equal(t, "Apply in progress on all 3 targets: 2 done", got.Output.Title)
+	assert.Contains(t, got.Output.Summary, "In progress · 2 of 3 done")
 	assert.Contains(t, got.Output.Summary,
-		"- `stopped_apply_db` targets: 3 (1 in progress, 1 queued, 1 complete) · [progress](https://github.com/octocat/rollout-progress/pull/41#issuecomment-5150)")
-	assert.Empty(t, f.published, "a refresh with nothing moving publishes once")
+		"- `stopped_apply_db` targets: 3 (1 queued, 2 complete) · [progress](https://github.com/octocat/rollout-progress/pull/41#issuecomment-5150)")
+	assert.Equal(t, []string{
+		"GET /repos/" + repo + "/commits/headsha1/check-runs",
+		"PATCH /repos/" + repo + "/check-runs/1",
+	}, f.takeGitHubRequests(), "the refresh finds the run and rewrites its text, nothing more")
+	assert.Empty(t, f.published, "the refresh publishes once")
 	f.requireStoredCheckHeld(t)
+
+	full := f.fold(t, "a full fold with the same counts")
+	assert.Equal(t, full.Output.Title, got.Output.Title)
+	assert.Equal(t, full.Output.Summary, got.Output.Summary)
 }
 
-// The apply finishes while a progress refresh is publishing: the terminal path
-// writes the stored check state and publishes the passing run before the
-// refresh's in-progress run lands. The refresh reads the stored check state
-// again once it has published and publishes once more, so the Check Run ends
-// on the apply's outcome rather than stuck in progress.
+// A refresh offered when no target has moved since the fold makes no GitHub
+// request at all.
+func TestRolloutCheckRunRefreshWithNothingMovedMakesNoRequest(t *testing.T) {
+	f := newStoppedApplyCheckFixture(t, "octocat/rollout-progress-still", 43, "headsha1", "headsha1")
+	f.startRollout(t)
+	f.fold(t, "the fold")
+	f.takeGitHubRequests()
+
+	f.handler.refreshRolloutCheckRun(t.Context(), f.apply)
+
+	assert.Empty(t, f.takeGitHubRequests())
+	assert.Empty(t, f.published)
+}
+
+// The aggregate row carries no render, as one stored before renders were
+// stored does. The refresh cannot render the text on its own, so it folds the
+// aggregate in full, and the Check Run still shows the finished target.
+func TestRolloutCheckRunRefreshFoldsWhenNoRenderIsStored(t *testing.T) {
+	const repo, pr = "octocat/rollout-progress-unrendered", 44
+	f := newStoppedApplyCheckFixture(t, repo, pr, "headsha1", "headsha1")
+	f.startRollout(t)
+	f.fold(t, "the fold")
+	_, err := f.db.ExecContext(t.Context(), "UPDATE checks SET aggregate_render = NULL WHERE repository = ? AND pull_request = ?", repo, pr)
+	require.NoError(t, err)
+	f.finishTarget(t, "shop-002")
+	f.takeGitHubRequests()
+
+	f.handler.refreshRolloutCheckRun(t.Context(), f.apply)
+
+	got := f.requirePublished(t, "the full fold")
+	assert.Equal(t, checkStatusInProgress, got.Status)
+	assert.Equal(t, "Apply in progress on all 3 targets: 2 done", got.Output.Title)
+	assert.Contains(t, f.takeGitHubRequests(), "GET /repos/"+repo+"/pulls/44", "the full fold reads the PR")
+	assert.Empty(t, f.published, "the refresh folds once")
+}
+
+// The apply finishes while a refresh is publishing: the terminal path writes
+// the stored check state and publishes the passing run before the refresh's
+// text lands. The refresh reads the stored check state again once it has
+// published and folds once more, so the Check Run ends on the apply's outcome
+// rather than with text that says the rollout is running.
 func TestRolloutCheckRunRefreshEndsOnTheOutcomeWhenTheApplyFinishesMeanwhile(t *testing.T) {
 	f := newStoppedApplyCheckFixture(t, "octocat/rollout-progress-finish", 42, "headsha1", "headsha1")
 	f.startRollout(t)
+	f.fold(t, "the fold before the target finishes")
+	f.finishTarget(t, "shop-002")
 	f.onPublish = func(n int) {
-		if n != 1 {
+		if n != 2 {
 			return
 		}
 		f.setStoredState(t, state.Apply.Completed)
@@ -91,9 +160,9 @@ func TestRolloutCheckRunRefreshEndsOnTheOutcomeWhenTheApplyFinishesMeanwhile(t *
 	f.handler.refreshRolloutCheckRun(t.Context(), f.apply)
 
 	first := f.requirePublished(t, "the refresh that read the rollout in progress")
-	assert.Equal(t, checkStatusInProgress, first.Status)
-	got := f.requirePublished(t, "the publish after the stored check state settled")
+	assert.Equal(t, "Apply in progress on all 3 targets: 2 done", first.Output.Title)
+	got := f.requirePublished(t, "the fold after the stored check state settled")
 	assert.Equal(t, checkStatusCompleted, got.Status)
 	assert.Equal(t, checkConclusionSuccess, got.Conclusion)
-	assert.Empty(t, f.published, "the refresh publishes once more and stops")
+	assert.Empty(t, f.published, "the refresh folds once more and stops")
 }
