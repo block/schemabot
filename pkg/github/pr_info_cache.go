@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// requestPRInfoCache memoises PR metadata, changed files, required checks, and
+// requestPRInfoCache memoises PR metadata, changed files, and
 // team membership for the lifetime of a single webhook delivery (or
 // any other ctx-bounded operation it is attached to). A fresh cache is constructed at every entry
 // point via WithPRInfoCache, so the cached value cannot outlive the scope it
@@ -27,11 +27,10 @@ import (
 // comment's who-can-apply check, answer from one read. Only successful reads are
 // cached, so a failed read is retried by the next check rather than replayed.
 type requestPRInfoCache struct {
-	mu             sync.Mutex
-	m              map[string]*PullRequestInfo
-	files          map[string][]PRFile
-	requiredChecks map[branchPolicyCacheKey][]string
-	memberships    map[string]bool
+	mu          sync.Mutex
+	m           map[string]*PullRequestInfo
+	files       map[string][]PRFile
+	memberships map[string]bool
 }
 
 type prInfoCacheCtxKey struct{}

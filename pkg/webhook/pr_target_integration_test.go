@@ -170,3 +170,66 @@ func TestRetargetedCommandPreservesConfirmationBeforePlanResponses(t *testing.T)
 		})
 	}
 }
+
+// The branch and commit can stay the same while protection changes. Earlier
+// gates use a valid cached policy, and the durable gate must get its own answer.
+func TestApplyAcceptanceRechecksCachedBranchPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		liveResponse string
+		refusal      string
+	}{
+		{name: "required check removed", liveResponse: `{"data":{"repository":{"ref":{"name":"release","branchProtectionRule":null}}}}`, refusal: "This PR targets `release`"},
+		{name: "rules lookup failed", liveResponse: `{"errors":[{"message":"protection denied"}]}`, refusal: "Could not verify the PR target"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database := "webhook_target_policy_apply"
+			svc := setupE2EServiceOpts(t, database, e2eServiceOpts{skipOperator: true})
+			client, mux := setupGitHubServer(t)
+			fixture := setupFakeGitHubForPlan(t, mux, map[string]string{
+				"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL PRIMARY KEY) ENGINE=InnoDB;",
+			}, fmt.Sprintf("database: %s\ntype: mysql\n", database), database)
+			fixture.BaseRef.Store(new("release"))
+			var rulesReads, classicReads atomic.Int32
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/release", func(w http.ResponseWriter, _ *http.Request) {
+				_, err := fmt.Fprint(w, `{"ref":"refs/heads/release","object":{"sha":"def456"}}`)
+				require.NoError(t, err)
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release", func(w http.ResponseWriter, _ *http.Request) {
+				rulesReads.Add(1)
+				_, err := fmt.Fprint(w, "[]")
+				require.NoError(t, err)
+			})
+			mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+				response := tc.liveResponse
+				if classicReads.Add(1) == 1 {
+					response = `{"data":{"repository":{"ref":{"name":"release","branchProtectionRule":{"requiresStatusChecks":true,"requiredStatusCheckContexts":["SchemaBot"]}}}}}`
+				}
+				_, err := fmt.Fprint(w, response)
+				require.NoError(t, err)
+			})
+			ic := ghclient.NewInstallationClient(client, testLogger())
+			h := NewHandler(svc, &fakeClientFactory{client: ic}, nil, testLogger())
+
+			ctx := ghclient.WithPRInfoCache(t.Context())
+			info, err := ic.FetchPullRequestNoCache(ctx, "octocat/hello-world", 1)
+			require.NoError(t, err)
+			decision, err := h.evaluatePRTarget(ctx, ic, "octocat/hello-world", info)
+			require.NoError(t, err)
+			require.True(t, decision.Eligible)
+
+			retry, err := h.applyCommandCore(ctx, "octocat/hello-world", 1, "staging", database, 12345, "alice", CommandResult{})
+			require.NoError(t, err)
+			assert.False(t, retry)
+			prepared := requireComment(t, fixture.comments, "automatic apply plan")
+			require.Contains(t, prepared, "Applying automatically")
+			refusal := requireComment(t, fixture.comments, "live branch policy refusal")
+			assert.Contains(t, refusal, tc.refusal)
+			assert.Equal(t, int32(2), rulesReads.Load())
+			assert.Equal(t, int32(2), classicReads.Load())
+			applies, err := svc.Storage().Applies().GetByPR(ctx, "octocat/hello-world", 1)
+			require.NoError(t, err)
+			assert.Empty(t, applies, "cached eligibility must never authorize a durable apply")
+		})
+	}
+}

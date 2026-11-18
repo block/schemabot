@@ -17,23 +17,33 @@ import (
 var errPRTargetExcluded = errors.New("pull request target is excluded from SchemaBot")
 
 func (h *Handler) evaluatePRTarget(ctx context.Context, client *ghclient.InstallationClient, repo string, info *ghclient.PullRequestInfo) (ghclient.PRTargetEligibility, error) {
+	return client.EvaluatePRTarget(ctx, repo, info, h.prTargetCheckBases(repo))
+}
+
+func (h *Handler) prTargetCheckBases(repo string) []string {
 	bases := []string{h.aggregateCheckNameForRepo(repo)}
 	if config, ok := h.serverConfig(); ok {
 		// Participants must honor the leader's required promotion check too.
 		bases = append(bases, config.PromotionCheckNameBaseForRepo(repo))
 	}
-	return client.EvaluatePRTarget(ctx, repo, info, bases)
+	return bases
 }
 
-// enforcePRTarget runs before command discovery and again at durable apply
-// acceptance. Receipt of a queued command is not consent to run it after a retarget.
-// Lifecycle controls and accepted applies never call this gate.
+// enforcePRTarget runs before command discovery. It reads fresh PR metadata
+// and can reuse the installation's recent policy for a non-default target.
 func (h *Handler) enforcePRTarget(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, command, environment, requestedBy string, silent, suppressRetryComments bool) (bool, error) {
+	return h.enforcePRTargetWithPolicy(ctx, client, repo, pr, installationID, command, environment, requestedBy, silent, suppressRetryComments, client.EvaluatePRTarget)
+}
+
+type prTargetEvaluator func(context.Context, string, *ghclient.PullRequestInfo, []string) (ghclient.PRTargetEligibility, error)
+
+func (h *Handler) enforcePRTargetWithPolicy(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, command, environment, requestedBy string, silent, suppressRetryComments bool, evaluate prTargetEvaluator) (bool, error) {
 	info, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		return h.prTargetVerificationFailure(repo, pr, installationID, command, environment, requestedBy, silent, suppressRetryComments, err)
 	}
-	return h.enforcePRTargetSnapshot(ctx, client, repo, pr, installationID, info, command, environment, requestedBy, silent, suppressRetryComments)
+	decision, err := evaluate(ctx, repo, info, h.prTargetCheckBases(repo))
+	return h.enforcePRTargetDecision(repo, pr, installationID, info, command, environment, requestedBy, silent, suppressRetryComments, decision, err)
 }
 
 // enforcePRTargetSnapshot checks an already-fresh PR read before a command can
@@ -41,6 +51,10 @@ func (h *Handler) enforcePRTarget(ctx context.Context, client *ghclient.Installa
 // fetches its own snapshot immediately before queuing an apply.
 func (h *Handler) enforcePRTargetSnapshot(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, info *ghclient.PullRequestInfo, command, environment, requestedBy string, silent, suppressRetryComments bool) (bool, error) {
 	decision, err := h.evaluatePRTarget(ctx, client, repo, info)
+	return h.enforcePRTargetDecision(repo, pr, installationID, info, command, environment, requestedBy, silent, suppressRetryComments, decision, err)
+}
+
+func (h *Handler) enforcePRTargetDecision(repo string, pr int, installationID int64, info *ghclient.PullRequestInfo, command, environment, requestedBy string, silent, suppressRetryComments bool, decision ghclient.PRTargetEligibility, err error) (bool, error) {
 	if err != nil {
 		return h.prTargetVerificationFailure(repo, pr, installationID, command, environment, requestedBy, silent, suppressRetryComments, err)
 	}

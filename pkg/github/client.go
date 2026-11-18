@@ -439,6 +439,7 @@ type InstallationClient struct {
 	// branchPolicyReads shares overlapping policy lookups for this API client
 	// and installation. The factory reuses the client across deliveries.
 	branchPolicyReads singleflight.Group
+	branchPolicies    branchPolicyCache
 
 	// treeLevels holds tree levels read by SHA across calls, so the
 	// listings and comparisons a delivery repeats read each level once.

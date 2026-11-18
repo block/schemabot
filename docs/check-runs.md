@@ -56,10 +56,9 @@ review any new confirmation. A plan updates validation; it does not restore a
 lost pending confirmation. Authors are responsible for this step.
 
 Retargeting does not itself invalidate earlier check results or retire plans and
-comments. New commands use current eligibility. Apply and confirmation check
+comments. New commands read current PR metadata and use the protection lookup described below. Apply and confirmation check
 already-fresh PR snapshots before interpreting freshness or re-plan results that
-can release or replace a pending confirmation, and apply retains its uncached
-check close to durable acceptance. Normal freshness and replanning rules still
+can release or replace a pending confirmation, and apply re-reads the PR and any required branch policy close to durable acceptance. Normal freshness and replanning rules still
 apply; exact preservation of a pending confirmation across every race is not
 promised.
 
@@ -90,12 +89,15 @@ excursion. It adds no generation solely to revoke prior results or confirmations
 
 ### Protection discovery and rollout
 
-Default-target PRs need no protection lookup. For each distinct non-default
-target within one delivery or recovery scan, SchemaBot reads active branch
-rules (paginated) and queries the ref's classic `branchProtectionRule` through
-GraphQL. Overlapping lookups for the same repository and ref share one fetch
-within a GitHub App installation client. Each delivery keeps its own successful
-result and later deliveries fetch current policy. These lookups do not grow
+Default-target PRs need no protection lookup. For a non-default target,
+SchemaBot reads active branch rules (paginated) and queries the ref's classic
+`branchProtectionRule` through GraphQL. Within a GitHub App installation client,
+overlapping reads share one fetch, and deliveries reuse successful results
+for the same repository and exact branch for up to 60 seconds. Failed reads
+and expired results do not substitute for a successful response. This means a
+change to branch protection can take up to one minute to affect planning and
+check publication. Apply acceptance bypasses the cache and reads current
+policy directly. These lookups do not grow
 with changed-file count. Publication and apply acceptance also perform bounded
 uncached PR metadata reads. A two-environment
 no-work publisher reads one initial target snapshot and performs one final

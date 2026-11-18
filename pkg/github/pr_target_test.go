@@ -239,6 +239,8 @@ func TestEvaluatePRTargetSharesOverlappingPolicyReads(t *testing.T) {
 
 	client, mux := setupRateLimitedTestGitHubServer(t)
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Unix(0, 0)
+	ic.branchPolicies.now = func() time.Time { return now }
 	var ruleReads, classicReads atomic.Int32
 	var protectionChanged atomic.Bool
 	started := make(chan struct{}, 1)
@@ -300,9 +302,17 @@ func TestEvaluatePRTargetSharesOverlappingPolicyReads(t *testing.T) {
 	assert.Equal(t, int32(2), ruleReads.Load())
 	assert.Equal(t, int32(1), classicReads.Load())
 
-	decision, err = ic.EvaluatePRTarget(WithPRInfoCache(ctx), "octocat/hello-world", info, []string{"SchemaBot", "Rule plan"})
+	now = now.Add(branchPolicyTTL - time.Second)
+	decision, err = ic.EvaluatePRTarget(WithPRInfoCache(ctx), "OctoCat/Hello-World", info, []string{"SchemaBot", "Rule plan"})
 	require.NoError(t, err)
-	assert.False(t, decision.Eligible, "a later delivery sees the changed policy")
+	assert.True(t, decision.Eligible, "another delivery reuses both policy responses for the same canonical repository")
+	assert.Equal(t, int32(2), ruleReads.Load())
+	assert.Equal(t, int32(1), classicReads.Load())
+
+	now = now.Add(time.Second)
+	decision, err = ic.EvaluatePRTarget(waiter, "octocat/hello-world", info, []string{"SchemaBot", "Rule plan"})
+	require.NoError(t, err)
+	assert.False(t, decision.Eligible, "neither prior hits nor the delivery context extend the original expiry")
 	assert.Equal(t, int32(3), ruleReads.Load())
 	assert.Equal(t, int32(2), classicReads.Load())
 }
@@ -460,4 +470,119 @@ func TestEvaluatePRTargetRetriesFailedSharedPolicyRead(t *testing.T) {
 	assert.True(t, decision.Eligible, "the next read retries both policy sources")
 	assert.Equal(t, int32(2), rulesReads.Load())
 	assert.Equal(t, int32(2), classicReads.Load())
+}
+
+func TestBranchPolicyCachesEmptyAndRejectsExpiredResultsOnError(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Unix(0, 0)
+	ic.branchPolicies.now = func() time.Time { return now }
+	var rulesReads, classicReads atomic.Int32
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release", func(w http.ResponseWriter, _ *http.Request) {
+		rulesReads.Add(1)
+		_, err := io.WriteString(w, "[]")
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		switch classicReads.Add(1) {
+		case 1:
+			writePolicyClassicResponse(t, w, r, "null")
+		case 2, 4, 5:
+			writePolicyClassicResponse(t, w, r, `{"requiresStatusChecks":true,"requiredStatusCheckContexts":["SchemaBot"]}`)
+		case 3, 6:
+			_, err := io.WriteString(w, `{"errors":[{"message":"protection denied"}]}`)
+			require.NoError(t, err)
+		}
+	})
+
+	ctx := WithPRInfoCache(t.Context())
+	info := &PullRequestInfo{BaseRef: "release", DefaultBranch: "main"}
+	checks := []string{"SchemaBot"}
+	decision, err := ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, checks)
+	require.NoError(t, err)
+	assert.False(t, decision.Eligible)
+	decision, err = ic.EvaluatePRTarget(WithPRInfoCache(t.Context()), "octocat/hello-world", info, checks)
+	require.NoError(t, err)
+	assert.False(t, decision.Eligible)
+	assert.Equal(t, int32(1), rulesReads.Load(), "a complete empty policy is a cache hit")
+
+	decision, err = ic.EvaluatePRTargetFresh(ctx, "octocat/hello-world", info, checks)
+	require.NoError(t, err)
+	assert.True(t, decision.Eligible, "a fresh read bypasses a cached negative policy")
+	assert.Equal(t, int32(2), classicReads.Load())
+
+	now = now.Add(branchPolicyTTL)
+	decision, err = ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, checks)
+	require.ErrorContains(t, err, "protection denied")
+	assert.False(t, decision.Eligible)
+	decision, err = ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, checks)
+	require.NoError(t, err)
+	assert.True(t, decision.Eligible)
+	assert.Equal(t, int32(4), rulesReads.Load(), "a failed pair is retried")
+
+	now = now.Add(branchPolicyTTL)
+	decision, err = ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, checks)
+	require.NoError(t, err)
+	assert.True(t, decision.Eligible)
+	now = now.Add(branchPolicyTTL)
+	decision, err = ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, checks)
+	require.ErrorContains(t, err, "protection denied")
+	assert.False(t, decision.Eligible, "an expired eligible policy cannot substitute for a GitHub error")
+	assert.Equal(t, int32(6), rulesReads.Load())
+	assert.Equal(t, int32(6), classicReads.Load())
+}
+
+func TestFreshPRTargetPolicyDoesNotJoinBackgroundRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+	var reads atomic.Int32
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release", func(w http.ResponseWriter, r *http.Request) {
+		if reads.Add(1) == 1 {
+			started <- struct{}{}
+			select {
+			case <-release:
+				_, err := io.WriteString(w, `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot"}]}}]`)
+				require.NoError(t, err)
+			case <-r.Context().Done():
+			}
+			return
+		}
+		_, err := io.WriteString(w, "[]")
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		writePolicyClassicResponse(t, w, r, "null")
+	})
+
+	background := evaluatePolicyInBackground(ctx, ic, "octocat/hello-world", "release", "SchemaBot")
+	receivePolicyTestResult(t, ctx, started)
+	info := &PullRequestInfo{BaseRef: "release", DefaultBranch: "main"}
+	decision, err := ic.EvaluatePRTargetFresh(ctx, "octocat/hello-world", info, []string{"SchemaBot"})
+	require.NoError(t, err)
+	assert.False(t, decision.Eligible, "the live apply check finishes independently of the blocked older read")
+	assert.Equal(t, int32(2), reads.Load())
+	finish()
+	result := receivePolicyTestResult(t, ctx, background)
+	require.NoError(t, result.err)
+	assert.True(t, result.decision.Eligible)
+}
+
+func TestBranchPolicyCacheCopiesNames(t *testing.T) {
+	var cache branchPolicyCache
+	names := []string{"SchemaBot"}
+	cache.put("release", names)
+	names[0] = "mutated input"
+	cached, ok := cache.get("release")
+	require.True(t, ok)
+	assert.Equal(t, []string{"SchemaBot"}, cached)
+	cached[0] = "mutated result"
+	cached, ok = cache.get("release")
+	require.True(t, ok)
+	assert.Equal(t, []string{"SchemaBot"}, cached)
 }

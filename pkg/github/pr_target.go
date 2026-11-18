@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -53,6 +54,18 @@ type PRTargetEligibility struct {
 // conservatively even when GitHub pins a different App: a pin never permits
 // silently omitting a required check.
 func (ic *InstallationClient) EvaluatePRTarget(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string) (PRTargetEligibility, error) {
+	return evaluatePRTarget(ctx, repo, info, checkBases, ic.requiredChecksForBranch)
+}
+
+// EvaluatePRTargetFresh uses live policy reads before accepting an apply.
+// It bypasses the cache and any background reads already in progress.
+func (ic *InstallationClient) EvaluatePRTargetFresh(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string) (PRTargetEligibility, error) {
+	fetchCtx, cancel := context.WithTimeout(ctx, sharedFetchTimeout)
+	defer cancel()
+	return evaluatePRTarget(fetchCtx, repo, info, checkBases, ic.fetchRequiredChecks)
+}
+
+func evaluatePRTarget(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string, readPolicy func(context.Context, string, string) ([]string, error)) (PRTargetEligibility, error) {
 	target, err := info.EffectiveTarget()
 	if err != nil {
 		return PRTargetEligibility{}, err
@@ -61,7 +74,7 @@ func (ic *InstallationClient) EvaluatePRTarget(ctx context.Context, repo string,
 	if result.Eligible {
 		return result, nil
 	}
-	contexts, err := ic.requiredChecksForBranch(ctx, repo, target)
+	contexts, err := readPolicy(ctx, repo, target)
 	if err != nil {
 		return result, fmt.Errorf("resolve required checks for %s branch %q: %w", repo, target, err)
 	}
@@ -76,34 +89,33 @@ func (ic *InstallationClient) EvaluatePRTarget(ctx context.Context, repo string,
 	return result, nil
 }
 
-type branchPolicyCacheKey struct {
-	client *InstallationClient
-	target string
-}
-
 func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo, branch string) ([]string, error) {
-	cache := prInfoCacheFromContext(ctx)
-	// GitHub repository names are case-insensitive, and ref names are exact.
-	target := strings.ToLower(repo) + "\x00" + branch
-	key := branchPolicyCacheKey{client: ic, target: target}
-	if cache != nil {
-		cache.mu.Lock()
-		names, ok := cache.requiredChecks[key]
-		cache.mu.Unlock()
-		if ok {
-			return names, nil
-		}
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	// GitHub repository names are case-insensitive, and ref names are exact.
+	key := strings.ToLower(repo) + "\x00" + branch
+	if names, ok := ic.branchPolicies.get(key); ok {
+		return names, nil
 	}
 
 	// Bound the combined ruleset and classic lookup independently of the
 	// callers. Each waiter may cancel while the shared GitHub read continues.
-	flight := ic.branchPolicyReads.DoChan(target, func() (any, error) {
+	flight := ic.branchPolicyReads.DoChan(key, func() (any, error) {
+		// A successful read may have landed between the first cache miss
+		// and the start of this flight. Apply acceptance uses a different path.
+		if names, ok := ic.branchPolicies.get(key); ok {
+			return names, nil
+		}
+
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedFetchTimeout)
 		defer cancel()
-		return ic.fetchRequiredChecks(fetchCtx, repo, branch)
+		names, err := ic.fetchRequiredChecks(fetchCtx, repo, branch)
+		if err != nil {
+			return nil, err
+		}
+		ic.branchPolicies.put(key, names)
+		return names, nil
 	})
 	select {
 	case <-ctx.Done():
@@ -112,18 +124,8 @@ func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo,
 		if result.Err != nil {
 			return nil, result.Err
 		}
-		// Eligibility reads this list without mutating it. Only successful
-		// results enter the current delivery's cache.
-		contexts := result.Val.([]string)
-		if cache != nil {
-			cache.mu.Lock()
-			if cache.requiredChecks == nil {
-				cache.requiredChecks = make(map[branchPolicyCacheKey][]string)
-			}
-			cache.requiredChecks[key] = contexts
-			cache.mu.Unlock()
-		}
-		return contexts, nil
+		// Each waiter owns its result independently of the other waiters.
+		return slices.Clone(result.Val.([]string)), nil
 	}
 }
 

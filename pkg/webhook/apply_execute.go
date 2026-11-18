@@ -529,7 +529,9 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, actionName, environment, requestedBy, false, false)
+	// Re-read both the PR target and its policy before durable acceptance.
+	// A cached eligibility result cannot authorize database work.
+	blocked, gateErr := h.enforcePRTargetWithPolicy(ctx, client, repo, pr, installationID, actionName, environment, requestedBy, false, false, client.EvaluatePRTargetFresh)
 	if gateErr != nil {
 		return
 	}
