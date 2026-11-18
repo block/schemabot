@@ -103,10 +103,12 @@ const partListInlineLimit = 8
 // The caps on how many parts a wide listing names. Enough failed parts are
 // named that a handful of failures are each visible, few enough that a change
 // that failed everywhere does not print a line per part. The slowest few
-// copying parts are named because they set the ETA.
+// copying parts are named because they set the ETA, and the first few parts
+// working past the copy are named because they are as live as a copying one.
 const (
 	maxFailedParts  = 5
 	maxCopyingParts = 4
+	maxWorkingParts = 4
 )
 
 // ListsParts reports whether a table in status lists its parts one per line
@@ -258,10 +260,10 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 	// A part working through any later phase is as live as a copying one, so
 	// it is named too, in its own order, rather than hidden in the heading.
 	working := workingPastCopy(n, part)
-	for _, i := range working[:min(len(working), maxCopyingParts)] {
+	for _, i := range working[:min(len(working), maxWorkingParts)] {
 		lines = append(lines, PartListLine{Part: i})
 	}
-	if more := len(working) - maxCopyingParts; more > 0 {
+	if more := len(working) - maxWorkingParts; more > 0 {
 		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more %s past copying", more, noun.Label(more))})
 	}
 	return lines

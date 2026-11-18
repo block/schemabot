@@ -328,8 +328,10 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 		"           ✗ payments-041: failed\n"+
 		"           ◉ payments-042: 51.00% · 510 / 1,000 rows · ETA: 2m 0s\n"+
 		"           ◉ payments-043: 52.00% · 520 / 1,000 rows · ETA: 2m 0s\n"+
-		"           ◉ payments-044: 53.00% · 530 / 1,000 rows · ETA: 2m 0s\n",
-		"the failure and the three slowest copiers are named; the heading counts the rest")
+		"           ◉ payments-044: 53.00% · 530 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ◉ payments-045: 54.00% · 540 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ... 15 more copying targets\n",
+		"the failure and the four slowest copiers are named; the rest are counted")
 	assertLess(t, out, "Targets needing attention:", "❌ payments-041 — failed: Error 1062: Duplicate entry 'x' for key 'orders.idx'")
 	assertLess(t, out, "payments-041 — failed", "External operation ID: spirit-op-041")
 	assertLess(t, out, "External operation ID: spirit-op-041", "External apply ID: spirit-041")
