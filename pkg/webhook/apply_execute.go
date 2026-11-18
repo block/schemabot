@@ -111,6 +111,11 @@ func (h *Handler) executeApply(
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final PR freshness fetch failure")
 		return
 	}
+	if blocked, gateErr := h.enforcePRTargetSnapshot(ctx, client, repo, pr, installationID, freshPRInfo, actionName, environment, requestedBy, false, false); gateErr != nil {
+		return
+	} else if blocked {
+		return
+	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, actionName); rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
 		return

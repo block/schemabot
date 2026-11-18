@@ -45,31 +45,46 @@ inheritance; upper members targeting excluded parent branches stay silent.
 An excluded PR receives no new automatic plan or Check Run. Explicit `plan`,
 `apply`, and `apply-confirm` commands are rejected before schema discovery.
 SchemaBot never publishes a successful, neutral, or skipped result to represent
-exclusion. Retarget the PR to an enforced branch to run normal validation, even
-when its head commit has not changed.
+exclusion.
 
-Retargeting to an excluded branch preserves prior results, plans, visible plan
-comments, confirmations, and locks. New commands use the current PR target when
-they are processed, and apply rechecks it with an uncached read close to durable
-acceptance. Once accepted, pending and running applies continue under the
-operator; progress, lifecycle controls, and stored outcomes remain available.
+**After changing the base to an enforced branch, request a fresh `schemabot plan`
+for the affected databases, even when the head commit has not changed.** A base
+change notification also triggers automatic planning, but authors must not rely
+on it or recovery to finish every reevaluation. If changes remain and an earlier
+confirmation is unavailable or rejected, start a fresh `schemabot apply` and
+review any new confirmation. A plan updates validation; it does not restore a
+lost pending confirmation. Authors are responsible for this step.
+
+Retargeting does not itself invalidate earlier check results or retire plans and
+comments. New commands use current eligibility. Apply and confirmation check
+already-fresh PR snapshots before interpreting freshness or re-plan results that
+can release or replace a pending confirmation, and apply retains its uncached
+check close to durable acceptance. Normal freshness and replanning rules still
+apply; exact preservation of a pending confirmation across every race is not
+promised.
+
+Once accepted, pending and running applies continue under the operator;
+locks, progress, lifecycle controls, and stored outcomes remain available.
 Terminal callbacks record outcomes while suppressing Check Run publication on
-an excluded PR. Returning to an enforced branch uses the ordinary planning,
-freshness, authorization, and ownership safeguards; it introduces no special
-invalidation or pending-reset lifecycle.
+an excluded PR. No special invalidation or pending-reset lifecycle is introduced.
 
-**Accepted limit:** a prior real success at the same SHA can satisfy GitHub
-before return-to-target evaluation finishes, including when another PR shares
-the SHA. Retargeting can also race the last eligibility read before acceptance.
-The branch transition and SchemaBot's asynchronous response are not atomic.
+**Accepted limits:** a prior real success at the same SHA can satisfy GitHub
+before a fresh plan completes, including when another PR shares the SHA. The
+expectation to re-plan does not prevent that merge. Retargeting can also race
+the last eligibility read before acceptance. The branch transition and
+SchemaBot's asynchronous response are not atomic.
 
 Recovery compares the latest observed head, direct base, default branch, native
-stack target, and eligibility. A delivery for an excluded head cannot hide a lost
-retarget notification at the same SHA. Target-specific recovery deliveries also
-cover work already queued for that context. An evaluation identity distinguishes
-a later visit from a completed or permanently failed recovery at the same SHA;
-it never revokes earlier results or consent. Observations use the existing
-settings store and do not revoke previous results or confirmation consent.
+stack target, and eligibility. Target-specific recovery deliveries cover work
+already queued for that context. These observations do not prove planning
+finished: an attempt discarded after a target change can still count as covered,
+and a failed eligibility read in the background planner can stop it after the
+original delivery completed. Either case may require an author to request a plan.
+
+Follow-up work is to distinguish observed targets from finished evaluations and
+to retain retry ownership through background planning. This release keeps the
+existing recovery machinery without promising automatic recovery of every branch
+excursion. It adds no generation solely to revoke prior results or confirmations.
 
 ### Protection discovery and rollout
 

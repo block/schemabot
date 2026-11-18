@@ -924,6 +924,12 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return true, fmt.Errorf("apply-confirm command fetch PR for checks gate %s#%d: %w", repo, pr, err)
 	}
 
+	if blocked, gateErr := h.enforcePRTargetSnapshot(ctx, client, repo, pr, installationID, confirmPRInfo, action.ApplyConfirm, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
+		return false, nil
+	}
+
 	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {

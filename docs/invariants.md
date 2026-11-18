@@ -791,7 +791,8 @@ applies remain authoritative through a target change.
 *Enforced:* effective-target and protection discovery (`pkg/github/pr_target.go`);
 shared command and recovery policy (`pkg/webhook/pr_target.go`); auto-plan and
 aggregate publishers (`pkg/webhook/pull_request.go`, `pkg/webhook/check_publisher.go`);
-uncached apply-acceptance gate (`pkg/webhook/apply_execute.go`).
+fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.go`,
+`pkg/webhook/apply_execute.go`).
 
 ## Apply state machine (ST)
 

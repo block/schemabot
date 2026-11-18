@@ -3,22 +3,27 @@
 package webhook
 
 import (
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
-// Retargeting preserves reviewed plans and outstanding confirmations. Rejected
-// commands never replace the plan or release the lock; the same intent is still
-// available when the PR returns to its enforced target.
+// A command that observes an excluded target stops before changing an existing
+// confirmation. Normal freshness and replanning rules still apply on return.
 func TestExcludedPRPreservesConfirmation(t *testing.T) {
 	database := "webhook_target_confirmation"
 	svc := setupE2EService(t, database)
@@ -99,4 +104,69 @@ func TestExcludedPRRecordsAcceptedApplyOutcomeWithoutPublishing(t *testing.T) {
 	assert.Equal(t, checkStatusCompleted, result.Status)
 	assert.Equal(t, checkConclusionSuccess, result.Conclusion, "terminal truth is recorded independently of GitHub publication")
 	assert.Equal(t, int32(0), writes.Load())
+}
+
+// A target can become excluded after the first command gate. Both fresh PR
+// reads must reject it before freshness handling or a no-change re-plan can
+// release the pending confirmation (MG-13).
+func TestRetargetedCommandPreservesConfirmationBeforePlanResponses(t *testing.T) {
+	for _, phase := range []string{"confirmation freshness", "apply replan"} {
+		t.Run(phase, func(t *testing.T) {
+			database := "webhook_target_response_" + strings.ReplaceAll(phase, " ", "_")
+			svc := setupE2EService(t, database)
+			ddl := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+			seedTargetTable(t, database, ddl)
+			planID := "plan-pending-" + database
+			seedPendingConfirmation(t, svc, database, planID, "staging")
+
+			mux := http.NewServeMux()
+			var fixture *planFlowResult
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mux.ServeHTTP(w, r)
+				if phase == "confirmation freshness" && strings.Contains(r.URL.Path, "/git/blobs/") {
+					// Discovery started on main; its next fresh PR read sees exclusion.
+					fixture.BaseRef.Store(new("parent"))
+				}
+			}))
+			t.Cleanup(server.Close)
+			client := gh.NewClient(nil)
+			var err error
+			client.BaseURL, err = url.Parse(server.URL + "/")
+			require.NoError(t, err)
+			fixture = setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ddl + ";"}, fmt.Sprintf("database: %s\ntype: mysql\n", database), database)
+			serveUnrequiredTarget(t, mux)
+			var baseReads atomic.Int32
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/parent", func(w http.ResponseWriter, _ *http.Request) {
+				baseReads.Add(1)
+				_, err := fmt.Fprint(w, `{"ref":"refs/heads/parent","object":{"sha":"def456"}}`)
+				require.NoError(t, err)
+			})
+			ic := ghclient.NewInstallationClient(client, testLogger())
+			h := NewHandler(svc, &fakeClientFactory{client: ic}, nil, testLogger())
+			if phase == "confirmation freshness" {
+				retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", database, 12345, "alice", CommandResult{})
+				require.NoError(t, err)
+				assert.False(t, retry)
+			} else {
+				schema, err := h.createManagedSchemaRequestFromPR(t.Context(), ic, "octocat/hello-world", 1, "staging", database, action.ApplyConfirm)
+				require.NoError(t, err)
+				require.NoError(t, h.attachServerEnvironments(schema, "staging"))
+				disclosed, err := svc.Storage().Plans().Get(t.Context(), planID)
+				require.NoError(t, err)
+				fixture.BaseRef.Store(new("parent"))
+				h.executeApply(t.Context(), ic, "octocat/hello-world", 1, schema, "staging", 12345, "alice", CommandResult{}, nil, disclosed, planID, nil)
+			}
+
+			body := requireComment(t, fixture.comments, "excluded target rejection")
+			assert.Contains(t, body, "This PR targets `parent`")
+			assert.Zero(t, baseReads.Load(), "eligibility must precede base freshness handling")
+			lock, err := svc.Storage().Locks().Get(t.Context(), database, "mysql")
+			require.NoError(t, err)
+			require.NotNil(t, lock)
+			assert.Equal(t, planID, lock.PendingPlanID)
+			applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+			require.NoError(t, err)
+			assert.Empty(t, applies)
+		})
+	}
 }

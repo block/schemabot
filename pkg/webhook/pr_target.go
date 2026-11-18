@@ -30,21 +30,32 @@ func (h *Handler) evaluatePRTarget(ctx context.Context, client *ghclient.Install
 // Lifecycle controls and accepted applies never call this gate.
 func (h *Handler) enforcePRTarget(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, command, environment, requestedBy string, silent, suppressRetryComments bool) (bool, error) {
 	info, err := client.FetchPullRequestNoCache(ctx, repo, pr)
-	if err == nil {
-		var decision ghclient.PRTargetEligibility
-		decision, err = h.evaluatePRTarget(ctx, client, repo, info)
-		if err == nil {
-			if decision.Eligible {
-				return false, nil
-			}
-			h.logger.Info("command rejected because PR target is excluded", "repo", repo, "pr", pr, "head_sha", info.HeadSHA, "effective_target", decision.Target, "command", command)
-			if !silent {
-				h.postCommandError(repo, pr, installationID, command, environment, requestedBy,
-					fmt.Sprintf("This PR targets `%s`, where SchemaBot plans and applies are disabled. Retarget it to `%s` or a branch requiring SchemaBot checks, then retry.", sanitizeCheckRunErrorSummary(decision.Target), sanitizeCheckRunErrorSummary(info.DefaultBranch)))
-			}
-			return true, nil
-		}
+	if err != nil {
+		return h.prTargetVerificationFailure(repo, pr, installationID, command, environment, requestedBy, silent, suppressRetryComments, err)
 	}
+	return h.enforcePRTargetSnapshot(ctx, client, repo, pr, installationID, info, command, environment, requestedBy, silent, suppressRetryComments)
+}
+
+// enforcePRTargetSnapshot checks an already-fresh PR read before a command can
+// release or replace pending confirmation intent. The acceptance gate still
+// fetches its own snapshot immediately before queuing an apply.
+func (h *Handler) enforcePRTargetSnapshot(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, info *ghclient.PullRequestInfo, command, environment, requestedBy string, silent, suppressRetryComments bool) (bool, error) {
+	decision, err := h.evaluatePRTarget(ctx, client, repo, info)
+	if err != nil {
+		return h.prTargetVerificationFailure(repo, pr, installationID, command, environment, requestedBy, silent, suppressRetryComments, err)
+	}
+	if decision.Eligible {
+		return false, nil
+	}
+	h.logger.Info("command rejected because PR target is excluded", "repo", repo, "pr", pr, "head_sha", info.HeadSHA, "effective_target", decision.Target, "command", command)
+	if !silent {
+		h.postCommandError(repo, pr, installationID, command, environment, requestedBy,
+			fmt.Sprintf("This PR targets `%s`, where SchemaBot plans and applies are disabled. Retarget it to `%s` or a branch requiring SchemaBot checks, then retry.", sanitizeCheckRunErrorSummary(decision.Target), sanitizeCheckRunErrorSummary(info.DefaultBranch)))
+	}
+	return true, nil
+}
+
+func (h *Handler) prTargetVerificationFailure(repo string, pr int, installationID int64, command, environment, requestedBy string, silent, suppressRetryComments bool, err error) (bool, error) {
 	h.logger.Error("could not verify PR target eligibility", "repo", repo, "pr", pr, "command", command, "error", err)
 	if !silent && !suppressRetryComments {
 		h.postCommandError(repo, pr, installationID, command, environment, requestedBy, "Could not verify the PR target, so the command was blocked. Retry, and see server logs if it persists.")
