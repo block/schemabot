@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // RecoveryUnaryInterceptor contains handler panics so a fault in one RPC fails
@@ -68,8 +69,16 @@ func RecoveryStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor
 // on, with the recovery interceptors installed as the outermost link of each
 // chain so a handler panic fails only that RPC instead of killing the process
 // that drives applies.
+//
+// It accepts requests up to tern.DefaultMaxRecvMsgBytes, the ceiling the
+// client already applies to responses. A plan request carries the CREATE TABLE
+// text of every declared table, so it grows with the schema the same way a
+// pull response does, and gRPC's 4 MiB default refuses a schema that the pull
+// side reads without trouble. Embedders that register the Tern service on
+// their own server should raise that server's limit the same way.
 func newTernGRPCServer(logger *slog.Logger) *grpc.Server {
 	return grpc.NewServer(
+		grpc.MaxRecvMsgSize(tern.DefaultMaxRecvMsgBytes),
 		grpc.ChainUnaryInterceptor(RecoveryUnaryInterceptor(logger)),
 		grpc.ChainStreamInterceptor(RecoveryStreamInterceptor(logger)),
 	)
