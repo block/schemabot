@@ -336,6 +336,16 @@ and it is recorded like any other request, as `operation="fetch_rate_limit"`
 after the installation list (`operation="list_app_installations"`). An idle
 server therefore keeps exporting its installations' budgets.
 
+Only a server configured with a GitHub App runs the probe, one per App. A server
+without App credentials serves a disabled webhook endpoint and starts no probe,
+so a deployment that only runs schema changes and never talks to GitHub sends
+no probe requests and exports no snapshot. Every replica of a server with an App
+runs its own probe, so the reads scale with replicas: 20 replicas make 20
+installation lists per App and 20 budget reads per installation each minute.
+None of those reads spends the core budget. Each replica exports the same budget
+under its own series, so query the snapshot with an aggregation across replicas
+(`min` for headroom), not a single series.
+
 `schemabot.github.rate_limit.observation_age_seconds` continues increasing after
 snapshot expiry. Above 120 seconds the budget is unknown, which means the
 probe could not read it, for example because GitHub was unreachable or the

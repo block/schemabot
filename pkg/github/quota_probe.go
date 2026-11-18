@@ -56,7 +56,9 @@ type QuotaProbe struct {
 }
 
 // NewQuotaProbe returns a probe over every installation of the App that c
-// authenticates as.
+// authenticates as. Only a server configured with a GitHub App builds one, and
+// each replica runs its own, so the probe's reads grow with the replica count
+// while none of them spends the core budget.
 func (c *Client) NewQuotaProbe() *QuotaProbe {
 	return &QuotaProbe{
 		logger:            c.logger,
