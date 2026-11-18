@@ -91,20 +91,21 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 			return
 		}
 
-		applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment)
+		var err error
+		apply, err = s.storage.Applies().GetLatestByDatabase(r.Context(), database, "", environment)
 		if err != nil {
-			s.logger.Error("failed to get applies", "database", database, "error", err)
+			s.logger.Error("failed to get latest apply", "database", database, "environment", environment, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "failed to get applies")
 			return
 		}
 
-		if len(applies) == 0 {
+		if apply == nil {
+			s.logger.Debug("no applies for database; returning no logs", "database", database, "environment", environment)
 			s.writeJSON(w, http.StatusOK, withLogScope(map[string]any{
 				"logs": []any{},
 			}, scope))
 			return
 		}
-		apply = applies[0]
 	}
 	if deployment != "" {
 		s.handleDeploymentLogs(w, r, apply, deployment, scope, limit)

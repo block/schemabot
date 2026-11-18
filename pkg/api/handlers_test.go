@@ -431,6 +431,19 @@ func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, en
 	}
 	return []*storage.Apply{s.apply}, nil
 }
+
+// GetLatestByDatabase returns the first fixture row GetByDatabase matches;
+// fixtures list their applies newest first.
+func (s *staticApplyStore) GetLatestByDatabase(ctx context.Context, database, dbType, environment string) (*storage.Apply, error) {
+	applies, err := s.GetByDatabase(ctx, database, dbType, environment)
+	if err != nil {
+		return nil, err
+	}
+	if len(applies) == 0 {
+		return nil, nil
+	}
+	return applies[0], nil
+}
 func (s *staticApplyStore) Update(_ context.Context, apply *storage.Apply) error {
 	s.apply = apply
 	return s.err

@@ -104,6 +104,13 @@ func TestPostgresStorageParity(t *testing.T) {
 			})
 		}, namedlock.Postgres{}, postgresApplyRowLocks(h.db))
 	})
+	t.Run("GetLatestByDatabaseOrdersByCreationThenID", func(t *testing.T) {
+		testGetLatestByDatabaseOrdersByCreationThenID(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		})
+	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
 	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
 }
