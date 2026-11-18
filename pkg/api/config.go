@@ -95,6 +95,10 @@ type ServerConfig struct {
 	// Repos holds per-repository configuration.
 	Repos map[string]RepoConfig `yaml:"repos"`
 
+	// PRSchemaCap sets planning admission defaults for repositories served by
+	// this deployment. A repository can override each policy field.
+	PRSchemaCap PRSchemaCapPolicy `yaml:"pr_schema_cap,omitempty"`
+
 	// PRCommandAuthorization controls which GitHub users may run SchemaBot
 	// apply/apply-confirm PR comment commands. When disabled, existing OSS/local
 	// behavior is preserved.
@@ -1871,6 +1875,8 @@ func (c *PlanetScaleConfig) validate() error {
 
 // RepoConfig holds configuration for a specific repository.
 type RepoConfig struct {
+	PRSchemaCap PRSchemaCapOverride `yaml:"pr_schema_cap,omitempty"`
+
 	// EnableChecks controls whether SchemaBot publishes GitHub Check Runs for
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
@@ -2627,9 +2633,15 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 
+	if err := c.validateDefaultPRSchemaCap(); err != nil {
+		return err
+	}
 	for repo, repoConfig := range c.Repos {
 		if repo != storage.CanonicalKey(repo) {
 			return fmt.Errorf("repos repository key %q must be canonical", repo)
+		}
+		if err := c.validatePRSchemaCap(repo, repoConfig); err != nil {
+			return err
 		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err

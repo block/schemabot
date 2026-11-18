@@ -41,8 +41,9 @@ const (
 // could not be confirmed to match). summary explains why for the check's Change
 // column and logs.
 type reviewDriftOutcome struct {
-	state   reviewDriftState
-	summary string
+	admissionErr error
+	state        reviewDriftState
+	summary      string
 	// work is how many rollout members still need the change, read from the
 	// same rollup. The primary plan speaks only for the primary, so a
 	// primary already at the desired schema says nothing about members planned

@@ -678,6 +678,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	primaryPlan, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
+		if _, ok := errors.AsType[*PRSchemaAdmissionError](err); ok {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
@@ -953,6 +957,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		)
 	}
 
+	if err := s.admitPRSchemaRequest(ctx, req.Repository, int(ternReq.PullRequest), ternReq.HeadSha); err != nil {
+		return nil, nil, err
+	}
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
 		span.RecordError(err)
@@ -1434,6 +1441,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	req.viaHTTP = true
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
+		if _, ok := errors.AsType[*PRSchemaAdmissionError](err); ok {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errors.Is(err, errPlanLookupFailed) {
 			s.logger.Error("apply failed to load the stored plan", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage("apply", req.PlanID))
@@ -1792,6 +1803,9 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		return nil, 0, err
 	}
 	if err := s.authorizeStoredPlanSource(ctx, span, plan, req); err != nil {
+		return nil, 0, err
+	}
+	if err := s.admitPRSchemaRequest(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
 		return nil, 0, err
 	}
 	return s.queueValidatedApply(ctx, span, plan, req)

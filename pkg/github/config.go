@@ -179,6 +179,24 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 	return &config, nil
 }
 
+// fetchConfigAtTreeEntry reuses a parsed config when a later commit still
+// references the same immutable blob. A config symlink may resolve to a
+// different blob, so it uses the ordinary ref-based read.
+func (ic *InstallationClient) fetchConfigAtTreeEntry(ctx context.Context, repo, ref, configPath string, entry TreeEntry) (*SchemabotConfig, error) {
+	if !fullObjectSHA.MatchString(ref) || entry.Mode == gitSymlinkMode {
+		return ic.FetchConfig(ctx, repo, configPath, ref)
+	}
+	key := treeLevelKey{repo: repo, sha: entry.SHA}
+	if cached := ic.treeLevels.getConfig(key); cached != nil {
+		return cached, nil
+	}
+	config, err := ic.FetchConfig(ctx, repo, configPath, ref)
+	if err == nil {
+		ic.treeLevels.putConfig(key, config)
+	}
+	return config, err
+}
+
 // FindAllConfigsResult contains both valid and invalid config information.
 type FindAllConfigsResult struct {
 	ValidConfigs   []DiscoveredConfig
@@ -228,7 +246,7 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 		if entry.Type != "blob" || !strings.HasSuffix(entry.Path, ConfigFileName) {
 			continue
 		}
-		config, err := ic.FetchConfig(ctx, repo, entry.Path, ref)
+		config, err := ic.fetchConfigAtTreeEntry(ctx, repo, ref, entry.Path, entry)
 		if err != nil {
 			ic.logger.Warn("failed to parse config", "path", entry.Path, "error", err)
 			result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{
@@ -378,7 +396,7 @@ func (ic *InstallationClient) scanHintDirsForConfigs(ctx context.Context, repo, 
 			}
 			seen[configPath] = struct{}{}
 
-			config, err := ic.FetchConfig(ctx, repo, configPath, ref)
+			config, err := ic.fetchConfigAtTreeEntry(ctx, repo, ref, configPath, entry)
 			if err != nil {
 				ic.logger.Warn("failed to parse config", "path", configPath, "error", err)
 				result.InvalidConfigs = append(result.InvalidConfigs, InvalidConfigInfo{

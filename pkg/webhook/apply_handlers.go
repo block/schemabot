@@ -80,6 +80,15 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 	defer cancel()
 
+	revision, err := h.admitPRSchemaWork(ctx, client, repo, pr, prSchemaRevision{})
+	if err != nil {
+		if isPRSchemaCapStop(err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("verify schema cap for %s#%d: %w", repo, pr, err)
+	}
+	ctx = withPRSchemaAdmission(ctx, client, revision)
+
 	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, result.Tenant, requestedBy, action.Apply, result.SuppressRetryComments) {
 		return false, nil
 	}
@@ -345,6 +354,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if isPRSchemaCapStop(err) {
+		return false, nil
+	}
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		if isTransientRemotePlanError(err) {
@@ -377,6 +389,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// as it runs the primary plan: every gate below reads each target's plan,
 	// and the comment the apply posts renders every target's plan.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+	if rollout.admissionErr != nil {
+		if isPRSchemaCapStop(rollout.admissionErr) {
+			return false, nil
+		}
+		return true, rollout.admissionErr
+	}
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
 	switch {
@@ -832,6 +850,15 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return true, fmt.Errorf("apply-confirm command bootstrap %s#%d: %w", repo, pr, err)
 	}
 	defer cancel()
+
+	revision, err := h.admitPRSchemaWork(ctx, client, repo, pr, prSchemaRevision{})
+	if err != nil {
+		if isPRSchemaCapStop(err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("verify schema cap for %s#%d: %w", repo, pr, err)
+	}
+	ctx = withPRSchemaAdmission(ctx, client, revision)
 
 	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, result.Tenant, requestedBy, action.ApplyConfirm, result.SuppressRetryComments) {
 		return false, nil

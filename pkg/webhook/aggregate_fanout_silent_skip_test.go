@@ -335,7 +335,7 @@ func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 // A -t-scoped command and a non-aggregate repo still surface the error.
 func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 	barePlan := func(h *Handler, databaseName, tenant string) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0, nil)
+		assert.NoError(t, h.handleMultiEnvPlan(t.Context(), "octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0, nil, prSchemaRevision{}))
 	}
 
 	t.Run("leader answers for a database it has not registered", func(t *testing.T) {
@@ -698,7 +698,7 @@ func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testin
 // the leader may publish Database Not Found as the fleet-authoritative answer.
 func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
 	barePlan := func(h *Handler) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0, nil)
+		assert.NoError(t, h.handleMultiEnvPlan(t.Context(), "octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0, nil, prSchemaRevision{}))
 	}
 
 	t.Run("participant stays silent", func(t *testing.T) {
@@ -1272,7 +1272,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		serveSchemaConfigForDatabase(t, mux, "orders")
 		reactions := registerReactionRecorder(t, mux)
 
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
+		assert.NoError(t, h.handleMultiEnvPlan(t.Context(), "octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil, prSchemaRevision{}))
 
 		select {
 		case <-reactions:
@@ -1311,7 +1311,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 					CommandResult{Action: action.ApplyConfirm, CommentID: 42})
 			},
 			"multi-env plan": func(h *Handler) {
-				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
+				assert.NoError(t, h.handleMultiEnvPlan(t.Context(), "octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil, prSchemaRevision{}))
 			},
 		} {
 			t.Run(name, func(t *testing.T) {

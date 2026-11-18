@@ -754,7 +754,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	}
 
 	switch {
-	case isAutoPlannablePullRequest(payload):
+	case isAutoPlannablePullRequest(payload) || h.isPRSchemaLabelEvent(payload):
 		return h.processDurablePullRequestAutoPlan(ctx, event, payload)
 	case payload.Action == storage.PullRequestClosedAction:
 		return h.processDurablePullRequestClosed(ctx, event, payload)
@@ -834,7 +834,13 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 	}
 	defer cancel()
 
-	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, event.DeliveryID)
+	var message string
+	var planErr error
+	if h.isPRSchemaLabelEvent(payload) {
+		message, planErr = h.runPRSchemaLabelEvent(ctx, client, payload, installationID, event.DeliveryID, event.CreatedAt)
+	} else {
+		message, planErr = h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, event.DeliveryID)
+	}
 	if planErr != nil {
 		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
 	}

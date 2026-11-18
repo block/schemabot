@@ -79,6 +79,8 @@ type Handler struct {
 	service   *api.Service
 	ghClients github.ClientSet
 
+	prSchemaDiscovery prSchemaDiscoveryCache
+
 	// shardedPlans is the sharded plan cache every comment render this
 	// handler starts shares; see shardedPlanCache. Nil (a Handler built
 	// without its constructor) reads storage on every render.
@@ -336,6 +338,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 	// Register recovery callback so the operator can attach comment observers
 	// before resuming recovered applies.
 	if service != nil {
+		service.OnPRSchemaAdmission = h.admitDispatchPRSchemaWork
 		service.OnApplyRecovered = func(apply *storage.Apply) {
 			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
 				return
@@ -669,6 +672,14 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		return
 	}
 
+	expected, err := h.admitPRSchemaBeforeQueue(context.Background(), a.Repository, a.PullRequest, a.InstallationID, schemaRevision(prInfo))
+	if err != nil {
+		if !isPRSchemaCapStop(err) {
+			h.logger.Warn("could not verify schema cap after apply", "repo", a.Repository, "pr", a.PullRequest, "error", err)
+		}
+		return
+	}
+
 	tenant := ""
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
@@ -681,7 +692,9 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		// for an apply, not for a plan. The stored check state it writes is the
 		// whole point. It re-plans the one database the settled apply held the
 		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil)
+		if err := h.handleMultiEnvPlan(context.Background(), a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, expected); err != nil {
+			h.logger.Warn("Could not re-plan after apply", "repo", a.Repository, "pr", a.PullRequest, "database", a.Database, "error", err)
+		}
 	})
 }
 

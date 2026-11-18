@@ -1345,14 +1345,30 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 					"blocking_reason", blockingReason)
 			}
 		}
-		summary = sanitizeCheckRunErrorSummary(summary)
+		title, conclusion := planFailedCheckText, checkConclusionFailure
+		if block == prSchemaCapBlock {
+			// The cap formats its own Markdown and escapes every dynamic value.
+			title, conclusion = prSchemaCapTitle, checkConclusionActionRequired
+			existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, ec.environment, aggregateSentinel, aggregateSentinel)
+			if err != nil {
+				h.logger.Warn("could not read stored schema cap check", "repo", repo, "pr", pr, "error", err)
+				stored = false
+				continue
+			}
+			if existing != nil && existing.HeadSHA == headSHA && existing.CheckRunID != 0 &&
+				existing.BlockingReason == blockingReason && existing.ErrorMessage == errorMessage {
+				continue
+			}
+		} else {
+			summary = sanitizeCheckRunErrorSummary(summary)
+		}
 
 		opts := ghclient.CheckRunOptions{
 			Name:       ec.name,
 			Status:     checkStatusCompleted,
-			Conclusion: checkConclusionFailure,
+			Conclusion: conclusion,
 			Output: &ghclient.CheckRunOutput{
-				Title:   planFailedCheckText,
+				Title:   title,
 				Summary: summary,
 			},
 		}
@@ -1380,7 +1396,7 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 			CheckRunID:     id,
 			HasChanges:     false,
 			Status:         checkStatusCompleted,
-			Conclusion:     checkConclusionFailure,
+			Conclusion:     conclusion,
 			BlockingReason: blockingReason,
 			ErrorMessage:   errorMessage,
 		}

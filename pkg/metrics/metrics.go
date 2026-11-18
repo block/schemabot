@@ -161,6 +161,16 @@ func EnvironmentAttribute(environment string) attribute.KeyValue {
 	return attribute.String("environment", environment)
 }
 
+// RecordPRSchemaCap reports a PR-wide planning admission decision and its
+// database fan-out. Distinct schemas can share a single database plan.
+func RecordPRSchemaCap(ctx context.Context, repo, outcome string, databases int) {
+	repository := attribute.String("repository", repo)
+	decision := attribute.String("outcome", outcome)
+	addCounter(ctx, "schemabot.pr_schema_cap.decisions.total", "PR schema cap decisions", "{decision}", repository, decision)
+	addCounterN(ctx, int64(databases), "schemabot.pr_schema_cap.database_plans.total",
+		"Database plans affected by the PR schema cap", "{plan}", repository, decision)
+}
+
 // RecordPlan increments the plans counter with database, deployment, environment, and status attributes.
 // Status should be "success" or "error".
 //

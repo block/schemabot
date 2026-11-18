@@ -152,7 +152,10 @@ type Service struct {
 	// missing Check Runs; wired from the webhook handler at serve startup,
 	// nil when no GitHub webhook runtime exists.
 	checkRunBackfiller CheckRunBackfiller
-	clock              clock.Clock
+	// OnPRSchemaAdmission resolves the current GitHub PR for direct API
+	// requests. Set by the webhook runtime before the service starts.
+	OnPRSchemaAdmission func(context.Context, string, int, string) error
+	clock               clock.Clock
 
 	// pullPerCallerLimiter and pullPerTargetLimiter bound POST /api/pull. Both
 	// are nil when the endpoint's rate limiting is disabled, which a nil

@@ -19,9 +19,20 @@ import (
 
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
 type pullRequestPayload struct {
+	Label struct {
+		Name string `json:"name"`
+	} `json:"label"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
 	Action      string `json:"action"`
 	Before      string `json:"before"`
 	PullRequest struct {
+		UpdatedAt time.Time `json:"updated_at"`
+		Base      struct {
+			SHA string `json:"sha"`
+			Ref string `json:"ref"`
+		} `json:"base"`
 		Number int  `json:"number"`
 		Merged bool `json:"merged"`
 		Head   struct {
@@ -48,6 +59,10 @@ type pullRequestPayload struct {
 			} `json:"ref"`
 		} `json:"base"`
 	} `json:"changes"`
+}
+
+func (p pullRequestPayload) schemaRevision() prSchemaRevision {
+	return prSchemaRevision{Head: p.PullRequest.Head.SHA, BaseRef: p.PullRequest.Base.Ref, Base: p.PullRequest.Base.SHA}
 }
 
 // isAutoPlannablePullRequestAction reports whether a pull_request action
@@ -90,6 +105,7 @@ func isAutoPlannablePullRequest(p pullRequestPayload) bool {
 // handlePullRequest processes GitHub pull_request webhook events.
 // On PR open/synchronize/reopen, it auto-plans all databases with schema changes.
 func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
+	receivedAt := time.Now()
 	var payload pullRequestPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid pull_request payload")
@@ -103,7 +119,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 
 	// Route PR actions
 	switch {
-	case isAutoPlannablePullRequest(payload):
+	case isAutoPlannablePullRequest(payload) || h.isPRSchemaLabelEvent(payload):
 		// proceed to auto-plan below
 	case payload.Action == storage.PullRequestClosedAction:
 		if h.durableWebhookDispatch {
@@ -224,6 +240,16 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		return
 	}
 
+	if payload.Action == "labeled" && h.isPRSchemaLabelEvent(payload) {
+		firstReceipt, err := h.originalPRSchemaLabelReceipt(ctx, repo, pr, deliveryID, receivedAt)
+		if err != nil {
+			h.logger.Error("could not persist schema cap label delivery receipt", "repo", repo, "pr", pr, "error", err)
+			h.writeError(w, http.StatusInternalServerError, "could not persist label delivery")
+			return
+		}
+		receivedAt = firstReceipt
+	}
+
 	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 		if err != nil {
@@ -236,7 +262,15 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		// inside runAutoPlanForPR (the post itself re-verifies the head SHA and
 		// can no-op during a GitHub outage); the fire-and-forget request path has
 		// no durable row to retry, so the error is intentionally dropped here.
-		message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
+		var message string
+		if h.isPRSchemaLabelEvent(payload) {
+			message, err = h.runPRSchemaLabelEvent(ctx, client, payload, installationID, deliveryID, receivedAt)
+			if err != nil {
+				h.logger.Error("schema cap label reconciliation failed", "repo", repo, "pr", pr, "error", err)
+			}
+		} else {
+			message, _ = h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
+		}
 		h.logger.Info("auto-plan dispatched",
 			"action", payload.Action,
 			"repo", repo,
@@ -419,52 +453,80 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		return "config discovery failed", missingBase
 	}
 
-	// Fetch the changed files once so the same list drives both config discovery
-	// and the server-managed-directory safety check below.
-	changedFiles, err := client.FetchPRFiles(ctx, repo, pr)
-	if err != nil {
-		if errors.Is(err, ghclient.ErrPRFilesIncomplete) {
-			// The schema_visible label records whether the truncated prefix
-			// already shows a schema or config path. Both shapes get the same
-			// cap-specific blocking check — the withheld tail is not
-			// inspectable either way — but the label lets operators see how
-			// many cap hits look schema-related versus pure refactors.
-			metrics.RecordPRFileCapExceeded(ctx, repo, ghclient.HasDiscoveryInputFiles(changedFiles))
+	policy := h.prSchemaCap(repo)
+	var capDiscovery *prSchemaDiscovery
+	if policy.Limit > 0 {
+		if prInfo.HeadSHA != headSHA || !prInfo.IsOpen() {
+			return "auto-plan discarded because the PR moved", nil
 		}
-		h.logConfigDiscoveryFailure("list PR changed files", repo, pr, headSHA, source, deliveryID, err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
+		capDiscovery, err = h.discoverPRSchemaCap(ctx, client, repo, pr, schemaRevision(prInfo))
+		if errors.Is(err, errPRSchemaRevisionMoved) {
+			return "auto-plan discarded because the PR moved during discovery", nil
+		}
+		if err != nil {
+			h.logConfigDiscoveryFailure("resolve repo-wide schema count", repo, pr, headSHA, source, deliveryID, err)
+			if !policy.Observe {
+				h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+				h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+				return "config discovery failed", err
+			}
+		}
 	}
 
-	// Narrow the list to what the PR proposes against the default branch before
-	// anything reads it. Every guard below asks a question about the PR's own
-	// schema changes — which databases it touches, whether it drops a config out
-	// from under a managed directory, whether participants must report — and a
-	// file the PR inherited from history it has not caught up with answers none
-	// of them. Failing here is a discovery failure like any other: without the
-	// comparison there is no way to tell an inherited file from a proposed one.
-	files, defaultTipSHA, err := client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, changedFiles)
-	if err != nil {
-		h.logger.Error("failed to scope PR files to what the PR proposes", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
-	}
-	if len(files) != len(changedFiles) {
-		h.logger.Info("auto-plan scoped to the files the PR proposes against the default branch",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "default_tip_sha", defaultTipSHA,
-			"changed_files", len(changedFiles), "proposed_files", len(files),
-			"source", source, "delivery_id", deliveryID)
-	}
+	var changedFiles, files []ghclient.PRFile
+	var configs []ghclient.DiscoveredConfig
+	if capDiscovery != nil {
+		changedFiles, files, configs = capDiscovery.changed, capDiscovery.proposed, slices.Clone(capDiscovery.configs)
+	} else {
+		var defaultTipSHA string
+		// Fetch the changed files once so the same list drives both config discovery
+		// and the server-managed-directory safety check below.
+		changedFiles, err = client.FetchPRFiles(ctx, repo, pr)
+		if err != nil {
+			if errors.Is(err, ghclient.ErrPRFilesIncomplete) {
+				// The schema_visible label records whether the truncated prefix
+				// already shows a schema or config path. Both shapes get the same
+				// cap-specific blocking check — the withheld tail is not
+				// inspectable either way — but the label lets operators see how
+				// many cap hits look schema-related versus pure refactors.
+				metrics.RecordPRFileCapExceeded(ctx, repo, ghclient.HasDiscoveryInputFiles(changedFiles))
+			}
+			h.logConfigDiscoveryFailure("list PR changed files", repo, pr, headSHA, source, deliveryID, err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+			return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
+		}
 
-	// Discover all configs matching changed schema files in this PR
-	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
-	if err != nil {
-		h.logConfigDiscoveryFailure("resolve schema configs for changed files", repo, pr, headSHA, source, deliveryID, err)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
+		// Narrow the list to what the PR proposes against the default branch before
+		// anything reads it. Every guard below asks a question about the PR's own
+		// schema changes — which databases it touches, whether it drops a config out
+		// from under a managed directory, whether participants must report — and a
+		// file the PR inherited from history it has not caught up with answers none
+		// of them. Failing here is a discovery failure like any other: without the
+		// comparison there is no way to tell an inherited file from a proposed one.
+		files, defaultTipSHA, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, changedFiles)
+		if err != nil {
+			h.logger.Error("failed to scope PR files to what the PR proposes", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+			return "config discovery failed", fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
+		}
+		if len(files) != len(changedFiles) {
+			h.logger.Info("auto-plan scoped to the files the PR proposes against the default branch",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "default_tip_sha", defaultTipSHA,
+				"changed_files", len(changedFiles), "proposed_files", len(files),
+				"source", source, "delivery_id", deliveryID)
+		}
+
+		// Discover all configs matching changed schema files in this PR
+		configs, err = client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
+		if err != nil {
+			h.logConfigDiscoveryFailure("resolve schema configs for changed files", repo, pr, headSHA, source, deliveryID, err)
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+			return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
+		}
+
 	}
 
 	// Fail closed when the PR changes schema files under a directory the server
@@ -480,6 +542,22 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		return "schema change under managed directory has no config", nil
 	}
 
+	var capAcknowledgment prSchemaAcknowledgment
+	if capDiscovery != nil {
+		capAcknowledgment, err = h.admitDiscoveredPRSchemaWork(ctx, client, repo, pr, policy, schemaRevision(prInfo), capDiscovery)
+		if isPRSchemaCapStop(err) {
+			return err.Error(), nil
+		}
+		if err != nil {
+			h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+			return "schema cap evaluation failed", err
+		}
+		// Label events below the cap do not trigger an otherwise unneeded plan.
+		if action == "labeled" && capAcknowledgment.EventID == 0 {
+			return "PR is within the schema limit", nil
+		}
+	}
+
 	discovered := slices.Clone(configs)
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
 	// On synchronize the comment cadence compares changed files between SHAs —
@@ -490,6 +568,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA, configs)
 	})
 	unmanagedPlanNote := h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
+
+	if capDiscovery != nil && !policy.Observe && h.publishesPRSchemaCapComment(repo, policy) {
+		if err := h.updatePRSchemaCapComment(ctx, client, repo, pr, "Planning is enabled for the current PR revision.", false); err != nil {
+			h.logger.Warn("could not update resolved schema cap comment", "repo", repo, "pr", pr, "error", err)
+		}
+	}
 
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
@@ -619,10 +703,68 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		tenant = config.Tenant
 	}
 	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles, files, discovered)
+	if capDiscovery != nil && !policy.Observe {
+		latest, err := h.admitDiscoveredPRSchemaWork(ctx, client, repo, pr, policy, schemaRevision(prInfo), capDiscovery)
+		if isPRSchemaCapStop(err) {
+			return err.Error(), nil
+		}
+		if err != nil {
+			return "schema cap dispatch verification failed", err
+		}
+		capAcknowledgment = latest
+	}
+	var expected prSchemaRevision
+	if policy.Limit > 0 && !policy.Observe {
+		expected = schemaRevision(prInfo)
+	}
+	if capAcknowledgment.EventID != 0 && source == "pull_request" {
+		parent, ok := runParent(ctx)
+		if !ok {
+			parent = ctx
+		}
+		var dispatched sync.WaitGroup
+		errorsByDatabase := make(chan error, len(configs))
+		seen := make(map[string]bool)
+		for _, cfg := range configs {
+			database := cfg.Config.Database
+			if seen[database] {
+				continue
+			}
+			seen[database] = true
+			claim, err := h.claimPRSchemaAutoPlan(ctx, repo, pr, database, capAcknowledgment)
+			if err != nil {
+				errorsByDatabase <- err
+			}
+			if claim == nil {
+				continue
+			}
+			dispatched.Add(1)
+			h.goSafe(repo, pr, installationID, deliveryID, func() {
+				defer dispatched.Done()
+				planErr := fmt.Errorf("auto-plan interrupted for %s", database)
+				defer func() {
+					settleErr := h.finishPRSchemaAutoPlan(parent, claim, capAcknowledgment.EventID, planErr != nil)
+					if err := errors.Join(planErr, settleErr); err != nil {
+						errorsByDatabase <- err
+					}
+				}()
+				planErr = h.handleMultiEnvPlan(parent, repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote, expected)
+			})
+		}
+		dispatched.Wait()
+		close(errorsByDatabase)
+		var dispatchErr error
+		for err := range errorsByDatabase {
+			dispatchErr = errors.Join(dispatchErr, err)
+		}
+		return "schema cap exception reconciled", dispatchErr
+	}
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote)
+			if err := h.handleMultiEnvPlan(context.Background(), repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote, expected); err != nil {
+				h.logger.Warn("Could not complete the automatic plan", "repo", repo, "pr", pr, "database", database, "error", err)
+			}
 		})
 	}
 

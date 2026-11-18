@@ -32,6 +32,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 	defer cancel()
+	revision, err := h.admitPRSchemaWork(ctx, client, repo, pr, prSchemaRevision{})
+	if err != nil {
+		if !isPRSchemaCapStop(err) {
+			h.logger.Warn("plan admission failed", "repo", repo, "pr", pr, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, "SchemaBot could not verify the PR schema limit. Retry the command.")
+		}
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": err.Error()})
+		return
+	}
+	ctx = withPRSchemaAdmission(ctx, client, revision)
 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
@@ -139,6 +149,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Execute plan via the service
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if isPRSchemaCapStop(err) {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": err.Error()})
+		return
+	}
 	if planRefusedByNamespacePlacement(err) {
 		h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
 			"repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "head_sha", schemaResult.HeadSHA, "error", err)
@@ -187,6 +201,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Roll up every deployment's diff against the primary plan so drift on a
 	// non-primary deployment fails the check closed at review time.
 	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+	if drift.admissionErr != nil {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": drift.admissionErr.Error()})
+		return
+	}
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
@@ -521,19 +539,28 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // only an auto-plan reads it. unmanagedSchema lists the schema configs the PR
 // also changes that this environment-scoped deployment does not manage; the
 // comment names them, and posts even when it has no plan to show.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData) {
-	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
+func (h *Handler) handleMultiEnvPlan(parent context.Context, repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData, expected prSchemaRevision) error {
+	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
-		return
+		return err
 	}
 	defer cancel()
+	revision, err := h.admitPRSchemaWork(ctx, client, repo, pr, expected)
+	if err != nil {
+		if isPRSchemaCapStop(err) {
+			return nil
+		}
+		h.logger.Warn("multi-environment plan admission failed", "repo", repo, "pr", pr, "error", err)
+		return err
+	}
+	ctx = withPRSchemaAdmission(ctx, client, revision)
 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
-		return
+		return err
 	}
 
 	// The registry gate reads databaseName as the command's -d value. An
@@ -542,7 +569,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// multi-environment setup below posts, which is what tells branch
 	// protection the plan cannot succeed.
 	if !isAutoPlan && h.answerUnregisteredDatabase(repo, pr, installationID, "", databaseName, tenant, requestedBy, action.Plan, false) {
-		return
+		return nil
 	}
 
 	// A user-issued plan on a PR with no managed schema changes converges the
@@ -553,9 +580,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, "", databaseName, requestedBy); err != nil {
 			h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "database", databaseName, "error", err)
 			h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, err.Error())
-			return
+			return nil
 		} else if handled {
-			return
+			return nil
 		}
 	}
 
@@ -567,22 +594,24 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
-				return
+				return nil
 			}
 			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
-			return
+			if h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false) {
+				return nil
+			}
+			return findErr
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
 			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
 			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, unownedErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
-				return
+				return nil
 			}
 			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, unownedErr, false)
-			return
+			return nil
 		}
 		schemaDatabase = config.Database
 	} else {
@@ -591,13 +620,15 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "error", findErr)
-				return
+				return nil
 			}
 			// Answering the failure is acting on the command: the deployment
 			// that posts the answer is the one that acknowledges.
 			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
-			return
+			if h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false) {
+				return nil
+			}
+			return findErr
 		}
 		schemaDatabase = config.Database
 	}
@@ -605,7 +636,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// requires that database's configured principals. Auto-plans are
 	// system-triggered with no actor to authorize.
 	if !isAutoPlan && h.planForResolvedDatabaseBlocked(ctx, repo, pr, installationID, requestedBy, schemaDatabase, "") {
-		return
+		return nil
 	}
 
 	configuredEnvironments, envErr := h.configuredDatabaseEnvironments(schemaDatabase)
@@ -614,7 +645,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			h.postFailingAggregateForMultiEnvSetupError(ctx, client, repo, pr, schemaDatabase, envErr)
 		}
 		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr, false)
-		return
+		return nil
 	}
 	environments, envErr := h.allowedDatabaseEnvironments(schemaDatabase)
 	if envErr != nil {
@@ -622,7 +653,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			h.postFailingAggregateForMultiEnvSetupError(ctx, client, repo, pr, schemaDatabase, envErr)
 		}
 		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr, false)
-		return
+		return nil
 	}
 	// Ownership is only fully decided once the discovered database resolves in
 	// this deployment's registry: config discovery alone can pass on a repo with
@@ -638,19 +669,19 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
 			h.logger.Error("failed to fetch PR for environment with no local work", "repo", repo, "pr", pr, "error", err)
-			return
+			return nil
 		}
 		h.logger.Info("database has no environments served by this deployment; refreshing aggregate scope",
 			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", schemaDatabase)
 		h.updateAggregateCheck(ctx, client, repo, pr, prInfo.HeadSHA)
-		return
+		return nil
 	}
 	if len(environments) == 0 {
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
 			h.logger.Error("failed to fetch PR for no allowed configured environments failure",
 				"repo", repo, "pr", pr, "error", err)
-			return
+			return nil
 		}
 
 		block := noAllowedConfiguredEnvironmentsBlock
@@ -666,7 +697,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"allowed_environments", allowedEnvironments)
 		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, prInfo.HeadSHA,
 			h.aggregateMessagesForAllEnvironments(block.message), block)
-		return
+		return nil
 	}
 
 	// Collect plans for all environments
@@ -728,6 +759,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
+			if expected.valid() && ghclient.IsUnavailableError(err) {
+				return err
+			}
 			planFailed(env, err)
 			continue
 		}
@@ -757,10 +791,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 					h.logger.Error("failed to fetch PR for stale-schema check",
 						"repo", repo, "pr", pr, "error", prErr)
 					h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to verify PR HEAD: "+prErr.Error())
-					return
+					return nil
 				}
 				if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, env, requestedBy, action.Plan); rejected {
-					return
+					return nil
 				}
 			}
 		}
@@ -781,6 +815,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+		if isPRSchemaCapStop(err) {
+			return nil
+		}
+		if _, admissionFailed := errors.AsType[*api.PRSchemaAdmissionError](err); admissionFailed {
+			return err
+		}
 		if planRefusedByNamespacePlacement(err) {
 			h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
 				"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
@@ -805,6 +845,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		// Roll up every deployment's diff against the primary plan so drift on a
 		// non-primary deployment fails the check closed at review time.
 		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+		if drift.admissionErr != nil {
+			if isPRSchemaCapStop(drift.admissionErr) {
+				return nil
+			}
+			return drift.admissionErr
+		}
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -973,7 +1019,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			h.logger.Info("auto-plan refreshed checks without posting plan comment because the visible plan comment still answers for this plan",
 				"repo", repo, "pr", pr, "database", slot.Database,
 				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate)
-			return
+			return nil
 		}
 		h.logger.Info("auto-plan posting plan comment because the visible plan comment no longer matches the plan outcome",
 			"repo", repo, "pr", pr, "database", slot.Database,
@@ -990,7 +1036,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			h.logger.Info("auto-plan: no changes, errors, or drift detected and no plan comment from a prior head is visible; skipping comment",
 				"repo", repo, "pr", pr, "database", slot.Database,
 				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA)
-			return
+			return nil
 		}
 		h.logger.Info("auto-plan: no changes, errors, or drift detected; posting the no-changes plan comment to supersede the plan comment from a prior head",
 			"repo", repo, "pr", pr, "database", slot.Database,
@@ -1005,6 +1051,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 	// Post a single combined comment
 	h.postTrackedPlanComment(repo, pr, installationID, slot, templates.RenderMultiEnvPlanComment(multiEnvData))
+	return nil
 }
 
 // planCommentUpToDate reports whether the plan shows nothing to act on: no

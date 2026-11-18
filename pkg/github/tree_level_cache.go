@@ -2,6 +2,7 @@ package github
 
 import (
 	"regexp"
+	"slices"
 	"sync"
 )
 
@@ -14,40 +15,41 @@ const maxCachedTreeEntries = 100_000
 // later.
 var fullObjectSHA = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
-// treeLevelCache holds shallow tree levels by repository and tree SHA. A tree
-// object never changes, so a level read once is valid for every later call on
+// treeLevelCache holds immutable tree listings and parsed config blobs. A Git
+// object never changes, so a result read once is valid for every later call on
 // the same installation. A nil cache holds nothing.
 type treeLevelCache struct {
 	mu      sync.Mutex
 	levels  map[treeLevelKey][]TreeEntry
 	entries int
+	configs map[treeLevelKey]SchemabotConfig
 }
 
 type treeLevelKey struct {
 	repo, sha string
+	recursive bool
 }
 
 func newTreeLevelCache() *treeLevelCache {
 	return &treeLevelCache{levels: make(map[treeLevelKey][]TreeEntry)}
 }
 
-func (c *treeLevelCache) get(repo, sha string) ([]TreeEntry, bool) {
-	if c == nil || !fullObjectSHA.MatchString(sha) {
+func (c *treeLevelCache) get(key treeLevelKey) ([]TreeEntry, bool) {
+	if c == nil || !fullObjectSHA.MatchString(key.sha) {
 		return nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entries, ok := c.levels[treeLevelKey{repo, sha}]
+	entries, ok := c.levels[key]
 	return entries, ok
 }
 
-func (c *treeLevelCache) put(repo, sha string, entries []TreeEntry) {
-	if c == nil || !fullObjectSHA.MatchString(sha) || len(entries) > maxCachedTreeEntries {
+func (c *treeLevelCache) put(key treeLevelKey, entries []TreeEntry) {
+	if c == nil || !fullObjectSHA.MatchString(key.sha) || len(entries) > maxCachedTreeEntries {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	key := treeLevelKey{repo, sha}
 	if _, ok := c.levels[key]; ok {
 		return
 	}
@@ -57,4 +59,37 @@ func (c *treeLevelCache) put(repo, sha string, entries []TreeEntry) {
 	}
 	c.levels[key] = entries
 	c.entries += len(entries)
+}
+
+const maxCachedSchemaConfigs = 4096
+
+func (c *treeLevelCache) getConfig(key treeLevelKey) *SchemabotConfig {
+	if c == nil || !fullObjectSHA.MatchString(key.sha) {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	config, ok := c.configs[key]
+	if !ok {
+		return nil
+	}
+	return cloneSchemaConfig(config)
+}
+
+func (c *treeLevelCache) putConfig(key treeLevelKey, config *SchemabotConfig) {
+	if c == nil || !fullObjectSHA.MatchString(key.sha) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.configs == nil || len(c.configs) >= maxCachedSchemaConfigs {
+		c.configs = make(map[treeLevelKey]SchemabotConfig)
+	}
+	c.configs[key] = *cloneSchemaConfig(*config)
+}
+
+func cloneSchemaConfig(config SchemabotConfig) *SchemabotConfig {
+	config.IgnoreNamespaces = slices.Clone(config.IgnoreNamespaces)
+	config.IgnoreTables = slices.Clone(config.IgnoreTables)
+	return &config
 }

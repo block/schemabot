@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -83,6 +84,9 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 	}
 
 	rollup, err := h.service.RollupReviewTimeDrift(ctx, planReq, primaryPlan, primaryMember)
+	if _, admissionRefused := errors.AsType[*api.PRSchemaAdmissionError](err); admissionRefused {
+		return reviewDriftOutcome{admissionErr: err}, nil
+	}
 	if err != nil {
 		h.logger.Error("review-time drift rollup failed; the plan check will block the PR closed",
 			"repo", repo,

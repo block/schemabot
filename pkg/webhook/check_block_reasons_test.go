@@ -84,6 +84,7 @@ func declaredCheckBlockReasonVars(t *testing.T) map[string]string {
 		"BlockConfigDiscoveryFailed":            checkstate.BlockConfigDiscoveryFailed,
 		"BlockPlanPublishVerificationFailed":    checkstate.BlockPlanPublishVerificationFailed,
 		"BlockPRFileCapExceeded":                checkstate.BlockPRFileCapExceeded,
+		"BlockPRSchemaCapExceeded":              checkstate.BlockPRSchemaCapExceeded,
 		"BlockManagedDirMissingConfig":          checkstate.BlockManagedDirMissingConfig,
 		"BlockNoAllowedConfiguredEnvironments":  checkstate.BlockNoAllowedConfiguredEnvironments,
 		"BlockParticipantUnresolved":            checkstate.BlockParticipantUnresolved,

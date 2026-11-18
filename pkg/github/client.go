@@ -811,6 +811,7 @@ func (ic *InstallationClient) AddReactionToComment(ctx context.Context, repo str
 // branch tip, so callers that need the current base commit must resolve
 // BaseRef themselves.
 type PullRequestInfo struct {
+	Labels  []string
 	HeadRef string
 	HeadSHA string
 	BaseRef string
@@ -957,6 +958,7 @@ func (ic *InstallationClient) FetchPullRequest(ctx context.Context, repo string,
 		// Hand each caller its own copy so a caller mutating the returned
 		// struct cannot affect another caller's view within the same scope.
 		copyOf := *info
+		copyOf.Labels = slices.Clone(info.Labels)
 		return &copyOf, nil
 	}
 	info, err := ic.fetchPullRequest(ctx, repo, pr)
@@ -994,7 +996,12 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 	if err != nil {
 		return nil, err
 	}
+	var labels []string
+	for _, label := range ghPR.Labels {
+		labels = append(labels, label.GetName())
+	}
 	return &PullRequestInfo{
+		Labels:        labels,
 		HeadRef:       ghPR.GetHead().GetRef(),
 		HeadSHA:       ghPR.GetHead().GetSHA(),
 		BaseRef:       ghPR.GetBase().GetRef(),
@@ -1060,12 +1067,12 @@ const maxGitHubCompareFiles = 300
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	cache := prInfoCacheFromContext(ctx)
 	if cache == nil {
-		return ic.fetchPRFiles(ctx, repo, pr)
+		return ic.fetchPRFiles(ctx, repo, pr, ic.schemaSymlinkScope(repo))
 	}
 	if files, ok := cache.getFiles(repo, pr); ok {
 		return slices.Clone(files), nil
 	}
-	files, err := ic.fetchPRFiles(ctx, repo, pr)
+	files, err := ic.fetchPRFiles(ctx, repo, pr, ic.schemaSymlinkScope(repo))
 	if err != nil {
 		return files, err
 	}
@@ -1073,7 +1080,61 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 	return files, nil
 }
 
-func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
+// FetchPRFilesForSchemaDirs uses the complete schema boundary for a
+// repository served by several control planes. It also returns the merge
+// base used by GitHub's changed-file list for reading vacated paths.
+func (ic *InstallationClient) FetchPRFilesForSchemaDirs(ctx context.Context, repo string, pr int, head, baseTip string, dirs []string) ([]PRFile, string, error) {
+	files, err := ic.listPRFiles(ctx, repo, pr)
+	if err != nil {
+		return files, "", err
+	}
+	scope := pathScope{dirs: dirs, bounded: len(dirs) > 0, strict: true}
+	hasSymlinks := slices.ContainsFunc(files, func(file PRFile) bool { return mayBeSchemaSymlink(file, scope) })
+	if !hasSymlinks && !HasDiscoveryInputFiles(files) {
+		return files, "", nil
+	}
+	mergeBase, err := ic.mergeBaseSHA(ctx, repo, baseTip, head)
+	if err != nil {
+		return nil, "", fmt.Errorf("find the merge base of PR %s#%d: %w", repo, pr, err)
+	}
+	if hasSymlinks {
+		if err := ic.markSymlinks(ctx, repo, ChangeRange{PR: pr, Base: mergeBase, Head: head}, files, scope); err != nil {
+			return nil, "", fmt.Errorf("find which files PR %s#%d changes are symlinks: %w", repo, pr, err)
+		}
+	}
+	return files, mergeBase, nil
+}
+
+func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr int, scope pathScope) ([]PRFile, error) {
+	allFiles, err := ic.listPRFiles(ctx, repo, pr)
+	if err != nil || !slices.ContainsFunc(allFiles, func(file PRFile) bool { return mayBeSchemaSymlink(file, scope) }) {
+		// Every path is named like a schema input, changed by more than one
+		// line, or outside every configured schema directory, so none can be
+		// a schema symlink and no mode is read.
+		return allFiles, err
+	}
+	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("read PR %s#%d to find which changed files are symlinks: %w", repo, pr, err)
+	}
+	// The listing diffs the head against its merge base with the base
+	// branch, so a path's mode before the change is read there.
+	tip, err := ic.prBaseCommit(ctx, repo, pr, prInfo)
+	if err != nil {
+		return nil, err
+	}
+	mergeBase, err := ic.mergeBaseSHA(ctx, repo, tip, prInfo.HeadSHA)
+	if err != nil {
+		return nil, fmt.Errorf("find the merge base of PR %s#%d to read which changed files are symlinks: %w", repo, pr, err)
+	}
+	change := ChangeRange{PR: pr, Base: mergeBase, Head: prInfo.HeadSHA}
+	if err := ic.markSymlinks(ctx, repo, change, allFiles, scope); err != nil {
+		return nil, fmt.Errorf("find which files PR %s#%d changes are symlinks: %w", repo, pr, err)
+	}
+	return allFiles, nil
+}
+
+func (ic *InstallationClient) listPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.ListOptions{PerPage: 100}
 	var allFiles []PRFile
@@ -1116,31 +1177,6 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 		opts.Page = readResult.resp.NextPage
 	}
 
-	scope := ic.schemaSymlinkScope(repo)
-	if !slices.ContainsFunc(allFiles, func(file PRFile) bool { return mayBeSchemaSymlink(file, scope) }) {
-		// Every path is named like a schema input, changed by more than one
-		// line, or outside every configured schema directory, so none can be
-		// a schema symlink and no mode is read.
-		return allFiles, nil
-	}
-	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
-	if err != nil {
-		return nil, fmt.Errorf("read PR %s#%d to find which changed files are symlinks: %w", repo, pr, err)
-	}
-	// The listing diffs the head against its merge base with the base
-	// branch, so a path's mode before the change is read there.
-	tip, err := ic.prBaseCommit(ctx, repo, pr, prInfo)
-	if err != nil {
-		return nil, err
-	}
-	mergeBase, err := ic.mergeBaseSHA(ctx, repo, tip, prInfo.HeadSHA)
-	if err != nil {
-		return nil, fmt.Errorf("find the merge base of PR %s#%d to read which changed files are symlinks: %w", repo, pr, err)
-	}
-	change := ChangeRange{PR: pr, Base: mergeBase, Head: prInfo.HeadSHA}
-	if err := ic.markSymlinks(ctx, repo, change, allFiles, scope); err != nil {
-		return nil, fmt.Errorf("find which files PR %s#%d changes are symlinks: %w", repo, pr, err)
-	}
 	return allFiles, nil
 }
 
@@ -1194,7 +1230,7 @@ func (ic *InstallationClient) prBaseCommit(ctx context.Context, repo string, pr 
 			"repo", repo, "pr", pr, "base_sha", prInfo.BaseSHA, "head_sha", prInfo.HeadSHA)
 		return prInfo.BaseSHA, nil
 	}
-	tip, err := ic.branchTipSHA(ctx, repo, prInfo.BaseRef)
+	tip, err := ic.BranchTipSHA(ctx, repo, prInfo.BaseRef)
 	if err != nil {
 		return "", fmt.Errorf("resolve base branch %s of PR %s#%d: %w", prInfo.BaseRef, repo, pr, err)
 	}
@@ -1206,6 +1242,7 @@ func (ic *InstallationClient) prBaseCommit(ctx context.Context, repo string, pr 
 type pathScope struct {
 	dirs    []string
 	bounded bool
+	strict  bool
 }
 
 func (s pathScope) contains(p string) bool {
@@ -1297,7 +1334,7 @@ func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, cha
 			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "scoped_to_schema_dirs", scope.bounded)
 		return nil
 	}
-	modes, err := ic.SymlinkModes(ctx, repo, change, probes, scope.bounded)
+	modes, err := ic.SymlinkModes(ctx, repo, change, probes, scope.bounded || scope.strict)
 	if err != nil {
 		return fmt.Errorf("read the modes of %d changed paths: %w", len(probes), err)
 	}
@@ -1555,7 +1592,7 @@ func (ic *InstallationClient) directoryLinkDeclaresNamespace(ctx context.Context
 // changed, beside the error: a path proven changed makes the branch stale
 // whatever the paths after it would have shown.
 func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed []string, baseTipSHA string, err error) {
-	baseTipSHA, err = ic.branchTipSHA(ctx, repo, baseRef)
+	baseTipSHA, err = ic.BranchTipSHA(ctx, repo, baseRef)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1710,7 +1747,7 @@ type SchemaFileBlobs struct {
 // than maxSchemaSymlinkReads.
 func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, defaultBranch, approvedSHA, headSHA string, paths []string, compareStatements SchemaFileChangeComparer) (SchemaChangeComparison, error) {
 	result := SchemaChangeComparison{BaseIsDefaultBranch: defaultBranch != "" && baseRef == defaultBranch}
-	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
+	baseTipSHA, err := ic.BranchTipSHA(ctx, repo, baseRef)
 	if err != nil {
 		return result, err
 	}
@@ -2233,8 +2270,8 @@ func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo 
 	return defaultBranch, nil
 }
 
-// branchTipSHA resolves branch to the commit it points at now.
-func (ic *InstallationClient) branchTipSHA(ctx context.Context, repo, branch string) (string, error) {
+// BranchTipSHA resolves branch to the commit it points at now.
+func (ic *InstallationClient) BranchTipSHA(ctx context.Context, repo, branch string) (string, error) {
 	owner, repoName := splitRepo(repo)
 	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
 		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+branch)
@@ -2368,34 +2405,35 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		return files, "", nil
 	}
 
-	owner, repoName := splitRepo(repo)
-	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	_, defaultTipSHA, err = ic.DefaultBranchTipForSchemaDiscovery(ctx, repo)
 	if err != nil {
 		return nil, "", err
 	}
+	proposed, err = ic.PRFilesProposedAgainstTip(ctx, repo, headSHA, defaultTipSHA, files)
+	return proposed, defaultTipSHA, err
+}
 
-	// Pin the tip up front so a commit landing on the default branch mid-pass
-	// cannot leave some files compared against one commit and some against the
-	// next.
-	tip, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
-		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
-		if err != nil {
-			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
-		}
-		return ref, nil
-	})
+// DefaultBranchTipForSchemaDiscovery pins the default branch comparison anchor.
+func (ic *InstallationClient) DefaultBranchTipForSchemaDiscovery(ctx context.Context, repo string) (branch, tip string, err error) {
+	branch, err = ic.repositoryDefaultBranch(ctx, repo)
 	if err != nil {
-		return nil, "", err
+		return "", "", err
 	}
-	defaultTipSHA = tip.GetObject().GetSHA()
-	if defaultTipSHA == "" {
-		return nil, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
+	tip, err = ic.BranchTipSHA(ctx, repo, branch)
+	return branch, tip, err
+}
+
+// PRFilesProposedAgainstTip scopes an already fetched PR diff to an immutable
+// default-branch tip. The caller must supply the same tip for its entire pass.
+func (ic *InstallationClient) PRFilesProposedAgainstTip(ctx context.Context, repo, headSHA, defaultTipSHA string, files []PRFile) ([]PRFile, error) {
+	if !HasDiscoveryInputFiles(files) {
+		return files, nil
 	}
 
 	// One cache serves both refs: it is keyed by tree SHA, and the two refs
 	// share the subtrees they have in common.
 	levelCache := make(map[string][]TreeEntry)
-	proposed = make([]PRFile, 0, len(files))
+	proposed := make([]PRFile, 0, len(files))
 	for _, file := range files {
 		if !isDiscoveryInputPRFile(file) {
 			proposed = append(proposed, file)
@@ -2409,7 +2447,7 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		if file.Symlink || isDiscoveryInputFile(file.Filename) {
 			differs, err := ic.pathDiffersFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, file.Filename, levelCache)
 			if err != nil {
-				return nil, defaultTipSHA, err
+				return nil, err
 			}
 			keep = differs
 		}
@@ -2421,7 +2459,7 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		if vacated, ok := renamedAwayDiscoveryInputPath(file); ok {
 			removes, err := ic.pathRemovedFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, vacated, levelCache)
 			if err != nil {
-				return nil, defaultTipSHA, err
+				return nil, err
 			}
 			if removes {
 				keep = true
@@ -2433,7 +2471,7 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 			proposed = append(proposed, file)
 		}
 	}
-	return proposed, defaultTipSHA, nil
+	return proposed, nil
 }
 
 // renamedAwayDiscoveryInputPath reports the path a rename vacated when that
@@ -3004,6 +3042,10 @@ const gitTreeMode = "040000"
 
 // FetchGitTree fetches the entire directory tree in one API call using recursive mode.
 func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA string) ([]TreeEntry, bool, error) {
+	cacheKey := treeLevelKey{repo: repo, sha: treeSHA, recursive: true}
+	if entries, ok := ic.treeLevels.get(cacheKey); ok {
+		return slices.Clone(entries), false, nil
+	}
 	owner, repoName := splitRepo(repo)
 	ghTree, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchGitTree, "fetch git tree", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
 		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, true)
@@ -3025,6 +3067,9 @@ func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA st
 			SHA:  entry.GetSHA(),
 			Size: entry.GetSize(),
 		}
+	}
+	if !ghTree.GetTruncated() {
+		ic.treeLevels.put(cacheKey, slices.Clone(entries))
 	}
 	return entries, ghTree.GetTruncated(), nil
 }
@@ -3181,7 +3226,7 @@ func (ic *InstallationClient) resolveGitTreeEntry(ctx context.Context, repo, ref
 func (ic *InstallationClient) treeLevel(ctx context.Context, repo, treeSHA string, levelCache map[string][]TreeEntry) ([]TreeEntry, error) {
 	levelEntries, cached := levelCache[treeSHA]
 	if !cached {
-		levelEntries, cached = ic.treeLevels.get(repo, treeSHA)
+		levelEntries, cached = ic.treeLevels.get(treeLevelKey{repo: repo, sha: treeSHA})
 	}
 	if !cached {
 		var err error
@@ -3189,7 +3234,7 @@ func (ic *InstallationClient) treeLevel(ctx context.Context, repo, treeSHA strin
 		if err != nil {
 			return nil, err
 		}
-		ic.treeLevels.put(repo, treeSHA, levelEntries)
+		ic.treeLevels.put(treeLevelKey{repo: repo, sha: treeSHA}, levelEntries)
 	}
 	if levelCache != nil {
 		levelCache[treeSHA] = levelEntries
@@ -3614,18 +3659,9 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 			target = strings.TrimSpace(content.GetTarget())
 		}
 	}
-	if target == "" {
-		return nil, fmt.Errorf("schema namespace symlink %s has empty target", entry.GetPath())
-	}
-	if strings.HasPrefix(target, "/") {
-		return nil, fmt.Errorf("schema namespace symlink %s points to absolute path %s", entry.GetPath(), target)
-	}
-	resolved := path.Clean(path.Join(schemaPath, target))
-	if !schema.PathWithinDirectory(".", resolved) {
-		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
-	}
-	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(entry.GetPath()) {
-		return nil, fmt.Errorf("schema namespace symlink %s must point to a distinct directory, not the repository root, its own schema root, or itself: %s", entry.GetPath(), target)
+	resolved, err := resolveNamespaceSymlinkTarget(schemaPath, entry.GetPath(), target)
+	if err != nil {
+		return nil, err
 	}
 
 	targetEntries, err := ic.fetchDirectoryContents(ctx, repo, resolved, ref)
@@ -3646,6 +3682,25 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		})
 	}
 	return locators, nil
+}
+
+func resolveNamespaceSymlinkTarget(schemaPath, link, target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("schema namespace symlink %s has empty target", link)
+	}
+	if strings.HasPrefix(target, "/") {
+		return "", fmt.Errorf("schema namespace symlink %s points to absolute path %s", link, target)
+	}
+	resolved := path.Clean(path.Join(schemaPath, target))
+	if !schema.PathWithinDirectory(".", resolved) {
+		return "", fmt.Errorf("schema namespace symlink %s points outside the repository: %s", link, target)
+	}
+	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(link) {
+		return "", fmt.Errorf("schema namespace symlink %s must point to a distinct directory, not the repository root, its own schema root, or itself: %s", link, target)
+	}
+
+	return resolved, nil
 }
 
 func isManagedSchemaFile(filePath string) bool {

@@ -313,7 +313,18 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 				h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			}
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil)
+				parent := context.Background()
+				expected, err := h.admitPRSchemaBeforeQueue(parent, repo, pr, installationID, prSchemaRevision{})
+				if err != nil {
+					if !isPRSchemaCapStop(err) {
+						h.logger.Warn("multi-environment plan admission failed", "repo", repo, "pr", pr, "error", err)
+						h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "SchemaBot could not verify the PR schema limit. Retry the command.")
+					}
+					return
+				}
+				if err := h.handleMultiEnvPlan(parent, repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil, expected); err != nil {
+					h.logger.Warn("Could not complete the multi-environment plan", "repo", repo, "pr", pr, "error", err)
+				}
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return

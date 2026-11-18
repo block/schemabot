@@ -53,17 +53,17 @@ func TestResolveGitTreeEntrySharesTreeLevelsAcrossCalls(t *testing.T) {
 func TestTreeLevelCacheStartsOverAtItsLimit(t *testing.T) {
 	cache := newTreeLevelCache()
 	first, second := strings.Repeat("c", 40), strings.Repeat("d", 40)
-	cache.put("octocat/hello-world", first, make([]TreeEntry, maxCachedTreeEntries-1))
-	_, ok := cache.get("octocat/hello-world", first)
+	cache.put(treeLevelKey{repo: "octocat/hello-world", sha: first}, make([]TreeEntry, maxCachedTreeEntries-1))
+	_, ok := cache.get(treeLevelKey{repo: "octocat/hello-world", sha: first})
 	require.True(t, ok)
 
-	cache.put("octocat/hello-world", second, make([]TreeEntry, 2))
+	cache.put(treeLevelKey{repo: "octocat/hello-world", sha: second}, make([]TreeEntry, 2))
 
-	_, ok = cache.get("octocat/hello-world", first)
+	_, ok = cache.get(treeLevelKey{repo: "octocat/hello-world", sha: first})
 	assert.False(t, ok, "the cache started over")
-	_, ok = cache.get("octocat/hello-world", second)
+	_, ok = cache.get(treeLevelKey{repo: "octocat/hello-world", sha: second})
 	assert.True(t, ok)
-	_, ok = cache.get("octocat/other", second)
+	_, ok = cache.get(treeLevelKey{repo: "octocat/other", sha: second})
 	assert.False(t, ok, "levels are kept per repository")
 }
 
@@ -75,23 +75,50 @@ func TestTreeLevelCacheStartsOverAtItsLimit(t *testing.T) {
 func TestTreeLevelCacheKeepsOnlyImmutableLevelsThatFit(t *testing.T) {
 	cache := newTreeLevelCache()
 	kept := strings.Repeat("e", 40)
-	cache.put("octocat/hello-world", kept, make([]TreeEntry, 1))
+	cache.put(treeLevelKey{repo: "octocat/hello-world", sha: kept}, make([]TreeEntry, 1))
 
 	for _, ref := range []string{"main", "e1a2b3c", strings.Repeat("e", 39), strings.Repeat("E", 40)} {
-		cache.put("octocat/hello-world", ref, make([]TreeEntry, 1))
+		cache.put(treeLevelKey{repo: "octocat/hello-world", sha: ref}, make([]TreeEntry, 1))
 	}
 	oversized := strings.Repeat("f", 40)
-	cache.put("octocat/hello-world", oversized, make([]TreeEntry, maxCachedTreeEntries+1))
+	cache.put(treeLevelKey{repo: "octocat/hello-world", sha: oversized}, make([]TreeEntry, maxCachedTreeEntries+1))
 
-	assert.Equal(t, map[treeLevelKey][]TreeEntry{{"octocat/hello-world", kept}: make([]TreeEntry, 1)}, cache.levels,
+	assert.Equal(t, map[treeLevelKey][]TreeEntry{{repo: "octocat/hello-world", sha: kept}: make([]TreeEntry, 1)}, cache.levels,
 		"neither a level read by something other than a full object name nor one larger than the cache is stored, and refusing them leaves the cache as it was")
 	assert.Equal(t, 1, cache.entries)
-	_, ok := cache.get("octocat/hello-world", kept)
+	_, ok := cache.get(treeLevelKey{repo: "octocat/hello-world", sha: kept})
 	assert.True(t, ok)
 
 	exact := newTreeLevelCache()
 	full := strings.Repeat("0", 40)
-	exact.put("octocat/hello-world", full, make([]TreeEntry, maxCachedTreeEntries))
-	_, ok = exact.get("octocat/hello-world", full)
+	exact.put(treeLevelKey{repo: "octocat/hello-world", sha: full}, make([]TreeEntry, maxCachedTreeEntries))
+	_, ok = exact.get(treeLevelKey{repo: "octocat/hello-world", sha: full})
 	assert.True(t, ok, "a level that exactly fills the cache is stored")
+}
+
+func TestTreeCacheSeparatesRecursiveListingsFromShallowLevels(t *testing.T) {
+	cache := newTreeLevelCache()
+	root := treeLevelKey{repo: "octocat/hello-world", sha: strings.Repeat("a", 40)}
+	cache.put(root, []TreeEntry{{Path: "schema"}})
+	recursive := root
+	recursive.recursive = true
+	cache.put(recursive, []TreeEntry{{Path: "schema"}, {Path: "schema/schemabot.yaml"}})
+	level, found := cache.get(root)
+	require.True(t, found)
+	require.Len(t, level, 1)
+	entries, found := cache.get(recursive)
+	require.True(t, found)
+	require.Len(t, entries, 2)
+}
+
+func TestTreeCacheReturnsIsolatedSchemaConfig(t *testing.T) {
+	cache := newTreeLevelCache()
+	key := treeLevelKey{repo: "octocat/hello-world", sha: strings.Repeat("a", 40)}
+	config := &SchemabotConfig{Database: "orders", IgnoreTables: []string{"tmp_orders"}}
+	cache.putConfig(key, config)
+	config.IgnoreTables[0] = "changed"
+	cached := cache.getConfig(key)
+	require.Equal(t, []string{"tmp_orders"}, cached.IgnoreTables)
+	cached.IgnoreTables[0] = "changed again"
+	require.Equal(t, []string{"tmp_orders"}, cache.getConfig(key).IgnoreTables)
 }

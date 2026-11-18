@@ -28,6 +28,7 @@
 - [Agent Hint](#agent-hint)
 - [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
+- [PR Schema Limit](#pr-schema-limit)
 - [PR Checks Gate](#pr-checks-gate)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
@@ -2024,6 +2025,62 @@ To read the cost, group `schemabot.github.requests_total` for the repository by 
 `listen_only` implies `enable_checks: false`. Config load rejects `listen_only` combined with `enable_checks: true` or with an `aggregate` role, because both of those publish checks.
 
 The App's rate limit is shared by every repository it is installed on. A listen-only repository spends the same budget as the repositories the deployment serves.
+
+## PR Schema Limit
+
+Set an inclusive limit on distinct logical schemas changed by one pull request.
+The server-wide `pr_schema_cap` policy applies to every repository served by
+the deployment. Omit the limit to leave planning uncapped. With the Helm
+chart, put these settings under `config` in the values file. The chart renders
+them to `config.yaml` in SchemaBot's ConfigMap.
+
+```yaml
+pr_schema_cap:
+  limit: 5
+  label: schemabot-lsc
+
+repos:
+  myorg/payments-service: {}
+  myorg/reporting-service:
+    pr_schema_cap:
+      limit: 8
+  myorg/tools:
+    pr_schema_cap:
+      limit: 0
+```
+
+Repositories inherit each omitted field. Here, payments uses the default limit
+of five, reporting uses eight with the same label, and tools is uncapped. A
+repository can also override `label`, `observe`, or `publish_comment`. Listen-only repositories
+use observation mode when they inherit the policy.
+
+When a PR exceeds its effective limit, SchemaBot pauses automatic planning,
+scoped plan commands, and new PR applies. The PR check and comment
+show which schemas changed. Split the PR or add the configured label to
+acknowledge the load. A push, retarget, or label removal revokes the
+acknowledgment. Apply approvals and controls for already running applies
+continue to work.
+
+SchemaBot counts one schema for a database with flat SQL files and one for
+each named namespace. The same logical schema counts once across environments
+and rollout members. Renames, deletions, config changes, and namespace links
+are evaluated using Git metadata from both revisions.
+
+Create the label in GitHub and deliver `pull_request` label events to every
+control plane for the repository. The App needs to read the PR and issue
+timeline and write the comment, checks, and stale-label removals. Set
+`observe: true` to measure would-block decisions and database fan-out before
+enforcement.
+
+For a repository served by multiple control planes, configure the same
+repo-wide `registrations` inventory under each repository’s `pr_schema_cap` block. Map
+each registered database name to its `type`, schema directory prefixes
+(`paths`), and configured `environments`. Include every control plane's
+registrations so each sees the same count before it starts any plans. For a
+standalone deployment, omit `registrations` to use the server's database
+registry. Aggregate participants defer the PR comment to the leader. When
+independent deployments share the same repo, set `publish_comment: false`
+on all but one to keep a single PR comment and stale-label remover.
 
 ## PR Checks Gate
 
