@@ -147,7 +147,7 @@ func TestHostileReasonStaysPlainTextInPlanComment(t *testing.T) {
 			} {
 				assert.Contains(t, rendered, "1. `orders`: "+tt.written+"\n", name)
 			}
-			assert.Contains(t, RenderPlanComment(plan), "- `orders`: "+tt.written+"\n", "the lint line")
+			assert.Contains(t, RenderPlanComment(plan), "💡 **Lint Warnings**: 1 advisory finding\n1. `orders`: "+tt.written+"\n", "the lint line")
 		})
 	}
 }
