@@ -154,6 +154,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	if blocked, gateErr := h.enforceSharedSchemaIgnoreLists(ctx, client, repo, pr, installationID, environment, requestedBy, action.Apply, schemaResult, result.SuppressRetryComments); gateErr != nil {
+		return true, fmt.Errorf("apply command shared schema ignore_tables check %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
+		h.logger.Info("apply refused: ignore_tables disagree with a database sharing the same schema", "repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "requested_by", requestedBy)
+		return false, nil
+	}
+
 	// Fix checks stuck at "in_progress" from crashed applies after the actor
 	// is authorized to run apply for this database.
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
@@ -936,6 +943,13 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command actor authorization gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
+		return false, nil
+	}
+
+	if blocked, gateErr := h.enforceSharedSchemaIgnoreLists(ctx, client, repo, pr, installationID, environment, requestedBy, action.ApplyConfirm, schemaResult, result.SuppressRetryComments); gateErr != nil {
+		return true, fmt.Errorf("apply-confirm command shared schema ignore_tables check %s#%d: %w", repo, pr, gateErr)
+	} else if blocked {
+		h.logger.Info("apply-confirm refused: ignore_tables disagree with a database sharing the same schema", "repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "requested_by", requestedBy)
 		return false, nil
 	}
 
