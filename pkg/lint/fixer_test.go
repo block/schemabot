@@ -660,3 +660,48 @@ func TestFixFiles_InvalidSQL(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "bad.sql")
 }
+
+// fixRuns is how many times the ordering tests repeat FixFiles. Go randomizes
+// map iteration on every range, so an order taken from the input map would
+// differ between runs well within this many.
+const fixRuns = 20
+
+// fix-lint reports and writes files in the order FixFiles returns them, so the
+// same schema directory gives the same output on every run.
+func TestFixFiles_ResultsAreInFilenameOrder(t *testing.T) {
+	files := map[string]string{
+		"payments.sql": "CREATE TABLE payments (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+		"accounts.sql": "CREATE TABLE accounts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+		"ledger.sql":   "CREATE TABLE ledger (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+		"orders.sql":   "CREATE TABLE orders (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+	}
+
+	for range fixRuns {
+		result, err := NewFixer().FixFiles(files)
+		require.NoError(t, err)
+
+		var names []string
+		for _, fr := range result.Files {
+			names = append(names, fr.Filename)
+		}
+		require.Equal(t, []string{"accounts.sql", "ledger.sql", "orders.sql", "payments.sql"}, names)
+		assert.Equal(t, 3, result.TotalFixed)
+	}
+}
+
+// With more than one file that cannot be read, the error always names the
+// first of them by filename, so a rerun points the operator at the same file.
+func TestFixFiles_ErrorNamesTheFirstFileByName(t *testing.T) {
+	files := map[string]string{
+		"zones.sql":    "CREATE TABLE zones (",
+		"accounts.sql": "CREATE TABLE accounts (",
+		"orders.sql":   "CREATE TABLE orders (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+	}
+
+	for range fixRuns {
+		_, err := NewFixer().FixFiles(files)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "accounts.sql")
+		require.NotContains(t, err.Error(), "zones.sql")
+	}
+}
