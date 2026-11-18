@@ -143,6 +143,64 @@ func TestQuotaProbeReadsInstallationsConcurrently(t *testing.T) {
 	assert.True(t, <-overlapped, "installation 22 was read only after installation 11 finished")
 }
 
+// A panic inside the probe, such as one raised while GitHub returns something
+// unexpected during an outage, is contained to the read that raised it: the
+// process keeps running and the other installations are still read.
+func TestQuotaProbeContainsAPanickingRead(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11, 22)
+	record := probe.readQuota
+	probe.readQuota = func(ctx context.Context, id int64) error {
+		if id == 11 {
+			panic("unexpected GitHub response")
+		}
+		return record(ctx, id)
+	}
+	require.NotPanics(t, func() { probe.probeOnce(t.Context()) })
+
+	assert.Equal(t, int64(22), receiveRead(t, reads))
+}
+
+// A panic while listing installations ends that pass, not the process, and the
+// next pass lists again.
+func TestQuotaProbeContainsAPanickingList(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11)
+	list := probe.listInstallations
+	var calls int
+	probe.listInstallations = func(ctx context.Context) ([]int64, error) {
+		calls++
+		if calls == 1 {
+			panic("unexpected installation list")
+		}
+		return list(ctx)
+	}
+	require.NotPanics(t, func() { probe.probeOnce(t.Context()) })
+	probe.probeOnce(t.Context())
+
+	assert.Equal(t, int64(11), receiveRead(t, reads))
+}
+
+// While GitHub is unreachable every list fails; the probe logs, reads nothing,
+// and keeps running until it is stopped.
+func TestQuotaProbeKeepsRunningWhileGitHubIsDown(t *testing.T) {
+	probe, _, _ := recordingQuotaProbe(t, nil)
+	probe.interval = 10 * time.Millisecond
+	lists := make(chan struct{}, 64)
+	probe.listInstallations = func(context.Context) ([]int64, error) {
+		lists <- struct{}{}
+		return nil, errors.New("dial tcp: connect: connection refused")
+	}
+	probe.Start(t.Context())
+	t.Cleanup(probe.Stop)
+
+	for range 3 {
+		select {
+		case <-lists:
+		case <-time.After(quotaProbeTestDeadline):
+			require.FailNow(t, "quota probe stopped listing while GitHub was down")
+		}
+	}
+}
+
 // Canceling the context the probe was started with stops it, the same as Stop,
 // so the probe ends with the server's lifecycle.
 func TestQuotaProbeStopsWhenItsContextIsCanceled(t *testing.T) {

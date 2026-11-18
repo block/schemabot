@@ -12,6 +12,7 @@ import (
 	gh "github.com/google/go-github/v86/github"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
 )
 
 // QuotaProbeInterval is how often the quota probe reads each installation's
@@ -124,11 +125,11 @@ func (p *QuotaProbe) Stop() {
 // probeOnce reads the budget of every installation once. Installations are
 // independent: one that fails or hangs is logged once its own read times out,
 // the rest are still read, and the failed one's budget ages out to unknown on
-// its own.
+// its own. Nothing the probe hits, GitHub being down included, ends the
+// process: errors are logged, every request is bounded by a timeout, and a
+// panic is contained to the list or the one read that raised it (AV-5).
 func (p *QuotaProbe) probeOnce(ctx context.Context) {
-	listCtx, cancel := context.WithTimeout(ctx, p.listTimeout)
-	ids, err := p.listInstallations(listCtx)
-	cancel()
+	ids, err := p.listContained(ctx)
 	if err != nil {
 		p.logger.Warn("GitHub quota probe could not list App installations; installation budgets will age out to unknown until a later pass succeeds",
 			"error", err)
@@ -155,14 +156,48 @@ func (p *QuotaProbe) probeOnce(ctx context.Context) {
 	}
 }
 
-// readInstallation reads one installation's budget under its own timeout.
+// listContained lists the App's installations under the list timeout,
+// converting a panic into an error so the pass ends instead of the process.
+func (p *QuotaProbe) listContained(ctx context.Context) ([]int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.listTimeout)
+	defer cancel()
+	var ids []int64
+	recovered, err := panicsafe.Catch(func() error {
+		var listErr error
+		ids, listErr = p.listInstallations(ctx)
+		return listErr
+	})
+	if recovered != nil {
+		p.recordPanic(ctx, recovered, "list App installations")
+		return nil, recovered
+	}
+	return ids, err
+}
+
+// readInstallation reads one installation's budget under its own timeout. A
+// panic is contained to this read; the other installations are still read.
 func (p *QuotaProbe) readInstallation(ctx context.Context, installationID int64) {
 	ctx, cancel := context.WithTimeout(ctx, p.readTimeout)
 	defer cancel()
-	if err := p.readQuota(ctx, installationID); err != nil {
+	recovered, err := panicsafe.Catch(func() error {
+		return p.readQuota(ctx, installationID)
+	})
+	if recovered != nil {
+		p.recordPanic(ctx, recovered, "read installation budget", "installation_id", installationID)
+		return
+	}
+	if err != nil {
 		p.logger.Warn("GitHub quota probe could not read installation budget; its budget will age out to unknown until a later pass succeeds",
 			"installation_id", installationID, "error", err)
 	}
+}
+
+// recordPanic logs and counts a panic the probe contained. The affected budget
+// ages out to unknown like any failed read, and the next pass tries again.
+func (p *QuotaProbe) recordPanic(ctx context.Context, recovered *panicsafe.Error, step string, attrs ...any) {
+	p.logger.Error("GitHub quota probe panicked; the panic was contained and the affected budget will age out to unknown",
+		append([]any{"step", step, "panic", fmt.Sprint(recovered.Value), "stack", string(recovered.Stack)}, attrs...)...)
+	metrics.RecordRecoveredPanic(context.WithoutCancel(ctx), "quota_probe")
 }
 
 // listActiveInstallations lists the App's installations through the App JWT,

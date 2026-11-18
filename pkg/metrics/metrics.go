@@ -1471,6 +1471,7 @@ var knownRecoveredPanicOperations = map[string]bool{
 	"observer_poll":          true,
 	"grpc_handler":           true,
 	"target_probe":           true,
+	"quota_probe":            true,
 }
 
 // RecordRecoveredPanic increments the recovered-panic counter for a background
