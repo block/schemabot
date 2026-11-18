@@ -424,8 +424,36 @@ const WebhookReconcileScanCursorSettingKeyPrefix = "webhook_reconcile_scan_curso
 // fetching one by key still works, for inspection. Component-state keys carry
 // a repository name, so they contain a slash and travel percent-encoded on
 // the settings path.
+//
+// The prefix matches in any letter case. Storage decides which row a key
+// names with its own text comparison, and a dialect whose comparison ignores
+// letter case stores "WEBHOOK_RECONCILE_SCAN_CURSOR:octo/payments" in the
+// reconciler's row. A dialect that compares keys exactly would keep that
+// spelling in a row of its own, and it is refused there as well: the rule is
+// the same on every dialect, set by the one that compares most loosely. A
+// comparison that ignores case can ignore accents,
+// character width and invisible characters too, which this check cannot see:
+// a caller deciding whether to write a key checks IsPrintableASCIISettingKey
+// first, and among such keys letter case is the only difference left.
 func IsComponentStateSettingKey(key string) bool {
-	return strings.HasPrefix(key, WebhookReconcileScanCursorSettingKeyPrefix)
+	return strings.HasPrefix(strings.ToLower(key), WebhookReconcileScanCursorSettingKeyPrefix)
+}
+
+// IsPrintableASCIISettingKey reports whether key is made only of printable
+// ASCII characters, space included. Two such keys name the same settings row
+// on every storage dialect only when they are equal or differ in letter case
+// alone, so a check written in Go agrees with storage about which row a write
+// lands on. That rests on storage keeping a trailing space significant, which
+// the settings table's text comparison does on both dialects. Outside
+// printable ASCII it stops being true: an accented or full-width letter, or
+// an invisible character, can make a key name another key's row.
+func IsPrintableASCIISettingKey(key string) bool {
+	for i := range len(key) {
+		if key[i] < ' ' || key[i] > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 // DatabaseType constants.
