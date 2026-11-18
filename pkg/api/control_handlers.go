@@ -572,16 +572,60 @@ func ternApplyIDForStoredApply(apply *storage.Apply) string {
 	return apply.ApplyIdentifier
 }
 
-// remoteApplyNotYetDispatched reports whether an immediate control attempt
-// against remote Tern has no apply to address. Remote Tern names an apply by
-// the ID it returns at dispatch, which SchemaBot stores as external_id, so
-// until that ID is stored nothing SchemaBot holds identifies the apply to the
-// data plane: SchemaBot's own apply_identifier is unknown there, and an empty
-// ID is refused. The durable control request already recorded is then the only
-// path to the apply, and the immediate attempt is skipped rather than sent to
-// fail.
-func remoteApplyNotYetDispatched(client tern.Client, apply *storage.Apply) bool {
-	return client.IsRemote() && apply.ExternalID == ""
+// immediateControlReach says whether an immediate control attempt can address
+// an apply on the data plane, and when it cannot, why not.
+type immediateControlReach int
+
+const (
+	// immediateControlAddressable means the apply row holds the ID the data
+	// plane knows the apply by. Local Tern shares SchemaBot's storage and its
+	// apply_identifier, so a local apply is always addressable.
+	immediateControlAddressable immediateControlReach = iota
+	// immediateControlUndispatched means the apply has not been sent to remote
+	// Tern, so no remote apply exists to address.
+	immediateControlUndispatched
+	// immediateControlHeldByOperation means the apply has been sent to remote
+	// Tern and its remote apply ID is recorded on an operation row, not on the
+	// apply. A drive under the operation lease records it there, and that drive
+	// resolves which ID its control calls carry.
+	immediateControlHeldByOperation
+	// immediateControlDispatchUnknown means the operation rows could not be
+	// read, so whether the apply has been sent is not known.
+	immediateControlDispatchUnknown
+)
+
+// immediateControlReachFor reports whether an immediate control attempt has an
+// apply to address. Remote Tern names an apply by the ID it returns at
+// dispatch, which SchemaBot stores as external_id, so until that ID is on the
+// apply row nothing the handler holds identifies the apply to the data plane:
+// SchemaBot's own apply_identifier is unknown there, and an empty ID is
+// refused. The durable control request already recorded is then the only path
+// to the apply, and the immediate attempt is skipped rather than sent to fail.
+//
+// An empty external_id on the apply row does not by itself mean the apply is
+// unsent: a drive under the operation lease records the remote ID on its
+// operation row and leaves the apply row empty. The operation rows are read so
+// the reason given for the skip is the true one.
+func (s *Service) immediateControlReachFor(ctx context.Context, client tern.Client, apply *storage.Apply, operation, caller string) immediateControlReach {
+	if !client.IsRemote() || apply.ExternalID != "" {
+		return immediateControlAddressable
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		s.logger.Warn("could not read apply operations to tell whether the apply has been sent to remote Tern; immediate "+operation+" skipped and the durable request remains pending for the apply owner",
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+		return immediateControlDispatchUnknown
+	}
+	for _, op := range ops {
+		if op.RemoteApplyID() != "" {
+			s.logger.Info("immediate "+operation+" skipped because the remote apply ID is recorded on the apply's operation and not on the apply; the drive that owns the operation delivers the durable request",
+				append(apply.LogAttrs(), "requested_by", caller, "apply_operation_id", op.ID, "operation_deployment", op.Deployment)...)
+			return immediateControlHeldByOperation
+		}
+	}
+	s.logger.Info("immediate "+operation+" skipped because the apply has not been sent to remote Tern yet, so there is no remote apply to address; durable request remains pending for the apply owner",
+		append(apply.LogAttrs(), "requested_by", caller)...)
+	return immediateControlUndispatched
 }
 
 // CutoverRequest is the HTTP request body for POST /api/cutover.
@@ -1257,12 +1301,19 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 				"requested_by", caller)...)
 		return
 	}
-	if remoteApplyNotYetDispatched(client, apply) {
-		s.logger.Info("immediate stop skipped because the apply has not been sent to remote Tern yet, so there is no remote apply to address; durable stop request remains pending for the apply owner",
-			append(apply.LogAttrs(),
-				"requested_by", caller)...)
+	switch s.immediateControlReachFor(ctx, client, apply, "stop", caller) {
+	case immediateControlAddressable:
+	case immediateControlUndispatched:
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			"Stop queued; the apply has not been sent to the engine yet, so the apply owner completes the durable stop request")
+		return
+	case immediateControlHeldByOperation:
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
+			"Stop queued; the apply owner delivers the durable stop request to the engine")
+		return
+	case immediateControlDispatchUnknown:
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
+			"Stop queued; the apply owner completes the durable stop request")
 		return
 	}
 	if client.IsRemote() {
@@ -1528,9 +1579,7 @@ func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, ap
 			append(apply.LogAttrs(), "requested_by", caller)...)
 		return
 	}
-	if remoteApplyNotYetDispatched(client, apply) {
-		s.logger.Info("immediate cancel skipped because the apply has not been sent to remote Tern yet, so there is no remote apply to address; durable cancel request remains pending for the apply owner",
-			append(apply.LogAttrs(), "requested_by", caller)...)
+	if s.immediateControlReachFor(ctx, client, apply, "cancel", caller) != immediateControlAddressable {
 		return
 	}
 	ternApplyID := ternApplyIDForStoredApply(apply)
