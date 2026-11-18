@@ -525,7 +525,7 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	if reporting == targets && !t.RowsTotalPlanned && total > 0 {
 		rowsCopied, rowsTotal, approxTotal = copied, total, estimated
 	}
-	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), acrossTargetsPercent(pct, exact, rowsCopied, rowsTotal), throttledSuffix(t))
+	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), presentation.AcrossTargetsPercent(pct, exact, rowsCopied, rowsTotal), throttledSuffix(t))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
@@ -540,6 +540,7 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 		if partial {
 			line += fmt.Sprintf(" across %d of %d targets", reporting, targets)
 		}
+		line += presentation.TargetsTableSizeClause(t.EstimatedBytes, partial, targets)
 		if t.ETASeconds > 0 {
 			floor := ""
 			if slices.ContainsFunc(t.Shards, outsideTargetsETA) {
@@ -552,22 +553,6 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	writeThrottleTooltip(&b, t)
 	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), runningWord(t)))
 	return b.String(), true
-}
-
-// acrossTargetsPercent renders a table's percent across its targets. When
-// every target's rows are known the percent is the rows copied of the rows to
-// copy, at the precision a single target's percent has; otherwise it is an
-// estimate from each target's share and stays whole. It never reads 100%
-// before pct, which waits for every target to complete, does.
-func acrossTargetsPercent(pct int, exact bool, copied, total int64) string {
-	if !exact || total <= 0 {
-		return fmt.Sprintf("%d%%", pct)
-	}
-	if pct < 100 && copied >= total {
-		// Every row is copied but a target has yet to complete the change.
-		return "99.99%"
-	}
-	return ui.FormatRowCopyPercent(pct, copied, total)
 }
 
 // rowsAcrossTargets sums a table's rows across its targets the way
@@ -763,7 +748,7 @@ func stoppedAcrossTargets(targets []ShardProgress) (stoppedProgress, bool) {
 	}
 	whole := min(int(p.copied*100/p.total), 99)
 	p.pct = ui.RowCopyDisplayPercent(whole, p.copied)
-	p.text = acrossTargetsPercent(whole, true, p.copied, p.total)
+	p.text = presentation.AcrossTargetsPercent(whole, true, p.copied, p.total)
 	return p, true
 }
 

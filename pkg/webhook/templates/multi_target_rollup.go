@@ -321,11 +321,13 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		switch status {
 		case state.Task.Completed, state.Task.RevertWindow:
 			// A target in its revert window has completed the change.
+			// It counts in full, the way PercentAcrossTargets weighs it, so
+			// the rows and the percent beside the bar agree.
 			done++
-			if c.RowsTotal == 0 {
-				reporting++
-				continue
-			}
+			reporting++
+			copied += c.RowsTotal
+			total += c.RowsTotal
+			continue
 		case state.Task.Pending:
 			queued++
 		case state.Task.Failed:
@@ -381,7 +383,10 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			// The list under the rows says where each target stands, so the
 			// headline carries only the table's progress across all of them,
 			// the way a sharded table's does.
-			fmt.Fprintf(sb, "**%s**: %s %d%%\n", name, ui.ProgressBarRowCopy(pct), pct)
+			// While every target's rows are its engine's own count, the percent
+			// has a single target's precision; a plan's estimate keeps it whole.
+			exact := reporting == len(cells) && estimated == 0
+			fmt.Fprintf(sb, "**%s**: %s %s\n", name, ui.ProgressBarRowCopy(pct), presentation.AcrossTargetsPercent(pct, exact, copied, total))
 			writeDDL()
 			if total+planned > 0 {
 				line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), rolledRowsTotal(total, planned))
@@ -390,15 +395,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 				if partial {
 					line += fmt.Sprintf(" across %d of %d targets", counted, len(cells))
 				}
-				// The planned size is every target's, including those left out of
-				// the rows, so beside partial rows it names the full span rather
-				// than reading as the reporting targets' size.
-				if size := targetsTableBytes(cells); size != nil {
-					line += ui.FormatTableSizeClause(size)
-					if partial {
-						line += fmt.Sprintf(" across all %d targets", len(cells))
-					}
-				}
+				line += presentation.TargetsTableSizeClause(targetsTableBytes(cells), partial, len(cells))
 				if eta > 0 {
 					// A target still to start, or working without its rows
 					// reported yet, can only add time.

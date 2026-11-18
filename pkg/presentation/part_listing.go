@@ -568,6 +568,24 @@ func PartStatusLabel(status string) string {
 	}
 }
 
+// AcrossTargetsPercent renders a table's percent across its targets beside
+// its bar. When exact, every target's rows are its engine's own count, so the
+// percent is the rows copied of the rows to copy at the precision a single
+// target's percent has (ui.FormatRowCopyPercent). Otherwise it is an estimate
+// from each target's share, or counts a plan's estimate, and stays whole. It
+// never reads complete before pct (PercentAcrossTargets), which waits for
+// every target to complete, does.
+func AcrossTargetsPercent(pct int, exact bool, copied, total int64) string {
+	if !exact || total <= 0 {
+		return fmt.Sprintf("%d%%", pct)
+	}
+	if pct < 100 && copied >= total {
+		// Every row is copied but a target has yet to complete the change.
+		return "99.99%"
+	}
+	return ui.FormatRowCopyPercent(pct, copied, total)
+}
+
 // PercentAcrossTargets is how far a table is across every target that runs it,
 // for the bar that leads its line until every target completes. While every
 // target's rows are known, it is the rows copied over the rows to copy across
