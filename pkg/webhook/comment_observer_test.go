@@ -375,10 +375,10 @@ func TestAggregateTerminalObserverBypassesApplyLeaseCheck(t *testing.T) {
 // The progress-comment authority exists only for applies whose work runs under
 // operation leases while the parent apply lease is legitimately unheld. This
 // pins the shape gate to the operator's drive-mode split: a multi-operation
-// rollout with keyed work still in flight, or a generation manifest still
-// promising operations, qualifies; terminal applies, settled keyed work,
-// single-operation applies, and whole-deployment operations — whose drives
-// hold the parent lease, so an unheld lease there means no driver — do not.
+// rollout with work still in flight, keyed shards or whole targets, or a
+// generation manifest still promising operations, qualifies; terminal applies,
+// settled work, and single-operation applies — whose drives hold the parent
+// lease, so an unheld lease there means no driver — do not.
 func TestOperationScopedWorkInFlight(t *testing.T) {
 	runningApply := &storage.Apply{ApplyIdentifier: "apply-1", State: state.Apply.Running}
 
@@ -423,10 +423,22 @@ func TestOperationScopedWorkInFlight(t *testing.T) {
 		assert.False(t, inFlight)
 	})
 
-	t.Run("whole-deployment operations are governed by the parent lease", func(t *testing.T) {
+	t.Run("whole targets on deployments of their own are in flight", func(t *testing.T) {
+		// One target per deployment carries no operation key, and the operator
+		// still drives the set under operation leases.
 		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
-			{ID: 1, Deployment: "primary", State: state.ApplyOperation.Running},
-			{ID: 2, Deployment: "replica", State: state.ApplyOperation.Running},
+			{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Completed},
+			{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Running},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.True(t, inFlight)
+	})
+
+	t.Run("settled whole targets are not in flight", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Completed},
+			{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
 		}})
 		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
 		require.NoError(t, err)
