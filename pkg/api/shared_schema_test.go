@@ -183,13 +183,14 @@ func TestCheckSharedSchemaIgnoreLists_MissingEntryIsRefusedFromEitherSide(t *tes
 			var mismatch *SharedSchemaIgnoreListsError
 			require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 			assert.Equal(t, []MissingIgnoreEntry{{
-				Database:   "shop",
-				ConfigPath: "db/shop/schemabot.yaml",
-				DeclaredBy: "shop_sharded",
-				Namespace:  "shop_0",
-				Target:     "shop-001",
-				Tables:     []string{"refunds"},
-				Entries:    []string{"refunds"},
+				Database:       "shop",
+				ConfigPath:     "db/shop/schemabot.yaml",
+				DeclaredBy:     "shop_sharded",
+				Namespace:      "shop_0",
+				OwnerNamespace: "shop_0",
+				Target:         "shop-001",
+				Tables:         []string{"refunds"},
+				Entries:        []string{"refunds"},
 			}}, mismatch.Missing)
 			assert.Empty(t, mismatch.Doubled)
 			assert.Equal(t,
@@ -232,10 +233,10 @@ func TestCheckSharedSchemaIgnoreLists_TableDeclaredByBoth(t *testing.T) {
 	require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 	assert.Empty(t, mismatch.Missing)
 	assert.Equal(t, []DoublyDeclaredTables{{
-		Databases: [2]string{"shop", "shop_sharded"},
-		Namespace: "shop_0",
-		Target:    "shop-001",
-		Tables:    []string{"Orders"},
+		Databases:  [2]string{"shop", "shop_sharded"},
+		Namespaces: [2]string{"shop_0", "shop_0"},
+		Target:     "shop-001",
+		Tables:     []string{"Orders"},
 	}}, mismatch.Doubled)
 	assert.Contains(t, err.Error(), `"shop" and "shop_sharded" both declare "Orders" in namespace "shop_0" on target "shop-001"`)
 }
@@ -332,13 +333,14 @@ func TestCheckSharedSchemaIgnoreLists_SameSchemaNameOnEveryCluster(t *testing.T)
 	var mismatch *SharedSchemaIgnoreListsError
 	require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
 	assert.Equal(t, []MissingIgnoreEntry{{
-		Database:   "ledger",
-		ConfigPath: "db/ledger/schemabot.yaml",
-		DeclaredBy: "ledger_sharded",
-		Namespace:  "ledger_production",
-		Target:     "ledger-001",
-		Tables:     []string{"holds"},
-		Entries:    []string{"holds"},
+		Database:       "ledger",
+		ConfigPath:     "db/ledger/schemabot.yaml",
+		DeclaredBy:     "ledger_sharded",
+		Namespace:      "ledger_production",
+		OwnerNamespace: "ledger_production",
+		Target:         "ledger-001",
+		Tables:         []string{"holds"},
+		Entries:        []string{"holds"},
 	}}, mismatch.Missing)
 
 	sharded.IgnoreTables = []string{"accounts"}
@@ -383,4 +385,128 @@ func TestCheckSharedSchemaIgnoreLists_EntryMustCoverTheLowerCaseSpelling(t *test
 			require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shopSide(ignore, "sequences"), []SharedSchemaDatabase{sharded}))
 		})
 	}
+}
+
+// sharedTargetConfig puts two databases of each engine on one target, each
+// under its own namespace key.
+const sharedTargetConfig = `
+tern_deployments:
+  us:
+    production: tern-us:9090
+databases:
+  shop:
+    type: mysql
+    environments:
+      production:
+        deployment: us
+        target: shop-001
+  shop_sharded:
+    type: mysql
+    environments:
+      production:
+        deployment: us
+        target: shop-001
+  catalog:
+    type: postgres
+    environments:
+      production:
+        deployment: us
+        target: catalog-001
+  catalog_search:
+    type: postgres
+    environments:
+      production:
+        deployment: us
+        target: catalog-001
+`
+
+func postgresCreateTables(tables ...string) *ternv1.SchemaFiles {
+	files := map[string]string{}
+	for _, table := range tables {
+		files[table+".sql"] = "CREATE TABLE " + table + " (id bigint PRIMARY KEY);"
+	}
+	return &ternv1.SchemaFiles{Files: files}
+}
+
+func namespacedSide(database, namespace string, ignore []string, tables ...string) SharedSchemaDatabase {
+	return SharedSchemaDatabase{
+		Database:     database,
+		ConfigPath:   "db/" + database + "/schemabot.yaml",
+		SchemaFiles:  map[string]*ternv1.SchemaFiles{namespace: createTables(tables...)},
+		IgnoreTables: ignore,
+	}
+}
+
+// A MySQL target whose connection names a database plans every namespace it
+// is sent as that one database, so two databases on the same target collide
+// even when their namespace keys differ, and only the data plane knows which
+// kind of connection the target uses. The check therefore compares a MySQL
+// pair across namespaces: each needs the other's tables in its ignore_tables,
+// and a table both declare is refused. A PostgreSQL target plans each schema
+// on its own, so the same pair under different keys shares nothing.
+func TestCheckSharedSchemaIgnoreLists_MySQLComparesAcrossNamespaces(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+
+	t.Run("missing entries are refused", func(t *testing.T) {
+		shop := namespacedSide("shop", "shop", nil, "settings")
+		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "orders")
+
+		err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
+		var mismatch *SharedSchemaIgnoreListsError
+		require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
+		assert.Equal(t, []MissingIgnoreEntry{
+			{
+				Database:       "shop",
+				ConfigPath:     "db/shop/schemabot.yaml",
+				DeclaredBy:     "shop_sharded",
+				Namespace:      "shop_sharded",
+				OwnerNamespace: "shop",
+				Target:         "shop-001",
+				Tables:         []string{"orders"},
+				Entries:        []string{"orders"},
+			},
+			{
+				Database:       "shop_sharded",
+				ConfigPath:     "db/shop_sharded/schemabot.yaml",
+				DeclaredBy:     "shop",
+				Namespace:      "shop",
+				OwnerNamespace: "shop_sharded",
+				Target:         "shop-001",
+				Tables:         []string{"settings"},
+				Entries:        []string{"settings"},
+			},
+		}, mismatch.Missing)
+		assert.Contains(t, err.Error(),
+			`"shop_sharded" declares "orders" in namespace "shop_sharded" on target "shop-001", where "shop" plans namespace "shop", and a target whose connection names one database plans both as that database. db/shop/schemabot.yaml does not ignore it, so a plan of "shop" would drop it. Add "orders" to ignore_tables in db/shop/schemabot.yaml`)
+
+		shop.IgnoreTables = []string{"orders"}
+		sharded.IgnoreTables = []string{"settings"}
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded}))
+	})
+
+	t.Run("a table both declare is refused", func(t *testing.T) {
+		shop := namespacedSide("shop", "shop", nil, "orders")
+		sharded := namespacedSide("shop_sharded", "shop_sharded", nil, "orders")
+
+		err := cfg.CheckSharedSchemaIgnoreLists("production", shop, []SharedSchemaDatabase{sharded})
+		var mismatch *SharedSchemaIgnoreListsError
+		require.True(t, errors.As(err, &mismatch), "want a SharedSchemaIgnoreListsError, got %v", err)
+		assert.Empty(t, mismatch.Missing)
+		assert.Equal(t, []DoublyDeclaredTables{{
+			Databases:  [2]string{"shop", "shop_sharded"},
+			Namespaces: [2]string{"shop", "shop_sharded"},
+			Target:     "shop-001",
+			Tables:     []string{"orders"},
+		}}, mismatch.Doubled)
+	})
+
+	t.Run("postgres schemas under different keys share nothing", func(t *testing.T) {
+		catalog := namespacedSide("catalog", "catalog", nil)
+		catalog.SchemaFiles["catalog"] = postgresCreateTables("products")
+		search := namespacedSide("catalog_search", "search", nil)
+		search.SchemaFiles["search"] = postgresCreateTables("products", "terms")
+
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists("production", catalog, []SharedSchemaDatabase{search}))
+	})
 }

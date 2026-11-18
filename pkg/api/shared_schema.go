@@ -11,6 +11,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // SharedSchemaDatabase is one database's side of a schema it shares with
@@ -123,7 +124,7 @@ func (c *ServerConfig) CheckSharedSchemaIgnoreLists(environment string, self Sha
 		if err != nil {
 			return err
 		}
-		for _, shared := range sharedNamespaces(selfTargets, self.SchemaFiles, peerTargets, peer.SchemaFiles) {
+		for _, shared := range sharedNamespaces(selfTargets, self.SchemaFiles, peerTargets, peer.SchemaFiles, plansEachNamespaceApart(dbConfig.Type)) {
 			report.compare(shared, selfSide, peerSide)
 		}
 	}
@@ -134,39 +135,63 @@ func (c *ServerConfig) CheckSharedSchemaIgnoreLists(environment string, self Sha
 	return report
 }
 
-// sharedNamespace is a namespace two databases both plan on one rollout member.
+// sharedNamespace is a pair of namespaces, one from each database, that one
+// rollout member can plan as the same set of tables: the same namespace, or,
+// on an engine that can plan a target as one unit, any two namespaces the two
+// databases hold there.
 type sharedNamespace struct {
-	namespace string
-	target    string
+	selfNamespace string
+	peerNamespace string
+	target        string
 }
 
-// sharedNamespaces returns each namespace both databases declare and hold on a
-// rollout member they both have, once per namespace, naming the first such
-// member's target in member order.
-func sharedNamespaces(selfTargets []routing.ExecutionTarget, selfFiles map[string]*ternv1.SchemaFiles, peerTargets []routing.ExecutionTarget, peerFiles map[string]*ternv1.SchemaFiles) []sharedNamespace {
+// plansEachNamespaceApart reports whether every target of a database type
+// plans each namespace as its own set of tables, so two databases can collide
+// only in a namespace they both declare. A Vitess plan is diffed per keyspace
+// and a PostgreSQL plan per schema. A MySQL target whose DSN names a database
+// diffs every namespace it is sent against that one database, and only the
+// data plane knows its DSN, so a MySQL pair is compared across namespaces. An
+// engine not listed here is compared the same cautious way.
+func plansEachNamespaceApart(databaseType string) bool {
+	switch databaseType {
+	case storage.DatabaseTypeVitess, storage.DatabaseTypePostgres:
+		return true
+	default:
+		return false
+	}
+}
+
+// sharedNamespaces returns each pair of namespaces the two databases declare
+// and hold on a rollout member they both have, once per pair, naming the first
+// such member's target in member order. With apart set, a pair is one
+// namespace both declare; otherwise it is any namespace of each.
+func sharedNamespaces(selfTargets []routing.ExecutionTarget, selfFiles map[string]*ternv1.SchemaFiles, peerTargets []routing.ExecutionTarget, peerFiles map[string]*ternv1.SchemaFiles, apart bool) []sharedNamespace {
 	peerByMember := make(map[string]routing.ExecutionTarget, len(peerTargets))
 	for _, t := range peerTargets {
 		peerByMember[t.MemberID()] = t
 	}
-	seen := map[string]bool{}
+	seen := map[[2]string]bool{}
 	var shared []sharedNamespace
 	for _, selfTarget := range selfTargets {
 		peerTarget, ok := peerByMember[selfTarget.MemberID()]
 		if !ok {
 			continue
 		}
-		for _, namespace := range slices.Sorted(maps.Keys(selfFiles)) {
-			if seen[namespace] {
+		for _, selfNamespace := range slices.Sorted(maps.Keys(selfFiles)) {
+			if !selfTarget.Holds(selfNamespace) {
 				continue
 			}
-			if _, declared := peerFiles[namespace]; !declared {
-				continue
+			for _, peerNamespace := range slices.Sorted(maps.Keys(peerFiles)) {
+				if apart && peerNamespace != selfNamespace {
+					continue
+				}
+				pair := [2]string{selfNamespace, peerNamespace}
+				if seen[pair] || !peerTarget.Holds(peerNamespace) {
+					continue
+				}
+				seen[pair] = true
+				shared = append(shared, sharedNamespace{selfNamespace: selfNamespace, peerNamespace: peerNamespace, target: selfTarget.Target})
 			}
-			if !selfTarget.Holds(namespace) || !peerTarget.Holds(namespace) {
-				continue
-			}
-			seen[namespace] = true
-			shared = append(shared, sharedNamespace{namespace: namespace, target: selfTarget.Target})
 		}
 	}
 	return shared
@@ -233,21 +258,26 @@ type MissingIgnoreEntry struct {
 	// DeclaredBy is the database whose schema files declare Tables, spelled
 	// as the files spell them.
 	DeclaredBy string
-	Namespace  string
-	Target     string
-	Tables     []string
+	// Namespace is where DeclaredBy declares Tables, and OwnerNamespace the
+	// namespace of Database that the target can plan as the same tables. The
+	// two differ only on an engine that can plan a target as one unit.
+	Namespace      string
+	OwnerNamespace string
+	Target         string
+	Tables         []string
 	// Entries are the names ignore_tables has to withhold for Tables: each
 	// declared spelling it misses, and the lower-case spelling a target that
 	// folds table names stores the table under.
 	Entries []string
 }
 
-// DoublyDeclaredTables are tables both databases declare in a shared namespace.
+// DoublyDeclaredTables are tables both databases declare in a shared
+// namespace pair: Namespaces[i] is where Databases[i] declares them.
 type DoublyDeclaredTables struct {
-	Databases [2]string
-	Namespace string
-	Target    string
-	Tables    []string
+	Databases  [2]string
+	Namespaces [2]string
+	Target     string
+	Tables     []string
 }
 
 // SharedSchemaIgnoreListsError is the refusal CheckSharedSchemaIgnoreLists
@@ -269,8 +299,8 @@ func (e *SharedSchemaIgnoreListsError) empty() bool {
 // table both declare is matched ignoring case, which errs toward refusing on a
 // target that folds table names.
 func (e *SharedSchemaIgnoreListsError) compare(shared sharedNamespace, self, peer sharedSchemaSide) {
-	selfTables := self.declared[shared.namespace]
-	peerTables := peer.declared[shared.namespace]
+	selfTables := self.declared[shared.selfNamespace]
+	peerTables := peer.declared[shared.peerNamespace]
 	selfFolded := foldedTableSet(selfTables)
 	peerFolded := foldedTableSet(peerTables)
 
@@ -282,14 +312,14 @@ func (e *SharedSchemaIgnoreListsError) compare(shared sharedNamespace, self, pee
 	}
 	if len(doubled) > 0 {
 		e.Doubled = append(e.Doubled, DoublyDeclaredTables{
-			Databases: [2]string{self.Database, peer.Database},
-			Namespace: shared.namespace,
-			Target:    shared.target,
-			Tables:    doubled,
+			Databases:  [2]string{self.Database, peer.Database},
+			Namespaces: [2]string{shared.selfNamespace, shared.peerNamespace},
+			Target:     shared.target,
+			Tables:     doubled,
 		})
 	}
-	e.addMissing(shared, self, peer, peerFolded)
-	e.addMissing(shared, peer, self, selfFolded)
+	e.addMissing(shared.target, shared.selfNamespace, self, shared.peerNamespace, peer, peerFolded)
+	e.addMissing(shared.target, shared.peerNamespace, peer, shared.selfNamespace, self, selfFolded)
 }
 
 // addMissing records the tables declarer declares in the shared namespace that
@@ -299,9 +329,9 @@ func (e *SharedSchemaIgnoreListsError) compare(shared sharedNamespace, self, pee
 // folds table names holds the table in lower case. Entries match case
 // exactly, so an entry naming only the declared spelling would leave the
 // folded table to be dropped.
-func (e *SharedSchemaIgnoreListsError) addMissing(shared sharedNamespace, declarer, owner sharedSchemaSide, ownerFolded map[string]bool) {
+func (e *SharedSchemaIgnoreListsError) addMissing(target, declarerNamespace string, declarer sharedSchemaSide, ownerNamespace string, owner sharedSchemaSide, ownerFolded map[string]bool) {
 	var tables, entries []string
-	for _, table := range declarer.declared[shared.namespace] {
+	for _, table := range declarer.declared[declarerNamespace] {
 		if ownerFolded[declaredTableKey(table)] {
 			continue
 		}
@@ -316,13 +346,14 @@ func (e *SharedSchemaIgnoreListsError) addMissing(shared sharedNamespace, declar
 		return
 	}
 	e.Missing = append(e.Missing, MissingIgnoreEntry{
-		Database:   owner.Database,
-		ConfigPath: owner.ConfigPath,
-		DeclaredBy: declarer.Database,
-		Namespace:  shared.namespace,
-		Target:     shared.target,
-		Tables:     tables,
-		Entries:    entries,
+		Database:       owner.Database,
+		ConfigPath:     owner.ConfigPath,
+		DeclaredBy:     declarer.Database,
+		Namespace:      declarerNamespace,
+		OwnerNamespace: ownerNamespace,
+		Target:         target,
+		Tables:         tables,
+		Entries:        entries,
 	})
 }
 
@@ -340,10 +371,10 @@ func unwithheldSpellings(ignored engine.IgnoredTables, table string) []string {
 
 func (e *SharedSchemaIgnoreListsError) sort() {
 	slices.SortFunc(e.Missing, func(a, b MissingIgnoreEntry) int {
-		return strings.Compare(a.Database+"\x00"+a.Namespace+"\x00"+a.DeclaredBy, b.Database+"\x00"+b.Namespace+"\x00"+b.DeclaredBy)
+		return strings.Compare(a.Database+"\x00"+a.Namespace+"\x00"+a.OwnerNamespace+"\x00"+a.DeclaredBy, b.Database+"\x00"+b.Namespace+"\x00"+b.OwnerNamespace+"\x00"+b.DeclaredBy)
 	})
 	slices.SortFunc(e.Doubled, func(a, b DoublyDeclaredTables) int {
-		return strings.Compare(a.Namespace+"\x00"+a.Databases[1], b.Namespace+"\x00"+b.Databases[1])
+		return strings.Compare(a.Namespaces[0]+"\x00"+a.Namespaces[1]+"\x00"+a.Databases[1], b.Namespaces[0]+"\x00"+b.Namespaces[1]+"\x00"+b.Databases[1])
 	})
 }
 
@@ -354,19 +385,33 @@ func (e *SharedSchemaIgnoreListsError) Error() string {
 		if config == "" {
 			config = fmt.Sprintf("the schemabot.yaml of %q", m.Database)
 		}
-		part := fmt.Sprintf(
-			"%q declares %s in namespace %q, which %q shares on target %q, but %s does not ignore %s, so a plan of %q would drop %s. Add %s to ignore_tables in %s",
-			m.DeclaredBy, quotedTables(m.Tables), m.Namespace, m.Database, m.Target,
-			config, pronoun(m.Tables), m.Database, pronoun(m.Tables), quotedTables(m.Entries), config)
+		var part string
+		if m.OwnerNamespace == m.Namespace {
+			part = fmt.Sprintf(
+				"%q declares %s in namespace %q, which %q shares on target %q, but %s does not ignore %s, so a plan of %q would drop %s. Add %s to ignore_tables in %s",
+				m.DeclaredBy, quotedTables(m.Tables), m.Namespace, m.Database, m.Target,
+				config, pronoun(m.Tables), m.Database, pronoun(m.Tables), quotedTables(m.Entries), config)
+		} else {
+			part = fmt.Sprintf(
+				"%q declares %s in namespace %q on target %q, where %q plans namespace %q, and a target whose connection names one database plans both as that database. %s does not ignore %s, so a plan of %q would drop %s. Add %s to ignore_tables in %s",
+				m.DeclaredBy, quotedTables(m.Tables), m.Namespace, m.Target, m.Database, m.OwnerNamespace,
+				config, pronoun(m.Tables), m.Database, pronoun(m.Tables), quotedTables(m.Entries), config)
+		}
 		if !slices.Equal(m.Entries, m.Tables) {
 			part += ". Entries match case exactly, and a target that folds table names stores each table in lower case, so the lower-case spelling needs an entry too"
 		}
 		parts = append(parts, part)
 	}
 	for _, d := range e.Doubled {
+		if d.Namespaces[0] == d.Namespaces[1] {
+			parts = append(parts, fmt.Sprintf(
+				"%q and %q both declare %s in namespace %q on target %q. Keep each table's schema file in one of them and list the table in the other's ignore_tables",
+				d.Databases[0], d.Databases[1], quotedTables(d.Tables), d.Namespaces[0], d.Target))
+			continue
+		}
 		parts = append(parts, fmt.Sprintf(
-			"%q and %q both declare %s in namespace %q on target %q. Keep each table's schema file in one of them and list the table in the other's ignore_tables",
-			d.Databases[0], d.Databases[1], quotedTables(d.Tables), d.Namespace, d.Target))
+			"%q declares %s in namespace %q and %q declares %s in namespace %q, both on target %q, and a target whose connection names one database plans both as that database. Keep each table's schema file in one of them and list the table in the other's ignore_tables",
+			d.Databases[0], quotedTables(d.Tables), d.Namespaces[0], d.Databases[1], pronoun(d.Tables), d.Namespaces[1], d.Target))
 	}
 	return strings.Join(parts, "; ")
 }
