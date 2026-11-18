@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1027,7 +1028,8 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				registerReviewGateGitObjects(t, mux, commits)
 			}
 			if tt.headFileStatus != 0 {
-				sum := sha1.Sum([]byte("blob\x00" + commits[reviewGateTestHeadSHA]["schema/testdb/orders/orders.sql"]))
+				headFile := commits[reviewGateTestHeadSHA]["schema/testdb/orders/orders.sql"]
+				sum := sha1.Sum([]byte("blob " + strconv.Itoa(len(headFile)) + "\x00" + headFile))
 				mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/"+hex.EncodeToString(sum[:]), func(w http.ResponseWriter, _ *http.Request) {
 					http.Error(w, http.StatusText(tt.headFileStatus), tt.headFileStatus)
 				})
@@ -1257,7 +1259,7 @@ func registerReviewGateGitObjects(t *testing.T, mux *http.ServeMux, commits map[
 	trees := make(map[string][]object)
 	blobs := make(map[string]string)
 	hash := func(kind, content string) string {
-		sum := sha1.Sum([]byte(kind + "\x00" + content))
+		sum := sha1.Sum([]byte(kind + " " + strconv.Itoa(len(content)) + "\x00" + content))
 		return hex.EncodeToString(sum[:])
 	}
 	var buildTree func(files map[string]string) string

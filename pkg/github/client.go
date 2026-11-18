@@ -108,6 +108,12 @@ type Client struct {
 	// checks), so any memoisation window would risk converting a
 	// now-failing gate into a passing one.
 	checkStatusSingleflight *CheckStatusSingleflight
+
+	// blobs holds file content by repository and blob SHA, shared across
+	// every InstallationClient this factory produces. Content never changes
+	// for its blob SHA, so a schema file read once is not read again for
+	// another environment, delivery, push, or path it is renamed to.
+	blobs *blobCache
 }
 
 // ClientOption configures optional Client behavior at construction.
@@ -189,6 +195,7 @@ func NewClient(appID int64, privateKey []byte, logger *slog.Logger, opts ...Clie
 		installations:           make(map[int64]*InstallationClient),
 		repoInstallations:       make(map[string]int64),
 		checkStatusSingleflight: NewCheckStatusSingleflight(),
+		blobs:                   newBlobCache(maxCachedBlobBytes),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -311,6 +318,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		configDirHints:          c.configDirHints,
 		checkStatusSingleflight: c.checkStatusSingleflight,
 		treeLevels:              newTreeLevelCache(),
+		blobs:                   c.blobs,
 	}
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
@@ -394,6 +402,7 @@ func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSl
 		logger:               logger,
 		trustedCheckAppSlugs: trustedCheckAppSlugs,
 		treeLevels:           newTreeLevelCache(),
+		blobs:                newBlobCache(maxCachedBlobBytes),
 	}
 	ic.storeAppSlug(appSlug)
 	return ic
@@ -438,6 +447,11 @@ type InstallationClient struct {
 	// treeLevels holds tree levels read by SHA across calls, so the
 	// listings and comparisons a delivery repeats read each level once.
 	treeLevels *treeLevelCache
+
+	// blobs holds file content by repository and blob SHA. Owned by the
+	// parent Client and shared across its installations; a client built
+	// without one owns its own.
+	blobs *blobCache
 }
 
 // InstallationID returns the GitHub App installation this client is scoped
@@ -3197,8 +3211,18 @@ func (ic *InstallationClient) treeLevel(ctx context.Context, repo, treeSHA strin
 	return levelEntries, nil
 }
 
-// FetchBlobContent fetches file content using the Git Blob API.
+// FetchBlobContent returns the content of the blob blobSHA in repo, read once
+// through the Git Blob API and then held by blob SHA, which content never
+// changes for. Content that does not hash to blobSHA is an error, never
+// returned or held.
 func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSHA string) (string, error) {
+	return ic.blobs.read(ctx, repo, blobSHA, func(ctx context.Context) (string, error) {
+		return ic.fetchBlobUncached(ctx, repo, blobSHA)
+	})
+}
+
+// fetchBlobUncached reads the blob blobSHA in repo from the Git Blob API.
+func (ic *InstallationClient) fetchBlobUncached(ctx context.Context, repo, blobSHA string) (string, error) {
 	owner, repoName := splitRepo(repo)
 	blob, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchBlob, "fetch blob", []any{"repo", repo, "blob_sha", blobSHA}, func(ctx context.Context) (*gh.Blob, error) {
 		blob, _, err := ic.client.Git.GetBlob(ctx, owner, repoName, blobSHA)
@@ -3343,10 +3367,10 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 	}
 
 	// Fetch all file contents in parallel with concurrency limit. Content is
-	// fetched from fetchPath (the real path on the branch — the symlink target
-	// for files reached through a symlinked namespace, since the Contents API
-	// does not traverse symlinked directories), but each file is labeled with
-	// displayPath so namespace grouping uses the symlink name.
+	// read by the blob SHA the listing reported, so content any earlier read
+	// already holds costs no request. Each file is labeled with displayPath so
+	// namespace grouping uses the symlink name for files reached through a
+	// symlinked namespace.
 	results := make(chan fileResult, len(filesToFetch))
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, 10)
@@ -3356,7 +3380,7 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
+			content, err := ic.schemaFileContent(ctx, repo, headSHA, loc)
 			if err != nil {
 				results <- fileResult{err: fmt.Errorf("fetch %s: %w", loc.fetchPath, err)}
 				return
@@ -3393,6 +3417,20 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 		return files[i].Path < files[j].Path
 	})
 	return files, nil
+}
+
+// schemaFileContent reads the content of the schema file loc points at. A
+// listing entry that names no blob, which GitHub always reports, is read by
+// path at ref through the Contents API: fetchPath is the real path on the
+// branch, the symlink target for a file reached through a symlinked
+// namespace, since the Contents API does not traverse symlinked directories.
+func (ic *InstallationClient) schemaFileContent(ctx context.Context, repo, ref string, loc schemaFileLocator) (string, error) {
+	if fullObjectSHA.MatchString(loc.blobSHA) {
+		return ic.FetchBlobContent(ctx, repo, loc.blobSHA)
+	}
+	ic.logger.Debug("schema file listing names no blob, reading its content by path",
+		"repo", repo, "ref", ref, "path", loc.fetchPath, "blob_sha", loc.blobSHA)
+	return ic.FetchFileContent(ctx, repo, loc.fetchPath, ref)
 }
 
 func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo string, headSHA, schemaPath string) ([]GitHubFile, error) {
@@ -3511,6 +3549,10 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 type schemaFileLocator struct {
 	fetchPath   string
 	displayPath string
+	// blobSHA names the blob holding the file's content, as the directory
+	// listing reports it. Content is read by blob SHA, so the same content
+	// at another path, environment, or commit is read once.
+	blobSHA string
 }
 
 // schemaFileLocators lists every schema file directly under the schema root and
@@ -3533,7 +3575,7 @@ func (ic *InstallationClient) schemaFileLocators(ctx context.Context, repo, ref,
 	for _, entry := range rootEntries {
 		switch entry.GetType() {
 		case "file":
-			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath()})
+			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath(), blobSHA: entry.GetSHA()})
 		case "dir", "symlink":
 			namespaceEntries = append(namespaceEntries, entry)
 		default:
@@ -3589,7 +3631,7 @@ func (ic *InstallationClient) directoryFileLocators(ctx context.Context, repo, r
 				"repo", repo, "ref", ref, "path", sub.GetPath(), "type", sub.GetType())
 			continue
 		}
-		locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath()})
+		locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath(), blobSHA: sub.GetSHA()})
 	}
 	return locators, nil
 }
@@ -3643,6 +3685,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		locators = append(locators, schemaFileLocator{
 			fetchPath:   sub.GetPath(),
 			displayPath: path.Join(schemaPath, symlinkName, path.Base(sub.GetPath())),
+			blobSHA:     sub.GetSHA(),
 		})
 	}
 	return locators, nil
