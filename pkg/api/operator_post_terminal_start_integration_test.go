@@ -402,8 +402,9 @@ func TestOperator_StartOnAStoppedRolloutReportsEachClaimOutOfStopped(t *testing.
 // rollout's fresh comment, so the PR still shows the stop's summary. The next
 // pod to claim one of the rollout's operations attaches an observer itself, so
 // the PR follows the resumed copy from the bottom of the timeline. It attaches
-// once per process, and once an observer has rotated the stop's summary away
-// no pod attaches another.
+// once per process. Once an observer has rotated the stop's summary away, a pod
+// that never watched the rollout still attaches its own when it claims, so the
+// comment keeps following the copy whichever pod drives it.
 func TestOperator_ResumedRolloutObserverSurvivesTheLossOfItsPod(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -454,8 +455,8 @@ func TestOperator_ResumedRolloutObserverSurvivesTheLossOfItsPod(t *testing.T) {
 	another := newMatrixService(t, stor, matrixClients(stor, rec, outcomes))
 	driveNextOperation(t, ctx, another, 3)
 	require.Equal(t, []string{"region-a", "region-b", "region-c"}, rec.resumeOrder())
-	assert.Zero(t, another.matrixSummary.recoveredCount(),
-		"once the stop's summary is rotated away, a claim on another pod attaches no observer")
+	assert.Equal(t, 1, another.matrixSummary.recoveredCount(),
+		"a pod that never watched the rollout attaches its own observer when it claims, after the stop's summary is rotated away")
 }
 
 // A rollout was stopped and started twice, and both times the pod that took it
@@ -690,4 +691,68 @@ func TestOperator_ResumedOperationReadsRunningOnceItsEngineWorks(t *testing.T) {
 	assert.Equal(t, state.ApplyOperation.Running, client.operationState, "the operation reads running once its engine is copying again")
 	assert.Equal(t, state.Apply.Running, client.applyState, "the rollout reads running with it")
 	assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
+}
+
+// A rolling rollout that was never stopped is copying region-a when the pod
+// driving it goes away, and with it the progress comment observer that
+// process held. The pod that claims region-a next has never watched the
+// rollout, so it attaches an observer of its own and the PR comment keeps
+// following the copy instead of freezing at the last progress the lost pod
+// rendered. That pod attaches once however often it claims the rollout, and a
+// further restart attaches again on the pod that claims after it.
+func TestOperator_RolloutObserverFollowsTheCopyAcrossARestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "rollout-restarted-mid-copy",
+		parentState:     state.Apply.Running,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a", "region-b"},
+		opState:         state.ApplyOperation.Pending,
+		taskState:       state.Task.Pending,
+		perOpState:      map[string]string{"region-a": state.ApplyOperation.Running},
+		perTaskState:    map[string]string{"region-a": state.Task.Running},
+	})
+
+	rec := &driveRecorder{}
+	// Each drive ends with region-a still copying, the way a drive ends when
+	// its pod goes away mid-copy.
+	stillCopying := map[string]matrixOutcome{
+		"region-a": {taskState: state.Task.Running},
+		"region-b": {taskState: state.Task.Completed},
+	}
+
+	// The pod that was driving region-a is gone; its heartbeat goes stale.
+	stalenessBackdate(t, ctx, db, seed.applyID)
+	restarted := newMatrixService(t, stor, matrixClients(stor, rec, stillCopying))
+	driveNextOperation(t, ctx, restarted, 1)
+	require.Equal(t, []string{"region-a"}, rec.resumeOrder())
+	assert.Equal(t, 1, restarted.matrixSummary.recoveredCount(),
+		"the pod that claims the copy after the restart attaches a progress comment observer")
+	assert.Equal(t, state.Apply.Running, getApply(t, ctx, stor, seed.applyID).State,
+		"the rollout is still in flight")
+
+	stalenessBackdate(t, ctx, db, seed.applyID)
+	driveNextOperation(t, ctx, restarted, 2)
+	require.Equal(t, []string{"region-a", "region-a"}, rec.resumeOrder())
+	assert.Equal(t, 1, restarted.matrixSummary.recoveredCount(),
+		"a later claim in the same process does not attach a second observer")
+
+	// Another restart: the next pod has never watched the rollout either.
+	stalenessBackdate(t, ctx, db, seed.applyID)
+	restartedAgain := newMatrixService(t, stor, matrixClients(stor, rec, stillCopying))
+	driveNextOperation(t, ctx, restartedAgain, 3)
+	require.Equal(t, []string{"region-a", "region-a", "region-a"}, rec.resumeOrder())
+	assert.Equal(t, 1, restartedAgain.matrixSummary.recoveredCount(),
+		"the pod that claims after a second restart attaches its own observer")
+	assert.Zero(t, restartedAgain.matrixSummary.count(),
+		"no terminal summary publishes while the rollout is still copying")
 }

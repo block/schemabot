@@ -1471,22 +1471,25 @@ func rolloutInFlight(projection applyProjectionResult) bool {
 	return !state.IsTerminalApplyState(projection.DerivedState)
 }
 
-// attachResumedRolloutObserver gives a resumed rollout a progress comment
-// observer again. The rollout's observer stopped watching when the rollout
-// stopped, and operation drives never attach one of their own, so without this
-// the PR keeps reading stopped for the whole resumed copy. The observer's first
-// tick sees the stop's summary comment and posts a fresh progress comment at the
-// bottom of the PR. Its GitHub writes go through the durable progress-comment
-// authority, so observers on other pods never edit the comment at the same time.
+// attachResumedRolloutObserver gives an in-flight rollout a progress comment
+// observer in the process that claimed it. Operation drives never attach one of
+// their own, and an observer lives only as long as its process, so without this
+// the PR keeps reading whatever the last observer wrote: stopped, for a resumed
+// rollout, or a frozen copy percentage, for a rollout whose pod restarted
+// mid-copy. Its GitHub writes go through the durable progress-comment
+// authority, so observers on other pods never edit the comment at the same
+// time. The terminal summary stays with the projection CAS winner, whose
+// summary-marker claim keeps it exactly-once against any observer still alive.
 //
-// The drive that takes the rollout out of its stop attaches one. A later claim
-// attaches one too while the stop's summary comment is still waiting to be
-// rotated, so a resume whose observer was lost with its pod before the first
-// tick still reaches the bottom of the PR from whichever pod claims next. Once
-// an observer rotates, the summary comment is consumed and claims stop
-// attaching. Each process attaches once per stop summary comment, and every
-// stop posts a new one, so the next stop and start of the same rollout
-// attaches again.
+// The drive that takes the rollout out of its stop attaches one. Its first tick
+// sees the stop's summary comment and posts a fresh progress comment at the
+// bottom of the PR. Every other claim attaches one unless this process already
+// attached one since the rollout's last stop. That covers a resume whose
+// observer was lost with its pod before the first tick, which still reaches the
+// bottom of the PR from whichever pod claims next, and a rollout that never
+// stopped and was claimed again on a pod that never watched it. Each process
+// remembers the summary comment it attached against, and every stop posts a new
+// one, so the next stop and start of the same rollout attaches again.
 func (s *Service) attachResumedRolloutObserver(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, projection applyProjectionResult) {
 	attrs := append(apply.LogAttrs(),
 		"driver", driverID, "apply_operation_id", op.ID,
@@ -1521,16 +1524,16 @@ func (s *Service) attachResumedRolloutObserver(ctx context.Context, driverID int
 			append(attrs, "error", err)...)
 		return
 	}
-	if !awaiting {
-		s.logger.Debug("operator: rollout has no stop summary waiting to be rotated; no progress comment observer to attach", attrs...)
-		return
-	}
 	if s.hasResumeObserverFor(apply.ID, stopSummaryCommentID) {
-		s.logger.Debug("operator: this process already attached a progress comment observer for the rollout's current stop",
+		s.logger.Debug("operator: this process already attached a progress comment observer since the rollout's last stop",
 			append(attrs, "stop_summary_comment_id", stopSummaryCommentID)...)
 		return
 	}
-	s.attachResumeObserver(apply, stopSummaryCommentID, "PR still shows the rollout's stop", attrs)
+	if awaiting {
+		s.attachResumeObserver(apply, stopSummaryCommentID, "PR still shows the rollout's stop", attrs)
+		return
+	}
+	s.attachResumeObserver(apply, stopSummaryCommentID, "this process has no progress comment observer for the rollout", attrs)
 }
 
 func (s *Service) attachResumeObserver(apply *storage.Apply, stopSummaryCommentID int64, reason string, attrs []any) {
@@ -1556,7 +1559,8 @@ func (s *Service) stopSummaryAwaitingRotation(ctx context.Context, apply *storag
 }
 
 // hasResumeObserverFor reports whether this process already attached an
-// observer to rotate the given stop summary comment.
+// observer to the rollout since the stop that posted the given summary comment.
+// A rollout that never stopped has no summary comment and passes zero.
 func (s *Service) hasResumeObserverFor(applyID, stopSummaryCommentID int64) bool {
 	s.resumeObserversMu.Lock()
 	defer s.resumeObserversMu.Unlock()
@@ -1788,6 +1792,12 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "error", err)...)
 		return claimSpent
+	}
+	if !rolloutInFlight(result) {
+		// The rollout stopped or settled, so this process's observer has
+		// stopped watching and the next claim of a resumed rollout needs a
+		// fresh one.
+		s.forgetResumeObserver(apply.ID)
 	}
 
 	// Settle what the apply resolved before the summary is published: a command

@@ -86,7 +86,8 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, 1, svc.matrixSummary.count(), "the aggregate terminal summary must publish exactly once")
 		assert.Len(t, svc.matrixSummary.lastTasks(), len(seed.deployments),
 			"the summary must include every operation's task")
-		assert.Zero(t, svc.matrixSummary.recoveredCount(), "a multi-op drive must not fire the per-driver recovered observer")
+		assert.Equal(t, 1, svc.matrixSummary.recoveredCount(),
+			"the process attaches one progress comment observer to the rollout, on its first claim, and its later claims attach no more")
 	})
 
 	t.Run("ShardedWorkCompletesBeforeGroupFinalizer", func(t *testing.T) {
