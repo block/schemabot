@@ -299,6 +299,7 @@ func TestCheckSuiteWebhookIgnoredWhenDurableDispatchDisabled(t *testing.T) {
 // A delivery from a repository outside the allowlist is acknowledged without
 // occupying an inbox row.
 func TestCheckSuiteWebhookRejectsUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newRecordingWebhookEventStore()
 	h := newCheckSuiteIngressHandler(t, store, map[string]api.RepoConfig{"octocat/other-repo": {}})
 
@@ -313,6 +314,7 @@ func TestCheckSuiteWebhookRejectsUnregisteredRepo(t *testing.T) {
 	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-cs-1")
 	require.NoError(t, err)
 	require.Nil(t, row)
+	requireUnregisteredRepositoryCounted(t, reader, "check_suite", "requested")
 }
 
 // check_suite.requested fires for every push to every branch, but GitHub
@@ -746,6 +748,7 @@ func TestDurableCheckSuiteGitHubFailureRetries(t *testing.T) {
 // Config can change between enqueue and claim: a repository deregistered in
 // the interim must not have work synthesized for it.
 func TestDurableCheckSuiteRevalidatesAllowlist(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newRecordingWebhookEventStore()
 	h, _ := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/other-repo": {}})
 
@@ -756,6 +759,7 @@ func TestDurableCheckSuiteRevalidatesAllowlist(t *testing.T) {
 	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row)
+	requireUnregisteredRepositoryCounted(t, reader, "check_suite", "requested")
 }
 
 // The kill switch must stop synthesis with a restart, including rows already

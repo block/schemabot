@@ -450,6 +450,7 @@ func TestDurableIssueCommentDriverDispatchesParticipantFanOut(t *testing.T) {
 // without creating a client — config can drop a repo between enqueue and
 // drive, and the driver re-validates the allowlist fail-closed.
 func TestDurableIssueCommentDriverCompletesUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot apply -e production"))
 	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"other/repo": {}}}
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
@@ -468,6 +469,7 @@ func TestDurableIssueCommentDriverCompletesUnregisteredRepo(t *testing.T) {
 		t.Fatal("unregistered repo must not create a GitHub client")
 	default:
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "issue_comment", "created")
 }
 
 // An apply command enqueued before its repository became listen-only completes

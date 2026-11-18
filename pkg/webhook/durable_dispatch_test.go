@@ -768,6 +768,7 @@ func TestDurableWebhookDriverRetriesBootstrapFailure(t *testing.T) {
 }
 
 func TestDurableWebhookDriverCompletesUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
 	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"other/repo": {}}}
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
@@ -786,6 +787,7 @@ func TestDurableWebhookDriverCompletesUnregisteredRepo(t *testing.T) {
 		t.Fatal("unregistered repo must not create a GitHub client")
 	default:
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "pull_request", "opened")
 }
 
 // A claimed auto-plan delivery covered by a newer delivery for the same PR —

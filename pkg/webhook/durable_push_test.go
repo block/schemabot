@@ -164,6 +164,7 @@ func TestDurablePushDriverPostsChecks(t *testing.T) {
 // A push delivery for a repo this deployment does not manage completes as a
 // no-op — there is no check source to maintain — without creating a client.
 func TestDurablePushDriverCompletesUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durablePushEvent())
 	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"other/repo": {}}}
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
@@ -182,6 +183,7 @@ func TestDurablePushDriverCompletesUnregisteredRepo(t *testing.T) {
 		t.Fatal("unregistered repo must not create a GitHub client")
 	default:
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "push", "")
 }
 
 // A push row with an empty repo or an empty head SHA is a corrupted/replayed
