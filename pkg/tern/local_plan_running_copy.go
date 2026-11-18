@@ -120,9 +120,9 @@ func (c *LocalClient) runningCopiesForPlan(ctx context.Context, result *engine.P
 // so a row left in flight by a crashed server marks a stopped copy as running
 // until recovery clears it.
 func (c *LocalClient) runningCopyTables(ctx context.Context, database, environment, target string) (map[runningCopyKey]bool, error) {
-	tasks, err := c.storage.Tasks().GetByDatabase(ctx, database)
+	tasks, err := c.storage.Tasks().GetNonTerminalByDatabase(ctx, database)
 	if err != nil {
-		return nil, fmt.Errorf("load tasks for database %q: %w", database, err)
+		return nil, fmt.Errorf("load non-terminal tasks for database %q: %w", database, err)
 	}
 	running := map[runningCopyKey]bool{}
 	operationTargets := map[int64]string{}

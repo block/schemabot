@@ -50,12 +50,12 @@ import (
 func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder, error) {
 	memo := newConflictScanMemo()
 	for attempt := range 10 {
-		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
+		existingTasks, err := c.storage.Tasks().GetNonTerminalByDatabase(ctx, plan.Database)
 		if err != nil {
 			return blockingTask{}, nil, fmt.Errorf("check existing tasks: %w", err)
 		}
 
-		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
+		c.logger.Debug("conflict check: found non-terminal tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
 		blocking, released := c.findBlockingTask(ctx, existingTasks, plan, environment, dispatchShard, attachApplyID, memo)
 		if !blocking.blocks() {

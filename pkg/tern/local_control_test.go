@@ -57,6 +57,22 @@ func (s *controlTestTaskStore) GetByDatabase(_ context.Context, _ string) ([]*st
 	return s.tasks, nil
 }
 
+func (s *controlTestTaskStore) GetNonTerminalByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
+	return nonTerminalTasks(s.tasks), nil
+}
+
+// nonTerminalTasks mirrors TaskStore.GetNonTerminalByDatabase for a fake's
+// seeded tasks: it keeps their order and leaves out the terminal ones.
+func nonTerminalTasks(tasks []*storage.Task) []*storage.Task {
+	var kept []*storage.Task
+	for _, task := range tasks {
+		if !state.IsTerminalTaskState(task.State) {
+			kept = append(kept, task)
+		}
+	}
+	return kept
+}
+
 func (s *controlTestTaskStore) Update(_ context.Context, task *storage.Task) error {
 	for i, storedTask := range s.tasks {
 		if storedTask.ID == task.ID || storedTask.TaskIdentifier == task.TaskIdentifier {
@@ -3399,6 +3415,10 @@ func (s *revertScopeTaskStore) GetByApplyID(_ context.Context, applyID int64) ([
 // GetByDatabase mirrors the SQL store: every environment's tasks, newest first.
 func (s *revertScopeTaskStore) GetByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
 	return s.tasks, nil
+}
+
+func (s *revertScopeTaskStore) GetNonTerminalByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
+	return nonTerminalTasks(s.tasks), nil
 }
 
 type revertScopeOperationStore struct {
