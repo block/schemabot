@@ -480,8 +480,9 @@ Two databases share a schema when, in the same environment, both have a target o
 
 - A table that both databases declare in the shared namespace also fails the check, whatever the lists say. Each table belongs to one of them.
 - Entries match case exactly. A target that folds table names stores `Refunds` as `refunds`, so a table declared with capital letters needs an entry for its lower-case spelling as well, or a pattern that matches both. The error names every spelling still missing.
-- The other database's files must come from a directory its own `allowed_dirs` allow, the same source policy its own plans pass. If they do not, or if SchemaBot cannot read them, the environment fails. It does not pass a pair it could not compare.
-- A database whose `schemabot.yaml` is in another repository is managed from there, so it is not compared. SchemaBot skips it only when its search read every config it found; a miss that skipped an unreadable config fails the environment.
+- The other database's files must come from a directory its own `allowed_dirs` allow, the same source policy its own plans pass. If they do not, or if SchemaBot cannot read them, the environment fails. It does not pass a pair it could not compare. A `schemabot.yaml` found elsewhere in the repository is refused the same way.
+- A database whose `schemabot.yaml` is in another repository is managed from there, so it is not compared. SchemaBot skips it when the database accepts no schema changes from this repository, or when a search of the repository read every config it found and none was for that database. A miss that skipped an unreadable config fails the environment.
+- An apply also needs the branch to have every base branch change to the other database's `schemabot.yaml` and schema files. The comparison read them at the pull request's head, so a branch missing a newer change to them is refused as stale, like a branch missing a change to the database's own schema. Merge or rebase the base branch and apply again.
 - A plan narrowed with `--target` runs the check too. The disagreement is in the schema files, so it fails the environment's check whichever target the plan named.
 - The CLI plans one database from a local directory and does not run this check.
 

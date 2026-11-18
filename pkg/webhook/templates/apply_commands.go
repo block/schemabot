@@ -712,6 +712,10 @@ type BaseSchemaFreshnessRejectionData struct {
 	Environment       string
 	SchemaPath        string
 	VerificationError bool
+	// SharedSchemaPeer names the database whose files changed on the base
+	// branch when SchemaPath is that database's, not this one's. This
+	// database's ignore_tables were compared with that database's files.
+	SharedSchemaPeer string
 }
 
 // RenderBaseSchemaFreshnessRejection renders the path-scoped base freshness
@@ -723,10 +727,14 @@ func RenderBaseSchemaFreshnessRejection(data BaseSchemaFreshnessRejectionData) s
 	writeEnvironmentTitle(&sb, glyph.Attention+" Apply rejected — base schema is newer", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
-	if data.VerificationError {
+	switch {
+	case data.VerificationError:
 		sb.WriteString("SchemaBot could not verify whether this PR includes the current base branch's schema changes. The apply was rejected to avoid reverting a change that may already be on the base branch.\n\n")
 		sb.WriteString("Retry the command. If verification continues to fail, contact a SchemaBot operator.\n")
-	} else {
+	case data.SharedSchemaPeer != "":
+		fmt.Fprintf(&sb, "The base branch contains newer changes to %s, the schema of %s, which shares a schema with this database. This PR was compared with the older version of it.\n\n", inlineCode(data.SchemaPath), inlineCode(data.SharedSchemaPeer))
+		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
+	default:
 		fmt.Fprintf(&sb, "The base branch contains newer changes to the schema directory %s that are not included in this PR. Applying this branch could revert those changes.\n\n", inlineCode(data.SchemaPath))
 		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
 	}

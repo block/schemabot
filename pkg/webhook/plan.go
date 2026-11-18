@@ -159,7 +159,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// table before it plans. A disagreement is in the schema files, not in any
 	// one target, so it fails the environment's check even when the plan is
 	// narrowed to one target.
-	if err := h.verifySharedSchemaIgnoreLists(ctx, client, repo, pr, environment, action.Plan, schemaResult, nil); err != nil {
+	if _, err := h.verifySharedSchemaIgnoreLists(ctx, client, repo, pr, environment, action.Plan, schemaResult, nil); err != nil {
 		h.logger.Error("shared schema ignore_tables check failed; the environment's check fails",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"deployment", deployment, "environment", environment, "target", target, "error", err)
@@ -858,7 +858,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			SourceTrusted:     true,
 		}
 
-		if err := h.verifySharedSchemaIgnoreLists(ctx, client, repo, pr, env, action.Plan, schemaResult, sharedSchemaPeers); err != nil {
+		if _, err := h.verifySharedSchemaIgnoreLists(ctx, client, repo, pr, env, action.Plan, schemaResult, sharedSchemaPeers); err != nil {
 			h.logger.Error("shared schema ignore_tables check failed; the environment's plan fails", "repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
 			planFailed(env, err)
 			continue

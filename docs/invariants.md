@@ -827,7 +827,8 @@ database's next plan proposes dropping it. *Enforced:* `CheckSharedSchemaIgnoreL
 `pkg/api/shared_schema.go`, run before the plan by `verifySharedSchemaIgnoreLists`
 (`pkg/webhook/shared_schema.go`) from the single- and multi-environment plans in
 `pkg/webhook/plan.go`, and before an apply or apply-confirm by `enforceSharedSchemaIgnoreLists` in
-`pkg/webhook/apply_handlers.go`.
+`pkg/webhook/apply_handlers.go`, whose comparison holds only while `assertBaseSchemaStillCurrent`
+(`pkg/webhook/schema_freshness.go`) finds no base branch change to the other database's inputs.
 
 ## Apply state machine (ST)
 
