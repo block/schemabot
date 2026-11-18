@@ -464,9 +464,10 @@ backpressure semantics are the same; only the explanation is missing.
 
 **A throttled copy on a small writer can finish in hours instead of weeks after an upsize.** A
 schema change runs long for two reasons: a large table with many writes is more work, and a busy
-database leaves Spirit less room to do it. Upsizing helps with the second. Spirit copies as fast
-as the writer allows, and on Aurora both its thread budget and its thread pools follow the
-instance's vCPUs:
+database leaves Spirit less room to do it. Upsizing helps with the second, at the cost of a
+short write outage while the writer changes (see [Before you upsize](#before-you-upsize)).
+Spirit copies as fast as the writer allows, and on Aurora both its thread budget and its thread
+pools follow the instance's vCPUs:
 
 - **The thread budget grows.** The [redo-aware](#redo-aware) signal pauses the copy when active
   threads exceed the vCPUs plus one. A 2-vCPU writer allows 3, which a busy application can fill
@@ -481,18 +482,30 @@ In one staging schema change, the copy of a 107M-row table showed an ETA of abou
 `db.r6g.2xlarge` (8 vCPUs), the copy finished in about 2 hours. The application gained as well:
 its request latency roughly halved, and commit latency fell from 4.4ms to 1.85ms.
 
-Before you upsize:
+### Before you upsize
 
 - **Read the throttle reason.** A [`redo-aware`](#redo-aware) reason points at CPU, which more
   vCPUs relieve, because it leaves out threads waiting on the redo log. A
   [`threads-running`](#threads-running) reason counts those waiters too, so confirm high writer
   CPU before you resize for it. A sustained [`commit-latency`](#commit-latency) reason points at
   the write path, which a larger instance may not fix.
-- **Schedule the resize.** Changing a writer's instance class interrupts it, so plan it like any
-  other instance change. See [checkpointing](#checkpointing-and-resuming-a-change) for how an
-  interrupted copy resumes.
-- **Find the load before you size back down.** If the writer stays busy after the change finishes,
-  the smaller class would pin its CPU again. Find the source of that load first.
+- **Expect a short write outage.** Changing an instance's class takes that instance offline. When
+  it is the writer, the application cannot write until another instance takes over. Add a reader
+  at the larger class, or resize an existing one, and fail over to it. Writes then stop for
+  seconds to about a minute while the writer endpoint moves, plus however long your clients take
+  to reconnect. Do not change the writer's class in place, least of all on a cluster with no
+  reader: writes stay down until the instance comes back, which can take many minutes. Pick a
+  time of low traffic.
+- **Expect a cold cache.** The new writer starts with an empty buffer pool, so queries run slower
+  until it warms up.
+- **Stop the change first.** Run `stop` before the failover and `start` once the new writer is
+  serving (see [pausing](engines.md#pausing)). The copy then pauses at a
+  [checkpoint](#checkpointing-and-resuming-a-change) instead of failing partway through a chunk.
+  Spirit reads the vCPU count when the copy starts, so the new thread counts take effect on
+  `start`. Keep binary logs long enough to cover the pause, and do not resize during the cutover.
+- **Sizing back down is another writer change.** It brings the same outage and cold cache. If the
+  writer stays busy after the change finishes, the smaller class would pin its CPU again, so find
+  the source of that load first.
 
 ## Multi-target environments
 
