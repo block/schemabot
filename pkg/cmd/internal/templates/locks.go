@@ -9,7 +9,10 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
-// LockData contains data for rendering lock information.
+// LockData contains data for rendering lock information. Whoever takes a lock
+// chooses its owner and repository, and the lock list reports the database and
+// type of every lock the server holds, so the templates remove control runes
+// from each of those where they print it.
 type LockData struct {
 	Database     string
 	DatabaseType string
@@ -40,10 +43,12 @@ func WriteLockKept(database, dbType, reason string) {
 	fmt.Printf("   Release it once nothing is left to run: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
-// WriteLockForceReleased writes the force release message.
+// WriteLockForceReleased writes the force release message. The previous owner
+// is whatever the caller that took the lock named itself, so its control runes
+// are removed, as for every lock owner these templates print.
 func WriteLockForceReleased(database, dbType, previousOwner string) {
 	fmt.Printf(glyph.Attention+"  Force released lock for %s (%s)\n", database, dbType)
-	fmt.Printf("   Previous owner: %s\n", previousOwner)
+	fmt.Printf("   Previous owner: %s\n", ui.TerminalSafeLine(previousOwner))
 }
 
 // LockConflictData contains data for a lock conflict error.
@@ -65,11 +70,11 @@ func WriteLockConflict(data LockConflictData) {
 	// Show a table of lock info
 	rows := []BoxRow{
 		{"Database", fmt.Sprintf("%s (%s)", data.Database, data.DatabaseType)},
-		{"Locked by", data.Owner},
+		{"Locked by", ui.TerminalSafeLine(data.Owner)},
 		{"Since", formatLockTime(data.CreatedAt)},
 	}
 	if data.Repository != "" && data.PullRequest > 0 {
-		rows = append(rows, BoxRow{"PR", fmt.Sprintf("%s#%d", data.Repository, data.PullRequest)})
+		rows = append(rows, BoxRow{"PR", fmt.Sprintf("%s#%d", ui.TerminalSafeLine(data.Repository), data.PullRequest)})
 	}
 	WriteBox(rows, "", nil)
 	fmt.Println()
@@ -93,11 +98,11 @@ func WriteLocksList(locks []LockData) {
 	fmt.Printf("🔒 Active Locks (%d)\n\n", len(locks))
 
 	for i, lock := range locks {
-		fmt.Printf("  %d. %s (%s)\n", i+1, lock.Database, lock.DatabaseType)
-		fmt.Printf("     Owner: %s\n", lock.Owner)
+		fmt.Printf("  %d. %s (%s)\n", i+1, ui.TerminalSafeLine(lock.Database), ui.TerminalSafeLine(lock.DatabaseType))
+		fmt.Printf("     Owner: %s\n", ui.TerminalSafeLine(lock.Owner))
 		fmt.Printf("     Since: %s\n", formatLockTime(lock.CreatedAt))
 		if lock.Repository != "" && lock.PullRequest > 0 {
-			fmt.Printf("     PR:    %s#%d\n", lock.Repository, lock.PullRequest)
+			fmt.Printf("     PR:    %s#%d\n", ui.TerminalSafeLine(lock.Repository), lock.PullRequest)
 		}
 		if !lock.UpdatedAt.IsZero() && lock.UpdatedAt.After(lock.CreatedAt) {
 			fmt.Printf("     Last activity: %s\n", formatLockTime(lock.UpdatedAt))
@@ -119,8 +124,10 @@ func WriteNoLockFound(database, dbType string) {
 // locked under the requested type but does hold a lock under another database
 // type. Lock lookups are keyed by (database, type) and the type flag defaults
 // to mysql, so an operator targeting a vitess database without -t searches
-// the wrong namespace — point them at the lock that actually exists.
+// the wrong namespace — point them at the lock that actually exists. The type
+// found is read from the server's lock, so its control runes are removed.
 func WriteLockExistsUnderOtherType(database, requestedType, foundType string) {
+	foundType = ui.TerminalSafeLine(foundType)
 	fmt.Printf("No lock found for %s (%s), but a %s lock exists for this database.\n", database, requestedType, foundType)
 	fmt.Printf("Release it with: %s\n", cliname.Command("unlock", "-d", database, "-t", foundType))
 }
@@ -129,7 +136,7 @@ func WriteLockExistsUnderOtherType(database, requestedType, foundType string) {
 // other database types could not run, so a "no lock found" answer is only
 // authoritative for the requested type.
 func WriteLockTypeScanFailed(err error) {
-	fmt.Printf("Could not check for locks under other database types: %v\n", err)
+	fmt.Printf("Could not check for locks under other database types: %s\n", ui.TerminalSafeInline(err.Error()))
 }
 
 // WriteUnlockNotOwned writes the message when trying to unlock without ownership.
@@ -138,7 +145,7 @@ func WriteUnlockNotOwned(database, dbType, currentOwner string) {
 	fmt.Println(glyph.Attention + "  Cannot release lock")
 	fmt.Println()
 	fmt.Printf("  Database:      %s (%s)\n", database, dbType)
-	fmt.Printf("  Current owner: %s\n", currentOwner)
+	fmt.Printf("  Current owner: %s\n", ui.TerminalSafeLine(currentOwner))
 	fmt.Println()
 	fmt.Println("You can only release locks that you own.")
 	fmt.Println("Use --force to release a lock owned by someone else.")
