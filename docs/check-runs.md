@@ -76,7 +76,9 @@ SchemaBot's asynchronous response are not atomic.
 
 Recovery compares the latest observed head, direct base, default branch, native
 stack target, and eligibility. Target-specific recovery deliveries cover work
-already queued for that context. These observations do not prove planning
+already queued for that context. After an upgrade, an inbox delivery that
+already covers the head stays sufficient until SchemaBot observes a target or
+queues recovery for that target. These observations do not prove planning
 finished: an attempt discarded after a target change can still count as covered,
 and a failed eligibility read in the background planner can stop it after the
 original delivery completed. Either case may require an author to request a plan.

@@ -160,7 +160,7 @@ func writeSinglePR(t *testing.T, w http.ResponseWriter, number int, state, headS
 
 // coveringAutoPlanRow is an organic pull_request delivery that already plans
 // the head, so recovery must no-op on it.
-func coveringAutoPlanRow(t *testing.T, store storage.WebhookEventStore, pr int, headSHA string) {
+func coveringAutoPlanRow(t *testing.T, store storage.WebhookEventStore, pr int, headSHA, state string) {
 	t.Helper()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
@@ -170,6 +170,7 @@ func coveringAutoPlanRow(t *testing.T, store storage.WebhookEventStore, pr int, 
 		Repository:  "octocat/hello-world",
 		PullRequest: pr,
 		HeadSHA:     headSHA,
+		State:       state,
 		Payload:     []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -412,22 +413,39 @@ func TestCheckSuiteWebhookDedupesRedelivery(t *testing.T) {
 // grace and planned the head, so processing finds coverage and synthesizes
 // nothing.
 func TestDurableCheckSuiteCoveredHeadNoOps(t *testing.T) {
-	store := newRecordingWebhookEventStore()
-	coveringAutoPlanRow(t, store, 7, "suite-sha")
-	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
-	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "suite-sha")
+	for _, tc := range []struct {
+		name            string
+		withObservation bool
+	}{
+		{name: "current delivery", withObservation: true},
+		{name: "legacy delivery"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRecordingWebhookEventStore()
+			coveringAutoPlanRow(t, store, 7, "suite-sha", storage.WebhookEventCompleted)
+			h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+			if tc.withObservation {
+				recordMainTargetObservation(t, h, "octocat/hello-world", 7, "suite-sha", "delivery-organic-1")
+			}
 
-	mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
-		writeSinglePR(t, w, 7, "open", "suite-sha")
-	})
+			mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+				writeSinglePR(t, w, 7, "open", "suite-sha")
+			})
 
-	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "suite-sha", 7))
+			retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "suite-sha", 7))
 
-	require.NoError(t, err)
-	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
-	require.NoError(t, err)
-	require.Nil(t, row, "a covered head must not get a recovery row")
+			require.NoError(t, err)
+			require.False(t, retry)
+			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
+			require.NoError(t, err)
+			require.Nil(t, row, "a covered head must not get a recovery row")
+			if !tc.withObservation {
+				observed, err := h.loadPRTargetObservation(t.Context(), "octocat/hello-world", 7)
+				require.NoError(t, err)
+				require.Nil(t, observed, "legacy coverage does not create a target observation")
+			}
+		})
+	}
 }
 
 // The recovery case: an open PR still at the suite head has no auto-plan
@@ -651,7 +669,7 @@ func TestDurableCheckSuiteSameRepoEmptyPRListSkipsOpenPRWalk(t *testing.T) {
 // an uncovered sibling in the same pass still gets its recovery row.
 func TestDurableCheckSuiteMixedCoverageSynthesizesOnlyUncovered(t *testing.T) {
 	store := newRecordingWebhookEventStore()
-	coveringAutoPlanRow(t, store, 7, "suite-sha")
+	coveringAutoPlanRow(t, store, 7, "suite-sha", storage.WebhookEventPending)
 	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
 	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "suite-sha")
 	for _, pr := range []string{"7", "8"} {

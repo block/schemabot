@@ -232,30 +232,51 @@ func TestWebhookReconcilerReportsMissingInboxRow(t *testing.T) {
 }
 
 func TestWebhookReconcilerSkipsRecordedHead(t *testing.T) {
-	store := newRecordingWebhookEventStore()
-	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
-		DeliveryID:  "delivery-recorded",
-		Event:       "pull_request",
-		Action:      "synchronize",
-		Repository:  "octocat/hello-world",
-		PullRequest: 7,
-		HeadSHA:     "head-sha",
-		Payload:     []byte(`{}`),
-	})
-	require.NoError(t, err)
-	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
-	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "head-sha")
+	for _, tc := range []struct {
+		name            string
+		withObservation bool
+	}{
+		{name: "current delivery", withObservation: true},
+		{name: "legacy delivery"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRecordingWebhookEventStore()
+			_, err := store.Create(t.Context(), &storage.WebhookEvent{
+				Provider:    storage.WebhookProviderGitHub,
+				DeliveryID:  "delivery-recorded",
+				Event:       "pull_request",
+				Action:      "synchronize",
+				Repository:  "octocat/hello-world",
+				PullRequest: 7,
+				HeadSHA:     "head-sha",
+				State:       storage.WebhookEventCompleted,
+				Payload:     []byte(`{}`),
+			})
+			require.NoError(t, err)
+			h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+			if tc.withObservation {
+				recordMainTargetObservation(t, h, "octocat/hello-world", 7, "head-sha", "delivery-recorded")
+			}
 
-	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
-		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
-	})
+			mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+				writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+			})
 
-	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+			scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
 
-	require.Equal(t, 1, scanned)
-	require.Equal(t, 0, missing)
-	require.Equal(t, 0, synthesized)
+			require.Equal(t, 1, scanned)
+			require.Equal(t, 0, missing)
+			require.Equal(t, 0, synthesized)
+			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha"))
+			require.NoError(t, err)
+			require.Nil(t, row, "a covered head must not get a recovery row")
+			if !tc.withObservation {
+				observed, err := h.loadPRTargetObservation(t.Context(), "octocat/hello-world", 7)
+				require.NoError(t, err)
+				require.Nil(t, observed, "legacy coverage does not create a target observation")
+			}
+		})
+	}
 }
 
 func TestWebhookReconcilerSkipsGraceAndLookbackWindows(t *testing.T) {

@@ -219,7 +219,10 @@ func (h *Handler) recoveryTargetCovered(ctx context.Context, store storage.Webho
 		return false, fmt.Errorf("read target recovery delivery: %w", err)
 	}
 	if queued == nil {
-		return false, nil
+		// Keep legacy head coverage until we have an observation or a
+		// recovery delivery for the current target. The next evaluation
+		// records the actual target.
+		return observed == nil, nil
 	}
 	// Only work still queued or processing covers a context not yet observed.
 	// An older completed recovery cannot cover a later same-SHA return.

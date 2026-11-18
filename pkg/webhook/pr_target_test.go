@@ -218,27 +218,39 @@ func TestPublicationRejectsMovedEligibleTarget(t *testing.T) {
 // A completed organic delivery for an earlier target cannot cover a later
 // target's exhausted synthesized delivery. Recovery reopens the failed row.
 func TestTargetRecoveryRetriesDespiteEarlierOrganicHeadCoverage(t *testing.T) {
-	store := newRecordingWebhookEventStore()
-	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
-	_, err := store.Create(t.Context(), &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "old-target", Event: "pull_request", Action: "opened", Repository: "octocat/hello-world", PullRequest: 7, HeadSHA: "same-head", State: storage.WebhookEventCompleted, Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	info := &ghclient.PullRequestInfo{HeadSHA: "same-head", BaseRef: "main", DefaultBranch: "main"}
-	decision := ghclient.PRTargetEligibility{Target: "main", Eligible: true}
-	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "same-head", prTargetObservation(info, decision))
-	_, err = store.Create(t.Context(), &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: guid, Event: "pull_request", Action: "synchronize", Repository: "octocat/hello-world", PullRequest: 7, HeadSHA: "same-head", State: storage.WebhookEventFailed, Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.NoError(t, h.recordPRTargetObservation(t.Context(), "octocat/hello-world", 7, info, decision, guid))
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
-		writeOpenPRs(t, w, openPR(7, "same-head", time.Now().Add(-time.Hour)))
-	})
-	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
-	assert.Equal(t, 1, scanned)
-	assert.Equal(t, 1, missing)
-	assert.Equal(t, 1, synthesized)
-	reopened, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, guid)
-	require.NoError(t, err)
-	require.NotNil(t, reopened)
-	assert.Equal(t, storage.WebhookEventPending, reopened.State)
+	for _, tc := range []struct {
+		name            string
+		withObservation bool
+	}{
+		{name: "observed failure", withObservation: true},
+		{name: "failure before observation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRecordingWebhookEventStore()
+			h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+			_, err := store.Create(t.Context(), &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "old-target", Event: "pull_request", Action: "opened", Repository: "octocat/hello-world", PullRequest: 7, HeadSHA: "same-head", State: storage.WebhookEventCompleted, Payload: []byte(`{}`)})
+			require.NoError(t, err)
+			info := &ghclient.PullRequestInfo{HeadSHA: "same-head", BaseRef: "main", DefaultBranch: "main"}
+			decision := ghclient.PRTargetEligibility{Target: "main", Eligible: true}
+			guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "same-head", prTargetObservation(info, decision))
+			_, err = store.Create(t.Context(), &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: guid, Event: "pull_request", Action: "synchronize", Repository: "octocat/hello-world", PullRequest: 7, HeadSHA: "same-head", State: storage.WebhookEventFailed, Payload: []byte(`{}`)})
+			require.NoError(t, err)
+			if tc.withObservation {
+				require.NoError(t, h.recordPRTargetObservation(t.Context(), "octocat/hello-world", 7, info, decision, guid))
+			}
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+				writeOpenPRs(t, w, openPR(7, "same-head", time.Now().Add(-time.Hour)))
+			})
+			scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+			assert.Equal(t, 1, scanned)
+			assert.Equal(t, 1, missing)
+			assert.Equal(t, 1, synthesized)
+			reopened, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, guid)
+			require.NoError(t, err)
+			require.NotNil(t, reopened)
+			assert.Equal(t, storage.WebhookEventPending, reopened.State)
+		})
+	}
 }
 
 // A completed or permanently failed recovery from an earlier enforced-target
