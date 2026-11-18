@@ -8,8 +8,8 @@ import (
 	"sync"
 )
 
-// requestPRInfoCache memoises FetchPullRequest, FetchPRFiles, and
-// IsTeamMember results for the lifetime of a single webhook delivery (or
+// requestPRInfoCache memoises PR metadata, changed files, required checks, and
+// team membership for the lifetime of a single webhook delivery (or
 // any other ctx-bounded operation it is attached to). A fresh cache is constructed at every entry
 // point via WithPRInfoCache, so the cached value cannot outlive the scope it
 // was created for — eliminating the staleness risk that a TTL'd
@@ -30,7 +30,7 @@ type requestPRInfoCache struct {
 	mu             sync.Mutex
 	m              map[string]*PullRequestInfo
 	files          map[string][]PRFile
-	requiredChecks map[string][]string
+	requiredChecks map[branchPolicyCacheKey][]string
 	memberships    map[string]bool
 }
 

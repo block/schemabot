@@ -93,8 +93,11 @@ excursion. It adds no generation solely to revoke prior results or confirmations
 Default-target PRs need no protection lookup. For each distinct non-default
 target within one delivery or recovery scan, SchemaBot reads active branch
 rules (paginated) and queries the ref's classic `branchProtectionRule` through
-GraphQL. These lookups do not grow with changed-file count. Publication and apply
-acceptance also perform bounded uncached PR metadata reads. A two-environment
+GraphQL. Overlapping lookups for the same repository and ref share one fetch
+within a GitHub App installation client. Each delivery keeps its own successful
+result and later deliveries fetch current policy. These lookups do not grow
+with changed-file count. Publication and apply acceptance also perform bounded
+uncached PR metadata reads. A two-environment
 no-work publisher reads one initial target snapshot and performs one final
 uncached check per published environment, in addition to scope discovery and
 revalidation. Existing snapshots are reused for the initial currency check. A successful null

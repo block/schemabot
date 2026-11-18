@@ -1,13 +1,17 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -176,4 +180,284 @@ func TestEvaluatePRTarget(t *testing.T) {
 			}
 		})
 	}
+}
+
+type policyWaitContext struct {
+	context.Context
+	waiting chan struct{}
+}
+
+func (c policyWaitContext) Done() <-chan struct{} {
+	// The caller consults Done after joining the in-flight read.
+	select {
+	case c.waiting <- struct{}{}:
+	default:
+	}
+	return c.Context.Done()
+}
+
+func receivePolicyTestResult[T any](t *testing.T, ctx context.Context, ready <-chan T) T {
+	t.Helper()
+	select {
+	case result := <-ready:
+		return result
+	case <-ctx.Done():
+		require.NoError(t, ctx.Err(), "wait for branch policy test")
+		var zero T
+		return zero
+	}
+}
+
+type policyTestResult struct {
+	decision PRTargetEligibility
+	err      error
+}
+
+func evaluatePolicyInBackground(ctx context.Context, client *InstallationClient, repo, branch, checkBase string) <-chan policyTestResult {
+	result := make(chan policyTestResult, 1)
+	go func() {
+		decision, err := client.EvaluatePRTarget(ctx, repo, &PullRequestInfo{BaseRef: branch, DefaultBranch: "main"}, []string{checkBase})
+		result <- policyTestResult{decision: decision, err: err}
+	}()
+	return result
+}
+
+func writePolicyClassicResponse(t *testing.T, w http.ResponseWriter, r *http.Request, protection string) {
+	t.Helper()
+	var request struct {
+		Variables map[string]string `json:"variables"`
+	}
+	require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+	branch := strings.TrimPrefix(request.Variables["ref"], "refs/heads/")
+	_, err := fmt.Fprintf(w, `{"data":{"repository":{"ref":{"name":%q,"branchProtectionRule":%s}}}}`, branch, protection)
+	require.NoError(t, err)
+}
+
+func TestEvaluatePRTargetSharesOverlappingPolicyReads(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var ruleReads, classicReads atomic.Int32
+	var protectionChanged atomic.Bool
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/rules/branches/release", func(w http.ResponseWriter, r *http.Request) {
+		if ruleReads.Add(1) == 1 {
+			started <- struct{}{}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if !protectionChanged.Load() {
+			if r.URL.Query().Get("page") == "1" {
+				w.Header().Set("Link", `<?page=2>; rel="next"`)
+			} else {
+				_, err := io.WriteString(w, `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Rule plan (staging)"}]}}]`)
+				require.NoError(t, err)
+				return
+			}
+		}
+		_, err := io.WriteString(w, `[]`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		classicReads.Add(1)
+		rule := `{"requiresStatusChecks":true,"requiredStatusCheckContexts":["SchemaBot (staging)"]}`
+		if protectionChanged.Load() {
+			rule = "null"
+		}
+		writePolicyClassicResponse(t, w, r, rule)
+	})
+
+	first := evaluatePolicyInBackground(WithPRInfoCache(ctx), ic, "octocat/hello-world", "release", "SchemaBot")
+	receivePolicyTestResult(t, ctx, started)
+	waiter := policyWaitContext{Context: WithPRInfoCache(ctx), waiting: make(chan struct{}, 1)}
+	second := evaluatePolicyInBackground(waiter, ic, "OctoCat/Hello-World", "release", "Other check")
+	receivePolicyTestResult(t, ctx, waiter.waiting)
+	finish()
+
+	firstResult := receivePolicyTestResult(t, ctx, first)
+	require.NoError(t, firstResult.err)
+	assert.True(t, firstResult.decision.Eligible, "classic protection contributes to the shared policy")
+	secondResult := receivePolicyTestResult(t, ctx, second)
+	require.NoError(t, secondResult.err)
+	assert.False(t, secondResult.decision.Eligible, "each caller matches its own check names")
+	assert.Equal(t, int32(2), ruleReads.Load(), "one shared paginated rules read")
+	assert.Equal(t, int32(1), classicReads.Load(), "one shared classic protection read")
+
+	protectionChanged.Store(true)
+	info := &PullRequestInfo{BaseRef: "release", DefaultBranch: "main"}
+	decision, err := ic.EvaluatePRTarget(waiter, "octocat/hello-world", info, []string{"Rule plan"})
+	require.NoError(t, err)
+	assert.True(t, decision.Eligible, "the delivery retains the complete shared list, including the second rules page")
+	assert.Equal(t, int32(2), ruleReads.Load())
+	assert.Equal(t, int32(1), classicReads.Load())
+
+	decision, err = ic.EvaluatePRTarget(WithPRInfoCache(ctx), "octocat/hello-world", info, []string{"SchemaBot", "Rule plan"})
+	require.NoError(t, err)
+	assert.False(t, decision.Eligible, "a later delivery sees the changed policy")
+	assert.Equal(t, int32(3), ruleReads.Load())
+	assert.Equal(t, int32(2), classicReads.Load())
+}
+
+func TestEvaluatePRTargetPolicyReadSurvivesCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var reads atomic.Int32
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release", func(w http.ResponseWriter, r *http.Request) {
+		if reads.Add(1) == 1 {
+			started <- struct{}{}
+		}
+		select {
+		case <-release:
+			_, err := io.WriteString(w, `[]`)
+			require.NoError(t, err)
+		case <-r.Context().Done():
+		}
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		writePolicyClassicResponse(t, w, r, `{"requiresStatusChecks":true,"requiredStatusCheckContexts":["SchemaBot"]}`)
+	})
+
+	leaderCtx, cancelLeader := context.WithCancel(WithPRInfoCache(ctx))
+	defer cancelLeader()
+	leader := evaluatePolicyInBackground(leaderCtx, ic, "octocat/hello-world", "release", "SchemaBot")
+	receivePolicyTestResult(t, ctx, started)
+
+	waiterCtx, cancelWaiter := context.WithCancel(WithPRInfoCache(ctx))
+	defer cancelWaiter()
+	waiter := policyWaitContext{Context: waiterCtx, waiting: make(chan struct{}, 1)}
+	waiting := evaluatePolicyInBackground(waiter, ic, "octocat/hello-world", "release", "SchemaBot")
+	receivePolicyTestResult(t, ctx, waiter.waiting)
+	survivor := policyWaitContext{Context: WithPRInfoCache(ctx), waiting: make(chan struct{}, 1)}
+	surviving := evaluatePolicyInBackground(survivor, ic, "octocat/hello-world", "release", "SchemaBot")
+	receivePolicyTestResult(t, ctx, survivor.waiting)
+
+	cancelLeader()
+	cancelWaiter()
+	leaderResult := receivePolicyTestResult(t, ctx, leader)
+	waiterResult := receivePolicyTestResult(t, ctx, waiting)
+	assert.ErrorIs(t, leaderResult.err, context.Canceled)
+	assert.ErrorIs(t, waiterResult.err, context.Canceled)
+	finish()
+
+	result := receivePolicyTestResult(t, ctx, surviving)
+	require.NoError(t, result.err)
+	assert.True(t, result.decision.Eligible)
+	assert.Equal(t, int32(1), reads.Load(), "cancelling either caller leaves one shared read")
+}
+
+func TestEvaluatePRTargetSeparatesPolicyReadIdentities(t *testing.T) {
+	ctx, cancel := context.WithTimeout(WithPRInfoCache(t.Context()), 5*time.Second)
+	defer cancel()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/{owner}/{repo}/rules/branches/{branch}", func(w http.ResponseWriter, r *http.Request) {
+		response := `[]`
+		if r.PathValue("repo") == "hello-world" && r.PathValue("branch") == "release" {
+			started <- struct{}{}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			response = `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot"}]}}]`
+		}
+		_, err := io.WriteString(w, response)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		writePolicyClassicResponse(t, w, r, "null")
+	})
+
+	otherClient, otherMux := setupRateLimitedTestGitHubServer(t)
+	otherMux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, `[]`)
+		require.NoError(t, err)
+	})
+	otherMux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		writePolicyClassicResponse(t, w, r, "null")
+	})
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ic := NewInstallationClient(client, logger)
+	otherInstallation := NewInstallationClient(otherClient, logger)
+	leader := evaluatePolicyInBackground(ctx, ic, "octocat/hello-world", "release", "SchemaBot")
+	receivePolicyTestResult(t, ctx, started)
+
+	for _, tc := range []struct {
+		name   string
+		client *InstallationClient
+		repo   string
+		branch string
+	}{
+		{name: "another repository", client: ic, repo: "octocat/other", branch: "release"},
+		{name: "case-sensitive branch", client: ic, repo: "octocat/hello-world", branch: "Release"},
+		{name: "another installation client", client: otherInstallation, repo: "octocat/hello-world", branch: "release"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &PullRequestInfo{BaseRef: tc.branch, DefaultBranch: "main"}
+			decision, err := tc.client.EvaluatePRTarget(ctx, tc.repo, info, []string{"SchemaBot"})
+			require.NoError(t, err)
+			assert.False(t, decision.Eligible, "a separate policy lookup finishes independently")
+		})
+	}
+	finish()
+	result := receivePolicyTestResult(t, ctx, leader)
+	require.NoError(t, result.err)
+	assert.True(t, result.decision.Eligible)
+
+	info := &PullRequestInfo{BaseRef: "release", DefaultBranch: "main"}
+	decision, err := otherInstallation.EvaluatePRTarget(ctx, "octocat/hello-world", info, []string{"SchemaBot"})
+	require.NoError(t, err)
+	assert.False(t, decision.Eligible, "policy caches stay isolated even within a shared context")
+}
+
+func TestEvaluatePRTargetRetriesFailedSharedPolicyRead(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var rulesReads, classicReads atomic.Int32
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release", func(w http.ResponseWriter, _ *http.Request) {
+		rulesReads.Add(1)
+		_, err := io.WriteString(w, `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot"}]}}]`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		if classicReads.Add(1) == 1 {
+			_, err := io.WriteString(w, `{"errors":[{"message":"protection denied"}]}`)
+			require.NoError(t, err)
+			return
+		}
+		writePolicyClassicResponse(t, w, r, "null")
+	})
+
+	ctx := WithPRInfoCache(t.Context())
+	info := &PullRequestInfo{BaseRef: "release", DefaultBranch: "main"}
+	decision, err := ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, []string{"SchemaBot"})
+	require.ErrorContains(t, err, "protection denied")
+	assert.False(t, decision.Eligible, "partial rules alone do not establish policy")
+
+	decision, err = ic.EvaluatePRTarget(ctx, "octocat/hello-world", info, []string{"SchemaBot"})
+	require.NoError(t, err)
+	assert.True(t, decision.Eligible, "the next read retries both policy sources")
+	assert.Equal(t, int32(2), rulesReads.Load())
+	assert.Equal(t, int32(2), classicReads.Load())
 }

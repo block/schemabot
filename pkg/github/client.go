@@ -27,6 +27,7 @@ import (
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	gh "github.com/google/go-github/v86/github"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // schemaDiscoveryConcurrency bounds the parallel per-namespace directory
@@ -434,6 +435,10 @@ type InstallationClient struct {
 	// Optional: when nil, GetPRCheckStatuses bypasses the coalescer
 	// (e.g. tests).
 	checkStatusSingleflight *CheckStatusSingleflight
+
+	// branchPolicyReads shares overlapping policy lookups for this API client
+	// and installation. The factory reuses the client across deliveries.
+	branchPolicyReads singleflight.Group
 
 	// treeLevels holds tree levels read by SHA across calls, so the
 	// listings and comparisons a delivery repeats read each level once.

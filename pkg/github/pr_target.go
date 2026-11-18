@@ -76,9 +76,16 @@ func (ic *InstallationClient) EvaluatePRTarget(ctx context.Context, repo string,
 	return result, nil
 }
 
+type branchPolicyCacheKey struct {
+	client *InstallationClient
+	target string
+}
+
 func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo, branch string) ([]string, error) {
 	cache := prInfoCacheFromContext(ctx)
-	key := repo + "\x00" + branch
+	// GitHub repository names are case-insensitive, and ref names are exact.
+	target := strings.ToLower(repo) + "\x00" + branch
+	key := branchPolicyCacheKey{client: ic, target: target}
 	if cache != nil {
 		cache.mu.Lock()
 		names, ok := cache.requiredChecks[key]
@@ -87,6 +94,40 @@ func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo,
 			return names, nil
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Bound the combined ruleset and classic lookup independently of the
+	// callers. Each waiter may cancel while the shared GitHub read continues.
+	flight := ic.branchPolicyReads.DoChan(target, func() (any, error) {
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedFetchTimeout)
+		defer cancel()
+		return ic.fetchRequiredChecks(fetchCtx, repo, branch)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-flight:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		// Eligibility reads this list without mutating it. Only successful
+		// results enter the current delivery's cache.
+		contexts := result.Val.([]string)
+		if cache != nil {
+			cache.mu.Lock()
+			if cache.requiredChecks == nil {
+				cache.requiredChecks = make(map[branchPolicyCacheKey][]string)
+			}
+			cache.requiredChecks[key] = contexts
+			cache.mu.Unlock()
+		}
+		return contexts, nil
+	}
+}
+
+func (ic *InstallationClient) fetchRequiredChecks(ctx context.Context, repo, branch string) ([]string, error) {
 	owner, name := splitRepo(repo)
 	var contexts []string
 	for page := 1; page != 0; {
@@ -123,16 +164,7 @@ func (ic *InstallationClient) requiredChecksForBranch(ctx context.Context, repo,
 	if err != nil {
 		return nil, err
 	}
-	contexts = append(contexts, classic...)
-	if cache != nil {
-		cache.mu.Lock()
-		if cache.requiredChecks == nil {
-			cache.requiredChecks = make(map[string][]string)
-		}
-		cache.requiredChecks[key] = contexts
-		cache.mu.Unlock()
-	}
-	return contexts, nil
+	return append(contexts, classic...), nil
 }
 
 // A successful GraphQL null branchProtectionRule proves there is no classic
