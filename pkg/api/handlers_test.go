@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -430,6 +431,33 @@ func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, en
 		return nil, nil
 	}
 	return []*storage.Apply{s.apply}, nil
+}
+
+// GetRecent mirrors the SQL store's paging over the fixture rows: the rows
+// matching the database and environment byte-for-byte, below AfterID when it
+// is set, by row id descending, cut to the limit.
+func (s *staticApplyStore) GetRecent(_ context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	var applies []*storage.Apply
+	for _, apply := range s.applies {
+		if filter.Database != "" && apply.Database != filter.Database {
+			continue
+		}
+		if filter.Environment != "" && apply.Environment != filter.Environment {
+			continue
+		}
+		if filter.AfterID > 0 && apply.ID >= filter.AfterID {
+			continue
+		}
+		applies = append(applies, apply)
+	}
+	slices.SortFunc(applies, func(a, b *storage.Apply) int { return cmp.Compare(b.ID, a.ID) })
+	if filter.Limit > 0 && len(applies) > filter.Limit {
+		applies = applies[:filter.Limit]
+	}
+	return applies, nil
 }
 
 // GetLatestByDatabase returns the first fixture row GetByDatabase matches;
@@ -6267,22 +6295,24 @@ func TestHandleStatusFailedFilter(t *testing.T) {
 	assert.Equal(t, "duplicate column name 'status'", resp.Applies[0].ErrorMessage)
 }
 
-func TestParseStatusLimit(t *testing.T) {
+func TestParseApplyListLimit(t *testing.T) {
 	for _, tt := range []struct {
-		name      string
-		target    string
-		want      int
-		wantError bool
+		name         string
+		target       string
+		defaultLimit int
+		want         int
+		wantError    bool
 	}{
-		{name: "default", target: "/api/status", want: defaultStatusLimit},
-		{name: "custom", target: "/api/status?limit=50", want: 50},
-		{name: "clamped", target: "/api/status?limit=5000", want: maxStatusLimit},
-		{name: "zero", target: "/api/status?limit=0", wantError: true},
-		{name: "not a number", target: "/api/status?limit=lots", wantError: true},
+		{name: "status default", target: "/api/status", defaultLimit: defaultStatusLimit, want: defaultStatusLimit},
+		{name: "history default", target: "/api/history/orders", defaultLimit: defaultHistoryLimit, want: maxStatusLimit},
+		{name: "custom", target: "/api/status?limit=50", defaultLimit: defaultStatusLimit, want: 50},
+		{name: "clamped", target: "/api/status?limit=5000", defaultLimit: defaultStatusLimit, want: maxStatusLimit},
+		{name: "zero", target: "/api/status?limit=0", defaultLimit: defaultStatusLimit, wantError: true},
+		{name: "not a number", target: "/api/status?limit=lots", defaultLimit: defaultStatusLimit, wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
-			got, err := parseStatusLimit(req)
+			got, err := parseApplyListLimit(req, tt.defaultLimit)
 			if tt.wantError {
 				require.Error(t, err)
 				return
