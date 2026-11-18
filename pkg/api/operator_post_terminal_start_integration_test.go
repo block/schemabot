@@ -755,4 +755,45 @@ func TestOperator_RolloutObserverFollowsTheCopyAcrossARestart(t *testing.T) {
 		"the pod that claims after a second restart attaches its own observer")
 	assert.Zero(t, restartedAgain.matrixSummary.count(),
 		"no terminal summary publishes while the rollout is still copying")
+	assert.Empty(t, getApply(t, ctx, stor, seed.applyID).LeaseToken,
+		"a rollout's operation claims never lease the parent apply, so while a target copies the observer's edits go through the progress comment authority")
+}
+
+// The process whose command started the rollout already has its observer
+// attached, so its claims of the rollout attach no second one. The one it
+// remembers drops when the rollout settles, and a later resume in the same
+// process attaches again.
+func TestOperator_RolloutClaimKeepsTheCommandObserver(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "rollout-with-command-observer",
+		parentState:     state.Apply.Running,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a", "region-b"},
+		opState:         state.ApplyOperation.Pending,
+		taskState:       state.Task.Pending,
+	})
+
+	rec := &driveRecorder{}
+	stillCopying := map[string]matrixOutcome{
+		"region-a": {taskState: state.Task.Running},
+		"region-b": {taskState: state.Task.Completed},
+	}
+	svc := newMatrixService(t, stor, matrixClients(stor, rec, stillCopying))
+	// The command that started the rollout attached its observer here.
+	svc.rememberResumeObserver(seed.applyID, 0)
+
+	driveNextOperation(t, ctx, svc, 1)
+	require.Equal(t, []string{"region-a"}, rec.resumeOrder())
+	assert.Zero(t, svc.matrixSummary.recoveredCount(),
+		"the claim leaves the command's observer as the rollout's only one")
 }

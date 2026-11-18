@@ -2003,6 +2003,9 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 			setter.SetApplyID(storedApplyID)
 		}
 		client.SetObserver(storedApplyID, observer)
+		// A rollout's claims in this process must not attach a second
+		// observer beside the one the command just attached.
+		s.rememberResumeObserver(storedApplyID, 0)
 	}
 
 	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)

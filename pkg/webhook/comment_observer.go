@@ -1152,15 +1152,16 @@ func (o *CommentObserver) decideProgressCommentAuthority(apply *storage.Apply, o
 // parent apply lease is legitimately unheld mid-apply. True when the apply is
 // non-terminal and either its generation manifest still lists keys with no
 // attached operation (the dispatcher owes more dispatch waves) or the apply
-// has multiple attached operations with a keyed row not yet terminal. A
-// single attached operation is deliberately not counted, matching the
-// operator's drive-mode split: that shape drives under the parent apply
-// lease, so an unheld lease there means no driver and the lease checks stay
-// authoritative. (The one single-operation drive that runs under the
-// operation lease — a task-less operation — fails closed here too; it has no
-// task progress to report and its terminal comment is published by the
-// aggregate projection winner.) Whole-deployment operations (empty key) are
-// likewise not counted, whatever their number.
+// has multiple attached operations with one not yet terminal. This matches the
+// operator's drive-mode split (tern.DecideApplyDriveMode), which drives every
+// apply with more than one operation under operation leases, whether its
+// operations are keyed shards or whole targets on deployments of their own. A
+// single attached operation is deliberately not counted: that shape drives
+// under the parent apply lease, so an unheld lease there means no driver and
+// the lease checks stay authoritative. (The one single-operation drive that
+// runs under the operation lease — a task-less operation — fails closed here
+// too; it has no task progress to report and its terminal comment is
+// published by the aggregate projection winner.)
 func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply *storage.Apply) (bool, error) {
 	if state.IsTerminalApplyState(apply.State) {
 		return false, nil
@@ -1176,7 +1177,7 @@ func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply
 		return false, nil
 	}
 	for _, op := range ops {
-		if op.OperationKey != "" && !state.IsApplyOperationTerminal(op.State) {
+		if !state.IsApplyOperationTerminal(op.State) {
 			return true, nil
 		}
 	}
