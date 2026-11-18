@@ -334,3 +334,65 @@ func TestOnePhaseSpeaksForParts(t *testing.T) {
 	assert.False(t, OnePhaseSpeaksForParts([]string{task.WaitingForCutover, task.Pending}))
 	assert.False(t, OnePhaseSpeaksForParts(nil))
 }
+
+// A table's rows across targets weigh each target the way its bar does: a
+// target that completed counts in full whatever its last report read, a
+// copying target counts its rows up to its own total, and a queued target
+// counts only by the plan's estimate. A halted target, or a queued one with no
+// estimate, is left out, so the rows cover only some of the targets.
+func TestSumTargetRows(t *testing.T) {
+	task := state.Task
+	planned := func(rows int64) *int64 { return &rows }
+	copying := Part{Status: task.Running, RowsCopied: 420, RowsTotal: 1000, ETASeconds: 120}
+
+	rows := SumTargetRows([]Part{copying, {Status: task.Completed, RowsCopied: 990, RowsTotal: 1000}})
+	assert.Equal(t, TargetRows{Copied: 1420, Total: 2000, Counted: 2, ETASeconds: 120}, rows)
+	assert.True(t, rows.Exact(2))
+	assert.False(t, rows.Partial(2))
+
+	// Rows a queued target reported before its copy started are not its
+	// progress, so they stay out of the sum.
+	rows = SumTargetRows([]Part{copying, {Status: task.Pending, RowsTotal: 9000}})
+	assert.Equal(t, TargetRows{Copied: 420, Total: 1000, Counted: 1, ETASeconds: 120, ETAFloor: true}, rows)
+	assert.False(t, rows.Exact(2))
+	assert.True(t, rows.Partial(2))
+
+	rows = SumTargetRows([]Part{copying, {Status: task.Pending, PlannedRows: planned(1000)}})
+	assert.Equal(t, TargetRows{Copied: 420, Total: 2000, Counted: 2, Estimated: true, ETASeconds: 120, ETAFloor: true}, rows)
+	assert.False(t, rows.Exact(2), "an estimate keeps the percent whole")
+
+	rows = SumTargetRows([]Part{copying, {Status: task.Failed, RowsCopied: 300, RowsTotal: 1000}})
+	assert.Equal(t, TargetRows{Copied: 420, Total: 1000, Counted: 1, ETASeconds: 120}, rows)
+
+	// A target past its copy with no rows had none to copy.
+	rows = SumTargetRows([]Part{copying, {Status: task.WaitingForCutover}})
+	assert.Equal(t, TargetRows{Copied: 420, Total: 1000, Counted: 2, ETASeconds: 120}, rows)
+	assert.True(t, rows.Exact(2))
+}
+
+// The rows line names how many targets the rows cover when they cover only
+// some, marks an estimated total as approximate, and floors the ETA when a
+// target still has time to add that no ETA covers.
+func TestTargetRowsLine(t *testing.T) {
+	size := int64(4_000_000_000)
+	exact := TargetRows{Copied: 3420, Total: 4000, Counted: 4, ETASeconds: 120}
+	assert.Equal(t, "Rows: 3,420 / 4,000 · ~4.0 GB · ETA: 2m 0s", exact.RowsLine(4, &size))
+
+	partial := TargetRows{Copied: 1420, Total: 2000, Counted: 2, ETASeconds: 120, ETAFloor: true}
+	assert.Equal(t, "Rows: 1,420 / 2,000 across 2 of 3 targets · ~4.0 GB across all 3 targets · ETA: ≥ 2m 0s", partial.RowsLine(3, &size))
+
+	estimated := TargetRows{Copied: 500, Total: 2000, Counted: 2, Estimated: true, ETAFloor: true}
+	assert.Equal(t, "Rows: 500 / ~2k", estimated.RowsLine(2, nil))
+
+	assert.Empty(t, TargetRows{Counted: 1}.RowsLine(2, nil), "no rows known")
+}
+
+// The percent beside a table's bar across targets reads at one target's
+// precision only when every target's rows are its own count, and never reads
+// as done while a target is still short of its total.
+func TestAcrossTargetsPercent(t *testing.T) {
+	assert.Equal(t, "85.50%", AcrossTargetsPercent(85, true, 3420, 4000))
+	assert.Equal(t, "85%", AcrossTargetsPercent(85, false, 3420, 4000))
+	assert.Equal(t, "99.99%", AcrossTargetsPercent(99, true, 4000, 4000))
+	assert.Equal(t, "0%", AcrossTargetsPercent(0, true, 0, 0))
+}

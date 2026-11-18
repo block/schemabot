@@ -430,7 +430,14 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			}
 			reported++
 			if countsTowardRolledRows(status) {
-				rolled.RowsCopied += t.RowsCopied
+				// A target that completed the change copied its rows in full,
+				// whatever its last progress report read, as
+				// presentation.SumTargetRows counts it.
+				copied := t.RowsCopied
+				if state.IsState(status, state.Task.Completed, state.Task.RevertWindow) {
+					copied = t.RowsTotal
+				}
+				rolled.RowsCopied += copied
 				rolled.RowsTotal += t.RowsTotal
 				rolled.ChecksumRowsChecked += t.ChecksumRowsChecked
 				rolled.ChecksumRowsTotal += t.ChecksumRowsTotal
@@ -502,53 +509,20 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	for i, s := range t.Shards {
 		parts[i] = shardPart(s)
 	}
-	pct := ui.RowCopyDisplayPercent(presentation.PercentAcrossTargets(parts, 0), t.RowsCopied)
-	if pct == 0 && t.RowsTotal == 0 {
+	rows := presentation.SumTargetRows(parts)
+	targets := len(t.Shards)
+	pct := ui.RowCopyDisplayPercent(presentation.PercentAcrossTargets(parts, 0), rows.Copied)
+	if pct == 0 && rows.Total == 0 {
 		// Nothing copied and no rows known: the table's phase says more.
 		return "", false
 	}
 	var b strings.Builder
-	reporting := 0
-	for _, s := range t.Shards {
-		if reportsRolledRows(s) {
-			reporting++
-		}
-	}
-	targets := len(t.Shards)
-	copied, total, estimated := rowsAcrossTargets(t.Shards)
-	// The percent has a single target's precision only when every target's
-	// rows are its own count; a plan's estimate for a target still to copy
-	// keeps it whole.
-	exact := reporting == targets && !t.RowsTotalPlanned && !estimated
-	rowsCopied, rowsTotal := ui.ClampRows(t.RowsCopied, t.RowsTotal), t.RowsTotal
-	approxTotal := t.RowsTotalPlanned
-	if reporting == targets && !t.RowsTotalPlanned && total > 0 {
-		rowsCopied, rowsTotal, approxTotal = copied, total, estimated
-	}
-	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), presentation.AcrossTargetsPercent(pct, exact, rowsCopied, rowsTotal), throttledSuffix(t))
+	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), presentation.AcrossTargetsPercent(pct, rows.Exact(targets), rows.Copied, rows.Total), throttledSuffix(t))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
-	if rowsTotal > 0 {
-		total := ui.FormatNumber(rowsTotal)
-		if approxTotal {
-			// The plan's estimate stands in for the targets still to copy.
-			total = ui.FormatApproxRows(rowsTotal)
-		}
-		line := fmt.Sprintf(indentDetail+"Rows: %s / %s", ui.FormatNumber(rowsCopied), total)
-		partial := reporting < targets
-		if partial {
-			line += fmt.Sprintf(" across %d of %d targets", reporting, targets)
-		}
-		line += presentation.TargetsTableSizeClause(t.EstimatedBytes, partial, targets)
-		if t.ETASeconds > 0 {
-			floor := ""
-			if slices.ContainsFunc(t.Shards, outsideTargetsETA) {
-				floor = "≥ "
-			}
-			line += " · ETA: " + floor + ui.FormatETA(t.ETASeconds)
-		}
-		b.WriteString(line + "\n")
+	if line := rows.RowsLine(targets, t.EstimatedBytes); line != "" {
+		b.WriteString(indentDetail + line + "\n")
 	}
 	writeThrottleTooltip(&b, t)
 	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), runningWord(t)))
@@ -577,33 +551,6 @@ func rowsAcrossTargets(targets []ShardProgress) (copied, total int64, estimated 
 		copied += ui.ClampRows(target.RowsCopied, target.RowsTotal)
 	}
 	return copied, total, estimated
-}
-
-// reportsRolledRows reports whether a target's rows are in the table's
-// rolled-up rows: it counts toward them (countsTowardRolledRows) and has
-// reported its rows, or the plan's estimate stands in for the copy still
-// ahead of it, or it is past its copy, which it may have finished without
-// copying any. A target working without its rows reported yet is left out, so
-// the rows line says the sum covers only some targets.
-func reportsRolledRows(s ShardProgress) bool {
-	if s.PlannedRows != nil {
-		return true
-	}
-	if !countsTowardRolledRows(s.Status) {
-		return false
-	}
-	return s.RowsTotal > 0 || !presentation.CopyStillAhead(s.Status)
-}
-
-// outsideTargetsETA reports whether a target still has time to add that the
-// rolled-up ETA does not cover: it has not started, or it is working without
-// having reported its rows yet. A target past its copy with no rows copied a
-// table that had none, so it adds nothing.
-func outsideTargetsETA(s ShardProgress) bool {
-	if state.IsState(s.Status, state.Task.Pending) {
-		return true
-	}
-	return state.IsInFlightTaskState(s.Status) && s.RowsTotal <= 0 && presentation.CopyStillAhead(s.Status)
 }
 
 // isHaltedAcrossTargets reports whether a table rolled up across targets has

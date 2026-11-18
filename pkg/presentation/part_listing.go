@@ -24,6 +24,9 @@ type Part struct {
 	// part's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
+	// ETASeconds is the part's own estimate of the time its copy has left,
+	// zero when its engine reports none.
+	ETASeconds int64
 	// PlannedRows is the plan's row estimate for a part whose copy is still
 	// ahead (CopyStillAhead) and whose engine has reported no row total yet,
 	// standing in for the rows it will copy. Nil once the part reports a
@@ -566,6 +569,126 @@ func PartStatusLabel(status string) string {
 	default:
 		return status
 	}
+}
+
+// TargetRows is a table's rows summed across the targets that run it, for the
+// rows line under its bar and the percent beside it. Every surface derives it
+// with SumTargetRows, so the PR comment and the CLI count the same rows.
+type TargetRows struct {
+	// Copied and Total are the rows copied of the rows to copy across the
+	// targets in Counted.
+	Copied, Total int64
+	// Counted is how many targets the sum covers. A target whose rows are not
+	// known, or whose rows are not progressing, is left out.
+	Counted int
+	// Estimated reports whether a plan's estimate stands in for the rows of a
+	// target still to copy, which makes Total approximate.
+	Estimated bool
+	// ETASeconds is the slowest copying target's ETA, zero when none reports
+	// one.
+	ETASeconds int64
+	// ETAFloor reports whether a target still has time to add that no target's
+	// ETA covers: it has not started, or it is working without having reported
+	// its rows yet. The table's ETA is then a floor.
+	ETAFloor bool
+}
+
+// SumTargetRows sums a table's rows across its targets the way
+// PercentAcrossTargets weighs them, so the rows line agrees with the bar. A
+// completed target counts in full, since it has every row; its engine's row
+// estimate may have run ahead of the rows it copied. A working target counts
+// the rows it reports, capped at its own total, so one target copying past its
+// estimate never covers another's unfinished copy. A target still to copy
+// counts the plan's estimate (Part.PlannedRows) as nothing copied yet, and
+// without one it is left out. A target past its copy that reported no rows
+// copied a table with none, so it counts as nothing to copy. A target that
+// failed, is retrying, halted, or is undoing the change is left out, since its
+// rows are not progressing.
+func SumTargetRows(parts []Part) TargetRows {
+	var r TargetRows
+	for _, p := range parts {
+		status := state.NormalizeTaskStatus(p.Status)
+		if status == state.Task.Pending || (p.RowsTotal <= 0 && CopyStillAhead(status)) {
+			r.ETAFloor = true
+		}
+		if status == state.Task.Running {
+			r.ETASeconds = max(r.ETASeconds, p.ETASeconds)
+		}
+		switch status {
+		case state.Task.Completed, state.Task.RevertWindow:
+			r.Counted++
+			r.Copied += max(p.RowsTotal, 0)
+			r.Total += max(p.RowsTotal, 0)
+		case state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled,
+			state.Task.Reverting, state.Task.Reverted:
+			continue
+		case state.Task.Pending:
+			// A queued target's rows are the plan's estimate until it starts:
+			// PercentAcrossTargets weighs it no other way.
+			if p.PlannedRows != nil {
+				r.Counted++
+				r.Total += *p.PlannedRows
+				r.Estimated = true
+			}
+		default:
+			switch {
+			case p.RowsTotal > 0:
+				r.Counted++
+				r.Copied += ui.ClampRows(p.RowsCopied, p.RowsTotal)
+				r.Total += p.RowsTotal
+			case p.PlannedRows != nil:
+				r.Counted++
+				r.Total += *p.PlannedRows
+				r.Estimated = true
+			case !CopyStillAhead(status):
+				r.Counted++
+			}
+		}
+	}
+	return r
+}
+
+// Exact reports whether every one of targets is in the sum by its engine's own
+// count, so the percent beside the bar can carry a single target's precision.
+func (r TargetRows) Exact(targets int) bool {
+	return r.Counted == targets && !r.Estimated && r.Total > 0
+}
+
+// Partial reports whether the sum leaves some of targets out, so the rows line
+// names the targets it covers.
+func (r TargetRows) Partial(targets int) bool {
+	return r.Counted < targets
+}
+
+// RowsLine is the rows line under a table's bar across targets, after its
+// bullet: "Rows: 1,400 / 2,000 across 2 of 3 targets · ~3.5 GB · ETA: ≥ 2m 0s".
+// The total is approximate while a plan's estimate stands in for a target. The
+// line names the targets it covers when it leaves some out, and then the
+// planned size, which is every target's, names them all (TargetsTableSizeClause).
+// estimatedBytes is the plan's size summed across every target, nil unless each
+// has one. It is empty while no target's rows are known.
+func (r TargetRows) RowsLine(targets int, estimatedBytes *int64) string {
+	if r.Total <= 0 {
+		return ""
+	}
+	total := ui.FormatNumber(r.Total)
+	if r.Estimated {
+		total = ui.FormatApproxRows(r.Total)
+	}
+	line := fmt.Sprintf("Rows: %s / %s", ui.FormatNumber(r.Copied), total)
+	partial := r.Partial(targets)
+	if partial {
+		line += fmt.Sprintf(" across %d of %d targets", r.Counted, targets)
+	}
+	line += TargetsTableSizeClause(estimatedBytes, partial, targets)
+	if r.ETASeconds > 0 {
+		floor := ""
+		if r.ETAFloor {
+			floor = "≥ "
+		}
+		line += " · ETA: " + floor + ui.FormatETA(r.ETASeconds)
+	}
+	return line
 }
 
 // AcrossTargetsPercent renders a table's percent across its targets beside

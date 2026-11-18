@@ -115,7 +115,7 @@ func shardPart(s ShardProgress) presentation.Part {
 	return presentation.Part{
 		Name: s.Shard, Status: s.Status, PercentComplete: s.PercentComplete, RowsCopied: s.RowsCopied, RowsTotal: s.RowsTotal,
 		ChecksumRowsChecked: s.ChecksumRowsChecked, ChecksumRowsTotal: s.ChecksumRowsTotal,
-		PlannedRows: s.PlannedRows,
+		ETASeconds: s.ETASeconds, PlannedRows: s.PlannedRows,
 	}
 }
 
