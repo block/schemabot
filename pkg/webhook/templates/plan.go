@@ -2847,15 +2847,12 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
-// directExecutionDocURL documents how a direct statement takes its table's
-// metadata lock: the wait, the kill, its attempts, and the blockers it spares.
-const directExecutionDocURL = "https://github.com/block/schemabot/blob/main/docs/direct-execution.md"
-
 // directMySQLConsequence is the MySQL consequence sentence of the
 // direct-execution disclosure.
-const directMySQLConsequence = "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again " +
-	"([how](" + directExecutionDocURL + ")). It never kills a `LOCK TABLES` session, a transaction too large to roll back, " +
-	"or a session it is not permitted to end: the apply fails as busy instead. " +
+const directMySQLConsequence = "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again, " +
+	"for a limited number of attempts ([how it works](" + ui.DirectExecutionDocURL + ")). " +
+	"It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end. " +
+	"When the attempts run out or it meets one of those blockers, the apply fails as busy. " +
 	"Writes to each table are blocked until its statement finishes."
 
 // directDisclosureCopy returns the header noun and the consequence sentence for
@@ -2872,9 +2869,9 @@ const directMySQLConsequence = "If a transaction holds a table's metadata lock p
 // The MySQL copy names the limits of the lock kill, so a reader does not take
 // it as a promise that every blocker is ended: the kill waits first, retries a
 // bounded number of times, and spares sessions it is unsafe or not permitted to
-// end, failing the apply as busy instead. It leaves out the wait and the
-// attempt count, which the policy and the engine own, and links to the
-// documentation that states them.
+// end. Running out of attempts and meeting a spared blocker both fail the
+// apply as busy. It leaves out the wait and the attempt count, which the
+// policy and the engine own, and links to the documentation that states them.
 func directDisclosureCopy(databaseType string, isMySQL bool) (headerNoun, consequence string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.

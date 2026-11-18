@@ -792,7 +792,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		logger.Info("executing statement directly as native MySQL DDL",
 			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows, "estimated_bytes", ds.bytes,
 			"lock_wait_timeout_seconds", lockWaitSeconds, "max_attempts", forceExecConfig.MaxRetries)
-		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: transactions blocking the table's metadata lock are killed; writes to the table block while it runs")
+		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: a transaction holding the table's metadata lock past a short wait is killed and the statement retried, a limited number of times; a LOCK TABLES session, a transaction too large to roll back, or a session SchemaBot is not permitted to end is never killed and fails the apply as busy; writes to the table block while it runs")
 		// The ALTER is spliced in with %r so ForceExec's format string never
 		// interprets it: a literal % in a comment or default value stays as
 		// written.
