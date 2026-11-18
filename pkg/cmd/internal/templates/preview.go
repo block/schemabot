@@ -176,20 +176,21 @@ const (
 	PreviewCommentApplyCuttingOver             PreviewType = "comment_apply_cutting_over"              // Cutting over
 
 	// Multi-deployment apply comment previews (one apply fanned out across deployments)
-	PreviewCommentMultiDeployInProgress PreviewType = "comment_multi_deploy_in_progress" // Barrier rollout mid-flight
-	PreviewCommentMultiDeployFailed     PreviewType = "comment_multi_deploy_failed"      // Halt-on-failure: one deployment failed
-	PreviewCommentMultiDeployCompleted  PreviewType = "comment_multi_deploy_completed"   // All deployments completed
-	PreviewCommentMultiDeployAll        PreviewType = "comment_multi_deploy_all"         // Show all multi-deployment apply previews
-	PreviewCLIMultiDeployInProgress     PreviewType = "cli_multi_deploy_in_progress"     // Barrier rollout mid-flight
-	PreviewCLIMultiDeployFailed         PreviewType = "cli_multi_deploy_failed"          // Halt-on-failure: one deployment failed
-	PreviewCLIMultiDeployHalted         PreviewType = "cli_multi_deploy_halted"          // Halt-on-failure while a sibling deployment is still running
-	PreviewCLIMultiDeployCompleted      PreviewType = "cli_multi_deploy_completed"       // All deployments completed
-	PreviewCLIMultiDeployAll            PreviewType = "cli_multi_deploy_all"             // Show all CLI multi-deployment apply previews
-	PreviewCommentShardedAll            PreviewType = "comment_sharded_all"              // Show all sharded apply + plan previews
-	PreviewAggregateCheckSummary        PreviewType = "aggregate_check_summary"          // Aggregate check Details summary (own databases + tenant deployments)
-	PreviewAggregateCheckFileCapBlocked PreviewType = "aggregate_check_file_cap_blocked" // Failing aggregate when the PR exceeds GitHub's changed-file cap
-	PreviewAggregateCheckStopped        PreviewType = "aggregate_check_stopped"          // Aggregate check while a stopped apply holds the PR
-	PreviewAggregateCheckRollout        PreviewType = "aggregate_check_rollout"          // Aggregate check naming the targets a multi-target rollout still needs
+	PreviewCommentMultiDeployInProgress    PreviewType = "comment_multi_deploy_in_progress"     // Barrier rollout mid-flight
+	PreviewCommentMultiDeployFailed        PreviewType = "comment_multi_deploy_failed"          // Halt-on-failure: one deployment failed
+	PreviewCommentMultiDeployCompleted     PreviewType = "comment_multi_deploy_completed"       // All deployments completed
+	PreviewCommentMultiDeployAll           PreviewType = "comment_multi_deploy_all"             // Show all multi-deployment apply previews
+	PreviewCLIMultiDeployInProgress        PreviewType = "cli_multi_deploy_in_progress"         // Barrier rollout mid-flight
+	PreviewCLIMultiDeployFailed            PreviewType = "cli_multi_deploy_failed"              // Halt-on-failure: one deployment failed
+	PreviewCLIMultiDeployHalted            PreviewType = "cli_multi_deploy_halted"              // Halt-on-failure while a sibling deployment is still running
+	PreviewCLIMultiDeployCompleted         PreviewType = "cli_multi_deploy_completed"           // All deployments completed
+	PreviewCLIMultiDeployAll               PreviewType = "cli_multi_deploy_all"                 // Show all CLI multi-deployment apply previews
+	PreviewCommentShardedAll               PreviewType = "comment_sharded_all"                  // Show all sharded apply + plan previews
+	PreviewAggregateCheckSummary           PreviewType = "aggregate_check_summary"              // Aggregate check Details summary (own databases + tenant deployments)
+	PreviewAggregateCheckFileCapBlocked    PreviewType = "aggregate_check_file_cap_blocked"     // Failing aggregate when the PR exceeds GitHub's changed-file cap
+	PreviewAggregateCheckAutoPlanSizeLimit PreviewType = "aggregate_check_auto_plan_size_limit" // Failing aggregate when the PR is too large to plan automatically
+	PreviewAggregateCheckStopped           PreviewType = "aggregate_check_stopped"              // Aggregate check while a stopped apply holds the PR
+	PreviewAggregateCheckRollout           PreviewType = "aggregate_check_rollout"              // Aggregate check naming the targets a multi-target rollout still needs
 
 	// Single-table apply comment previews (most common case)
 	PreviewCommentSingleProgress           PreviewType = "comment_single_progress"             // Single table running

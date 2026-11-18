@@ -129,6 +129,20 @@ func PreviewAggregateCheckFileCapBlocked() string {
 	return "Plan failed\n\n" + prFileCapExceededBlock.message
 }
 
+// PreviewAggregateCheckAutoPlanSizeLimit renders the failing aggregate-check
+// output published when a PR changes schema in more databases than one
+// automatic plan covers: the fixed failure title plus the summary naming the
+// counts, the limit, and the way forward.
+func PreviewAggregateCheckAutoPlanSizeLimit() string {
+	return planFailedCheckText + "\n\n" + autoPlanSizeLimitCheckSummary(templates.AutoPlanSizeLimitData{
+		Databases:        make([]string, 28),
+		SchemaFiles:      400,
+		MaxDatabases:     10,
+		MaxSchemaFiles:   100,
+		TooManyDatabases: true,
+	})
+}
+
 // PreviewRollbackConfirmPlanWithoutRouting renders the refusal of a
 // rollback-confirm whose pinned rollback plan was stored without the
 // deployment it routes to, through the renderer rollback-confirm uses.

@@ -652,6 +652,7 @@ Run output remains human-readable and may change.
 | `github_schema_config_discovery_unavailable` | Aggregate row | SchemaBot knew the PR head SHA, but GitHub was unavailable while SchemaBot inspected changed files or repository contents. |
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
 | `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
+| `auto_plan_size_limit` | Aggregate row | The PR changes schema in more databases, or more schema files across several databases, than one automatic plan covers (see [Auto-plan Limits](configuration.md#auto-plan-limits)), so SchemaBot read none of its schema. Like `pr_file_cap_exceeded` it is a property of the PR itself: an explicit `schemabot plan -d <database>` does not clear it, and it clears only when an automatic plan of a later commit finds the PR within the limits. While it stands, `schemabot apply` is refused. |
 | `no_allowed_configured_environments` | Aggregate row | The database has no configured environments from which scope can be established. |
 | `plan_failed_unrecorded` | Aggregate row | An environment could not plan, and its failing per-database row could not be stored, so stored check state holds nothing of the failure. No plan command releases it; a re-run of the check or a new commit re-plans every environment and does. |
 | `plan_refused_by_source_policy` | Aggregate row | The database's source policy refused a plan because the PR's repository or schema directory is not authorized for it. No per-database row is stored on behalf of a refused source, so without the block a later plan of another environment could fold the refused environment's earlier passing row to green. No plan command releases it; once the policy authorizes the PR, a re-run of the check or a new commit re-plans every environment and does. A re-plan the policy still refuses posts the block again. |
@@ -673,7 +674,9 @@ the current branch protection gate.
 Re-run does not help a check blocked with `pr_file_cap_exceeded`. GitHub returns
 the same truncated changed-file list every time, so the check fails closed again;
 the PR has to be split before SchemaBot can plan it. The check output says so
-rather than offering a retry.
+rather than offering a retry. The same holds for `auto_plan_size_limit`: the
+PR has to be split until each part is within the [auto-plan
+limits](configuration.md#auto-plan-limits).
 
 Use these PR comment commands for normal retry paths:
 

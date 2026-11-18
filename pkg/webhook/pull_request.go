@@ -517,6 +517,19 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	shouldPostComment := sync.OnceValue(func() bool {
 		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA, configs)
 	})
+
+	// Refuse a PR larger than one automatic plan covers before anything reads
+	// its schema: planning it would read every changed schema file once per
+	// environment of every database, out of the installation's shared GitHub
+	// budget. The refusal stores a block that only a later automatic plan of a
+	// head within the limits clears, so it runs before the clear below.
+	if size, databases := autoPlanSizeOf(files, configs); h.service.Config().AutoPlanLimits.Exceeded(size) {
+		h.refuseOversizedAutoPlan(ctx, client, repo, pr, installationID, headSHA, source, deliveryID, size, databases, shouldPostComment)
+		// The refusal posts no plan comment, so an earlier head's plan comment
+		// would otherwise stay expanded beside it, still offering to apply.
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		return "auto-plan refused: the PR is larger than one automatic plan covers", nil
+	}
 	unmanagedPlanNote := h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
 
 	// Config discovery and the managed-directory guard just re-verified this

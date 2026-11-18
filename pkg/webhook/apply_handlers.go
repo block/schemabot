@@ -142,6 +142,14 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	// A PR too large to plan automatically cannot merge until it is split, so
+	// applying any part of it is refused before anything is planned or locked.
+	if refused, err := h.refuseApplyOnOversizedPR(ctx, repo, pr, installationID, environment, requestedBy, result); err != nil {
+		return true, fmt.Errorf("apply command auto-plan size gate %s#%d: %w", repo, pr, err)
+	} else if refused {
+		return false, nil
+	}
+
 	// Fix checks stuck at "in_progress" from crashed applies after the actor
 	// is authorized to run apply for this database.
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {

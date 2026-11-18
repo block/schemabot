@@ -161,6 +161,16 @@ type ServerConfig struct {
 	// Defaults to storage.DefaultMaxDriversPerApply.
 	MaxDriversPerApply int `yaml:"max_drivers_per_apply,omitempty"`
 
+	// AutoPlanLimits bounds how much schema one automatic plan may cover
+	// before SchemaBot refuses to plan it and fails the check closed instead.
+	// Every GitHub read an automatic plan makes comes out of the App
+	// installation's shared rate limit, and a plan reads each changed schema
+	// file once per environment for every database the PR touches, so a PR
+	// that rewrites schema across many databases can spend the budget every
+	// other pull request needs. Unset fields take the defaults in
+	// DefaultAutoPlanMaxDatabases and DefaultAutoPlanMaxSchemaFiles.
+	AutoPlanLimits AutoPlanLimitsConfig `yaml:"auto_plan_limits,omitempty"`
+
 	// MetricsPort is the TCP port of the dedicated HTTP listener serving
 	// Prometheus metrics at /metrics. Metrics are served on their own listener —
 	// not on the main API port — so scrapers can reach them without traversing
@@ -2410,6 +2420,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
+		return err
+	}
+	if err := c.AutoPlanLimits.validate(); err != nil {
 		return err
 	}
 	if c.MetricsPort < 0 || c.MetricsPort > 65535 {

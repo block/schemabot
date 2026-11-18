@@ -3242,6 +3242,48 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="pr-too-large-to-plan-automatically-too-many-databases"></a><strong>PR Too Large To Plan Automatically (Too Many Databases)</strong></summary>
+
+
+## ⚠️ This PR is too large to plan automatically
+
+It changes schema in 28 databases, and SchemaBot plans at most 10 databases in one PR.
+
+**What to do next:** split this PR into smaller PRs. Until then its SchemaBot check stays blocked and `schemabot apply` is refused.
+
+To see one database's plan now, comment:
+
+```
+schemabot plan -d billing
+```
+
+Databases this PR changes: `billing`, `catalog`, `checkout`, `fulfillment`, `inventory`, `invoices`, `ledger`, `loyalty`, `notifications`, `orders`, and 18 more
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="pr-too-large-to-plan-automatically-too-many-schema-files"></a><strong>PR Too Large To Plan Automatically (Too Many Schema Files)</strong></summary>
+
+
+## ⚠️ This PR is too large to plan automatically
+
+It changes 240 schema files across 3 databases, and SchemaBot plans at most 100 schema files in one PR that changes more than one database.
+
+**What to do next:** split this PR into smaller PRs. Until then its SchemaBot check stays blocked and `schemabot apply` is refused.
+
+To see one database's plan now, comment:
+
+```
+schemabot plan -d orders
+```
+
+Databases this PR changes: `orders`, `payments`, `shipping`
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="agent-hint-footer"></a><strong>Agent Hint Footer</strong></summary>
 
 
@@ -3992,6 +4034,17 @@ Apply in progress
 Plan failed
 
 SchemaBot cannot determine whether this PR contains managed schema changes: the PR changes more files than GitHub will report for a single pull request, so the changed-file list SchemaBot reads is incomplete. SchemaBot fails this check closed rather than planning from a partial diff, and retrying the check returns the same incomplete list. Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.
+</details>
+
+
+## Aggregate Check — Blocked: PR Too Large to Plan Automatically
+
+<details>
+<summary><strong>Aggregate Check — Blocked: PR Too Large to Plan Automatically</strong></summary>
+
+Plan failed
+
+This PR is too large to plan automatically. It changes schema in 28 databases, and SchemaBot plans at most 10 databases in one PR. SchemaBot planned none of it. Split this PR into smaller PRs; the PR comment names a command that plans one database meanwhile.
 </details>
 
 

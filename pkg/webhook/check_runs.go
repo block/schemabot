@@ -128,6 +128,18 @@ var prFileCapExceededBlock = checkBlockReason{
 		"Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.",
 }
 
+// autoPlanSizeLimitBlock is used when a PR changes schema in more databases,
+// or more schema files across several databases, than one automatic plan
+// covers (auto_plan_limits). SchemaBot plans nothing rather than spend the App
+// installation's shared GitHub budget reading every file, so the aggregate
+// fails closed. Like the file cap it is a property of the PR, so it clears only
+// when a smaller head re-plans; the per-environment message, which names the
+// counts and limits, is built at the call site.
+var autoPlanSizeLimitBlock = checkBlockReason{
+	blockingReason: checkstate.BlockAutoPlanSizeLimit,
+	message:        "This PR changes schema in more databases than SchemaBot plans at once. Split it into smaller PRs.",
+}
+
 // managedDirMissingConfigBlock is used when a PR changes schema files under a
 // directory the server config manages (databases.<db>.allowed_dirs) but no
 // schemabot.yaml resolves for them — for example because the PR removed the
@@ -227,6 +239,7 @@ var allCheckBlockReasons = []checkBlockReason{
 	configDiscoveryFailedBlock,
 	planPublishVerificationFailedBlock,
 	prFileCapExceededBlock,
+	autoPlanSizeLimitBlock,
 	managedDirMissingConfigBlock,
 	reviewTimeDeploymentDriftBlock,
 	namespacePlacementRefusedBlock,
