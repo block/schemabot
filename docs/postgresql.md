@@ -782,8 +782,9 @@ PostgreSQL gives every table exactly one owner: a role, initially whichever
 role ran `CREATE TABLE`. Ownership decides two things a schema change depends
 on:
 
-- **Who can change the table.** Only the owner, a member of the owner role, or
-  a superuser can `ALTER`, `DROP`, or index a table. No grant confers this.
+- **Who can change the table.** Only the owner, a member that inherits the
+  owner role's privileges, or a superuser can `ALTER`, `DROP`, or index a
+  table. No grant confers this.
 - **Who can use the table.** A new table is usable by its owner alone; every
   other role needs a grant on that table. Default privileges
   (`ALTER DEFAULT PRIVILEGES FOR ROLE app_owner ...`) issue those grants
@@ -854,9 +855,9 @@ owners.
 With `table_owner: app_owner`, each create step runs `SET LOCAL ROLE
 app_owner` inside its transaction. The table and its serial sequences are
 owned by `app_owner`, the default privileges grant the service roles access,
-and `schemabot` can still alter the table in later schema changes through its
-membership in `app_owner`. Indexes always belong to their table's owner, so
-they need nothing further.
+and `schemabot` can still alter the table in later schema changes because its
+membership in `app_owner` inherits the owner's privileges. Indexes always
+belong to their table's owner, so they need nothing further.
 
 `table_owner` applies only to tables SchemaBot creates. A table that already
 exists keeps its owner, and default privileges never apply retroactively: a
@@ -870,7 +871,8 @@ database's own provisioning. For the layout above:
 
 ```sql
 -- SchemaBot can SET ROLE to the owner for creates, and act as the owner
--- for in-place ALTER TABLE.
+-- for in-place ALTER TABLE. A plain GRANT inherits by default, and that
+-- inheritance is what lets the later ALTERs run.
 GRANT app_owner TO schemabot;
 
 -- The owner can create tables in the schema, and the service roles can
@@ -886,6 +888,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
 ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
   GRANT SELECT ON TABLES TO app_read_only;
 ```
+
+Keep the membership inheriting. Granted `WITH INHERIT FALSE`, or held by a
+`NOINHERIT` `schemabot` role, it still lets every create run, but the first
+later `ALTER TABLE` on one of those tables is refused at plan time.
 
 Then set `table_owner: app_owner` on the target (see
 [configuration](configuration.md#postgresql-dsn_from-targets)). A missing
