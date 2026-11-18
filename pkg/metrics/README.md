@@ -88,7 +88,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.symlink_modes_unread_total` | Counter | environment, repository | Changed paths treated as not symlinks because GitHub refused the diff (or gave no mode for a pure rename), truncated the tree listing, and no configured schema directories bound the paths. Reading them would cost requests per non-schema file (AV-15). A nonzero rate means a symlink-only schema change in that repository may go unplanned; set `allowed_dirs` on every database the repository serves |
 | `schemabot.github.rate_limit.limit` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
 | `schemabot.github.rate_limit.remaining` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
-| `schemabot.github.rate_limit.observation_age_seconds` | Observable gauge | environment, operation, resource, github_app, installation_id | Age of the latest trustworthy installation snapshot; continues increasing during idle periods |
+| `schemabot.github.rate_limit.observation_age_seconds` | Observable gauge | environment, operation, resource, github_app, installation_id | Age of the latest trustworthy installation snapshot; rises past the export age only when the quota probe cannot read the budget |
 | `schemabot.github.rate_limit.used` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.target.probe.total` | Counter | database_type, environment, outcome | Startup connectivity probes of enumerated targets, by outcome. This counter sits below the volume bar in [Does it belong in a metric?](#does-it-belong-in-a-metric) — one observation per target per process start — and earns its place as a deploy-time alert instead: a fleet-wide rollout produces a burst of observations at once, and any non-`success` outcome in that burst is a rotated credential, dropped grant, or unreachable target found before the first schema change reaches it. Alert on `outcome != success` per environment after each deploy. Target is omitted to bound cardinality; the paired warn log names it |
@@ -328,10 +328,20 @@ a depleted snapshot. Within one window, a lower allowance wins even when it is
 recorded out of receipt order; its original receipt time still controls expiry.
 A new window can increase the allowance.
 
+Webhook traffic refreshes a snapshot from the headers of every response, and
+the server's GitHub quota probe refreshes it while there is no traffic: once a
+minute it reads `GET /rate_limit` for each active installation of every
+configured App. GitHub does not count that read against the budget it reports,
+and it is recorded like any other request, as `operation="fetch_rate_limit"`
+after the installation list (`operation="list_app_installations"`). An idle
+server therefore keeps exporting its installations' budgets.
+
 `schemabot.github.rate_limit.observation_age_seconds` continues increasing after
-snapshot expiry. Above 120 seconds the budget is unknown; idle installations
-legitimately reach this state. Endpoint heartbeat monitoring independently covers
-missing scrapes. Missing quota must not be interpreted as zero or recovery.
+snapshot expiry. Above 120 seconds the budget is unknown, which means the
+probe could not read it, for example because GitHub was unreachable or the
+installation's token exchange failed. The probe logs a warning naming the installation for each failed read.
+Endpoint heartbeat monitoring independently covers missing scrapes. Missing
+quota must not be interpreted as zero or recovery.
 
 The other operation/repository series on `remaining`, `limit` and `used` retain
 the latest diagnostic response values; they can be stale and must not enter a
