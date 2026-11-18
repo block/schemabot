@@ -371,6 +371,14 @@ type Check struct {
 	RolloutTargets         int
 	RolloutTargetsWithWork int
 
+	// AggregateRender is what an aggregate row's Check Run text was rendered
+	// from, so the text can be rendered again with newer rollout counts
+	// without re-reading the PR. The encoding belongs to the caller. Upsert
+	// writes it, so an Upsert that leaves it empty clears it; other reads do
+	// not load it, and GetAggregateRender returns it. Empty on per-database
+	// rows.
+	AggregateRender []byte `json:"-"`
+
 	// CreatedAt is when the check was created.
 	CreatedAt time.Time
 

@@ -1157,6 +1157,31 @@ When the apply reaches a terminal state:
   publish fails, the run keeps saying the apply is stopped until the next
   aggregate publish for the PR; merge stays blocked either way.
 
+While an apply across several targets runs, SchemaBot rewrites the aggregate
+Check Run's text each time one more target finishes, at most as often as it
+edits the progress comment. The title and the database row count the finished
+targets ("Apply in progress on all 32 targets: 5 done"), and a line under the
+table counts every target by state and links the progress comment. The counts
+are read from the apply's stored operations and never change the Check Run's
+status or conclusion. If they cannot be read, the Check Run is published
+without them.
+
+Each aggregate publish stores what its text was rendered from on the stored
+aggregate check state, in the same write as the status it published. A
+target finishing re-renders that text with the new counts and sends only the
+text, so it costs two GitHub requests however many files and databases the PR
+has: one to find the newest run and one to rewrite it. When the stored render
+does not match the stored state or the newest run, or an apply stopped or
+started again since, SchemaBot publishes the aggregate in full instead. Another
+event can change the stored check state while one of these refreshes
+publishes, so once it has published the refresh reads again what its text was
+rendered from: the stored render, the aggregate check state, the stopped
+applies, and every database's stored check state. If any of them moved, it
+publishes the aggregate in full, so the refresh's text is never the last one
+GitHub shows over newer state. A repository with Check Runs turned off gets no
+refresh. When a PR runs more rollouts than the text has room for, the target
+lines end with a count of the rollouts left out.
+
 Completion is conditional on ownership: the watcher can only update the row if
 the row still represents that `apply_id` and no newer apply exists for the same
 PR/environment/database.

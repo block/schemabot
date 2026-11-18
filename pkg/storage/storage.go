@@ -317,6 +317,10 @@ type CheckStore interface {
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
 	Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*Check, error)
 
+	// GetAggregateRender returns the AggregateRender the row was last upserted
+	// with, or nil when the row is missing or none is stored.
+	GetAggregateRender(ctx context.Context, repo string, pr int, environment, dbType, database string) ([]byte, error)
+
 	// GetByCheckRunID returns stored check state by GitHub's check run ID, or nil if not found.
 	// Used for handling check_run webhooks from GitHub.
 	GetByCheckRunID(ctx context.Context, checkRunID int64) (*Check, error)

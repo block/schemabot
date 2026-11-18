@@ -797,6 +797,8 @@ func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo
 		EngineLogs:     h.engineLogReader(),
 		shardedPlans:   h.shardedPlans,
 		Logger:         h.logger,
+
+		OnTargetsFinishedHook: h.rolloutTargetsFinishedHook(),
 	}
 }
 
