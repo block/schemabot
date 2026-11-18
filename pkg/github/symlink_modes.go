@@ -91,6 +91,10 @@ type SymlinkMode struct {
 // costs a bounded number of requests per side, so a PR's request count never
 // grows with its non-schema files (AV-15).
 func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, change ChangeRange, probes []SymlinkProbe, scopedToSchemaDirs bool) (map[string]SymlinkMode, error) {
+	return ic.symlinkModes(ctx, repo, change, probes, pathScope{bounded: scopedToSchemaDirs})
+}
+
+func (ic *InstallationClient) symlinkModes(ctx context.Context, repo string, change ChangeRange, probes []SymlinkProbe, scope pathScope) (map[string]SymlinkMode, error) {
 	modes := make(map[string]SymlinkMode, len(probes))
 	if len(probes) == 0 {
 		return modes, nil
@@ -124,7 +128,7 @@ func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, cha
 	}
 
 	if len(unknownAtHead) > 0 {
-		symlinks, err := ic.symlinksAtRef(ctx, repo, change, change.Head, unknownAtHead, scopedToSchemaDirs)
+		symlinks, err := ic.symlinksAtRef(ctx, repo, change, change.Head, unknownAtHead, scope)
 		if err != nil {
 			return nil, fmt.Errorf("read the modes of %d changed paths at head %s in %s: %w", len(unknownAtHead), change.Head, repo, err)
 		}
@@ -135,7 +139,7 @@ func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, cha
 		}
 	}
 	if len(unknownAtBase) > 0 {
-		symlinks, err := ic.symlinksAtRef(ctx, repo, change, change.Base, unknownAtBase, scopedToSchemaDirs)
+		symlinks, err := ic.symlinksAtRef(ctx, repo, change, change.Base, unknownAtBase, scope)
 		if err != nil {
 			return nil, fmt.Errorf("read the modes of %d changed paths at base %s in %s: %w", len(unknownAtBase), change.Base, repo, err)
 		}
@@ -150,7 +154,7 @@ func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, cha
 
 // symlinksAtRef reports which of paths, whose modes the diff did not give,
 // are symlinks at ref (see SymlinkModes for how the read is chosen).
-func (ic *InstallationClient) symlinksAtRef(ctx context.Context, repo string, change ChangeRange, ref string, paths []string, scopedToSchemaDirs bool) (map[string]bool, error) {
+func (ic *InstallationClient) symlinksAtRef(ctx context.Context, repo string, change ChangeRange, ref string, paths []string, scope pathScope) (map[string]bool, error) {
 	dirs := parentDirs(paths)
 	if len(dirs) <= symlinkModeGraphQLBatch {
 		return ic.graphQLSymlinks(ctx, repo, ref, paths)
@@ -189,7 +193,7 @@ func (ic *InstallationClient) symlinksAtRef(ctx context.Context, repo string, ch
 	}
 	unlistedDirs := parentDirs(unlisted)
 
-	if scopedToSchemaDirs {
+	if scope.bounded {
 		ic.logger.Info("GitHub truncated the tree listing, so the modes of the changed paths inside the configured schema directories that it left out are read from their directories with GraphQL",
 			"repo", repo, "pr", change.PR, "ref", ref, "paths", len(unlisted), "directories", len(unlistedDirs))
 		read, err := ic.graphQLSymlinks(ctx, repo, ref, unlisted)
@@ -203,9 +207,12 @@ func (ic *InstallationClient) symlinksAtRef(ctx context.Context, repo string, ch
 	// Without configured schema directories bounding the paths, reading them
 	// directory by directory would cost requests in proportion to the PR's
 	// other files, so they are left unread and reported as not symlinks.
+	metrics.RecordSymlinkModesUnread(ctx, repo, len(unlisted))
+	if scope.strict {
+		return nil, fmt.Errorf("cannot verify the PR schema count: the truncated tree at %s omitted %d changed paths and no complete schema directory boundary is configured", ref, len(unlisted))
+	}
 	ic.logger.Warn("GitHub truncated the tree listing and no configured schema directories bound the changed paths, so the paths it left out are treated as not symlinks: a symlink among them that names a schema root or namespace is not planned; set allowed_dirs on every database the repository serves so only paths inside them are read",
 		"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "ref", ref, "paths", len(unlisted), "directories", len(unlistedDirs))
-	metrics.RecordSymlinkModesUnread(ctx, repo, len(unlisted))
 	return symlinks, nil
 }
 

@@ -188,6 +188,7 @@ func TestParseDiffModesReadsTheFilesAfterAnOverlongLine(t *testing.T) {
 // level-by-level tree read. A ref is resolvable when at least one tree is
 // registered under it.
 type symlinkModesServer struct {
+	mux   *http.ServeMux
 	ic    *InstallationClient
 	diff  func(w http.ResponseWriter)
 	trees map[string][]graphQLTreeEntry // "<ref>:<dir>" → entries; absent → null
@@ -207,7 +208,7 @@ type symlinkModesServer struct {
 func newSymlinkModesServer(t *testing.T) *symlinkModesServer {
 	t.Helper()
 	client, mux := setupRateLimitedTestGitHubServer(t)
-	s := &symlinkModesServer{trees: map[string][]graphQLTreeEntry{}}
+	s := &symlinkModesServer{mux: mux, trees: map[string][]graphQLTreeEntry{}}
 	s.ic = NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{basehead}", func(w http.ResponseWriter, r *http.Request) {
@@ -525,6 +526,49 @@ func TestSymlinkModesLeavesUnscopedPathsUnreadWhenTheTreeIsTruncated(t *testing.
 	assert.Empty(t, s.graphQLQueries(), "no directory is listed")
 	assert.Equal(t, SymlinkMode{}, modes["schema/pkg042/Main.java"], "an unread path is reported as not a symlink")
 	assert.Len(t, modes, 151)
+}
+
+// Cap discovery may expand fallback lookups only inside a known schema boundary.
+func TestFetchPRFilesForSchemaDirsLimitsSymlinkReads(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		dirs []string
+	}{
+		{"unbounded registration", nil},
+		{"unrelated files outside registered directory", []string{"orders/schema"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSymlinkModesServer(t)
+			s.diff = func(w http.ResponseWriter) { writeDiffTooLarge(t, w) }
+			s.recursiveTree = func(w http.ResponseWriter, ref string) bool {
+				writeTruncatedTree(t, w, ref)
+				return true
+			}
+			var files []*gh.CommitFile
+			for i := range 151 {
+				files = append(files, &gh.CommitFile{
+					Filename: new(fmt.Sprintf("src/pkg%03d/Main.java", i)), Status: new("added"), Additions: new(1),
+				})
+			}
+			s.mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+				assert.NoError(t, json.NewEncoder(w).Encode(files))
+			})
+			s.mux.HandleFunc("GET /repos/octocat/hello-world/compare/tip...head1", func(w http.ResponseWriter, _ *http.Request) {
+				assert.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{MergeBaseCommit: &gh.RepositoryCommit{SHA: new("base1")}}))
+			})
+			got, _, err := s.ic.FetchPRFilesForSchemaDirs(t.Context(), "octocat/hello-world", 7, "head1", "tip", tc.dirs)
+			assert.Empty(t, s.graphQLQueries())
+			if len(tc.dirs) == 0 {
+				require.ErrorContains(t, err, "cannot verify the PR schema count")
+				assert.Equal(t, []string{"head1"}, s.treeReadRefs())
+			} else {
+				require.NoError(t, err)
+				require.Len(t, got, len(files))
+				assert.Empty(t, s.treeReadRefs())
+				assert.Zero(t, s.compareCount())
+			}
+		})
+	}
 }
 
 // A truncated tree listing still gives the mode of every path it names. With

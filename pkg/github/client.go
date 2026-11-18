@@ -1242,7 +1242,7 @@ func (ic *InstallationClient) prBaseCommit(ctx context.Context, repo string, pr 
 type pathScope struct {
 	dirs    []string
 	bounded bool
-	strict  bool
+	strict  bool // require known modes for cap admission
 }
 
 func (s pathScope) contains(p string) bool {
@@ -1334,7 +1334,7 @@ func (ic *InstallationClient) markSymlinks(ctx context.Context, repo string, cha
 			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head, "scoped_to_schema_dirs", scope.bounded)
 		return nil
 	}
-	modes, err := ic.SymlinkModes(ctx, repo, change, probes, scope.bounded || scope.strict)
+	modes, err := ic.symlinkModes(ctx, repo, change, probes, scope)
 	if err != nil {
 		return fmt.Errorf("read the modes of %d changed paths: %w", len(probes), err)
 	}
