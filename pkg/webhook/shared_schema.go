@@ -29,17 +29,23 @@ import (
 // It reads GitHub only for databases that share a target with this one
 // (AV-15). peerConfigs carries where each peer's schemabot.yaml was found
 // across the environments of one delivery; nil looks each one up again.
-func (h *Handler) verifySharedSchemaIgnoreLists(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, source string, schemaResult *ghclient.SchemaRequestResult, peerConfigs *sharedSchemaPeerConfigs) error {
+//
+// It returns the inputs of each database it compared with, so an apply can
+// refuse a branch whose base has since changed them (see
+// assertBaseSchemaStillCurrent): the comparison holds only for the versions it
+// read.
+func (h *Handler) verifySharedSchemaIgnoreLists(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, source string, schemaResult *ghclient.SchemaRequestResult, peerConfigs *sharedSchemaPeerConfigs) ([]sharedSchemaPeerInputs, error) {
 	config := h.service.Config()
 	peers, err := config.SharedSchemaPeers(repo, schemaResult.Database, environment)
 	if err != nil {
-		return fmt.Errorf("find the databases that share a target with %q in %s: %w", schemaResult.Database, environment, err)
+		return nil, fmt.Errorf("find the databases that share a target with %q in %s: %w", schemaResult.Database, environment, err)
 	}
 	if len(peers) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	peerSides := make([]api.SharedSchemaDatabase, 0, len(peers))
+	peerInputs := make([]sharedSchemaPeerInputs, 0, len(peers))
 	for _, peer := range peers {
 		peerResult, err := h.sharedSchemaPeerRequest(ctx, client, repo, pr, environment, peer, source, schemaResult.HeadSHA, peerConfigs)
 		if peerConfigOutsideRepository(err) {
@@ -52,9 +58,10 @@ func (h *Handler) verifySharedSchemaIgnoreLists(ctx context.Context, client *ghc
 			h.logger.Error("could not read the schema files of a database that shares a target with the planned database; the environment fails closed",
 				"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 				"environment", environment, "peer_database", peer, "error", err)
-			return &sharedSchemaPeerUnreadableError{Peer: peer, Database: schemaResult.Database, Environment: environment, Cause: err}
+			return nil, &sharedSchemaPeerUnreadableError{Peer: peer, Database: schemaResult.Database, Environment: environment, Cause: err}
 		}
 		peerSides = append(peerSides, sharedSchemaSideOf(peerResult))
+		peerInputs = append(peerInputs, sharedSchemaPeerInputsOf(peerResult))
 	}
 
 	err = config.CheckSharedSchemaIgnoreLists(environment, sharedSchemaSideOf(schemaResult), peerSides)
@@ -63,14 +70,30 @@ func (h *Handler) verifySharedSchemaIgnoreLists(ctx context.Context, client *ghc
 		h.logger.Warn("schema files and ignore_tables disagree with a database sharing the same schema; the environment is refused until they agree",
 			"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", schemaResult.Database, "database_type", schemaResult.Type,
 			"environment", environment, "peer_databases", peers, "error", err)
-		return err
+		return nil, err
 	}
 	if err != nil {
-		return fmt.Errorf("compare ignore_tables of %q with the databases sharing its targets in %s: %w", schemaResult.Database, environment, err)
+		return nil, fmt.Errorf("compare ignore_tables of %q with the databases sharing its targets in %s: %w", schemaResult.Database, environment, err)
 	}
 	h.logger.Debug("ignore_tables agree with every database sharing a schema",
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "environment", environment, "peer_databases", peers)
-	return nil
+	return peerInputs, nil
+}
+
+// sharedSchemaPeerInputs are the paths whose content decided one peer's side
+// of a shared schema comparison: its schemabot.yaml, which holds its
+// ignore_tables, and the paths that decide its schema in the environment.
+type sharedSchemaPeerInputs struct {
+	Database string
+	Paths    []string
+}
+
+func sharedSchemaPeerInputsOf(result *ghclient.SchemaRequestResult) sharedSchemaPeerInputs {
+	paths := environmentSchemaPaths(result)
+	if result.ConfigPath != "" {
+		paths = append(paths, result.ConfigPath)
+	}
+	return sharedSchemaPeerInputs{Database: result.Database, Paths: paths}
 }
 
 // sharedSchemaPeerUnreadableError is a failure to read a database that shares
@@ -120,27 +143,44 @@ func (h *Handler) sharedSchemaPeerRequest(ctx context.Context, client *ghclient.
 }
 
 // findSharedSchemaPeerConfig finds a peer's schemabot.yaml at headSHA. It
-// scans only the directories the server allows the peer's config in, so the
-// cost stays with the peer's own inputs however many other configs the
-// repository holds (AV-15). Only a peer allowed anywhere in the repository is
-// searched for the way a command naming it with -d would be.
+// scans first the directories the server allows the peer's config in, so the
+// usual cost stays with the peer's own inputs however many other configs the
+// repository holds (AV-15). It searches the repository the way a command
+// naming the peer with -d would when those directories cannot bound where the
+// config lives, and when they hold no config for the peer: a scoped miss shows
+// only that the config is not where the server allows it, not that it is
+// absent from this repository. A config found elsewhere is then refused by the
+// peer's source policy, so the environment fails closed. Only a peer this
+// repository is not allowed to plan at all is settled by the scoped miss.
 func (h *Handler) findSharedSchemaPeerConfig(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, peer string) (sharedSchemaPeerConfig, error) {
 	config, configDir, scoped, err := client.FindConfigByDatabaseNameInItsDirs(ctx, repo, headSHA, peer)
-	if scoped {
+	if !scoped {
+		h.logger.Info("database sharing a schema has no directories bounding where its config lives; searching the repository for it",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "peer_database", peer)
+		return h.findSharedSchemaPeerConfigInRepo(ctx, client, repo, pr, peer)
+	}
+	var notFound *ghclient.DatabaseNotFoundError
+	if !errors.As(err, &notFound) || notFound.RepositoryNotAccepted() {
 		return sharedSchemaPeerConfig{config: config, configDir: configDir}, err
 	}
-	h.logger.Info("database sharing a schema has no directories bounding where its config lives; searching the repository for it",
-		"repo", repo, "pr", pr, "head_sha", headSHA, "peer_database", peer)
-	config, configDir, err = client.FindConfigByDatabaseName(ctx, repo, pr, peer)
+	h.logger.Info("database sharing a schema has no schemabot.yaml in the directories this repository allows it in; searching the repository for it",
+		"repo", repo, "pr", pr, "head_sha", headSHA, "peer_database", peer, "searched_dirs", notFound.SearchedDirs)
+	return h.findSharedSchemaPeerConfigInRepo(ctx, client, repo, pr, peer)
+}
+
+func (h *Handler) findSharedSchemaPeerConfigInRepo(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, peer string) (sharedSchemaPeerConfig, error) {
+	config, configDir, err := client.FindConfigByDatabaseName(ctx, repo, pr, peer)
 	return sharedSchemaPeerConfig{config: config, configDir: configDir}, err
 }
 
 // sharedSchemaPeerConfigs remembers, for one delivery, where each peer's
-// schemabot.yaml was found, so planning several environments looks each peer
-// up once. A failed lookup is not remembered: the next environment tries it
-// again, and fails closed again if it fails again.
+// schemabot.yaml was found, or that a complete search showed it is not in this
+// repository, so planning several environments looks each peer up once. Any
+// other failed lookup is not remembered: the next environment tries it again,
+// and fails closed again if it fails again.
 type sharedSchemaPeerConfigs struct {
-	found map[string]sharedSchemaPeerConfig
+	found   map[string]sharedSchemaPeerConfig
+	outside map[string]error
 }
 
 type sharedSchemaPeerConfig struct {
@@ -149,7 +189,7 @@ type sharedSchemaPeerConfig struct {
 }
 
 func newSharedSchemaPeerConfigs() *sharedSchemaPeerConfigs {
-	return &sharedSchemaPeerConfigs{found: map[string]sharedSchemaPeerConfig{}}
+	return &sharedSchemaPeerConfigs{found: map[string]sharedSchemaPeerConfig{}, outside: map[string]error{}}
 }
 
 func (c *sharedSchemaPeerConfigs) find(peer string, lookup func() (sharedSchemaPeerConfig, error)) (sharedSchemaPeerConfig, error) {
@@ -159,7 +199,13 @@ func (c *sharedSchemaPeerConfigs) find(peer string, lookup func() (sharedSchemaP
 	if found, ok := c.found[peer]; ok {
 		return found, nil
 	}
+	if err, ok := c.outside[peer]; ok {
+		return sharedSchemaPeerConfig{}, err
+	}
 	found, err := lookup()
+	if peerConfigOutsideRepository(err) {
+		c.outside[peer] = err
+	}
 	if err != nil {
 		return sharedSchemaPeerConfig{}, err
 	}
@@ -194,19 +240,20 @@ func peerConfigOutsideRepository(err error) bool {
 // for the same reason; refusing the apply keeps a completed apply from storing
 // a passing row over it. A mismatch is answered on the PR and returns blocked;
 // a failure to read the other database returns the error, so the command fails
-// closed and can be retried.
-func (h *Handler) enforceSharedSchemaIgnoreLists(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, environment, requestedBy, commandName string, schemaResult *ghclient.SchemaRequestResult, suppressRetryComments bool) (bool, error) {
-	err := h.verifySharedSchemaIgnoreLists(ctx, client, repo, pr, environment, commandName, schemaResult, nil)
+// closed and can be retried. On success it returns the inputs of the databases
+// it compared with, for the apply's base freshness checks.
+func (h *Handler) enforceSharedSchemaIgnoreLists(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, environment, requestedBy, commandName string, schemaResult *ghclient.SchemaRequestResult, suppressRetryComments bool) ([]sharedSchemaPeerInputs, bool, error) {
+	peerInputs, err := h.verifySharedSchemaIgnoreLists(ctx, client, repo, pr, environment, commandName, schemaResult, nil)
 	if err == nil {
-		return false, nil
+		return peerInputs, false, nil
 	}
 	var mismatch *api.SharedSchemaIgnoreListsError
 	if errors.As(err, &mismatch) {
 		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, userFacingError(err))
-		return true, nil
+		return nil, true, nil
 	}
 	if !suppressRetryComments {
 		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, userFacingError(err))
 	}
-	return false, err
+	return nil, false, err
 }

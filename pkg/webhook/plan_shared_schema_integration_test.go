@@ -4,6 +4,7 @@ package webhook
 
 import (
 	"database/sql"
+	"encoding/json"
 	"html"
 	"log/slog"
 	"maps"
@@ -11,7 +12,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +47,7 @@ type sharedSchemaHarness struct {
 	store      storage.Storage
 	handler    *Handler
 	github     *planFlowResult
+	mux        *http.ServeMux
 	production *namespaceSelectingTernClient
 }
 
@@ -118,10 +122,12 @@ func newSharedSchemaHarness(t *testing.T, unshardedConfig string, extraFiles map
 	result.baseHolds(onBase...)
 
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
+	installClient.SetConfigDirHints(serverConfig)
 	return &sharedSchemaHarness{
 		store:      st,
 		handler:    NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
 		github:     result,
+		mux:        mux,
 		production: production,
 	}
 }
@@ -334,6 +340,34 @@ func TestE2EAutoPlanFailsClosedWhenSharedSchemaPeerSourceIsNotAuthorized(t *test
 	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion)
 }
 
+// The unsharded database takes schema changes only from another repository,
+// so the copy of its files in this one is not its source and cannot show what
+// it declares. Its ignore_tables are not compared with this pull request, and
+// the sharded database's production plan runs instead of failing on a
+// disagreement with files no plan of the unsharded database would read.
+func TestE2EAutoPlanSkipsSharedSchemaPeerManagedFromAnotherRepository(t *testing.T) {
+	p := newSharedSchemaHarness(t, sharedSchemaUnshardedConfig, map[string]string{
+		"shop_sharded/shop_0/refunds.sql": sharedSchemaTable("refunds"),
+	}, sharedSchemaBaseFiles, func(c *api.ServerConfig) {
+		for db, policy := range map[string]struct{ repos, dirs []string }{
+			sharedSchemaUnshardedDB: {repos: []string{"octocat/shop-schema"}, dirs: []string{"schema/shop"}},
+			sharedSchemaShardedDB:   {repos: []string{"octocat/hello-world"}, dirs: []string{"schema/shop_sharded"}},
+		} {
+			cfg := c.Databases[db]
+			cfg.AllowedRepos = policy.repos
+			cfg.AllowedDirs = policy.dirs
+			c.Databases[db] = cfg
+		}
+	})
+
+	aggregate := p.openAndAwaitAggregate(t)
+	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion)
+	assert.Equal(t, []string{"shop_0"}, p.production.planNamespaces, "production plans once the peer is known to be managed elsewhere")
+	byEnv := p.checksByEnv(t, sharedSchemaShardedDB)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionSuccess, byEnv["production"].Conclusion)
+}
+
 // The unsharded database's schema file cannot be parsed, so the check cannot
 // tell which tables it declares. The sharded database's production plan fails
 // closed rather than passing a pair it could not compare.
@@ -350,4 +384,109 @@ func TestE2EAutoPlanFailsClosedWhenSharedSchemaPeerCannotBeRead(t *testing.T) {
 	byEnv := p.checksByEnv(t, sharedSchemaShardedDB)
 	require.Contains(t, byEnv, "production")
 	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion)
+}
+
+// Both databases share shard 0's schema in staging, and the pull request adds
+// a sharded table together with the unsharded database's ignore_tables entry,
+// so the two agree at the pull request's head. After the branch diverged, the
+// base branch changed the unsharded database's schema and nothing of the
+// sharded database's. The apply is refused as stale and names the unsharded
+// database's files: its ignore_tables were compared with a version the base
+// branch has since replaced, so the comparison no longer holds.
+func TestE2EApplyRefusesBranchMissingABaseChangeToASharedSchemaPeer(t *testing.T) {
+	onBase := []string{
+		"schema/shop_sharded/schemabot.yaml",
+		"schema/shop/shop_0/sequences.sql",
+		"schema/shop_sharded/shop_0/orders.sql",
+		"schema/shop_sharded/shop_1/orders.sql",
+	}
+	p := newSharedSchemaHarness(t, sharedSchemaUnshardedConfig+"  - refunds\n", map[string]string{
+		"shop_sharded/shop_0/refunds.sql": sharedSchemaTable("refunds"),
+	}, onBase, func(c *api.ServerConfig) {
+		for db, targets := range map[string][]api.TargetEntry{
+			sharedSchemaUnshardedDB: {{Target: "shop-staging-001", Namespaces: []string{"shop_0"}}},
+			sharedSchemaShardedDB: {
+				{Target: "shop-staging-001", Namespaces: []string{"shop_0"}},
+				{Target: "shop-staging-002", Namespaces: []string{"shop_1"}},
+			},
+		} {
+			cfg := c.Databases[db]
+			cfg.Environments["staging"] = api.EnvironmentConfig{Deployment: "us", Targets: targets}
+			c.Databases[db] = cfg
+		}
+	})
+	registerBaseChangeSinceDivergence(t, p.mux, p.github, "schema/shop/shop_0/sequences.sql")
+
+	rr := httptest.NewRecorder()
+	p.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e staging -d " + sharedSchemaShardedDB, isPR: true}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	body := p.commentContaining(t, "Apply rejected — base schema is newer")
+	assert.Contains(t, body, "newer changes to `schema/shop`, the schema of `"+sharedSchemaUnshardedDB+"`, which shares a schema with this database")
+	assert.Contains(t, body, "Merge or rebase")
+	assert.NotContains(t, body, "schema/shop_sharded")
+}
+
+// commentContaining waits for the next comment that contains want, skipping
+// the acknowledgements a command posts before its answer.
+func (p *sharedSchemaHarness) commentContaining(t *testing.T, want string) string {
+	t.Helper()
+	deadline := time.After(webhookIntegrationPollDeadline)
+	for {
+		select {
+		case body := <-p.github.comments:
+			if body = html.UnescapeString(body); strings.Contains(body, want) {
+				return body
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for a comment containing %q", want)
+			return ""
+		}
+	}
+}
+
+// registerBaseChangeSinceDivergence moves the default branch past the pull
+// request's merge base by one change to changedPath. The merge base holds the
+// default branch's files with changedPath at an older blob, so the directories
+// above it differ between the two commits and every other directory is the
+// same tree in both.
+func registerBaseChangeSinceDivergence(t *testing.T, mux *http.ServeMux, result *planFlowResult, changedPath string) {
+	t.Helper()
+	tip := func() string { return "base-tip-sha" }
+	result.BaseTip.Store(&tip)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, r *http.Request) {
+		if wantsDiff(r) {
+			writeCommitFilesDiff(t, w, servedPRFiles(t, mux))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("merge-base-sha")},
+		}))
+	})
+	const mergeBasePrefix = "mergebase~"
+	mergeBaseLevel := func(dir string) []*gh.TreeEntry {
+		level := treeLevelFrom(result.baseTreeEntries(), dir, baseSubtreeSHAPrefix)
+		for _, entry := range level {
+			full := entry.GetPath()
+			if dir != "" {
+				full = dir + "/" + full
+			}
+			switch {
+			case full == changedPath:
+				entry.SHA = new(mergeBasePrefix + "blob")
+			case strings.HasPrefix(changedPath, full+"/"):
+				entry.SHA = new(mergeBasePrefix + strings.ReplaceAll(full, "/", "~"))
+			}
+		}
+		return level
+	}
+	serveLevel := func(dir string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: mergeBaseLevel(dir)}))
+		}
+	}
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/merge-base-sha", serveLevel(""))
+	for dir := path.Dir(changedPath); dir != "."; dir = path.Dir(dir) {
+		mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+mergeBasePrefix+strings.ReplaceAll(dir, "/", "~"), serveLevel(dir))
+	}
 }

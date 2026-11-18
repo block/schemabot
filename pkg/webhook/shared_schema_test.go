@@ -63,3 +63,32 @@ func TestSharedSchemaPeerConfigsLooksEachPeerUpOnce(t *testing.T) {
 	}
 	assert.Equal(t, 3, lookups["shop"], "without a cache every call looks the peer up")
 }
+
+// An apply's base freshness check compares the database's own schema paths and
+// then each shared schema peer's inputs, each path once. A stale rejection
+// names the database's own schema when that changed, since its plan would
+// revert it, and otherwise the peer whose files changed.
+func TestBaseFreshnessPathsNameThePeerWhoseFilesChanged(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "shop_sharded", SchemaPath: "schema/shop_sharded"}
+	peers := []sharedSchemaPeerInputs{
+		{Database: "shop", Paths: []string{"schema/shop", "schema/shop/schemabot.yaml"}},
+		{Database: "shop_archive", Paths: []string{"schema/shop", "schema/shop_sharded", "schema/shop_archive"}},
+	}
+
+	paths, peerOfPath := baseFreshnessPaths(schema, peers)
+
+	assert.Equal(t, []string{"schema/shop_sharded", "schema/shop", "schema/shop/schemabot.yaml", "schema/shop_archive"}, paths)
+	assert.Equal(t, map[string]string{
+		"schema/shop":                "shop",
+		"schema/shop/schemabot.yaml": "shop",
+		"schema/shop_archive":        "shop_archive",
+	}, peerOfPath)
+
+	path, peer := stalePathToShow(schema, []string{"schema/shop/schemabot.yaml", "schema/shop_sharded"}, peerOfPath)
+	assert.Equal(t, "schema/shop_sharded", path)
+	assert.Empty(t, peer)
+
+	path, peer = stalePathToShow(schema, []string{"schema/shop/schemabot.yaml"}, peerOfPath)
+	assert.Equal(t, "schema/shop/schemabot.yaml", path)
+	assert.Equal(t, "shop", peer)
+}
