@@ -11424,6 +11424,54 @@ To run the cutover for prod/payments-001:
 </details>
 
 <details>
+<summary><a name="multitarget-rollout-creating-a-table-some-targets-lack"></a><strong>Multi-target Rollout Creating A Table Some Targets Lack</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        running                                │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Targets:      1 completed · 3 running                │
+└───────────────────────────────────────────────────────┘
+
+
+     + customers: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 50%
+       targets payments-003, payments-004
+       CREATE TABLE `customers` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `tier` varchar(16) DEFAULT NULL,
+           PRIMARY KEY(`id`)
+       );
+       • Targets: 2 (1 applying, 1 complete)
+           ✓ payments-003: complete
+           ◉ payments-004: applying
+
+     ~ customers: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       targets payments-001, payments-002
+       ALTER TABLE `customers` ADD COLUMN `tier` varchar(16) DEFAULT NULL;
+
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 52%
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+       • Rows: 168,000 / 240,000 across 3 of 4 targets · ETA: ≥ 4m 0s
+       • Targets: 4 (2 copying, 1 queued, 1 complete)
+           ◉ payments-001: 45.00% · 36,000 / 80,000 rows · ETA: 4m 0s
+           ◉ payments-002: 65.00% · 52,000 / 80,000 rows · ETA: 2m 30s
+           ✓ payments-003: 80,000 rows
+           ○ payments-004: queued
+
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
 <summary><a name="multitarget-rollout-stopped"></a><strong>Multi-target Rollout Stopped</strong></summary>
 
 ```

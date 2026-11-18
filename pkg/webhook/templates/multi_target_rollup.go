@@ -267,9 +267,10 @@ func tableChangeSignature(tables []TableProgressData) string {
 }
 
 // rankTargetTableLines orders a rollup's table lines by
-// presentation.TableRolloutRank across every target each line speaks for, so
-// the table being copied leads and one no target has started sits below one
-// already finished on some. Lines of equal rank keep plan order.
+// presentation.TableChangeOrder, ranked across every target each line speaks
+// for, so the table being copied leads, one no target has started sits below
+// one already finished on some, and a table its targets change with different
+// statements lists them together.
 func rankTargetTableLines(lines []targetTableLine) {
 	for li := range lines {
 		statuses := make([]string, len(lines[li].listed))
@@ -278,7 +279,14 @@ func rankTargetTableLines(lines []targetTableLine) {
 		}
 		lines[li].rank = presentation.TableRolloutRank(statuses)
 	}
-	slices.SortStableFunc(lines, func(a, b targetTableLine) int { return a.rank - b.rank })
+	order := presentation.TableChangeOrder(len(lines),
+		func(i int) string { return lines[i].table.Namespace + "\x00" + lines[i].table.TableName },
+		func(i int) int { return lines[i].rank })
+	sorted := make([]targetTableLine, len(lines))
+	for i, j := range order {
+		sorted[i] = lines[j]
+	}
+	copy(lines, sorted)
 }
 
 // writeTargetTableLine writes one table's line across the targets that run it.
@@ -363,7 +371,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	name := inlineCode(table)
 	pending := queued
 	pendingWord := presentation.PendingWord(settled)
-	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, pendingWord)
+	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, presentation.RunningCopying, pendingWord)
 	status := rollupTaskStatus(cells)
 	if keepsTargetProgressBar(cells, status, done, pending, settled) {
 		percent := presentation.PercentAcrossTargets(targetParts(cells), 0)
@@ -409,7 +417,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if partlyCompleted(status, done, pending) {
 		// Complete on some targets and queued on the rest: the change is live
 		// where it completed, so the line leads with that, not with Queued.
-		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells), presentation.TargetCoverage(0, 0, pending, 0, 0, pendingWord))
+		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells), presentation.TargetCoverage(0, 0, pending, 0, 0, presentation.RunningCopying, pendingWord))
 		writeDDL()
 		return
 	}
@@ -499,7 +507,7 @@ func cancelledTargetsLine(t cancelledTargets, settled, lists bool) (string, stri
 	if t.cancelled > 0 && !lists {
 		phrase += fmt.Sprintf(" on %d of %d targets", t.cancelled, t.targets)
 	}
-	coverage := presentation.TargetCoverage(t.done, 0, queued, 0, 0, presentation.PendingQueued)
+	coverage := presentation.TargetCoverage(t.done, 0, queued, 0, 0, presentation.RunningCopying, presentation.PendingQueued)
 	if notStarted > 0 {
 		separator := ", "
 		if coverage == "" {

@@ -537,7 +537,7 @@ func AwaitingResume(statuses []string) (coverage string, ok bool) {
 	if stopped == 0 {
 		return "", false
 	}
-	return TargetCoverage(done, 0, queued, 0, 0, PendingQueued), true
+	return TargetCoverage(done, 0, queued, 0, 0, RunningCopying, PendingQueued), true
 }
 
 // ResumeClaimed reads the operations of an apply in applyState. A start moves

@@ -473,6 +473,18 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 	return FormatTableProgressWithActivity(t, activityBar, "Finalizing copy")
 }
 
+// runningWord names t's parts while they work on its change: copying, unless
+// the change copies no rows, which a CREATE TABLE, a DROP TABLE and an instant
+// ALTER do not. The table's own line says "Applying..." for those, and its
+// parts read the same way.
+func runningWord(t TableProgress) string {
+	switch ddl.OpToStatementType(t.ChangeType) {
+	case ddl.StatementCreateTable, ddl.StatementDropTable:
+		return presentation.RunningApplying
+	}
+	return presentation.RunningWord(!isInstantAlter(t))
+}
+
 // isInstantAlter reports whether the table should be described as applying
 // instantly: the engine flagged it instant and it is an ALTER. Other
 // operations may complete without a row copy, but they are not instant DDL,

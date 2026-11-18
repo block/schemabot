@@ -546,6 +546,23 @@ func TestWriteProgress_TargetRollupGroupsTablesByNamespace(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(out, "── billing ──"), "%s", out)
 }
 
+// payments-001 and payments-002 alter `customers` while payments-003 and
+// payments-004 create it, and `orders` is copying on two targets. The running
+// CREATE copies no rows, so it reads as applying, never as copying, and the
+// two `customers` entries sit next to each other ahead of `orders`, so the
+// listing reads as the two tables the rollout changes.
+func TestWriteProgress_TargetRollupCreateAppliesAndListsBesideItsAlter(t *testing.T) {
+	out := renderRollout(t, mixedStatementsRolloutData())
+
+	assert.Contains(t, out, "• Targets: 2 (1 applying, 1 complete)", "%s", out)
+	assert.Contains(t, out, "◉ payments-004: applying", "%s", out)
+	assert.NotContains(t, out, "payments-004: copying", "%s", out)
+	assert.Contains(t, out, "• Targets: 4 (2 copying, 1 queued, 1 complete)", "the ALTER of orders still copies rows: %s", out)
+
+	assertLess(t, out, "CREATE TABLE `customers`", "ALTER TABLE `customers`")
+	assertLess(t, out, "ALTER TABLE `customers`", "ALTER TABLE `orders`")
+}
+
 // A table still in flight on any target reads as in flight, never as failed,
 // whatever phase the live targets are in; and it reads as the earliest phase a
 // target is in, not as a later one only some targets have reached.

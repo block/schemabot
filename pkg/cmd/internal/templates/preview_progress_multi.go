@@ -72,6 +72,7 @@ func previewCLIMultiDeployAllOutput() {
 		{"ALL DEPLOYMENTS COMPLETED", previewCLIMultiDeploymentApplyCompleted},
 		{"MULTI-TARGET ROLLOUT PAST A FAILED TARGET", previewCLIMultiTargetRolloutInProgress},
 		{"MULTI-TARGET ROLLOUT WAITING FOR CUTOVER", previewCLIMultiTargetRolloutWaitingForCutover},
+		{"MULTI-TARGET ROLLOUT CREATING A TABLE SOME TARGETS LACK", previewCLIMultiTargetRolloutMixedStatements},
 		{"MULTI-TARGET ROLLOUT STOPPED", previewCLIMultiTargetRolloutStopped},
 		{"SHARDED APPLY ON A KEYSPACE'S ONLY SHARD", previewCLISingleShardApplyCompleted},
 		{"SHARDED APPLY COPYING ACROSS FOUR SHARDS", previewCLIShardedApplyRunning},
@@ -116,6 +117,47 @@ func previewCLIMultiTargetRolloutInProgress() {
 	data := multiDeploymentProgressData(ops, tables)
 	data.State = state.Apply.RunningDegraded
 	WriteProgress(data)
+}
+
+// previewCLIMultiTargetRolloutMixedStatements is four targets where
+// payments-001 and payments-002 already have `customers` and alter it, while
+// payments-003 and payments-004 do not have it yet and create it. The CREATE is
+// running on payments-004, and `orders` is still copying on two targets.
+func previewCLIMultiTargetRolloutMixedStatements() {
+	WriteProgress(mixedStatementsRolloutData())
+}
+
+// mixedStatementsRolloutData is the rollout previewCLIMultiTargetRolloutMixedStatements
+// renders.
+func mixedStatementsRolloutData() ProgressData {
+	const (
+		alterCustomers  = "ALTER TABLE `customers` ADD COLUMN `tier` varchar(16) DEFAULT NULL"
+		createCustomers = "CREATE TABLE `customers` (`id` bigint NOT NULL AUTO_INCREMENT, `tier` varchar(16) DEFAULT NULL, PRIMARY KEY (`id`))"
+		alterOrders     = "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL"
+	)
+	var ops []ProgressOperation
+	var tables []TableProgress
+	for i := range 4 {
+		target := fmt.Sprintf("payments-%03d", i+1)
+		op := ProgressOperation{Deployment: "prod", Target: target, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt}
+		customers := TableProgress{Deployment: "prod", Target: target, TableName: "customers", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: alterCustomers, Status: state.Task.Completed, RowsCopied: 50000, RowsTotal: 50000, PercentComplete: 100}
+		orders := TableProgress{Deployment: "prod", Target: target, TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: alterOrders, Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100}
+		switch i {
+		case 0:
+			orders.Status, orders.RowsCopied, orders.PercentComplete, orders.ETASeconds = state.Task.Running, 36000, 45, 240
+		case 1:
+			orders.Status, orders.RowsCopied, orders.PercentComplete, orders.ETASeconds = state.Task.Running, 52000, 65, 150
+		case 2:
+			customers = TableProgress{Deployment: "prod", Target: target, TableName: "customers", ChangeType: "create", Dialect: schema.DialectMySQL, DDL: createCustomers, Status: state.Task.Completed, PercentComplete: 100}
+			op.State = state.ApplyOperation.Completed
+		case 3:
+			customers = TableProgress{Deployment: "prod", Target: target, TableName: "customers", ChangeType: "create", Dialect: schema.DialectMySQL, DDL: createCustomers, Status: state.Task.Running}
+			orders = TableProgress{Deployment: "prod", Target: target, TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: alterOrders, Status: state.Task.Pending, RowsTotal: 80000}
+		}
+		ops = append(ops, op)
+		tables = append(tables, customers, orders)
+	}
+	return multiDeploymentProgressData(ops, tables)
 }
 
 // previewCLIMultiTargetRolloutWaitingForCutover is three targets of an apply

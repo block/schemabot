@@ -2075,6 +2075,48 @@ func TestRenderMultiDeploymentApplyComment_UnreportedTargetsRankAsQueued(t *test
 	assert.Less(t, orders, invoices, "the table finished on one target leads the one no target has started")
 }
 
+// A parallel rollout across three targets where testapp-001 and testapp-002
+// already have `customers` and alter it, while testapp-003 does not and is
+// creating it. `orders` is copying on testapp-001. The two `customers` lines
+// sit next to each other, with `orders` after them, so the comment reads as
+// the two tables the rollout changes.
+func TestRenderMultiDeploymentApplyComment_ListsATablesStatementsTogether(t *testing.T) {
+	const (
+		alterCustomers  = "ALTER TABLE `customers` ADD COLUMN `tier` varchar(16)"
+		createCustomers = "CREATE TABLE `customers` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	)
+	detail := func(database string, tables ...TableProgressData) *ApplyStatusCommentData {
+		return &ApplyStatusCommentData{
+			Database: database, State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit,
+			Tables: tables,
+		}
+	}
+	customers := func(ddl, st string) TableProgressData {
+		return TableProgressData{TableName: "customers", DDL: ddl, Status: st, RowsCopied: 1000, RowsTotal: 1000}
+	}
+	orders := func(st string, copied int64) TableProgressData {
+		return TableProgressData{TableName: "orders", DDL: addNote, Status: st, RowsCopied: copied, RowsTotal: 1000}
+	}
+	out := renderTargets(presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Completed),
+		parallelTarget("primary", "testapp-003", so.Running),
+	}),
+		detail("testapp_001", customers(alterCustomers, state.Task.Completed), orders(state.Task.Running, 400)),
+		detail("testapp_002", customers(alterCustomers, state.Task.Completed), orders(state.Task.Completed, 1000)),
+		detail("testapp_003", TableProgressData{TableName: "customers", DDL: createCustomers, Status: state.Task.Running}, orders(state.Task.Pending, 0)),
+	)
+
+	alter := strings.Index(out, "ADD COLUMN `tier`")
+	create := strings.Index(out, "CREATE TABLE `customers`")
+	ordersLine := strings.Index(out, "**`orders`**")
+	require.NotEqual(t, -1, alter, out)
+	require.NotEqual(t, -1, create, out)
+	require.NotEqual(t, -1, ordersLine, out)
+	assert.Less(t, alter, ordersLine, "the ALTER of customers lists with its CREATE, ahead of orders: %s", out)
+	assert.Less(t, create, ordersLine, "the CREATE of customers leads orders: %s", out)
+}
+
 // A table in its revert window on one target and queued on the other has
 // completed where it ran, so its bar counts that target in full and its list
 // marks it done. Once every target is in its revert window, the line keeps the
