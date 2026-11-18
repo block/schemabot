@@ -238,6 +238,10 @@ func (h *Handler) loadRolloutProgress(ctx context.Context, checks []*storage.Che
 // The publish runs off the observer's goroutine on a copy of the apply, so the
 // progress tick never waits on GitHub. One refresh runs at a time for each
 // observer; a tick that finds one running is declined and offered again later.
+// Starting the refresh counts as reporting the finished targets, so a refresh
+// that then fails, on a GitHub error for example, leaves the Check Run's counts
+// as they were until the next target finishes or the aggregate is folded. Only
+// the text is late: a refresh never changes what the run gates.
 func (h *Handler) rolloutTargetsFinishedHook() func(*storage.Apply) bool {
 	var refreshing atomic.Bool
 	return func(apply *storage.Apply) bool {

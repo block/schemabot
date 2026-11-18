@@ -187,3 +187,35 @@ func TestRolloutCheckRunRefreshEndsOnTheOutcomeWhenTheApplyFinishesMeanwhile(t *
 	assert.Equal(t, checkConclusionSuccess, got.Conclusion)
 	assert.Empty(t, f.published, "the refresh folds once more and stops")
 }
+
+// A target finishes while a fold publishes, and the apply settles while the
+// fold's follow-up refresh rewrites the counts. The refresh finds the stored
+// check state moved and the aggregate is folded once more from the stored
+// check state read again, so the Check Run ends on the apply's outcome rather
+// than on the in-progress rows the first fold read.
+func TestRolloutCheckRunFoldEndsOnTheOutcomeWhenTheApplySettlesDuringItsRefresh(t *testing.T) {
+	f := newStoppedApplyCheckFixture(t, "octocat/rollout-progress-fold-settle", 46, "headsha1", "headsha1")
+	f.startRollout(t)
+	f.onPublish = func(n int) {
+		switch n {
+		case 1:
+			f.finishTarget(t, "shop-002")
+		case 2:
+			f.setStoredState(t, state.Apply.Completed)
+			stored, err := f.store.Checks().Get(t.Context(), f.apply.Repository, f.apply.PullRequest, f.apply.Environment, f.apply.DatabaseType, f.apply.Database)
+			require.NoError(t, err)
+			stored.Status = checkStatusCompleted
+			stored.Conclusion = checkConclusionSuccess
+			require.NoError(t, f.store.Checks().Upsert(t.Context(), stored))
+		}
+	}
+
+	first := f.fold(t, "the fold that read the rollout in progress")
+	assert.Equal(t, "Apply in progress on all 3 targets: 1 done", first.Output.Title)
+	refresh := f.requirePublished(t, "the refresh with the finished target")
+	assert.Equal(t, "Apply in progress on all 3 targets: 2 done", refresh.Output.Title)
+	got := f.requirePublished(t, "the fold from the settled stored check state")
+	assert.Equal(t, checkStatusCompleted, got.Status)
+	assert.Equal(t, checkConclusionSuccess, got.Conclusion)
+	assert.Empty(t, f.published, "the aggregate is folded once more and stops")
+}
