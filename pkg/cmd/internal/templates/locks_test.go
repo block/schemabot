@@ -104,11 +104,11 @@ func TestLockTemplatesDropTerminalEscapes(t *testing.T) {
 			"Release it with: "+cliname.Command("unlock", "-d", "orders", "-t", "vitess"+lineAttackCleaned)+"\n", output)
 	})
 
-	t.Run("a failed check for locks under other types keeps the error's line break", func(t *testing.T) {
+	t.Run("a failed check for locks under other types reports the error on one line", func(t *testing.T) {
 		output := captureStdout(t, func() {
 			WriteLockTypeScanFailed(errors.New("list locks: bad gateway\x1b[2J\r\n  retry the unlock"))
 		})
 
-		assert.Equal(t, "Could not check for locks under other database types: list locks: bad gateway[2J\n  retry the unlock\n", output)
+		assert.Equal(t, "Could not check for locks under other database types: list locks: bad gateway[2J retry the unlock\n", output)
 	})
 }

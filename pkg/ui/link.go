@@ -106,7 +106,8 @@ func isControl(r rune) bool {
 // it. Newlines and tabs are kept because multi-line error messages rely on
 // them. Bytes that are not valid UTF-8 come out as U+FFFD, so the result is not
 // byte for byte the input. A value that belongs on one line takes
-// TerminalSafeLine instead.
+// TerminalSafeLine instead, and a message printed inside a line takes
+// TerminalSafeInline.
 func TerminalSafe(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {
@@ -117,6 +118,14 @@ func TerminalSafe(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// TerminalSafeInline is TerminalSafe for a message printed inside a line the
+// CLI writes, such as the reason that ends a warning. Each run of white space,
+// line breaks included, becomes one space: the words stay apart, and the
+// message cannot start a line of its own under the one it was printed on.
+func TerminalSafeInline(s string) string {
+	return strings.Join(strings.Fields(TerminalSafe(s)), " ")
 }
 
 // terminalEscapePattern matches the zero-width escape sequences this CLI

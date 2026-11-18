@@ -107,7 +107,7 @@ func showDeploymentLogs(endpoint, applyID, deployment string, scope client.LogSc
 		}
 	}
 	for _, sourceErr := range result.Errors {
-		fmt.Printf("Warning: %s: %s\n", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), ui.TerminalSafe(sourceErr.Message))
+		fmt.Printf("Warning: %s: %s\n", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), ui.TerminalSafeInline(sourceErr.Message))
 	}
 	return nil
 }
@@ -385,7 +385,7 @@ func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse)
 	var warnings []string
 	for _, sourceErr := range result.Errors {
 		key := deploymentFollowSourceKey(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID)
-		warning := fmt.Sprintf("%s: %s", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), ui.TerminalSafe(sourceErr.Message))
+		warning := fmt.Sprintf("%s: %s", deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID), ui.TerminalSafeInline(sourceErr.Message))
 		if s.lastWarned[key] == warning {
 			// This exact failure was already reported; repeating it on every
 			// poll would drown the tail.
@@ -476,7 +476,7 @@ func followFailureOutcome(err error, failures int, pacing followPacing) (time.Du
 	}
 	wait := pacing.retryWait(err, failures)
 	fmt.Fprintf(os.Stderr, "Warning: failed to fetch logs (attempt %d/%d), retrying in %s: %s\n",
-		failures, maxConsecutiveProgressFailures, wait, ui.TerminalSafe(err.Error()))
+		failures, maxConsecutiveProgressFailures, wait, ui.TerminalSafeInline(err.Error()))
 	return wait, nil
 }
 

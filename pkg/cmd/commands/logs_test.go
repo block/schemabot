@@ -622,17 +622,21 @@ func TestLogsCmdParsesShardStartingWithHyphen(t *testing.T) {
 // arrived: it sets the window title, clears the screen, returns to the start
 // of the line, opens a control sequence with a C1 rune and reverses the text
 // after it. terminalAttackCleaned is what is left once the control runes are
-// removed.
+// removed. lineBreakAttack adds a line break and a tab, which a value that
+// belongs on one line loses as well.
 const (
 	terminalAttack        = "\x1b]0;owned\x07\x1b[2J\r\u009b31m\u202e"
 	terminalAttackCleaned = "]0;owned[2J31m"
+	lineBreakAttack       = terminalAttack + "\n\t"
 )
 
 // A log entry's level, message and states are relayed from the engine and the
 // database, and a data-plane source's label and failure text come from the
 // response too. The one-shot data-plane read prints all of them, so none of it
 // reaches the terminal with its escape sequences: the only escapes in the
-// output are the CLI's own colors. A message's own line break is kept.
+// output are the CLI's own colors. A log message's own line break is kept. A
+// source label and a warning each stay on the one line they are printed on, so
+// neither can add a line that reads as a log entry.
 func TestShowDeploymentLogsDropsTerminalEscapes(t *testing.T) {
 	createdAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	response := apitypes.DeploymentLogsResponse{
@@ -640,8 +644,8 @@ func TestShowDeploymentLogsDropsTerminalEscapes(t *testing.T) {
 		Deployment: "region-a",
 		Sources: []*apitypes.DeploymentLogSource{
 			{
-				ExternalID: "remote-1" + terminalAttack,
-				Operations: []*apitypes.LogOperationProvenance{{Target: "target-a" + terminalAttack, OperationKind: "spirit" + terminalAttack}},
+				ExternalID: "remote-1" + lineBreakAttack,
+				Operations: []*apitypes.LogOperationProvenance{{Target: "target-a" + lineBreakAttack, OperationKind: "spirit" + lineBreakAttack}},
 				Logs: []*apitypes.LogEntry{{
 					ID: 1, Level: "info", CreatedAt: createdAt,
 					Message: "copy started" + terminalAttack, OldState: "pending" + terminalAttack, NewState: "running" + terminalAttack,
@@ -654,7 +658,8 @@ func TestShowDeploymentLogsDropsTerminalEscapes(t *testing.T) {
 			},
 		},
 		Errors: []*apitypes.DeploymentLogError{
-			deploymentFollowError("target-c"+terminalAttack, "remote-3"+terminalAttack, "Data-plane logs could not be read."+terminalAttack),
+			deploymentFollowError("target-c"+lineBreakAttack, "remote-3"+lineBreakAttack,
+				"Data-plane logs could not be read."+terminalAttack+"\n00:00:00 [INF] cutover complete"),
 		},
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -677,7 +682,7 @@ func TestShowDeploymentLogsDropsTerminalEscapes(t *testing.T) {
 			"\n"+
 			templates.ANSIDim+"target-b / spirit (remote-2)"+templates.ANSIReset+"\n"+
 			timestamp+" [NOTICE[31M] line one\n  line two\n"+
-			"Warning: target-c"+cleaned+" / spirit (remote-3"+cleaned+"): Data-plane logs could not be read."+cleaned+"\n",
+			"Warning: target-c"+cleaned+" / spirit (remote-3"+cleaned+"): Data-plane logs could not be read."+cleaned+" 00:00:00 [INF] cutover complete\n",
 		output)
 }
 
@@ -690,11 +695,11 @@ func TestDeploymentFollowStateDropsTerminalEscapes(t *testing.T) {
 
 	batches, warnings := state.advance(&apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{
-			deploymentFollowSource("target-a", "remote-1\x1b", 1),
+			deploymentFollowSource("target-a", "remote-1\x1b\n", 1),
 			deploymentFollowSource("target-a", "remote-1", 1),
 		},
 		Errors: []*apitypes.DeploymentLogError{
-			deploymentFollowError("target-b"+terminalAttack, "remote-2", "Data-plane logs could not be read."+terminalAttack),
+			deploymentFollowError("target-b"+lineBreakAttack, "remote-2", "Data-plane logs could not be read."+terminalAttack+"\n  retry later"),
 		},
 	})
 
@@ -702,14 +707,14 @@ func TestDeploymentFollowStateDropsTerminalEscapes(t *testing.T) {
 	assert.Equal(t, "target-a / spirit (remote-1)", batches[0].label)
 	assert.Equal(t, "target-a / spirit (remote-1)", batches[1].label)
 	require.Len(t, warnings, 1)
-	assert.Equal(t, "target-b"+terminalAttackCleaned+" / spirit (remote-2): Data-plane logs could not be read."+terminalAttackCleaned, warnings[0])
+	assert.Equal(t, "target-b"+terminalAttackCleaned+" / spirit (remote-2): Data-plane logs could not be read."+terminalAttackCleaned+" retry later", warnings[0])
 }
 
 // A failed poll's warning quotes the error, and an error from the server can
 // carry the text of whatever answered. The warning goes to the terminal
-// without its escape sequences.
+// without its escape sequences and on one line.
 func TestFollowFailureWarningDropsTerminalEscapes(t *testing.T) {
-	failure := followAPIError(http.StatusServiceUnavailable, "storage unavailable"+terminalAttack)
+	failure := followAPIError(http.StatusServiceUnavailable, "storage unavailable"+terminalAttack+"\nWarning: the apply was cancelled")
 
 	var err error
 	warning := captureStderr(t, func() {
@@ -717,5 +722,5 @@ func TestFollowFailureWarningDropsTerminalEscapes(t *testing.T) {
 	})
 
 	require.NoError(t, err, "one failed poll is retried, not the end of the tail")
-	assert.Equal(t, "Warning: failed to fetch logs (attempt 1/10), retrying in 1ms: storage unavailable"+terminalAttackCleaned+"\n", warning)
+	assert.Equal(t, "Warning: failed to fetch logs (attempt 1/10), retrying in 1ms: storage unavailable"+terminalAttackCleaned+" Warning: the apply was cancelled\n", warning)
 }

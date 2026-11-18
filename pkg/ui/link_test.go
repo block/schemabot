@@ -213,6 +213,28 @@ func TestTerminalSafeLine(t *testing.T) {
 	}
 }
 
+func TestTerminalSafeInline(t *testing.T) {
+	cases := map[string]struct {
+		in, want string
+	}{
+		"plain text is unchanged":                      {"storage unavailable", "storage unavailable"},
+		"a line break becomes a space":                 {"bad gateway\nretry the unlock", "bad gateway retry the unlock"},
+		"a line break and its indent become a space":   {"bad gateway\r\n\t  retry the unlock", "bad gateway retry the unlock"},
+		"a line separator becomes a space":             {"bad gateway\u2028retry", "bad gateway retry"},
+		"white space at either end is removed":         {"\n bad gateway \n", "bad gateway"},
+		"an escape sequence is removed":                {"bad gateway\x1b[2J", "bad gateway[2J"},
+		"a control rune inside a word adds no space":   {"bad gate\x1bway", "bad gateway"},
+		"a right-to-left override is removed":          {"bad\u202e gateway", "bad gateway"},
+		"printable Unicode is kept":                    {"josé · 👩\u200d💻", "josé · 👩\u200d💻"},
+		"text of only control runes and space is \"\"": {"\x1b\n\t ", ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, TerminalSafeInline(tc.in))
+		})
+	}
+}
+
 func TestPadVisible(t *testing.T) {
 	t.Run("pads plain text to the requested cell count", func(t *testing.T) {
 		assert.Equal(t, "ab   ", PadVisible("ab", 5))

@@ -136,7 +136,7 @@ func WriteLockExistsUnderOtherType(database, requestedType, foundType string) {
 // other database types could not run, so a "no lock found" answer is only
 // authoritative for the requested type.
 func WriteLockTypeScanFailed(err error) {
-	fmt.Printf("Could not check for locks under other database types: %s\n", ui.TerminalSafe(err.Error()))
+	fmt.Printf("Could not check for locks under other database types: %s\n", ui.TerminalSafeInline(err.Error()))
 }
 
 // WriteUnlockNotOwned writes the message when trying to unlock without ownership.
