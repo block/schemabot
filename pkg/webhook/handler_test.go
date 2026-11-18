@@ -1391,6 +1391,7 @@ func TestWebhookConcurrentRequests(t *testing.T) {
 }
 
 func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -1434,6 +1435,7 @@ func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
 		t.Fatalf("unexpected rejection comment: %s", body)
 	case <-time.After(100 * time.Millisecond):
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "issue_comment", "created")
 }
 
 func TestWebhookRepoAllowlistAllowsRegisteredRepo(t *testing.T) {
@@ -1511,6 +1513,7 @@ func TestWebhookRepoAllowlistEmptyAllowsAll(t *testing.T) {
 }
 
 func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	service := api.New(nil, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{
 			"org/allowed-repo": {},
@@ -1529,6 +1532,7 @@ func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "repository not registered")
+	requireUnregisteredRepositoryCounted(t, reader, "pull_request", "opened")
 }
 
 // PR close bypass of the allowlist is tested in the integration suite

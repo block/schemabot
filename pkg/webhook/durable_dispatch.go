@@ -818,7 +818,7 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 		h.logger.Warn("durable pull_request delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "action", payload.Action, "repo", repo, "pr", pr,
 			"installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "pull_request", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "pull_request", payload.Action)
 		return false, nil
 	}
 
@@ -917,7 +917,7 @@ func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *st
 		h.logger.Warn("durable check_run completion from unregistered repository",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
 			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_run", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_run", payload.Action)
 		return false, nil
 	}
 
@@ -1002,7 +1002,7 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
 			"check_run_id", payload.CheckRun.ID, "check_name", payload.CheckRun.Name,
 			"head_sha", payload.CheckRun.HeadSHA)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_run", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_run", payload.Action)
 		return false, nil
 	}
 	if !h.isSchemaBotAggregateCheckName(repo, payload.CheckRun.Name) {

@@ -60,6 +60,26 @@ func collectCounterPoints(t *testing.T, reader *sdkmetric.ManualReader, name str
 	return nil
 }
 
+// requireUnregisteredRepositoryCounted asserts that one delivery was counted as
+// ignored for an unregistered repository, under the given event type and
+// action, on a series that names no repository. An empty action means the event
+// carries none, and the series then has no action attribute.
+func requireUnregisteredRepositoryCounted(t *testing.T, reader *sdkmetric.ManualReader, eventType, action string) {
+	t.Helper()
+	points := collectCounterPoints(t, reader, "schemabot.webhook.unregistered_repository_ignored_total")
+	require.Len(t, points, 1, "one ignored delivery lands on one series")
+	point := points[0]
+	assert.Equal(t, int64(1), point.Value)
+
+	gotEventType, _ := point.Attributes.Value("event_type")
+	assert.Equal(t, eventType, gotEventType.AsString())
+	gotAction, hasAction := point.Attributes.Value("action")
+	assert.Equal(t, action != "", hasAction, "the action attribute is present only for events that carry one")
+	assert.Equal(t, action, gotAction.AsString())
+	_, hasRepository := point.Attributes.Value("repository")
+	assert.False(t, hasRepository, "the repository belongs in the log line, not on the series")
+}
+
 // collectDispatchHistogramPoints collects the named float64 histogram's data
 // points from the reader.
 func collectDispatchHistogramPoints(t *testing.T, reader *sdkmetric.ManualReader, name string) []metricdata.HistogramDataPoint[float64] {

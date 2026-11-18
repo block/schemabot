@@ -189,7 +189,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			"pr", pr,
 			"installation_id", installationID,
 			"requested_by", requestedBy)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "issue_comment", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "issue_comment", payload.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",
 		})
@@ -1050,7 +1050,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
 		h.logger.Warn("durable issue_comment delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action)
 		return false, nil
 	}
 	// The request path refuses commands from a listen-only repository before

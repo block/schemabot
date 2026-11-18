@@ -169,6 +169,7 @@ func TestDurableMergeGroupDriverPostsChecks(t *testing.T) {
 // A merge_group delivery for a repo this deployment does not manage completes as
 // a no-op — its check is not required there — without creating a GitHub client.
 func TestDurableMergeGroupDriverCompletesUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durableMergeGroupEvent())
 	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"other/repo": {}}}
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
@@ -187,6 +188,7 @@ func TestDurableMergeGroupDriverCompletesUnregisteredRepo(t *testing.T) {
 		t.Fatal("unregistered repo must not create a GitHub client")
 	default:
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "merge_group", "checks_requested")
 }
 
 // An aggregate participant stays silent on merge-group commits — the leader

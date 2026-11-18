@@ -277,6 +277,7 @@ func TestDurableCheckRunDriverFailsMalformedTerminally(t *testing.T) {
 // A check_run rerequest for a repo outside the allowlist is completed without
 // running auto-plan or creating a GitHub client.
 func TestDurableCheckRunDriverCompletesUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
 	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"other/repo": {}}}
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
@@ -295,6 +296,7 @@ func TestDurableCheckRunDriverCompletesUnregisteredRepo(t *testing.T) {
 		t.Fatal("unregistered repo must not create a GitHub client")
 	default:
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "check_run", "rerequested")
 }
 
 // A check_run rerequest for a check SchemaBot does not own is completed without

@@ -141,6 +141,7 @@ func TestWebhookMergeGroupIgnoresNonChecksRequested(t *testing.T) {
 // A merge_group event for a repository SchemaBot does not manage gets no check:
 // SchemaBot's check is not required on that repo, so there is nothing to unblock.
 func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	h, created := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"org/allowed-repo": {}})
 
 	rr := httptest.NewRecorder()
@@ -154,6 +155,7 @@ func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
 		t.Fatalf("unexpected check run created for unregistered repo: %q", c.Name)
 	case <-time.After(100 * time.Millisecond):
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "merge_group", "checks_requested")
 }
 
 // A webhook redelivery for the same merge group must not create a duplicate

@@ -167,7 +167,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			"repo", repo,
 			"pr", pr,
 			"installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "pull_request", payload.Action, repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "pull_request", payload.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",
 		})
