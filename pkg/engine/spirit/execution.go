@@ -303,6 +303,7 @@ func (e *Engine) runStatementPhase(ctx context.Context, database, stopLabel, fai
 	for _, stmt := range statements {
 		if err := run(ctx, stmt); err != nil {
 			if ctx.Err() != nil {
+				e.noteStoppedStatement(logger, database, err)
 				logger.Info("schema change stopped during "+stopLabel,
 					"database", database,
 					"reason", ctx.Err(),
@@ -506,6 +507,9 @@ func classifyRunnerErrorCutover(result status.WorkflowResult) runnerErrorCutover
 func (e *Engine) settleRunnerError(ctx context.Context, runErr error, result status.WorkflowResult, database string, tables []string) error {
 	logger := e.changeLogger()
 	cancelled := ctx.Err() != nil
+	if cancelled {
+		e.noteStoppedStatement(logger, database, runErr)
+	}
 	switch classifyRunnerErrorCutover(result) {
 	case runnerErrorAfterCutover:
 		// The error is cleanup Spirit could not finish; it is logged, never
@@ -721,7 +725,7 @@ func (e *Engine) dropCutoverOriginalsLeftByCancel(ctx context.Context, dsn, data
 			"database", database,
 			"tables", present,
 		)
-		discarded, err := discardArtifacts(ctx, db, database, present)
+		discarded, err := discardArtifacts(ctx, db, logger, database, present)
 		return present[len(discarded):], err
 	}()
 	if err != nil {

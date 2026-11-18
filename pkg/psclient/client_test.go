@@ -1,11 +1,13 @@
 package psclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -226,6 +229,11 @@ func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
 			wantInError: "branch / main is behind",
 			wantOmitted: []string{"|", "\n"},
 		},
+		{
+			name:        "the refusal carries several kilobytes of detail beside its message",
+			body:        `{"message":"branch has no schema changes","detail":"` + strings.Repeat("x", 9<<10) + `"}`,
+			wantInError: "branch has no schema changes",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -253,7 +261,173 @@ func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
 			var apiErr *APIError
 			require.ErrorAs(t, err, &apiErr)
 			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
-			assert.Equal(t, tc.body, apiErr.Body, "the whole response stays on the error for the server log")
+			assert.Equal(t, tc.body, apiErr.Body, "a short response stays on the error whole for the server log")
+		})
+	}
+}
+
+// captureLogs routes the default logger into a buffer for the test and returns
+// a function that decodes the records logged so far.
+func captureLogs(t *testing.T) func() []map[string]any {
+	t.Helper()
+	var logs bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+	return func() []map[string]any {
+		var records []map[string]any
+		dec := json.NewDecoder(bytes.NewReader(logs.Bytes()))
+		for dec.More() {
+			var record map[string]any
+			require.NoError(t, dec.Decode(&record), "decode a captured log record")
+			records = append(records, record)
+		}
+		return records
+	}
+}
+
+// requireLogged returns the one captured record carrying msg.
+func requireLogged(t *testing.T, records []map[string]any, msg string) map[string]any {
+	t.Helper()
+	var matched []map[string]any
+	for _, record := range records {
+		if record["msg"] == msg {
+			matched = append(matched, record)
+		}
+	}
+	require.Len(t, matched, 1, "log records with message %q", msg)
+	return matched[0]
+}
+
+// A failed call reads only the start of its response: a proxy that answers
+// with megabytes of HTML still produces a typed APIError with the status, and
+// only the first 64 KiB are kept on the error and in the server log, which
+// says whether anything was left out. A body of exactly 64 KiB is kept whole,
+// and a cut that lands inside a multi-byte character drops that character
+// rather than leaving half of it.
+func TestRawRequestFailureKeepsOnlyTheStartOfALargeBody(t *testing.T) {
+	const limit = 64 << 10
+	for _, tc := range []struct {
+		name          string
+		body          string
+		wantKept      int
+		wantTruncated bool
+	}{
+		{
+			name:     "a body of exactly the limit",
+			body:     strings.Repeat("y", limit),
+			wantKept: limit,
+		},
+		{
+			name:          "a body one byte over the limit",
+			body:          strings.Repeat("y", limit+1),
+			wantKept:      limit,
+			wantTruncated: true,
+		},
+		{
+			name:          "a proxy page of three megabytes",
+			body:          strings.Repeat("<p>gateway</p>", 3<<20/len("<p>gateway</p>")),
+			wantKept:      limit,
+			wantTruncated: true,
+		},
+		{
+			// One byte, then two-byte characters: the limit falls after the
+			// first byte of one of them.
+			name:          "a cut inside a multi-byte character",
+			body:          "y" + strings.Repeat("é", limit),
+			wantKept:      limit - 1,
+			wantTruncated: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLogs(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+			require.NoError(t, err)
+
+			_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			var apiErr *APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+			assert.Equal(t, tc.body[:tc.wantKept], apiErr.Body)
+			assert.True(t, utf8.ValidString(apiErr.Body), "the kept body is valid UTF-8")
+
+			record := requireLogged(t, logged(), "PlanetScale API request failed")
+			assert.Equal(t, tc.body[:tc.wantKept], record["response_body"])
+			assert.Equal(t, tc.wantTruncated, record["response_body_truncated"])
+		})
+	}
+}
+
+// A failed response whose body breaks off part-way is reported as a read
+// failure that still names the status the API answered with, and keeps the
+// cause of the break so a caller can match it.
+func TestRawRequestFailureWithAnUnreadableBodyKeepsTheStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Declaring more than is written makes the server end the connection
+		// before the body is complete.
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("partial"))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Contains(t, err.Error(), "read GET /v1/organizations/block/databases/orders/deploy-requests/132 response (status 502)")
+	assert.NotContains(t, err.Error(), srv.URL)
+}
+
+// A successful response of up to 8 MiB is read whole. One byte more is larger
+// than any raw endpoint sends, and is refused with a typed error naming the
+// endpoint, rather than read whole into memory or cut short into JSON that
+// fails to decode. The refusal is logged with the status the API answered
+// with, since the request itself succeeded.
+func TestRawRequestRefusesAnOversizedResponse(t *testing.T) {
+	const limit = 8 << 20
+	for _, tc := range []struct {
+		name        string
+		size        int
+		wantRefused bool
+	}{
+		{name: "a response of exactly the limit", size: limit},
+		{name: "a response one byte over the limit", size: limit + 1, wantRefused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLogs(t)
+			prefix, suffix := `{"deployment":{"auto_cutover":true},"padding":"`, `"}`
+			body := prefix + strings.Repeat("x", tc.size-len(prefix)-len(suffix)) + suffix
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			t.Cleanup(srv.Close)
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+			require.NoError(t, err)
+
+			autoCutover, err := client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			if !tc.wantRefused {
+				require.NoError(t, err)
+				assert.True(t, autoCutover)
+				assert.Empty(t, logged(), "a response within the limit logs nothing")
+				return
+			}
+			require.ErrorIs(t, err, ErrResponseTooLarge)
+			assert.Contains(t, err.Error(), "GET /v1/organizations/block/databases/orders/deploy-requests/132")
+			assert.NotContains(t, err.Error(), srv.URL)
+
+			record := requireLogged(t, logged(), "PlanetScale API response refused: larger than SchemaBot reads")
+			assert.Equal(t, "/v1/organizations/block/databases/orders/deploy-requests/132", record["path"])
+			assert.Equal(t, float64(http.StatusOK), record["status_code"])
+			assert.Equal(t, float64(limit), record["limit_bytes"])
 		})
 	}
 }

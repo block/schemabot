@@ -809,7 +809,7 @@ func TestUpdateApplyStateFromOperations_FinalizerPendingIsNonTerminal(t *testing
 	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
 	require.NoError(t, err)
 	require.NotNil(t, applyStore.updated, "the pending finalizer must keep the aggregate non-terminal")
-	assert.Equal(t, state.Apply.Pending, applyStore.updated.State)
+	assert.Equal(t, state.Apply.Running, applyStore.updated.State, "completed work leaves the apply running while its finalizer waits to be claimed")
 	assert.Nil(t, applyStore.updated.CompletedAt)
 }
 

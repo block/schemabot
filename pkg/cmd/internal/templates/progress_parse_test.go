@@ -310,3 +310,30 @@ func TestParseProgressResponseCountsTablesStoppedAtCutoverOnTheOnlyShard(t *test
 	assert.Equal(t, "1 table stopped at the cutover because orders failed. Its copy is saved, so applying again resumes it.",
 		ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released))
 }
+
+// A failed apply's error and a table's throttle reason are relayed from the
+// engine and the database and printed to the operator's terminal. Escape
+// sequences in them are removed, while the newline that splits a multi-line
+// error stays.
+func TestParseProgressResponseDropsTerminalEscapesFromServerText(t *testing.T) {
+	const response = `{
+		"state": "failed",
+		"error_message": "deploy request failed\n  lock wait timeout\u001b[2J",
+		"operations": [
+			{"deployment": "default", "state": "failed", "error_message": "duplicate key\u001b]0;owned\u0007"}
+		],
+		"tables": [
+			{"table_name": "orders", "status": "running", "throttled": true, "throttle_reason": "replica lag\u001b[31m"}
+		]
+	}`
+	var result apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal([]byte(response), &result))
+
+	data := ParseProgressResponse(&result)
+
+	assert.Equal(t, "deploy request failed\n  lock wait timeout[2J", data.ErrorMessage)
+	require.Len(t, data.Operations, 1)
+	assert.Equal(t, "duplicate key]0;owned", data.Operations[0].ErrorMessage)
+	require.Len(t, data.Tables, 1)
+	assert.Equal(t, "replica lag[31m", data.Tables[0].ThrottleReason)
+}

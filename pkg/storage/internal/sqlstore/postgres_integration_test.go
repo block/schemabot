@@ -104,6 +104,13 @@ func TestPostgresStorageParity(t *testing.T) {
 			})
 		}, namedlock.Postgres{}, postgresApplyRowLocks(h.db))
 	})
+	t.Run("GetLatestByDatabaseOrdersByCreationThenID", func(t *testing.T) {
+		testGetLatestByDatabaseOrdersByCreationThenID(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		})
+	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
 	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
 }
@@ -1217,6 +1224,21 @@ func TestPostgresListRecentTargetsWindow(t *testing.T) {
 		{Database: "orders", Environment: "staging", Target: "orders-recent"},
 		{Database: "orders", Environment: "staging", Target: "orders-settled-late"},
 	}, targets)
+}
+
+// A failed organic plan delivery covers its head only during the cool-off on
+// PostgreSQL too: the cutoff is rendered SQL, so it is exercised on each
+// dialect.
+func TestPostgresFailedOrganicRowCoversOnlyDuringCoolOff(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_webhook_cool_off")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	assertFailedRowCoverageCoolOff(t, NewPostgres(db), db, PostgresDialect{}, PostgresDialect{}.Rebind)
 }
 
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {

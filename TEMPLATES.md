@@ -917,7 +917,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
 - `users`: the table has \~1,240 rows
 
-Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.
+If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again, for a limited number of attempts ([how it works](https://github.com/block/schemabot/blob/main/docs/direct-execution.md)). It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end. When the attempts run out or it meets one of those blockers, the apply fails as busy. Writes to each table are blocked until its statement finishes.
 
 📋 **Plan**: **2** tables to alter
 
@@ -2580,7 +2580,8 @@ schemabot apply -e production
 
 ### 2 of 3 targets
 
-`us/testapp_1`, `us/testapp_2`
+- `us/testapp_1`
+- `us/testapp_2`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -2604,6 +2605,232 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ▶️ **To apply**, comment:
 ```
 schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-wide-rollout"></a><strong>Rollout Plans (Wide Rollout)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 28 of 32 targets
+
+<details>
+<summary>Target names</summary>
+
+```
+us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+us/testapp_030  us/testapp_031  us/testapp_032
+```
+
+</details>
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `last_login_at` timestamp NULL,
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `notes` varchar(255) NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_status`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+### 4 of 32 targets
+
+- `us/testapp_001`
+- `us/testapp_002`
+- `us/testapp_003`
+- `us/testapp_004`
+
+```sql
+ALTER TABLE `orders` ADD COLUMN `notes` varchar(255) NULL;
+```
+
+💡 **Lint Warnings**: 4 advisory findings
+- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `users` on 28 of 32 targets: Column `last_login_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+  <details>
+  <summary>Target names</summary>
+
+  ```
+  us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+  us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+  us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+  us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+  us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+  us/testapp_030  us/testapp_031  us/testapp_032
+  ```
+
+  </details>
+
+On targets `us/testapp_001`, `us/testapp_002`, `us/testapp_003`, `us/testapp_004`:
+- `orders`: Index `idx_user` on column `user_id` is redundant - covered by index `idx_user_status` on columns (`user_id`, `status`)
+- `orders`: AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type
+
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 32 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-wide-rollout-128-targets"></a><strong>Rollout Plans (Wide Rollout, 128 Targets)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 124 of 128 targets
+
+<details>
+<summary>Target names</summary>
+
+```
+us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+us/testapp_030  us/testapp_031  us/testapp_032  us/testapp_033  us/testapp_034
+us/testapp_035  us/testapp_036  us/testapp_037  us/testapp_038  us/testapp_039
+us/testapp_040  us/testapp_041  us/testapp_042  us/testapp_043  us/testapp_044
+us/testapp_045  us/testapp_046  us/testapp_047  us/testapp_048  us/testapp_049
+us/testapp_050  us/testapp_051  us/testapp_052  us/testapp_053  us/testapp_054
+us/testapp_055  us/testapp_056  us/testapp_057  us/testapp_058  us/testapp_059
+us/testapp_060  us/testapp_061  us/testapp_062  us/testapp_063  us/testapp_064
+us/testapp_065  us/testapp_066  us/testapp_067  us/testapp_068  us/testapp_069
+us/testapp_070  us/testapp_071  us/testapp_072  us/testapp_073  us/testapp_074
+us/testapp_075  us/testapp_076  us/testapp_077  us/testapp_078  us/testapp_079
+us/testapp_080  us/testapp_081  us/testapp_082  us/testapp_083  us/testapp_084
+us/testapp_085  us/testapp_086  us/testapp_087  us/testapp_088  us/testapp_089
+us/testapp_090  us/testapp_091  us/testapp_092  us/testapp_093  us/testapp_094
+us/testapp_095  us/testapp_096  us/testapp_097  us/testapp_098  us/testapp_099
+us/testapp_100  us/testapp_101  us/testapp_102  us/testapp_103  us/testapp_104
+us/testapp_105  us/testapp_106  us/testapp_107  us/testapp_108  us/testapp_109
+us/testapp_110  us/testapp_111  us/testapp_112  us/testapp_113  us/testapp_114
+us/testapp_115  us/testapp_116  us/testapp_117  us/testapp_118  us/testapp_119
+us/testapp_120  us/testapp_121  us/testapp_122  us/testapp_123  us/testapp_124
+us/testapp_125  us/testapp_126  us/testapp_127  us/testapp_128
+```
+
+</details>
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `last_login_at` timestamp NULL,
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `notes` varchar(255) NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_status`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+### 4 of 128 targets
+
+- `us/testapp_001`
+- `us/testapp_002`
+- `us/testapp_003`
+- `us/testapp_004`
+
+```sql
+ALTER TABLE `orders` ADD COLUMN `notes` varchar(255) NULL;
+```
+
+💡 **Lint Warnings**: 4 advisory findings
+- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `users` on 124 of 128 targets: Column `last_login_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+  <details>
+  <summary>Target names</summary>
+
+  ```
+  us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+  us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+  us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+  us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+  us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+  us/testapp_030  us/testapp_031  us/testapp_032  us/testapp_033  us/testapp_034
+  us/testapp_035  us/testapp_036  us/testapp_037  us/testapp_038  us/testapp_039
+  us/testapp_040  us/testapp_041  us/testapp_042  us/testapp_043  us/testapp_044
+  us/testapp_045  us/testapp_046  us/testapp_047  us/testapp_048  us/testapp_049
+  us/testapp_050  us/testapp_051  us/testapp_052  us/testapp_053  us/testapp_054
+  us/testapp_055  us/testapp_056  us/testapp_057  us/testapp_058  us/testapp_059
+  us/testapp_060  us/testapp_061  us/testapp_062  us/testapp_063  us/testapp_064
+  us/testapp_065  us/testapp_066  us/testapp_067  us/testapp_068  us/testapp_069
+  us/testapp_070  us/testapp_071  us/testapp_072  us/testapp_073  us/testapp_074
+  us/testapp_075  us/testapp_076  us/testapp_077  us/testapp_078  us/testapp_079
+  us/testapp_080  us/testapp_081  us/testapp_082  us/testapp_083  us/testapp_084
+  us/testapp_085  us/testapp_086  us/testapp_087  us/testapp_088  us/testapp_089
+  us/testapp_090  us/testapp_091  us/testapp_092  us/testapp_093  us/testapp_094
+  us/testapp_095  us/testapp_096  us/testapp_097  us/testapp_098  us/testapp_099
+  us/testapp_100  us/testapp_101  us/testapp_102  us/testapp_103  us/testapp_104
+  us/testapp_105  us/testapp_106  us/testapp_107  us/testapp_108  us/testapp_109
+  us/testapp_110  us/testapp_111  us/testapp_112  us/testapp_113  us/testapp_114
+  us/testapp_115  us/testapp_116  us/testapp_117  us/testapp_118  us/testapp_119
+  us/testapp_120  us/testapp_121  us/testapp_122  us/testapp_123  us/testapp_124
+  us/testapp_125  us/testapp_126  us/testapp_127  us/testapp_128
+  ```
+
+  </details>
+
+On targets `us/testapp_001`, `us/testapp_002`, `us/testapp_003`, `us/testapp_004`:
+- `orders`: Index `idx_user` on column `user_id` is redundant - covered by index `idx_user_status` on columns (`user_id`, `status`)
+- `orders`: AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type
+
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 128 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
 ```
 
 </details>
@@ -10283,6 +10510,35 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="plan-few-shards-8"></a><strong>Plan: Few Shards (8)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `cdb_resolute_sharded`
+**shards `-20`, `20-40`, `40-60`, `60-80`, `80-a0`, `a0-c0`, `c0-e0`, `e0-`**
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="plan-many-shards-32"></a><strong>Plan: Many Shards (32)</strong></summary>
 
 
@@ -10296,7 +10552,70 @@ schemabot apply -e production
 <details>
 <summary><b>all 32 shards</b></summary>
 
-`-08`, `08-10`, `10-18`, `18-20`, `20-28`, `28-30`, `30-38`, `38-40`, `40-48`, `48-50`, `50-58`, `58-60`, `60-68`, `68-70`, `70-78`, `78-80`, `80-88`, `88-90`, `90-98`, `98-a0`, `a0-a8`, `a8-b0`, `b0-b8`, `b8-c0`, `c0-c8`, `c8-d0`, `d0-d8`, `d8-e0`, `e0-e8`, `e8-f0`, `f0-f8`, `f8-`
+```
+-08    08-10  10-18  18-20  20-28  28-30  30-38  38-40  40-48  48-50  50-58
+58-60  60-68  68-70  70-78  78-80  80-88  88-90  90-98  98-a0  a0-a8  a8-b0
+b0-b8  b8-c0  c0-c8  c8-d0  d0-d8  d8-e0  e0-e8  e8-f0  f0-f8  f8-
+```
+
+</details>
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="plan-many-shards-256"></a><strong>Plan: Many Shards (256)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `cdb_resolute_sharded`
+<details>
+<summary><b>all 256 shards</b></summary>
+
+```
+-01    01-02  02-03  03-04  04-05  05-06  06-07  07-08  08-09  09-0a  0a-0b
+0b-0c  0c-0d  0d-0e  0e-0f  0f-10  10-11  11-12  12-13  13-14  14-15  15-16
+16-17  17-18  18-19  19-1a  1a-1b  1b-1c  1c-1d  1d-1e  1e-1f  1f-20  20-21
+21-22  22-23  23-24  24-25  25-26  26-27  27-28  28-29  29-2a  2a-2b  2b-2c
+2c-2d  2d-2e  2e-2f  2f-30  30-31  31-32  32-33  33-34  34-35  35-36  36-37
+37-38  38-39  39-3a  3a-3b  3b-3c  3c-3d  3d-3e  3e-3f  3f-40  40-41  41-42
+42-43  43-44  44-45  45-46  46-47  47-48  48-49  49-4a  4a-4b  4b-4c  4c-4d
+4d-4e  4e-4f  4f-50  50-51  51-52  52-53  53-54  54-55  55-56  56-57  57-58
+58-59  59-5a  5a-5b  5b-5c  5c-5d  5d-5e  5e-5f  5f-60  60-61  61-62  62-63
+63-64  64-65  65-66  66-67  67-68  68-69  69-6a  6a-6b  6b-6c  6c-6d  6d-6e
+6e-6f  6f-70  70-71  71-72  72-73  73-74  74-75  75-76  76-77  77-78  78-79
+79-7a  7a-7b  7b-7c  7c-7d  7d-7e  7e-7f  7f-80  80-81  81-82  82-83  83-84
+84-85  85-86  86-87  87-88  88-89  89-8a  8a-8b  8b-8c  8c-8d  8d-8e  8e-8f
+8f-90  90-91  91-92  92-93  93-94  94-95  95-96  96-97  97-98  98-99  99-9a
+9a-9b  9b-9c  9c-9d  9d-9e  9e-9f  9f-a0  a0-a1  a1-a2  a2-a3  a3-a4  a4-a5
+a5-a6  a6-a7  a7-a8  a8-a9  a9-aa  aa-ab  ab-ac  ac-ad  ad-ae  ae-af  af-b0
+b0-b1  b1-b2  b2-b3  b3-b4  b4-b5  b5-b6  b6-b7  b7-b8  b8-b9  b9-ba  ba-bb
+bb-bc  bc-bd  bd-be  be-bf  bf-c0  c0-c1  c1-c2  c2-c3  c3-c4  c4-c5  c5-c6
+c6-c7  c7-c8  c8-c9  c9-ca  ca-cb  cb-cc  cc-cd  cd-ce  ce-cf  cf-d0  d0-d1
+d1-d2  d2-d3  d3-d4  d4-d5  d5-d6  d6-d7  d7-d8  d8-d9  d9-da  da-db  db-dc
+dc-dd  dd-de  de-df  df-e0  e0-e1  e1-e2  e2-e3  e3-e4  e4-e5  e5-e6  e6-e7
+e7-e8  e8-e9  e9-ea  ea-eb  eb-ec  ec-ed  ed-ee  ee-ef  ef-f0  f0-f1  f1-f2
+f2-f3  f3-f4  f4-f5  f5-f6  f6-f7  f7-f8  f8-f9  f9-fa  fa-fb  fb-fc  fc-fd
+fd-fe  fe-ff  ff-
+```
 
 </details>
 

@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/mattn/go-runewidth"
+
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -2211,8 +2213,8 @@ func writeNamespaceLabel(sb *strings.Builder, data PlanCommentData, label, value
 // target group reads as its own section. A lone target is named in the
 // heading. A group is headed by how many targets it holds, and how many the
 // rollout has when it holds only some, so the heading stays one short line
-// however many targets the group holds; the names follow on their own line,
-// collapsed when too many to read inline. The names stay whole, as an
+// however many targets the group holds; the names follow one per line, or as
+// a collapsed grid when too many to read inline. The names stay whole, as an
 // operator addresses each target.
 func writeTargetGroupHeading(sb *strings.Builder, level string, members []string, total int) {
 	if len(members) == 1 {
@@ -2224,12 +2226,14 @@ func writeTargetGroupHeading(sb *strings.Builder, level string, members []string
 		count = fmt.Sprintf("%d %s", total, targetNoun.Plural)
 	}
 	fmt.Fprintf(sb, "%s %s\n\n", level, count)
-	names := strings.Join(inlineCodeList(members), ", ")
 	if len(members) <= shardNamesInlineLimit {
-		fmt.Fprintf(sb, "%s\n\n", names)
+		for _, name := range inlineCodeList(members) {
+			fmt.Fprintf(sb, "- %s\n", name)
+		}
+		sb.WriteString("\n")
 		return
 	}
-	fmt.Fprintf(sb, "<details>\n<summary>Target names</summary>\n\n%s\n\n</details>\n\n", names)
+	writeCollapsedNameGrid(sb, "", "Target names", members)
 }
 
 func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []string, total int) {
@@ -2237,9 +2241,89 @@ func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []st
 		fmt.Fprintf(sb, "**%s**\n\n", planGroupList(noun, members, total))
 		return
 	}
-	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
-		presentation.CoveragePhrase(noun, len(members), total), strings.Join(inlineCodeList(members), ", "))
+	writeCollapsedNameGrid(sb, "", "<b>"+presentation.CoveragePhrase(noun, len(members), total)+"</b>", members)
 }
+
+// nameGridWidth is the widest a row of the member name grid grows before the
+// next name starts a new row, so the grid reads without scrolling sideways
+// in a PR comment.
+const nameGridWidth = 80
+
+// nameGridGap separates the grid's columns.
+const nameGridGap = "  "
+
+// writeCollapsedNameGrid writes members' names as a grid behind a collapsed
+// block whose summary line is summary, every line prefixed with indent so the
+// block can sit inside a list item.
+func writeCollapsedNameGrid(sb *strings.Builder, indent, summary string, members []string) {
+	fmt.Fprintf(sb, "%s<details>\n%s<summary>%s</summary>\n\n", indent, indent, summary)
+	var grid strings.Builder
+	writeFencedBlock(&grid, "", nameGrid(members))
+	for _, line := range strings.SplitAfter(grid.String(), "\n") {
+		if line != "" {
+			sb.WriteString(indent + line)
+		}
+	}
+	fmt.Fprintf(sb, "\n%s</details>\n\n", indent)
+}
+
+// nameGrid lays names out in rows of equal-width columns, as many to a row as
+// fit in nameGridWidth, in the order given. Names are never shortened: a wide
+// group of short names such as shard key ranges packs many to a row, a group
+// of long target names packs few, and a gap in a numbered or key-range
+// sequence shows as a break in the column. The widest name that fits in the
+// grid sets the column width for the group. A name wider than the grid ends
+// the row before it and gets a row of its own, without widening the columns
+// of the other names.
+//
+// Each name is flattened as inlineCode flattens it, so a line break or a
+// format character in a name the PR author chose cannot add a row or disguise
+// a name. Widths are terminal cells rather than runes, so a wide character
+// such as a CJK ideograph counts twice and a combining mark not at all, and
+// the columns stay aligned and within the grid.
+func nameGrid(names []string) string {
+	flat := make([]string, len(names))
+	widths := make([]int, len(names))
+	column := 0
+	for i, name := range names {
+		flat[i] = flattenIdentifier(name)
+		widths[i] = nameGridCells.StringWidth(flat[i])
+		if widths[i] <= nameGridWidth {
+			column = max(column, widths[i])
+		}
+	}
+	perRow := max(1, (nameGridWidth+len(nameGridGap))/(column+len(nameGridGap)))
+	var sb strings.Builder
+	inRow := 0
+	for i, name := range flat {
+		if widths[i] > nameGridWidth {
+			if inRow > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(name + "\n")
+			inRow = 0
+			continue
+		}
+		if inRow > 0 {
+			sb.WriteString(strings.Repeat(" ", column-widths[i-1]) + nameGridGap)
+		}
+		sb.WriteString(name)
+		inRow++
+		if inRow == perRow {
+			sb.WriteString("\n")
+			inRow = 0
+		}
+	}
+	if inRow > 0 {
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// nameGridCells measures names the same way on every server: characters whose
+// width depends on an East Asian locale count as one cell, whatever locale the
+// server runs in.
+var nameGridCells = &runewidth.Condition{EastAsianWidth: false}
 
 // BaseSchemaData describes how an environment's schema on the PR branch
 // compares to the PR's base branch.
@@ -2847,6 +2931,14 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
+// directMySQLConsequence is the MySQL consequence sentence of the
+// direct-execution disclosure.
+const directMySQLConsequence = "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again, " +
+	"for a limited number of attempts ([how it works](" + ui.DirectExecutionDocURL + ")). " +
+	"It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end. " +
+	"When the attempts run out or it meets one of those blockers, the apply fails as busy. " +
+	"Writes to each table are blocked until its statement finishes."
+
 // directDisclosureCopy returns the header noun and the consequence sentence for
 // the direct-execution disclosure, keyed by database type. What a
 // direct statement does to the table while it runs is engine-specific — an
@@ -2857,13 +2949,19 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 // rest of the plan. Undoing one is the same inverse schema change as for any other
 // MySQL change, none of which has a revert window, so the MySQL copy does not
 // warn about reverting.
+//
+// The MySQL copy names the limits of the lock kill, so a reader does not take
+// it as a promise that every blocker is ended: the kill waits first, retries a
+// bounded number of times, and spares sessions it is unsafe or not permitted to
+// end. Running out of attempts and meeting a spared blocker both fail the
+// apply as busy. It leaves out the wait and the attempt count, which the
+// policy and the engine own, and links to the documentation that states them.
 func directDisclosureCopy(databaseType string, isMySQL bool) (headerNoun, consequence string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
-		return "native MySQL DDL, not through Spirit",
-			"Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes."
+		return "native MySQL DDL, not through Spirit", directMySQLConsequence
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest
@@ -3310,10 +3408,17 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	}
 	count := fmt.Sprintf("%d advisory %s", n, pluralize("finding", n))
 
+	labeled, shared := groupLintWarningsByTargets(warnings)
 	if n <= lintWarningsFoldThreshold {
 		fmt.Fprintf(sb, "%s **Lint Warnings**: %s\n", glyph.Tip, count)
-		for _, w := range warnings {
+		for _, w := range labeled {
 			writeLintLine(sb, w.Table, w)
+		}
+		for i, set := range shared {
+			writeLintTargetsHeading(sb, set, i > 0 || len(labeled) > 0)
+			for _, w := range set.warnings {
+				writeLintLine(sb, w.Table, w)
+			}
 		}
 		sb.WriteString("\n")
 		return
@@ -3322,6 +3427,16 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
 	fmt.Fprintf(sb, "<details>\n<summary>%s <b>Lint Warnings</b>: %s</summary>\n\n", glyph.Tip, count)
+	writeLintTableGroups(sb, labeled)
+	for _, set := range shared {
+		writeLintTargetsHeading(sb, set, false)
+		writeLintTableGroups(sb, set.warnings)
+	}
+	sb.WriteString("</details>\n\n")
+}
+
+// writeLintTableGroups writes folded findings under a bold heading per table.
+func writeLintTableGroups(sb *strings.Builder, warnings []LintViolationData) {
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**%s**\n", inlineCode(group.table))
@@ -3331,7 +3446,6 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString("</details>\n\n")
 }
 
 type lintWarningGroup struct {
@@ -3339,10 +3453,86 @@ type lintWarningGroup struct {
 	warnings []LintViolationData
 }
 
+// lintTargetSet holds several findings raised by the same targets. Their
+// lines carry no targets: the heading above them names the targets once,
+// where every line would otherwise repeat the same list, which in a wide
+// rollout is most of the comment.
+type lintTargetSet struct {
+	targets  []string
+	total    int
+	warnings []LintViolationData
+}
+
+// groupLintWarningsByTargets splits warnings into those that name their own
+// targets on their line, and sets of findings that share the same targets.
+// A finding every target raised names no targets, and a finding alone in its
+// set of targets names them on its line; both stay in the order they arrive
+// in. Sets of shared targets follow in first-appearance order, each keeping
+// its findings' order, so a heading's findings sit together after every
+// labeled line rather than between them. Two findings share a set when they
+// name the same targets out of the same total, in any order; the heading
+// lists them in the order the set's first finding gave.
+func groupLintWarningsByTargets(warnings []LintViolationData) (labeled []LintViolationData, shared []lintTargetSet) {
+	index := make(map[string]int)
+	var sets []lintTargetSet
+	for _, w := range warnings {
+		if len(w.Targets) == 0 {
+			continue
+		}
+		key := lintTargetSetKey(w)
+		i, ok := index[key]
+		if !ok {
+			i = len(sets)
+			index[key] = i
+			sets = append(sets, lintTargetSet{targets: w.Targets, total: w.TotalTargets})
+		}
+		sets[i].warnings = append(sets[i].warnings, w)
+	}
+	for _, w := range warnings {
+		if len(w.Targets) == 0 || len(sets[index[lintTargetSetKey(w)]].warnings) == 1 {
+			labeled = append(labeled, w)
+		}
+	}
+	for _, set := range sets {
+		if len(set.warnings) < 2 {
+			continue
+		}
+		for i := range set.warnings {
+			set.warnings[i].Targets = nil
+		}
+		shared = append(shared, set)
+	}
+	return labeled, shared
+}
+
+// lintTargetSetKey identifies the set of targets a finding names, out of how
+// many, whatever order its producer listed them in.
+func lintTargetSetKey(w LintViolationData) string {
+	targets := slices.Clone(w.Targets)
+	slices.Sort(targets)
+	return fmt.Sprintf("%d\x00%s", w.TotalTargets, strings.Join(targets, "\x00"))
+}
+
+// writeLintTargetsHeading names the targets that raised every finding under
+// it, as "On targets `a`, `b`:" when few enough to read inline, and otherwise
+// as their coverage with the names in a collapsed grid. A heading that follows
+// other findings is set apart from them by a blank line, so it starts a list
+// of its own rather than reading as an item of the list above.
+func writeLintTargetsHeading(sb *strings.Builder, set lintTargetSet, afterFindings bool) {
+	if afterFindings && !strings.HasSuffix(sb.String(), "\n\n") {
+		sb.WriteString("\n")
+	}
+	fmt.Fprintf(sb, "On %s:\n", planGroupList(targetNoun, set.targets, set.total))
+	if len(set.targets) > shardNamesInlineLimit {
+		sb.WriteString("\n")
+		writeCollapsedNameGrid(sb, "", "Target names", set.targets)
+	}
+}
+
 // writeLintLine writes one finding as a list item, led by its table, if
 // given, and by the targets that raised it when not every target did. Targets
 // too many to name inline read as coverage on the line, with their names
-// collapsed beneath it.
+// in a collapsed grid beneath it.
 func writeLintLine(sb *strings.Builder, table string, w LintViolationData) {
 	message := markdownReason(w.Message)
 	if label := lintLabel(table, w); label != "" {
@@ -3351,8 +3541,7 @@ func writeLintLine(sb *strings.Builder, table string, w LintViolationData) {
 		fmt.Fprintf(sb, "- %s\n", message)
 	}
 	if len(w.Targets) > shardNamesInlineLimit {
-		fmt.Fprintf(sb, "  <details>\n  <summary>Target names</summary>\n\n  %s\n\n  </details>\n\n",
-			strings.Join(inlineCodeList(w.Targets), ", "))
+		writeCollapsedNameGrid(sb, "  ", "Target names", w.Targets)
 	}
 }
 

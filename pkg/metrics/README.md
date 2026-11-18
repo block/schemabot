@@ -73,6 +73,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
+| `schemabot.webhook.inbox_claimable_depth` | Gauge | environment | Rows ready to claim now; excludes scheduled work, active leases and exhausted retries. Use max across replicas sharing an inbox. |
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
 | `schemabot.webhook.inbox_stuck_processing` | Gauge | environment | Durable webhook inbox rows stuck in processing past the attempt cap |
 | `schemabot.webhook.inbox_stats_collection_failures` | Counter | environment | Failed durable webhook inbox metric snapshots (liveness signal for the inbox gauges) |
@@ -180,7 +181,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_branch_rules`, `get_combined_status`, `get_pull_request_review_protection`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 

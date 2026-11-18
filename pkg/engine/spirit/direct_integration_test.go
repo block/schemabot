@@ -751,6 +751,14 @@ func TestEngine_Stop_DuringDirectStatementKeepsStoppedState(t *testing.T) {
 	require.NotNil(t, directEntry, "progress reports the direct statement")
 	assert.Equal(t, directStateStopped, directEntry.State)
 	assert.Nil(t, directEntry.CompletedAt, "a stopped statement's server-side outcome is indeterminate")
+
+	// The stop ended the queued ALTER on the server, so it cannot take effect
+	// once the blocker releases the table.
+	var stillQueued int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE 'ALTER TABLE `direct_stop`%'").Scan(&stillQueued))
+	assert.Zero(t, stillQueued, "the stopped ALTER must not still be queued on the server")
+	assert.False(t, eng.CancelledStatementMayStillRun(), "the stop confirmed that the ALTER ended")
 }
 
 // waitForStatementWaitingOnMetadataLock polls the process list until an ALTER

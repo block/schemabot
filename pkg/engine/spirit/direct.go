@@ -792,7 +792,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		logger.Info("executing statement directly as native MySQL DDL",
 			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows, "estimated_bytes", ds.bytes,
 			"lock_wait_timeout_seconds", lockWaitSeconds, "max_attempts", forceExecConfig.MaxRetries)
-		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: transactions blocking the table's metadata lock are killed; writes to the table block while it runs")
+		e.emitTableLog(ds.table, "executing statement as native MySQL DDL: a transaction holding the table's metadata lock past a short wait is killed and the statement retried, a limited number of times; a LOCK TABLES session, a transaction too large to roll back, or a session SchemaBot is not permitted to end is never killed and fails the apply as busy; writes to the table block while it runs")
 		// The ALTER is spliced in with %r so ForceExec's format string never
 		// interprets it: a literal % in a comment or default value stays as
 		// written.
@@ -800,12 +800,15 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		killLogger := logger.With("database", database, "table", ds.table)
 		if err := dbconn.ForceExec(ctx, db, tables, forceExecConfig, killLogger, "%r", sqlescape.RawSQL(ds.stmt)); err != nil {
 			if ctx.Err() != nil {
-				// A cancelled context closes the connection, but MySQL may
-				// finish the DDL server-side — the statement's outcome is
-				// indeterminate until an operator inspects the table.
+				// ForceExec ends the cancelled statement on the server before
+				// returning, unless the error says it could not confirm that.
+				// Either way the statement may have finished before the stop,
+				// so its outcome is indeterminate until an operator inspects
+				// the table.
+				e.noteStoppedStatement(logger, database, err)
 				e.setDirectStatementState(progress, directStateStopped)
 				metrics.RecordDirectExecution(ctx, database, "stopped")
-				logger.Info("schema change stopped during direct execution; the in-flight statement may still complete server-side",
+				logger.Info("schema change stopped during direct execution; the in-flight statement's outcome is unknown until the table is inspected",
 					"database", database, "table", ds.table, "reason", ctx.Err())
 				return false
 			}

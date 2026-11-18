@@ -495,7 +495,7 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 		primary.Primary = true
 		out := render(primary, group(2, "b", "c"))
 		assert.Contains(t, out, "### Target `a`\n\n```sql\n")
-		assert.Contains(t, out, "`b`, `c`\n\n```sql\n")
+		assert.Contains(t, out, "- `b`\n- `c`\n\n```sql\n")
 		assert.Less(t, strings.Index(out, "### 2 of 3 targets"), strings.Index(out, "### Target `a`"),
 			"the group most targets run leads, whichever group holds the primary")
 		assert.NotContains(t, out, "_Already applied")
@@ -504,14 +504,14 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 	})
 	t.Run("a wide group collapses its names", func(t *testing.T) {
 		out := render(group(1, "a", "b", "c", "d", "e", "f", "g", "h", "i"), group(2, "j"))
-		assert.Contains(t, out, "### 9 of 10 targets\n\n<details>\n<summary>Target names</summary>\n\n`a`, `b`, `c`, `d`, `e`, `f`, `g`, `h`, `i`\n\n</details>")
+		assert.Contains(t, out, "### 9 of 10 targets\n\n<details>\n<summary>Target names</summary>\n\n```\na  b  c  d  e  f  g  h  i\n```\n\n</details>")
 		assert.Contains(t, out, "### Target `j`\n\n```sql\n")
 	})
 	t.Run("a schema name sits one level under its targets' heading", func(t *testing.T) {
 		changes := planGroupChanges(1)
 		changes[0].Keyspace = "testapp_staging"
 		out := render(DeploymentPlanGroup{Members: []string{"a", "c"}, Changes: changes}, group(2, "b"))
-		assert.Contains(t, out, "### 2 of 3 targets\n\n`a`, `c`\n\n#### Schema Name: `testapp_staging`\n```sql\nALTER TABLE `t0`",
+		assert.Contains(t, out, "### 2 of 3 targets\n\n- `a`\n- `c`\n\n#### Schema Name: `testapp_staging`\n```sql\nALTER TABLE `t0`",
 			"each target group is a section with its schema heading under it")
 	})
 }
@@ -927,7 +927,7 @@ func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 
 	positions := map[string]int{}
 	for _, want := range []string{
-		"`primary/testapp_1`, `primary/testapp_2`",
+		"- `primary/testapp_1`\n- `primary/testapp_2`",
 		"ADD COLUMN `email`",
 		"### Target `primary/testapp_4`",
 		"ADD INDEX `idx_email`",
@@ -936,7 +936,7 @@ func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 		positions[want] = strings.Index(out, want)
 		require.GreaterOrEqual(t, positions[want], 0, "%q missing from:\n%s", want, out)
 	}
-	assert.Less(t, positions["`primary/testapp_1`, `primary/testapp_2`"], positions["ADD COLUMN `email`"])
+	assert.Less(t, positions["- `primary/testapp_1`\n- `primary/testapp_2`"], positions["ADD COLUMN `email`"])
 	assert.Less(t, positions["ADD COLUMN `email`"], positions["### Target `primary/testapp_4`"], "each plan's DDL sits under its own targets")
 	assert.Less(t, positions["### Target `primary/testapp_4`"], positions["ADD INDEX `idx_email`"])
 	assert.Less(t, positions["ADD INDEX `idx_email`"], positions["📋 **Plan**: **1** table to alter · rolling out to 3 targets\n"])
@@ -963,7 +963,7 @@ func TestRenderMultiEnvPlanComment_EachTargetPlanRendersUnderItsTargets(t *testi
 
 	_, production, found := strings.Cut(out, "Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "#### 2 of 3 targets\n\n`primary/testapp_1`, `primary/testapp_2`")
+	assert.Contains(t, production, "#### 2 of 3 targets\n\n- `primary/testapp_1`\n- `primary/testapp_2`")
 	otherHeader := strings.Index(production, "#### Target `primary/testapp_4`")
 	details := strings.Index(production, "<details>\n<summary>Show SQL (2 statements)</summary>")
 	assert.GreaterOrEqual(t, otherHeader, 0)
@@ -989,7 +989,7 @@ func TestRenderMultiEnvPlanComment_SchemaNameSitsUnderItsTargets(t *testing.T) {
 
 	_, production, found := strings.Cut(out, "### Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "#### 2 of 3 targets\n\n`primary/testapp_1`, `primary/testapp_2`\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
+	assert.Contains(t, production, "#### 2 of 3 targets\n\n- `primary/testapp_1`\n- `primary/testapp_2`\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
 	assert.NotContains(t, production, "#### Schema Name")
 }
 

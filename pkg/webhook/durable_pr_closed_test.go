@@ -1,6 +1,8 @@
 package webhook
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -31,12 +33,16 @@ func (s *durableClosedTestStorage) Applies() storage.ApplyStore              { r
 func (s *durableClosedTestStorage) Checks() storage.CheckStore               { return s.checks }
 
 func durableClosedEvent() *storage.WebhookEvent {
-	payload := []byte(`{
+	return durableClosedEventWithMerged(true)
+}
+
+func durableClosedEventWithMerged(merged bool) *storage.WebhookEvent {
+	payload := fmt.Appendf(nil, `{
 		"action": "closed",
-		"pull_request": {"number": 1, "merged": true, "head": {"sha": "head-sha", "ref": "feature"}},
+		"pull_request": {"number": 1, "merged": %t, "head": {"sha": "head-sha", "ref": "feature"}},
 		"repository": {"full_name": "octocat/hello-world"},
 		"installation": {"id": 12345}
-	}`)
+	}`, merged)
 	return &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  "delivery-closed-1",
@@ -107,6 +113,37 @@ func TestDurablePRClosedDriverRunsCleanup(t *testing.T) {
 	require.Empty(t, scripted.failed)
 }
 
+// A merged close never reads GitHub, so a delivery whose stored installation
+// cannot be resolved still releases the lock, deletes stored check state, and
+// completes instead of being marked failed.
+func TestDurablePRClosedDriverCleansMergedCloseWithoutInstallation(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	event := durableClosedEventWithMerged(true)
+	event.TenantID = ""
+	scripted := newScriptedWebhookEventStore(event)
+	st := &durableClosedTestStorage{
+		webhookEvents: scripted,
+		locks:         lockStore,
+		applies:       &prClosedApplyStore{},
+		checks:        checkStore,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(st, &api.ServerConfig{}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Equal(t, []string{"orders"}, lockStore.released, "a merged close releases the lock without an installation")
+	require.Equal(t, 1, checkStore.deleteCalls, "a merged close deletes stored check state without an installation")
+	select {
+	case <-scripted.completed:
+	default:
+		t.Fatal("expected the merged close delivery to be marked completed")
+	}
+	require.Empty(t, scripted.failed)
+}
+
 // A failed apply lookup fails closed — nothing is released or deleted — and the
 // delivery stays retryable so a transient storage blip does not permanently
 // skip cleanup and leave a lock stranded.
@@ -131,6 +168,75 @@ func TestDurablePRClosedDriverRetriesOnApplyLookupFailure(t *testing.T) {
 	select {
 	case failure := <-scripted.failed:
 		require.NotNil(t, failure.retryAfter, "a failed apply lookup must stay retryable")
+	default:
+		t.Fatal("expected the close delivery to be marked failed and retryable")
+	}
+	require.Empty(t, scripted.completed)
+}
+
+// A close delivery retried after the PR was reopened must not undo the
+// reopened PR's state: the operator took a lock owned by repo#pr after the
+// reopen, so the driver sees the live PR is open, releases and deletes
+// nothing, and completes the stale delivery instead of retrying it. Its log
+// says the delivery completed without cleanup, not that cleanup completed.
+func TestDurablePRClosedDriverSkipsCleanupForReopenedPR(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	scripted := newScriptedWebhookEventStore(durableClosedEventWithMerged(false))
+	st := &durableClosedTestStorage{
+		webhookEvents: scripted,
+		locks:         lockStore,
+		applies:       &prClosedApplyStore{},
+		checks:        checkStore,
+	}
+	factory, fetches := prClosedGitHub(t, "open", 0)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	service := api.New(st, &api.ServerConfig{}, nil, logger)
+	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Equal(t, int32(1), fetches.Load(), "the driver reads the live PR once")
+	require.Empty(t, lockStore.released, "the lock taken after the reopen must stay held")
+	require.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive the stale close delivery")
+	select {
+	case <-scripted.completed:
+	default:
+		t.Fatal("expected the stale close delivery to be marked completed")
+	}
+	require.Empty(t, scripted.failed)
+	require.Contains(t, logs.String(), "completed without cleanup because the PR is open again",
+		"the driver must say that the delivery completed without cleaning up")
+	require.NotContains(t, logs.String(), "close cleanup completed",
+		"the driver must not report a cleanup that did not run")
+}
+
+// A close delivery whose live PR read fails fails closed — nothing is released
+// or deleted — and stays retryable, so the driver re-checks the PR on the next
+// attempt instead of cleaning up on an unverified state.
+func TestDurablePRClosedDriverRetriesWhenLivePRReadFails(t *testing.T) {
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{prClosedLock("orders")}}
+	checkStore := &prClosedCheckStore{}
+	scripted := newScriptedWebhookEventStore(durableClosedEventWithMerged(false))
+	st := &durableClosedTestStorage{
+		webhookEvents: scripted,
+		locks:         lockStore,
+		applies:       &prClosedApplyStore{},
+		checks:        checkStore,
+	}
+	factory, _ := prClosedGitHub(t, "closed", http.StatusForbidden)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(st, &api.ServerConfig{}, nil, logger)
+	h := NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, lockStore.released, "no lock is released when the live PR state is unknown")
+	require.Equal(t, 0, checkStore.deleteCalls, "no check state is deleted when the live PR state is unknown")
+	select {
+	case failure := <-scripted.failed:
+		require.NotNil(t, failure.retryAfter, "a failed live PR read must stay retryable")
 	default:
 		t.Fatal("expected the close delivery to be marked failed and retryable")
 	}

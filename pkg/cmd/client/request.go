@@ -20,6 +20,7 @@ import (
 	"golang.org/x/net/html"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // authTransport injects a Bearer token on outbound requests when one is
@@ -442,6 +443,10 @@ func checkNonJSONResponse(resp *http.Response, body []byte, parseErr error) erro
 		// Extract visible text from HTML for context (strip tags).
 		text := stripHTMLTags(string(body))
 		text = strings.Join(strings.Fields(text), " ") // collapse whitespace
+		// The tokenizer decodes character references, so a control rune can
+		// arrive spelled out as one. They are removed before the text is cut to
+		// length.
+		text = ui.TerminalSafe(text)
 		if len(text) > 200 {
 			text = text[:200] + "..."
 		}
@@ -594,7 +599,15 @@ func FormatConnectionError(endpoint string, err error) error {
 }
 
 // FormatAPIError returns a user-friendly error message from an API response.
+// The message is printed to the operator's terminal and comes from whatever
+// answered the request, a proxy included, so control runes are removed first.
 func FormatAPIError(statusCode int, body []byte) string {
+	return ui.TerminalSafe(apiErrorText(statusCode, body))
+}
+
+// apiErrorText picks the error message out of an API response body, falling
+// back to the start of the raw body.
+func apiErrorText(statusCode int, body []byte) string {
 	var resp map[string]any
 	if err := json.Unmarshal(body, &resp); err == nil {
 		if msg, ok := resp["error"].(string); ok && msg != "" {

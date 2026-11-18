@@ -3,15 +3,15 @@ module github.com/block/schemabot
 go 1.26.11
 
 require (
-	github.com/alecthomas/kong v1.16.1
+	github.com/alecthomas/kong v1.17.0
 	github.com/aws/aws-sdk-go-v2 v1.43.5
 	github.com/aws/aws-sdk-go-v2/config v1.32.14
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.5
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
-	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6
+	github.com/block/mysql v0.0.0-20261117230711-208b4ce0ea9a
 	github.com/block/pg-sprite v0.4.1
-	github.com/block/spirit v0.19.0
+	github.com/block/spirit v0.20.1-0.20261117183342-2fae808ab16b
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -27,6 +27,7 @@ require (
 	github.com/hashicorp/go-cleanhttp v0.5.2
 	github.com/hmarr/codeowners v1.2.1
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/mattn/go-runewidth v0.0.23
 	github.com/moby/moby/api v1.54.2
 	github.com/pganalyze/pg_query_go/v6 v6.2.2
 	github.com/planetscale/planetscale-go v0.155.0
@@ -52,13 +53,13 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.45.0
 	go.opentelemetry.io/otel/trace v1.45.0
 	go.opentelemetry.io/proto/otlp v1.11.0
-	golang.org/x/net v0.60.0
+	golang.org/x/net v0.61.0
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sync v0.24.0
-	golang.org/x/sys v0.48.0
-	golang.org/x/text v0.43.0
+	golang.org/x/sync v0.25.0
+	golang.org/x/sys v0.49.0
+	golang.org/x/text v0.44.0
 	golang.org/x/time v0.15.0
-	golang.org/x/tools v0.51.0
+	golang.org/x/tools v0.52.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
@@ -185,7 +186,6 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
-	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/minio/simdjson-go v0.4.5 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
@@ -262,9 +262,9 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	gopkg.in/DataDog/dd-trace-go.v1 v1.74.8 // indirect

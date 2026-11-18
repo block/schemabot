@@ -250,6 +250,7 @@ func TestCollectWebhookInboxMetricsSkipsGaugesAndCountsFailureOnStoreError(t *te
 		}
 	}
 	assert.NotContains(t, names, "schemabot.webhook.inbox_depth", "gauges must not be re-emitted on error")
+	assert.NotContains(t, names, "schemabot.webhook.inbox_claimable_depth")
 	assert.NotContains(t, names, "schemabot.webhook.inbox_oldest_claimable_age_seconds")
 	assert.NotContains(t, names, "schemabot.webhook.inbox_stuck_processing")
 	assert.Contains(t, names, "schemabot.webhook.inbox_stats_collection_failures", "a failed snapshot must increment the failure counter")

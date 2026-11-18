@@ -111,6 +111,50 @@ func TestDoPostIntoErrorStatusReturnsAPIError(t *testing.T) {
 	assert.Contains(t, apiErr.Message, "not in its revert window")
 }
 
+// An error message is printed to the operator's terminal as is, so the
+// escape sequences a server or a proxy in front of it put in one are removed
+// first, from a JSON error and from a raw body alike.
+func TestAPIErrorMessageDropsTerminalEscapes(t *testing.T) {
+	t.Run("json error", func(t *testing.T) {
+		srv := controlStatusServer(t, http.StatusConflict, `{"error": "lock is held\u001b[2J\u001b]0;owned\u0007", "error_code": "conflict"}`)
+
+		err := doPostInto(srv.URL, "/api/locks/acquire", map[string]string{"database": "orders"}, &struct{}{})
+
+		var apiErr *APIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, "lock is held[2J]0;owned", apiErr.Message)
+	})
+
+	t.Run("raw body", func(t *testing.T) {
+		assert.Equal(t, "HTTP 502: bad gateway[31m", FormatAPIError(http.StatusBadGateway, []byte("bad gateway\x1b[31m")))
+	})
+}
+
+// A proxy in front of the server can answer a request with an HTML page, such
+// as a sign-in page, and the CLI shows the page's text in its error. An escape
+// sequence in that text is removed whether the page carries it as a raw byte or
+// spelled out as a character reference, which the HTML reader turns back into
+// the control rune.
+func TestHTMLResponseErrorDropsTerminalEscapes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html><body>Sign in&#27;[2J&#x1b;]0;owned&#7;done\x1b[31m</body></html>"))
+	}))
+	t.Cleanup(srv.Close)
+
+	const want = "unexpected response from server (received HTML, expected JSON):\n  Sign in[2J]0;owneddone[31m"
+
+	t.Run("post", func(t *testing.T) {
+		err := doPostInto(srv.URL, "/api/plan", map[string]string{"database": "orders"}, &struct{}{})
+		require.EqualError(t, err, want)
+	})
+
+	t.Run("get", func(t *testing.T) {
+		err := doGetInto(srv.URL, "/api/progress/apply/apply-abc", &struct{}{})
+		require.EqualError(t, err, want)
+	})
+}
+
 // A refused request carries both facts a client automating against the API
 // needs: that the refusal is transient, and the wait the server expects it to
 // observe before trying again.
