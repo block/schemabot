@@ -22,15 +22,15 @@ browser=await chromium.launch({headless:true,...(process.env.CHROME ? {executabl
  await page.setContent(fs.readFileSync(path.join(root,'assets/src/'+name+'.html'),'utf8'));await page.evaluate(()=>document.fonts.ready);
  // Chrome can tear the first screenshot after a page loads; discard it.
  await page.screenshot();
- const frames=[],fps=20,speed=speeds[name]||1,duration=illustrations[name]/speed;
+ const frames=[],fps=20,speed=speeds[name]||1,duration=illustrations[name]/speed,frameCount=Math.ceil(fps*duration);
  let previous;
- for(let i=0;i<fps*duration;i++){
+ for(let i=0;i<frameCount;i++){
   const f=path.join(framesDir,String(i).padStart(4,'0')+'.png');
   await page.evaluate(t=>renderFrame(t),i/fps*speed);const png=await page.screenshot();
   const delay=frameDelay(name,i/fps*speed);
   if(previous&&png.equals(previous)){frames[frames.length-1].delay+=delay;}
   else{fs.writeFileSync(f,png);frames.push({file:f,delay});previous=png;}
-  if(i%100===0)console.log('Rendered frame '+i+'/'+fps*duration);
+  if(i%100===0)console.log('Rendered frame '+i+'/'+frameCount);
  }
  if(pageError)throw pageError;
  const colors=['ffffff','f6f8fa','d1d9e0','1f2328','59636e','0969da','ddf4ff','1a7f37','dafbe1','9a6700','fff8c5','8250df','fbefff','cf222e','ffebe9'];
