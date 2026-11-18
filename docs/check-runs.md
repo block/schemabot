@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [PR target eligibility](#pr-target-eligibility)
 - [GitHub Check Concepts](#github-check-concepts)
 - [Safety Philosophy](#safety-philosophy)
 - [Cross-Deployment Trust Model](#cross-deployment-trust-model)
@@ -28,6 +29,92 @@
 SchemaBot uses GitHub Check Runs as the PR safety gate for schema changes. A
 required SchemaBot check blocks merge until every schema change represented by
 the PR has either been applied successfully or resolved by a new plan.
+
+## PR target eligibility
+
+SchemaBot plans and publishes checks for PRs targeting the repository's configured
+**default branch**. It also runs on another branch when active repository or
+organization rulesets, or classic branch protection, require its aggregate or
+promotion check. Check names and GitHub App identity pins remain unchanged.
+
+For an ordinary PR, the target is its direct base. For a native GitHub stack,
+the target is the stack's ultimate base: every member receives real validation
+when that target is enforced. An ordinary branch-based stack has no such
+inheritance; upper members targeting excluded parent branches stay silent.
+
+An excluded PR receives no new automatic plan or Check Run. Explicit `plan`,
+`apply`, and `apply-confirm` commands are rejected before schema discovery.
+SchemaBot never publishes a successful, neutral, or skipped result to represent
+exclusion.
+
+**After changing the base to an enforced branch, request a fresh `schemabot plan`
+for the affected databases, even when the head commit has not changed.** A base
+change notification also triggers automatic planning, but authors must not rely
+on it or recovery to finish every reevaluation. If changes remain and an earlier
+confirmation is unavailable or rejected, start a fresh `schemabot apply` and
+review any new confirmation. A plan updates validation; it does not restore a
+lost pending confirmation. Authors are responsible for this step.
+
+Retargeting does not itself invalidate earlier check results or retire plans and
+comments. New commands read current PR metadata and use the protection lookup described below. Apply and confirmation check
+already-fresh PR snapshots before interpreting freshness or re-plan results that
+can release or replace a pending confirmation, and apply re-reads the PR and any required branch policy close to durable acceptance. Normal freshness and replanning rules still
+apply; exact preservation of a pending confirmation across every race is not
+promised.
+
+Once accepted, pending and running applies continue under the operator;
+locks, progress, lifecycle controls, and stored outcomes remain available.
+Terminal callbacks record outcomes while suppressing Check Run publication on
+an excluded PR. No special invalidation or pending-reset lifecycle is introduced.
+
+**Accepted limits:** a prior real success at the same SHA can satisfy GitHub
+before a fresh plan completes, including when another PR shares the SHA. The
+expectation to re-plan does not prevent that merge. Retargeting can also race
+the last eligibility read before acceptance. The branch transition and
+SchemaBot's asynchronous response are not atomic.
+
+Recovery compares the latest observed head, direct base, default branch, native
+stack target, and eligibility. Target-specific recovery deliveries cover work
+already queued for that context. After an upgrade, an inbox delivery that
+already covers the head stays sufficient until SchemaBot observes a target or
+queues recovery for that target. These observations do not prove planning
+finished: an attempt discarded after a target change can still count as covered,
+and a failed eligibility read in the background planner can stop it after the
+original delivery completed. Either case may require an author to request a plan.
+
+Follow-up work is to distinguish observed targets from finished evaluations and
+to retain retry ownership through background planning. This release keeps the
+existing recovery machinery without promising automatic recovery of every branch
+excursion. It adds no generation solely to revoke prior results or confirmations.
+
+### Protection discovery and rollout
+
+Default-target PRs need no protection lookup. For a non-default target,
+SchemaBot reads active branch rules (paginated) and queries the ref's classic
+`branchProtectionRule` through GraphQL. Within a GitHub App installation client,
+overlapping reads share one fetch, and deliveries reuse successful results
+for the same repository and exact branch for up to 60 seconds. Failed reads
+and expired results do not substitute for a successful response. This means a
+change to branch protection can take up to one minute to affect planning and
+check publication. Apply acceptance bypasses the cache and reads current
+policy directly. These lookups do not grow
+with changed-file count. Publication and apply acceptance also perform bounded
+uncached PR metadata reads. A two-environment
+no-work publisher reads one initial target snapshot and performs one final
+uncached check per published environment, in addition to scope discovery and
+revalidation. Existing snapshots are reused for the initial currency check. A successful null
+classic rule proves absence; an ambiguous REST 404 does not. Missing metadata,
+permission failures, and incomplete lookup responses stop processing rather
+than permitting exclusion. The GitHub App needs **Administration: read** access
+for protection discovery, in addition to its existing permissions.
+
+Before rollout, audit repository and organization rulesets plus classic branch
+protection. Scope SchemaBot requirements to the default branch and intentionally
+included release refs. If a shared ruleset covers additional branches, split out
+only SchemaBot's requirements; preserve other builds and App pins. Existing
+release requirements remain enforced automatically. Participants must configure
+the leader's promotion check name so all deployments resolve the same target
+policy. No repository protection settings are changed by the bot.
 
 ## GitHub Check Concepts
 

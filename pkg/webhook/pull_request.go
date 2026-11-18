@@ -42,7 +42,8 @@ type pullRequestPayload struct {
 	// modified. GitHub populates changes.base.ref.from only when the PR was
 	// retargeted, which is what separates a retarget from a title or body edit.
 	Changes struct {
-		Base struct {
+		Stack json.RawMessage `json:"stack"`
+		Base  struct {
 			Ref struct {
 				From string `json:"from"`
 			} `json:"ref"`
@@ -81,10 +82,10 @@ func isBaseRetarget(p pullRequestPayload) bool {
 // plans a head reached the inbox, which a SQL "action IN (...)" test can only
 // answer from the action alone — it cannot tell a retarget from a title edit,
 // so admitting "edited" there would let a title edit mask a lost synchronize.
-// Nothing is lost by leaving it out: a retarget does not move the head SHA, so
-// the head it re-plans is already covered by the delivery that introduced it.
+// Recovery separately compares the observed target context, so an earlier
+// delivery for the same head cannot conceal a lost retarget or stack edit.
 func isAutoPlannablePullRequest(p pullRequestPayload) bool {
-	return isAutoPlannablePullRequestAction(p.Action) || isBaseRetarget(p)
+	return isAutoPlannablePullRequestAction(p.Action) || isBaseRetarget(p) || (p.Action == "edited" && len(p.Changes.Stack) > 0)
 }
 
 // handlePullRequest processes GitHub pull_request webhook events.
@@ -409,15 +410,23 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
 	}
-	baseRef := prInfo.BaseRef
-	if baseRef == "" {
-		missingBase := fmt.Errorf("PR %s#%d reports no base branch", repo, pr)
-		h.logger.Error("PR reports no base branch; a plan's base cannot be re-verified before publishing",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
-		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, missingBase)
-		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", missingBase
+	decision, err := h.evaluatePRTarget(ctx, client, repo, prInfo)
+	if err != nil {
+		h.logger.Error("auto-plan could not verify PR target", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		return "target eligibility could not be verified", fmt.Errorf("evaluate target for %s#%d: %w", repo, pr, err)
 	}
+	if prInfo.HeadSHA != headSHA {
+		return "auto-plan discarded because the PR moved during discovery", nil
+	}
+	if err := h.recordPRTargetObservation(ctx, repo, pr, prInfo, decision, deliveryID); err != nil {
+		h.logger.Error("auto-plan could not record PR target observation", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		return "target observation failed", fmt.Errorf("record target for %s#%d: %w", repo, pr, err)
+	}
+	if !decision.Eligible {
+		h.logger.Info("auto-plan skipped for excluded PR target", "repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "effective_target", decision.Target, "source", source)
+		return "skipped: PR target is excluded", nil
+	}
+	baseRef := prInfo.BaseRef
 
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
@@ -478,6 +487,25 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// offering to apply DDL for a config this head no longer carries.
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "schema change under managed directory has no config", nil
+	}
+
+	// Publishing a plan asserts that the inputs it was computed from still
+	// describe the PR. Both can move while discovery runs: a push changes what
+	// the DDL would be applied to, and a retarget changes which commits the PR
+	// proposes and so which databases it touches. Re-read them and discard
+	// rather than publish a plan and a merge-blocking check for a PR that has
+	// moved on — whichever event moved it re-plans on its own.
+	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, prInfo)
+	if err != nil {
+		h.logger.Error("failed to re-verify the PR before publishing its plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.postPlanPublishVerificationFailure(ctx, client, repo, pr, headSHA, err)
+		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
+	}
+	if moved != autoPlanInputsUnchanged {
+		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
+			"source", source, "delivery_id", deliveryID)
+		return "auto-plan discarded because the PR moved during discovery", nil
 	}
 
 	discovered := slices.Clone(configs)
@@ -555,6 +583,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
+				ctx = withExpectedPRTarget(ctx, repo, pr, prInfo)
 				c, err := h.clientForRepo(repo, installationID)
 				if err != nil {
 					h.logger.Error("failed to create GitHub client for participant-gated aggregate",
@@ -577,6 +606,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
+			ctx = withExpectedPRTarget(ctx, repo, pr, prInfo)
 			c, err := h.clientForRepo(repo, installationID)
 			if err != nil {
 				h.logger.Error("failed to create GitHub client for passing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
@@ -585,24 +615,6 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA, unmanaged)
 		})
 		return "no schema files in PR", nil
-	}
-	// Publishing a plan asserts that the inputs it was computed from still
-	// describe the PR. Both can move while discovery runs: a push changes what
-	// the DDL would be applied to, and a retarget changes which commits the PR
-	// proposes and so which databases it touches. Re-read them and discard
-	// rather than publish a plan and a merge-blocking check for a PR that has
-	// moved on — whichever event moved it re-plans on its own.
-	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, baseRef)
-	if err != nil {
-		h.logger.Error("failed to re-verify the PR before publishing its plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		h.postPlanPublishVerificationFailure(ctx, client, repo, pr, headSHA, err)
-		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
-	}
-	if moved != autoPlanInputsUnchanged {
-		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
-			"source", source, "delivery_id", deliveryID)
-		return "auto-plan discarded because the PR moved during discovery", nil
 	}
 
 	// Discovery is complete. Publish empty environments and pending placeholders
@@ -697,8 +709,8 @@ const (
 	// autoPlanHeadMoved means a push replaced the head commit. Checks on the
 	// old head no longer gate the merge, and the push plans the new head.
 	autoPlanHeadMoved
-	// autoPlanBaseMoved means the PR was retargeted. The head commit is the
-	// same, so its checks still gate the merge.
+	// autoPlanBaseMoved means the PR target changed or lost eligibility while
+	// the head stayed the same.
 	autoPlanBaseMoved
 )
 
@@ -706,7 +718,7 @@ const (
 // be published changed underneath it. An error means the question could not
 // be answered — the caller must not publish on an unverified PR, and durable
 // callers retry the delivery.
-func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, baseRef string) (autoPlanInputMove, error) {
+func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, previous *ghclient.PullRequestInfo) (autoPlanInputMove, error) {
 	fresh, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		return autoPlanInputsUnchanged, fmt.Errorf("fetch PR %s#%d: %w", repo, pr, err)
@@ -716,9 +728,16 @@ func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.Inst
 			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", fresh.HeadSHA)
 		return autoPlanHeadMoved, nil
 	}
-	if baseRef != "" && fresh.BaseRef != baseRef {
-		h.logger.Info("PR base branch moved while its plan was being discovered",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef, "current_base_ref", fresh.BaseRef)
+	if !samePRTargetContext(fresh, previous) {
+		h.logger.Info("PR target metadata moved while its plan was being discovered",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", previous.BaseRef, "current_base_ref", fresh.BaseRef)
+		return autoPlanBaseMoved, nil
+	}
+	decision, err := h.evaluatePRTarget(ctx, client, repo, fresh)
+	if err != nil {
+		return autoPlanInputsUnchanged, err
+	}
+	if !decision.Eligible {
 		return autoPlanBaseMoved, nil
 	}
 	return autoPlanInputsUnchanged, nil

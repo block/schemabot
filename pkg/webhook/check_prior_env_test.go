@@ -542,7 +542,7 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"head": map[string]any{"sha": headSHA, "ref": "feature"},
-			"base": map[string]any{"sha": "base123", "ref": "main"},
+			"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 			"user": map[string]any{"login": "testuser"},
 		})
 	})
@@ -648,7 +648,7 @@ func TestCheckPriorEnvironmentsWithDatabaseOverrideGatesOnOverrideOrder(t *testi
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"head": map[string]any{"sha": headSHA, "ref": "feature"},
-			"base": map[string]any{"sha": "base123", "ref": "main"},
+			"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 			"user": map[string]any{"login": "testuser"},
 		})
 	})
@@ -805,7 +805,7 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"head": map[string]any{"sha": headSHA, "ref": "feature"},
-				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 				"user": map[string]any{"login": "testuser"},
 			})
 		})
@@ -1002,7 +1002,7 @@ func TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"head": map[string]any{"sha": headSHA, "ref": "feature"},
-			"base": map[string]any{"sha": "base123", "ref": "main"},
+			"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 			"user": map[string]any{"login": "testuser"},
 		})
 	})
@@ -1077,7 +1077,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"head": map[string]any{"sha": headSHA, "ref": "feature"},
-				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 				"user": map[string]any{"login": "testuser"},
 			})
 		})
@@ -1321,7 +1321,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"head": map[string]any{"sha": headSHA, "ref": "feature"},
-				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 				"user": map[string]any{"login": "testuser"},
 			})
 		})
@@ -1378,7 +1378,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"head": map[string]any{"sha": headSHA, "ref": "feature"},
-				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 				"user": map[string]any{"login": "testuser"},
 			})
 		})
@@ -1435,7 +1435,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"head": map[string]any{"sha": headSHA, "ref": "feature"},
-				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"base": map[string]any{"sha": "base123", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 				"user": map[string]any{"login": "testuser"},
 			})
 		})
