@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -57,8 +58,9 @@ func (s *etagPRServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"state": "open",
-		"head":  map[string]string{"ref": "feature", "sha": s.headSHA},
+		"state":  "closed",
+		"merged": true,
+		"head":   map[string]string{"ref": "feature", "sha": s.headSHA},
 		"base": map[string]any{
 			"ref": "main", "sha": "base111",
 			"repo": map[string]string{"default_branch": "main"},
@@ -90,7 +92,7 @@ func TestFetchPullRequest_UnchangedPRIsAnsweredNotModified(t *testing.T) {
 
 	want := &PullRequestInfo{
 		HeadRef: "feature", HeadSHA: "head111", BaseRef: "main", BaseSHA: "base111",
-		DefaultBranch: "main", User: "octocat", State: "open",
+		DefaultBranch: "main", User: "octocat", State: "closed", Merged: true,
 	}
 
 	first, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
@@ -110,6 +112,28 @@ func TestFetchPullRequest_UnchangedPRIsAnsweredNotModified(t *testing.T) {
 	third, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
 	require.NoError(t, err)
 	assert.Equal(t, "head111", third.HeadSHA, "a caller mutating its result must not change the stored copy")
+}
+
+// Every PullRequestInfo field must survive a 304. The fake server populates
+// every field the pull request response carries, so a field added to
+// PullRequestInfo without being read from the response, and stored with the
+// ETag, fails here instead of reading as its zero value on a 304.
+func TestFetchPullRequest_NotModifiedReturnsEveryField(t *testing.T) {
+	server := &etagPRServer{headSHA: "head111", sendETag: true}
+	ic := newETagPRTestClient(t, server)
+
+	full, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+	require.NoError(t, err)
+	fromETag, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+	require.NoError(t, err)
+	require.Equal(t, 1, server.notModified, "the second read must be answered 304")
+	assert.Equal(t, full, fromETag)
+
+	v := reflect.ValueOf(*fromETag)
+	for i := range v.NumField() {
+		assert.False(t, v.Field(i).IsZero(),
+			"PullRequestInfo.%s is empty after a 304: read it from the pull request response and populate it in the fake server", v.Type().Field(i).Name)
+	}
 }
 
 // A safety re-check after a push must see the new head. The stored ETag no
