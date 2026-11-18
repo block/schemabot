@@ -1235,7 +1235,8 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 	// so the footer still refreshes periodically as a liveness signal.
 	// Expected and frequent, so no log; the edit count is not incremented
 	// because no edit happens.
-	contentKey := templates.CommentContentKey(body)
+	rendered := o.renderPRComment(apply, body)
+	contentKey := templates.CommentContentKey(rendered)
 	if o.skipUnchangedEdit(comment.GitHubCommentID, contentKey) {
 		return
 	}
@@ -1252,7 +1253,7 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 		return
 	}
 
-	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(apply, body)); err != nil {
+	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, rendered); err != nil {
 		o.logError(apply, "observer: failed to edit comment", "error", err, "comment_state", commentState)
 		return
 	}
@@ -2055,6 +2056,7 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 				"error", err, "github_comment_id", oldCommentID)
 			return
 		}
+		o.recordLastWritten(oldCommentID, templates.CommentContentKey(frozen))
 	}
 	if err := o.stor.ApplyComments().ClearPendingFreeze(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Progress); err != nil {
 		o.logError(apply, "observer: failed to clear pending-freeze marker after freezing superseded progress comment; a later retry finds the comment already frozen and clears the marker",
@@ -2087,12 +2089,13 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		return 0, false, false
 	}
 
-	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
+	rendered := o.renderPRComment(apply, body)
+	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, rendered)
 	if err != nil {
 		o.logError(apply, "observer: failed to post comment", "error", err, "comment_state", commentState)
 		return 0, false, false
 	}
-	o.recordLastWritten(commentID, templates.CommentContentKey(body))
+	o.recordLastWritten(commentID, templates.CommentContentKey(rendered))
 	if !o.leaseStillOwnsObserver(apply, "record posted GitHub comment") {
 		// The comment is live on the PR; only the tracking write is being
 		// skipped. Report it posted-but-untracked — the contract callers use to

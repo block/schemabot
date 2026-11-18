@@ -3975,7 +3975,7 @@ func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID)
-		assert.Contains(t, edited.Body, "50%")
+		assert.Contains(t, edited.Body, "50.00%")
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected the first tick to edit the progress comment")
 	}
@@ -4024,7 +4024,7 @@ func TestE2EStagnantApplySkipsIdenticalProgressEdits(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID)
-		assert.Contains(t, edited.Body, "70%")
+		assert.Contains(t, edited.Body, "70.00%")
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected the tick after real progress to edit the comment")
 	}
@@ -4076,7 +4076,7 @@ func TestE2EStagnantApplyHeartbeatRefreshesComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID)
-		assert.Contains(t, edited.Body, "50%")
+		assert.Contains(t, edited.Body, "50.00%")
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected an unchanged render to refresh the comment after the heartbeat elapsed")
 	}
