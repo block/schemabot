@@ -25,6 +25,13 @@ const (
 	// Rendered next to a throttle tip so an operator can jump from the
 	// one-line tip to the full prose.
 	ThrottleDocURL = DocsBaseURL + "throttle.md"
+
+	// DirectExecutionDocURL documents how a direct statement takes its
+	// table's metadata lock: the wait, the kill, its attempts, and the
+	// blockers it spares. Rendered in the direct-execution disclosure, which
+	// names those limits without printing the values the policy and the
+	// engine own.
+	DirectExecutionDocURL = DocsBaseURL + "direct-execution.md"
 )
 
 // DocLinks is every documentation link rendered on a user-facing surface. The
@@ -33,6 +40,7 @@ const (
 var DocLinks = []string{
 	SchemaConfigDocURL,
 	ThrottleDocURL,
+	DirectExecutionDocURL,
 }
 
 // DocRef is the short form a documentation link is displayed as on a terminal:

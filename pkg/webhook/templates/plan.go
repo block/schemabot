@@ -2931,6 +2931,14 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
+// directMySQLConsequence is the MySQL consequence sentence of the
+// direct-execution disclosure.
+const directMySQLConsequence = "If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again, " +
+	"for a limited number of attempts ([how it works](" + ui.DirectExecutionDocURL + ")). " +
+	"It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end. " +
+	"When the attempts run out or it meets one of those blockers, the apply fails as busy. " +
+	"Writes to each table are blocked until its statement finishes."
+
 // directDisclosureCopy returns the header noun and the consequence sentence for
 // the direct-execution disclosure, keyed by database type. What a
 // direct statement does to the table while it runs is engine-specific — an
@@ -2941,13 +2949,19 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 // rest of the plan. Undoing one is the same inverse schema change as for any other
 // MySQL change, none of which has a revert window, so the MySQL copy does not
 // warn about reverting.
+//
+// The MySQL copy names the limits of the lock kill, so a reader does not take
+// it as a promise that every blocker is ended: the kill waits first, retries a
+// bounded number of times, and spares sessions it is unsafe or not permitted to
+// end. Running out of attempts and meeting a spared blocker both fail the
+// apply as busy. It leaves out the wait and the attempt count, which the
+// policy and the engine own, and links to the documentation that states them.
 func directDisclosureCopy(databaseType string, isMySQL bool) (headerNoun, consequence string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
-		return "native MySQL DDL, not through Spirit",
-			"Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes."
+		return "native MySQL DDL, not through Spirit", directMySQLConsequence
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest

@@ -917,7 +917,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
 - `users`: the table has \~1,240 rows
 
-Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.
+If a transaction holds a table's metadata lock past a short wait, SchemaBot kills it and tries again, for a limited number of attempts ([how it works](https://github.com/block/schemabot/blob/main/docs/direct-execution.md)). It never kills a `LOCK TABLES` session, a transaction too large to roll back, or a session it is not permitted to end. When the attempts run out or it meets one of those blockers, the apply fails as busy. Writes to each table are blocked until its statement finishes.
 
 📋 **Plan**: **2** tables to alter
 
