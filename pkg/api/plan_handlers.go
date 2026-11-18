@@ -1805,8 +1805,16 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	if err := s.authorizeStoredPlanSource(ctx, span, plan, req); err != nil {
 		return nil, 0, err
 	}
-	if err := s.admitPRSchemaRequest(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
-		return nil, 0, err
+	// A confirmed rollback restores a captured schema and has no PR head.
+	// Only the webhook supplies these internal guards. Storage checks both
+	// against the live lock in the transaction that queues the apply.
+	pinnedRollback := req.Options["rollback"] == "true" &&
+		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier &&
+		req.ExpectedLockOwner == fmt.Sprintf("%s#%d", plan.Repository, plan.PullRequest)
+	if !pinnedRollback {
+		if err := s.admitPRSchemaRequest(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
+			return nil, 0, err
+		}
 	}
 	return s.queueValidatedApply(ctx, span, plan, req)
 }

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -48,6 +49,33 @@ func (h *Handler) executeApply(
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
+	actionName := action.ApplyConfirm
+	if storedPlan != nil {
+		actionName = action.Apply
+	}
+
+	stopForPRSchemaAdmission := func(err error) bool {
+		stopped := isPRSchemaCapStop(err)
+		if _, refused := errors.AsType[*api.PRSchemaAdmissionError](err); !refused && !stopped {
+			return false
+		}
+		// Only the automatic command created a lock intent for this attempt.
+		// Verification can fail when the command context expires, so give the
+		// conditional release its own deadline.
+		if storedPlan != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			h.releaseApplyLockIfIntentUnchanged(cleanupCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "PR schema admission refusal")
+		}
+		if !stopped {
+			h.logger.Error("apply rejected: failed to verify the PR schema limit",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "action", actionName, "error", err)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"SchemaBot could not verify the PR schema limit. Nothing was applied. Retry the command.")
+		}
+		return true
+	}
 
 	// apply-confirm names no target: it confirms the plan its apply posted, so
 	// a plan narrowed to one rollout member narrows the re-plan and the apply
@@ -80,7 +108,7 @@ func (h *Handler) executeApply(
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
-	if isPRSchemaCapStop(err) {
+	if stopForPRSchemaAdmission(err) {
 		return
 	}
 	if err != nil {
@@ -95,10 +123,6 @@ func (h *Handler) executeApply(
 	// be rejected before any plan-derived response — the "no changes" release,
 	// the drift downgrade, and especially the unsafe-change prompt would all
 	// misread DDL that is only an artifact of the stale branch.
-	actionName := action.ApplyConfirm
-	if storedPlan != nil {
-		actionName = action.Apply
-	}
 	// What a refusal tells the operator when the lock changed under the apply:
 	// re-run the apply they sent, narrowed as its confirmed plan was, with the
 	// options they typed.
@@ -189,7 +213,7 @@ func (h *Handler) executeApply(
 	// posted with every target's plan just before this re-plan. Work that comment
 	// did not show stops for a fresh confirmation or is refused.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
-	if rollout.admissionErr != nil {
+	if stopForPRSchemaAdmission(rollout.admissionErr) {
 		return
 	}
 	primaryTargetConverged := !planResp.HasChanges()
@@ -560,7 +584,7 @@ func (h *Handler) executeApply(
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.ClearPendingObserver(pendingObserver)
-		if isPRSchemaCapStop(err) {
+		if stopForPRSchemaAdmission(err) {
 			return
 		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)

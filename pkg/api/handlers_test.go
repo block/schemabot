@@ -4871,6 +4871,49 @@ func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
 	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
 }
 
+func TestExecuteApplyPRSchemaCapRequiresPinnedRollback(t *testing.T) {
+	for _, tc := range []struct {
+		name, owner, pin   string
+		rollback, accepted bool
+	}{
+		{"confirmed rollback", "org/repo#7", "rollback:plan-1", true, true},
+		{"rollback option alone", "", "", true, false},
+		{"different owner", "org/repo#8", "rollback:plan-1", true, false},
+		{"different plan", "org/repo#7", "rollback:other", true, false},
+		{"forward apply", "org/repo#7", "plan-1", false, false},
+		{"forward request with rollback pin", "org/repo#7", "rollback:plan-1", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := executeApplyTestPlan()
+			plan.Repository, plan.PullRequest = "org/repo", 7
+			applies := &capturingApplyStore{}
+			svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+			svc.config.PRSchemaCap = PRSchemaCapPolicy{Limit: 1, Label: "ack"}
+			svc.OnPRSchemaAdmission = func(_ context.Context, _ string, _ int, head string) error {
+				require.Empty(t, head)
+				return errors.New("missing planned head commit")
+			}
+			req := ApplyRequest{
+				PlanID: plan.PlanIdentifier, Environment: plan.Environment,
+				ExpectedLockOwner: tc.owner, ExpectedPendingPlanID: tc.pin,
+			}
+			if tc.rollback {
+				req.Options = map[string]string{"rollback": "true"}
+			}
+			_, _, err := svc.ExecuteApply(t.Context(), req)
+			if !tc.accepted {
+				require.ErrorAs(t, err, new(*PRSchemaAdmissionError))
+				require.Nil(t, applies.apply)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, applies.apply)
+			assert.Equal(t, tc.owner, applies.apply.ExpectedLockOwner)
+			assert.Equal(t, tc.pin, applies.apply.ExpectedPendingPlanID)
+		})
+	}
+}
+
 func TestExecuteApplyGatesDeferredCutoverByDatabaseType(t *testing.T) {
 	tests := []struct {
 		name         string
