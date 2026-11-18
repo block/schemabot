@@ -15,11 +15,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/html"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -574,18 +576,90 @@ func (e *ConnectionError) Unwrap() error {
 	return e.Err
 }
 
+// message names the failure and its cause. A refused connection or an
+// unknown host never reached the server, so those keep their short messages.
+// Any other failure of a request that changes something, such as an apply or
+// a stop, may have happened after the server received it, so the message says
+// so and names the command that shows what the server did.
 func (e *ConnectionError) message() string {
-	msg := e.Err.Error()
-	if strings.Contains(msg, "connection refused") {
+	if isConnectionRefused(e.Err) {
 		return fmt.Sprintf("cannot connect to %s (is the server running?)", e.Endpoint)
 	}
-	if strings.Contains(msg, "no such host") {
+	if isHostNotFound(e.Err) {
 		return fmt.Sprintf("cannot resolve host: %s", e.Endpoint)
 	}
-	if strings.Contains(msg, "timeout") {
-		return fmt.Sprintf("connection timeout: %s", e.Endpoint)
+	cause := ui.TerminalSafe(requestFailureCause(e.Err))
+	var msg string
+	if isTimeout(e.Err) {
+		msg = fmt.Sprintf("request to %s timed out: %s", e.Endpoint, cause)
+	} else {
+		msg = fmt.Sprintf("connection failed: %s: %s", e.Endpoint, cause)
 	}
-	return fmt.Sprintf("connection failed: %s", e.Endpoint)
+	if mayHaveReachedServer(e.Err) {
+		msg += fmt.Sprintf("\nThe server may already have acted on this request. Run '%s' to check before you send it again.",
+			cliname.Command("status"))
+	}
+	return msg
+}
+
+// isConnectionRefused reports whether the server's host refused the
+// connection. The text match covers causes that carry no errno, such as one
+// relayed by a proxy.
+func isConnectionRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(err.Error(), "connection refused")
+}
+
+// isHostNotFound reports whether the server's host name did not resolve. The
+// text match covers causes that carry no DNS error, such as one relayed by a
+// proxy.
+func isHostNotFound(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return true
+	}
+	return strings.Contains(err.Error(), "no such host")
+}
+
+// isTimeout reports whether the request ran out of time, whether the client's
+// own timeout or a network read or write deadline ended it.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// requestFailureCause returns the text of the underlying cause. The HTTP
+// client wraps it with the method and full URL, which the message already
+// names through the endpoint, so that wrapper is dropped.
+func requestFailureCause(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
+}
+
+// mayHaveReachedServer reports whether a failed request could have been
+// received by the server before it failed. Only a request that changes
+// something needs the warning, and only when the failure came after the
+// connection opened: a failure while dialing never sent the request. A cause
+// that does not name its method is treated as a read, since nothing says it
+// changed anything.
+func mayHaveReachedServer(err error) bool {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return false
+	}
+	if urlErr.Op == "Get" || urlErr.Op == "Head" {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return false
+	}
+	return true
 }
 
 // FormatConnectionError returns a ConnectionError wrapping the underlying cause.
