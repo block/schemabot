@@ -12,15 +12,21 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-// FormatNumber formats an integer with comma-separated thousands.
-// Example: 1234567 → "1,234,567"
+// FormatNumber formats an integer with comma-separated thousands. The sign of
+// a negative number stays in front of the digits rather than being grouped
+// with them.
+// Example: 1234567 → "1,234,567", -123456 → "-123,456"
 func FormatNumber(n int64) string {
 	s := fmt.Sprintf("%d", n)
+	sign := ""
+	if n < 0 {
+		sign, s = "-", s[1:]
+	}
 	if len(s) <= 3 {
-		return s
+		return sign + s
 	}
 
-	var result []byte
+	result := []byte(sign)
 	for i, c := range s {
 		if i > 0 && (len(s)-i)%3 == 0 {
 			result = append(result, ',')
