@@ -30,9 +30,10 @@ var capTestRevision = prSchemaRevision{Head: "head", Base: "base", BaseRef: "mai
 
 type prSchemaCapFixture struct {
 	*Handler
-	client   *ghclient.InstallationClient
-	settings *memorySettingsStore
-	hasLabel atomic.Bool
+	client        *ghclient.InstallationClient
+	settings      *memorySettingsStore
+	hasLabel      atomic.Bool
+	timelineReads atomic.Int64
 }
 
 func newPRSchemaCapFixture(t *testing.T, schemas int) *prSchemaCapFixture {
@@ -69,6 +70,7 @@ func newPRSchemaCapFixture(t *testing.T, schemas int) *prSchemaCapFixture {
 		assert.NoError(t, err)
 	})
 	mux.HandleFunc("/repos/"+capTestRepo+"/issues/1/timeline", func(w http.ResponseWriter, _ *http.Request) {
+		fixture.timelineReads.Add(1)
 		_, err := fmt.Fprint(w, `[{"id":13,"event":"labeled","label":{"name":"schemabot-lsc"},"actor":{"login":"mona"},"created_at":"2026-11-18T21:00:00Z"}]`)
 		assert.NoError(t, err)
 	})
@@ -88,6 +90,14 @@ func newPRSchemaCapFixture(t *testing.T, schemas int) *prSchemaCapFixture {
 		Repo: capTestRepo, PR: 1, Revision: capTestRevision, DefaultTip: "base", BaseTip: "base", Registrations: sha256.Sum256(registry),
 	}, discovery)
 	return fixture
+}
+
+func TestPRSchemaCapWithinLimitSkipsLabelHistory(t *testing.T) {
+	fixture := newPRSchemaCapFixture(t, 5)
+	fixture.hasLabel.Store(true)
+	_, err := fixture.admitPRSchemaWork(t.Context(), fixture.client, capTestRepo, 1, capTestRevision)
+	require.NoError(t, err)
+	require.Zero(t, fixture.timelineReads.Load())
 }
 
 func TestPRSchemaCapAdmitsFiveAndHoldsSixAcrossPlanes(t *testing.T) {

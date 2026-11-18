@@ -23,7 +23,7 @@ type prSchemaAcknowledgment struct {
 
 func (a prSchemaAcknowledgment) authorizes(revision prSchemaRevision, state ghclient.PRLabelState, label string) bool {
 	return state.Present && a.EventID != 0 && state.EventID == a.EventID &&
-		state.RevisionID == a.RevisionID && a.Revision == revision && a.Label == label
+		state.RevisionID < state.EventID && a.RevisionID < a.EventID && a.Revision == revision && a.Label == label
 }
 
 func prSchemaLabelKey(repo string, pr int) string {
@@ -102,13 +102,6 @@ func (h *Handler) runPRSchemaLabelEvent(ctx context.Context, client *ghclient.In
 		revision != payload.schemaRevision() {
 		return "schema cap label delivery superseded", nil
 	}
-	state, err := client.FetchPRLabelState(ctx, repo, pr, policy.Label)
-	if err != nil {
-		return "", err
-	}
-	if !matchesPRSchemaLabelAddition(payload, state, receivedAt) {
-		return "schema cap label event not current", nil
-	}
 	discovery, err := h.discoverPRSchemaCap(ctx, client, repo, pr, revision)
 	if err != nil {
 		if isPRSchemaCapStop(err) {
@@ -119,6 +112,13 @@ func (h *Handler) runPRSchemaLabelEvent(ctx context.Context, client *ghclient.In
 	}
 	if len(discovery.schemas) <= policy.Limit {
 		return "PR is within the schema limit", nil
+	}
+	state, err := client.FetchPRLabelState(ctx, repo, pr, policy.Label)
+	if err != nil {
+		return "", err
+	}
+	if !matchesPRSchemaLabelAddition(payload, state, receivedAt) {
+		return "schema cap label event not current", nil
 	}
 	if err := h.recordPRSchemaLabel(ctx, repo, pr, policy, revision, state); err != nil {
 		return "", err

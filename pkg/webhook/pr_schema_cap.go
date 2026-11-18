@@ -67,6 +67,9 @@ func (h *Handler) admitDiscoveredPRSchemaWork(ctx context.Context, client *ghcli
 		return prSchemaAcknowledgment{}, errPRSchemaRevisionMoved
 	}
 
+	if !aboveLimit {
+		return prSchemaAcknowledgment{}, nil
+	}
 	if fresh.HasLabel(policy.Label) {
 		state, err := client.FetchPRLabelState(ctx, repo, pr, policy.Label)
 		if err != nil {
@@ -77,10 +80,7 @@ func (h *Handler) admitDiscoveredPRSchemaWork(ctx context.Context, client *ghcli
 			return prSchemaAcknowledgment{}, err
 		}
 		if acknowledgment.authorizes(revision, state, policy.Label) {
-			if aboveLimit {
-				return acknowledgment, nil
-			}
-			return prSchemaAcknowledgment{}, nil
+			return acknowledgment, nil
 		}
 		// Absence of an acknowledgment may mean its delivery is still in
 		// flight. Remove only an event with positive evidence of staleness.
@@ -90,9 +90,6 @@ func (h *Handler) admitDiscoveredPRSchemaWork(ctx context.Context, client *ghcli
 		}
 	}
 
-	if !aboveLimit {
-		return prSchemaAcknowledgment{}, nil
-	}
 	metrics.RecordPRSchemaCap(ctx, repo, "blocked", len(discovery.configs))
 	if err := h.publishPRSchemaHold(ctx, client, repo, pr, policy, revision, discovery.schemas); err != nil {
 		return prSchemaAcknowledgment{}, fmt.Errorf("publish PR schema cap hold: %w", err)

@@ -11,8 +11,8 @@ import (
 	gh "github.com/google/go-github/v86/github"
 )
 
-// PRLabelState is the most recent event for a label and the last force push
-// or retarget in the same GitHub timeline. The latter distinguishes revisions
+// PRLabelState records the latest matching label and revision events visible
+// in the terminal page of the GitHub timeline. The latter distinguishes revisions
 // that return to a previously seen head or base.
 type PRLabelState struct {
 	EventID    int64
@@ -29,7 +29,8 @@ func (p *PullRequestInfo) HasLabel(label string) bool {
 func (ic *InstallationClient) FetchPRLabelState(ctx context.Context, repo string, pr int, label string) (PRLabelState, error) {
 	owner, name := splitRepo(repo)
 	opts := &gh.ListOptions{PerPage: 100}
-	var state PRLabelState
+	// Jump directly to the last page. Only a single terminal page proves
+	// continuity from a visible label event through the latest revision.
 	for {
 		var response *gh.Response
 		events, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list PR label and revision events", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.Timeline, error) {
@@ -40,6 +41,16 @@ func (ic *InstallationClient) FetchPRLabelState(ctx context.Context, repo string
 		if err != nil {
 			return PRLabelState{}, fmt.Errorf("list PR timeline for %s#%d: %w", repo, pr, err)
 		}
+		if response.NextPage != 0 {
+			if opts.Page != 0 || response.LastPage <= 1 {
+				// The tail moved or GitHub supplied no last-page link.
+				// An empty state cannot authorize the acknowledgment.
+				return PRLabelState{}, nil
+			}
+			opts.Page = response.LastPage
+			continue
+		}
+		var state PRLabelState
 		for _, event := range events {
 			switch event.GetEvent() {
 			case "head_ref_force_pushed", "base_ref_force_pushed", "base_ref_changed":
@@ -53,10 +64,7 @@ func (ic *InstallationClient) FetchPRLabelState(ctx context.Context, repo string
 				}
 			}
 		}
-		if response.NextPage == 0 {
-			return state, nil
-		}
-		opts.Page = response.NextPage
+		return state, nil
 	}
 }
 
