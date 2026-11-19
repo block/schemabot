@@ -85,6 +85,14 @@ func (cmd *ChecksBackfillCmd) pauseForBudget(ctx context.Context, rate *apitypes
 // checksSynthesizeBatchSize matches the server's per-request PR cap.
 const checksSynthesizeBatchSize = 10
 
+// checksSynthesizeMergeQueueBatchSize matches the server's per-request cap on
+// merge queue heads.
+const checksSynthesizeMergeQueueBatchSize = 20
+
+// checksBackfillMergeQueueDryRunStatus is a dry run's action for a merge group
+// missing a check.
+const checksBackfillMergeQueueDryRunStatus = "would post the passing merge queue check if the group is still queued"
+
 // checksScanNamedBatchSize matches the server's cap on named PRs per scan.
 const checksScanNamedBatchSize = 30
 
@@ -122,8 +130,15 @@ const checksBackfillInterruptedScanNote = "Interrupted during the scan: only the
 // outcomes the report shows.
 func checksBackfillInterruptedRecreateNote(report *checksBackfillReport) string {
 	var unconfirmed, notAttempted bool
+	outcomes := make([]string, 0, len(report.Actions)+len(report.MergeQueue))
 	for _, action := range report.Actions {
-		switch action.Outcome {
+		outcomes = append(outcomes, action.Outcome)
+	}
+	for _, group := range report.MergeQueue {
+		outcomes = append(outcomes, group.Outcome)
+	}
+	for _, outcome := range outcomes {
+		switch outcome {
 		case checksBackfillUnconfirmedStatus:
 			unconfirmed = true
 		case checksBackfillNotAttemptedStatus:
@@ -185,6 +200,37 @@ type checksBackfillAction struct {
 	// batch from the PRs it never sent.
 	sent     bool
 	answered bool
+}
+
+// checksMergeQueueAction is one merge group missing a SchemaBot check, and
+// (after acting) the outcome of posting the passing check on its head. Until
+// the check exists, the group blocks every PR queued behind it.
+type checksMergeQueueAction struct {
+	Repo string `json:"repo"`
+	// Ref is the merge group's temporary branch, gh-readonly-queue/<base>/pr-<n>-<sha>.
+	Ref     string `json:"ref"`
+	BaseRef string `json:"base_ref,omitempty"`
+	// PR is the pull request whose queue entry created the group; 0 when its
+	// branch name does not say.
+	PR                     int      `json:"pr,omitempty"`
+	URL                    string   `json:"url,omitempty"`
+	HeadSHA                string   `json:"head_sha"`
+	MissingNames           []string `json:"missing_names"`
+	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
+	Outcome                string   `json:"outcome,omitempty"`
+	Error                  string   `json:"error,omitempty"`
+	// sent and answered track the request as they do for a PR.
+	sent     bool
+	answered bool
+}
+
+// label names the merge group in the report: the PR that created it when its
+// branch says, otherwise the branch itself.
+func (a checksMergeQueueAction) label() string {
+	if a.URL != "" {
+		return a.URL
+	}
+	return a.Ref
 }
 
 // checksStuckCheck is one existing-but-uncompleted Check Run on an open PR,
@@ -254,6 +300,17 @@ type checksBackfillReport struct {
 	StuckAfter  string                 `json:"stuck_after"`
 	Actions     []checksBackfillAction `json:"actions"`
 	Stuck       []checksStuckCheck     `json:"stuck,omitempty"`
+	// MergeQueueScanned counts the merge groups the scan found queued across
+	// the scanned repositories, and MergeQueue lists those missing a check.
+	// A scan of named PRs does not read the merge queue.
+	MergeQueueScanned int                      `json:"merge_queue_scanned,omitempty"`
+	MergeQueue        []checksMergeQueueAction `json:"merge_queue,omitempty"`
+	// MergeQueueUnsupported lists the scanned repositories whose merge queue
+	// went unread because the server does not support reading it.
+	MergeQueueUnsupported []string `json:"merge_queue_unsupported,omitempty"`
+	// MergeQueueUnread lists the scanned repositories whose merge queue the
+	// server failed to read, and why. Their PRs were still scanned.
+	MergeQueueUnread []checksMergeQueueUnread `json:"merge_queue_unread,omitempty"`
 	// interruptedScan says the interrupt landed before the scan finished, so
 	// nothing was sent for recreation and the table shows what the backfill
 	// would do rather than an outcome.
@@ -275,6 +332,17 @@ func (r *checksBackfillReport) markUnanswered() {
 			continue
 		}
 		action.Outcome = checksBackfillNotAttemptedStatus
+	}
+	for i := range r.MergeQueue {
+		group := &r.MergeQueue[i]
+		if group.answered {
+			continue
+		}
+		if group.sent {
+			group.Outcome = checksBackfillUnconfirmedStatus
+			continue
+		}
+		group.Outcome = checksBackfillNotAttemptedStatus
 	}
 }
 
@@ -394,6 +462,10 @@ scanning:
 				// This command handles the not-installed skip below, so the
 				// server may answer with it instead of an error.
 				ReportAppNotInstalled: true,
+				// A blocked merge queue holds every PR queued behind it, so
+				// a sweep of the repository reads it too. The server reads it
+				// on the first page only; named PRs leave it out.
+				MergeQueue: len(namedPRs) == 0,
 			})
 			if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
 				scanCanceled = canceled
@@ -432,6 +504,15 @@ scanning:
 				continue scanning
 			}
 			reached = i + 1
+			// Reading the merge queue only adds findings, so a server that
+			// cannot read it does not stop the sweep; the report says which
+			// queues went unread, and the run exits nonzero for them.
+			if page == 1 && len(namedPRs) == 0 && !chunk.Supports.MergeQueue {
+				report.MergeQueueUnsupported = append(report.MergeQueueUnsupported, repo)
+			}
+			if chunk.MergeQueueError != "" {
+				report.MergeQueueUnread = append(report.MergeQueueUnread, checksMergeQueueUnread{Repo: repo, Error: chunk.MergeQueueError})
+			}
 			for _, name := range chunk.CheckNames {
 				if !checkNamesSeen[name] {
 					checkNamesSeen[name] = true
@@ -440,6 +521,19 @@ scanning:
 			}
 			repoScanned += chunk.Scanned
 			report.Scanned += chunk.Scanned
+			report.MergeQueueScanned += chunk.MergeQueueScanned
+			for _, group := range chunk.MergeQueue {
+				report.MergeQueue = append(report.MergeQueue, checksMergeQueueAction{
+					Repo:                   repo,
+					Ref:                    group.Ref,
+					BaseRef:                group.BaseRef,
+					PR:                     group.PR,
+					URL:                    group.URL,
+					HeadSHA:                group.HeadSHA,
+					MissingNames:           group.MissingNames,
+					UntrustedConflictNames: group.UntrustedConflictNames,
+				})
+			}
 			if chunk.EstimatedOpenPRs > 0 {
 				repoEstimate = chunk.EstimatedOpenPRs
 			}
@@ -614,14 +708,30 @@ func chunkPRNumbers(prs []int, size int) [][]int {
 	return chunks
 }
 
+// checksMergeQueueUnread is a repository whose merge queue the server failed
+// to read, so its merge groups were not checked.
+type checksMergeQueueUnread struct {
+	Repo  string `json:"repo"`
+	Error string `json:"error"`
+}
+
 // checksScanMark is how much of a report existed before one repository's scan
 // began.
 type checksScanMark struct {
-	actions, stuck, scanned, checkNames int
+	actions, stuck, scanned, checkNames, mergeQueue, mergeQueueScanned, mergeQueueUnsupported, mergeQueueUnread int
 }
 
 func (r *checksBackfillReport) mark() checksScanMark {
-	return checksScanMark{actions: len(r.Actions), stuck: len(r.Stuck), scanned: r.Scanned, checkNames: len(r.CheckNames)}
+	return checksScanMark{
+		actions:               len(r.Actions),
+		stuck:                 len(r.Stuck),
+		scanned:               r.Scanned,
+		checkNames:            len(r.CheckNames),
+		mergeQueue:            len(r.MergeQueue),
+		mergeQueueScanned:     r.MergeQueueScanned,
+		mergeQueueUnsupported: len(r.MergeQueueUnsupported),
+		mergeQueueUnread:      len(r.MergeQueueUnread),
+	}
 }
 
 // rollback removes everything added to the report since m, for a repository
@@ -642,6 +752,10 @@ func (r *checksBackfillReport) rollback(m checksScanMark, checkNamesSeen map[str
 	r.Stuck = r.Stuck[:m.stuck]
 	r.Scanned = m.scanned
 	r.CheckNames = r.CheckNames[:m.checkNames]
+	r.MergeQueue = r.MergeQueue[:m.mergeQueue]
+	r.MergeQueueScanned = m.mergeQueueScanned
+	r.MergeQueueUnsupported = r.MergeQueueUnsupported[:m.mergeQueueUnsupported]
+	r.MergeQueueUnread = r.MergeQueueUnread[:m.mergeQueueUnread]
 	return held
 }
 
@@ -667,6 +781,9 @@ func appNotInstalledError(repo, app string) error {
 func attentionExitError(report *checksBackfillReport) error {
 	var parts []string
 	if report.DryRun {
+		if n := len(report.MergeQueue); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s missing Check Runs", n, ui.PluralizeLabel("merge group", "merge groups", n)))
+		}
 		if n := len(report.Actions); n > 0 {
 			part := fmt.Sprintf("%d %s with missing Check Runs", n, ui.Pluralize("PR", n))
 			held := 0
@@ -703,9 +820,18 @@ func attentionExitError(report *checksBackfillReport) error {
 		if failed > 0 {
 			parts = append(parts, fmt.Sprintf("%d failed Check Run %s", failed, ui.Pluralize("recreation", failed)))
 		}
+		// A merge group whose check was not posted still blocks its queue.
+		// One the queue no longer holds needs nothing.
+		if n := mergeGroupsStillBlocked(report.MergeQueue); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s still missing Check Runs", n, ui.PluralizeLabel("merge group", "merge groups", n)))
+		}
 	}
 	if n := len(report.Stuck); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d stuck %s", n, ui.Pluralize("Check Run", n)))
+	}
+	// An unchecked merge queue may be blocked, so the run cannot call it clear.
+	if n := len(report.MergeQueueUnsupported) + len(report.MergeQueueUnread); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s with an unchecked merge queue", n, ui.PluralizeLabel("repository", "repositories", n)))
 	}
 	// A repo the App is not installed on was never scanned, so the run cannot
 	// say it has nothing to backfill.
@@ -894,6 +1020,11 @@ type repoPR struct {
 }
 
 func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *checksBackfillReport, updateProgress func(string)) error {
+	// Merge groups go first, across every repository: each one holds every PR
+	// queued behind it, so clearing it unblocks more than any single PR.
+	if err := cmd.actOnMergeQueue(ctx, endpoint, report, updateProgress); err != nil {
+		return err
+	}
 	// Synthesize per repository, in server-bounded batches. Held PRs never
 	// reach the server; their outcome records why.
 	synthesizeByRepo := make(map[string][]int)
@@ -962,6 +1093,104 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 		}
 	}
 	return nil
+}
+
+// actOnMergeQueue asks the server to post the passing merge queue check on
+// each merge group head the scan found missing one, per repository, in
+// server-bounded batches. The server lists the queue again and posts only on
+// a head it still holds, so a group that merged or left the queue since the
+// scan gets nothing.
+func (cmd *ChecksBackfillCmd) actOnMergeQueue(ctx context.Context, endpoint string, report *checksBackfillReport, updateProgress func(string)) error {
+	headsByRepo := make(map[string][]string)
+	groupByHead := make(map[string]*checksMergeQueueAction)
+	for i := range report.MergeQueue {
+		group := &report.MergeQueue[i]
+		headsByRepo[group.Repo] = append(headsByRepo[group.Repo], group.HeadSHA)
+		groupByHead[group.Repo+"@"+group.HeadSHA] = group
+	}
+	for _, repo := range sortedKeys(headsByRepo) {
+		heads := headsByRepo[repo]
+		pending := heads
+		for len(pending) > 0 {
+			batch := pending[:min(checksSynthesizeMergeQueueBatchSize, len(pending))]
+			pending = pending[len(batch):]
+			updateProgress(fmt.Sprintf("posting merge queue checks for %d/%d merge groups in %s...", len(heads)-len(pending), len(heads), repo))
+			for _, head := range batch {
+				groupByHead[repo+"@"+head].sent = true
+			}
+			resp, err := cmdclient.ChecksSynthesize(ctx, endpoint, apitypes.ChecksSynthesizeRequest{
+				Repo:                  repo,
+				MergeQueueHeads:       batch,
+				Environment:           cmd.Environment,
+				CheckName:             cmd.CheckName,
+				RateLimitFloorPercent: cmd.RateLimitFloor,
+			})
+			if err != nil {
+				if endedByInterrupt(ctx, err) {
+					return fmt.Errorf("post merge queue checks for %s: %w", repo, err)
+				}
+				// A failed request leaves this batch unconfirmed, since the
+				// server may have posted some of its checks before failing.
+				// The run keeps going: the PRs' own checks do not depend on
+				// the merge queue, and the unconfirmed groups still make the
+				// run exit nonzero.
+				updateProgress(fmt.Sprintf("posting merge queue checks in %s failed; continuing with the rest of the sweep", repo))
+				for _, head := range batch {
+					group := groupByHead[repo+"@"+head]
+					group.Error = fmt.Sprintf("request failed before the server answered, so the check may or may not have been posted: %v", err)
+					group.answered = true
+				}
+				continue
+			}
+			// Heads the server did not start because the budget was below
+			// the floor go back on the queue to send after the pause.
+			_, pausing := rateLimitPauseDuration(resp.RateLimit, cmd.RateLimitFloor, webhookRedriveNow())
+			var notStarted []string
+			for _, result := range resp.MergeQueue {
+				group, ok := groupByHead[repo+"@"+result.HeadSHA]
+				if !ok {
+					continue
+				}
+				if result.RateLimited && pausing {
+					group.sent = false
+					notStarted = append(notStarted, result.HeadSHA)
+					continue
+				}
+				applyMergeQueueResult(group, result)
+			}
+			pending = append(notStarted, pending...)
+			if err := cmd.pauseForBudget(ctx, resp.RateLimit, updateProgress); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// applyMergeQueueResult records the server's answer for one merge group. A
+// head not started for the budget, and not about to be resent, is a failure:
+// its check is still missing.
+func applyMergeQueueResult(group *checksMergeQueueAction, result apitypes.ChecksMergeQueueResult) {
+	group.Outcome = result.Outcome
+	group.Error = result.Error
+	if result.RateLimited && group.Error == "" {
+		group.Error = result.Outcome
+	}
+	group.answered = true
+}
+
+// mergeGroupsStillBlocked counts the merge groups the run did not confirm a
+// check on: a failed post, or no answer from the server (an interrupted run).
+// A group the queue no longer holds, or one skipped for the repository's
+// configuration, needs nothing more.
+func mergeGroupsStillBlocked(groups []checksMergeQueueAction) int {
+	n := 0
+	for _, group := range groups {
+		if group.Error != "" || !group.answered {
+			n++
+		}
+	}
+	return n
 }
 
 // applySynthesizeResult records the server's answer for one PR on its action.
@@ -1038,7 +1267,11 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if len(report.CheckNames) > 0 {
 		checkScope = fmt.Sprintf(" for %s", strings.Join(report.CheckNames, ", "))
 	}
-	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s in %s%s.\n", report.Scanned, window, repoScope, checkScope); err != nil {
+	mergeGroups := ""
+	if report.MergeQueueScanned > 0 {
+		mergeGroups = fmt.Sprintf(" and %d queued %s", report.MergeQueueScanned, ui.PluralizeLabel("merge group", "merge groups", report.MergeQueueScanned))
+	}
+	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s%s in %s%s.\n", report.Scanned, window, mergeGroups, repoScope, checkScope); err != nil {
 		return err
 	}
 	if err := writeChecksInterruptedNote(w, report); err != nil {
@@ -1047,17 +1280,33 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if err := writeChecksSkippedRepos(w, report); err != nil {
 		return err
 	}
+	if len(report.MergeQueueUnsupported) > 0 {
+		if _, err := fmt.Fprintf(w, "The server cannot read the merge queue, so queued merge groups in %s were not checked. Upgrade the server to check them.\n", strings.Join(report.MergeQueueUnsupported, ", ")); err != nil {
+			return err
+		}
+	}
+	for _, unread := range report.MergeQueueUnread {
+		if _, err := fmt.Fprintf(w, "Could not read the merge queue of %s, so its queued merge groups were not checked: %s. Run the backfill for %s again to check them.\n", unread.Repo, unread.Error, unread.Repo); err != nil {
+			return err
+		}
+	}
 	if err := writeChecksStuckSection(w, report); err != nil {
 		return err
 	}
+	// An interrupted scan sent nothing for recreation, so like a dry run it
+	// lists what the backfill would do.
+	acted := !report.DryRun && !report.interruptedScan
+	if err := writeChecksMergeQueueSection(w, report, acted); err != nil {
+		return err
+	}
 	if len(report.Actions) == 0 {
+		if len(report.MergeQueue) > 0 {
+			return nil
+		}
 		_, err := fmt.Fprintln(w, "No missing SchemaBot Check Runs found.")
 		return err
 	}
 
-	// An interrupted scan sent nothing for recreation, so like a dry run it
-	// lists what the backfill would do.
-	acted := !report.DryRun && !report.interruptedScan
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	header := "PR\tMISSING CHECKS\tACTION"
 	if acted {
@@ -1100,6 +1349,56 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		}
 	}
 	return writeChecksDeferredHint(w, report)
+}
+
+// writeChecksMergeQueueSection lists the merge groups missing a SchemaBot
+// check, ahead of the PRs: each one blocks every PR queued behind it.
+func writeChecksMergeQueueSection(w io.Writer, report *checksBackfillReport, acted bool) error {
+	if len(report.MergeQueue) == 0 {
+		return nil
+	}
+	n := len(report.MergeQueue)
+	if _, err := fmt.Fprintf(w, "%d %s missing SchemaBot Check Runs, blocking the PRs queued behind %s:\n",
+		n, ui.PluralizeLabel("merge group is", "merge groups are", n), ui.PluralizeLabel("it", "them", n)); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	header := "MERGE GROUP\tBASE\tMISSING CHECKS\tACTION"
+	if acted {
+		header = "MERGE GROUP\tBASE\tMISSING CHECKS\tOUTCOME"
+	}
+	if _, err := fmt.Fprintln(tw, header); err != nil {
+		return err
+	}
+	for _, group := range report.MergeQueue {
+		status := checksBackfillMergeQueueDryRunStatus
+		if acted {
+			status = group.Outcome
+			if group.Error != "" {
+				status = "failed: " + group.Error
+			}
+		}
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", group.label(), group.BaseRef, strings.Join(group.MissingNames, ", "), sanitizeCell(status)); err != nil {
+			return err
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	for _, group := range report.MergeQueue {
+		if len(group.UntrustedConflictNames) > 0 {
+			if _, err := fmt.Fprintf(w, "Note: merge group %s has checks held by an untrusted app (%s); backfill posts the trusted check, but resolve the conflicting one too.\n", group.Ref, strings.Join(group.UntrustedConflictNames, ", ")); err != nil {
+				return err
+			}
+		}
+	}
+	// A blank line keeps the merge queue table apart from the PR table.
+	if len(report.Actions) > 0 {
+		if _, err := fmt.Fprintln(w); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // deferredStatus is the outcome cell of a PR deferred because it changes

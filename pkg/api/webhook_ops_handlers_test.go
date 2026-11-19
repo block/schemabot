@@ -386,6 +386,21 @@ type fakeCheckRunBackfiller struct {
 	// deferred maps a PR to the databases it changes; without Plan the fake
 	// defers it, as the webhook handler defers a PR that changes schema.
 	deferred map[int][]string
+	// mergeQueueCalls records each merge group head the fake posted on, and
+	// failHead names one whose post fails.
+	mergeQueueCalls []string
+	failHead        string
+	// mergeQueueScopes records the scope each merge group post carried.
+	mergeQueueScopes []MergeQueueCheckScope
+}
+
+func (f *fakeCheckRunBackfiller) BackfillMergeQueueCheck(_ context.Context, _ string, _ int64, headSHA string, scope MergeQueueCheckScope) (string, error) {
+	f.mergeQueueCalls = append(f.mergeQueueCalls, headSHA)
+	f.mergeQueueScopes = append(f.mergeQueueScopes, scope)
+	if headSHA == f.failHead {
+		return "", errors.New("create check run: 502 Bad Gateway")
+	}
+	return "posted passing merge queue check", nil
 }
 
 func (f *fakeCheckRunBackfiller) BackfillPRCheckRuns(_ context.Context, _ string, pr int, _ int64, opts CheckRunBackfillOptions) (CheckRunBackfillResult, error) {
@@ -419,6 +434,32 @@ func (f *fakeCoreRateLimit) CoreRateLimit(context.Context) (int, int, time.Time,
 	}
 	i := min(f.calls-1, len(f.remaining)-1)
 	return f.remaining[i], f.limit, time.Now().Add(time.Hour), nil
+}
+
+// fakeMergeQueueSynthesizeClient lists a fixed merge queue on top of a budget
+// sequence, the GitHub surface a merge queue backfill reads.
+type fakeMergeQueueSynthesizeClient struct {
+	fakeCoreRateLimit
+	queue    []ghclient.MergeQueueHead
+	queueErr error
+	// prHeads maps a commit to the open PR whose head it is, and prHeadErr
+	// fails that lookup.
+	prHeads   map[string]int
+	prHeadErr error
+}
+
+func (f *fakeMergeQueueSynthesizeClient) OpenPullRequestHeadedAt(_ context.Context, _, sha string) (int, error) {
+	if f.prHeadErr != nil {
+		return 0, f.prHeadErr
+	}
+	return f.prHeads[sha], nil
+}
+
+func (f *fakeMergeQueueSynthesizeClient) ListMergeQueueHeads(context.Context, string) ([]ghclient.MergeQueueHead, error) {
+	if f.queueErr != nil {
+		return nil, f.queueErr
+	}
+	return f.queue, nil
 }
 
 // A synthesize batch defers each PR that changes managed schema unless the
@@ -515,7 +556,19 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 
 	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo"}, discardLogger())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "prs is required")
+	assert.Contains(t, err.Error(), "prs or merge_queue_heads is required")
+
+	tooManyHeads := make([]string, checksSynthesizeMaxMergeQueueHeadsPerRequest+1)
+	for i := range tooManyHeads {
+		tooManyHeads[i] = fmt.Sprintf("sha%d", i)
+	}
+	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: tooManyHeads}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at most 20 merge_queue_heads per request")
+
+	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"sha1", ""}}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "merge_queue_heads must not contain an empty commit")
 
 	tooMany := make([]int, checksSynthesizeMaxPRsPerRequest+1)
 	_, err = executeChecksSynthesize(t.Context(), cfg, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: tooMany}, discardLogger())
@@ -529,6 +582,25 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 	_, err = executeChecksSynthesize(t.Context(), cfg, nil, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1}}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no GitHub webhook runtime")
+
+	narrowable := &ServerConfig{AllowedEnvironments: []string{"staging"}}
+	_, err = executeChecksSynthesize(t.Context(), narrowable, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"sha1"}, Environment: "production"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `environment "production" is not one this instance handles`)
+	assert.Empty(t, backfiller.mergeQueueScopes, "a refused environment posts nothing")
+}
+
+// An operator who types "-e Production" names the environment the scan
+// already accepted under that spelling. The synthesize request folds it the
+// same way, so the merge queue post is not refused and its scope matches the
+// configured lowercase name.
+func TestChecksSynthesizeFoldsTheEnvironmentLikeTheScan(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+	req := ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"sha1"}, Environment: " Production "}
+	require.NoError(t, validateChecksSynthesizeRequest(cfg, &req))
+	assert.Equal(t, "production", req.Environment)
 }
 
 // A repository that is not an owner/name pair is the caller's mistake, and it
@@ -807,6 +879,17 @@ type fakeWebhookMissingCheckScanClient struct {
 	// untrusted maps headSHA+"/"+checkName to app slugs that published a
 	// same-named check but are not trusted.
 	untrusted map[string][]string
+	// queue is the merge queue the repository lists, and queueErr fails the
+	// listing.
+	queue    []ghclient.MergeQueueHead
+	queueErr error
+}
+
+func (f fakeWebhookMissingCheckScanClient) ListMergeQueueHeads(context.Context, string) ([]ghclient.MergeQueueHead, error) {
+	if f.queueErr != nil {
+		return nil, f.queueErr
+	}
+	return f.queue, nil
 }
 
 func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Context, _ string, page, perPage int) ([]ghclient.OpenPullRequest, int, int, error) {
@@ -1085,7 +1168,7 @@ func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
 	assert.Equal(t, "octo/repo", response.Repo)
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
-	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true, MergeQueue: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 }
 
 // fakeChecksScanClient adds the installation budget read a scan page ends
@@ -1141,7 +1224,7 @@ func TestExecuteChecksScanSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
 	assert.Empty(t, response.CheckNames)
-	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true, MergeQueue: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 
 	var entry map[string]any
 	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log line: %s", logs.String())
@@ -1217,7 +1300,7 @@ func TestExecuteChecksScanScansThroughTheResolvedInstallation(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, response.AppNotInstalled)
 	assert.Empty(t, response.GitHubApp)
-	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true, MergeQueue: true}, response.Supports)
 	assert.Equal(t, 1, response.Scanned)
 	require.Len(t, response.Missing, 1)
 	assert.Equal(t, 7, response.Missing[0].Number)
@@ -1873,4 +1956,227 @@ func TestExecuteChecksScanOfNamedPRsValidation(t *testing.T) {
 			require.ErrorContains(t, err, tc.want)
 		})
 	}
+}
+
+// testMergeQueue is a merge queue testing two merge groups on main.
+var testMergeQueue = []ghclient.MergeQueueHead{
+	{Ref: "gh-readonly-queue/main/pr-412-0a1b2c3d", BaseRef: "main", PR: 412, HeadSHA: "group-412"},
+	{Ref: "gh-readonly-queue/main/pr-418-4e5f6a7b", BaseRef: "main", PR: 418, HeadSHA: "group-418"},
+}
+
+func checksScanTestConfig(repo RepoConfig) *ServerConfig {
+	return &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": repo},
+	}
+}
+
+// A first-page scan that asks for the merge queue reports each merge group
+// missing a SchemaBot check, with the PR that created it, alongside the open
+// PRs. A group that already has the check is not reported.
+func TestExecuteChecksScanReportsMergeGroupsMissingChecks(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{
+		queue: testMergeQueue,
+		runs: map[string]*ghclient.CheckRunResult{
+			"group-418/SchemaBot": {ID: 40, Name: "SchemaBot", Status: "completed", Conclusion: "success"},
+		},
+	}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+
+	response, err := executeChecksScanWith(t.Context(), checksScanTestConfig(RepoConfig{GitHubApp: "main"}), nil,
+		ChecksScanRequest{Repo: "octo/repo", MergeQueue: true}, discardLogger(), resolve)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, response.MergeQueueScanned)
+	require.Len(t, response.MergeQueue, 1)
+	assert.Equal(t, MissingMergeQueueCheck{
+		Ref:          "gh-readonly-queue/main/pr-412-0a1b2c3d",
+		BaseRef:      "main",
+		PR:           412,
+		URL:          "https://github.com/octo/repo/pull/412",
+		HeadSHA:      "group-412",
+		MissingNames: []string{"SchemaBot"},
+	}, response.MergeQueue[0])
+}
+
+// A paged sweep reads the merge queue once, on its first page; later pages
+// and scans that did not ask for the queue never list it.
+func TestExecuteChecksScanReadsTheMergeQueueOnlyOnTheFirstPage(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{queueErr: errors.New("merge queue must not be listed")}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+	cfg := checksScanTestConfig(RepoConfig{GitHubApp: "main"})
+
+	for name, req := range map[string]ChecksScanRequest{
+		"second page":         {Repo: "octo/repo", MergeQueue: true, Page: 2},
+		"queue not requested": {Repo: "octo/repo"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response, err := executeChecksScanWith(t.Context(), cfg, nil, req, discardLogger(), resolve)
+			require.NoError(t, err)
+			assert.Empty(t, response.MergeQueueError, "the queue was listed")
+			assert.Zero(t, response.MergeQueueScanned)
+			assert.Empty(t, response.MergeQueue)
+		})
+	}
+}
+
+// A merge queue that cannot be listed is reported as unread rather than as an
+// empty queue, so a sweep never reports a blocked queue as clear. The PRs on
+// the page are still scanned, so one repository's queue cannot stop the PRs'
+// recovery in it or in the repositories after it.
+func TestExecuteChecksScanReportsAMergeQueueItCannotList(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{queueErr: errors.New("502 Bad Gateway")}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+
+	response, err := executeChecksScanWith(t.Context(), checksScanTestConfig(RepoConfig{GitHubApp: "main"}), nil,
+		ChecksScanRequest{Repo: "octo/repo", MergeQueue: true}, discardLogger(), resolve)
+	require.NoError(t, err)
+	assert.Equal(t, "scan merge queue of octo/repo for missing checks: 502 Bad Gateway", response.MergeQueueError)
+	assert.Zero(t, response.MergeQueueScanned)
+	assert.Empty(t, response.MergeQueue)
+}
+
+// An aggregate participant posts no checks on merge groups (its leader posts
+// the required one), so its queue is not scanned: every group would read as
+// missing a check that is not supposed to exist.
+func TestExecuteChecksScanLeavesOutAParticipantsMergeQueue(t *testing.T) {
+	t.Parallel()
+
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{queue: testMergeQueue}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+	cfg := checksScanTestConfig(RepoConfig{GitHubApp: "main", Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}})
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", MergeQueue: true}, discardLogger(), resolve)
+	require.NoError(t, err)
+	assert.Zero(t, response.MergeQueueScanned)
+	assert.Empty(t, response.MergeQueue)
+}
+
+// A scan of named PRs refuses the merge queue: the queue belongs to the
+// repository, not to the PRs the operator named.
+func TestExecuteChecksScanOfNamedPRsRefusesTheMergeQueue(t *testing.T) {
+	t.Parallel()
+
+	_, err := executeChecksScan(t.Context(), &ServerConfig{}, nil,
+		ChecksScanRequest{Repo: "octo/repo", PRs: []int{1}, MergeQueue: true}, discardLogger())
+	require.ErrorContains(t, err, "merge_queue does not apply to a scan of named prs")
+}
+
+// The passing merge queue check goes only on a head the queue is still
+// testing when the request arrives. A head the caller sends that the queue no
+// longer holds gets nothing, and one head whose post fails does not stop the
+// rest.
+func TestBackfillMergeQueuePostsOnlyOnLiveHeads(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, queue: testMergeQueue}
+	backfiller := &fakeCheckRunBackfiller{failHead: "group-418"}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "merged-group", "group-418"}, Environment: "production", CheckName: "SchemaBot (production)"}, 7, discardLogger())
+
+	assert.Equal(t, []string{"group-412", "group-418"}, backfiller.mergeQueueCalls)
+	scope := MergeQueueCheckScope{Environment: "production", CheckName: "SchemaBot (production)"}
+	assert.Equal(t, []MergeQueueCheckScope{scope, scope}, backfiller.mergeQueueScopes, "each post carries the run's scope, so it posts only the checks the scan looked for")
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
+		{HeadSHA: "merged-group", Outcome: mergeQueueHeadGoneOutcome},
+		{HeadSHA: "group-418", Error: "create check run: 502 Bad Gateway"},
+	}, results)
+}
+
+// If the queue cannot be listed, no head can be verified, so nothing is
+// posted and every head reports why (MG-1).
+func TestBackfillMergeQueuePostsNothingWhenTheQueueCannotBeListed(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{queueErr: errors.New("502 Bad Gateway")}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "group-418"}}, 7, discardLogger())
+
+	assert.Empty(t, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Error: "list merge queue to verify this head: 502 Bad Gateway"},
+		{HeadSHA: "group-418", Error: "list merge queue to verify this head: 502 Bad Gateway"},
+	}, results)
+}
+
+// A gh-readonly-queue/ branch proves only that a branch points at the commit,
+// not that the merge queue made it. A head that is also an open PR's head is
+// refused, since the passing check would pass that PR's own required check,
+// and a head that cannot be checked gets nothing either (MG-1).
+func TestBackfillMergeQueueRefusesAnOpenPRsHead(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{
+		fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{5000}, limit: 5000},
+		queue:             testMergeQueue,
+		prHeads:           map[string]int{"group-418": 418},
+	}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "group-418"}}, 7, discardLogger())
+
+	assert.Equal(t, []string{"group-412"}, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
+		{HeadSHA: "group-418", Error: "refused: this commit is also the head of open PR #418, and a passing merge queue check would pass that PR's required check"},
+	}, results)
+
+	failing := &fakeMergeQueueSynthesizeClient{
+		fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{5000}, limit: 5000},
+		queue:             testMergeQueue,
+		prHeadErr:         errors.New("502 Bad Gateway"),
+	}
+	backfiller = &fakeCheckRunBackfiller{}
+	results = backfillMergeQueueWithinBudget(t.Context(), failing, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412"}}, 7, discardLogger())
+
+	assert.Empty(t, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Error: "check whether this head is an open PR's head: 502 Bad Gateway"},
+	}, results)
+}
+
+// Merge queue heads stop at the budget floor like PRs do, and the ones not
+// started come back marked RateLimited for the caller to resend.
+func TestBackfillMergeQueueStopsAtTheFloor(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeMergeQueueSynthesizeClient{fakeCoreRateLimit: fakeCoreRateLimit{remaining: []int{3000, 900}, limit: 5000}, queue: testMergeQueue}
+	backfiller := &fakeCheckRunBackfiller{}
+
+	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "group-418"}, RateLimitFloorPercent: 20}, 7, discardLogger())
+
+	assert.Equal(t, []string{"group-412"}, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{
+		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
+		{HeadSHA: "group-418", Outcome: "not started: GitHub budget is below 20% (900 of 5000 requests left)", RateLimited: true},
+	}, results)
+}
+
+// A repository with Check Run publishing turned off skips its merge queue
+// heads the same way it skips its PRs, without touching GitHub.
+func TestExecuteChecksSynthesizeSkipsMergeQueueWithChecksDisabled(t *testing.T) {
+	t.Parallel()
+
+	checksOff := false
+	backfiller := &fakeCheckRunBackfiller{}
+
+	response, err := executeChecksSynthesize(t.Context(), checksScanTestConfig(RepoConfig{GitHubApp: "main", EnableChecks: &checksOff}), backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412"}}, discardLogger())
+	require.NoError(t, err)
+	assert.Empty(t, backfiller.mergeQueueCalls)
+	assert.Equal(t, []ChecksMergeQueueResult{{HeadSHA: "group-412", Outcome: checksDisabledSkipOutcome}}, response.MergeQueue)
+	assert.Empty(t, response.Results)
 }

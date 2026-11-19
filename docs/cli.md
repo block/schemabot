@@ -1131,6 +1131,35 @@ below `--rate-limit-floor` (20% by default), it stops the batch and returns
 the PRs it did not start. The command waits for the budget to reset and sends
 them again, so live webhook traffic keeps its headroom.
 
+A blocked merge queue holds every PR queued behind it, so a sweep of a
+repository also reads its merge queue. A merge group missing its SchemaBot
+check gets the same passing check the `merge_group` webhook posts, before
+any PR's check is recreated. The server lists the queue again first and
+posts only on groups it still holds. It posts only the checks in the run's
+`-e` and `--check-name` that the group is missing, and leaves the group's
+existing checks as they are:
+
+```console
+$ schemabot checks backfill acme/store -e production
+Scanned 1 open PRs and 3 queued merge groups in acme/store for SchemaBot (production).
+2 merge groups are missing SchemaBot Check Runs, blocking the PRs queued behind them:
+MERGE GROUP                             BASE  MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/431  main  SchemaBot (production)  posted passing merge queue check
+https://github.com/acme/store/pull/436  main  SchemaBot (production)  skipped: no longer in the merge queue
+
+PR                                      MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/418  SchemaBot (production)  created 1 Check Run
+```
+
+A scan of named PRs (`--pr`) leaves the merge queue out. If the server
+cannot read a repository's merge queue, because it is older or because the
+read failed, the backfill still recreates the PRs' checks. The report names
+the repositories whose queue went unchecked, and the run exits nonzero,
+since an unchecked queue may still be blocked. A request to post merge queue
+checks that fails does not stop the sweep either: the PRs' checks are still
+recreated, the groups in that request are reported as failed, and the run
+exits nonzero.
+
 `--skip-repo` leaves repositories out of an `--all-repos` sweep, for example
 one you have already backfilled by hand. Separate names with commas or repeat
 the flag. A name the server does not declare stops the sweep, so a typo

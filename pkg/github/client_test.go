@@ -806,3 +806,191 @@ func writeGitHubSecondaryRateLimitError(t *testing.T, w http.ResponseWriter, sta
 		DocumentationURL: "https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api#about-secondary-rate-limits",
 	}))
 }
+
+// serveMergeQueueEntries serves GitHub's merge queue GraphQL query: the
+// entry head commits of each base branch's queue, one page per call, so a
+// test can check that every page is read. A branch absent from the map has no
+// merge queue. It returns the branches each request asked for, in order.
+func serveMergeQueueEntries(t *testing.T, mux *http.ServeMux, pagesByBranch map[string][][]string) *[]string {
+	t.Helper()
+	var asked []string
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		assert.Contains(t, body.Query, "mergeQueue(branch: $branch)")
+		assert.Equal(t, "octocat", body.Variables["owner"])
+		assert.Equal(t, "hello-world", body.Variables["name"])
+		branch, _ := body.Variables["branch"].(string)
+		asked = append(asked, branch)
+		pages, ok := pagesByBranch[branch]
+		if !ok {
+			_, err := w.Write([]byte(`{"data":{"repository":{"mergeQueue":null}}}`))
+			require.NoError(t, err)
+			return
+		}
+		page := 0
+		if after, _ := body.Variables["after"].(string); after != "" {
+			page, _ = strconv.Atoi(after)
+		}
+		nodes := make([]map[string]any, 0, len(pages[page]))
+		for _, oid := range pages[page] {
+			nodes = append(nodes, map[string]any{"headCommit": map[string]string{"oid": oid}})
+		}
+		hasNext := page+1 < len(pages)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"mergeQueue": map[string]any{
+			"entries": map[string]any{"nodes": nodes, "pageInfo": map[string]any{"hasNextPage": hasNext, "endCursor": strconv.Itoa(page + 1)}},
+		}}}}))
+	})
+	return &asked
+}
+
+// The queue branches are listed in one request for every base branch, and
+// each group's base branch and PR come from its branch name, including a base
+// branch whose own name contains slashes. Each base branch's merge queue is
+// read once, every page of it, to confirm the groups.
+func TestListMergeQueueHeadsReadsEveryMergeGroup(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	requests := 0
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/matching-refs/heads/gh-readonly-queue/", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.Reference{
+			{Ref: new("refs/heads/gh-readonly-queue/main/pr-412-0a1b2c3d"), Object: &gh.GitObject{SHA: new("group-412")}},
+			{Ref: new("refs/heads/gh-readonly-queue/main/pr-415-9f8e7d6c"), Object: &gh.GitObject{SHA: new("group-415")}},
+			{Ref: new("refs/heads/gh-readonly-queue/release/2026-11/pr-418-4e5f6a7b"), Object: &gh.GitObject{SHA: new("group-418")}},
+		}))
+	})
+	asked := serveMergeQueueEntries(t, mux, map[string][][]string{
+		"main":            {{"group-412"}, {"group-415"}},
+		"release/2026-11": {{"group-418"}},
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	heads, err := ic.ListMergeQueueHeads(t.Context(), "octocat/hello-world")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests)
+	assert.Equal(t, []string{"main", "main", "release/2026-11"}, *asked, "each base branch's queue is read once, every page of it")
+	assert.Equal(t, []MergeQueueHead{
+		{Ref: "gh-readonly-queue/main/pr-412-0a1b2c3d", BaseRef: "main", PR: 412, HeadSHA: "group-412"},
+		{Ref: "gh-readonly-queue/main/pr-415-9f8e7d6c", BaseRef: "main", PR: 415, HeadSHA: "group-415"},
+		{Ref: "gh-readonly-queue/release/2026-11/pr-418-4e5f6a7b", BaseRef: "release/2026-11", PR: 418, HeadSHA: "group-418"},
+	}, heads)
+}
+
+// Anyone who can push a branch can name it gh-readonly-queue/..., and a
+// passing check on such a commit would pass whatever else points at it. So a
+// branch counts as a merge group only when GitHub's merge queue for its base
+// branch has an entry headed at the branch's commit. A branch the queue does
+// not list, or whose name does not say its base branch, is left out.
+func TestListMergeQueueHeadsLeavesOutBranchesTheQueueDoesNotList(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/matching-refs/heads/gh-readonly-queue/", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.Reference{
+			{Ref: new("refs/heads/gh-readonly-queue/main/pr-412-0a1b2c3d"), Object: &gh.GitObject{SHA: new("group-412")}},
+			{Ref: new("refs/heads/gh-readonly-queue/main/pr-77-feedface"), Object: &gh.GitObject{SHA: new("pushed-by-hand")}},
+			{Ref: new("refs/heads/gh-readonly-queue/no-pr-segment"), Object: &gh.GitObject{SHA: new("unparsed")}},
+		}))
+	})
+	asked := serveMergeQueueEntries(t, mux, map[string][][]string{"main": {{"group-412"}}})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	heads, err := ic.ListMergeQueueHeads(t.Context(), "octocat/hello-world")
+
+	require.NoError(t, err)
+	assert.Equal(t, []MergeQueueHead{
+		{Ref: "gh-readonly-queue/main/pr-412-0a1b2c3d", BaseRef: "main", PR: 412, HeadSHA: "group-412"},
+	}, heads)
+	assert.Equal(t, []string{"main"}, *asked, "a branch with no base branch in its name asks no queue")
+}
+
+// A base branch with queue branches but no merge queue GitHub will return, as
+// when the App cannot read merge queues, is an error rather than an empty
+// queue, so the caller reports the queue as unread instead of clean.
+func TestListMergeQueueHeadsFailsWhenTheQueueCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/matching-refs/heads/gh-readonly-queue/", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.Reference{
+			{Ref: new("refs/heads/gh-readonly-queue/main/pr-412-0a1b2c3d"), Object: &gh.GitObject{SHA: new("group-412")}},
+		}))
+	})
+	serveMergeQueueEntries(t, mux, map[string][][]string{})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	heads, err := ic.ListMergeQueueHeads(t.Context(), "octocat/hello-world")
+
+	require.Error(t, err)
+	assert.Nil(t, heads)
+	assert.Contains(t, err.Error(), "GitHub returned no merge queue for branch main")
+}
+
+// The lookup finds an open PR whose head is the commit, ignoring PRs that only
+// contain it or are closed, and reads every page before saying there is none.
+func TestOpenPullRequestHeadedAtMatchesOnlyAnOpenPRsHead(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/group-412/pulls", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "" {
+			w.Header().Set("Link", `<https://api.github.com/repos/octocat/hello-world/commits/group-412/pulls?page=2>; rel="next"`)
+			require.NoError(t, json.NewEncoder(w).Encode([]*gh.PullRequest{
+				{Number: new(7), State: new("open"), Head: &gh.PullRequestBranch{SHA: new("later-commit")}},
+				{Number: new(8), State: new("closed"), Head: &gh.PullRequestBranch{SHA: new("group-412")}},
+			}))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.PullRequest{
+			{Number: new(9), State: new("open"), Head: &gh.PullRequestBranch{SHA: new("group-412")}},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/group-418/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.PullRequest{}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	pr, err := ic.OpenPullRequestHeadedAt(t.Context(), "octocat/hello-world", "group-412")
+	require.NoError(t, err)
+	assert.Equal(t, 9, pr)
+
+	pr, err = ic.OpenPullRequestHeadedAt(t.Context(), "octocat/hello-world", "group-418")
+	require.NoError(t, err)
+	assert.Zero(t, pr)
+}
+
+// A merge group branch whose name does not follow the pr-<n>-<sha> shape
+// leaves the PR unknown, and the base branch too when no PR segment is found.
+func TestMergeQueueHeadFromUnexpectedBranchName(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, MergeQueueHead{Ref: "gh-readonly-queue/main/group-7", HeadSHA: "sha7"},
+		mergeQueueHeadFrom("heads/gh-readonly-queue/main/group-7", "sha7"))
+	assert.Equal(t, MergeQueueHead{Ref: "gh-readonly-queue/main/pr-x-1a2b", BaseRef: "main", HeadSHA: "sha8"},
+		mergeQueueHeadFrom("heads/gh-readonly-queue/main/pr-x-1a2b", "sha8"))
+}
+
+// A failed listing is an error, never an empty queue, so a caller cannot
+// mistake a GitHub failure for a queue with nothing blocked in it.
+func TestListMergeQueueHeadsReturnsListingFailure(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/matching-refs/heads/gh-readonly-queue/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		require.NoError(t, json.NewEncoder(w).Encode(gh.ErrorResponse{Message: "Resource not accessible by integration"}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	heads, err := ic.ListMergeQueueHeads(t.Context(), "octocat/hello-world")
+
+	require.Error(t, err)
+	assert.Nil(t, heads)
+	assert.Contains(t, err.Error(), "list merge queue refs for octocat/hello-world")
+}
