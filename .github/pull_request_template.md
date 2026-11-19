@@ -4,7 +4,9 @@ Short sentences, one physical line per paragraph (GitHub turns a newline
 inside a paragraph into a line break). No test plans or checklists: CI
 reports the tests. This is a public repo, so leave out internal names,
 hosts, environments, and incident details. Delete these comments and any
-section that does not apply. AGENTS.md (Git section) has the full rules.
+section that does not apply, except Upgrade notes, which always stays. A
+change that weakens or removes an invariant says so above Why, before
+anything else. AGENTS.md (Git section) has the full rules.
 -->
 
 ## Why
@@ -60,7 +62,8 @@ not fenced; keep terminal output fenced.
 Blast radius in one or two sentences, and what an operator would see if it
 went wrong. Name every invariant the change touches by ID (docs/invariants.md)
 and say whether it upholds, extends, establishes, or weakens it. A change
-that weakens one says so here, first, with the reason.
+that weakens or removes one also says so at the top of the summary, above
+Why, with the reason.
 -->
 
 ## Upgrade notes
@@ -69,7 +72,8 @@ that weakens one says so here, first, with the reason.
 Anything an operator must do before or after upgrading: config keys added,
 removed, or with a new default; new GitHub App permissions and the config key
 that needs each; deploy ordering; storage schema changes. The release notes
-copy this. Write "None" when the change asks nothing of operators.
+copy this. Always keep this section: write "None" when the change asks
+nothing of operators, so the release notes can say so.
 -->
 
 <!-- Agents: end with your disclosure line, after everything else. -->
