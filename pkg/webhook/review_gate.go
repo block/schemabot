@@ -656,6 +656,10 @@ type reviewGatePolicy struct {
 	OperatorTeams      []string
 	OperatorUsers      []string
 	CodeownerReviewers map[string]struct{}
+	// IsCommandApp reports whether a reviewer is an App the database lists in
+	// command_apps. Such an App may run commands, but its approval never
+	// counts, even if its login is also configured as a reviewer.
+	IsCommandApp func(reviewer string) bool
 	// IncludeCodeowners records that CODEOWNERS was consulted, so an empty
 	// reviewer set can name CODEOWNERS as the source that contributed none.
 	IncludeCodeowners bool
@@ -670,6 +674,9 @@ type reviewGatePolicy struct {
 }
 
 func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.InstallationClient, reviewer string) (bool, string, error) {
+	if p.IsCommandApp != nil && p.IsCommandApp(reviewer) {
+		return false, "", nil
+	}
 	if len(p.AdminTeams) > 0 {
 		matched, principal, err := actorInAnyTeam(ctx, client, p.AdminTeams, reviewer)
 		if err != nil {
@@ -725,6 +732,9 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 		RepoAdminTeams:     repoAdminTeams,
 		RepoAdminUsers:     repoAdminUsers,
 		CodeownerReviewers: make(map[string]struct{}),
+		IsCommandApp: func(reviewer string) bool {
+			return config.IsCommandApp(repo, database, reviewer)
+		},
 	}
 	appendOperatorReviewers := func(values ...[]string) {
 		for _, group := range values {

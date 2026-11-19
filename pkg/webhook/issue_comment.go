@@ -144,13 +144,15 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		requestedBy = payload.Comment.User.Login
 	}
 
-	// Ignore comments from bots to prevent infinite loops. The one exception is
-	// a trusted sibling SchemaBot deployment's comment on a repo this
-	// deployment leads: it is consumed as an aggregate re-fold nudge — never
-	// parsed as a command — because participants comment at exactly the moments
-	// their Check Runs change, and GitHub delivers check_run events only to the
-	// App that created the check.
-	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
+	// Ignore comments from bots to prevent infinite loops. There are two
+	// exceptions. An App listed in command_apps has its comments parsed as
+	// commands, authorized per database like a person's. A trusted sibling
+	// SchemaBot deployment's comment on a repo this deployment leads is
+	// consumed as an aggregate re-fold nudge — never parsed as a command —
+	// because participants comment at exactly the moments their Check Runs
+	// change, and GitHub delivers check_run events only to the App that
+	// created the check.
+	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" && !h.isCommandAppComment(repo, installationID, requestedBy) {
 		if h.participantCommentNudge(ctx, repo, pr, installationID, deliveryID, requestedBy) {
 			h.writeJSON(w, http.StatusOK, map[string]string{
 				"message": "participant comment triggered aggregate re-fold",
@@ -1031,7 +1033,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 		return false, nil
 	}
 	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
-	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
+	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" && !h.isDurableCommandAppComment(event, &payload) {
 		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
 			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
 		return false, nil

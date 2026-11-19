@@ -15,6 +15,7 @@ const (
 	ActorAuthReasonAllowedRepoAdminUser  = "allowed_repo_admin_user"
 	ActorAuthReasonAllowedOperatorTeam   = "allowed_operator_team"
 	ActorAuthReasonAllowedOperatorUser   = "allowed_operator_user"
+	ActorAuthReasonAllowedCommandApp     = "allowed_command_app"
 	ActorAuthReasonMissingActor          = "missing_actor"
 	ActorAuthReasonMissingServerConfig   = "missing_server_config"
 	ActorAuthReasonMissingDatabaseConfig = "missing_database_config"
@@ -163,6 +164,69 @@ func validateDatabaseActorAuthorization(database string, dbConfig DatabaseConfig
 		return err
 	}
 	return nil
+}
+
+// validateDatabaseCommandApps rejects a command_apps slug that is malformed
+// or that names a trusted sibling SchemaBot App: those Apps' comments are
+// SchemaBot's own, and running them as commands could loop.
+func (c *ServerConfig) validateDatabaseCommandApps(database string, dbConfig DatabaseConfig) error {
+	field := "databases." + database + ".command_apps"
+	if err := validateGitHubUsers(field, dbConfig.CommandApps); err != nil {
+		return err
+	}
+	trusted := c.allTrustedCheckAppSlugs()
+	for _, slug := range dbConfig.CommandApps {
+		if strings.HasSuffix(slug, "[bot]") {
+			return fmt.Errorf("%s contains %q: list the App slug, without the [bot] suffix of its login", field, slug)
+		}
+		if slices.ContainsFunc(trusted, func(t string) bool { return strings.EqualFold(t, slug) }) {
+			return fmt.Errorf("%s contains %q, which is in trusted-check-app-slugs: a SchemaBot App's comments are never commands", field, slug)
+		}
+	}
+	return nil
+}
+
+// allTrustedCheckAppSlugs returns every App's trusted-check-app-slugs.
+func (c *ServerConfig) allTrustedCheckAppSlugs() []string {
+	slugs := slices.Clone(c.GitHub.TrustedCheckAppSlugs)
+	for _, app := range c.Apps {
+		slugs = append(slugs, app.TrustedCheckAppSlugs...)
+	}
+	return slugs
+}
+
+// CommandAppSlug returns the slug of the App behind a comment author's login
+// when that App is listed in command_apps for some database that accepts
+// repo. Only such an App's comments are parsed as commands; whether it may
+// run a given command is decided per database by IsCommandApp.
+func (c *ServerConfig) CommandAppSlug(repo, login string) (string, bool) {
+	slug, ok := strings.CutSuffix(login, "[bot]")
+	if c == nil || !ok || slug == "" {
+		return "", false
+	}
+	for _, db := range c.DatabaseConfigs() {
+		if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
+			continue
+		}
+		if slices.ContainsFunc(db.CommandApps, func(s string) bool { return strings.EqualFold(s, slug) }) {
+			return slug, true
+		}
+	}
+	return "", false
+}
+
+// IsCommandApp reports whether login is the bot login of an App listed in
+// database's command_apps, and the database accepts repo.
+func (c *ServerConfig) IsCommandApp(repo, database, login string) bool {
+	slug, ok := strings.CutSuffix(login, "[bot]")
+	if c == nil || !ok || slug == "" {
+		return false
+	}
+	db := c.Database(database)
+	if db == nil || (len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo)) {
+		return false
+	}
+	return slices.ContainsFunc(db.CommandApps, func(s string) bool { return strings.EqualFold(s, slug) })
 }
 
 func validateRepoActorAuthorization(repo string, repoConfig RepoConfig) error {
