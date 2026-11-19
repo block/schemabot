@@ -160,23 +160,27 @@ func (r *githubRateLimitRecorder) record(sample GitHubRateLimitSample) {
 	}
 	key := githubRateLimitIdentity{sample.GitHubApp, sample.InstallationID, sample.Resource}
 	if previous, ok := r.snapshots[key]; ok {
-		if sample.ResetAt.Before(previous.ResetAt) {
-			slog.Debug("Ignoring older GitHub quota window", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
+		if !sample.ResetAt.Equal(previous.ResetAt) {
+			if !supersedesGitHubQuotaWindow(previous, sample) {
+				slog.Debug("Ignoring GitHub quota window from an earlier response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", sample.ResetAt, "current_reset_at", previous.ResetAt)
+				return
+			}
+			if sample.ResetAt.Before(previous.ResetAt) {
+				slog.Info("GitHub reported an earlier quota reset than the last response; following the newer response", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "reset_at", sample.ResetAt, "previous_reset_at", previous.ResetAt, "remaining", sample.Remaining, "previous_remaining", previous.Remaining)
+			}
+			r.snapshots[key] = sample
 			return
 		}
-		// Within one window, depletion takes precedence over receipt order.
-		// Keep the lower observation's original timestamp so recording it late
-		// cannot extend its export lifetime.
-		if sample.ResetAt.Equal(previous.ResetAt) {
-			if sample.Remaining > previous.Remaining {
-				slog.Debug("Ignoring out-of-order GitHub quota allowance", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
-				return
-			}
-			if sample.Remaining == previous.Remaining && !sample.ObservedAt.After(previous.ObservedAt) {
-				slog.Debug("Ignoring older identical GitHub quota observation", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID)
-				return
-			}
+		merged, changed := sameWindowGitHubRateLimitSnapshot(previous, sample)
+		if !changed {
+			slog.Debug("Ignoring GitHub quota observation that is neither lower nor newer", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource)
+			return
 		}
+		if merged.Remaining < sample.Remaining {
+			slog.Debug("Keeping lower GitHub quota allowance from earlier in the window", "github_app", sample.GitHubApp, "installation_id", sample.InstallationID, "resource", sample.Resource, "remaining", merged.Remaining, "reported_remaining", sample.Remaining)
+		}
+		r.snapshots[key] = merged
+		return
 	}
 	r.snapshots[key] = sample
 }
@@ -239,6 +243,45 @@ func SetGitHubQuotaProbeTargets(appID int64, githubApp string, installations []i
 		unresolved:    unresolved,
 		reportedAt:    recorder.now(),
 	}
+}
+
+// supersedesGitHubQuotaWindow reports whether sample, which reports a different
+// quota window than previous, replaces it. The response received most recently
+// says which window is current, whichever way its reset time moved: GitHub can
+// report one reset time and then an earlier one for the rest of the window, and
+// holding on to the first would stop the installation's budget from being
+// refreshed until it ages out. A response received earlier is stale. Between
+// responses received at the same instant, the later window wins.
+func supersedesGitHubQuotaWindow(previous, sample GitHubRateLimitSample) bool {
+	switch {
+	case sample.ObservedAt.After(previous.ObservedAt):
+		return true
+	case sample.ObservedAt.Equal(previous.ObservedAt):
+		return sample.ResetAt.After(previous.ResetAt)
+	default:
+		return false
+	}
+}
+
+// sameWindowGitHubRateLimitSnapshot combines two observations of one quota
+// window. Depletion takes precedence over receipt order, so the lower
+// remaining is kept even when GitHub later reports more. Freshness follows the
+// later receipt, since either response proves the installation was observed
+// at its receipt time: an installation read every minute never ages out, and
+// a response recorded late cannot extend export lifetime past the newest
+// receipt. changed reports whether the result differs from previous.
+func sameWindowGitHubRateLimitSnapshot(previous, sample GitHubRateLimitSample) (merged GitHubRateLimitSample, changed bool) {
+	merged = previous
+	if sample.Remaining < previous.Remaining {
+		merged = sample
+		changed = true
+	}
+	merged.ObservedAt = previous.ObservedAt
+	if sample.ObservedAt.After(previous.ObservedAt) {
+		merged.ObservedAt = sample.ObservedAt
+		changed = true
+	}
+	return merged, changed
 }
 
 func validGitHubRateLimitSnapshot(sample GitHubRateLimitSample) bool {

@@ -113,20 +113,29 @@ func TestGitHubQuotaSnapshotOrderingAndIdentity(t *testing.T) {
 	delayed.ObservedAt = now
 	delayed.Remaining = 6000
 	RecordGitHubRateLimit(t.Context(), delayed)
-	assert.Equal(t, sample, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
+	// A higher allowance in the same window keeps the lower remaining but
+	// refreshes when the installation was observed.
+	refreshed := sample
+	refreshed.ObservedAt = delayed.ObservedAt
+	assert.Equal(t, refreshed, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
 	// A newer reset window supersedes the depleted window, even with more quota.
 	newer := delayed
 	newer.ResetAt = sample.ResetAt.Add(time.Hour)
 	RecordGitHubRateLimit(t.Context(), newer)
+	// The earlier window, in a response received before the newer one, is
+	// stale and cannot replace it.
 	olderWindow := sample
-	olderWindow.ObservedAt = now.Add(time.Second)
 	RecordGitHubRateLimit(t.Context(), olderWindow)
 	assert.Equal(t, newer, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
 	delayed = newer
 	delayed.ObservedAt = delayed.ObservedAt.Add(-time.Millisecond)
 	delayed.Remaining = 1000
 	RecordGitHubRateLimit(t.Context(), delayed)
-	assert.Equal(t, delayed, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
+	// A lower allowance recorded late is kept, without moving the receipt time
+	// back to its own.
+	lowered := delayed
+	lowered.ObservedAt = newer.ObservedAt
+	assert.Equal(t, lowered, recorder.snapshots[githubRateLimitIdentity{"example-app", 42, "core"}])
 	for _, change := range []func(*GitHubRateLimitSample){
 		func(s *GitHubRateLimitSample) { s.InstallationID++ },
 		func(s *GitHubRateLimitSample) { s.GitHubApp = "another-app" },
@@ -222,7 +231,8 @@ func TestGitHubQuotaInvalidResponsesDoNotRefreshAge(t *testing.T) {
 }
 
 // Concurrent responses report the same quota window. A lower allowance must
-// survive either recording order, with freshness measured from its own receipt.
+// survive either recording order, with freshness measured from the later
+// receipt and never moved backward by an older one.
 func TestGitHubQuotaSnapshotLowerAllowanceAcrossRecordingOrders(t *testing.T) {
 	for _, lowFirst := range []bool{false, true} {
 		t.Run(fmt.Sprintf("low_first_%t", lowFirst), func(t *testing.T) {
@@ -240,7 +250,9 @@ func TestGitHubQuotaSnapshotLowerAllowanceAcrossRecordingOrders(t *testing.T) {
 				RecordGitHubRateLimit(t.Context(), low)
 			}
 			key := githubRateLimitIdentity{"example-app", 42, "core"}
-			assert.Equal(t, low, recorder.snapshots[key])
+			want := low
+			want.ObservedAt = high.ObservedAt
+			assert.Equal(t, want, recorder.snapshots[key])
 			lines := snapshotLines(scrape(), "schemabot_github_rate_limit_remaining")
 			require.Len(t, lines, 1)
 			assert.True(t, strings.HasSuffix(lines[0], " 1999"), lines[0])
@@ -248,8 +260,8 @@ func TestGitHubQuotaSnapshotLowerAllowanceAcrossRecordingOrders(t *testing.T) {
 			olderEqual := low
 			olderEqual.ObservedAt = received.Add(-time.Second)
 			RecordGitHubRateLimit(t.Context(), olderEqual)
-			assert.Equal(t, low, recorder.snapshots[key])
-			now = received.Add(120*time.Second + time.Nanosecond)
+			assert.Equal(t, want, recorder.snapshots[key])
+			now = high.ObservedAt.Add(120*time.Second + time.Nanosecond)
 			body := scrape()
 			assert.Empty(t, snapshotLines(body, "schemabot_github_rate_limit_remaining"))
 			ages := snapshotLines(body, "schemabot_github_rate_limit_observation_age_seconds")
@@ -362,4 +374,76 @@ func TestGitHubQuotaUnobservedInstallationsSumAppsSharingALabel(t *testing.T) {
 	lines := snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
 	require.Len(t, lines, 1)
 	assert.True(t, strings.HasSuffix(lines[0], " 2"), lines[0])
+}
+
+// GitHub can report more remaining later in the same window. An installation
+// the probe reads every minute stays observed: the snapshot keeps the lower
+// remaining, since depletion takes precedence, but each reading refreshes when
+// the installation was last observed, so the budget does not age out while
+// every read succeeds.
+func TestGitHubQuotaSnapshotHigherReadingInWindowKeepsInstallationObserved(t *testing.T) {
+	recorder, scrape := newQuotaRegistry(t)
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := start
+	recorder.now = func() time.Time { return now }
+	key := githubRateLimitIdentity{"example-app", 42, "core"}
+
+	RecordGitHubRateLimit(t.Context(), quotaSample(start, 14995))
+	higher := quotaSample(start.Add(60*time.Second), 14999)
+	now = higher.ObservedAt
+	RecordGitHubRateLimit(t.Context(), higher)
+	assert.Equal(t, int64(14995), recorder.snapshots[key].Remaining)
+	assert.Equal(t, higher.ObservedAt, recorder.snapshots[key].ObservedAt)
+
+	// Past the export age of the first reading, but not of the second.
+	now = start.Add(150 * time.Second)
+	body := scrape()
+	lines := snapshotLines(body, "schemabot_github_rate_limit_remaining")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 14995"), lines[0])
+	ages := snapshotLines(body, "schemabot_github_rate_limit_observation_age_seconds")
+	require.Len(t, ages, 1)
+	assert.True(t, strings.HasSuffix(ages[0], " 90"), ages[0])
+
+	// Without another reading, the budget ages out from the later one.
+	now = higher.ObservedAt.Add(GitHubRateLimitSnapshotMaxAge + time.Nanosecond)
+	assert.Empty(t, snapshotLines(scrape(), "schemabot_github_rate_limit_remaining"))
+}
+
+// GitHub can report a reset time later than the one it reports for the rest of
+// the window: one reading shows a nearly full budget resetting in an hour,
+// and every reading after it shows the real, lower budget resetting sooner.
+// The installation stays observed on those later readings and exports the
+// lower budget, rather than holding the one outlier until it ages out and
+// leaving the installation with no budget at all until the real window resets.
+func TestGitHubQuotaSnapshotFollowsNewerResponseWithEarlierReset(t *testing.T) {
+	recorder, scrape := newQuotaRegistry(t)
+	start := time.Date(2026, 1, 1, 0, 50, 0, 0, time.UTC)
+	now := start
+	recorder.now = func() time.Time { return now }
+	key := githubRateLimitIdentity{"example-app", 42, "core"}
+
+	outlier := quotaSample(start, 14996)
+	outlier.ResetAt = start.Add(time.Hour)
+	RecordGitHubRateLimit(t.Context(), outlier)
+
+	var last GitHubRateLimitSample
+	for i, remaining := range []int64{14745, 14736, 14720} {
+		last = quotaSample(start.Add(time.Duration(i+1)*time.Minute), remaining)
+		require.True(t, last.ResetAt.Before(outlier.ResetAt))
+		now = last.ObservedAt
+		RecordGitHubRateLimit(t.Context(), last)
+	}
+	assert.Equal(t, last, recorder.snapshots[key])
+
+	// Past the export age of the outlier, the newest reading is exported.
+	now = last.ObservedAt.Add(30 * time.Second)
+	require.True(t, now.After(outlier.ObservedAt.Add(GitHubRateLimitSnapshotMaxAge)))
+	body := scrape()
+	lines := snapshotLines(body, "schemabot_github_rate_limit_remaining")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 14720"), lines[0])
+	ages := snapshotLines(body, "schemabot_github_rate_limit_observation_age_seconds")
+	require.Len(t, ages, 1)
+	assert.True(t, strings.HasSuffix(ages[0], " 30"), ages[0])
 }
