@@ -1458,6 +1458,9 @@ type backfillServer struct {
 	// reports them when the request asks for the merge queue.
 	queue        []apitypes.MissingMergeQueueCheck
 	queueScanned int
+	// queueError, when set, is the error the scan reports for a merge queue
+	// it failed to read.
+	queueError string
 }
 
 func (s *backfillServer) scanRequests() []apitypes.ChecksScanRequest {
@@ -1484,12 +1487,13 @@ func newBackfillServer(t *testing.T, missing []int, synthesize func(call int, re
 			server.mu.Lock()
 			server.scans = append(server.scans, req)
 			supports := server.supports
-			queue, queueScanned := server.queue, server.queueScanned
+			queue, queueScanned, queueError := server.queue, server.queueScanned, server.queueError
 			server.mu.Unlock()
 			response := apitypes.ChecksScanResponse{Repo: "octo/repo", CheckNames: []string{"SchemaBot (production)"}, Scanned: len(missing)}
 			if req.MergeQueue && (supports == nil || supports.MergeQueue) {
 				response.MergeQueueScanned = queueScanned
 				response.MergeQueue = queue
+				response.MergeQueueError = queueError
 			}
 			for _, pr := range missing {
 				response.Missing = append(response.Missing, apitypes.MissingCheckPR{
@@ -1719,7 +1723,7 @@ func TestChecksBackfillRefusesBehaviorsTheServerDoesNotConfirm(t *testing.T) {
 	output := captureStdout(func() {
 		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
 	})
-	assert.EqualError(t, runErr, "checks backfill left 1 PR with missing Check Runs needing attention")
+	assert.EqualError(t, runErr, "checks backfill left 1 PR with missing Check Runs and 1 repository with an unchecked merge queue needing attention")
 	assert.Contains(t, output, "https://github.com/octo/repo/pull/7")
 }
 
@@ -1920,7 +1924,8 @@ func TestChecksBackfillOfNamedPRsLeavesOutTheMergeQueue(t *testing.T) {
 
 // A server that cannot read the merge queue still recreates the PRs' checks.
 // Reading the queue only adds findings, so the sweep goes on, and the report
-// says which queues went unread and what to do about it.
+// says which queues went unread and what to do about it. The run exits
+// nonzero, because an unread queue may be blocked.
 func TestChecksBackfillSaysWhenTheServerCannotReadTheMergeQueue(t *testing.T) {
 	server := newBackfillServer(t, []int{7}, createdForEach)
 	server.supports = &apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}
@@ -1932,8 +1937,27 @@ func TestChecksBackfillSaysWhenTheServerCannotReadTheMergeQueue(t *testing.T) {
 		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
 	})
 
-	require.NoError(t, runErr)
+	require.EqualError(t, runErr, "checks backfill left 1 repository with an unchecked merge queue needing attention")
 	assert.Contains(t, output, "The server cannot read the merge queue, so queued merge groups in octo/repo were not checked. Upgrade the server to check them.\n")
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/7", "SchemaBot (production)", "created 1 Check Run"},
+		renderedCells(lineContaining(t, output, "/pull/7 ")))
+}
+
+// A merge queue the server failed to read does not stop the sweep: the PRs'
+// checks are still recreated, the report names the repository and the error,
+// and the run exits nonzero because the unread queue may be blocked.
+func TestChecksBackfillReportsAMergeQueueTheServerFailedToRead(t *testing.T) {
+	server := newBackfillServer(t, []int{7}, createdForEach)
+	server.queueError = "scan merge queue of octo/repo for missing checks: 502 Bad Gateway"
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.EqualError(t, runErr, "checks backfill left 1 repository with an unchecked merge queue needing attention")
+	assert.Contains(t, output, "Could not read the merge queue of octo/repo, so its queued merge groups were not checked: scan merge queue of octo/repo for missing checks: 502 Bad Gateway. Run the backfill for octo/repo again to check them.\n")
 	assert.Equal(t, []string{"https://github.com/octo/repo/pull/7", "SchemaBot (production)", "created 1 Check Run"},
 		renderedCells(lineContaining(t, output, "/pull/7 ")))
 }

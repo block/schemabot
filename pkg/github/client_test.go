@@ -834,6 +834,39 @@ func TestListMergeQueueHeadsReadsEveryMergeGroup(t *testing.T) {
 	}, heads)
 }
 
+// The lookup finds an open PR whose head is the commit, ignoring PRs that only
+// contain it or are closed, and reads every page before saying there is none.
+func TestOpenPullRequestHeadedAtMatchesOnlyAnOpenPRsHead(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/group-412/pulls", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "" {
+			w.Header().Set("Link", `<https://api.github.com/repos/octocat/hello-world/commits/group-412/pulls?page=2>; rel="next"`)
+			require.NoError(t, json.NewEncoder(w).Encode([]*gh.PullRequest{
+				{Number: new(7), State: new("open"), Head: &gh.PullRequestBranch{SHA: new("later-commit")}},
+				{Number: new(8), State: new("closed"), Head: &gh.PullRequestBranch{SHA: new("group-412")}},
+			}))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.PullRequest{
+			{Number: new(9), State: new("open"), Head: &gh.PullRequestBranch{SHA: new("group-412")}},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/group-418/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.PullRequest{}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	pr, err := ic.OpenPullRequestHeadedAt(t.Context(), "octocat/hello-world", "group-412")
+	require.NoError(t, err)
+	assert.Equal(t, 9, pr)
+
+	pr, err = ic.OpenPullRequestHeadedAt(t.Context(), "octocat/hello-world", "group-418")
+	require.NoError(t, err)
+	assert.Zero(t, pr)
+}
+
 // A merge group branch whose name does not follow the pr-<n>-<sha> shape is
 // still a head the queue is testing; only the base branch and PR are unknown.
 func TestMergeQueueHeadFromUnexpectedBranchName(t *testing.T) {

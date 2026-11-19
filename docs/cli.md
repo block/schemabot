@@ -1151,9 +1151,11 @@ PR                                      MISSING CHECKS          OUTCOME
 https://github.com/acme/store/pull/418  SchemaBot (production)  created 1 Check Run
 ```
 
-A scan of named PRs (`--pr`) leaves the merge queue out. A server that
-cannot read the merge queue still recreates the PRs' checks, and the report
-names the repositories whose queue went unchecked.
+A scan of named PRs (`--pr`) leaves the merge queue out. If the server
+cannot read a repository's merge queue, because it is older or because the
+read failed, the backfill still recreates the PRs' checks. The report names
+the repositories whose queue went unchecked, and the run exits nonzero,
+since an unchecked queue may still be blocked.
 
 `--skip-repo` leaves repositories out of an `--all-repos` sweep, for example
 one you have already backfilled by hand. Separate names with commas or repeat

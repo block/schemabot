@@ -231,28 +231,8 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	if err := requireRepoFullName(req.Repo); err != nil {
+	if err := validateChecksSynthesizeRequest(cfg, &req); err != nil {
 		return nil, err
-	}
-	if len(req.PRs) == 0 && len(req.MergeQueueHeads) == 0 {
-		return nil, webhookOpsRequestErrorf("prs or merge_queue_heads is required")
-	}
-	if len(req.MergeQueueHeads) > checksSynthesizeMaxMergeQueueHeadsPerRequest {
-		return nil, webhookOpsRequestErrorf("at most %d merge_queue_heads per request; send the rest in follow-up requests", checksSynthesizeMaxMergeQueueHeadsPerRequest)
-	}
-	if slices.Contains(req.MergeQueueHeads, "") {
-		return nil, webhookOpsRequestErrorf("merge_queue_heads must not contain an empty commit")
-	}
-	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
-		return nil, err
-	}
-	if len(req.PRs) > checksSynthesizeMaxPRsPerRequest {
-		return nil, webhookOpsRequestErrorf("at most %d prs per request; send the rest in follow-up requests", checksSynthesizeMaxPRsPerRequest)
-	}
-	for _, pr := range req.PRs {
-		if pr <= 0 {
-			return nil, webhookOpsRequestErrorf("pr numbers must be positive; got %d", pr)
-		}
 	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -290,6 +270,37 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	}
 	response.RateLimit = gitHubRateLimitSnapshot(ctx, installationClient, logger, "checks synthesize batch")
 	return response, nil
+}
+
+// validateChecksSynthesizeRequest refuses a malformed synthesize request and
+// folds its environment the way the scan folds it, so the environment a scan
+// accepted is accepted here too and matches the configured names exactly.
+func validateChecksSynthesizeRequest(cfg *ServerConfig, req *ChecksSynthesizeRequest) error {
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return err
+	}
+	if len(req.PRs) == 0 && len(req.MergeQueueHeads) == 0 {
+		return webhookOpsRequestErrorf("prs or merge_queue_heads is required")
+	}
+	if len(req.MergeQueueHeads) > checksSynthesizeMaxMergeQueueHeadsPerRequest {
+		return webhookOpsRequestErrorf("at most %d merge_queue_heads per request; send the rest in follow-up requests", checksSynthesizeMaxMergeQueueHeadsPerRequest)
+	}
+	if slices.Contains(req.MergeQueueHeads, "") {
+		return webhookOpsRequestErrorf("merge_queue_heads must not contain an empty commit")
+	}
+	req.Environment = canonicalEnvironment(req.Environment)
+	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+		return err
+	}
+	if len(req.PRs) > checksSynthesizeMaxPRsPerRequest {
+		return webhookOpsRequestErrorf("at most %d prs per request; send the rest in follow-up requests", checksSynthesizeMaxPRsPerRequest)
+	}
+	for _, pr := range req.PRs {
+		if pr <= 0 {
+			return webhookOpsRequestErrorf("pr numbers must be positive; got %d", pr)
+		}
+	}
+	return nil
 }
 
 // coreRateLimitReader reads an installation's remaining core GitHub budget.
@@ -347,6 +358,7 @@ func backfillPRsWithinBudget(ctx context.Context, rate coreRateLimitReader, back
 type mergeQueueSynthesizeClient interface {
 	coreRateLimitReader
 	mergeQueueLister
+	OpenPullRequestHeadedAt(ctx context.Context, repo, sha string) (int, error)
 }
 
 // backfillMergeQueueWithinBudget posts the passing merge-queue check on each
@@ -358,6 +370,11 @@ type mergeQueueSynthesizeClient interface {
 // proves nothing about that, so the queue is listed again here and a head it
 // no longer holds gets nothing. If the queue cannot be listed, nothing is
 // posted (MG-1).
+//
+// A merge queue head is a commit on a gh-readonly-queue/ branch, and nothing
+// here proves the queue made that branch. A head that is also an open PR's
+// head is refused, because the passing check would pass that PR's own
+// required check too. If that cannot be checked, nothing is posted on it.
 func backfillMergeQueueWithinBudget(ctx context.Context, client mergeQueueSynthesizeClient, backfiller CheckRunBackfiller, req ChecksSynthesizeRequest, installationID int64, logger *slog.Logger) []ChecksMergeQueueResult {
 	if len(req.MergeQueueHeads) == 0 {
 		return nil
@@ -395,6 +412,10 @@ func backfillMergeQueueWithinBudget(ctx context.Context, client mergeQueueSynthe
 			}
 			return results
 		}
+		if refusal := refuseMergeQueueHeadOfOpenPR(ctx, client, req.Repo, head, logger); refusal != "" {
+			results = append(results, ChecksMergeQueueResult{HeadSHA: head, Error: refusal})
+			continue
+		}
 		outcome, err := backfiller.BackfillMergeQueueCheck(ctx, req.Repo, installationID, head, MergeQueueCheckScope{Environment: req.Environment, CheckName: req.CheckName})
 		result := ChecksMergeQueueResult{HeadSHA: head, Outcome: outcome}
 		if err != nil {
@@ -406,6 +427,24 @@ func backfillMergeQueueWithinBudget(ctx context.Context, client mergeQueueSynthe
 		results = append(results, result)
 	}
 	return results
+}
+
+// refuseMergeQueueHeadOfOpenPR returns why a passing merge queue check must
+// not be posted on head, or "" when it may be. It refuses a head that is also
+// an open PR's head, and a head it could not check.
+func refuseMergeQueueHeadOfOpenPR(ctx context.Context, client mergeQueueSynthesizeClient, repo, head string, logger *slog.Logger) string {
+	pr, err := client.OpenPullRequestHeadedAt(ctx, repo, head)
+	if err != nil {
+		logger.Warn("merge queue check backfill posting nothing on a head it could not check against open PR heads",
+			"repo", repo, "head_sha", head, "error", err)
+		return fmt.Sprintf("check whether this head is an open PR's head: %v", err)
+	}
+	if pr > 0 {
+		logger.Warn("merge queue check backfill refusing a head that is also an open PR's head; a passing merge queue check there would pass the PR's own required check",
+			"repo", repo, "head_sha", head, "pr", pr)
+		return fmt.Sprintf("refused: this commit is also the head of open PR #%d, and a passing merge queue check would pass that PR's required check", pr)
+	}
+	return ""
 }
 
 // budgetBelowFloor reports whether the installation's GitHub budget is below
@@ -687,8 +726,16 @@ func scanChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage, r
 		return nil, err
 	}
 	if scansMergeQueue(req) {
+		// The queue only adds findings, so failing to read it must not stop
+		// the PRs' recovery in this repository or the ones after it. The
+		// response says the queue went unread, and the caller counts it as
+		// needing attention rather than as clear.
 		if err := scanMergeQueueForMissingChecks(ctx, cfg, installationClient, req.Repo, scope, response, logger); err != nil {
-			return nil, err
+			logger.Warn("checks scan could not read the merge queue; the PRs on this page are still reported and the queue is reported as unchecked",
+				"repo", req.Repo, "environment", req.Environment, "check_name", req.CheckName, "error", err)
+			response.MergeQueue = nil
+			response.MergeQueueScanned = 0
+			response.MergeQueueError = err.Error()
 		}
 	}
 	response.RateLimit = gitHubRateLimitSnapshot(ctx, installationClient, logger, "checks scan page")
@@ -1326,7 +1373,8 @@ type mergeQueueScanClient interface {
 // scanMergeQueueForMissingChecks records in result each merge group whose head
 // lacks an expected SchemaBot check. Such a group holds every PR queued behind
 // it until the queue times it out. A queue that cannot be listed is an error,
-// not an empty queue, so a sweep never reports a blocked queue as clear.
+// not an empty queue, so a sweep never reports a blocked queue as clear. On an
+// error, result may hold some of the queue's groups; the caller discards them.
 //
 // An aggregate participant's checks are never required on a merge group (the
 // leader posts the required one), so its queue is not scanned: every group

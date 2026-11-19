@@ -341,6 +341,10 @@ type ChecksScanResponse struct {
 	MergeQueueScanned int `json:"merge_queue_scanned,omitempty"`
 	// MergeQueue lists the merge groups missing an expected SchemaBot check.
 	MergeQueue []MissingMergeQueueCheck `json:"merge_queue,omitempty"`
+	// MergeQueueError says why the merge queue could not be read. The PRs on
+	// this page are still reported, and MergeQueue and MergeQueueScanned are
+	// empty, so the caller can report the queue as unchecked rather than clear.
+	MergeQueueError string `json:"merge_queue_error,omitempty"`
 	// Supports names the backfill behaviors this server implements. A server
 	// that predates one ignores the request field that asks for it, so the
 	// CLI checks this before relying on a behavior rather than finding out

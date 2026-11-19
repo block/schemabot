@@ -1117,6 +1117,38 @@ func (ic *InstallationClient) ListMergeQueueHeads(ctx context.Context, repo stri
 	return heads, nil
 }
 
+// OpenPullRequestHeadedAt returns the number of an open pull request whose
+// head commit is sha, or 0 when no open pull request has that head. A passing
+// merge queue check posted on such a commit would also pass that pull
+// request's own required check, so a caller about to post one asks first.
+func (ic *InstallationClient) OpenPullRequestHeadedAt(ctx context.Context, repo, sha string) (int, error) {
+	owner, repoName := splitRepo(repo)
+	opts := &gh.ListOptions{PerPage: 100}
+	for {
+		var resp *gh.Response
+		prs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list pull requests for commit", []any{"repo", repo, "sha", sha}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+			listed, listResp, listErr := ic.client.PullRequests.ListPullRequestsWithCommit(ctx, owner, repoName, sha, opts)
+			if listErr != nil {
+				return nil, classifyGitHubAPIError(listErr)
+			}
+			resp = listResp
+			return listed, nil
+		})
+		if err != nil {
+			return 0, fmt.Errorf("list pull requests for commit %s in %s: %w", sha, repo, err)
+		}
+		for _, pr := range prs {
+			if pr.GetState() == "open" && pr.GetHead().GetSHA() == sha {
+				return pr.GetNumber(), nil
+			}
+		}
+		if resp == nil || resp.NextPage == 0 {
+			return 0, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
 // mergeQueueHeadFrom reads the base branch and PR number out of a merge group
 // branch name, heads/gh-readonly-queue/<base>/pr-<n>-<sha>. The base can itself
 // contain slashes, so the PR segment is found from the end.

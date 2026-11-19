@@ -477,7 +477,9 @@ webhook would skip. If the queue cannot be listed, it posts nothing (MG-1).
 The backfill posts only the checks in the run's `-e` and `--check-name`, and
 only those the merge group does not already carry. It leaves an existing
 check as it is, and posts nothing on a head whose existing checks it cannot
-read.
+read. It also refuses a head that is the head of an open PR, because the
+passing check would pass that PR's own required check too, and it posts
+nothing on a head it cannot check against open PRs.
 Listing the queue reads branches, which the App's Contents read permission
 already grants.
 

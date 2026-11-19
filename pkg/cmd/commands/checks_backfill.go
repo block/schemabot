@@ -308,6 +308,9 @@ type checksBackfillReport struct {
 	// MergeQueueUnsupported lists the scanned repositories whose merge queue
 	// went unread because the server does not support reading it.
 	MergeQueueUnsupported []string `json:"merge_queue_unsupported,omitempty"`
+	// MergeQueueUnread lists the scanned repositories whose merge queue the
+	// server failed to read, and why. Their PRs were still scanned.
+	MergeQueueUnread []checksMergeQueueUnread `json:"merge_queue_unread,omitempty"`
 	// interruptedScan says the interrupt landed before the scan finished, so
 	// nothing was sent for recreation and the table shows what the backfill
 	// would do rather than an outcome.
@@ -503,9 +506,12 @@ scanning:
 			reached = i + 1
 			// Reading the merge queue only adds findings, so a server that
 			// cannot read it does not stop the sweep; the report says which
-			// queues went unread.
+			// queues went unread, and the run exits nonzero for them.
 			if page == 1 && len(namedPRs) == 0 && !chunk.Supports.MergeQueue {
 				report.MergeQueueUnsupported = append(report.MergeQueueUnsupported, repo)
+			}
+			if chunk.MergeQueueError != "" {
+				report.MergeQueueUnread = append(report.MergeQueueUnread, checksMergeQueueUnread{Repo: repo, Error: chunk.MergeQueueError})
 			}
 			for _, name := range chunk.CheckNames {
 				if !checkNamesSeen[name] {
@@ -702,10 +708,17 @@ func chunkPRNumbers(prs []int, size int) [][]int {
 	return chunks
 }
 
+// checksMergeQueueUnread is a repository whose merge queue the server failed
+// to read, so its merge groups were not checked.
+type checksMergeQueueUnread struct {
+	Repo  string `json:"repo"`
+	Error string `json:"error"`
+}
+
 // checksScanMark is how much of a report existed before one repository's scan
 // began.
 type checksScanMark struct {
-	actions, stuck, scanned, checkNames, mergeQueue, mergeQueueScanned, mergeQueueUnsupported int
+	actions, stuck, scanned, checkNames, mergeQueue, mergeQueueScanned, mergeQueueUnsupported, mergeQueueUnread int
 }
 
 func (r *checksBackfillReport) mark() checksScanMark {
@@ -717,6 +730,7 @@ func (r *checksBackfillReport) mark() checksScanMark {
 		mergeQueue:            len(r.MergeQueue),
 		mergeQueueScanned:     r.MergeQueueScanned,
 		mergeQueueUnsupported: len(r.MergeQueueUnsupported),
+		mergeQueueUnread:      len(r.MergeQueueUnread),
 	}
 }
 
@@ -741,6 +755,7 @@ func (r *checksBackfillReport) rollback(m checksScanMark, checkNamesSeen map[str
 	r.MergeQueue = r.MergeQueue[:m.mergeQueue]
 	r.MergeQueueScanned = m.mergeQueueScanned
 	r.MergeQueueUnsupported = r.MergeQueueUnsupported[:m.mergeQueueUnsupported]
+	r.MergeQueueUnread = r.MergeQueueUnread[:m.mergeQueueUnread]
 	return held
 }
 
@@ -813,6 +828,10 @@ func attentionExitError(report *checksBackfillReport) error {
 	}
 	if n := len(report.Stuck); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d stuck %s", n, ui.Pluralize("Check Run", n)))
+	}
+	// An unchecked merge queue may be blocked, so the run cannot call it clear.
+	if n := len(report.MergeQueueUnsupported) + len(report.MergeQueueUnread); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s with an unchecked merge queue", n, ui.PluralizeLabel("repository", "repositories", n)))
 	}
 	// A repo the App is not installed on was never scanned, so the run cannot
 	// say it has nothing to backfill.
@@ -1249,6 +1268,11 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	}
 	if len(report.MergeQueueUnsupported) > 0 {
 		if _, err := fmt.Fprintf(w, "The server cannot read the merge queue, so queued merge groups in %s were not checked. Upgrade the server to check them.\n", strings.Join(report.MergeQueueUnsupported, ", ")); err != nil {
+			return err
+		}
+	}
+	for _, unread := range report.MergeQueueUnread {
+		if _, err := fmt.Fprintf(w, "Could not read the merge queue of %s, so its queued merge groups were not checked: %s. Run the backfill for %s again to check them.\n", unread.Repo, unread.Error, unread.Repo); err != nil {
 			return err
 		}
 	}
