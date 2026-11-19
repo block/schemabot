@@ -19,12 +19,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/spirit/pkg/utils"
+
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
-	pushBurstQuietPeriod = 2 * time.Second
+	// pushBurstQuietPeriod leaves room for three pushes a second apart, plus a
+	// full second, before the first push becomes claimable, even after the
+	// inbox stores its not-before time to the second.
+	pushBurstQuietPeriod = 4 * time.Second
 	pushBurstDriver      = "burst-test/webhook-driver-0"
 	// pushBurstPullRequestRead is the request the driver makes to confirm a
 	// claimed head against the live pull request.
@@ -49,7 +54,7 @@ func newPushBurstFixture(t *testing.T, dbName, liveHead string) *pushBurstFixtur
 	// earlier tests would otherwise be claimed ahead of this test's pushes.
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	_, err = schemabotDB.ExecContext(t.Context(), "DELETE FROM webhook_events")
 	require.NoError(t, err)
 
@@ -211,6 +216,48 @@ func TestE2EDurableDispatchKeepsTheCurrentHeadWhenAnOlderPushArrivesLast(t *test
 
 	before := f.requests.snapshot()
 	assert.Equal(t, storage.WebhookEventCompleted, f.drive(t, "cycle-push-away-arriving-late"))
+	assert.Equal(t, []string{pushBurstPullRequestRead}, slices.Sorted(maps.Keys(f.requestsSince(before))),
+		"the late delivery may read the pull request, and must publish nothing on a head the pull request has left")
+}
+
+// A PR on head Z is pushed to A, then to B, then back to A, and the webhook of
+// the push from A to B arrives last. All three deliveries wait in the inbox.
+// Both deliveries that carry A are kept and planned, because the live pull
+// request shows A is still its head; the first publishes A's plan and Check
+// Run. The late delivery's head is no longer the PR's head, so it publishes
+// nothing. The current head is never left without a plan and a Check Run.
+func TestE2EDurableDispatchKeepsTheCurrentHeadThroughAReplayedPushCycle(t *testing.T) {
+	const (
+		dbName       = "webhook_push_replay"
+		startHead    = "replay-head-z"
+		currentHead  = "replay-head-a"
+		replacedHead = "replay-head-b"
+	)
+	f := newPushBurstFixture(t, dbName, currentHead)
+	f.push(t, "replay-push-z-to-a", startHead, currentHead)
+	waitBetweenPushes()
+	f.push(t, "replay-push-b-to-a", replacedHead, currentHead)
+	waitBetweenPushes()
+	f.push(t, "replay-push-a-to-b-arriving-late", currentHead, replacedHead)
+	f.requireNothingClaimable(t)
+
+	assert.Equal(t, storage.WebhookEventCompleted, f.drive(t, "replay-push-z-to-a"),
+		"a delivery that carries the current head must be planned, even with later deliveries behind it")
+	f.requirePlanOf(t, dbName, currentHead)
+
+	assert.Equal(t, storage.WebhookEventCompleted, f.drive(t, "replay-push-b-to-a"),
+		"the later delivery that carries the current head must be planned, not superseded by the late delivery")
+	// The Check Run already on A is refreshed rather than recreated, which
+	// this fake GitHub does not serve, so only the plan comment is awaited.
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatalf("timed out waiting for the second plan comment of %s", currentHead)
+	}
+
+	before := f.requests.snapshot()
+	assert.Equal(t, storage.WebhookEventCompleted, f.drive(t, "replay-push-a-to-b-arriving-late"))
 	assert.Equal(t, []string{pushBurstPullRequestRead}, slices.Sorted(maps.Keys(f.requestsSince(before))),
 		"the late delivery may read the pull request, and must publish nothing on a head the pull request has left")
 }

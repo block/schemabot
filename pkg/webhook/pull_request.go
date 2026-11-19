@@ -111,7 +111,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			// Enqueue and ACK fast; a leased driver runs cleanup with retries so
 			// a process restart mid-cleanup cannot drop the delivery and leave a
 			// lock held or stale check state behind.
-			inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+			inserted, _, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
 			if err != nil {
 				h.logger.Error("failed to enqueue durable PR close cleanup",
 					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number,
@@ -189,7 +189,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		// rather than silently, but GitHub never auto-retries, so the delivery
 		// stays lost until an operator hits "Redeliver" (which re-opens a
 		// terminal row — failed or completed) or a new push arrives.
-		inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+		inserted, notBefore, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
 		if err != nil {
 			h.logger.Error("failed to enqueue durable pull_request auto-plan",
 				"action", payload.Action,
@@ -214,13 +214,24 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan already queued"})
 			return
 		}
-		h.logger.Info("durable pull_request auto-plan queued",
-			"action", payload.Action,
-			"repo", repo,
-			"pr", pr,
-			"head_sha", headSHA,
-			"delivery_id", deliveryID,
-		)
+		if notBefore != nil {
+			h.logger.Info("durable pull_request auto-plan queued; no driver will claim it until the synchronize quiet period has passed",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+				"not_before", notBefore.UTC(),
+			)
+		} else {
+			h.logger.Info("durable pull_request auto-plan queued",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+			)
+		}
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan queued"})
 		return
 	}

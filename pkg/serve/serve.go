@@ -1657,13 +1657,19 @@ func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookbac
 	return maxPages, lookback
 }
 
+// maxSynchronizeQuietPeriod caps WEBHOOK_SYNCHRONIZE_QUIET_PERIOD. Every push
+// waits this long for its plan and its Check Run, so a value such as 15m
+// typed for 15s would hold every PR's required check back for a quarter of
+// an hour.
+const maxSynchronizeQuietPeriod = 2 * time.Minute
+
 // synchronizeQuietPeriodOptions returns the handler option that defers durable
 // synchronize deliveries by WEBHOOK_SYNCHRONIZE_QUIET_PERIOD (a Go duration
 // such as 15s), so a burst of pushes to one PR plans only its newest head.
 // Unset keeps webhook.DefaultSynchronizeQuietPeriod; 0 turns the deferral
 // off and plans every push as soon as it arrives. Like the scan bounds, this
-// is tuning with no safe direction to fail in, so a malformed or negative
-// value is logged and ignored and the default stays in force.
+// is tuning with no safe direction to fail in, so a malformed, negative, or
+// above-ceiling value is logged and ignored and the default stays in force.
 func synchronizeQuietPeriodOptions(logger *slog.Logger) []webhook.HandlerOption {
 	period := parseSynchronizeQuietPeriod(logger)
 	if period == 0 {
@@ -1691,6 +1697,10 @@ func parseSynchronizeQuietPeriod(logger *slog.Logger) time.Duration {
 	case parsed < 0:
 		logger.Error("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD must not be negative; the default synchronize quiet period stays in force",
 			"value", value, "default", webhook.DefaultSynchronizeQuietPeriod)
+		return webhook.DefaultSynchronizeQuietPeriod
+	case parsed > maxSynchronizeQuietPeriod:
+		logger.Error("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD is above its ceiling; the default synchronize quiet period stays in force",
+			"value", value, "max", maxSynchronizeQuietPeriod, "default", webhook.DefaultSynchronizeQuietPeriod)
 		return webhook.DefaultSynchronizeQuietPeriod
 	default:
 		return parsed
