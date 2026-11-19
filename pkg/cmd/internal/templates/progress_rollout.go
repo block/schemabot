@@ -529,28 +529,24 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	return b.String(), true
 }
 
-// rowsAcrossTargets sums a table's rows across its targets the way
-// presentation.PercentAcrossTargets weighs them: each target's copied rows are
-// capped at its own total, a target past its copy counts in full, and a target
-// still to copy counts the plan's estimate, so neither one target copying past
-// its estimate nor a target yet to start makes the table read as done.
-// estimated reports whether a plan's estimate is in the total.
-func rowsAcrossTargets(targets []ShardProgress) (copied, total int64, estimated bool) {
+// stoppedRowsAcrossTargets sums the rows a stopped table's targets copied, for
+// its "Stopped at" line. A target that completed the change counts in full,
+// and every other target counts the rows it copied, capped at its own total.
+// It cannot use presentation.SumTargetRows, which leaves stopped targets out
+// because their rows are not progressing: here the rows a stopped target
+// copied are the point. The caller has every target's own row total, so no
+// plan's estimate is in the sum.
+func stoppedRowsAcrossTargets(targets []ShardProgress) (copied, total int64) {
 	for _, target := range targets {
 		if state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow) {
 			total += target.RowsTotal
 			copied += target.RowsTotal
 			continue
 		}
-		if target.RowsTotal <= 0 && target.PlannedRows != nil {
-			total += *target.PlannedRows
-			estimated = true
-			continue
-		}
 		total += target.RowsTotal
 		copied += ui.ClampRows(target.RowsCopied, target.RowsTotal)
 	}
-	return copied, total, estimated
+	return copied, total
 }
 
 // isHaltedAcrossTargets reports whether a table rolled up across targets has
@@ -688,8 +684,7 @@ func stoppedAcrossTargets(targets []ShardProgress) (stoppedProgress, bool) {
 		}
 	}
 	var p stoppedProgress
-	// Every target reported its rows above, so no estimate is in the total.
-	p.copied, p.total, _ = rowsAcrossTargets(targets)
+	p.copied, p.total = stoppedRowsAcrossTargets(targets)
 	if p.total == 0 {
 		return stoppedProgress{}, false
 	}

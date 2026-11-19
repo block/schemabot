@@ -1680,13 +1680,13 @@ statement count. *Enforced:* the shared plan counter and summary renderer
 `pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`), and the
 multi-environment CLI deduplication fingerprint (`planFingerprint` in `pkg/cmd/commands/plan.go`).
 
-### UX-7: A table's progress across targets reads the same on every surface
+### UX-7: A table's copy progress across targets reads the same on every surface
 
-A table that a rollout runs on several targets has one reading of its progress: the percent beside
-its bar, the rows copied of the rows to copy, how many targets those rows cover, its planned size,
-and whether its ETA is a floor. That reading is derived once from the targets' progress and
-rendered by the CLI and the PR comment alike, so the two never disagree about how far one rollout
-has got. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
+While a rollout is copying a table on several targets, the table has one reading of its progress:
+the percent beside its bar, the rows copied of the rows to copy, how many targets those rows cover,
+its planned size, and whether its ETA is a floor. That reading is derived once from the targets'
+progress and rendered by the CLI and the PR comment alike, so the two never disagree about how far
+one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
 `AcrossTargetsPercent`, and `TargetsTableSizeClause` in `pkg/presentation`), and a test that
 renders the same rollouts through both surfaces and fails when they read differently
 (`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
