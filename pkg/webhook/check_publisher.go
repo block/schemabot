@@ -1525,6 +1525,21 @@ func sanitizeCheckRunErrorSummary(summary string) string {
 // was read, so a block recorded concurrently (for example by a newer commit's
 // guards on another pod) stays authoritative.
 func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, configs []ghclient.DiscoveredConfig) {
+	if h.isRepoListenOnly(repo) {
+		// A listen-only repository publishes no aggregate check, so it has no
+		// block to release. Its databases are usually registered by another
+		// deployment, and the registry check below would warn on every pull
+		// request that merge stays blocked, though nothing blocks it. Make
+		// the uncached head read a deployment that serves the repository
+		// makes, so the listener measures it, and stop. The read goes around
+		// the verification helper because that helper records status-check
+		// metrics and logs for a check this repository never has.
+		if _, err := client.FetchPullRequestNoCache(ctx, repo, pr); err != nil {
+			h.logger.Warn("listen-only PR head read failed; this delivery's GitHub request measurement misses the head read a serving deployment makes",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "listen_only", true, "error", err)
+		}
+		return
+	}
 	for _, cfg := range configs {
 		environments, err := h.configuredDatabaseEnvironments(cfg.Config.Database)
 		if err != nil {
