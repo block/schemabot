@@ -205,6 +205,22 @@ func TestOperationCutoverRequestTurn(t *testing.T) {
 			want:        cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
 			wantBlocker: true,
 		},
+		{
+			name:        "a request bound to eu after eu completed is settled as landed while us still copies",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.Completed,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.Running)},
+			want:        cutoverRequestTurn{reason: "the member the request was bound to has cut over", settle: cutoverRequestLanded},
+			wantBlocker: true,
+		},
+		{
+			name:        "a request bound to eu after eu failed is settled as ended while us still copies",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.Failed,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.Running)},
+			want:        cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
+			wantBlocker: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
