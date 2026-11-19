@@ -6,7 +6,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -37,7 +36,7 @@ func (cmd *CutoverCmd) Run(ctx context.Context, g *Globals) error {
 		populateControlDisplayFields(&cmd.Database, result)
 		if state.IsState(result.State, state.Apply.Completed) {
 			fmt.Println("✓ Schema change already complete")
-			tables := ddl.FilterInternalTablesTyped(result.Tables)
+			tables := result.Tables
 			if len(tables) > 0 {
 				fmt.Println("Tables:")
 				for _, tbl := range tables {

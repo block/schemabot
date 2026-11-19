@@ -214,6 +214,19 @@ func CallPullSchemaAPIWithContext(ctx context.Context, endpoint, database, dbTyp
 type PlanExclusions struct {
 	Namespaces []string
 	Tables     []string
+	// DropTables is not an exclusion: it is the config's drop_tables, the
+	// live tables the plan should drop although no schema file declares them.
+	// It travels here because it comes from the same file and rides on the
+	// same request.
+	DropTables []string
+}
+
+// WithoutDropTables returns the exclusions alone, for a plan that verifies
+// schema files mirror the target and must not propose the drops the config
+// asks for.
+func (e PlanExclusions) WithoutDropTables() PlanExclusions {
+	e.DropTables = nil
+	return e
 }
 
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
@@ -271,7 +284,7 @@ func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, s
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaRoot)
 	}
-	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target, rendersRollout)
+	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, exclusions.DropTables, groupedExecution, target, rendersRollout)
 	if err != nil {
 		return nil, ignored, err
 	}
@@ -282,7 +295,7 @@ func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, s
 // schema files. It does not say it renders the rollout, so the server refuses
 // it a rollout-wide plan of an environment with more than one member.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
-	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, false, "", false)
+	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, nil, false, "", false)
 }
 
 // postPlanRequestWithContext posts a plan request. ignoredNamespaces names the
@@ -291,7 +304,7 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 // rendersRollout is the caller's own statement, never a default: a caller
 // that does not read the rollout block would present the primary's plan as
 // every member's.
-func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, error) {
+func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables, dropTables []string, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -300,6 +313,7 @@ func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType,
 		Repository:        repo,
 		IgnoredNamespaces: ignoredNamespaces,
 		IgnoreTables:      ignoreTables,
+		DropTables:        dropTables,
 		GroupedExecution:  groupedExecution,
 		Target:            target,
 		RendersRollout:    rendersRollout,

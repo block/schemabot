@@ -10,6 +10,7 @@
 - [Per-Environment Schema Roots](#per-environment-schema-roots)
 - [Ignoring Namespaces](#ignoring-namespaces)
 - [Ignoring Tables](#ignoring-tables)
+- [Dropping Tables](#dropping-tables)
 - [Per-Target Schema Overrides](#per-target-schema-overrides)
 - [Summary](#summary)
 - [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
@@ -491,6 +492,59 @@ it would propose creating a table that already exists.
 When reviewing a PR that *introduces* an `ignore_tables` entry, the disclosure
 plus the config diff is the review surface: the plan stops seeing that table
 from this PR onward.
+
+## Dropping Tables
+
+The MySQL planner leaves some live tables out of every plan by their names: an
+online schema change's leftover `_` tables and `<name>_archive_YYYY` tables
+(see the table above). Because the plan never sees them, removing a schema file
+cannot drop them. To drop one through SchemaBot, name it under `drop_tables` in
+`schemabot.yaml`:
+
+```yaml
+# schemabot.yaml
+database: commerce
+type: mysql
+drop_tables:
+  - _events_old
+```
+
+The plan proposes `DROP TABLE` for each listed table that is on the target. The
+statement shows in the PR plan comment and in `plan` and `apply` output like any
+other drop, and the drop is listed under unsafe changes, so it needs the same
+consent as any other drop (`--allow-unsafe`). On a deployment with
+[pending drops](pending-drops.md) enabled, the apply moves the table into
+`_pending_drops` rather than dropping it outright, so it can be recovered until
+the retention period ends.
+
+### Rules
+
+- MySQL only. A plan of a PostgreSQL database, or of one the PlanetScale
+  engine plans, fails when its config lists `drop_tables` and asks you to
+  remove the key.
+- Each entry is one exact, case-sensitive table name. There are no patterns:
+  list each table to drop, so the config diff shows every table the plan will
+  drop. An entry that is blank, padded with whitespace, or contains `/` is an
+  error naming it.
+- Entries are not namespace-qualified, so an entry applies to every namespace
+  the plan covers.
+- A table a schema file declares cannot also be listed, and neither can a table
+  `ignore_tables` withholds. The plan fails and names the entry, so you can
+  remove it from one of the two.
+- A listed table written in the last 24 hours is refused, naming it. A table
+  that still receives rows, such as the shadow table of an online schema change
+  another tool is running, is not a leftover yet. Wait until nothing writes to
+  it.
+- An entry that names no live table plans nothing and the plan proceeds. The
+  server logs the entry, so an operator can tell a stale or misspelled entry
+  from a drop that ran.
+- A rollback never drops a listed table. It restores the schema the apply
+  started from, so a listed table still on the target is left in place.
+- A plan records the entries, and an apply, resume or drift check of that plan
+  proposes the same drops.
+
+Remove the entry once the drop has landed. An entry left behind plans nothing,
+but it would drop a table someone later creates under the same name.
 
 ## Per-Target Schema Overrides
 

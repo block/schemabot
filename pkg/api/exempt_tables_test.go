@@ -602,6 +602,35 @@ func TestDropTablesEntriesStillSkipped(t *testing.T) {
 	assert.Nil(t, dropTablesEntriesStillSkipped(nil, changes, nil, groups), "a plan with no drop_tables has nothing to report")
 }
 
+// A drop_tables entry the plan neither drops nor still skips names no live
+// table, such as one whose drop already landed. Only those entries are
+// reported, once each: a dropped entry is planned, and a still-skipped one is
+// the separate answer of a data plane that did not apply the list. A drop
+// planned on one shard counts as planned.
+func TestDropTablesEntriesUnmatched(t *testing.T) {
+	changes := []*ternv1.SchemaChange{{
+		Namespace: "app",
+		TableChanges: []*ternv1.TableChange{{
+			TableName: "_users_old", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+			Ddl: "DROP TABLE `_users_old`",
+		}},
+	}}
+	shards := []*ternv1.ShardPlan{{
+		Namespace: "app", Shard: "-80",
+		Changes: []*ternv1.TableChange{{
+			TableName: "_invoices_old", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP,
+			Ddl: "DROP TABLE `_invoices_old`",
+		}},
+	}}
+
+	got := dropTablesEntriesUnmatched(
+		[]string{"_users_old", "_orders_old", "_payouts_old", "_invoices_old", "_payouts_old"},
+		[]string{"_orders_old"}, changes, shards)
+
+	assert.Equal(t, []string{"_payouts_old"}, got)
+	assert.Nil(t, dropTablesEntriesUnmatched(nil, nil, changes, shards), "a plan with no drop_tables has nothing to report")
+}
+
 // POST /api/plan holds drop_tables to the rule the engine indexes it by, so an
 // entry that is not one exact table name is the request's error, answered
 // before any data plane is asked to plan.

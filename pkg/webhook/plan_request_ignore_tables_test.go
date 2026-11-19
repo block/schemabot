@@ -19,9 +19,12 @@ import (
 // that catches such a drop derives what it checks from the same field, so an
 // omission there disarms the guard that would otherwise report it.
 //
+// Each also carries drop_tables, so a re-plan proposes the same drops the
+// reviewed plan showed rather than silently leaving them out.
+//
 // The builders are found by parsing the package rather than listed here, so a
 // fifth one added later is held to the same rule.
-func TestPlanRequestBuildersCarryIgnoreTables(t *testing.T) {
+func TestPlanRequestBuildersCarryIgnoreAndDropTables(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	require.NoError(t, err)
 
@@ -46,6 +49,9 @@ func TestPlanRequestBuildersCarryIgnoreTables(t *testing.T) {
 			builders++
 			assert.True(t, litSetsField(lit, "IgnoreTables"),
 				"%s builds a PlanRequest without IgnoreTables; the plan would drop every table the repository withholds",
+				fset.Position(lit.Pos()))
+			assert.True(t, litSetsField(lit, "DropTables"),
+				"%s builds a PlanRequest without DropTables; the plan would leave out the drops the repository asked for",
 				fset.Position(lit.Pos()))
 			return true
 		})

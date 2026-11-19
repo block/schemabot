@@ -1745,9 +1745,6 @@ const (
 	executionModeDirect  = "direct"
 )
 
-// GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
-func (t *TableChangeResponse) GetTableName() string { return t.TableName }
-
 // EngineBlocked reports whether the planner's execution-mode verdict says the
 // engine deterministically refuses this change: an apply will fail on it.
 func (t *TableChangeResponse) EngineBlocked() bool {
@@ -2006,9 +2003,6 @@ type ShardProgressResponse struct {
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
 }
-
-// GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
-func (t *TableProgressResponse) GetTableName() string { return t.TableName }
 
 // ApplyHistoryResponse represents a single apply in the history.
 type ApplyHistoryResponse struct {

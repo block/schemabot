@@ -133,9 +133,9 @@ type onboardWritePlan struct {
 	namespacePrefix string
 	databaseType    string
 	files           map[string]string
-	// exclusions carries an existing config's ignore_namespaces and
-	// ignore_tables through a rewrite, so re-onboarding does not drop the
-	// exclusions an operator configured, and plan verification excludes the
+	// exclusions carries an existing config's ignore_namespaces,
+	// ignore_tables and drop_tables through a rewrite, so re-onboarding does
+	// not lose what an operator configured, and plan verification excludes the
 	// same namespaces and withholds the same tables a real plan would.
 	exclusions client.PlanExclusions
 	// withheld names the live tables ignore_tables kept out of the written
@@ -145,17 +145,17 @@ type onboardWritePlan struct {
 	withheld []*apitypes.ExemptTablesResponse
 }
 
-// preservedExclusions returns the ignore_namespaces and ignore_tables of an
-// existing schemabot.yaml under schemaRoot. A missing config is a fresh
-// onboarding with nothing to preserve; an unreadable one is an error —
-// rewriting it would silently drop whatever it configured.
+// preservedExclusions returns the ignore_namespaces, ignore_tables and
+// drop_tables of an existing schemabot.yaml under schemaRoot. A missing config
+// is a fresh onboarding with nothing to preserve; an unreadable one is an
+// error — rewriting it would silently drop whatever it configured.
 func preservedExclusions(schemaRoot string) (client.PlanExclusions, error) {
 	if _, err := os.Stat(filepath.Join(schemaRoot, "schemabot.yaml")); os.IsNotExist(err) {
 		return client.PlanExclusions{}, nil
 	}
 	cfg, err := LoadCLIConfig(schemaRoot)
 	if err != nil {
-		return client.PlanExclusions{}, fmt.Errorf("read existing schemabot.yaml to preserve ignore_namespaces and ignore_tables: %w", err)
+		return client.PlanExclusions{}, fmt.Errorf("read existing schemabot.yaml to preserve ignore_namespaces, ignore_tables and drop_tables: %w", err)
 	}
 	return cfg.PlanExclusions(), nil
 }
@@ -472,6 +472,7 @@ type onboardConfig struct {
 	Type             string   `yaml:"type"`
 	IgnoreNamespaces []string `yaml:"ignore_namespaces,omitempty"`
 	IgnoreTables     []string `yaml:"ignore_tables,omitempty"`
+	DropTables       []string `yaml:"drop_tables,omitempty"`
 }
 
 // onboardConfigYAML renders the config for a freshly onboarded database. The
@@ -489,6 +490,7 @@ func onboardConfigYAML(database, databaseType string, exclusions client.PlanExcl
 		Type:             databaseType,
 		IgnoreNamespaces: exclusions.Namespaces,
 		IgnoreTables:     exclusions.Tables,
+		DropTables:       exclusions.DropTables,
 	}); err != nil {
 		return "", fmt.Errorf("encode schemabot.yaml for database %s: %w", database, err)
 	}
@@ -689,8 +691,11 @@ func verifyOnboardPlan(endpoint, database, environment string, plan *onboardWrit
 	err := withLoading("Verifying pulled schema...", true, func() error {
 		var planErr error
 		// The verification reads every rollout member's plan: it fails on a
-		// member listed for attention and on work on any member.
-		planResult, _, planErr = client.CallPlanAPIForTarget(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.exclusions, false, "", true)
+		// member listed for attention and on work on any member. It checks
+		// that the written files mirror the target, so it plans without the
+		// preserved drop_tables: a listed table still on the target is a drop
+		// the repository has asked for, not a file the pull got wrong.
+		planResult, _, planErr = client.CallPlanAPIForTarget(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.exclusions.WithoutDropTables(), false, "", true)
 		return planErr
 	})
 	if err != nil {

@@ -144,6 +144,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables())
 	case PreviewCommentPlanIgnoreTables:
 		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables())
+	case PreviewCommentPlanDropTables:
+		fmt.Print(webhooktemplates.PreviewCommentPlanDropTables())
 	case PreviewCommentPlanColumnOnlyAlter:
 		fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter())
 	case PreviewCommentPlanManyTables:

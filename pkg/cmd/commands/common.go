@@ -23,6 +23,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -126,15 +127,17 @@ type CLIConfig struct {
 	// the exclusion a live table no schema file declares is planned as DROP
 	// TABLE, which blocks the merge.
 	IgnoreTables []string `yaml:"ignore_tables"`
-	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	// DropTables lists live tables no schema file declares that the plan
+	// should drop, each by its exact name.
+	DropTables []string `yaml:"drop_tables"`
+	SchemaDir  string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
 
-// PlanExclusions returns the config's declared exclusions in the form the plan
-// API takes them. Both lists are exclusions the repository recorded, and they
-// are passed as one value so a caller cannot hand the plan its tables as its
-// namespaces.
+// PlanExclusions returns the config's declared exclusions, and its drop_tables,
+// in the form the plan API takes them. The lists are passed as one value so a
+// caller cannot hand the plan its tables as its namespaces.
 func (c *CLIConfig) PlanExclusions() client.PlanExclusions {
-	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables}
+	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables, DropTables: c.DropTables}
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -170,6 +173,9 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	if err := schema.ValidateIgnoreTables(cfg.IgnoreTables); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
+	}
+	if _, err := engine.NewDroppedTables(cfg.DropTables); err != nil {
 		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml

@@ -200,9 +200,10 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 }
 
 // Re-onboarding over an existing schema root must not drop the exclusions an
-// operator configured: the rewritten schemabot.yaml carries both lists forward,
-// and the plan verification excludes the same namespaces and withholds the same
-// tables a real plan would.
+// operator configured: the rewritten schemabot.yaml carries every list forward,
+// drop_tables included, and the plan verification excludes the same namespaces
+// and withholds the same tables a real plan would, without asking for the
+// drops.
 func TestBuildOnboardWritePlanPreservesExclusions(t *testing.T) {
 	root := t.TempDir()
 	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
@@ -216,15 +217,19 @@ func TestBuildOnboardWritePlanPreservesExclusions(t *testing.T) {
 	}, client.PlanExclusions{
 		Namespaces: []string{"local_fixtures", "fixtures_$ENV"},
 		Tables:     []string{"flyway_schema_history"},
+		DropTables: []string{"_users_old"},
 	})
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 
 	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
 	require.NoError(t, err)
-	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\nignore_tables:\n  - flyway_schema_history\n", string(config))
+	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\nignore_tables:\n  - flyway_schema_history\ndrop_tables:\n  - _users_old\n", string(config))
 	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, plan.exclusions.Namespaces)
 	assert.Equal(t, []string{"flyway_schema_history"}, plan.exclusions.Tables)
+	assert.Empty(t, plan.exclusions.WithoutDropTables().DropTables,
+		"verification checks the files mirror the target, so it does not ask for the drops")
+	assert.Equal(t, []string{"flyway_schema_history"}, plan.exclusions.WithoutDropTables().Tables)
 }
 
 // A pull returns the target's whole catalog, the tables ignore_tables withholds
@@ -350,12 +355,13 @@ func TestPreservedExclusions(t *testing.T) {
 	t.Run("existing config's entries are preserved", func(t *testing.T) {
 		root := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
-			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\nignore_tables:\n  - flyway_schema_history\n"), 0o644))
+			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\nignore_tables:\n  - flyway_schema_history\ndrop_tables:\n  - _users_old\n"), 0o644))
 
 		exclusions, err := preservedExclusions(root)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"local_fixtures"}, exclusions.Namespaces)
 		assert.Equal(t, []string{"flyway_schema_history"}, exclusions.Tables)
+		assert.Equal(t, []string{"_users_old"}, exclusions.DropTables)
 	})
 
 	t.Run("unreadable config is an error, not a silent drop", func(t *testing.T) {
@@ -365,7 +371,7 @@ func TestPreservedExclusions(t *testing.T) {
 
 		_, err := preservedExclusions(root)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "preserve ignore_namespaces and ignore_tables")
+		assert.Contains(t, err.Error(), "preserve ignore_namespaces, ignore_tables and drop_tables")
 	})
 }
 

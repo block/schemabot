@@ -366,7 +366,7 @@ database: shop
 type: mysql
 ```
 
-Preserve any existing `ignore_namespaces` and `ignore_tables` settings. For
+Preserve any existing `ignore_namespaces`, `ignore_tables` and `drop_tables` settings. For
 each managed table, copy its decoded SQL string to
 `schema/<namespace>/<table>.sql`, adding line breaks outside quoted content
 without changing options, comments, or statements. The example becomes

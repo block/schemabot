@@ -153,6 +153,38 @@ func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
 	}, data.ExemptTables)
 }
 
+// A repository names a leftover table from an earlier online schema change in
+// drop_tables, so the plan drops `_jobs_old`. The PR comment shows the
+// statement and lists the drop among the unsafe changes, the same as the CLI
+// plan (TestWritePlanBody_ShowsDropOfUnderscoreTable).
+func TestBuildPlanCommentData_ShowsDropOfUnderscoreTable(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "jobs", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "jobs",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:    "_jobs_old",
+				DDL:          "DROP TABLE `_jobs_old`;",
+				ChangeType:   "drop",
+				IsUnsafe:     true,
+				UnsafeReason: "DROP TABLE removes all data",
+			}},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+	require.Len(t, data.Changes, 1)
+	assert.Equal(t, []string{"DROP TABLE `_jobs_old`;"}, data.Changes[0].Statements)
+	require.Len(t, data.UnsafeChanges, 1)
+	assert.Equal(t, "_jobs_old", data.UnsafeChanges[0].Table)
+
+	comment := templates.RenderPlanComment(data)
+	assert.Contains(t, comment, "DROP TABLE `_jobs_old`;")
+	assert.Contains(t, comment, "**1** table to drop")
+	assert.Contains(t, comment, "`_jobs_old`")
+	assert.Contains(t, comment, "DROP TABLE removes all data")
+}
+
 // An unsafe change on a single shard (per-shard plan) is surfaced with its shard,
 // even when the collapsed namespace-level Changes don't carry it.
 func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {

@@ -18,7 +18,6 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -456,8 +455,8 @@ func collectPlanWork(result *apitypes.PlanResponse) planWork {
 	}
 	tables := result.RenderedTables()
 	w.renderedTables = len(tables)
-	// Collect DDL changes (filter out internal Spirit tables), grouped by namespace
-	for _, tbl := range ddl.FilterInternalTablesTyped(tables) {
+	// Collect DDL changes, grouped by namespace
+	for _, tbl := range tables {
 		ns := renderedNamespace(tbl.Namespace, result.Database)
 		w.namespaceMap[ns] = append(w.namespaceMap[ns], templates.DDLChange{
 			ChangeType: tbl.ChangeType,
@@ -739,7 +738,7 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		ddls = append(ddls, renderedNamespace(tbl.Namespace, result.Database)+":"+tbl.ChangeType+":"+tbl.TableName+":"+tbl.DDL)
 	}
 	namespacesWithDDL := map[string]bool{}
-	for _, tbl := range ddl.FilterInternalTablesTyped(result.RenderedTables()) {
+	for _, tbl := range result.RenderedTables() {
 		namespacesWithDDL[renderedNamespace(tbl.Namespace, result.Database)] = true
 	}
 	// A finalize beside DDL or a VSchema change renders as that work alone, so
