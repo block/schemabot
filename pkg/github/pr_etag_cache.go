@@ -47,9 +47,14 @@ func (c *prETagCache) get(repo string, pr int) (prETagEntry, bool) {
 	return entry, ok
 }
 
-// put stores the ETag GitHub returned with info. Concurrent reads of the same
-// pull request may store out of order; every stored pair is still a matching
-// ETag and body, so an older pair only costs a full read on the next call.
+// put stores the ETag GitHub returned with info. A response without an ETag
+// is not stored, and it leaves the pair stored earlier in place. That pair is
+// still a matching ETag and body, so the next read sends its ETag and GitHub
+// answers in full unless the pull request matches it again.
+//
+// Concurrent reads of the same pull request may store out of order; every
+// stored pair is still a matching ETag and body, so an older pair only costs a
+// full read on the next call.
 func (c *prETagCache) put(repo string, pr int, etag string, info PullRequestInfo) {
 	if c == nil || etag == "" {
 		return

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -21,14 +22,17 @@ import (
 
 // etagPRServer is a fake GitHub pull request endpoint that versions the pull
 // request by head SHA and honors If-None-Match the way GitHub does: a request
-// carrying the current ETag gets 304 with no body.
+// carrying the current ETag gets 304 with no body. While unavailable is set it
+// answers every request 503, as GitHub does during an outage.
 type etagPRServer struct {
 	mu          sync.Mutex
 	headSHA     string
 	sendETag    bool
+	unavailable bool
 	ifNoneMatch []string
 	notModified int
 	fullReads   int
+	refused     int
 }
 
 func (s *etagPRServer) etag() string {
@@ -41,11 +45,28 @@ func (s *etagPRServer) setHead(sha string) {
 	s.headSHA = sha
 }
 
+func (s *etagPRServer) setSendETag(send bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sendETag = send
+}
+
+func (s *etagPRServer) setUnavailable(unavailable bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unavailable = unavailable
+}
+
 func (s *etagPRServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sent := r.Header.Get("If-None-Match")
 	s.ifNoneMatch = append(s.ifNoneMatch, sent)
+	if s.unavailable {
+		s.refused++
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if s.sendETag && sent != "" && sent == s.etag() {
 		s.notModified++
 		w.Header().Set("ETag", s.etag())
@@ -177,6 +198,61 @@ func TestFetchPullRequest_NoETagMeansUnconditionalReads(t *testing.T) {
 	}
 	assert.Equal(t, []string{"", "", ""}, server.ifNoneMatch)
 	assert.Equal(t, 3, server.fullReads)
+}
+
+// A full response without an ETag is returned as read and is not stored. The
+// pair stored earlier stays in place, so later reads keep sending its ETag.
+// GitHub answers each of them in full, and answers 304 again only once the
+// pull request matches that ETag, when the stored info is once more correct.
+func TestFetchPullRequest_ResponseWithoutETagKeepsTheEarlierPair(t *testing.T) {
+	server := &etagPRServer{headSHA: "head111", sendETag: true}
+	ic := newETagPRTestClient(t, server)
+
+	_, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+	require.NoError(t, err)
+
+	server.setHead("head222")
+	server.setSendETag(false)
+	for range 2 {
+		info, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+		require.NoError(t, err)
+		assert.Equal(t, "head222", info.HeadSHA, "the response without an ETag is the one returned")
+	}
+	assert.Equal(t, []string{"", `W/"head111"`, `W/"head111"`}, server.ifNoneMatch)
+	assert.Equal(t, 3, server.fullReads)
+	assert.Equal(t, 0, server.notModified)
+
+	server.setHead("head111")
+	server.setSendETag(true)
+	info, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, "head111", info.HeadSHA)
+	assert.Equal(t, 1, server.notModified)
+}
+
+// When GitHub is unavailable, a read fails even though an earlier read stored
+// the pull request. The stored copy is returned only after GitHub confirms it
+// with a 304, so a safety re-check never acts on a head it could not verify.
+// Once GitHub answers again, the stored copy is confirmed and used as before.
+func TestFetchPullRequest_UnavailableGitHubIsAnErrorDespiteAStoredCopy(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+	server := &etagPRServer{headSHA: "head111", sendETag: true}
+	ic := newETagPRTestClient(t, server)
+
+	_, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+	require.NoError(t, err)
+
+	server.setUnavailable(true)
+	info, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+	require.ErrorIs(t, err, ErrGitHubUnavailable)
+	assert.Nil(t, info, "an unavailable GitHub must not be answered from the stored copy")
+	assert.Equal(t, githubUnavailableReadRetryMaxAttempts, server.refused, "every attempt asked GitHub")
+
+	server.setUnavailable(false)
+	info, err = ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, "head111", info.HeadSHA)
+	assert.Equal(t, 1, server.notModified)
 }
 
 // The request-scoped cache still collapses repeat reads within a delivery,
