@@ -32,16 +32,21 @@ const GitHubRequestsMetric = "schemabot_github_requests_total"
 const GitHubCallsGauge = "schemabot.e2e.github_calls"
 
 // ErrNoCallCount reports that the GitHub calls a run caused cannot be counted.
-// A count taken across a restarted or replaced pod would read low and let a
-// release that multiplies GitHub calls through, so no count is sent and the
-// gate, seeing no data, holds the release.
+// A count taken across a restarted container or a replaced pod would read low
+// and let a release that multiplies GitHub calls through, so no count is sent
+// and the gate, seeing no data, holds the release.
 var ErrNoCallCount = errors.New("no GitHub call count")
 
 // Pod is one SchemaBot process whose GitHub request counter a run reads.
 type Pod struct {
-	// UID identifies the pod. A pod replaced during the run has a new UID,
-	// which is how a counter reset shows.
+	// UID identifies the pod. A pod replaced during the run has a new UID.
 	UID string
+	// Process identifies the processes running in the pod: every container's
+	// name and container ID. A container restart keeps the pod UID but gets a
+	// new container ID, and its counters start again from zero, so a changed
+	// Process is a counter reset even when the new counter has climbed past
+	// the old one. Empty means the identity is unknown, which voids a count.
+	Process string
 	// Name is the pod's namespace/name, for logs.
 	Name string
 	// MetricsURL is the pod's Prometheus endpoint.
@@ -53,12 +58,20 @@ type PodLister interface {
 	ListPods(ctx context.Context) ([]Pod, error)
 }
 
-// CallSnapshot is each pod's GitHub request counter at one moment, by pod UID.
-type CallSnapshot map[string]float64
+// PodCalls is one pod's GitHub request counter and the processes that served it.
+type PodCalls struct {
+	Process string
+	Calls   float64
+}
 
-// ReadGitHubCalls lists the pods and reads every pod's GitHub request counter.
-// Any pod that cannot be read fails the snapshot, because a count missing a
-// pod would read low.
+// CallSnapshot is each pod's GitHub request counter at one moment, by pod UID.
+type CallSnapshot map[string]PodCalls
+
+// ReadGitHubCalls lists the pods, reads every pod's GitHub request counter,
+// and lists the pods again. Any pod that cannot be read fails the snapshot,
+// because a count missing a pod would read low. So does a pod whose identity
+// is unknown, or whose containers changed between the two lists, because the
+// counter read may belong to a process that has just started.
 func ReadGitHubCalls(ctx context.Context, pods PodLister, client *http.Client) (CallSnapshot, error) {
 	list, err := pods.ListPods(ctx)
 	if err != nil {
@@ -69,30 +82,71 @@ func ReadGitHubCalls(ctx context.Context, pods PodLister, client *http.Client) (
 	}
 	snap := make(CallSnapshot, len(list))
 	for _, pod := range list {
+		if pod.Process == "" {
+			return nil, fmt.Errorf("pod %s has no container identity: %w", pod.Name, ErrNoCallCount)
+		}
 		n, err := scrapeGitHubRequests(ctx, client, pod.MetricsURL)
 		if err != nil {
 			return nil, fmt.Errorf("read GitHub requests from pod %s (%s): %w", pod.Name, pod.MetricsURL, err)
 		}
-		snap[pod.UID] = n
+		snap[pod.UID] = PodCalls{Process: pod.Process, Calls: n}
+	}
+	again, err := pods.ListPods(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list SchemaBot pods after reading them: %w", err)
+	}
+	if err := sameProcesses(list, again); err != nil {
+		return nil, fmt.Errorf("SchemaBot pods changed while being read: %w", err)
 	}
 	return snap, nil
 }
 
+// sameProcesses reports whether two pod lists hold the same pods running the
+// same containers.
+func sameProcesses(a, b []Pod) error {
+	if len(a) != len(b) {
+		return fmt.Errorf("%d pods, then %d: %w", len(a), len(b), ErrNoCallCount)
+	}
+	process := make(map[string]string, len(b))
+	for _, pod := range b {
+		process[pod.UID] = pod.Process
+	}
+	for _, pod := range a {
+		now, ok := process[pod.UID]
+		if !ok {
+			return fmt.Errorf("pod %s went away: %w", pod.Name, ErrNoCallCount)
+		}
+		if now != pod.Process {
+			return fmt.Errorf("pod %s restarted a container: %w", pod.Name, ErrNoCallCount)
+		}
+	}
+	return nil
+}
+
 // GitHubCallsDuring returns the GitHub calls made between two snapshots: the
 // sum of each pod's increase. It returns ErrNoCallCount when the set of pods
-// changed, because a new pod's counter starts at zero, and when the sum is not
-// positive, because every run makes calls.
+// changed or a pod restarted a container, because a new process's counter
+// starts at zero, and when the sum is not positive, because every run makes
+// calls.
+//
+// Two snapshots cannot see a pod that started and went away between them, so
+// the count holds only while the replica set stays fixed for the run: no
+// autoscaling and no rollout of the deployment under test.
 func GitHubCallsDuring(before, after CallSnapshot) (int64, error) {
 	if !samePods(before, after) {
 		return 0, fmt.Errorf("SchemaBot pods changed during the run (%d before, %d after): %w",
 			len(before), len(after), ErrNoCallCount)
 	}
 	var total float64
-	for uid, n := range after {
-		if n < before[uid] {
-			return 0, fmt.Errorf("pod %s counter went from %v to %v: %w", uid, before[uid], n, ErrNoCallCount)
+	for uid, now := range after {
+		then := before[uid]
+		if now.Process != then.Process {
+			return 0, fmt.Errorf("pod %s restarted a container during the run: %w", uid, ErrNoCallCount)
 		}
-		total += n - before[uid]
+		if now.Calls < then.Calls {
+			return 0, fmt.Errorf("pod %s counter went from %v to %v: %w", uid, then.Calls, now.Calls, ErrNoCallCount)
+		}
+		total += now.Calls - then.Calls
 	}
 	if total <= 0 {
 		return 0, fmt.Errorf("SchemaBot made %v GitHub calls during the run: %w", total, ErrNoCallCount)
@@ -216,8 +270,12 @@ type podList struct {
 			UID       string `json:"uid"`
 		} `json:"metadata"`
 		Status struct {
-			Phase string `json:"phase"`
-			PodIP string `json:"podIP"`
+			Phase             string `json:"phase"`
+			PodIP             string `json:"podIP"`
+			ContainerStatuses []struct {
+				Name        string `json:"name"`
+				ContainerID string `json:"containerID"`
+			} `json:"containerStatuses"`
 		} `json:"status"`
 	} `json:"items"`
 }
@@ -236,9 +294,19 @@ func (k *KubernetesPods) ListPods(ctx context.Context) ([]Pod, error) {
 			if item.Status.Phase != "Running" || item.Status.PodIP == "" {
 				continue
 			}
+			var containers []string
+			for _, c := range item.Status.ContainerStatuses {
+				if c.ContainerID == "" {
+					containers = nil
+					break
+				}
+				containers = append(containers, c.Name+"="+c.ContainerID)
+			}
+			slices.Sort(containers)
 			pods = append(pods, Pod{
-				UID:  item.Metadata.UID,
-				Name: item.Metadata.Namespace + "/" + item.Metadata.Name,
+				UID:     item.Metadata.UID,
+				Name:    item.Metadata.Namespace + "/" + item.Metadata.Name,
+				Process: strings.Join(containers, ","),
 				MetricsURL: "http://" + net.JoinHostPort(item.Status.PodIP, strconv.Itoa(k.metricsPort)) +
 					"/metrics",
 			})
@@ -289,7 +357,8 @@ type Gauge interface {
 
 // GitHubCallCounter counts the GitHub calls SchemaBot makes during a run and
 // sends the count as GitHubCallsGauge. Start reads every pod's counter before
-// the run and Finish reads it again after.
+// the run and Finish reads it again after. The count assumes the replica set
+// stays fixed for the run (see GitHubCallsDuring).
 type GitHubCallCounter struct {
 	pods   PodLister
 	client *http.Client

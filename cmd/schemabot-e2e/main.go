@@ -16,9 +16,11 @@
 // With -github-calls-namespaces, a run in a pod also counts the GitHub API
 // calls SchemaBot made during it, from every SchemaBot pod's metrics endpoint,
 // and sends the count to DogStatsD as the schemabot.e2e.github_calls gauge,
-// tagged with -metric-tags. When the count cannot be taken (a pod restarted,
-// or a read failed) nothing is sent, so a gate that requires the gauge holds
-// the release. The count does not change the exit code.
+// tagged with -metric-tags. When the count cannot be taken (a pod was added,
+// removed or replaced, a container restarted, or a read failed) nothing is
+// sent, so a gate that requires the gauge holds the release. The count does
+// not change the exit code. It assumes the SchemaBot replicas stay fixed for
+// the run: a pod that starts and goes away between the two reads is not seen.
 package main
 
 import (

@@ -6,5 +6,7 @@
 //
 // Run in a pod, it can also count the GitHub API calls SchemaBot made during
 // the run (GitHubCallCounter), so the gate can hold a release that works but
-// multiplies its GitHub calls.
+// multiplies its GitHub calls. The count needs the SchemaBot replicas to stay
+// fixed for the run: two reads cannot see a pod that started and went away
+// between them.
 package livee2e
