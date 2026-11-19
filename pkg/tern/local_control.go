@@ -2516,12 +2516,15 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		if err != nil {
 			return nil, fmt.Errorf("load tasks for apply %s to derive final state: %w", apply.ApplyIdentifier, err)
 		}
-		derivedState := state.DeriveApplyState(taskStates(tasks))
-		if !state.IsTerminalApplyState(derivedState) {
-			c.logger.Warn("stop found every targeted task terminal, but the apply's tasks do not finish it; failing closed rather than recording an outcome over active task work",
-				append(apply.LogAttrs(), "derived_state", derivedState, "task_count", len(tasks), "client_database", c.config.Database)...)
-			return nil, fmt.Errorf("stop cannot settle apply %s: its tasks derive %s, not a finished or stopped outcome", apply.ApplyIdentifier, derivedState)
+		// The derived state cannot be the guard: it ranks a stopped, failed,
+		// or cancelled task above a running one, so a sibling still running
+		// on another database would hide behind a finished-looking outcome.
+		if unfinished := firstUnfinishedTask(tasks); unfinished != nil {
+			c.logger.Warn("stop found every targeted task terminal, but another of the apply's tasks is unfinished; failing closed rather than recording an outcome over active task work",
+				append(apply.LogAttrs(), "task_id", unfinished.TaskIdentifier, "task_database", unfinished.Database, "task_state", unfinished.State, "task_count", len(tasks), "client_database", c.config.Database)...)
+			return nil, fmt.Errorf("stop cannot settle apply %s: task %s on database %s is %s, not finished or stopped", apply.ApplyIdentifier, unfinished.TaskIdentifier, unfinished.Database, unfinished.State)
 		}
+		derivedState := state.DeriveApplyState(taskStates(tasks))
 		oldState := apply.State
 		now := time.Now()
 		apply.State = derivedState
@@ -2545,6 +2548,18 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 	}
 
 	return stopAlreadyFinishedResponse(apply.State, skippedCount), nil
+}
+
+// firstUnfinishedTask returns the first task that is neither terminal nor
+// stopped, or nil when every task is. Only then has the apply no task work
+// left that an outcome recorded now would strand.
+func firstUnfinishedTask(tasks []*storage.Task) *storage.Task {
+	for _, task := range tasks {
+		if !state.IsTerminalTaskState(task.State) && !state.IsState(task.State, state.Task.Stopped) {
+			return task
+		}
+	}
+	return nil
 }
 
 // anotherWriterFinishedTheApply reports whether storage refused a stop's apply

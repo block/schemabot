@@ -17,14 +17,14 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// addTaskOnAnotherDatabase records a second task for the apply on a database
+// addTaskOnAnotherDatabase records another task for the apply on a database
 // this client does not serve, so the client's stop cannot see or target it.
-func addTaskOnAnotherDatabase(t *testing.T, stor storage.Storage, task *storage.Task, taskState string) {
+func addTaskOnAnotherDatabase(t *testing.T, stor storage.Storage, task *storage.Task, database, taskState string) {
 	t.Helper()
 	elsewhere := *task
 	elsewhere.ID = 0
-	elsewhere.TaskIdentifier = task.TaskIdentifier + "-elsewhere"
-	elsewhere.Database = "otherdb"
+	elsewhere.TaskIdentifier = task.TaskIdentifier + "-" + database
+	elsewhere.Database = database
 	elsewhere.State = taskState
 	elsewhere.CompletedAt = nil
 	_, err := stor.Tasks().Create(t.Context(), &elsewhere)
@@ -45,46 +45,62 @@ func stopAsOperator(t *testing.T, client *LocalClient, apply *storage.Apply) (*t
 // that task running under a finished apply that no later stop can reach, so the
 // stop fails closed with an error, as cancel does, instead of reporting the
 // apply finished: the apply stays running and the running task is left alone.
+// The second case adds a stopped task on a third database: the tasks then
+// derive stopped, which looks finished, and the running task must still keep
+// the stop from recording it.
 func TestLocalClient_StopFailsClosedWhenTheApplyStillHasActiveTasks(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	_, dsn := setupMySQLContainer(t)
-	setupStorageSchema(t, dsn)
-	cleanupTasks(t, dsn)
-	cleanupTestTables(t, dsn)
-
-	ctx := t.Context()
-	stor := createStorage(t, dsn)
-	defer utils.CloseAndLog(stor)
-	client, eng := newTasklessControlClient(t, dsn, stor)
-
-	apply, task := dispatchApplyWithCompletedTask(t, stor, client, "unfinished_stop_note")
-	addTaskOnAnotherDatabase(t, stor, task, state.Task.Running)
-	apply.State = state.Apply.Running
-	require.NoError(t, stor.Applies().Update(ctx, apply))
-
-	resp, err := stopAsOperator(t, client, apply)
-	require.Error(t, err)
-	assert.Nil(t, resp)
-	assert.Contains(t, err.Error(), "stop cannot settle apply "+apply.ApplyIdentifier)
-	assert.Contains(t, err.Error(), "its tasks derive running")
-
-	current, err := stor.Applies().Get(ctx, apply.ID)
-	require.NoError(t, err)
-	require.NotNil(t, current)
-	assert.Equal(t, state.Apply.Running, current.State, "the apply must not finish over a task still running elsewhere")
-	assert.Nil(t, current.CompletedAt)
-	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
-	require.NoError(t, err)
-	require.Len(t, tasks, 2)
-	for _, got := range tasks {
-		if got.Database == "otherdb" {
-			assert.Equal(t, state.Task.Running, got.State, "the stop must not touch a task it cannot see")
-		}
+	testCases := []struct {
+		name            string
+		withStoppedTask bool
+	}{
+		{name: "running task elsewhere"},
+		{name: "running task elsewhere behind a stopped one", withStoppedTask: true},
 	}
-	assert.NotContains(t, eng.recorded(), "Stop", "the finished task has no engine work to stop")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, dsn := setupMySQLContainer(t)
+			setupStorageSchema(t, dsn)
+			cleanupTasks(t, dsn)
+			cleanupTestTables(t, dsn)
+
+			ctx := t.Context()
+			stor := createStorage(t, dsn)
+			defer utils.CloseAndLog(stor)
+			client, eng := newTasklessControlClient(t, dsn, stor)
+
+			apply, task := dispatchApplyWithCompletedTask(t, stor, client, "unfinished_stop_note")
+			addTaskOnAnotherDatabase(t, stor, task, "otherdb", state.Task.Running)
+			if tc.withStoppedTask {
+				addTaskOnAnotherDatabase(t, stor, task, "stoppeddb", state.Task.Stopped)
+			}
+			apply.State = state.Apply.Running
+			require.NoError(t, stor.Applies().Update(ctx, apply))
+
+			resp, err := stopAsOperator(t, client, apply)
+			require.Error(t, err)
+			assert.Nil(t, resp)
+			assert.Contains(t, err.Error(), "stop cannot settle apply "+apply.ApplyIdentifier)
+			assert.Contains(t, err.Error(), "on database otherdb is running")
+
+			current, err := stor.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, current)
+			assert.Equal(t, state.Apply.Running, current.State, "the apply must not finish over a task still running elsewhere")
+			assert.Nil(t, current.CompletedAt)
+			tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+			require.NoError(t, err)
+			for _, got := range tasks {
+				if got.Database == "otherdb" {
+					assert.Equal(t, state.Task.Running, got.State, "the stop must not touch a task it cannot see")
+				}
+			}
+			assert.NotContains(t, eng.recorded(), "Stop", "the finished task has no engine work to stop")
+		})
+	}
 }
 
 // An operator stops an apply whose task on this database has finished, and
@@ -106,7 +122,7 @@ func TestLocalClient_StopRecordsStoppedWhenTheOnlyUnfinishedTaskIsStopped(t *tes
 	client, _ := newTasklessControlClient(t, dsn, stor)
 
 	apply, task := dispatchApplyWithCompletedTask(t, stor, client, "stopped_sibling_note")
-	addTaskOnAnotherDatabase(t, stor, task, state.Task.Stopped)
+	addTaskOnAnotherDatabase(t, stor, task, "otherdb", state.Task.Stopped)
 	apply.State = state.Apply.Running
 	require.NoError(t, stor.Applies().Update(ctx, apply))
 
@@ -173,7 +189,7 @@ func TestLocalClient_StopThatLosesTheRaceToFinishTheApplyReportsTheRecordedOutco
 
 			apply, task := dispatchApplyWithCompletedTask(t, stor, client, "race_stop_note")
 			if tc.siblingState != "" {
-				addTaskOnAnotherDatabase(t, inner, task, tc.siblingState)
+				addTaskOnAnotherDatabase(t, inner, task, "otherdb", tc.siblingState)
 			}
 			apply.State = state.Apply.Running
 			require.NoError(t, stor.Applies().Update(ctx, apply))
