@@ -259,6 +259,57 @@ func TestPRSchemaCapApplyRefusalReleasesOnlyAutomaticIntent(t *testing.T) {
 	}
 }
 
+func TestPRSchemaCapLabelTimelineBudget(t *testing.T) {
+	f := newSchemaCapTestFixture(t, 2, 2, api.PRSchemaCapConfig{Limit: 1, Label: schemaCapTestLabel}, nil)
+	f.labels.Store(true)
+	now := time.Now().UTC().Truncate(time.Second)
+	var reads atomic.Int64
+	var more atomic.Bool
+	f.mux.HandleFunc("GET /repos/"+schemaCapTestRepo+"/issues/1/timeline", func(w http.ResponseWriter, r *http.Request) {
+		reads.Add(1)
+		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
+		if r.URL.Query().Get("page") == "2" {
+			t.Error("requested a second timeline page")
+			http.Error(w, "unexpected page", http.StatusBadRequest)
+			return
+		}
+		if more.Load() {
+			w.Header().Set("Link", `<https://api.github.com/repos/octocat/hello-world/issues/1/timeline?page=2>; rel="next"`)
+		}
+		_, _ = fmt.Fprintf(w, `[{"id":13,"event":"labeled","label":{"name":%q},"actor":{"login":"alice"},"created_at":%q}]`, schemaCapTestLabel, now.Format(time.RFC3339))
+	})
+	ctx := t.Context()
+	info, err := f.client.FetchPullRequest(ctx, schemaCapTestRepo, 1)
+	require.NoError(t, err)
+	policy := f.config().PRSchemaCapForRepo(schemaCapTestRepo)
+	for _, databases := range [][]string{nil, {"db0"}} {
+		_, err := f.evaluatePRSchemaCap(ctx, f.client, schemaCapTestRepo, 1, info, policy, databases, schemaCapAutoPlan)
+		require.NoError(t, err)
+	}
+	require.Zero(t, reads.Load())
+
+	payload := schemaCapLabelPayload(now)
+	adopted, err := f.recordPRSchemaLabel(ctx, f.client, schemaCapTestRepo, 1, info, schemaCapTestLabel, payload, now)
+	require.NoError(t, err)
+	require.True(t, adopted)
+	dbs := []string{"db0", "db1"}
+	admission, err := f.evaluatePRSchemaCap(ctx, f.client, schemaCapTestRepo, 1, info, policy, dbs, schemaCapVerify)
+	require.NoError(t, err)
+	require.Equal(t, "label:13", admission.exception)
+	require.EqualValues(t, 2, reads.Load())
+
+	// Page one still contains the acknowledged action, but a later page
+	// could contain a removal, reapplication, or revision change.
+	more.Store(true)
+	_, err = f.evaluatePRSchemaCap(ctx, f.client, schemaCapTestRepo, 1, info, policy, dbs, schemaCapReport)
+	require.ErrorIs(t, err, errPRSchemaCapHeld)
+	require.EqualValues(t, 3, reads.Load())
+	adopted, err = f.recordPRSchemaLabel(ctx, f.client, schemaCapTestRepo, 1, info, schemaCapTestLabel, payload, now)
+	require.ErrorIs(t, err, ghclient.ErrPRSchemaTimelineIncomplete)
+	require.False(t, adopted)
+	require.EqualValues(t, 4, reads.Load())
+}
+
 func TestPRSchemaCapRetriesLabelVerification(t *testing.T) {
 	f := newSchemaCapTestFixture(t, 2, 2, api.PRSchemaCapConfig{Limit: 1, Label: schemaCapTestLabel}, &flakyPlanTernClient{})
 	f.labels.Store(true)

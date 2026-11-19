@@ -162,20 +162,25 @@ func (h *Handler) evaluatePRSchemaCap(ctx context.Context, client *ghclient.Inst
 		return prSchemaAdmission{}, nil
 	}
 	admission := prSchemaAdmission{client: client}
-	aboveLimit := len(databases) > policy.Limit
+	if len(databases) <= policy.Limit {
+		if mode == schemaCapAutoPlan {
+			h.resolvePRSchemaHold(ctx, client, repo, pr, policy)
+		}
+		return admission, nil
+	}
 	var notice string
 	var verificationErr error
 	if info.IsOpen() && info.HasLabel(policy.Label) {
 		admission.exception, verificationErr = h.evaluatePRSchemaLabel(ctx, client, repo, pr, info, policy.Label)
-		if verificationErr != nil {
+		if errors.Is(verificationErr, ghclient.ErrPRSchemaTimelineIncomplete) {
+			notice = "The timeline exceeds GitHub’s 100-event verification page. Split the changes into smaller PRs to proceed."
+			verificationErr = nil
+		} else if verificationErr != nil {
 			h.logger.Warn("could not verify the PR schema limit exception", "repo", repo, "pr", pr, "error", verificationErr)
 			notice = "SchemaBot could not verify the exception with GitHub. Retry the check."
 		}
 	}
-	if !aboveLimit || admission.exception != "" {
-		if !aboveLimit {
-			admission.exception = ""
-		}
+	if admission.exception != "" {
 		if mode == schemaCapAutoPlan {
 			h.resolvePRSchemaHold(ctx, client, repo, pr, policy)
 		}

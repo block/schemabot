@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -214,7 +215,9 @@ func (h *Handler) runPRSchemaExceptionEvent(parent context.Context, payload pull
 	if payload.Action == "labeled" {
 		label := h.config().PRSchemaCapForRepo(repo).Label
 		adopted, err := h.recordPRSchemaLabel(ctx, client, repo, pr, info, label, payload, received)
-		if err != nil || !adopted {
+		// An incomplete timeline cannot authorize the label. Continue to
+		// admission so an over-limit PR gets the hold and recovery instructions.
+		if !errors.Is(err, ghclient.ErrPRSchemaTimelineIncomplete) && (err != nil || !adopted) {
 			return err
 		}
 	}

@@ -2033,6 +2033,11 @@ set it to `false` on the others. By default, standalone deployments and aggregat
 leaders remove stale labels. If a stale label remains visible, remove it and
 add it again to acknowledge the new revision.
 
+At or below the limit, admission skips label verification. Above the limit,
+SchemaBot verifies an exception using at most one page of 100 PR timeline
+events. If GitHub reports another page, the PR stays held. Split the changes
+into smaller PRs to proceed.
+
 The exception enables planning and new work on that revision. Existing apply
 approval policies are evaluated independently.
 
