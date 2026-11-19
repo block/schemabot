@@ -2144,9 +2144,24 @@ func TestE2EAutoPlanPublishesApplicableEnvironmentChecks(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, missing)
 			require.NoError(t, svc.Storage().Checks().Delete(ctx, missing.ID))
-			outcome, err := h.BackfillPRCheckRuns(ctx, "octocat/hello-world", 1, 12345)
+			// Without a plan request the schema PR is deferred, and nothing is
+			// written: its check stays missing, so the merge stays blocked.
+			deferred, err := h.BackfillPRCheckRuns(ctx, "octocat/hello-world", 1, 12345, api.CheckRunBackfillOptions{})
 			require.NoError(t, err)
-			assert.Equal(t, "auto-plan started", outcome)
+			assert.Equal(t, api.CheckRunBackfillResult{
+				Outcome:      "deferred: PR changes managed schema",
+				Deferred:     true,
+				Databases:    []string{dbName},
+				ChangedFiles: 1,
+			}, deferred)
+			h.DrainInProcessWebhookWork(ctx)
+			require.NoError(t, ctx.Err())
+			stillMissing, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, tc.databaseEnv, aggregateSentinel, aggregateSentinel)
+			require.NoError(t, err)
+			assert.Nil(t, stillMissing)
+			backfilled, err := h.BackfillPRCheckRuns(ctx, "octocat/hello-world", 1, 12345, api.CheckRunBackfillOptions{Plan: true})
+			require.NoError(t, err)
+			assert.Equal(t, api.CheckRunBackfillResult{Outcome: "auto-plan started"}, backfilled)
 			require.Eventually(t, func() bool {
 				check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, tc.databaseEnv, aggregateSentinel, aggregateSentinel)
 				return err == nil && check != nil && check.HeadSHA == "newsha222" && check.Conclusion == checkConclusionActionRequired
