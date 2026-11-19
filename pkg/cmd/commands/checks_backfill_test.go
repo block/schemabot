@@ -105,7 +105,7 @@ func TestScanObservedAtPrefersTheServersClock(t *testing.T) {
 
 	// A server reporting no clock is one that does not annotate either, so the
 	// caller's own clock is all there is and the threshold still applies.
-	before := webhookRedriveNow()
+	before := operatorNow()
 	fallback := scanObservedAt(&apitypes.ChecksScanResponse{})
 	assert.False(t, fallback.Before(before), "an unreported clock falls back to the caller's own")
 

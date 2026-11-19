@@ -535,7 +535,7 @@ Reason values:
 
 Operation names mirror the mutating endpoints (`plan`, `apply`, control
 operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
-admin-only `checks_*`, `webhook_redrive`, `settings_set`). Unrecognized
+admin-only `checks_*`, `settings_set`). Unrecognized
 operation, status, or reason values are recorded as `unknown` to keep
 cardinality bounded. `database` and `environment` use the `unknown` sentinel
 when the operation has no such dimension (admin-only operations have no single
@@ -670,7 +670,7 @@ On a quota alert, find this warning for the installation/resource and check the
 reset time. The logged repository encountered exhaustion; it is not necessarily
 the repository that consumed the shared budget. Compare `requests_total` volume
 by repository and operation for that installation/resource before exhaustion to
-locate excess traffic, then reduce avoidable requests or repeated redrives. After
+locate excess traffic, then reduce avoidable requests or repeated backfills. After
 reset, verify fresh successful checks for affected repositories before declaring
 recovery. Keep the rejection counter as the direct alert signal, including
 locally blocked calls; use the warning for investigation context.

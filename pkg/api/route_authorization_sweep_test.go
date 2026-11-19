@@ -110,7 +110,6 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 		"POST /api/checks/scan":       `{}`,
 		"POST /api/checks/synthesize": `{}`,
 		"POST /api/checks/repos":      `{}`,
-		"POST /api/webhooks/redrive":  `{}`,
 		// The storage schema routes take no database — they are about
 		// SchemaBot's own bookkeeping database — so a scoped operator is denied
 		// on the admin requirement itself rather than on a target outside their

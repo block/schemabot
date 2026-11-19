@@ -779,7 +779,7 @@ before allowing the request to continue. See
 and how the check works.
 
 Some operations always need an admin: changing settings, maintaining checks,
-redriving webhooks, forcing a lock release, and reading or converging
+forcing a lock release, and reading or converging
 SchemaBot's own storage schema. A database operator grant does not permit those
 operations. An operator grant covers a team's own database; SchemaBot's storage
 database is not any team's, so nothing scopes to it.

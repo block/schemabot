@@ -295,7 +295,6 @@ func TestEveryNonGetRequestPathIsClassified(t *testing.T) {
 		"/api/locks":                {changes: true, check: "locks"},
 		"/api/locks/acquire":        {changes: true, check: "locks"},
 		"/api/checks/synthesize":    {changes: true},
-		"/api/webhooks/redrive":     {changes: true},
 		"/api/storage/schema/apply": {changes: true},
 	}
 

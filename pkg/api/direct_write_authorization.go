@@ -115,7 +115,7 @@ func (c *ServerConfig) AuthorizeDirectDatabaseWrite(user *auth.User, database st
 
 // AuthorizeDirectAdminWrite decides whether the caller may run a mutating
 // operation that has no single target database (deployment settings, stored
-// check state, webhook redrive). Such operations stay admin-only: without a
+// check state). Such operations stay admin-only: without a
 // database to scope to, a scoped grant cannot apply.
 func (c *ServerConfig) AuthorizeDirectAdminWrite(user *auth.User) DirectWriteAuthorizationResult {
 	result, decided := c.directWriteCommonDecision(user)

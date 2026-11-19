@@ -1092,6 +1092,14 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+`checks backfill` replaces the removed `webhooks redrive` command and its
+`POST /api/webhooks/redrive` endpoint. To recover missing Check Runs, run
+`checks backfill`, then run the `--plan --pr` command it prints for deferred
+schema PRs. To inspect or redeliver one specific failed delivery, use
+**Recent Deliveries** on the GitHub App's **Advanced** settings page. Scripts
+that sent delivery IDs to the removed endpoint should move to that page or to
+GitHub's App delivery API.
+
 A missing check on a PR that changes no managed schema costs a few GitHub
 requests to recreate. A PR that does change managed schema needs a plan, and
 a plan reads every changed database's schema once per environment, so one
@@ -1172,8 +1180,8 @@ Skipped repositories named by --skip-repo: acme/monorepo.
 No missing SchemaBot Check Runs found.
 ```
 
-A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
-are. Each says on stderr that it was canceled and exits 130, the status a
+A Ctrl-C or SIGTERM stops `checks backfill` where it is. It says on stderr
+that it was canceled and exits 130, the status a
 shell reports for an interrupted process, so a script can tell an interrupted
 run from one that failed or left findings.
 
@@ -1192,8 +1200,6 @@ What an interrupted run reports depends on where it stopped:
   may have acted on the request in flight. A PR in a later batch reads
   `not attempted: interrupted before this PR was sent`, because it never
   reached the server.
-- `webhooks redrive` prints the redelivery counts from the chunks that
-  completed, and prints none under `--dry-run`.
 
 ```console
 $ schemabot checks backfill acme/store -e production
@@ -1230,10 +1236,8 @@ sent for it. The same interrupted run, cut down to two of its PRs:
 }
 ```
 
-Treat the redrive counts as a lower bound: the server may have finished part
-of the chunk that was in flight. Checks already recreated and deliveries
-already redelivered are not undone. Run `checks backfill` again to finish the
-sweep; it only acts on PRs whose Check Runs are still missing.
+Checks already recreated are not undone. Run `checks backfill` again to finish
+the sweep; it only acts on PRs whose Check Runs are still missing.
 
 If `checks backfill` cannot write its interrupted report to stdout, for
 example because the disk behind a redirect is full, it says so on stderr,
