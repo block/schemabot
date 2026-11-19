@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -74,6 +75,9 @@ func TestRunMapsAStartupFailureToItsExitCode(t *testing.T) {
 		{name: "stopped while the database opens", ctx: stopped, args: args, code: exitInconclusive, out: "INCONCLUSIVE"},
 		{name: "database unreachable", ctx: t.Context(), args: args, code: exitFailed, out: "FAIL"},
 		{name: "help", ctx: t.Context(), args: []string{"schemabot-e2e", "-h"}, code: exitFailed},
+		// Counting GitHub calls needs the Kubernetes API, so outside a pod the
+		// gate fails at startup instead of running without a count.
+		{name: "counting calls outside a pod", ctx: t.Context(), args: append(slices.Clone(args), "--github-calls-namespaces", "schemabot"), code: exitFailed},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer

@@ -3,6 +3,7 @@ module github.com/block/schemabot
 go 1.26.11
 
 require (
+	github.com/DataDog/datadog-go/v5 v5.8.3
 	github.com/alecthomas/kong v1.17.0
 	github.com/aws/aws-sdk-go-v2 v1.43.5
 	github.com/aws/aws-sdk-go-v2/config v1.32.14
@@ -86,7 +87,6 @@ require (
 	github.com/DataDog/datadog-agent/pkg/util/log v0.77.3 // indirect
 	github.com/DataDog/datadog-agent/pkg/util/scrubber v0.77.3 // indirect
 	github.com/DataDog/datadog-agent/pkg/version v0.77.3 // indirect
-	github.com/DataDog/datadog-go/v5 v5.8.3 // indirect
 	github.com/DataDog/dd-trace-go/v2 v2.8.2 // indirect
 	github.com/DataDog/go-libddwaf/v4 v4.9.0 // indirect
 	github.com/DataDog/go-runtime-metrics-internal v0.0.4-0.20260217080614-b0f4edc38a6d // indirect
