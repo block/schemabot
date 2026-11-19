@@ -1102,6 +1102,8 @@ func (cmd *ChecksBackfillCmd) actOnMergeQueue(ctx context.Context, endpoint stri
 			resp, err := cmdclient.ChecksSynthesize(ctx, endpoint, apitypes.ChecksSynthesizeRequest{
 				Repo:                  repo,
 				MergeQueueHeads:       batch,
+				Environment:           cmd.Environment,
+				CheckName:             cmd.CheckName,
 				RateLimitFloorPercent: cmd.RateLimitFloor,
 			})
 			if err != nil {

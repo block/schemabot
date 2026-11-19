@@ -1822,7 +1822,7 @@ func TestChecksBackfillPostsMergeQueueChecksBeforePRs(t *testing.T) {
 	server.queue = []apitypes.MissingMergeQueueCheck{testMergeGroup(412, "mq412"), testMergeGroup(413, "mq413"), testMergeGroup(414, "mq414")}
 	server.queueScanned = 3
 
-	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h", RateLimitFloor: 20}
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", Environment: "production", CheckName: "SchemaBot (production)", StuckAfter: "1h", RateLimitFloor: 20}
 	var runErr error
 	output := captureStdout(func() {
 		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
@@ -1834,6 +1834,8 @@ func TestChecksBackfillPostsMergeQueueChecksBeforePRs(t *testing.T) {
 	assert.Equal(t, []string{"mq412", "mq413", "mq414"}, synthesizes[0].MergeQueueHeads)
 	assert.Empty(t, synthesizes[0].PRs)
 	assert.Equal(t, 20, synthesizes[0].RateLimitFloorPercent)
+	assert.Equal(t, "production", synthesizes[0].Environment, "merge queue posts stay within the run's environment")
+	assert.Equal(t, "SchemaBot (production)", synthesizes[0].CheckName, "merge queue posts stay within the run's check name")
 	assert.Equal(t, []int{7}, synthesizes[1].PRs)
 	assert.Empty(t, synthesizes[1].MergeQueueHeads)
 

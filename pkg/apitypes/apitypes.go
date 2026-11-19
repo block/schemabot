@@ -423,6 +423,11 @@ type ChecksSynthesizeRequest struct {
 	// live merge group never gets a passing check. They are handled before
 	// PRs, since each one blocks the PRs queued behind it.
 	MergeQueueHeads []string `json:"merge_queue_heads,omitempty"`
+	// Environment and CheckName are the run's scope, as on the scan request.
+	// They limit the checks posted on MergeQueueHeads to the ones the scan
+	// looked for. A head gets only the checks in scope it is still missing.
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
 }
 
 type ChecksSynthesizeResponse struct {

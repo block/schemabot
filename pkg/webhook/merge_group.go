@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -296,12 +297,14 @@ func (h *Handler) mergeGroupCheckSkipReason(ctx context.Context, repo string, at
 	return ""
 }
 
-// BackfillMergeQueueCheck posts the passing merge-queue check on headSHA, as
-// the merge_group delivery for that merge group would have. The caller must
-// have verified that headSHA is a merge group the queue is still testing:
-// the check passes unconditionally, which is right only for a commit the
-// queue built from PRs whose own checks already passed.
-func (h *Handler) BackfillMergeQueueCheck(ctx context.Context, repo string, installationID int64, headSHA string) (string, error) {
+// BackfillMergeQueueCheck posts the passing merge-queue check on headSHA for
+// each target in scope that the head is still missing, as the merge_group
+// delivery for that merge group would have. A check already on the head is
+// left as it is, so the backfill only fills gaps. The caller must have
+// verified that headSHA is a merge group the queue is still testing: the
+// check passes unconditionally, which is right only for a commit the queue
+// built from PRs whose own checks already passed.
+func (h *Handler) BackfillMergeQueueCheck(ctx context.Context, repo string, installationID int64, headSHA string, scope api.MergeQueueCheckScope) (string, error) {
 	repo = storage.CanonicalKey(repo)
 	if skip := h.mergeGroupCheckSkipReason(ctx, repo, "head_sha", headSHA, "installation_id", installationID, "source", "checks.backfill"); skip != "" {
 		return skip, nil
@@ -312,7 +315,8 @@ func (h *Handler) BackfillMergeQueueCheck(ctx context.Context, repo string, inst
 	if err != nil {
 		return "", fmt.Errorf("create GitHub client for merge queue check %s@%s: %w", repo, headSHA, err)
 	}
-	if err := h.postPassingAggregateChecks(ctx, client, repo, headSHA, mergeGroupCheckContent()); err != nil {
+	posted, err := h.postMissingMergeQueueChecks(ctx, client, repo, headSHA, scope)
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "merge_group_check",
 			Repository: repo,
@@ -325,8 +329,80 @@ func (h *Handler) BackfillMergeQueueCheck(ctx context.Context, repo string, inst
 			"repo", repo, "head_sha", headSHA)
 		return "skipped: listen-only repository", nil
 	}
-	h.logger.Info("merge queue check backfilled", "repo", repo, "head_sha", headSHA, "installation_id", installationID)
+	if posted == 0 {
+		h.logger.Info("merge queue check backfill posted nothing: every check in scope is already on the merge group",
+			"repo", repo, "head_sha", headSHA, "environment", scope.Environment, "check_name", scope.CheckName)
+		return mergeQueueChecksAlreadyPresent, nil
+	}
+	h.logger.Info("merge queue check backfilled", "repo", repo, "head_sha", headSHA, "installation_id", installationID, "posted", posted)
 	return "posted passing merge queue check", nil
+}
+
+// mergeQueueChecksAlreadyPresent is the outcome for a merge group whose checks
+// in scope appeared between the scan and the post, for example from a late
+// merge_group delivery.
+const mergeQueueChecksAlreadyPresent = "skipped: checks already present"
+
+// postMissingMergeQueueChecks creates the passing merge queue check for each
+// target in scope that headSHA does not already carry, and returns how many it
+// created. A scope that keeps no target is an error: the operator asked for a
+// check this server does not post on the merge group, so the group stays
+// reported as missing it. A failed lookup is an error too, rather than a
+// create, because a backfill that cannot tell whether a check exists must not
+// add a second one beside it.
+func (h *Handler) postMissingMergeQueueChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, scope api.MergeQueueCheckScope) (int, error) {
+	content := mergeGroupCheckContent()
+	targets, err := h.passingAggregateCheckTargets(ctx, client, repo, headSHA, content.operation)
+	if err != nil {
+		return 0, err
+	}
+	var inScope []aggregateCheckTarget
+	for _, target := range targets {
+		if scope.Environment != "" && target.environment != scope.Environment {
+			continue
+		}
+		if scope.CheckName != "" && target.name != scope.CheckName {
+			continue
+		}
+		inScope = append(inScope, target)
+	}
+	if len(inScope) == 0 {
+		return 0, fmt.Errorf("this server posts no merge queue check matching environment %q and check name %q on %s@%s", scope.Environment, scope.CheckName, repo, headSHA)
+	}
+	listenOnly := h.isRepoListenOnly(repo)
+	posted := 0
+	for _, target := range inScope {
+		existing, _, err := client.FindCheckRunByName(ctx, repo, headSHA, target.name)
+		if err != nil {
+			return posted, fmt.Errorf("look up %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
+		}
+		if existing != nil {
+			h.logger.Info("merge queue check backfill leaving an existing check as it is",
+				"repo", repo, "head_sha", headSHA, "check_name", target.name, "environment", target.environment, "check_run_id", existing.ID)
+			continue
+		}
+		if listenOnly {
+			h.logger.Info("skipping passing aggregate Check Run on listen-only repository",
+				"repo", repo, "head_sha", headSHA, "check_name", target.name,
+				"environment", target.environment, "operation", content.operation)
+			continue
+		}
+		if _, err := client.CreateCheckRun(ctx, repo, headSHA, passingAggregateCheckRunOptions(target, content)); err != nil {
+			return posted, fmt.Errorf("create %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
+		}
+		posted++
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   content.operation,
+			Repository:  repo,
+			Environment: target.environment,
+			Status:      "success",
+		})
+		h.logger.Info("posted passing aggregate",
+			"repo", repo, "head_sha", headSHA, "check_name", target.name,
+			"environment", target.environment, "action", "created",
+			"operation", content.operation)
+	}
+	return posted, nil
 }
 
 // passingAggregateCheckContent carries the operation name and Check Run output
@@ -343,28 +419,13 @@ type passingAggregateCheckContent struct {
 // names as the PR-head aggregates so branch protection's required checks
 // always match.
 func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, content passingAggregateCheckContent) error {
-	targets := h.aggregateCheckTargetsForRepo(repo)
-	if config, ok := h.serverConfig(); ok && len(config.AllowedEnvironments) > 0 {
-		environments, err := config.CheckEnvironmentsForRepo(ctx, client, repo, headSHA)
-		if err != nil {
-			return fmt.Errorf("resolve %s coverage: %w", content.operation, err)
-		}
-		targets = nil
-		for _, env := range environments {
-			targets = append(targets, aggregateCheckTarget{name: aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), env), environment: env})
-		}
+	targets, err := h.passingAggregateCheckTargets(ctx, client, repo, headSHA, content.operation)
+	if err != nil {
+		return err
 	}
 	listenOnly := h.isRepoListenOnly(repo)
 	for _, target := range targets {
-		opts := ghclient.CheckRunOptions{
-			Name:       target.name,
-			Status:     checkStatusCompleted,
-			Conclusion: checkConclusionSuccess,
-			Output: &ghclient.CheckRunOutput{
-				Title:   content.title,
-				Summary: content.summary,
-			},
-		}
+		opts := passingAggregateCheckRunOptions(target, content)
 		// Reuse an existing run for this name on the SHA so a webhook
 		// redelivery updates it rather than creating a duplicate Check Run.
 		// The lookup errors when the App slug is unknown; on any lookup error
@@ -409,4 +470,37 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			"operation", content.operation)
 	}
 	return nil
+}
+
+// passingAggregateCheckTargets lists the aggregate checks a passing post on
+// headSHA covers: one per environment the head's changes reach when this
+// instance gates environments, otherwise the single global aggregate.
+func (h *Handler) passingAggregateCheckTargets(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA, operation string) ([]aggregateCheckTarget, error) {
+	config, ok := h.serverConfig()
+	if !ok || len(config.AllowedEnvironments) == 0 {
+		return h.aggregateCheckTargetsForRepo(repo), nil
+	}
+	environments, err := config.CheckEnvironmentsForRepo(ctx, client, repo, headSHA)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s coverage: %w", operation, err)
+	}
+	targets := make([]aggregateCheckTarget, 0, len(environments))
+	for _, env := range environments {
+		targets = append(targets, aggregateCheckTarget{name: aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), env), environment: env})
+	}
+	return targets, nil
+}
+
+// passingAggregateCheckRunOptions is the completed, successful Check Run a
+// passing post writes for target.
+func passingAggregateCheckRunOptions(target aggregateCheckTarget, content passingAggregateCheckContent) ghclient.CheckRunOptions {
+	return ghclient.CheckRunOptions{
+		Name:       target.name,
+		Status:     checkStatusCompleted,
+		Conclusion: checkConclusionSuccess,
+		Output: &ghclient.CheckRunOutput{
+			Title:   content.title,
+			Summary: content.summary,
+		},
+	}
 }

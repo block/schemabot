@@ -474,6 +474,10 @@ each repository it sweeps and posts the same passing check on every merge
 group missing one. Before it posts, the server lists the queue again and
 posts only on heads the queue still holds, and it skips the repositories this
 webhook would skip. If the queue cannot be listed, it posts nothing (MG-1).
+The backfill posts only the checks in the run's `-e` and `--check-name`, and
+only those the merge group does not already carry. It leaves an existing
+check as it is, and posts nothing on a head whose existing checks it cannot
+read.
 Listing the queue reads branches, which the App's Contents read permission
 already grants.
 

@@ -390,10 +390,13 @@ type fakeCheckRunBackfiller struct {
 	// failHead names one whose post fails.
 	mergeQueueCalls []string
 	failHead        string
+	// mergeQueueScopes records the scope each merge group post carried.
+	mergeQueueScopes []MergeQueueCheckScope
 }
 
-func (f *fakeCheckRunBackfiller) BackfillMergeQueueCheck(_ context.Context, _ string, _ int64, headSHA string) (string, error) {
+func (f *fakeCheckRunBackfiller) BackfillMergeQueueCheck(_ context.Context, _ string, _ int64, headSHA string, scope MergeQueueCheckScope) (string, error) {
 	f.mergeQueueCalls = append(f.mergeQueueCalls, headSHA)
+	f.mergeQueueScopes = append(f.mergeQueueScopes, scope)
 	if headSHA == f.failHead {
 		return "", errors.New("create check run: 502 Bad Gateway")
 	}
@@ -568,6 +571,12 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 	_, err = executeChecksSynthesize(t.Context(), cfg, nil, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1}}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no GitHub webhook runtime")
+
+	narrowable := &ServerConfig{AllowedEnvironments: []string{"staging"}}
+	_, err = executeChecksSynthesize(t.Context(), narrowable, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"sha1"}, Environment: "production"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `environment "production" is not one this instance handles`)
+	assert.Empty(t, backfiller.mergeQueueScopes, "a refused environment posts nothing")
 }
 
 // A repository that is not an owner/name pair is the caller's mistake, and it
@@ -2042,9 +2051,11 @@ func TestBackfillMergeQueuePostsOnlyOnLiveHeads(t *testing.T) {
 	backfiller := &fakeCheckRunBackfiller{failHead: "group-418"}
 
 	results := backfillMergeQueueWithinBudget(t.Context(), client, backfiller,
-		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "merged-group", "group-418"}}, 7, discardLogger())
+		ChecksSynthesizeRequest{Repo: "octo/repo", MergeQueueHeads: []string{"group-412", "merged-group", "group-418"}, Environment: "production", CheckName: "SchemaBot (production)"}, 7, discardLogger())
 
 	assert.Equal(t, []string{"group-412", "group-418"}, backfiller.mergeQueueCalls)
+	scope := MergeQueueCheckScope{Environment: "production", CheckName: "SchemaBot (production)"}
+	assert.Equal(t, []MergeQueueCheckScope{scope, scope}, backfiller.mergeQueueScopes, "each post carries the run's scope, so it posts only the checks the scan looked for")
 	assert.Equal(t, []ChecksMergeQueueResult{
 		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
 		{HeadSHA: "merged-group", Outcome: mergeQueueHeadGoneOutcome},

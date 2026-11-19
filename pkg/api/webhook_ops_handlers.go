@@ -151,9 +151,19 @@ type IncompleteCheckRun = apitypes.IncompleteCheckRun
 // operator endpoints can reach the webhook pipeline.
 type CheckRunBackfiller interface {
 	BackfillPRCheckRuns(ctx context.Context, repo string, pr int, installationID int64, opts CheckRunBackfillOptions) (CheckRunBackfillResult, error)
-	// BackfillMergeQueueCheck posts the passing merge-queue check on a merge
-	// group head the caller has verified the queue is still testing.
-	BackfillMergeQueueCheck(ctx context.Context, repo string, installationID int64, headSHA string) (string, error)
+	// BackfillMergeQueueCheck posts the passing merge-queue checks in scope
+	// that a merge group head is still missing, on a head the caller has
+	// verified the queue is still testing.
+	BackfillMergeQueueCheck(ctx context.Context, repo string, installationID int64, headSHA string, scope MergeQueueCheckScope) (string, error)
+}
+
+// MergeQueueCheckScope limits a merge queue check backfill to the checks an
+// operator asked about. Environment keeps the checks for one environment, and
+// CheckName keeps the check with that exact name. Empty fields keep every
+// check the merge_group delivery would post.
+type MergeQueueCheckScope struct {
+	Environment string
+	CheckName   string
 }
 
 // CheckRunBackfillOptions controls how much work one PR's backfill may start.
@@ -232,6 +242,9 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	}
 	if slices.Contains(req.MergeQueueHeads, "") {
 		return nil, webhookOpsRequestErrorf("merge_queue_heads must not contain an empty commit")
+	}
+	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+		return nil, err
 	}
 	if len(req.PRs) > checksSynthesizeMaxPRsPerRequest {
 		return nil, webhookOpsRequestErrorf("at most %d prs per request; send the rest in follow-up requests", checksSynthesizeMaxPRsPerRequest)
@@ -382,7 +395,7 @@ func backfillMergeQueueWithinBudget(ctx context.Context, client mergeQueueSynthe
 			}
 			return results
 		}
-		outcome, err := backfiller.BackfillMergeQueueCheck(ctx, req.Repo, installationID, head)
+		outcome, err := backfiller.BackfillMergeQueueCheck(ctx, req.Repo, installationID, head, MergeQueueCheckScope{Environment: req.Environment, CheckName: req.CheckName})
 		result := ChecksMergeQueueResult{HeadSHA: head, Outcome: outcome}
 		if err != nil {
 			// Each merge group is independent; report the failure and keep
@@ -563,17 +576,22 @@ type mergeQueueLister interface {
 type checksScanClientResolver func(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (checksScanClient, error)
 
 // installationChecksScanClient reads through app's installation on repo, the
-// same one SchemaBot publishes the repository's Check Runs through.
-func installationChecksScanClient(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (checksScanClient, error) {
-	client, _, err := resolveAppInstallationClient(ctx, app, repo, logger)
-	if err != nil {
-		return nil, err
+// same one SchemaBot publishes the repository's Check Runs through. It carries
+// cfg's schema directory hints, as the webhook's clients do, so resolving
+// which environments a head expects checks for succeeds where the webhook's
+// would when GitHub truncates the repository tree.
+func installationChecksScanClient(cfg *ServerConfig) checksScanClientResolver {
+	return func(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (checksScanClient, error) {
+		client, _, err := resolveAppInstallationClient(ctx, app, repo, logger, ghclient.WithConfigDirHints(cfg))
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
 	}
-	return client, nil
 }
 
 func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
-	return executeChecksScanWith(ctx, cfg, store, req, logger, installationChecksScanClient)
+	return executeChecksScanWith(ctx, cfg, store, req, logger, installationChecksScanClient(cfg))
 }
 
 // checksBackfillSupport is every backfill behavior this server implements.

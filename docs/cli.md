@@ -1135,7 +1135,9 @@ A blocked merge queue holds every PR queued behind it, so a sweep of a
 repository also reads its merge queue. A merge group missing its SchemaBot
 check gets the same passing check the `merge_group` webhook posts, before
 any PR's check is recreated. The server lists the queue again first and
-posts only on groups it still holds:
+posts only on groups it still holds. It posts only the checks in the run's
+`-e` and `--check-name` that the group is missing, and leaves the group's
+existing checks as they are:
 
 ```console
 $ schemabot checks backfill acme/store -e production
