@@ -253,12 +253,14 @@ the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outco
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
 in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLanded`
 (`pkg/tern/local_apply_failure.go`) as the only proof that lets either gate adopt an outcome write
-that returned an error, the resume's refusal to record a failure over an outcome it already stored
-(the no-remaining-work branches of `resumeApplyWithTasks` and `launchAtomicResume` return a
-`postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
-`pkg/tern/local_control_resume.go`), the progress-poll error budget in the grouped drive and the
-resume's handling of a failed reattach to accepted engine work, whose pause disposition is
-`shouldPauseAcceptedWork` (`pkg/tern/local_apply_sequential.go`), the remote progress error
+that returned an error, the re-read before an outcome write that returns a failed or missing read
+as an error instead of writing (`storedTerminalApply`, `pkg/tern/local_apply_failure.go`), the
+resume's refusal to record a failure over an outcome it already stored (the no-remaining-work
+branches of `resumeApplyWithTasks` and `launchAtomicResume` return a `postTerminalReconcileError`
+that `handleGroupedResumeFailure` passes through, `pkg/tern/local_control_resume.go`), the
+progress-poll error budget in the grouped drive and the resume's handling of a failed reattach to
+accepted engine work, whose pause disposition is `shouldPauseAcceptedWork`
+(`pkg/tern/local_apply_sequential.go`), the remote progress error
 limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
 deploy call failed, which tracks a deploy that started instead of failing it and reports an
 unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
