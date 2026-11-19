@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -101,11 +103,23 @@ func TestFindInstallationErrorTransportFailureIsNotNotInstalled(t *testing.T) {
 // installationLookupServer answers GitHub's installation lookup for any
 // repository through the App-JWT transport and counts the lookups per
 // owner/name. respond picks the status, installation id, and account login for
-// each lookup; an id of zero with a 2xx status is never sent.
+// each lookup; an id of zero with a 2xx status is never sent. When release is
+// set, each lookup announces its repository on started and waits for release
+// or for its request's context to end before answering.
 type installationLookupServer struct {
 	mu      sync.Mutex
 	lookups map[string]int
 	respond func(owner, name string) (status int, id int64, account string)
+	started chan string
+	release chan struct{}
+}
+
+// holdLookups makes every later lookup wait until the returned function
+// releases them.
+func (s *installationLookupServer) holdLookups() (release func()) {
+	s.started = make(chan string, 64)
+	s.release = make(chan struct{})
+	return sync.OnceFunc(func() { close(s.release) })
 }
 
 func (s *installationLookupServer) total() int {
@@ -142,6 +156,14 @@ func newInstallationLookupClient(t *testing.T, respond func(owner, name string) 
 			server.mu.Lock()
 			server.lookups[owner+"/"+name]++
 			server.mu.Unlock()
+			if server.release != nil {
+				server.started <- owner + "/" + name
+				select {
+				case <-server.release:
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+			}
 			status, id, account := server.respond(owner, name)
 			body := `{"message":"status"}`
 			if status < 300 {
@@ -287,4 +309,105 @@ func TestInstallationIDForRepoDoesNotCacheAnotherAccountsInstallation(t *testing
 		assert.Equal(t, int64(7), id)
 	}
 	assert.Equal(t, 2, server.total())
+}
+
+// A webhook delivery whose request is canceled while it waits on another
+// caller's lookup for the same owner returns at once with its own context
+// error, and its cancellation does not cancel the shared lookup. A delivery
+// that started the lookup and then gave up leaves the owner resolved for every
+// other repository of that owner, with no second lookup.
+func TestInstallationIDForRepoCallerCancellationDoesNotFailTheSharedLookup(t *testing.T) {
+	client, server := newInstallationLookupClient(t, installedFor(map[string]int64{"octo": 7}))
+	release := server.holdLookups()
+	t.Cleanup(release)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	canceled := make(chan error, 1)
+	go func() {
+		_, err := client.InstallationIDForRepo(ctx, "octo/a")
+		canceled <- err
+	}()
+	waitForLookup(t, server, "octo/a")
+	cancel()
+	select {
+	case err := <-canceled:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(installationTestTimeout):
+		require.FailNow(t, "canceled caller did not return while the shared lookup was held")
+	}
+
+	other := make(chan error, 1)
+	var otherID int64
+	go func() {
+		var err error
+		otherID, err = client.InstallationIDForRepo(t.Context(), "octo/b")
+		other <- err
+	}()
+	release()
+	select {
+	case err := <-other:
+		require.NoError(t, err)
+	case <-time.After(installationTestTimeout):
+		require.FailNow(t, "second caller did not return after the shared lookup was released")
+	}
+	assert.Equal(t, int64(7), otherID)
+	assert.Equal(t, 1, server.total(), "the canceled caller's lookup must still finish and resolve the owner")
+}
+
+// When concurrent deliveries for two repositories of one owner share a lookup
+// that finds an installation belonging to another account, that installation is
+// not handed to the second repository: it gets its own lookup and its own
+// installation.
+func TestInstallationIDForRepoDoesNotShareAnotherAccountsInstallation(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(_, name string) (int, int64, string) {
+		if name == "a" {
+			return http.StatusOK, 7, "someone-else"
+		}
+		return http.StatusOK, 9, "octo"
+	})
+	release := server.holdLookups()
+	t.Cleanup(release)
+
+	firstID := make(chan int64, 1)
+	go func() {
+		id, err := client.InstallationIDForRepo(t.Context(), "octo/a")
+		assert.NoError(t, err)
+		firstID <- id
+	}()
+	waitForLookup(t, server, "octo/a")
+
+	secondID := make(chan int64, 1)
+	go func() {
+		id, err := client.InstallationIDForRepo(t.Context(), "octo/b")
+		assert.NoError(t, err)
+		secondID <- id
+	}()
+	release()
+
+	for _, want := range []struct {
+		results <-chan int64
+		id      int64
+	}{{firstID, 7}, {secondID, 9}} {
+		select {
+		case id := <-want.results:
+			assert.Equal(t, want.id, id)
+		case <-time.After(installationTestTimeout):
+			require.FailNow(t, "installation lookup did not return after release")
+		}
+	}
+	assert.Equal(t, 1, server.count("octo/a"))
+	assert.Equal(t, 1, server.count("octo/b"))
+}
+
+// installationTestTimeout bounds each wait on a held installation lookup.
+const installationTestTimeout = 10 * time.Second
+
+func waitForLookup(t *testing.T, server *installationLookupServer, repo string) {
+	t.Helper()
+	select {
+	case got := <-server.started:
+		require.Equal(t, repo, got)
+	case <-time.After(installationTestTimeout):
+		require.FailNow(t, "installation lookup did not start", "repo %s", repo)
+	}
 }
