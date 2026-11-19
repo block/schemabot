@@ -397,6 +397,34 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 // check here (the post re-verifies the head SHA and can no-op during a GitHub
 // outage).
 func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
+	dispatch, err := h.dispatchAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, source, action, beforeSHA, deliveryID, autoPlanOptions{})
+	return dispatch.message, err
+}
+
+// autoPlanOptions changes what one auto-plan dispatch is allowed to start.
+type autoPlanOptions struct {
+	// deferSchemaPlans stops before any write when the PR changes schema this
+	// deployment manages, and reports the databases it would have planned.
+	// Planning is the expensive part of an auto-plan: every database reads its
+	// schema files once per environment. An operator recovering checks across
+	// many PRs sets this so the cheap PRs settle first and each schema PR is
+	// planned only when asked for by number.
+	deferSchemaPlans bool
+}
+
+// autoPlanDispatch is what one auto-plan dispatch did.
+type autoPlanDispatch struct {
+	message string
+	// deferredDatabases lists the managed databases a deferred dispatch would
+	// have planned. It is set only when deferSchemaPlans stopped the dispatch.
+	deferredDatabases []string
+	// changedFiles counts the files the PR proposes against the default
+	// branch, as a size hint for the plan a deferred dispatch skipped.
+	changedFiles int
+}
+
+// dispatchAutoPlanForPR is runAutoPlanForPR with options; see its comment.
+func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string, opts autoPlanOptions) (autoPlanDispatch, error) {
 	// Snapshot the base ref before anything is read, so the publish-time check
 	// below covers the whole of discovery. A base that moves mid-discovery
 	// changes which databases the PR touches, which is the case that check
@@ -408,23 +436,23 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
+		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
 	}
 	decision, err := h.evaluatePRTarget(ctx, client, repo, prInfo)
 	if err != nil {
 		h.logger.Error("auto-plan could not verify PR target", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		return "target eligibility could not be verified", fmt.Errorf("evaluate target for %s#%d: %w", repo, pr, err)
+		return autoPlanDispatch{message: "target eligibility could not be verified"}, fmt.Errorf("evaluate target for %s#%d: %w", repo, pr, err)
 	}
 	if prInfo.HeadSHA != headSHA {
-		return "auto-plan discarded because the PR moved during discovery", nil
+		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery"}, nil
 	}
 	if err := h.recordPRTargetObservation(ctx, repo, pr, prInfo, decision, deliveryID); err != nil {
 		h.logger.Error("auto-plan could not record PR target observation", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
-		return "target observation failed", fmt.Errorf("record target for %s#%d: %w", repo, pr, err)
+		return autoPlanDispatch{message: "target observation failed"}, fmt.Errorf("record target for %s#%d: %w", repo, pr, err)
 	}
 	if !decision.Eligible {
 		h.logger.Info("auto-plan skipped for excluded PR target", "repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "effective_target", decision.Target, "source", source)
-		return "skipped: PR target is excluded", nil
+		return autoPlanDispatch{message: "skipped: PR target is excluded"}, nil
 	}
 	baseRef := prInfo.BaseRef
 
@@ -443,7 +471,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.logConfigDiscoveryFailure("list PR changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
+		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
 	}
 
 	// Narrow the list to what the PR proposes against the default branch before
@@ -458,7 +486,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.logger.Error("failed to scope PR files to what the PR proposes", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
+		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
 	}
 	if len(files) != len(changedFiles) {
 		h.logger.Info("auto-plan scoped to the files the PR proposes against the default branch",
@@ -473,7 +501,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.logConfigDiscoveryFailure("resolve schema configs for changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
+		return autoPlanDispatch{message: "config discovery failed"}, fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
 	}
 
 	// Fail closed when the PR changes schema files under a directory the server
@@ -486,7 +514,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// head's plan comment would otherwise stay expanded beside it, still
 		// offering to apply DDL for a config this head no longer carries.
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
-		return "schema change under managed directory has no config", nil
+		return autoPlanDispatch{message: "schema change under managed directory has no config"}, nil
 	}
 
 	// Publishing a plan asserts that the inputs it was computed from still
@@ -499,17 +527,31 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if err != nil {
 		h.logger.Error("failed to re-verify the PR before publishing its plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postPlanPublishVerificationFailure(ctx, client, repo, pr, headSHA, err)
-		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
+		return autoPlanDispatch{message: "plan publish verification failed"}, fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
 	}
 	if moved != autoPlanInputsUnchanged {
 		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
 			"source", source, "delivery_id", deliveryID)
-		return "auto-plan discarded because the PR moved during discovery", nil
+		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery"}, nil
 	}
 
 	discovered := slices.Clone(configs)
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
+	if opts.deferSchemaPlans && len(configs) > 0 {
+		// No Check Run or stored check state has been written for this head yet,
+		// so a missing required check keeps blocking the merge until the
+		// operator asks for these plans (MG-1).
+		databases := managedDatabaseNames(configs)
+		h.logger.Info("auto-plan deferred schema plans; the PR's Check Runs are left as they are until its plans are requested",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "databases", databases,
+			"proposed_files", len(files), "source", source, "delivery_id", deliveryID)
+		return autoPlanDispatch{
+			message:           "deferred: PR changes managed schema",
+			deferredDatabases: databases,
+			changedFiles:      len(files),
+		}, nil
+	}
 	// On synchronize the comment cadence compares changed files between SHAs —
 	// a GitHub compare call. The unmanaged-config notice and the plan comments
 	// follow the same cadence, so the decision is memoized and computed at most
@@ -556,7 +598,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				Repository: repo,
 				Status:     "skipped",
 			})
-			return "no schema files in PR (aggregate participant, staying silent)", nil
+			return autoPlanDispatch{message: "no schema files in PR (aggregate participant, staying silent)"}, nil
 		}
 		// A PR with no leader-managed schema can still touch schema owned by
 		// expected participant deployments. The leader's aggregate is the
@@ -592,7 +634,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				}
 				h.updateAggregateCheck(ctx, c, repo, pr, headSHA)
 			})
-			return "no schema files in PR (aggregate folds expected participants)", nil
+			return autoPlanDispatch{message: "no schema files in PR (aggregate folds expected participants)"}, nil
 		}
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
@@ -614,7 +656,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			}
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA, unmanaged)
 		})
-		return "no schema files in PR", nil
+		return autoPlanDispatch{message: "no schema files in PR"}, nil
 	}
 
 	// Discovery is complete. Publish empty environments and pending placeholders
@@ -638,7 +680,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 	}
 
-	return "auto-plan started", nil
+	return autoPlanDispatch{message: "auto-plan started"}, nil
 }
 
 // severalDatabases is the count that makes an auto-plan comment name its
@@ -1593,4 +1635,15 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 		Status:       "success",
 	})
 	return true
+}
+
+// managedDatabaseNames returns the sorted, de-duplicated database names of
+// configs.
+func managedDatabaseNames(configs []ghclient.DiscoveredConfig) []string {
+	names := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		names = append(names, cfg.Config.Database)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
 }

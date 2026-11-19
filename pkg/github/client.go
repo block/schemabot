@@ -1043,27 +1043,54 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		return nil, 0, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
 	}
 	for _, pr := range ghPRs {
-		info := OpenPullRequest{
-			DefaultBranch: pr.GetBase().GetRepo().GetDefaultBranch(),
-			Number:        pr.GetNumber(),
-			Title:         pr.GetTitle(),
-			HeadRef:       pr.GetHead().GetRef(),
-			HeadSHA:       pr.GetHead().GetSHA(),
-			BaseRef:       pr.GetBase().GetRef(),
-			User:          pr.GetUser().GetLogin(),
-			UpdatedAt:     pr.GetUpdatedAt().Time,
-		}
-		if pr.Stack != nil {
-			info.NativeStack = true
-			info.StackBaseRef = pr.Stack.Base.Ref
-		}
-		prs = append(prs, info)
+		prs = append(prs, openPullRequestFrom(pr))
 	}
 	if resp != nil {
 		nextPage = resp.NextPage
 		lastPage = resp.LastPage
 	}
 	return prs, nextPage, lastPage, nil
+}
+
+// FetchOpenPullRequest reads one pull request in the shape
+// ListOpenPullRequestsPage returns, so a caller that already knows which PRs
+// it wants reads only those instead of paging the repository. open is false
+// when the PR is closed or merged.
+func (ic *InstallationClient) FetchOpenPullRequest(ctx context.Context, repo string, number int) (pr OpenPullRequest, open bool, err error) {
+	owner, repoName := splitRepo(repo)
+	ghPR, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "get pull request", []any{"repo", repo, "pr", number}, func(ctx context.Context) (*pullRequestWithStack, error) {
+		req, reqErr := ic.client.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repoName, number), nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		var got pullRequestWithStack
+		if _, getErr := ic.client.Do(req, &got); getErr != nil {
+			return nil, classifyGitHubAPIError(getErr)
+		}
+		return &got, nil
+	})
+	if err != nil {
+		return OpenPullRequest{}, false, fmt.Errorf("get pull request %s#%d: %w", repo, number, err)
+	}
+	return openPullRequestFrom(ghPR), ghPR.GetState() == "open", nil
+}
+
+func openPullRequestFrom(pr *pullRequestWithStack) OpenPullRequest {
+	info := OpenPullRequest{
+		DefaultBranch: pr.GetBase().GetRepo().GetDefaultBranch(),
+		Number:        pr.GetNumber(),
+		Title:         pr.GetTitle(),
+		HeadRef:       pr.GetHead().GetRef(),
+		HeadSHA:       pr.GetHead().GetSHA(),
+		BaseRef:       pr.GetBase().GetRef(),
+		User:          pr.GetUser().GetLogin(),
+		UpdatedAt:     pr.GetUpdatedAt().Time,
+	}
+	if pr.Stack != nil {
+		info.NativeStack = true
+		info.StackBaseRef = pr.Stack.Base.Ref
+	}
+	return info
 }
 
 // CoreRateLimit reports the installation's remaining core REST budget. The

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -16,20 +17,27 @@ import (
 // opened before check enablement) or is no longer retained by GitHub.
 // A PR with a non-terminal apply is refused: the started apply remains
 // authoritative for the PR's check state until it reaches a terminal state.
-func (h *Handler) BackfillPRCheckRuns(ctx context.Context, repo string, pr int, installationID int64) (string, error) {
+//
+// Unless opts.Plan is set, a PR that changes managed schema is deferred: it is
+// reported with the databases it would plan, and nothing is written for it.
+// Planning reads every changed database's schema once per environment, so one
+// large schema PR can cost more GitHub requests than every other PR in a
+// sweep. Deferring keeps a fleet sweep cheap and leaves the operator to plan
+// the schema PRs by number.
+func (h *Handler) BackfillPRCheckRuns(ctx context.Context, repo string, pr int, installationID int64, opts api.CheckRunBackfillOptions) (api.CheckRunBackfillResult, error) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		return "", fmt.Errorf("create GitHub client to backfill Check Runs for %s#%d: %w", repo, pr, err)
+		return api.CheckRunBackfillResult{}, fmt.Errorf("create GitHub client to backfill Check Runs for %s#%d: %w", repo, pr, err)
 	}
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
-		return "", fmt.Errorf("fetch PR to backfill Check Runs for %s#%d: %w", repo, pr, err)
+		return api.CheckRunBackfillResult{}, fmt.Errorf("fetch PR to backfill Check Runs for %s#%d: %w", repo, pr, err)
 	}
 	if prInfo.IsClosed() {
 		// Close-time cleanup owns a closed PR's check state; recreating Check
 		// Runs there would resurrect what cleanup settled.
 		h.logger.Info("Check Run backfill skipping closed PR", "repo", repo, "pr", pr)
-		return "skipped: PR is closed", nil
+		return api.CheckRunBackfillResult{Outcome: "skipped: PR is closed"}, nil
 	}
 	// A started apply is authoritative for its PR's check state: replaying the
 	// auto-plan flow over it could replace an apply-owned merge block with a
@@ -39,18 +47,29 @@ func (h *Handler) BackfillPRCheckRuns(ctx context.Context, repo string, pr int, 
 	// is safe to re-plan.
 	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
 	if err != nil {
-		return "", fmt.Errorf("look up applies before backfilling Check Runs for %s#%d: %w", repo, pr, err)
+		return api.CheckRunBackfillResult{}, fmt.Errorf("look up applies before backfilling Check Runs for %s#%d: %w", repo, pr, err)
 	}
 	for _, apply := range applies {
 		if !state.IsTerminalApplyState(apply.State) {
 			h.logger.Info("Check Run backfill refusing PR with a non-terminal apply", apply.LogAttrs()...)
-			return fmt.Sprintf("skipped: apply %s is %s; backfill will not re-plan over a started apply", apply.ApplyIdentifier, apply.State), nil
+			return api.CheckRunBackfillResult{Outcome: fmt.Sprintf("skipped: apply %s is %s; backfill will not re-plan over a started apply", apply.ApplyIdentifier, apply.State)}, nil
 		}
 	}
 	h.logger.Info("backfilling Check Runs via the auto-plan flow",
-		"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA)
-	// Discovery failures are already logged and posted as a failing check
-	// inside runAutoPlanForPR; the backfill reconciler re-runs periodically.
-	message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, prInfo.HeadSHA, installationID, "checks.backfill", "checks.backfill", "", "")
-	return message, nil
+		"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "plan", opts.Plan)
+	dispatch, err := h.dispatchAutoPlanForPR(ctx, client, repo, pr, prInfo.HeadSHA, installationID,
+		"checks.backfill", "checks.backfill", "", "", autoPlanOptions{deferSchemaPlans: !opts.Plan})
+	result := api.CheckRunBackfillResult{
+		Outcome:      dispatch.message,
+		Deferred:     len(dispatch.deferredDatabases) > 0,
+		Databases:    dispatch.deferredDatabases,
+		ChangedFiles: dispatch.changedFiles,
+	}
+	if err != nil {
+		// The dispatch already logged the failure and posted a failing check
+		// where it could. Return it as well, so the operator sees this PR was
+		// not backfilled instead of reading the outcome as settled.
+		return result, fmt.Errorf("backfill Check Runs for %s#%d: %w", repo, pr, err)
+	}
+	return result, nil
 }

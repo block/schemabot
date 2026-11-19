@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -30,10 +31,10 @@ func TestBackfillPRCheckRunsSkipsClosedPR(t *testing.T) {
 	})
 	h := actorAuthStorageTestHandler(actorAuthTestConfig(false), &emptyStorage{}, ghclient.NewInstallationClient(client, testLogger()))
 
-	outcome, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345)
+	result, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345, api.CheckRunBackfillOptions{})
 
 	require.NoError(t, err)
-	assert.Equal(t, "skipped: PR is closed", outcome)
+	assert.Equal(t, api.CheckRunBackfillResult{Outcome: "skipped: PR is closed"}, result)
 }
 
 // appliesByStateStorage serves a fixed set of applies for any PR, so a
@@ -85,10 +86,10 @@ func TestBackfillPRCheckRunsRefusesNonTerminalApply(t *testing.T) {
 	}}
 	h := actorAuthStorageTestHandler(actorAuthTestConfig(false), store, openPRGitHubServer(t))
 
-	outcome, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345)
+	result, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345, api.CheckRunBackfillOptions{})
 
 	require.NoError(t, err)
-	assert.Equal(t, "skipped: apply apply-running is running; backfill will not re-plan over a started apply", outcome)
+	assert.Equal(t, api.CheckRunBackfillResult{Outcome: "skipped: apply apply-running is running; backfill will not re-plan over a started apply"}, result)
 }
 
 // When the apply rows cannot be read, the backfill fails instead of
@@ -97,7 +98,7 @@ func TestBackfillPRCheckRunsFailsClosedOnApplyLookupError(t *testing.T) {
 	store := &appliesByStateStorage{err: errors.New("storage read failed")}
 	h := actorAuthStorageTestHandler(actorAuthTestConfig(false), store, openPRGitHubServer(t))
 
-	_, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345)
+	_, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345, api.CheckRunBackfillOptions{})
 
 	require.ErrorContains(t, err, "look up applies before backfilling Check Runs for octocat/hello-world#1")
 	require.ErrorContains(t, err, "storage read failed")
@@ -131,8 +132,33 @@ func TestBackfillPRCheckRunsReplaysAutoPlanFlow(t *testing.T) {
 	}}
 	h := actorAuthStorageTestHandler(actorAuthTestConfig(false), store, ghclient.NewInstallationClient(client, testLogger()))
 
-	outcome, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345)
+	result, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345, api.CheckRunBackfillOptions{})
 
 	require.NoError(t, err)
-	assert.Equal(t, "no schema files in PR", outcome)
+	assert.Equal(t, api.CheckRunBackfillResult{Outcome: "no schema files in PR"}, result)
+}
+
+// A backfill whose config discovery fails returns the failure instead of
+// reporting the PR as settled, so the operator sees its check is still
+// missing and can run the backfill again.
+func TestBackfillPRCheckRunsReturnsDiscoveryFailure(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"state": "open",
+			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
+			"user":  map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+	})
+	h := actorAuthStorageTestHandler(actorAuthTestConfig(false), &appliesByStateStorage{}, ghclient.NewInstallationClient(client, testLogger()))
+
+	result, err := h.BackfillPRCheckRuns(t.Context(), "octocat/hello-world", 1, 12345, api.CheckRunBackfillOptions{})
+
+	require.ErrorContains(t, err, "backfill Check Runs for octocat/hello-world#1")
+	require.ErrorContains(t, err, "fetch PR files for octocat/hello-world#1")
+	assert.Equal(t, api.CheckRunBackfillResult{Outcome: "config discovery failed"}, result)
 }

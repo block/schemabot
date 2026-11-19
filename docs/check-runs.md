@@ -779,6 +779,16 @@ recreates each by replaying the auto-plan flow server-side. Check Runs that
 exist but never completed are reported for investigation, never acted on — an
 uncompleted run can belong to a genuinely in-flight apply.
 
+A PR that changes managed schema needs a plan to recreate its check, and a
+plan reads every changed database's schema once per environment. Without
+`--plan`, the server defers those PRs before writing anything: no Check Run
+and no stored check state, so the missing required check keeps the merge
+blocked (MG-1). The report names the databases each deferred PR changes and
+prints the `--plan --pr` command that plans them. The server also re-reads
+the GitHub budget before each PR and stops the batch below
+`--rate-limit-floor`; the CLI resends the PRs it did not start after the
+budget resets.
+
 Each reported run carries the stored check state behind it, classified the
 same way [`checks show`](#explaining-a-blocked-check) classifies it: the
 sweep says whether the run is waiting on SchemaBot or on an operator, and
@@ -794,8 +804,9 @@ its own `allowed_environments`, and its own storage, so one run converges only
 the checks that instance owns:
 
 - **Repositories.** Naming a repository (`schemabot checks backfill
-  <owner/name>`) scans just that one; `--all-repos` scans every repository
-  declared in the instance's `repos:` config. A legacy single-App config
+  <owner/name>`) scans just that one, and `--pr` narrows it to the named PRs;
+  `--all-repos` scans every repository declared in the instance's `repos:`
+  config, less any named by `--skip-repo`. A legacy single-App config
   declares no repos, so there `--all-repos` is rejected and repositories must
   be named explicitly. Repositories with `enable_checks: false` (including
   `listen_only` repositories, which never publish checks) are skipped,
@@ -864,9 +875,9 @@ that leaves work behind exits nonzero with a one-line count summary, after
 printing the full report, so a scheduled sweep can alert on the exit code
 without parsing the output. A `--dry-run` acts on nothing, so any finding —
 missing, held, or stuck — fails the run. Outside `--dry-run`, successfully
-recreated checks are resolved and do not fail the run; held PRs, failed
-recreations, and stuck Check Runs do, because the backfill never acts on
-those and an operator still has to. A run stopped by Ctrl-C or SIGTERM exits
+recreated checks are resolved and do not fail the run; held PRs, deferred
+schema PRs, failed recreations, and stuck Check Runs do, because their checks
+are still missing or unfinished and an operator still has to act. A run stopped by Ctrl-C or SIGTERM exits
 130 instead. Any report it prints is marked as interrupted, with
 `"interrupted": true` in its JSON; see
 [the CLI reference](cli.md#recover-missing-github-checks) for what it holds.

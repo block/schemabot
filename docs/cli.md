@@ -1092,6 +1092,48 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+A missing check on a PR that changes no managed schema costs a few GitHub
+requests to recreate. A PR that does change managed schema needs a plan, and
+a plan reads every changed database's schema once per environment, so one
+large PR can spend thousands of requests. Without `--plan`, the backfill
+recreates the cheap checks and defers the schema PRs. A deferred PR keeps its
+missing check, so its merge stays blocked, and the report prints the command
+that plans it:
+
+```console
+$ schemabot checks backfill acme/store -e production
+Scanned 3 open PRs in acme/store for SchemaBot (production).
+PR                                      MISSING CHECKS          OUTCOME
+https://github.com/acme/store/pull/412  SchemaBot (production)  created 1 Check Run
+https://github.com/acme/store/pull/418  SchemaBot (production)  deferred: changes schema in 1 database (orders); 2 changed files
+https://github.com/acme/store/pull/431  SchemaBot (production)  deferred: changes schema in 4 databases (billing, catalog, orders and 1 more); 409 changed files
+
+2 PRs change managed schema and were not planned, so their Check Runs are still missing and the merge stays blocked. Each plan reads every changed database's schema once per environment. To plan them:
+  schemabot checks backfill acme/store --plan --pr 418,431
+Error: checks backfill left 2 deferred schema PRs needing attention
+```
+
+`--pr` scans only the named PRs instead of paging the repository, and
+`--plan` requires it, so every plan the backfill runs is one an operator
+asked for by number. Plan the PRs whose merges matter most first.
+
+The server checks the GitHub budget before each PR. When the budget falls
+below `--rate-limit-floor` (20% by default), it stops the batch and returns
+the PRs it did not start. The command waits for the budget to reset and sends
+them again, so live webhook traffic keeps its headroom.
+
+`--skip-repo` leaves repositories out of an `--all-repos` sweep, for example
+one you have already backfilled by hand. Separate names with commas or repeat
+the flag. A name the server does not declare stops the sweep, so a typo
+cannot sweep the repository you meant to skip.
+
+```console
+$ schemabot checks backfill --all-repos -e staging --last 2h --dry-run --skip-repo acme/monorepo
+Scanned 6 open PRs updated in the last 2h in acme/ledger, acme/store for SchemaBot (staging).
+Skipped repositories named by --skip-repo: acme/monorepo.
+No missing SchemaBot Check Runs found.
+```
+
 A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
 are. Each says on stderr that it was canceled and exits 130, the status a
 shell reports for an interrupted process, so a script can tell an interrupted
