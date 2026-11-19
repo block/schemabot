@@ -1033,10 +1033,19 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 		return false, nil
 	}
 	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
-	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" && !h.isDurableCommandAppComment(event, &payload) {
-		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
-			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
-		return false, nil
+	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
+		admitted, err := h.durableCommandAppAdmission(event, &payload)
+		if err != nil {
+			h.logger.Warn("durable issue_comment delivery from a command App will be retried because this deployment cannot yet rule out a self-comment",
+				"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest,
+				"author", payload.Comment.User.Login, "error", err)
+			return true, fmt.Errorf("durable issue_comment delivery %s: %w", event.DeliveryID, err)
+		}
+		if !admitted {
+			h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
+				"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
+			return false, nil
+		}
 	}
 
 	installationID, err := durableInstallationID(event)

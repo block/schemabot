@@ -227,10 +227,12 @@ func TestIsCommandAppComment(t *testing.T) {
 	}
 }
 
-// A stored delivery is checked against command_apps like a live one, and a
+// A stored delivery is checked against command_apps like a live one. A
 // delivery whose installation is unknown is not admitted, so the bot comment
-// is ignored rather than retried.
-func TestIsDurableCommandAppComment(t *testing.T) {
+// is ignored rather than retried; a listed App whose comment cannot be decided
+// yet because this deployment's own App slug is unknown is not admitted
+// either, but reports that it can be retried.
+func TestDurableCommandAppAdmission(t *testing.T) {
 	client, _ := setupGitHubServer(t)
 	cfg := actorAuthTestConfig(true, withCommandApps(testCommandApp))
 	h := actorAuthTestHandler(cfg, ghclient.NewInstallationClientWithSlug(client, testLogger(), testOwnAppSlug))
@@ -239,10 +241,57 @@ func TestIsDurableCommandAppComment(t *testing.T) {
 	require.NoError(t, json.Unmarshal(commandAppCommentPayload(t, "schemabot apply -e staging"), &payload))
 
 	event := &storage.WebhookEvent{DeliveryID: "d-1", Event: "issue_comment", Repository: "octocat/hello-world", PullRequest: 7, TenantID: "12345"}
-	assert.True(t, h.isDurableCommandAppComment(event, &payload))
+	admitted, err := h.durableCommandAppAdmission(event, &payload)
+	require.NoError(t, err)
+	assert.True(t, admitted)
+
+	unknown := actorAuthTestHandler(cfg, ghclient.NewInstallationClientWithSlug(client, testLogger(), ""))
+	admitted, err = unknown.durableCommandAppAdmission(event, &payload)
+	require.ErrorIs(t, err, errCommandAppIdentityUnknown)
+	assert.False(t, admitted)
 
 	event.TenantID = ""
-	assert.False(t, h.isDurableCommandAppComment(event, &payload))
+	admitted, err = h.durableCommandAppAdmission(event, &payload)
+	require.NoError(t, err)
+	assert.False(t, admitted)
+}
+
+// A command App's queued command survives a driver that starts before it
+// knows its own App slug: the delivery stays pending and is retried, rather
+// than completing as an ignored bot comment, and once the slug resolves the
+// retry admits the comment and runs the command.
+func TestDurableCommandAppCommentRetriedUntilOwnAppKnown(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
+	event := durableIssueCommentEvent("schemabot unlock")
+	event.Payload = commandAppCommentPayload(t, "schemabot unlock")
+	store := newScriptedWebhookEventStore(event, event)
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, testLogger(), "")}
+	h := newDurableDriverHandler(t, store, actorAuthTestConfig(true, withCommandApps(testCommandApp)), factory)
+
+	before := time.Now()
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+	select {
+	case failure := <-store.failed:
+		require.NotNil(t, failure.retryAfter, "a command App delivery must stay retryable while the own App slug is unknown")
+		assert.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
+		assert.Contains(t, failure.errMsg, errCommandAppIdentityUnknown.Error())
+	default:
+		t.Fatal("expected the delivery to be marked failed for retry")
+	}
+	require.Empty(t, store.completed, "the delivery must not complete as an ignored bot comment")
+
+	factory.client = ghclient.NewInstallationClientWithSlug(client, testLogger(), testOwnAppSlug)
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+	select {
+	case <-store.completed:
+	case failure := <-store.failed:
+		t.Fatalf("the retried delivery must run once the own App slug is known, got failure %q", failure.errMsg)
+	default:
+		t.Fatal("expected the retried delivery to complete")
+	}
+	assert.Contains(t, requireComment(t, comments, "unlock reply to the command App"), "No Locks Found")
 }
 
 // A listed App's comment reaches the command parser: `schemabot help` gets
