@@ -1104,7 +1104,7 @@ that plans it:
 $ schemabot checks backfill acme/store -e production
 Scanned 3 open PRs in acme/store for SchemaBot (production).
 PR                                      MISSING CHECKS          OUTCOME
-https://github.com/acme/store/pull/412  SchemaBot (production)  created 1 Check Run
+https://github.com/acme/store/pull/412  SchemaBot (production)  no schema files in PR
 https://github.com/acme/store/pull/418  SchemaBot (production)  deferred: changes schema in 1 database (orders); 2 changed files
 https://github.com/acme/store/pull/431  SchemaBot (production)  deferred: changes schema in 4 databases (billing, catalog, orders and 1 more); 409 changed files
 
