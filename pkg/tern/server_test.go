@@ -514,7 +514,7 @@ type conflictReadFailureTaskStore struct {
 	storage.TaskStore
 }
 
-func (conflictReadFailureTaskStore) GetByDatabase(context.Context, string) ([]*storage.Task, error) {
+func (conflictReadFailureTaskStore) GetNonTerminalByDatabase(context.Context, string) ([]*storage.Task, error) {
 	return nil, errors.New("tasks storage unavailable")
 }
 
