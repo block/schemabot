@@ -555,6 +555,21 @@ timeout fails them. *Enforced:* the width refusal at apply and at apply creation
 (`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
 place recorded with a start request (`markResumed`, `pkg/storage/internal/sqlstore/control_requests.go`).
 
+### AV-17: An upgrade never needs a new GitHub App permission
+
+A GitHub App permission that existing installs do not already grant is used only by behavior a
+server config key turns on, and that key is off by default. With the key off, the server makes no
+request that needs the permission. With the key on and the permission still missing, the server
+serves pull requests as it would with the key off and logs which permission is missing.
+
+*Breaks if violated:* every install that upgrades without changing its App loses plans, Check Runs,
+or commands on the pull requests the new permission covers. *Enforced:* `skip_unrequired_branches`
+gating every PR target read (`pkg/api/config.go`, `pkg/webhook/pr_target.go`); the fallback that
+serves a target whose classic branch protection the App cannot read (`pkg/github/pr_target.go`);
+and `TestGitHubAppPermissionsAreRequiredOrGatedByConfig`
+(`pkg/api/github_app_permissions_test.go`), which fails when the setup guide lists a permission that
+is neither one existing installs grant nor optional behind a server config key.
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
@@ -2195,6 +2210,11 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   that the first does not. It drives the auto-plan on open and on push, the plan command, and the
   plan command in a repository whose tree GitHub truncates, so a lookup per changed file on those
   paths fails CI instead of exhausting the rate limit in production (AV-15).
+
+- **GitHub App permissions.** A test reads the setup guide's permission tables and fails on any
+  permission that existing installs do not already grant unless it is marked optional and names
+  the server config key that turns on the behavior needing it, so a release cannot quietly require
+  a new grant (AV-17).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.
