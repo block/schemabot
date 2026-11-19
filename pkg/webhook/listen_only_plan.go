@@ -47,7 +47,12 @@ func (h *Handler) readListenOnlyPlanInputs(ctx context.Context, client *ghclient
 		}
 	}
 	if len(schemas) > 0 {
-		h.planBaseSchemas(ctx, client, repo, pr, schemas)
+		// The comparison's findings name a plan comment and an apply block.
+		// A listen-only repository gets neither, and on a busy repository a
+		// stale branch is routine, so they are debug lines here.
+		h.compareBaseSchemas(ctx, client, repo, pr, schemas, func(msg string, args ...any) {
+			h.logger.Debug(msg, append(args, "listen_only", true)...)
+		})
 	}
 
 	read := make([]string, 0, len(schemas))

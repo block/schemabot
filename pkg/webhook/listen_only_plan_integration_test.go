@@ -30,10 +30,17 @@ import (
 // deployment serves, and one base-branch comparison for all of them. Nothing
 // is planned and nothing is written: no comment, no Check Run.
 func TestE2EAutoPlanOnListenOnlyRepositoryReadsPlanInputsForUnregisteredDatabase(t *testing.T) {
-	entry := runListenOnlyAutoPlan(t, []string{"staging", "production"}, nil, map[string]string{"users.sql": baseSchemaUsersTable})
+	logs := runListenOnlyAutoPlan(t, []string{"staging", "production"}, nil, map[string]string{"users.sql": baseSchemaUsersTable})
 
+	entry := findLogEntry(t, logs, listenOnlyPlanReadMessage)
 	assert.ElementsMatch(t, []any{"staging", "production"}, entry["environments"])
 	assert.EqualValues(t, 2, entry["schema_files"], "users.sql, once for each environment")
+
+	// The base branch changed the schema after the PR branched. A plan warns
+	// that its comment says so and that apply is blocked.
+	stale := findLogEntry(t, logs, "plan is of a branch missing newer schema changes from its base branch; the plan comment says so and apply is blocked until the branch has them")
+	assert.Equal(t, "DEBUG", stale["level"])
+	assert.Equal(t, true, stale["listen_only"])
 }
 
 // A deployment without allowed_environments serves every environment, so it
@@ -43,11 +50,12 @@ func TestE2EAutoPlanOnListenOnlyRepositoryReadsPlanInputsForUnregisteredDatabase
 // the environment directories as namespaces and skip the files one level
 // below them.
 func TestE2EAutoPlanOnListenOnlyRepositoryReadsEnvironmentDirectoriesWhenEnvironmentsAreUnscoped(t *testing.T) {
-	entry := runListenOnlyAutoPlan(t, nil, []string{"staging", "production"}, map[string]string{
+	logs := runListenOnlyAutoPlan(t, nil, []string{"staging", "production"}, map[string]string{
 		"staging/listen_only_orders/users.sql":    baseSchemaUsersTable,
 		"production/listen_only_orders/users.sql": baseSchemaUsersTable,
 	})
 
+	entry := findLogEntry(t, logs, listenOnlyPlanReadMessage)
 	assert.ElementsMatch(t, []any{"staging", "production"}, entry["environments"])
 	assert.EqualValues(t, 2, entry["schema_files"], "each environment's users.sql, from its own directory")
 }
@@ -55,11 +63,12 @@ func TestE2EAutoPlanOnListenOnlyRepositoryReadsEnvironmentDirectoriesWhenEnviron
 // runListenOnlyAutoPlan sends a synchronize webhook for a listen-only
 // repository whose database the deployment does not register, waits for the
 // auto-plan, and checks what every such auto-plan must do: write nothing,
-// read schema blobs at the head, and compare against the base branch once. It
-// returns the log entry that reports the reads. environmentDirectories names
+// read schema blobs at the head, compare against the base branch once, and
+// log nothing about a plan comment or an apply block as a warning. It returns
+// the handler's logs, at debug level. environmentDirectories names
 // the directories under schema/ that the repository keeps for environments,
 // each holding the listen_only_orders namespace.
-func runListenOnlyAutoPlan(t *testing.T, allowedEnvironments, environmentDirectories []string, schemaSQL map[string]string) map[string]any {
+func runListenOnlyAutoPlan(t *testing.T, allowedEnvironments, environmentDirectories []string, schemaSQL map[string]string) *bytes.Buffer {
 	t.Helper()
 	mux := http.NewServeMux()
 	for _, env := range environmentDirectories {
@@ -96,7 +105,7 @@ func runListenOnlyAutoPlan(t *testing.T, allowedEnvironments, environmentDirecto
 	registerStaleBaseSchemaComparisonWithHook(t, mux, result, func() { compares.Add(1) })
 
 	var logs bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	svc := api.New(&emptyStorage{}, &api.ServerConfig{
 		AllowedEnvironments: allowedEnvironments,
 		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {ListenOnly: true}},
@@ -120,10 +129,22 @@ func runListenOnlyAutoPlan(t *testing.T, allowedEnvironments, environmentDirecto
 		"the schema files at the head are read, as a plan would read them: %v", reads)
 	assert.Equal(t, int32(1), compares.Load(), "one base-branch comparison covers every environment")
 
-	entry := findLogEntry(t, &logs, "read a listen-only repository's plan inputs for a database this deployment does not register; nothing was planned or posted")
+	// A plan logs the base comparison's findings as warnings about its
+	// comment and a blocked apply. Neither exists on a listen-only
+	// repository, so the findings are debug lines.
+	for _, logged := range logEntries(&logs) {
+		msg, _ := logged["msg"].(string)
+		if strings.HasPrefix(msg, "plan comment will say the base branch could not be checked") || strings.HasPrefix(msg, "plan is of a branch missing newer schema changes") {
+			assert.Equal(t, "DEBUG", logged["level"], "a listen-only read must not warn about a plan comment or an apply block: %s", msg)
+		}
+	}
+
+	entry := findLogEntry(t, &logs, listenOnlyPlanReadMessage)
 	assert.Equal(t, "listen_only_orders", entry["database"])
-	return entry
+	return &logs
 }
+
+const listenOnlyPlanReadMessage = "read a listen-only repository's plan inputs for a database this deployment does not register; nothing was planned or posted"
 
 func containsPrefix(requests []string, prefix string) bool {
 	for _, request := range requests {
@@ -138,12 +159,23 @@ func containsPrefix(requests []string, prefix string) bool {
 // test when there is none.
 func findLogEntry(t *testing.T, logs *bytes.Buffer, msg string) map[string]any {
 	t.Helper()
-	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
-		var entry map[string]any
-		if json.Unmarshal([]byte(line), &entry) == nil && entry["msg"] == msg {
+	for _, entry := range logEntries(logs) {
+		if entry["msg"] == msg {
 			return entry
 		}
 	}
 	t.Fatalf("no log entry %q in:\n%s", msg, logs.String())
 	return nil
+}
+
+// logEntries parses every JSON log line in logs.
+func logEntries(logs *bytes.Buffer) []map[string]any {
+	var entries []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		if json.Unmarshal([]byte(line), &entry) == nil {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
 }
