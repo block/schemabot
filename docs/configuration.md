@@ -2218,11 +2218,11 @@ databases:
 ```
 
 - A listed App runs commands for this database only, and only from repositories the database accepts (`allowed_repos`).
-- The grant holds whether or not `pr_command_authorization` is enabled. With it enabled, an App is never matched against admin or operator teams and users, so listing its login there grants nothing; `command_apps` is the only way to authorize an App.
-- An App's approval never counts toward the review gate, even when its login is also configured as a reviewer. Where the review gate is on, an App can apply only a change that a person approved.
+- The grant holds whether or not `pr_command_authorization` is enabled, and so does its limit: with authorization off, an App still cannot run `plan` or any other gated command for a database that does not list it. With it enabled, an App is never matched against admin or operator teams and users, so listing its login there grants nothing; `command_apps` is the only way to authorize an App.
+- An App listed by any database never counts as a reviewer, for any database, even when its login is also configured as a reviewer. It is left out of the reviewers a Review Required comment lists, and an approval it gives is called out as one that never counts. Where the review gate is on, an App can apply only a change that a person approved.
 - SchemaBot never runs its own comments: a comment from this deployment's App is ignored even when `command_apps` lists it, and while the deployment does not yet know its own App slug it ignores every App's comment.
 
-SchemaBot refuses to start when a `command_apps` entry carries the `[bot]` suffix, is listed twice, or names an App in `trusted-check-app-slugs`, since those Apps are SchemaBot's own.
+SchemaBot refuses to start when a `command_apps` entry is not an App slug (letters, digits, hyphens and underscores, as in the App's URL), carries the `[bot]` suffix, is listed twice, or names an App in `trusted-check-app-slugs`, since those Apps are SchemaBot's own.
 
 ## Authentication
 

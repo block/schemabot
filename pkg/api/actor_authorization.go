@@ -3,9 +3,14 @@ package api
 import (
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 )
+
+// appSlugPattern is the shape of a GitHub App slug: the URL-safe form of the
+// App's name, which is also its bot login without the "[bot]" suffix.
+var appSlugPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 const (
 	ActorAuthReasonDisabled              = "disabled"
@@ -179,6 +184,9 @@ func (c *ServerConfig) validateDatabaseCommandApps(database string, dbConfig Dat
 		if strings.HasSuffix(slug, "[bot]") {
 			return fmt.Errorf("%s contains %q: list the App slug, without the [bot] suffix of its login", field, slug)
 		}
+		if !appSlugPattern.MatchString(slug) {
+			return fmt.Errorf("%s contains %q, which is not a GitHub App slug: use letters, digits, hyphens and underscores, as in the App's URL", field, slug)
+		}
 		if slices.ContainsFunc(trusted, func(t string) bool { return strings.EqualFold(t, slug) }) {
 			return fmt.Errorf("%s contains %q, which is in trusted-check-app-slugs: a SchemaBot App's comments are never commands", field, slug)
 		}
@@ -227,6 +235,23 @@ func (c *ServerConfig) IsCommandApp(repo, database, login string) bool {
 		return false
 	}
 	return slices.ContainsFunc(db.CommandApps, func(s string) bool { return strings.EqualFold(s, slug) })
+}
+
+// IsConfiguredCommandApp reports whether login is the bot login of an App
+// that any database lists in command_apps, whichever repository or database
+// is asking. The review gate uses it so that a command App's approval never
+// counts anywhere, including for a database that did not list it.
+func (c *ServerConfig) IsConfiguredCommandApp(login string) bool {
+	slug, ok := strings.CutSuffix(login, "[bot]")
+	if c == nil || !ok || slug == "" {
+		return false
+	}
+	for _, db := range c.DatabaseConfigs() {
+		if slices.ContainsFunc(db.CommandApps, func(s string) bool { return strings.EqualFold(s, slug) }) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateRepoActorAuthorization(repo string, repoConfig RepoConfig) error {

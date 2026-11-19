@@ -506,7 +506,10 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 		// blocked (fail closed).
 		return true
 	}
-	if authzClient == nil {
+	// An App's authority is exactly its command_apps entries whether or not
+	// PR command authorization is on, so an App's plan is gated either way;
+	// the gate decides it from config alone, without a GitHub client.
+	if authzClient == nil && !isAppLogin(requestedBy) {
 		h.logger.Debug("PR command authorization disabled; plan proceeds ungated",
 			"repo", repo, "pr", pr, "database", databaseName, "requested_by", requestedBy)
 		return false

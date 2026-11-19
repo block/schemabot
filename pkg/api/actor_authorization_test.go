@@ -355,6 +355,25 @@ func TestServerConfigValidateCommandApps(t *testing.T) {
 			wantErr: "databases.orders.command_apps contains an empty value",
 		},
 		{
+			name:    "leading fullwidth at sign",
+			cfg:     baseConfig("＠deploy-gate"),
+			wantErr: `databases.orders.command_apps contains "＠deploy-gate", which is not a GitHub App slug`,
+		},
+		{
+			name:    "leading at sign",
+			cfg:     baseConfig("@deploy-gate"),
+			wantErr: `databases.orders.command_apps contains "@deploy-gate", which is not a GitHub App slug`,
+		},
+		{
+			name:    "internal whitespace",
+			cfg:     baseConfig("deploy gate"),
+			wantErr: `databases.orders.command_apps contains "deploy gate", which is not a GitHub App slug`,
+		},
+		{
+			name: "slug with digits and underscore",
+			cfg:  baseConfig("deploy_gate-2"),
+		},
+		{
 			name: "trusted sibling App in the legacy github block",
 			cfg: func() ServerConfig {
 				cfg := baseConfig("schemabot-staging")
@@ -419,4 +438,12 @@ func TestCommandAppLookups(t *testing.T) {
 
 	var nilConfig *ServerConfig
 	assert.False(t, nilConfig.IsCommandApp("octocat/schemas", "orders", "deploy-gate[bot]"))
+
+	// The review gate asks whether a login is a command App anywhere, so a
+	// listing for orders counts for every repository and database.
+	assert.True(t, cfg.IsConfiguredCommandApp("Deploy-Gate[bot]"))
+	assert.False(t, cfg.IsConfiguredCommandApp("deploy-gate"), "a login without the [bot] suffix is not an App")
+	assert.False(t, cfg.IsConfiguredCommandApp("other-app[bot]"))
+	assert.False(t, cfg.IsConfiguredCommandApp("[bot]"))
+	assert.False(t, nilConfig.IsConfiguredCommandApp("deploy-gate[bot]"))
 }

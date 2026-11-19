@@ -275,29 +275,107 @@ func TestWebhookCommandAppCommentIsParsed(t *testing.T) {
 	assert.Contains(t, body, "schemabot plan")
 }
 
+// withPaymentsDatabase adds a payments database that lists apps in its
+// command_apps.
+func withPaymentsDatabase(apps ...string) func(*api.ServerConfig) {
+	return func(cfg *api.ServerConfig) {
+		cfg.Databases["payments"] = api.DatabaseConfig{
+			Type: storage.DatabaseTypeMySQL,
+			Environments: map[string]api.EnvironmentConfig{
+				"staging": {DSN: "root@tcp(localhost)/payments"},
+			},
+			CommandApps: apps,
+		}
+	}
+}
+
 // A command App may run commands, but its approval never satisfies the review
-// gate, even when its login is also configured as a reviewer.
+// gate, even when its login is also configured as a reviewer, and even for a
+// database that did not list it. It is not offered as a reviewer to ask, and
+// the gate reports it apart from unauthorized reviewers, since no team or
+// reviewer setting can make its approval count.
 func TestCheckReviewGate_CommandAppApprovalNeverCounts(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(withCommandApps(testCommandApp), func(cfg *api.ServerConfig) {
-		cfg.ReviewPolicy.AdminUsers = []string{testCommandAppLogin}
-	}))
+	tests := []struct {
+		name   string
+		listed func(*api.ServerConfig)
+	}{
+		{name: "listed by the gated database", listed: withCommandApps(testCommandApp)},
+		{name: "listed by another database", listed: withPaymentsDatabase(testCommandApp)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, reviewGateTestConfig(tt.listed, func(cfg *api.ServerConfig) {
+				cfg.ReviewPolicy.AdminUsers = []string{testCommandAppLogin, "carol"}
+				db := cfg.Databases["orders"]
+				db.OperatorUsers = []string{testCommandAppLogin, "dave"}
+				cfg.Databases["orders"] = db
+			}))
 
-	registerPREndpoint(mux, "alice")
-	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
-		{
-			User:        &gh.User{Login: new(testCommandAppLogin)},
-			State:       new(ghclient.ReviewApproved),
-			SubmittedAt: &gh.Timestamp{Time: time.Now()},
-		},
-	})
+			registerPREndpoint(mux, "alice")
+			registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+				{
+					User:        &gh.User{Login: new(testCommandAppLogin)},
+					State:       new(ghclient.ReviewApproved),
+					CommitID:    new(reviewGateTestHeadSHA),
+					SubmittedAt: &gh.Timestamp{Time: time.Now()},
+				},
+			})
 
-	client, err := h.clientForRepo("octocat/hello-world", 12345)
-	require.NoError(t, err)
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	assert.False(t, result.Approved)
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.False(t, result.Approved)
+			assert.Equal(t, []string{testCommandAppLogin}, result.CommandAppApprovers)
+			assert.Empty(t, result.UnauthorizedApprovers)
+			assert.Equal(t, []string{"dave"}, result.OperatorReviewers)
+			assert.Equal(t, []string{"carol"}, result.OtherReviewers)
+		})
+	}
+}
+
+// An App's plan is gated by its command_apps entries even with PR command
+// authorization off: an App listed only for orders cannot plan payments, in a
+// single-environment plan or a plan across every environment.
+func TestPlanForResolvedDatabaseGatesCommandAppWithAuthorizationDisabled(t *testing.T) {
+	tests := []struct {
+		name        string
+		database    string
+		environment string
+		wantBlocked bool
+	}{
+		{name: "listed database, one environment", database: "orders", environment: "staging"},
+		{name: "listed database, every environment", database: "orders"},
+		{name: "unlisted database, one environment", database: "payments", environment: "staging", wantBlocked: true},
+		{name: "unlisted database, every environment", database: "payments", wantBlocked: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 2)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			cfg := actorAuthTestConfig(false, withCommandApps(testCommandApp), withPaymentsDatabase())
+			h := actorAuthTestHandler(cfg, installClient)
+
+			blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, testCommandAppLogin, tt.database, tt.environment)
+
+			assert.Equal(t, tt.wantBlocked, blocked)
+			if !tt.wantBlocked {
+				select {
+				case body := <-comments:
+					t.Fatalf("no comment should be posted for a listed command App, got %q", body)
+				default:
+				}
+				return
+			}
+			body := requireComment(t, comments, "unauthorized command App plan comment")
+			assert.Contains(t, body, "SchemaBot Command Not Authorized")
+			assert.Contains(t, body, "@"+testCommandAppLogin+" is not authorized")
+		})
+	}
 }
 
 func commandAppCommentPayload(t *testing.T, body string) []byte {
