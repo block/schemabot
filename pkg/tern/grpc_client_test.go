@@ -1530,8 +1530,10 @@ func TestGRPCClient_ResumeApplyRedispatchesAdoptedStatementRendering(t *testing.
 // with the dispatch for that re-plan to reach the same verdict: a table the
 // repository withheld is live on the member and declared by no schema file, so
 // a member that re-plans without the list proposes dropping it and then fails
-// its own drift check against a plan it can never match.
-func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
+// its own drift check against a plan it can never match. The reviewed
+// `drop_tables` travels for the mirror reason: a member that re-plans without
+// it leaves out the reviewed DROP TABLE and fails the same check.
+func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreAndDropTables(t *testing.T) {
 	server := &capturingTernServer{
 		remoteApplyID: "remote-dispatched-ignore",
 		progressTables: []*ternv1.TableProgress{{
@@ -1573,6 +1575,7 @@ func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
 		Namespaces: map[string]*storage.NamespacePlanData{"default": {}},
 	}
 	plan.RecordIgnoreTables([]string{"flyway_schema_history", "legacy_audit"})
+	plan.RecordDropTables([]string{"_users_old", "_users_new"})
 	client.storage = &mockStorage{
 		applies: &mockApplyStore{apply: apply},
 		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
@@ -1590,6 +1593,8 @@ func TestGRPCClient_ResumeApplyDispatchCarriesIgnoreTables(t *testing.T) {
 		"the schema files the member re-plans are what the exclusions qualify")
 	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit"}, req.IgnoreTables,
 		"the dispatch carries the reviewed entries: without them the member re-plans the withheld tables as drops")
+	assert.Equal(t, []string{"_users_new", "_users_old"}, req.DropTables,
+		"the dispatch carries the reviewed drop list: without it the member's re-plan leaves out the reviewed drops")
 }
 
 // The VSchema-only dispatch is the other hop that hands a plan to a member, and

@@ -583,6 +583,15 @@ message PlanRequest {
   // as one unit (a database-scoped MySQL DSN), where an unselected namespace's
   // live tables would otherwise be planned as drops.
   repeated string unselected_namespaces = 15;
+  // Live tables the repository's drop_tables config asks the planner to drop
+  // although no schema file declares them, including tables the engine
+  // otherwise leaves out of every plan by their names. Each entry is one exact,
+  // case-sensitive table name, matched against the target's own catalog in
+  // every namespace the plan covers; an entry that names no live table plans
+  // nothing. An engine that does not support the list refuses a plan that
+  // carries it, and the engine refuses an entry that ignore_tables also
+  // withholds or that a schema file declares.
+  repeated string drop_tables = 16;
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
@@ -865,6 +874,15 @@ message ApplyRequest {
   // planned with. Empty on a dispatch that is not a table step, whose
   // ddl_changes already carry its whole plan.
   repeated TableChange plan_ddl_changes = 15;
+  // The drop_tables config the reviewed plan was planned under, as the plan
+  // recorded it, carried for the same reason as ignore_tables: a deployment
+  // that materializes this dispatch re-plans against its own live schema to
+  // prove the reviewed DDL is what it would independently produce, and a
+  // re-plan without these entries would not propose the reviewed DROP TABLE
+  // statements and would refuse an apply that matches the plan exactly. The
+  // plan's own record travels rather than the current config, so the
+  // comparison is against what was reviewed.
+  repeated string drop_tables = 16;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a

@@ -1643,6 +1643,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		CreatedAt:      time.Now(),
 	}
 	plan.RecordIgnoreTables(req.GetIgnoreTables())
+	plan.RecordDropTables(req.GetDropTables())
 	c.logger.Info("Plan: storing plan",
 		"plan_id", result.PlanID,
 		"ddl_change_count", len(ddlChanges),
@@ -1979,6 +1980,7 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 		Credentials:      creds,
 		GroupedExecution: groupedExecution,
 		IgnoreTables:     req.GetIgnoreTables(),
+		DropTables:       req.GetDropTables(),
 	})
 }
 
@@ -2330,6 +2332,9 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 	// stored plan, and a plan that forgot its exclusions re-plans the withheld
 	// tables as drops.
 	plan.RecordIgnoreTables(req.GetIgnoreTables())
+	// The drop_tables record survives the same way, so a later re-plan here
+	// proposes the drops the plan was reviewed with.
+	plan.RecordDropTables(req.GetDropTables())
 	c.logger.Info("Apply: materializing plan from dispatch request",
 		"plan_id", req.PlanId,
 		"database", c.config.Database,

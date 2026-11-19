@@ -762,6 +762,16 @@ type NamespacePlanData struct {
 	// of the plan's namespaces therefore still withholds all of them.
 	IgnoreTables []string `json:"ignore_tables,omitempty"`
 
+	// DropTables is the drop_tables config the plan was reviewed under: every
+	// entry the planner was asked to drop, not the subset that named a live
+	// table here. A re-plan of a stored plan must be asked to drop the same
+	// entries, or it no longer proposes the reviewed DROP TABLE statements and
+	// disagrees with the plan it is checking. Like IgnoreTables, it is the
+	// plan's record rather than the live config, the whole list is kept for
+	// the members this plan travels to, and every stored namespace carries
+	// the same list; Plan.DropTables reads their union.
+	DropTables []string `json:"drop_tables,omitempty"`
+
 	// Finalize records that the engine asked for this namespace's group
 	// finalizer to run once every shard's DDL has landed, independent of a
 	// VSchema change (engine.MetadataNeedsFinalizer). It is a typed field
@@ -1042,6 +1052,44 @@ func (p *Plan) IgnoreTables() []string {
 			continue
 		}
 		tables = append(tables, nsData.IgnoreTables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
+}
+
+// RecordDropTables stores the drop_tables config the plan was reviewed under
+// on every namespace it carries, so a re-plan of this plan — a rollback, a
+// resume, a member's drift check — is asked to drop the same tables and
+// proposes the same DROP TABLE statements the plan was reviewed with.
+// DropTables reads it back.
+func (p *Plan) RecordDropTables(tables []string) {
+	if p == nil || len(tables) == 0 {
+		return
+	}
+	normalized := slices.Clone(tables)
+	sort.Strings(normalized)
+	normalized = slices.Compact(normalized)
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		nsData.DropTables = slices.Clone(normalized)
+	}
+}
+
+// DropTables returns, in sorted order, the drop_tables entries the plan was
+// reviewed under, across all namespaces. A re-plan of a stored plan passes
+// these back so it proposes the same drops the plan was reviewed with.
+func (p *Plan) DropTables() []string {
+	if p == nil {
+		return nil
+	}
+	var tables []string
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		tables = append(tables, nsData.DropTables...)
 	}
 	sort.Strings(tables)
 	return slices.Compact(tables)

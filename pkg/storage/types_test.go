@@ -597,6 +597,30 @@ func TestPlanRecordIgnoreTables(t *testing.T) {
 	assert.Nil(t, clean.Namespaces["app"].IgnoreTables)
 }
 
+func TestPlanRecordDropTables(t *testing.T) {
+	(*Plan)(nil).RecordDropTables([]string{"_users_old"})
+	assert.Nil(t, (*Plan)(nil).DropTables(), "a nil plan dropped nothing")
+
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"app":       {Tables: []TableChange{{Table: "users"}}},
+		"billing":   {Tables: []TableChange{{Table: "invoices"}}},
+		"nil_entry": nil,
+	}}
+	plan.RecordDropTables([]string{"_users_old", "_invoices_old", "_users_old"})
+
+	// Every namespace carries the whole list, sorted and deduplicated, and a
+	// re-plan reads back their union.
+	want := []string{"_invoices_old", "_users_old"}
+	assert.Equal(t, want, plan.Namespaces["app"].DropTables)
+	assert.Equal(t, want, plan.Namespaces["billing"].DropTables)
+	assert.Equal(t, want, plan.DropTables())
+
+	clean := &Plan{Namespaces: map[string]*NamespacePlanData{"app": {}}}
+	clean.RecordDropTables(nil)
+	assert.Nil(t, clean.Namespaces["app"].DropTables)
+	assert.Nil(t, clean.DropTables())
+}
+
 func TestPlanIgnoreTables(t *testing.T) {
 	assert.Nil(t, (*Plan)(nil).IgnoreTables(), "a nil plan excluded nothing")
 	assert.Nil(t, (&Plan{}).IgnoreTables(), "a plan with no namespaces excluded nothing")

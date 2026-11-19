@@ -678,9 +678,12 @@ func replanBlockedStatements(result *engine.PlanResult) map[replanStatementKey]s
 func (c *LocalClient) replanTargetSchema(ctx context.Context, apply *storage.Apply, plan *storage.Plan) (map[shardTableKey][]string, error) {
 	// The re-plan withholds what the stored plan withheld: those tables were
 	// never captured in its original files, so a re-plan that saw them would
-	// report them as changes the apply still owes.
+	// report them as changes the apply still owes. It drops what the stored
+	// plan dropped by name, so a drop the apply has not yet run still reads as
+	// owed.
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
 		IgnoreTables: plan.IgnoreTables(),
+		DropTables:   plan.DropTables(),
 		// Judged under the policy this apply was admitted with, so a
 		// statement it routed directly is not read back as still owed
 		// because a re-plan without the policy refused it.
@@ -879,6 +882,7 @@ type replanResult struct {
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
 	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
 		IgnoreTables:    plan.IgnoreTables(),
+		DropTables:      plan.DropTables(),
 		DirectExecution: DirectExecutionPolicyProto(apply.GetOptions().DirectExecution),
 	}, apply.Database, plan.SchemaFiles)
 	if err != nil {

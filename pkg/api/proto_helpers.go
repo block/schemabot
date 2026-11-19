@@ -343,6 +343,37 @@ func plannedDropsWithheldBy(changes []*ternv1.SchemaChange, shards []*ternv1.Sha
 	return slices.Compact(dropped)
 }
 
+// dropTablesEntriesStillSkipped returns, in the order the config lists them,
+// the drop_tables entries the plan does not drop although it still discloses
+// them as tables the planner skips by a naming convention. A planner that read
+// drop_tables would have dropped such a table instead of skipping it, so these
+// entries reached a data plane that did not apply the list.
+func dropTablesEntriesStillSkipped(entries []string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, groups []*ternv1.ExemptTables) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	skipped := make(map[string]bool)
+	for _, group := range groups {
+		if group == nil || group.Reason == engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		for _, table := range group.Tables {
+			skipped[table] = true
+		}
+	}
+	dropped := make(map[string]bool)
+	for _, drop := range plannedTableDrops(changes, shards) {
+		dropped[drop.table] = true
+	}
+	var stillSkipped []string
+	for _, entry := range entries {
+		if skipped[entry] && !dropped[entry] && !slices.Contains(stillSkipped, entry) {
+			stillSkipped = append(stillSkipped, entry)
+		}
+	}
+	return stillSkipped
+}
+
 // existingCopiesFromProto carries the target's unfinished copies through to the
 // plan response so the operator is told, before applying, whether the apply
 // resumes an existing copy or throws it away and starts over.
