@@ -46,6 +46,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" \
     -o /schemabot ./pkg/cmd
 
+# The live end-to-end runner ships in the same image, so a deploy gate tests a
+# release with the runner from that release rather than one built elsewhere.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w" \
+    -o /schemabot-e2e ./cmd/schemabot-e2e
+
 # Runtime stage
 FROM alpine:3.19
 
@@ -71,6 +77,7 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /schemabot /app/schemabot
+COPY --from=builder /schemabot-e2e /app/schemabot-e2e
 
 # Copy configs into the image (config.yaml is gitignored but present locally;
 # CI creates it from config.yaml.example before building).
