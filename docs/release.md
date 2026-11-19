@@ -395,8 +395,8 @@ every install that has not granted it (AV-17 in
 [github-app-setup.md](./github-app-setup.md). A new permission must be marked
 optional and name the server config key that turns on the behavior needing it,
 and that key must be off by default; `TestGitHubAppPermissionsAreRequiredOrGatedByConfig`
-fails otherwise. The release notes name the permission and the key, so operators
-know to grant one before turning on the other.
+fails otherwise. The release notes' upgrade notes name the permission and the key,
+so operators know to grant one before turning on the other.
 
 ### 7. Error baseline
 
@@ -420,8 +420,14 @@ inside it.
    ```bash
    docker manifest inspect ghcr.io/block/schemabot:vX.Y.Z
    ```
-5. Write the release notes, operator actions first: config keys added or removed,
-   changed defaults, deploy ordering constraints, storage schema changes.
+5. Write the release notes. Open them with an **Upgrade notes** section that
+   lists every operator action the pre-tag checks found, before any other
+   change: config keys added or removed, changed defaults, new GitHub App
+   permissions with the config key that needs each one, deploy ordering
+   constraints, and storage schema changes. Name each key and permission
+   exactly, so operators can search their own configs and App settings for it.
+   When a release asks nothing of operators, say so in that section instead of
+   leaving it out.
 
 ## Fixing a bad release
 
