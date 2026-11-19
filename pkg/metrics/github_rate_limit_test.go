@@ -279,3 +279,50 @@ func TestGitHubQuotaSnapshotFutureObservation(t *testing.T) {
 	require.Len(t, ages, 1)
 	assert.True(t, strings.HasSuffix(ages[0], " 0"), ages[0])
 }
+
+// The unobserved-installations gauge counts the probe's targets whose core
+// budget is unknown. A serving installation with a fresh snapshot is observed;
+// one with no snapshot, and an owner whose installation could not be resolved,
+// are not, so a gate that requires zero fails closed instead of reading only
+// the budgets that happen to be known. A snapshot that ages out turns its
+// installation unobserved without another probe pass.
+func TestGitHubQuotaUnobservedInstallations(t *testing.T) {
+	recorder, scrape := newQuotaRegistry(t)
+	now := time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
+	recorder.now = func() time.Time { return now }
+	RecordGitHubRateLimit(t.Context(), quotaSample(now, 9000))
+
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42, 43}, 1)
+	lines := snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+	require.Len(t, lines, 1)
+	assert.Contains(t, lines[0], `github_app="example-app"`)
+	assert.Contains(t, lines[0], `resource="core"`)
+	assert.NotContains(t, lines[0], "installation_id=")
+	assert.True(t, strings.HasSuffix(lines[0], " 2"), "installation 43 and the unresolved owner: %s", lines[0])
+
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
+	lines = snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 0"), lines[0])
+
+	now = now.Add(GitHubRateLimitSnapshotMaxAge + time.Second)
+	lines = snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 1"), "the aged-out snapshot leaves installation 42 unobserved: %s", lines[0])
+}
+
+// A probe keeps one set of targets per App even when the label it reports
+// under changes, as it does once the App's slug is learned after startup, so
+// an earlier label does not linger as a permanently unobserved series.
+func TestGitHubQuotaProbeTargetsReplacedPerApp(t *testing.T) {
+	_, scrape := newQuotaRegistry(t)
+	SetGitHubQuotaProbeTargets(1, "", []int64{42}, 0)
+	SetGitHubQuotaProbeTargets(1, "example-app", []int64{42}, 0)
+	SetGitHubQuotaProbeTargets(2, "other-app", nil, 0)
+
+	lines := snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+	require.Len(t, lines, 2)
+	body := strings.Join(lines, "\n")
+	assert.Contains(t, body, `github_app="example-app"`)
+	assert.Contains(t, body, `github_app="other-app"`)
+}

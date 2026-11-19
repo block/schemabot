@@ -3719,6 +3719,29 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 	return ResolvedGitHubApp{Name: "default", Config: c.GitHub}, nil
 }
 
+// ReposServedByGitHubApp returns the configured repositories whose webhooks and
+// API calls go through the named App, sorted. restricted is false when the
+// config does not enumerate repositories at all (single-App, empty repos
+// config), meaning the App may serve any repository it is installed on. With
+// Apps configured, the list is the repos whose github_app names the App, so an
+// App no repository points at serves none.
+func (c *ServerConfig) ReposServedByGitHubApp(name string) (repos []string, restricted bool) {
+	if c == nil {
+		return nil, false
+	}
+	if len(c.Apps) == 0 && len(c.Repos) == 0 {
+		return nil, false
+	}
+	for repo, repoConfig := range c.Repos {
+		if len(c.Apps) > 0 && repoConfig.GitHubApp != name {
+			continue
+		}
+		repos = append(repos, repo)
+	}
+	slices.Sort(repos)
+	return repos, true
+}
+
 // ResolveGitHubAppsByID resolves every configured App's app-id and returns
 // a map keyed by the resolved int64 ID. Used at startup by the webhook
 // runtime to build the inbound-dispatch table that maps the App ID carried

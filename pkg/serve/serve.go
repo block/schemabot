@@ -1495,8 +1495,24 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		drainInProcessWebhookWork:      handler.DrainInProcessWebhookWork,
 		handler:                        handler,
 		reconcileTerminalApplyOutcomes: handler.ReconcileTerminalApplyOutcomes,
-		quotaProbes:                    []*ghclient.QuotaProbe{ghClient.NewQuotaProbe()},
+		quotaProbes:                    []*ghclient.QuotaProbe{newQuotaProbe(serverConfig, ghClient, "default", logger)},
 	}, nil
+}
+
+// newQuotaProbe builds the quota probe for one App. When the config enumerates
+// the repositories the App serves, the probe reads only the installations
+// serving them; otherwise any installation may serve a repository, so it reads
+// them all.
+func newQuotaProbe(serverConfig *api.ServerConfig, client *ghclient.Client, appName string, logger *slog.Logger) *ghclient.QuotaProbe {
+	repos, restricted := serverConfig.ReposServedByGitHubApp(appName)
+	if !restricted {
+		logger.Info("GitHub quota probe reads every installation: the config does not list the repositories this App serves",
+			"app_name", appName)
+		return client.NewQuotaProbe()
+	}
+	logger.Info("GitHub quota probe reads the installations serving configured repositories",
+		"app_name", appName, "repos", len(repos))
+	return client.NewServingQuotaProbe(repos)
 }
 
 // disabledWebhookRuntime serves the webhook path while GitHub is off: every
@@ -1565,7 +1581,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 			ghclient.WithConfigDirHints(serverConfig),
 			ghclient.WithListenOnlyRepos(serverConfig))
 		clients[e.name] = appClient
-		quotaProbes = append(quotaProbes, appClient.NewQuotaProbe())
+		quotaProbes = append(quotaProbes, newQuotaProbe(serverConfig, appClient, e.name, logger))
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 

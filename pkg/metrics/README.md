@@ -89,6 +89,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.limit` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
 | `schemabot.github.rate_limit.remaining` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
 | `schemabot.github.rate_limit.observation_age_seconds` | Observable gauge | environment, operation, resource, github_app, installation_id | Age of the latest trustworthy installation snapshot; rises past the export age only when the quota probe cannot read the budget |
+| `schemabot.github.rate_limit.unobserved_installations` | Observable gauge | environment, operation, resource, github_app | Installations serving configured repositories whose core budget is unknown: no fresh snapshot, or the owner's installation could not be resolved. Exported once the quota probe has listed its targets; a quota gate requires 0 alongside the `remaining` threshold |
 | `schemabot.github.rate_limit.used` | Observable gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.target.probe.total` | Counter | database_type, environment, outcome | Startup connectivity probes of enumerated targets, by outcome. This counter sits below the volume bar in [Does it belong in a metric?](#does-it-belong-in-a-metric) — one observation per target per process start — and earns its place as a deploy-time alert instead: a fleet-wide rollout produces a burst of observations at once, and any non-`success` outcome in that burst is a rotated credential, dropped grant, or unreachable target found before the first schema change reaches it. Alert on `outcome != success` per environment after each deploy. Target is omitted to bound cardinality; the paired warn log names it |
@@ -330,11 +331,28 @@ A new window can increase the allowance.
 
 Webhook traffic refreshes a snapshot from the headers of every response, and
 the server's GitHub quota probe refreshes it while there is no traffic: once a
-minute it reads `GET /rate_limit` for each active installation of every
-configured App. GitHub does not count that read against the budget it reports,
-and it is recorded like any other request, as `operation="fetch_rate_limit"`
-after the installation list (`operation="list_app_installations"`). An idle
-server therefore keeps exporting its installations' budgets. The budget read is
+minute it reads `GET /rate_limit` for each installation it is responsible for.
+GitHub does not count that read against the budget it reports, and it is
+recorded like any other request, as `operation="fetch_rate_limit"`. An idle
+server therefore keeps exporting its installations' budgets.
+
+The probe is responsible for the installations that serve the App's configured
+repositories, resolved through the same cached per-owner installation lookup
+webhook dispatch uses. An installation of the App on an account the server
+serves no repository of is not read, so its untouched budget neither stands in
+for a serving installation running low nor fails a quota gate; it exports a
+snapshot only while it has traffic of its own. A server whose config lists no
+repositories may serve any repository, so its probe reads every active
+installation of the App instead (`operation="list_app_installations"`).
+
+`schemabot.github.rate_limit.unobserved_installations` makes a missing budget
+visible. It counts the probe's installations with no exportable snapshot, plus
+each configured owner whose installation the probe could not resolve on its
+last pass (a 404, meaning the App is not installed on that repository, is not
+counted: no installation serves it). Because a missing series cannot lower a
+`min`, a headroom gate checks both: `min` of the snapshot `remaining` at or
+above its threshold, and `max` of `unobserved_installations` at 0. Treat no
+data on either query as a failure. The budget read is
 never refused locally for an exhausted primary budget, so an installation that
 has spent its whole budget still reports 0 rather than aging out to unknown;
 secondary cooldowns still apply to it.
@@ -344,7 +362,7 @@ without App credentials serves a disabled webhook endpoint and starts no probe,
 so a deployment that only runs schema changes and never talks to GitHub sends
 no probe requests and exports no snapshot. Every replica of a server with an App
 runs its own probe, so the reads scale with replicas: 20 replicas make 20
-installation lists per App and 20 budget reads per installation each minute.
+budget reads per installation each minute.
 None of those reads spends the core budget. Each replica exports the same budget
 under its own series, so query the snapshot with an aggregation across replicas
 (`min` for headroom), not a single series.
@@ -380,7 +398,8 @@ when a `not_found` rate looks anomalous.
 Useful dashboard views:
 
 1. Minimum `schemabot.github.rate_limit.remaining{operation="rate_limit_snapshot"}` by `github_app`,
-   `installation_id`, and `resource`.
+   `installation_id`, and `resource`, next to the maximum
+   `schemabot.github.rate_limit.unobserved_installations` by `github_app`.
 2. Request rate from `schemabot.github.requests_total` by `category`,
    `operation`, and `status`.
 3. Write request rate by `github_app` and `installation_id` to spot
