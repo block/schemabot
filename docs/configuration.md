@@ -2015,6 +2015,7 @@ For a listen-only repository, SchemaBot:
 - sends no comments, reactions, review requests, or Check Runs;
 - ignores comment commands, so no apply ever starts from the repository. Auto-plan still runs for any database this deployment manages in the repository, but its plan comment and checks are not posted;
 - runs the default-branch push and merge queue paths up to the Check Run write, so their coverage and Check Run lookups are measured too.
+- reads the pull request head once after config discovery, as the release of a stored aggregate block does, and releases nothing: a listen-only repository has no aggregate check, so it has no block to release.
 
 One path is not measured: the PR aggregate check sync, which reads the PR head and looks up the aggregate Check Run before it writes. A listen-only repository skips it, as any repository with `enable_checks: false` does. Its cost is a few reads per delivery, and it does not grow with the number of files in the pull request.
 
