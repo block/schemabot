@@ -176,6 +176,23 @@ type webhookRuntime struct {
 	stopDurableWebhookDispatch     func()
 	drainInProcessWebhookWork      func(context.Context)
 	reconcileTerminalApplyOutcomes func(context.Context)
+	// quotaProbes keep each App's installation budgets observed while the
+	// server has no GitHub traffic of its own, one probe per App.
+	quotaProbes []*ghclient.QuotaProbe
+}
+
+// startQuotaProbes starts every App's quota probe.
+func (r webhookRuntime) startQuotaProbes(ctx context.Context) {
+	for _, probe := range r.quotaProbes {
+		probe.Start(ctx)
+	}
+}
+
+// stopQuotaProbes stops every App's quota probe and waits for it to return.
+func (r webhookRuntime) stopQuotaProbes() {
+	for _, probe := range r.quotaProbes {
+		probe.Stop()
+	}
 }
 
 // reconcilePass is a running one-shot terminal outcome reconciliation. Start
@@ -1118,7 +1135,9 @@ func (s *Server) MetricsHandler() http.Handler {
 // Start launches the server's background work: the operator driver pool
 // (dispatches queued applies and recovers stale ones), the remote-deployment
 // health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
-// metrics), the startup target probe, and the pending-drops cleaner — all of which run until ctx is
+// metrics), the startup target probe, the GitHub quota probe (keeps each App
+// installation's budget observed while no deliveries arrive), and the
+// pending-drops cleaner — all of which run until ctx is
 // canceled or Close is called. It also kicks off a one-shot terminal outcome
 // reconciliation that, once started, runs independently of ctx (it repairs
 // interrupted terminal comments and checks and must not be cut short by a request context)
@@ -1132,6 +1151,7 @@ func (s *Server) Start(ctx context.Context) {
 	if s.webhook.startDurableWebhookDispatch != nil {
 		s.webhook.startDurableWebhookDispatch(ctx)
 	}
+	s.webhook.startQuotaProbes(ctx)
 	s.svc.StartOperator(ctx)
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartWebhookInboxMonitor(ctx)
@@ -1203,6 +1223,7 @@ func (s *Server) stopTargetProbe() {
 // the right move when the wait is the thing holding the process open.
 func (s *Server) Close() error {
 	s.stopTargetProbe()
+	s.webhook.stopQuotaProbes()
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()
@@ -1476,6 +1497,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		drainInProcessWebhookWork:      handler.DrainInProcessWebhookWork,
 		handler:                        handler,
 		reconcileTerminalApplyOutcomes: handler.ReconcileTerminalApplyOutcomes,
+		quotaProbes:                    []*ghclient.QuotaProbe{ghClient.NewQuotaProbe()},
 	}, nil
 }
 
@@ -1506,6 +1528,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	}
 
 	clients := make(map[string]ghclient.GitHubClientFactory, len(appsByID))
+	quotaProbes := make([]*ghclient.QuotaProbe, 0, len(appsByID))
 	secretsByApp := make(map[string][]byte, len(appsByID))
 	appByID := make(map[int64]string, len(appsByID))
 
@@ -1539,11 +1562,13 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 			return webhookRuntime{}, fmt.Errorf("app %q webhook secret resolved to empty value", e.name)
 		}
 
-		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger,
+		appClient := ghclient.NewClient(e.id, []byte(privateKey), logger,
 			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs),
 			ghclient.WithConfigDirHints(serverConfig),
 			ghclient.WithListenOnlyRepos(serverConfig),
 			ghclient.WithQuotaReserve(e.cfg.QuotaReserve))
+		clients[e.name] = appClient
+		quotaProbes = append(quotaProbes, appClient.NewQuotaProbe())
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
@@ -1574,6 +1599,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		drainInProcessWebhookWork:      handler.DrainInProcessWebhookWork,
 		handler:                        handler,
 		reconcileTerminalApplyOutcomes: handler.ReconcileTerminalApplyOutcomes,
+		quotaProbes:                    quotaProbes,
 	}, nil
 }
 

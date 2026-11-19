@@ -84,6 +84,11 @@ type Client struct {
 	// mutated afterwards.
 	quotaReserve int64
 
+	// appTransportBase is the transport requests signed with the App JWT go
+	// out on (the slug fetch, installation lookups, the installation list).
+	// Nil means http.DefaultTransport; tests set it to answer without GitHub.
+	appTransportBase http.RoundTripper
+
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
 	// failure. lastSlugAttempt is read+written only under this mutex.
@@ -221,27 +226,36 @@ func NewClient(appID int64, privateKey []byte, logger *slog.Logger, opts ...Clie
 	// Fetch the app slug so we can identify our own check runs.
 	// Non-fatal: if GitHub is down, the server still starts but the check gate won't
 	// exclude own checks (PR applies may be blocked until the slug is fetched).
-	c.fetchAppSlug()
+	c.fetchAppSlug(context.Background())
 
 	return c
 }
 
-// fetchAppSlug fetches the app slug from GitHub via GET /app.
-// On failure, logs an error and leaves appSlug empty.
-func (c *Client) fetchAppSlug() {
+// appBaseTransport returns the transport an App-JWT client sends through, with
+// the same quota tracking and metrics as installation requests.
+func (c *Client) appBaseTransport() http.RoundTripper {
+	base := c.appTransportBase
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return newGitHubRateLimitTransport(newGitHubMetricsTransport(base, 0, c.loadAppSlug))
+}
+
+// fetchAppSlug fetches the app slug from GitHub via GET /app, bounded by ctx
+// and the App client's own timeout. On failure, logs an error and leaves
+// appSlug empty.
+func (c *Client) fetchAppSlug(ctx context.Context) {
 	c.slugFetchMu.Lock()
 	c.lastSlugAttempt = time.Now()
 	c.slugFetchMu.Unlock()
 
-	appBaseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, 0, c.loadAppSlug))
-	appTransport, err := ghinstallation.NewAppsTransport(appBaseTransport, c.appID, c.privateKey)
+	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
 	if err != nil {
 		c.logger.Error("failed to create app transport for slug fetch", "error", err)
 		return
 	}
 	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
 	appClient.DisableRateLimitCheck = true
-	ctx := context.Background()
 	app, _, err := appClient.Apps.Get(ctx, "")
 	if err != nil {
 		c.logger.Error("failed to fetch app slug from GitHub — check gate will not exclude own checks",
@@ -294,6 +308,13 @@ func newInstallationTransport(appID, installationID int64, privateKey []byte, ap
 // recovers its slug after a startup failure does not strand existing
 // InstallationClients with an empty slug.
 func (c *Client) ForInstallation(installationID int64) (*InstallationClient, error) {
+	return c.forInstallation(context.Background(), installationID)
+}
+
+// forInstallation is ForInstallation with the slug retry bound to ctx, for a
+// caller that must stop promptly once its context is canceled, such as the
+// quota probe on shutdown.
+func (c *Client) forInstallation(ctx context.Context, installationID int64) (*InstallationClient, error) {
 	// Retry slug fetch if it failed at startup (e.g., GitHub was down).
 	// Rate-limited to once per 5 seconds to avoid hammering GitHub during
 	// an outage while still recovering quickly once it's back.
@@ -303,7 +324,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		c.slugFetchMu.Unlock()
 		if shouldRetry {
 			c.logger.Info("app slug not yet fetched, retrying")
-			c.fetchAppSlug()
+			c.fetchAppSlug(ctx)
 		}
 		if c.loadAppSlug() == "" {
 			c.logger.Error("app slug unavailable — check gate will block PR applies if own checks are not passing")
@@ -366,8 +387,7 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 		return 0, fmt.Errorf("resolve installation for %q: repository must be in owner/name form", repo)
 	}
 
-	appBaseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, 0, c.loadAppSlug))
-	appTransport, err := ghinstallation.NewAppsTransport(appBaseTransport, c.appID, c.privateKey)
+	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
 	if err != nil {
 		return 0, fmt.Errorf("create app transport to resolve installation for %s: %w", repo, err)
 	}
