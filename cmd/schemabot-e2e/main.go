@@ -12,6 +12,13 @@
 //
 // The GitHub token comes from GITHUB_TOKEN and the test database DSN from
 // SCHEMABOT_E2E_DSN.
+//
+// With -github-calls-namespaces, a run in a pod also counts the GitHub API
+// calls SchemaBot made during it, from every SchemaBot pod's metrics endpoint,
+// and sends the count to DogStatsD as the schemabot.e2e.github_calls gauge,
+// tagged with -metric-tags. When the count cannot be taken (a pod restarted,
+// or a read failed) nothing is sent, so a gate that requires the gauge holds
+// the release. The count does not change the exit code.
 package main
 
 import (
@@ -21,10 +28,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/DataDog/datadog-go/v5/statsd"
 
 	"github.com/block/schemabot/pkg/livee2e"
 )
@@ -63,6 +74,11 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	fs.DurationVar(&cfg.PollInterval, "poll-interval", 5*time.Second, "how often to read the pull request")
 	fs.DurationVar(&cfg.WaitTimeout, "wait-timeout", 15*time.Minute, "how long to wait for SchemaBot to act on each command")
 	fs.DurationVar(&cfg.RunTimeout, "run-timeout", 2*time.Hour, "how long a whole run may take, opening the test database included; a sweep reaps the run once this and then the wait timeout have passed")
+	callNamespaces := fs.String("github-calls-namespaces", "", "comma-separated namespaces of the SchemaBot pods whose GitHub calls the run counts; empty counts nothing")
+	callSelector := fs.String("github-calls-selector", "app.kubernetes.io/name=schemabot", "label selector for the SchemaBot pods whose GitHub calls the run counts")
+	metricsPort := fs.Int("github-calls-metrics-port", 9102, "port of each SchemaBot pod's Prometheus endpoint")
+	statsdAddr := fs.String("statsd-addr", "", "DogStatsD address for the GitHub call count; empty uses DD_DOGSTATSD_URL or DD_AGENT_HOST")
+	metricTags := fs.String("metric-tags", "", "comma-separated key:value tags for the GitHub call count, such as the deploy's values SHA and stage")
 	if err := fs.Parse(args[1:]); err != nil {
 		// -h fails too, so a gate misconfigured with it cannot pass.
 		return exitFailed
@@ -77,6 +93,20 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	// connection counts against it. The runner keeps its own cleanup budget.
 	runCtx, cancelRun := context.WithTimeout(ctx, cfg.RunTimeout)
 	defer cancelRun()
+
+	// The counter is built before the test database opens, so a gate
+	// misconfigured to count calls fails without touching the database.
+	var counter *livee2e.GitHubCallCounter
+	closeCounter := func() {}
+	if !*sweepOnly {
+		var err error
+		counter, closeCounter, err = newCallCounter(*callNamespaces, *callSelector, *metricsPort, *statsdAddr, *metricTags, getenv, logger)
+		if err != nil {
+			logger.Error("invalid configuration", "error", err)
+			return exitFailed
+		}
+	}
+	defer closeCounter()
 
 	gh, err := livee2e.NewGitHub(cfg.Repo, getenv("GITHUB_TOKEN"))
 	if err != nil {
@@ -108,11 +138,57 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 
 	if *sweepOnly {
-		err = runner.Sweep(runCtx)
-	} else {
-		err = runner.Run(runCtx)
+		return report(logger, stdout, runner.Sweep(runCtx), ctx.Err() != nil)
+	}
+	if counter != nil {
+		counter.Start(runCtx)
+	}
+	err = runner.Run(runCtx)
+	if counter != nil {
+		// The run's context may be cancelled by now; the count is still worth
+		// sending, so it gets its own bound.
+		countCtx, cancelCount := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		if _, cerr := counter.Finish(countCtx); cerr != nil {
+			logger.Error("no GitHub call count sent; a gate that requires it will hold the release", "error", cerr)
+		}
+		cancelCount()
 	}
 	return report(logger, stdout, err, ctx.Err() != nil)
+}
+
+// newCallCounter builds the GitHub call counter, or returns nil when no
+// namespaces are given. The returned close flushes the DogStatsD client.
+func newCallCounter(namespaces, selector string, port int, statsdAddr, tags string, getenv func(string) string, logger *slog.Logger) (*livee2e.GitHubCallCounter, func(), error) {
+	if namespaces == "" {
+		return nil, func() {}, nil
+	}
+	pods, err := livee2e.NewInClusterPods(getenv("KUBERNETES_SERVICE_HOST"), getenv("KUBERNETES_SERVICE_PORT"),
+		splitList(namespaces), selector, port)
+	if err != nil {
+		return nil, nil, fmt.Errorf("count GitHub calls: %w", err)
+	}
+	client, err := statsd.New(statsdAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("count GitHub calls: DogStatsD client: %w", err)
+	}
+	closeClient := func() {
+		if err := client.Close(); err != nil {
+			logger.Warn("closing the DogStatsD client failed", "error", err)
+		}
+	}
+	scrape := &http.Client{Timeout: 10 * time.Second}
+	return livee2e.NewGitHubCallCounter(pods, scrape, client, splitList(tags), logger), closeClient, nil
+}
+
+// splitList splits a comma-separated flag value, dropping empty entries.
+func splitList(s string) []string {
+	var out []string
+	for part := range strings.SplitSeq(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // report prints the outcome and returns the exit code. A run that stopped
