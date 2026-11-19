@@ -458,7 +458,7 @@ func TestWriteProgress_TargetRollupIsInstantOnlyWhenEveryTargetIs(t *testing.T) 
 
 	mixed := renderRollout(t, completedRollout(instant, completedTarget()))
 	assert.NotContains(t, mixed, "Applied instantly", "a target that copied rows keeps the change from reading instant:\n%s", mixed)
-	assert.Contains(t, mixed, "✓ Complete")
+	assert.Contains(t, mixed, "✅ Complete")
 
 	allInstant := renderRollout(t, completedRollout(instant, instant))
 	assert.Contains(t, allInstant, "⚡ Applied instantly")
@@ -826,7 +826,7 @@ func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 		data := targetRolloutData(repeat(completedTarget(), 3))
 		data.State = state.Apply.Completed
 		out := renderRollout(t, data)
-		assert.Contains(t, out, "~ orders: "+ui.ProgressBarComplete()+" ✓ Complete\n", "%s", out)
+		assert.Contains(t, out, "~ orders: "+ui.ProgressBarComplete()+" ✅ Complete\n", "%s", out)
 		assert.NotContains(t, out, "of 3 targets", "%s", out)
 	})
 }
@@ -1036,7 +1036,7 @@ func TestWriteProgress_TableByTableRolloutCountsTableSteps(t *testing.T) {
 	assert.NotContains(t, out, "Targets:      ")
 	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
 	assert.Equal(t, 1, strings.Count(out, "🔄 1 of 2 tables done on 2 targets\n"), "one section for the deployment:\n%s", out)
-	assert.Contains(t, out, "~ bikes: "+ui.ProgressBarComplete()+" ✓ Complete\n")
+	assert.Contains(t, out, "~ bikes: "+ui.ProgressBarComplete()+" ✅ Complete\n")
 	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 queued)")
 	assert.Equal(t, 1, strings.Count(out, "• Targets:"), "only the copying table lists its targets:\n%s", out)
 }
@@ -1170,7 +1170,7 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 		data := targetRolloutData([]rolloutTarget{completedTarget(), completedTarget(), heldBack})
 		data.State = state.Apply.Failed
 		out := renderRollout(t, data)
-		assert.Contains(t, out, "orders: ✓ Complete on 2 of 3 targets · 1 not started\n", out)
+		assert.Contains(t, out, "orders: ✅ Complete on 2 of 3 targets · 1 not started\n", out)
 		assert.NotContains(t, out, "• Targets:", out)
 		assert.NotContains(t, out, "queued", out)
 	})

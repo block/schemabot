@@ -119,6 +119,16 @@ func shardPart(s ShardProgress) presentation.Part {
 	}
 }
 
+// shardParts is each of a table's shards or targets as the shared part
+// listing reads it.
+func shardParts(shards []ShardProgress) []presentation.Part {
+	parts := make([]presentation.Part, len(shards))
+	for i, s := range shards {
+		parts[i] = shardPart(s)
+	}
+	return parts
+}
+
 // listedPart is s as a table's part listing names it, runningWord naming it
 // while it works on the change.
 func listedPart(s ShardProgress, runningWord string) presentation.Part {

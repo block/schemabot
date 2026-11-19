@@ -1696,16 +1696,19 @@ statement count. *Enforced:* the shared plan counter and summary renderer
 `pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`), and the
 multi-environment CLI deduplication fingerprint (`planFingerprint` in `pkg/cmd/commands/plan.go`).
 
-### UX-7: A table's copy progress across targets reads the same on every surface
+### UX-7: A table reads the same in the CLI and the PR comment
 
-While a rollout is copying a table on several targets, the table has one reading of its progress:
-the percent beside its bar, the rows copied of the rows to copy, how many targets those rows cover,
-its planned size, and whether its ETA is a floor. That reading is derived once from the targets'
-progress and rendered by the CLI and the PR comment alike, so the two never disagree about how far
-one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
-`AcrossTargetsPercent`, and `TargetsTableSizeClause` in `pkg/presentation`), and a test that
-renders the same rollouts through both surfaces and fails when they read differently
-(`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
+Wherever both the CLI and the PR comment show a table, its line is the same text on both: the
+phrase naming its state, its bar, its percent, and its rows. That holds for every engine, every
+task state, and every kind of change, and for a table rolled up across targets, where the line also
+says how many targets the rows cover, the table's planned size, and whether its ETA is a floor. Each
+of these is derived once and rendered by both surfaces, so an operator watching one apply from both
+never sees it at two different points. Only markup differs. *Enforced:* the shared state phrases
+and bars (`pkg/presentation/table_headline.go`, `pkg/ui`), the shared derivation across targets
+(`SumTargetRows`, `PercentAcrossTargets`, `AcrossTargetsPercent`, and `StoppedAcrossTargets` in
+`pkg/presentation/part_listing.go`, `TargetsTableSizeClause` in `pkg/presentation/planned_rows.go`),
+and tests that render the same tables through both surfaces and fail when they read differently,
+one over every engine and task state (`pkg/cmd/internal/templates/surface_parity_test.go`).
 
 ## Recovery (RC)
 

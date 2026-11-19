@@ -61,7 +61,7 @@
         "seconds": 4,
         "command": "",
         "caption": "The change is complete",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
       }
     ]
   },
@@ -187,7 +187,7 @@
         "seconds": 3,
         "command": "",
         "caption": "The watcher confirms completion",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
       }
     ]
   },
@@ -283,7 +283,7 @@
         "seconds": 3,
         "command": "",
         "caption": "The change completes",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
       }
     ]
   },
@@ -385,7 +385,7 @@
         "seconds": 3,
         "command": "",
         "caption": "The watcher confirms completion",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
       }
     ]
   },
@@ -476,7 +476,7 @@
         "seconds": 3,
         "command": "",
         "caption": "The watcher confirms completion",
-        "output": "\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-84\n"
+        "output": "\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-84\n"
       }
     ]
   },
@@ -615,7 +615,7 @@
         "seconds": 4,
         "command": "",
         "caption": "The new apply completes; the index is restored",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-86\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-86\n"
       }
     ]
   },
@@ -719,7 +719,7 @@
         "seconds": 4,
         "command": "",
         "caption": "The index lands on every target",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered on all 4 targets. Apply ID: apply-example-91\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered on all 4 targets. Apply ID: apply-example-91\n"
       }
     ]
   },
@@ -817,7 +817,7 @@
         "seconds": 4,
         "command": "",
         "caption": "shop-002 has the index; the other targets are unchanged",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-92\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-92\n"
       }
     ]
   },
@@ -843,7 +843,7 @@
         "seconds": 2,
         "command": "",
         "caption": "Press s to stop the apply",
-        "output": "\u001b[38;5;205m⣾ \u001b[0mStopping...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 46.94%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 12,675,000 / 27,000,000 · ETA: 5m 15s\n       • \u001b[2mTargets: 4 (3 copying, 1 complete)\u001b[0m\n           \u001b[36m◉ shop-001\u001b[0m: 45.00% · 2,700,000 / 6,000,000 rows · ETA: 2m 45s\n           \u001b[36m◉ shop-002\u001b[0m: 30.00% · 2,700,000 / 9,000,000 rows · ETA: 5m 15s\n           \u001b[36m◉ shop-003\u001b[0m: 37.00% · 2,775,000 / 7,500,000 rows · ETA: 3m 56s\n           \u001b[32m✓ shop-004\u001b[0m: 4,500,000 rows\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mStopping... 1 completed · 3 running (4 targets)\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 46.94%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 12,675,000 / 27,000,000 · ETA: 5m 15s\n       • \u001b[2mTargets: 4 (3 copying, 1 complete)\u001b[0m\n           \u001b[36m◉ shop-001\u001b[0m: 45.00% · 2,700,000 / 6,000,000 rows · ETA: 2m 45s\n           \u001b[36m◉ shop-002\u001b[0m: 30.00% · 2,700,000 / 9,000,000 rows · ETA: 5m 15s\n           \u001b[36m◉ shop-003\u001b[0m: 37.00% · 2,775,000 / 7,500,000 rows · ETA: 3m 56s\n           \u001b[32m✓ shop-004\u001b[0m: 4,500,000 rows\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 3.5,
@@ -915,7 +915,7 @@
         "seconds": 4,
         "command": "",
         "caption": "The index lands on every target",
-        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered on all 4 targets. Apply ID: apply-example-91\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered on all 4 targets. Apply ID: apply-example-91\n"
       }
     ]
   },

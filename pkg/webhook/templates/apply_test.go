@@ -1392,7 +1392,8 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	// counts the upcoming retry against the operator redispatch budget.
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 1/10)")
 	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
-	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
+	assert.Contains(t, result, "🟨") // yellow bar: the normal path is suspended, not halted by an operator
+	assert.NotContains(t, result, "🟧")
 	// Progress summary counts the retrying table.
 	assert.Contains(t, result, "1/2 complete")
 	assert.Contains(t, result, "1 retrying")
@@ -2898,7 +2899,7 @@ func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
 	}
 
 	progress := RenderApplyStatusComment(data)
-	assert.Contains(t, progress, "**`orders`**: 🚫 Cancelled at 40.00%\n", "%s", progress)
+	assert.Contains(t, progress, "**`orders`**: "+ui.ProgressBar(40, ui.ColorOrange)+" 🚫 Cancelled at 40.00%\n", "%s", progress)
 	assert.Contains(t, progress, "**`users`**: 🚫 Cancelled\n", "%s", progress)
 	assert.Contains(t, progress, "**`products`**: 🚫 Cancelled (not started)\n", "%s", progress)
 

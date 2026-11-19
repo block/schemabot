@@ -384,6 +384,19 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		// once, the way the CLI's progress view does.
 		phrase, coverage, lists = "⏹️ Stopped (not started)", "", false
 	}
+	if stopped, ok := stoppedPartWay(cells, parts, status); ok {
+		// Laid out the way a stopped table of one target is: its bar at where
+		// the targets stopped, its DDL, and the rows they copied, as the CLI
+		// shows it. The list counts the targets, so the headline does not.
+		if lists {
+			coverage = ""
+		}
+		fmt.Fprintf(sb, "**%s**: %s%s\n", name, stopped.Headline(), coverage)
+		writeDDL()
+		sb.WriteString("- " + stopped.RowsLine() + "\n")
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+		return
+	}
 	if status == state.Task.Cancelled {
 		phrase, coverage = cancelledTargetsLine(cancelledTargets{
 			done: done, cancelled: cancelled, neverStarted: neverStarted, pending: pending, targets: len(cells),
@@ -403,6 +416,17 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if lists {
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 	}
+}
+
+// stoppedPartWay is where a stopped table's targets stopped, when a target
+// got started on it and every target's rows are known
+// (presentation.StoppedAcrossTargets). ok is false for any other table, which
+// reads as its halt with no bar.
+func stoppedPartWay(cells []TableProgressData, parts []presentation.Part, status string) (presentation.StoppedTargets, bool) {
+	if status != state.Task.Stopped || !anyTargetBegan(cells) {
+		return presentation.StoppedTargets{}, false
+	}
+	return presentation.StoppedAcrossTargets(parts)
 }
 
 // stoppedBeforeAnyTargetBegan reports whether a table stopped on every

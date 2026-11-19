@@ -527,6 +527,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 
 	overlayApplyOptions(httpResp, apply)
+	httpResp.Attempt = apply.Attempt
 
 	setRevertSkippedMetadata(httpResp, apply)
 
@@ -1339,6 +1340,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 		httpResp.ErrorMessage = apply.ErrorMessage
 	}
 	overlayApplyOptions(httpResp, apply)
+	httpResp.Attempt = apply.Attempt
 	setRevertSkippedMetadata(httpResp, apply)
 	stored := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = stored.responses

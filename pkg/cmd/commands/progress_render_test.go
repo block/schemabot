@@ -111,7 +111,7 @@ func TestProgressRenderingNormalizesRawEngineStatuses(t *testing.T) {
 	}
 	out := b.String()
 
-	assert.Contains(t, out, "✓ Complete")
+	assert.Contains(t, out, "✅ Complete")
 	assert.Contains(t, out, "Checksumming to verify data")
 	assert.Contains(t, out, "Waiting for cutover")
 	assert.Contains(t, out, "⏳ Queued")

@@ -207,7 +207,7 @@ func TestWatchAfterCutover_ExitsOnEveryTerminalState(t *testing.T) {
 
 			if tc.wantErr == "" {
 				require.NoError(t, err)
-				assert.Contains(t, out, "✓ Complete")
+				assert.Contains(t, out, "✅ Complete")
 				return
 			}
 			require.EqualError(t, err, tc.wantErr)

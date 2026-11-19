@@ -730,7 +730,7 @@ func shardedTableStatusPhrase(status string) string {
 	case state.Task.Pending:
 		return "⏳ Queued"
 	case state.Task.Completed:
-		return "✅ Complete"
+		return presentation.Complete
 	case state.Task.Running:
 		return "🔄 Row copy in progress"
 	case state.Task.CatchingUp:

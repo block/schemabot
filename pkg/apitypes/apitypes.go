@@ -1843,6 +1843,10 @@ type ProgressResponse struct {
 	// VSchema change. Operations still lists every shard and finalizer row,
 	// but a client renders the apply as one change, the way its PR comments do.
 	Sharded bool `json:"sharded,omitempty"`
+	// Attempt is how many times SchemaBot has redispatched the apply after a
+	// recoverable failure. While the apply is failed_retryable, the retry under
+	// way is Attempt+1 of storage.MaxRecoveryAttempts.
+	Attempt int `json:"attempt,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.

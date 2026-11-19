@@ -402,6 +402,7 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			Namespace:           ns,
 			TableName:           t.TableName,
 			DDL:                 t.DDL,
+			ChangeType:          t.DDLAction,
 			Status:              string(t.State),
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,

@@ -393,7 +393,7 @@ func TestWatchModel_MultiDeploymentView(t *testing.T) {
 	)
 	assert.Contains(t, view, "duplicate key name 'idx_orders_source'")
 	assert.Contains(t, view, "orders")
-	assert.Contains(t, view, "✓ Complete")
+	assert.Contains(t, view, "✅ Complete")
 	assert.Contains(t, view, "Failed")
 }
 
