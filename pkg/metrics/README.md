@@ -81,7 +81,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
-| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP or local prevention; investigate shared quota usage and blocked work (see guidance below) |
+| `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP, local prevention, or the configured quota reserve; investigate shared quota usage and blocked work (see guidance below) |
 | `schemabot.github.secondary_rate_limit_cooldown_reports_total` | Counter | environment, operation, resource, github_app, installation_id, disposition | Parsed secondary cooldown decisions, including accepted and exceeded allowances |
 | `schemabot.github.wait_duration_seconds` | Histogram (seconds) | environment, operation, resource, github_app, installation_id, layer, reason | Actual elapsed outer read-retry waits, including cancellation/deadline interruptions |
 | `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
@@ -629,8 +629,11 @@ The OTel SDK deduplicates instruments with the same name, so calling `Int64Count
 
 HTTP attempt metrics remain unchanged. A primary quota rejection increments
 `primary_rate_limit_rejections_total` once at its producing layer, with
-`origin=http` for an actual quota response and `origin=local` for a prevented
-request. A bypass advisory is not a local rejection. Generic permission failures
+`origin=http` for an actual quota response, `origin=local` for a prevented
+request, and `origin=reserve` for a schema file, blob, or tree read SchemaBot
+did not send because the installation's core quota was at its configured
+`quota-reserve` (see [GitHub quota reserve](../../docs/configuration.md#github-quota-reserve)).
+A bypass advisory is not a local rejection. Generic permission failures
 remain HTTP errors. HTTP-origin quota rejections intentionally overlap HTTP
 errors; never add these counters together into one error total.
 Quota refusals with a missing or unrecognized resource header still count as

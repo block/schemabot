@@ -76,6 +76,14 @@ type Client struct {
 	// be written to.
 	listenOnlyRepos ListenOnlyRepos
 
+	// quotaReserve is the number of core REST requests each installation
+	// holds back for check runs and other merge-gating work: once GitHub
+	// reports no more than this many remaining, schema file and tree reads are
+	// refused with ErrGitHubQuotaReserved until the quota resets. Zero
+	// disables the reserve. Static configuration set at construction; never
+	// mutated afterwards.
+	quotaReserve int64
+
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
 	// failure. lastSlugAttempt is read+written only under this mutex.
@@ -149,6 +157,18 @@ type ConfigDirHints interface {
 func WithConfigDirHints(hints ConfigDirHints) ClientOption {
 	return func(c *Client) {
 		c.configDirHints = hints
+	}
+}
+
+// WithQuotaReserve holds back the given number of core REST requests per
+// installation for check runs, pull request reads, comments, and other work
+// that is not a schema input read. Once GitHub reports that many or fewer
+// remaining, schema file, blob, and tree reads are refused before they are sent
+// with an error matching ErrGitHubQuotaReserved, until the quota resets. Zero
+// disables the reserve.
+func WithQuotaReserve(requests int64) ClientOption {
+	return func(c *Client) {
+		c.quotaReserve = requests
 	}
 }
 
@@ -248,12 +268,19 @@ func newInstallationBaseTransport(installationID int64, appSlug func() string) h
 // triggered it, which names that request's repository, so a guard under it
 // would refuse the exchange and with it every read of a listen-only
 // repository.
-func newInstallationTransport(appID, installationID int64, privateKey []byte, appSlug func() string, listenOnlyRepos ListenOnlyRepos) (http.RoundTripper, error) {
+//
+// The quota reserve also wraps the installation token transport, for a
+// different reason: token exchanges are App-authenticated and report the
+// App's quota, not the installation's, so the reserve must only see the API
+// responses above the token transport. A refused read then never mints a
+// token either.
+func newInstallationTransport(appID, installationID int64, privateKey []byte, appSlug func() string, listenOnlyRepos ListenOnlyRepos, quotaReserve int64) (http.RoundTripper, error) {
 	installationTransport, err := ghinstallation.New(newInstallationBaseTransport(installationID, appSlug), appID, installationID, privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
 	}
-	return newListenOnlyTransport(installationTransport, listenOnlyRepos, installationID, appSlug), nil
+	reserved := newQuotaReserveTransport(installationTransport, quotaReserve, installationID, appSlug)
+	return newListenOnlyTransport(reserved, listenOnlyRepos, installationID, appSlug), nil
 }
 
 // ForInstallation returns a GitHub client scoped to a specific installation,
@@ -297,7 +324,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		return existing, nil
 	}
 
-	installationTransport, err := newInstallationTransport(c.appID, installationID, c.privateKey, c.loadAppSlug, c.listenOnlyRepos)
+	installationTransport, err := newInstallationTransport(c.appID, installationID, c.privateKey, c.loadAppSlug, c.listenOnlyRepos, c.quotaReserve)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +344,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
 	c.logger.Info("constructed installation client",
-		"installation_id", installationID, "app_slug", slug)
+		"installation_id", installationID, "app_slug", slug, "quota_reserve", c.quotaReserve)
 	return ic, nil
 }
 
@@ -3395,7 +3422,7 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 		if IsNotFoundError(err) {
 			return ic.fetchSchemaFilesFromTree(ctx, repo, headSHA, schemaPath)
 		}
-		return nil, err
+		return nil, fmt.Errorf("list schema files under %s in repo %s ref %s: %w", schemaPath, repo, headSHA, err)
 	}
 
 	var filesToFetch []schemaFileLocator
