@@ -579,6 +579,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 	// Find config to get the database identity. Environments are server-owned.
 	var schemaDatabase string
+	var schemaConfig *ghclient.SchemabotConfig
+	var schemaConfigDir string
 	if databaseName != "" {
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
@@ -603,8 +605,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			return
 		}
 		schemaDatabase = config.Database
+		schemaConfig, schemaConfigDir = config, configDir
 	} else {
-		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Plan)
+		config, configDir, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Plan)
 		if findErr != nil {
 			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
@@ -618,6 +621,16 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			return
 		}
 		schemaDatabase = config.Database
+		schemaConfig, schemaConfigDir = config, configDir
+	}
+	// A listen-only repository is there to measure what serving it would cost.
+	// Its databases are usually not registered in the deployment that listens
+	// to it, so the plan would end at the registry lookup below, before the
+	// schema reads that make up most of a plan's GitHub cost. Read those inputs
+	// instead of planning.
+	if isAutoPlan && h.isRepoListenOnly(repo) && h.service.Config().Database(schemaDatabase) == nil {
+		h.readListenOnlyPlanInputs(ctx, client, repo, pr, schemaConfig, schemaConfigDir)
+		return
 	}
 	// A user-issued plan reads the resolved database's live schema, so it
 	// requires that database's configured principals. Auto-plans are

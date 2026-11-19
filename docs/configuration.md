@@ -2014,6 +2014,7 @@ For a listen-only repository, SchemaBot:
 - processes its webhooks and reads GitHub the same way it does for any other repository;
 - sends no comments, reactions, review requests, or Check Runs;
 - ignores comment commands, so no apply ever starts from the repository. Auto-plan still runs for any database this deployment manages in the repository, but its plan comment and checks are not posted;
+- reads a plan's inputs for a database the pull request changes that this deployment does not register: the schema files at the head for each environment in `allowed_environments`, then one base-branch comparison for all of them. Nothing is planned, because there is no target to plan against, but the reads are the ones a deployment that registers the database makes, so the measurement covers plans and not only config discovery. An environment with no directory of its own reads the config directory, so a repository that lays out one directory per environment is read in full for each environment. This can count more than a deployment that serves one of those environments would read;
 - runs the default-branch push and merge queue paths up to the Check Run write, so their coverage and Check Run lookups are measured too.
 
 One path is not measured: the PR aggregate check sync, which reads the PR head and looks up the aggregate Check Run before it writes. A listen-only repository skips it, as any repository with `enable_checks: false` does. Its cost is a few reads per delivery, and it does not grow with the number of files in the pull request.
