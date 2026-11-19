@@ -15,9 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_primary_ratelimit"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -314,9 +316,23 @@ func TestRateLimitReadRecordsInstallationSnapshot(t *testing.T) {
 	assert.Equal(t, 14250, remaining)
 	assert.Equal(t, 15000, limit)
 
+	snapshot := installationQuotaSnapshot(t, reader)
+	require.NotNil(t, snapshot, "no installation quota snapshot was recorded")
+	assert.Equal(t, int64(14250), snapshot.Value)
+	installation, _ := snapshot.Attributes.Value("installation_id")
+	assert.Equal(t, "42", installation.AsString())
+	app, _ := snapshot.Attributes.Value("github_app")
+	assert.Equal(t, "example-app", app.AsString())
+	resource, _ := snapshot.Attributes.Value("resource")
+	assert.Equal(t, "core", resource.AsString())
+}
+
+// installationQuotaSnapshot returns the exported installation quota snapshot,
+// or nil when none is exported.
+func installationQuotaSnapshot(t *testing.T, reader *sdkmetric.ManualReader) *metricdata.DataPoint[int64] {
+	t.Helper()
 	var data metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &data))
-	var snapshot *metricdata.DataPoint[int64]
 	for _, scope := range data.ScopeMetrics {
 		for _, m := range scope.Metrics {
 			if m.Name != "schemabot.github.rate_limit.remaining" {
@@ -326,17 +342,113 @@ func TestRateLimitReadRecordsInstallationSnapshot(t *testing.T) {
 			require.True(t, ok)
 			for i, point := range gauge.DataPoints {
 				if op, _ := point.Attributes.Value("operation"); op.AsString() == metrics.GitHubOperationRateLimitSnapshot {
-					snapshot = &gauge.DataPoints[i]
+					return &gauge.DataPoints[i]
 				}
 			}
 		}
 	}
-	require.NotNil(t, snapshot, "no installation quota snapshot was recorded")
-	assert.Equal(t, int64(14250), snapshot.Value)
+	return nil
+}
+
+// An installation that has spent its whole budget still has that budget read.
+// After GitHub answers an ordinary call with the primary quota error, further
+// ordinary calls are refused locally until the reset, but the probe's
+// GET /rate_limit still reaches GitHub and records the zero, so the exhausted
+// installation reports 0 instead of aging out to unknown.
+func TestRateLimitReadReachesGitHubAfterQuotaExhaustion(t *testing.T) {
+	reader := newGitHubMetricsTestReader(t)
+	reset := time.Now().Add(time.Hour).Unix()
+	var mu sync.Mutex
+	var sent []string
+	rt := metricTestTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		sent = append(sent, req.Method+" "+req.URL.Path)
+		mu.Unlock()
+		header := http.Header{}
+		header.Set("Content-Type", "application/json")
+		header.Set(headerRateLimitLimit, "15000")
+		header.Set(headerRateLimitRemaining, "0")
+		header.Set(headerRateLimitUsed, "15000")
+		header.Set(headerRateLimitReset, strconv.FormatInt(reset, 10))
+		header.Set(headerRateLimitResource, "core")
+		if req.URL.Path == "/rate_limit" {
+			body := fmt.Sprintf(`{"resources": {"core": {"limit": 15000, "remaining": 0, "used": 15000, "reset": %d}}}`, reset)
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+		}
+		return &http.Response{StatusCode: http.StatusForbidden, Header: header, Body: io.NopCloser(strings.NewReader(`{"message": "API rate limit exceeded"}`)), Request: req}, nil
+	}))
+	pullRequest := "https://api.github.com/repos/octocat/example/pulls/1"
+	readPullRequest := func() error {
+		resp, err := rt.RoundTrip(throttlingRequest(t, t.Context(), http.MethodGet, pullRequest))
+		if resp != nil {
+			require.NoError(t, resp.Body.Close())
+		}
+		var quotaErr *github_primary_ratelimit.RateLimitReachedError
+		if errors.As(err, &quotaErr) {
+			require.NoError(t, quotaErr.Response.Body.Close())
+		}
+		return err
+	}
+
+	var quotaErr *github_primary_ratelimit.RateLimitReachedError
+	require.ErrorAs(t, readPullRequest(), &quotaErr, "GitHub's quota error should exhaust the installation's core budget")
+
+	ic := NewInstallationClient(gh.NewClient(&http.Client{Transport: rt}), slog.New(slog.DiscardHandler))
+	remaining, limit, _, err := ic.CoreRateLimit(t.Context())
+	require.NoError(t, err, "the budget read must not be refused locally while the budget is exhausted")
+	assert.Equal(t, 0, remaining)
+	assert.Equal(t, 15000, limit)
+
+	require.ErrorAs(t, readPullRequest(), &quotaErr, "ordinary calls stay refused until the reset")
+	mu.Lock()
+	assert.Equal(t, []string{"GET /repos/octocat/example/pulls/1", "GET /rate_limit"}, sent,
+		"only the budget read may reach GitHub while the budget is exhausted")
+	mu.Unlock()
+
+	snapshot := installationQuotaSnapshot(t, reader)
+	require.NotNil(t, snapshot, "the exhausted budget should be exported, not unknown")
+	assert.Equal(t, int64(0), snapshot.Value)
 	installation, _ := snapshot.Attributes.Value("installation_id")
 	assert.Equal(t, "42", installation.AsString())
-	app, _ := snapshot.Attributes.Value("github_app")
-	assert.Equal(t, "example-app", app.AsString())
-	resource, _ := snapshot.Attributes.Value("resource")
-	assert.Equal(t, "core", resource.AsString())
+}
+
+// A budget read whose installation client must first retry the App slug fetch
+// stops as soon as its context is canceled, rather than waiting out the App
+// client's own timeout, so stopping the probe stays bounded.
+func TestInstallationClientSlugRetryHonorsCancellation(t *testing.T) {
+	slugRequested := make(chan struct{})
+	var once sync.Once
+	c := &Client{
+		appID:         1,
+		privateKey:    testInstallationPrivateKey(t),
+		logger:        slog.New(slog.DiscardHandler),
+		installations: map[int64]*InstallationClient{},
+		appTransportBase: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			assert.Equal(t, "/app", req.URL.Path)
+			once.Do(func() { close(slugRequested) })
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}),
+	}
+	c.storeAppSlug("")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := c.forInstallation(ctx, 42)
+		assert.NoError(t, err)
+	}()
+	select {
+	case <-slugRequested:
+	case <-time.After(quotaProbeTestDeadline):
+		require.FailNow(t, "the App slug fetch was never sent")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "installation client acquisition kept waiting on the slug fetch after cancellation")
+	}
 }

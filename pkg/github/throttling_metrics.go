@@ -108,7 +108,15 @@ func (t *githubQuotaWaitTransport) cooldownCallback(disposition string) func(*gi
 
 func (t *githubQuotaWaitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	observation := &primaryRejectionObservation{}
-	req = req.WithContext(context.WithValue(req.Context(), primaryRejectionObservationKey{}, observation))
+	ctx := context.WithValue(req.Context(), primaryRejectionObservationKey{}, observation)
+	if isQuotaStatusRead(req) {
+		// GitHub does not count GET /rate_limit against the budget it reports,
+		// so an exhausted budget is no reason to refuse it locally: refusing it
+		// would hide the very zero the read exists to report. Only the primary
+		// refusal is lifted; secondary cooldowns still apply.
+		ctx = github_primary_ratelimit.WithOverrideConfig(ctx, github_primary_ratelimit.WithBypassLimit())
+	}
+	req = req.WithContext(ctx)
 	resp, err := t.base.RoundTrip(req)
 	var quotaErr *github_primary_ratelimit.RateLimitReachedError
 	// The prevention callback also runs in bypass mode. Count only a returned
@@ -118,6 +126,12 @@ func (t *githubQuotaWaitTransport) RoundTrip(req *http.Request) (*http.Response,
 		metrics.RecordGitHubPrimaryRateLimitRejection(req.Context(), t.sample(req, string(quotaErr.Category)), metrics.GitHubRejectionOriginLocal)
 	}
 	return resp, err
+}
+
+// isQuotaStatusRead reports whether req reads the budget itself (GET
+// /rate_limit), which GitHub does not count against that budget.
+func isQuotaStatusRead(req *http.Request) bool {
+	return githubRateLimitContextFromRequest(req).operation == metrics.GitHubOperationFetchRateLimit
 }
 
 func (t *githubQuotaWaitTransport) sample(req *http.Request, resource string) metrics.GitHubClientMetricContext {

@@ -334,7 +334,10 @@ minute it reads `GET /rate_limit` for each active installation of every
 configured App. GitHub does not count that read against the budget it reports,
 and it is recorded like any other request, as `operation="fetch_rate_limit"`
 after the installation list (`operation="list_app_installations"`). An idle
-server therefore keeps exporting its installations' budgets.
+server therefore keeps exporting its installations' budgets. The budget read is
+never refused locally for an exhausted primary budget, so an installation that
+has spent its whole budget still reports 0 rather than aging out to unknown;
+secondary cooldowns still apply to it.
 
 Only a server configured with a GitHub App runs the probe, one per App. A server
 without App credentials serves a disabled webhook endpoint and starts no probe,

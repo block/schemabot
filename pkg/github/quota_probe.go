@@ -69,7 +69,7 @@ func (c *Client) NewQuotaProbe() *QuotaProbe {
 		readConcurrency:   quotaReadConcurrency,
 		listInstallations: c.listActiveInstallations,
 		readQuota: func(ctx context.Context, installationID int64) error {
-			ic, err := c.ForInstallation(installationID)
+			ic, err := c.forInstallation(ctx, installationID)
 			if err != nil {
 				return fmt.Errorf("create installation client: %w", err)
 			}
@@ -203,8 +203,7 @@ func (p *QuotaProbe) recordPanic(ctx context.Context, recovered *panicsafe.Error
 // listActiveInstallations lists the App's installations through the App JWT,
 // skipping suspended ones, which cannot mint the token a budget read needs.
 func (c *Client) listActiveInstallations(ctx context.Context) ([]int64, error) {
-	appBaseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, 0, c.loadAppSlug))
-	appTransport, err := ghinstallation.NewAppsTransport(appBaseTransport, c.appID, c.privateKey)
+	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create app transport to list installations: %w", err)
 	}
