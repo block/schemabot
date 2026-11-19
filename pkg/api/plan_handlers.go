@@ -1408,6 +1408,12 @@ func storedNarrowingConflicts(stored, planned string) bool {
 }
 
 // handleApply handles POST /api/apply requests.
+//
+// Every 4xx it answers means no apply was stored: each refusal is decided
+// before createStoredApply stores the apply, or is the store itself refusing
+// and rolling back. The CLI relies on that to release the lock it took for a
+// refused apply, so a refusal added after the apply is stored must answer 5xx,
+// which the CLI reads as an unknown outcome and keeps its lock for.
 func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	var req ApplyRequest
 	decoder := json.NewDecoder(r.Body)
@@ -2003,6 +2009,9 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 			setter.SetApplyID(storedApplyID)
 		}
 		client.SetObserver(storedApplyID, observer)
+		// A rollout's claims in this process must not attach a second
+		// observer beside the one the command just attached.
+		s.rememberResumeObserver(storedApplyID, 0)
 	}
 
 	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
@@ -2237,6 +2246,9 @@ func (s *Service) createStoredApply(
 		}
 	}
 
+	// This is the last point a caller can be refused with a 4xx: the store
+	// either commits the apply or rolls back and stores nothing. Past it the
+	// apply exists, and handleApply's callers treat a 4xx as proof it does not.
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
 		if isApplyCreationStorageRefusal(err) {

@@ -29,6 +29,7 @@
 - [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
+- [Skipping Unrequired Branches](#skipping-unrequired-branches)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
 - [Authentication](#authentication)
@@ -255,6 +256,8 @@ role `USAGE` and `CREATE` on each target schema. The setting is valid only for
 PostgreSQL targets; when omitted, tables are created as the connected role.
 An owner the engine role cannot assume, or one the target has no role for,
 blocks the create step at plan time with the grant or correction it needs.
+[Table ownership](postgresql.md#table-ownership) explains what the owner
+controls and shows the full set of grants.
 
 `table_owner` is one role per target, deliberately scalar. A per-namespace
 map mirroring `schema_overrides` is a later extension for a target whose
@@ -2052,6 +2055,23 @@ When checks are not passing, SchemaBot posts a comment listing the non-passing c
 If the GitHub API is unreachable when checking statuses, the apply is blocked (fail-closed). SchemaBot posts a comment explaining the error and suggests retrying.
 
 Set `require_passing_checks: false` to disable this gate.
+
+## Skipping Unrequired Branches
+
+By default, SchemaBot plans, applies, and publishes Check Runs for PRs into
+every branch. Turn on `skip_unrequired_branches` to serve only PRs whose final
+target is the repository's default branch or a branch whose rulesets or
+classic branch protection require a SchemaBot check:
+
+```yaml
+# Skip PRs into branches that do not require SchemaBot (default: false)
+skip_unrequired_branches: true
+```
+
+Before turning it on, grant the GitHub App the **Administration: read**
+permission and audit which branches require SchemaBot checks. See
+[PR target eligibility](check-runs.md#pr-target-eligibility) for how targets
+are evaluated and what an excluded PR receives.
 
 ## Base Branch Schema Freshness
 

@@ -207,7 +207,7 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 	})
 
 	// Spirit's checksum estimate is runner-wide and only populated during the
-	// verify phase, when every table copy is complete — it must reach
+	// verification phase, when every table copy is complete — it must reach
 	// completed tables or it would never render at all.
 	t.Run("checksum progress reaches completed tables", func(t *testing.T) {
 		prog := status.Progress{
@@ -225,7 +225,7 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 
 	// Spirit's throttle status is runner-wide but only meaningful to tables
 	// participating in the paced phase: a table still copying, or every table
-	// during the checksum verify. A table whose copy finished while others
+	// during the checksum verification. A table whose copy finished while others
 	// still copy must not render as paused by their throttling.
 	t.Run("throttle reaches copying tables, not completed ones", func(t *testing.T) {
 		prog := status.Progress{
@@ -260,7 +260,7 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Empty(t, got[0].ThrottleReason)
 	})
 
-	// The checksum verify runs only after every copy completes, so a throttled
+	// The checksum verification runs only after every copy completes, so a throttled
 	// verify is stamped on the completed tables — otherwise it would never
 	// surface at all.
 	t.Run("throttle reaches completed tables during checksum", func(t *testing.T) {

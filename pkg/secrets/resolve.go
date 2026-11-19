@@ -138,6 +138,93 @@ func resolveFile(path string) (string, error) {
 	return strings.TrimSpace(string(content)), nil
 }
 
+// secretGetter is the one Secrets Manager call the resolver makes.
+type secretGetter interface {
+	GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+}
+
+// The process shares one Secrets Manager client. Building a client loads the
+// AWS config, which sets up the credential chain and the cache in front of it,
+// so reusing the client fetches credentials again only as they near expiry
+// instead of walking the chain, and calling the instance metadata service or
+// STS, on every resolve. Secret values are not cached: each resolve reads the
+// secret's current value, so a rotated secret takes effect on the next resolve.
+//
+// Everything else the config loader reads is fixed for the life of the
+// process once the client is built: the region, endpoint and profile, and
+// static access keys from the environment or the shared credentials file.
+// Credentials from a refreshing provider (instance metadata, container
+// credentials, web identity, an assumed role) still renew themselves. Changing
+// a static key in place, or the region or profile, needs a restart.
+var (
+	secretsManagerMu     sync.Mutex
+	secretsManagerClient secretGetter
+	// secretsManagerBuild is non-nil while one resolve builds the client, and
+	// is closed when that build ends.
+	secretsManagerBuild     chan struct{}
+	newSecretsManagerClient = loadSecretsManagerClient
+)
+
+// sharedSecretsManagerClient returns the process's Secrets Manager client,
+// building it on first use. Only one resolve builds at a time, outside the
+// mutex; the others wait for that build or for their own context, whichever
+// ends first, so a cancelled or short-deadline resolve does not wait out
+// another caller's AWS config load. A failed build is not kept: a waiter, or
+// the next resolve, builds the client again rather than failing for the life
+// of the process.
+func sharedSecretsManagerClient(ctx context.Context) (secretGetter, error) {
+	for {
+		secretsManagerMu.Lock()
+		if client := secretsManagerClient; client != nil {
+			secretsManagerMu.Unlock()
+			return client, nil
+		}
+		if building := secretsManagerBuild; building != nil {
+			secretsManagerMu.Unlock()
+			select {
+			case <-building:
+				// The build ended: loop to use its client, or to build
+				// again if it failed.
+			case <-ctx.Done():
+				return nil, fmt.Errorf("wait for Secrets Manager client: %w", ctx.Err())
+			}
+			continue
+		}
+		done := make(chan struct{})
+		secretsManagerBuild = done
+		secretsManagerMu.Unlock()
+		return buildSecretsManagerClient(ctx, done)
+	}
+}
+
+// buildSecretsManagerClient builds the shared client and publishes the
+// outcome. The publish runs in a defer so the build marker is cleared and the
+// waiters are woken on every exit, including a panic in the config loader
+// that a caller recovers; otherwise every later resolve would wait on a build
+// that never ends.
+func buildSecretsManagerClient(ctx context.Context, done chan struct{}) (client secretGetter, err error) {
+	defer func() {
+		secretsManagerMu.Lock()
+		if err == nil && client != nil {
+			secretsManagerClient = client
+		}
+		secretsManagerBuild = nil
+		secretsManagerMu.Unlock()
+		close(done)
+	}()
+	return newSecretsManagerClient(ctx)
+}
+
+// loadSecretsManagerClient builds a client from the default AWS config: the
+// standard credential chain (environment, shared config, IAM role) and region.
+func loadSecretsManagerClient(ctx context.Context) (secretGetter, error) {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	return secretsmanager.NewFromConfig(cfg), nil
+}
+
 // resolveSecretsManager fetches a secret from AWS Secrets Manager.
 // Format: "secret-name" or "secret-name#json-key"
 //
@@ -148,16 +235,13 @@ func resolveSecretsManager(ctx context.Context, ref string) (string, error) {
 	// Parse secret name and optional JSON key
 	secretName, jsonKey, _ := strings.Cut(ref, "#")
 
-	// Create AWS config (uses default credential chain: env vars, IAM role, etc.)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cfg, err := config.LoadDefaultConfig(ctx)
+	client, err := sharedSecretsManagerClient(ctx)
 	if err != nil {
-		return "", fmt.Errorf("load AWS config: %w", err)
+		return "", err
 	}
-
-	client := secretsmanager.NewFromConfig(cfg)
 
 	// Fetch the secret
 	result, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{

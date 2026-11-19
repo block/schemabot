@@ -685,7 +685,7 @@ func TestRenderMultiDeploymentApplyComment_RollsUpADeploymentsTargets(t *testing
 	assert.Contains(t, out, "**Targets**: 1 completed, 3 running\n")
 	assert.Contains(t, out, "- 🔄 `primary` — 1 completed, 2 running (3 targets)\n- 🔄 `eu-west` — running table copy\n")
 	assert.Contains(t, out, "<details open>\n<summary>🔄 primary — 1 completed, 2 running (3 targets)</summary>\n<dl><dd>\n\n")
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(53)+" 53%\n\n```sql\nALTER TABLE `orders` ADD COLUMN `note` text;\n```\n"+
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(53)+" 53.33%\n\n```sql\nALTER TABLE `orders` ADD COLUMN `note` text;\n```\n"+
 		"- Rows: 1,600 / 3,000 · ETA: "+ui.FormatETA(420)+"\n"+
 		"- Targets: 3 (2 copying, 1 complete)\n  - ✓ `testapp-001`: 1,000 rows\n  - ◉ `testapp-002`: 42.00% · 420 / 1,000 rows\n  - ◉ `testapp-003`: 18.00% · 180 / 1,000 rows\n")
 
@@ -714,8 +714,8 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 		nil,
 	)
 
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%\n\n**targets `testapp-001`, `testapp-003`**\n```sql\nALTER TABLE `orders` ADD COLUMN `note` text;\n```\n")
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%\n\n**target `testapp-002`**\n```sql\nALTER TABLE `orders` ADD INDEX `idx_note`(`note`);\n```\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50.00%\n\n**targets `testapp-001`, `testapp-003`**\n```sql\nALTER TABLE `orders` ADD COLUMN `note` text;\n```\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50.00%\n\n**target `testapp-002`**\n```sql\nALTER TABLE `orders` ADD INDEX `idx_note`(`note`);\n```\n")
 	assert.NotContains(t, out, "####", "lines replace the per-group headings")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `note`"))
 	assert.Equal(t, 1, strings.Count(out, "ADD INDEX `idx_note`"))
@@ -844,6 +844,33 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailedTargetsAreNamed(t *test
 	out = render(failedTargetRowLimit + 1)
 	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
 	assert.Contains(t, out, "\n…and 1 more failed target.\n", out)
+}
+
+// A table copying on one target and complete on the other three leads with
+// its percent at a single target's precision, since every target's rows are
+// its engine's own count, and its rows line carries the table's planned size.
+// A completed target counts in full even when its engine's row estimate ran
+// ahead of the rows it copied, so the rows and the percent agree with the bar.
+func TestRenderMultiDeploymentApplyComment_RolledUpTableReadsAtATargetsPrecision(t *testing.T) {
+	sized := func(detail *ApplyStatusCommentData) *ApplyStatusCommentData {
+		bytes := int64(1_000_000_000)
+		detail.Tables[0].EstimatedBytes = &bytes
+		return detail
+	}
+	out := renderTargets(presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Completed),
+		parallelTarget("primary", "testapp-003", so.Completed),
+		parallelTarget("primary", "testapp-004", so.Completed),
+	}),
+		sized(targetDetail("testapp_001", state.Task.Running, addNote, 420)),
+		sized(targetDetail("testapp_002", state.Task.Completed, addNote, 990)),
+		sized(targetDetail("testapp_003", state.Task.Completed, addNote, 990)),
+		sized(targetDetail("testapp_004", state.Task.Completed, addNote, 990)),
+	)
+	total := int64(4_000_000_000)
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(85)+" 85.50%\n")
+	assert.Contains(t, out, "- Rows: 3,420 / 4,000"+ui.FormatTableSizeClause(&total)+" · ETA: "+ui.FormatETA(420)+"\n")
 }
 
 // A table copying on several targets shows its planned size summed across
@@ -1076,10 +1103,10 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableWithTwoStatements(t *tes
 		twoStatements("testapp_002", 600, 300),
 	)
 
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(70)+" 70%\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(70)+" 70.00%\n")
 	assert.Contains(t, out, "- Rows: 1,400 / 2,000 · ETA: "+ui.FormatETA(800)+"\n"+
 		"- Targets: 2 (2 copying)\n  - ◉ `testapp-001`: 80.00% · 800 / 1,000 rows\n  - ◉ `testapp-002`: 60.00% · 600 / 1,000 rows\n")
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(20)+" 20%\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(20)+" 20.00%\n")
 	assert.Contains(t, out, "- Rows: 400 / 2,000 · ETA: "+ui.FormatETA(300)+"\n"+
 		"- Targets: 2 (2 copying)\n  - ◉ `testapp-001`: 10.00% · 100 / 1,000 rows\n  - ◉ `testapp-002`: 30.00% · 300 / 1,000 rows\n")
 }
@@ -2052,7 +2079,7 @@ func TestRenderMultiDeploymentApplyComment_RolledUpBarWeighsRowsOnceEveryTargetR
 		targetDetail("testapp_001", state.Task.Running, addNote, 900),
 		targetDetail("testapp_002", state.Task.Running, addNote, 100),
 	)
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50.00%")
 }
 
 // A rolling rollout three targets wide, where only the first target has
@@ -2073,6 +2100,48 @@ func TestRenderMultiDeploymentApplyComment_UnreportedTargetsRankAsQueued(t *test
 	require.NotEqual(t, -1, orders, out)
 	require.NotEqual(t, -1, invoices, out)
 	assert.Less(t, orders, invoices, "the table finished on one target leads the one no target has started")
+}
+
+// A parallel rollout across three targets where testapp-001 and testapp-002
+// already have `customers` and alter it, while testapp-003 does not and is
+// creating it. `orders` is copying on testapp-001. The two `customers` lines
+// sit next to each other, with `orders` after them, so the comment reads as
+// the two tables the rollout changes.
+func TestRenderMultiDeploymentApplyComment_ListsATablesStatementsTogether(t *testing.T) {
+	const (
+		alterCustomers  = "ALTER TABLE `customers` ADD COLUMN `tier` varchar(16)"
+		createCustomers = "CREATE TABLE `customers` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	)
+	detail := func(database string, tables ...TableProgressData) *ApplyStatusCommentData {
+		return &ApplyStatusCommentData{
+			Database: database, State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit,
+			Tables: tables,
+		}
+	}
+	customers := func(ddl, st string) TableProgressData {
+		return TableProgressData{TableName: "customers", DDL: ddl, Status: st, RowsCopied: 1000, RowsTotal: 1000}
+	}
+	orders := func(st string, copied int64) TableProgressData {
+		return TableProgressData{TableName: "orders", DDL: addNote, Status: st, RowsCopied: copied, RowsTotal: 1000}
+	}
+	out := renderTargets(presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Completed),
+		parallelTarget("primary", "testapp-003", so.Running),
+	}),
+		detail("testapp_001", customers(alterCustomers, state.Task.Completed), orders(state.Task.Running, 400)),
+		detail("testapp_002", customers(alterCustomers, state.Task.Completed), orders(state.Task.Completed, 1000)),
+		detail("testapp_003", TableProgressData{TableName: "customers", DDL: createCustomers, Status: state.Task.Running}, orders(state.Task.Pending, 0)),
+	)
+
+	alter := strings.Index(out, "ADD COLUMN `tier`")
+	create := strings.Index(out, "CREATE TABLE `customers`")
+	ordersLine := strings.Index(out, "**`orders`**")
+	require.NotEqual(t, -1, alter, out)
+	require.NotEqual(t, -1, create, out)
+	require.NotEqual(t, -1, ordersLine, out)
+	assert.Less(t, alter, ordersLine, "the ALTER of customers lists with its CREATE, ahead of orders: %s", out)
+	assert.Less(t, create, ordersLine, "the CREATE of customers leads orders: %s", out)
 }
 
 // A table in its revert window on one target and queued on the other has

@@ -1,6 +1,11 @@
 package presentation
 
-import "github.com/block/schemabot/pkg/state"
+import (
+	"cmp"
+	"slices"
+
+	"github.com/block/schemabot/pkg/state"
+)
 
 // The ranks TableRolloutRank returns, in the order a rollout's tables are
 // listed.
@@ -53,4 +58,44 @@ func TableRolloutRank(statuses []string) int {
 	default:
 		return tableRankFinished
 	}
+}
+
+// TableChangeOrder is the order a rollout lists its n table changes in, given
+// the table each one changes and its TableRolloutRank. Targets can need
+// different statements to reach the same table, an ALTER where the table
+// exists and a CREATE where it does not, and each statement has its own
+// entry. A table's statements are listed together, so the listing reads as
+// the tables the headline counts rather than as one table per statement.
+// Tables sort by the lowest rank among their statements, and a table's
+// statements by their own rank. Equal ranks keep plan order. The PR comment
+// and the CLI both order their target rollups by it.
+func TableChangeOrder(n int, table func(int) string, rank func(int) int) []int {
+	ranks := make([]int, n)
+	tableRank := make(map[string]int)
+	tablePlanned := make(map[string]int)
+	for i := range n {
+		ranks[i] = rank(i)
+		name := table(i)
+		if best, ok := tableRank[name]; !ok || ranks[i] < best {
+			tableRank[name] = ranks[i]
+		}
+		if _, ok := tablePlanned[name]; !ok {
+			tablePlanned[name] = i
+		}
+	}
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		ta, tb := table(a), table(b)
+		if c := cmp.Compare(tableRank[ta], tableRank[tb]); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(tablePlanned[ta], tablePlanned[tb]); c != 0 {
+			return c
+		}
+		return cmp.Compare(ranks[a], ranks[b])
+	})
+	return order
 }

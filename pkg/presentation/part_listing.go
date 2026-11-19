@@ -24,11 +24,25 @@ type Part struct {
 	// part's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
+	// ETASeconds is the part's own estimate of the time its copy has left,
+	// zero when its engine reports none.
+	ETASeconds int64
 	// PlannedRows is the plan's row estimate for a part whose copy is still
 	// ahead (CopyStillAhead) and whose engine has reported no row total yet,
 	// standing in for the rows it will copy. Nil once the part reports a
 	// total, or when the plan had no estimate for it.
 	PlannedRows *int64
+	// RunningLabel is the word for the part while it works on its change,
+	// RunningCopying when empty (RunningWord).
+	RunningLabel string
+}
+
+// runningLabel is the word p is named by while it works on its change.
+func (p Part) runningLabel() string {
+	if p.RunningLabel == "" {
+		return RunningCopying
+	}
+	return p.RunningLabel
 }
 
 // PendingQueued and PendingNotStarted name a part still to run: queued while
@@ -38,6 +52,24 @@ const (
 	PendingQueued     = "queued"
 	PendingNotStarted = "not started"
 )
+
+// RunningCopying and RunningApplying name a part working on its change:
+// copying while the change copies the table's rows, and applying while it runs
+// a change that copies none, such as a CREATE TABLE, a DROP TABLE or an
+// instant ALTER, where "copying" would describe work that is not happening.
+const (
+	RunningCopying  = "copying"
+	RunningApplying = "applying"
+)
+
+// RunningWord names a part working on a change that does or does not copy
+// the table's rows.
+func RunningWord(copiesRows bool) string {
+	if copiesRows {
+		return RunningCopying
+	}
+	return RunningApplying
+}
 
 // PendingWord names the parts still to run of a rollout that has or has not
 // settled.
@@ -103,10 +135,12 @@ const partListInlineLimit = 8
 // The caps on how many parts a wide listing names. Enough failed parts are
 // named that a handful of failures are each visible, few enough that a change
 // that failed everywhere does not print a line per part. The slowest few
-// copying parts are named because they set the ETA.
+// copying parts are named because they set the ETA, and the first few parts
+// working past the copy are named because they are as live as a copying one.
 const (
 	maxFailedParts  = 5
-	maxCopyingParts = 3
+	maxCopyingParts = 4
+	maxWorkingParts = 4
 )
 
 // ListsParts reports whether a table in status lists its parts one per line
@@ -189,13 +223,14 @@ func OnePhaseSpeaksForParts(statuses []string) bool {
 // the states some target is in, or "" when there are none. Queued targets are
 // waiting on the apply's driver cap or on their turn in order; pendingWord
 // names them, "not started" once the rollout has settled (PendingWord).
-func TargetCoverage(done, running, queued, failed, retrying int, pendingWord string) string {
+// runningWord names the targets working on the change (RunningWord).
+func TargetCoverage(done, running, queued, failed, retrying int, runningWord, pendingWord string) string {
 	var parts []string
 	if done > 0 {
 		parts = append(parts, fmt.Sprintf("%d complete", done))
 	}
 	if running > 0 {
-		parts = append(parts, fmt.Sprintf("%d copying", running))
+		parts = append(parts, fmt.Sprintf("%d %s", running, runningWord))
 	}
 	if queued > 0 {
 		parts = append(parts, fmt.Sprintf("%d %s", queued, pendingWord))
@@ -253,15 +288,15 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 		lines = append(lines, PartListLine{Part: i})
 	}
 	if more := len(copying) - maxCopyingParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, noun.Label(more))})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more %s %s", more, part(copying[0]).runningLabel(), noun.Label(more))})
 	}
 	// A part working through any later phase is as live as a copying one, so
 	// it is named too, in its own order, rather than hidden in the heading.
 	working := workingPastCopy(n, part)
-	for _, i := range working[:min(len(working), maxCopyingParts)] {
+	for _, i := range working[:min(len(working), maxWorkingParts)] {
 		lines = append(lines, PartListLine{Part: i})
 	}
-	if more := len(working) - maxCopyingParts; more > 0 {
+	if more := len(working) - maxWorkingParts; more > 0 {
 		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more %s past copying", more, noun.Label(more))})
 	}
 	return lines
@@ -342,10 +377,10 @@ func PartDetail(p Part, pendingWord string) string {
 		}
 		return "complete"
 	case state.Task.Running:
-		// A part that has not reported progress yet reads as copying rather
-		// than a misleading 0%.
+		// A part that has not reported progress yet reads as working on its
+		// change rather than a misleading 0%.
 		if !partReported(p) {
-			return "copying"
+			return p.runningLabel()
 		}
 		return partProgress(p)
 	case state.Task.Pending:
@@ -398,6 +433,9 @@ type PartCounts struct {
 	// PendingLabel is the word Phrases counts Queued parts by, PendingQueued
 	// when empty (PendingWord).
 	PendingLabel string
+	// RunningLabel is the word Phrases counts Running parts by,
+	// RunningCopying when empty (RunningWord).
+	RunningLabel string
 	// Other counts every status the fields above do not name, keyed by
 	// status, so a part in any phase stays in the summary.
 	Other map[string]int
@@ -440,7 +478,11 @@ func (c PartCounts) Phrases() []string {
 		parts = append(parts, fmt.Sprintf("%d failed", c.Failed))
 	}
 	if c.Running > 0 {
-		parts = append(parts, fmt.Sprintf("%d copying", c.Running))
+		label := c.RunningLabel
+		if label == "" {
+			label = RunningCopying
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", c.Running, label))
 	}
 	if c.WaitingForCutover > 0 {
 		parts = append(parts, fmt.Sprintf("%d waiting for cutover", c.WaitingForCutover))
@@ -527,6 +569,144 @@ func PartStatusLabel(status string) string {
 	default:
 		return status
 	}
+}
+
+// TargetRows is a table's rows summed across the targets that run it, for the
+// rows line under its bar and the percent beside it. Every surface derives it
+// with SumTargetRows, so the PR comment and the CLI count the same rows.
+type TargetRows struct {
+	// Copied and Total are the rows copied of the rows to copy across the
+	// targets in Counted.
+	Copied, Total int64
+	// Counted is how many targets the sum covers. A target whose rows are not
+	// known, or whose rows are not progressing, is left out.
+	Counted int
+	// Estimated reports whether a plan's estimate stands in for the rows of a
+	// target still to copy, which makes Total approximate.
+	Estimated bool
+	// ETASeconds is the slowest copying target's ETA, zero when none reports
+	// one.
+	ETASeconds int64
+	// ETAFloor reports whether a target still has time to add that no target's
+	// ETA covers: it has not started, or it is working without having reported
+	// its rows yet. The table's ETA is then a floor.
+	ETAFloor bool
+}
+
+// SumTargetRows sums a table's rows across its targets the way
+// PercentAcrossTargets weighs them, so the rows line agrees with the bar. A
+// completed target counts in full, since it has every row; its engine's row
+// estimate may have run ahead of the rows it copied. A working target counts
+// the rows it reports, capped at its own total, so one target copying past its
+// estimate never covers another's unfinished copy. A target still to copy
+// counts the plan's estimate (Part.PlannedRows) as nothing copied yet, and
+// without one it is left out. A target past its copy that reported no rows
+// copied a table with none, so it counts as nothing to copy. A target that
+// failed, is retrying, halted, or is undoing the change is left out, since its
+// rows are not progressing.
+func SumTargetRows(parts []Part) TargetRows {
+	var r TargetRows
+	for _, p := range parts {
+		status := state.NormalizeTaskStatus(p.Status)
+		if status == state.Task.Pending || (p.RowsTotal <= 0 && CopyStillAhead(status)) {
+			r.ETAFloor = true
+		}
+		if status == state.Task.Running {
+			r.ETASeconds = max(r.ETASeconds, p.ETASeconds)
+		}
+		switch status {
+		case state.Task.Completed, state.Task.RevertWindow:
+			r.Counted++
+			r.Copied += max(p.RowsTotal, 0)
+			r.Total += max(p.RowsTotal, 0)
+		case state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled,
+			state.Task.Reverting, state.Task.Reverted:
+			continue
+		case state.Task.Pending:
+			// A queued target's rows are the plan's estimate until it starts:
+			// PercentAcrossTargets weighs it no other way.
+			if p.PlannedRows != nil {
+				r.Counted++
+				r.Total += *p.PlannedRows
+				r.Estimated = true
+			}
+		default:
+			switch {
+			case p.RowsTotal > 0:
+				r.Counted++
+				r.Copied += ui.ClampRows(p.RowsCopied, p.RowsTotal)
+				r.Total += p.RowsTotal
+			case p.PlannedRows != nil:
+				r.Counted++
+				r.Total += *p.PlannedRows
+				r.Estimated = true
+			case !CopyStillAhead(status):
+				r.Counted++
+			}
+		}
+	}
+	return r
+}
+
+// Exact reports whether every one of targets is in the sum by its engine's own
+// count, so the percent beside the bar can carry a single target's precision.
+func (r TargetRows) Exact(targets int) bool {
+	return r.Counted == targets && !r.Estimated && r.Total > 0
+}
+
+// Partial reports whether the sum leaves some of targets out, so the rows line
+// names the targets it covers.
+func (r TargetRows) Partial(targets int) bool {
+	return r.Counted < targets
+}
+
+// RowsLine is the rows line under a table's bar across targets, after its
+// bullet: "Rows: 1,400 / 2,000 across 2 of 3 targets · ~3.5 GB · ETA: ≥ 2m 0s".
+// The total is approximate while a plan's estimate stands in for a target. The
+// line names the targets it covers when it leaves some out, and then the
+// planned size, which is every target's, names them all (TargetsTableSizeClause).
+// estimatedBytes is the plan's size summed across every target, nil unless each
+// has one. It is empty while no target's rows are known.
+func (r TargetRows) RowsLine(targets int, estimatedBytes *int64) string {
+	if r.Total <= 0 {
+		return ""
+	}
+	total := ui.FormatNumber(r.Total)
+	if r.Estimated {
+		total = ui.FormatApproxRows(r.Total)
+	}
+	line := fmt.Sprintf("Rows: %s / %s", ui.FormatNumber(r.Copied), total)
+	partial := r.Partial(targets)
+	if partial {
+		line += fmt.Sprintf(" across %d of %d targets", r.Counted, targets)
+	}
+	line += TargetsTableSizeClause(estimatedBytes, partial, targets)
+	if r.ETASeconds > 0 {
+		floor := ""
+		if r.ETAFloor {
+			floor = "≥ "
+		}
+		line += " · ETA: " + floor + ui.FormatETA(r.ETASeconds)
+	}
+	return line
+}
+
+// AcrossTargetsPercent renders a table's percent across its targets beside
+// its bar. When exact, every target's rows are its engine's own count, so the
+// percent is the rows copied of the rows to copy at the precision a single
+// target's percent has (ui.FormatRowCopyPercent). Otherwise it is an estimate
+// from each target's share, or counts a plan's estimate, and stays whole. It
+// never reads complete before pct (PercentAcrossTargets), which waits for
+// every target to complete, does.
+func AcrossTargetsPercent(pct int, exact bool, copied, total int64) string {
+	if !exact || total <= 0 {
+		return fmt.Sprintf("%d%%", pct)
+	}
+	if pct < 100 && copied >= total {
+		// Every row is copied but a target has yet to complete the change.
+		return "99.99%"
+	}
+	return ui.FormatRowCopyPercent(pct, copied, total)
 }
 
 // PercentAcrossTargets is how far a table is across every target that runs it,

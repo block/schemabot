@@ -454,9 +454,21 @@ func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
 			repository: "octocat/hello-world",
 		},
 		{
-			name:      "unknown route",
+			name:      "fetch rate limit",
 			method:    http.MethodGet,
 			url:       "https://api.github.com/rate_limit",
+			operation: metrics.GitHubOperationFetchRateLimit,
+		},
+		{
+			name:      "list app installations",
+			method:    http.MethodGet,
+			url:       "https://api.github.com/app/installations?per_page=100",
+			operation: metrics.GitHubOperationListAppInstallations,
+		},
+		{
+			name:      "unknown route",
+			method:    http.MethodGet,
+			url:       "https://api.github.com/meta",
 			operation: metrics.GitHubOperationUnknown,
 		},
 	}

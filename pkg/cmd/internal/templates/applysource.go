@@ -11,12 +11,13 @@ import (
 // PR when the caller carries PR provenance — the short "owner/repo#pr" as an
 // OSC 8 hyperlink on an interactive terminal, the full URL otherwise — or the
 // short caller such as "cli:jdoe" for everything else, so CLI-driven applies
-// still show where they came from.
+// still show where they came from. Whoever starts an apply chooses its caller,
+// so control runes are removed from it here, where it becomes terminal text.
 func applySource(c string) string {
 	if text, url, ok := sourceRef(c, ""); ok {
 		return ui.Link(text, url)
 	}
-	return caller.Short(c)
+	return ui.TerminalSafeLine(caller.Short(c))
 }
 
 // PullRequestLink renders a PR the way every CLI list surface renders one: the
@@ -41,15 +42,16 @@ func pullRequestRef(repo string, pr int) (text, url string) {
 // caller's host says which machine drove the apply even when a
 // server-provided PR URL adds a Source row alongside it. A server-substituted
 // bare repo#pr location names no driver at all, so only the Source row
-// renders for it.
+// renders for it. The Caller row has its control runes removed, as in
+// applySource.
 func callerAndSourceBoxRows(c, serverURL string) []BoxRow {
 	text, url, hasSource := sourceRef(c, serverURL)
 	var rows []BoxRow
 	if c != "" {
 		if _, _, ok := caller.PullRequest(c); !ok {
-			rows = append(rows, BoxRow{"Caller", c})
+			rows = append(rows, BoxRow{"Caller", ui.TerminalSafeLine(c)})
 		} else if short := caller.Short(c); short != c {
-			rows = append(rows, BoxRow{"Caller", short})
+			rows = append(rows, BoxRow{"Caller", ui.TerminalSafeLine(short)})
 		}
 	}
 	if hasSource {

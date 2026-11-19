@@ -57,3 +57,57 @@ func TestTableRolloutRankFailureLeadsUnstartedTables(t *testing.T) {
 	unstarted := TableRolloutRank([]string{task.Pending, task.Pending, task.Pending, task.Pending})
 	assert.Less(t, failed, unstarted)
 }
+
+// A rollout changes `customers` with an ALTER on the targets that have it and
+// a CREATE on the ones that do not, and also alters `orders`. The CREATE is
+// still working, the ALTER finished, and `orders` is finished on some targets.
+// Both `customers` entries are listed together, ahead of `orders`, so the
+// listing reads as the two tables the headline counts.
+func TestTableChangeOrderListsATablesStatementsTogether(t *testing.T) {
+	type change struct {
+		table, statement string
+		rank             int
+	}
+	changes := []change{
+		{"customers", "alter", tableRankFinished},
+		{"orders", "alter", tableRankPartlyDone},
+		{"customers", "create", tableRankWorking},
+	}
+	order := TableChangeOrder(len(changes),
+		func(i int) string { return changes[i].table },
+		func(i int) int { return changes[i].rank })
+	var got []string
+	for _, i := range order {
+		got = append(got, changes[i].table+" "+changes[i].statement)
+	}
+	assert.Equal(t, []string{"customers create", "customers alter", "orders alter"}, got)
+}
+
+// Tables of equal rank keep plan order, and so do one table's statements of
+// equal rank.
+func TestTableChangeOrderKeepsPlanOrderForEqualRanks(t *testing.T) {
+	tables := []string{"payments", "orders", "payments", "refunds"}
+	order := TableChangeOrder(len(tables),
+		func(i int) string { return tables[i] },
+		func(int) int { return tableRankWorking })
+	assert.Equal(t, []int{0, 2, 1, 3}, order)
+}
+
+// A table is placed by the most urgent of its statements: one whose CREATE is
+// working leads a table that is only partly done, even when its other
+// statement has finished.
+func TestTableChangeOrderPlacesATableByItsMostUrgentStatement(t *testing.T) {
+	type change struct {
+		table string
+		rank  int
+	}
+	changes := []change{
+		{"orders", tableRankPartlyDone},
+		{"customers", tableRankFinished},
+		{"customers", tableRankWorking},
+	}
+	order := TableChangeOrder(len(changes),
+		func(i int) string { return changes[i].table },
+		func(i int) int { return changes[i].rank })
+	assert.Equal(t, []int{2, 1, 0}, order)
+}

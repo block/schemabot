@@ -45,6 +45,37 @@ func TestResumeApply_TasklessNoOpCompletesNotFails(t *testing.T) {
 	assert.NotEqual(t, state.Apply.Failed, apply.State)
 }
 
+// Recovery of a task-less apply re-reads it before completing it, so a stop or
+// a concurrent drive's outcome that landed first is kept. When that re-read
+// fails, recovery returns the read error and writes nothing: completing over a
+// row it could not read would let the completion land on a stopped apply.
+func TestResumeApply_TasklessNoOpFailedReReadWritesNothing(t *testing.T) {
+	apply := &storage.Apply{
+		ID: 1, PlanID: 7, ApplyIdentifier: "apply-noop",
+		Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeStrata,
+		Environment: "production", State: state.Apply.Pending,
+	}
+	getErr := errors.New("connection reset by peer")
+	inner := &mockApplyStore{apply: &storage.Apply{ID: 1, ApplyIdentifier: "apply-noop", State: state.Apply.Stopped}}
+	client := &LocalClient{
+		config: LocalConfig{Database: "cdb_resolute", Type: storage.DatabaseTypeStrata},
+		storage: &exactProgressStorage{
+			applies: &reReadFailingApplyStore{mockApplyStore: inner, getErr: getErr},
+			tasks:   &mockTaskStore{},
+			plans:   &mockPlanStore{plan: &storage.Plan{ID: 7, PlanIdentifier: "plan-noop"}},
+		},
+		logger: slog.Default(),
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+
+	require.ErrorIs(t, err, getErr)
+	assert.Contains(t, err.Error(), "complete task-less apply apply-noop", "the error comes from the completion's re-read and names the apply")
+	assert.Empty(t, inner.updates, "no completion is written without knowing the stored state")
+	assert.Equal(t, state.Apply.Stopped, inner.apply.State)
+	assert.NotEqual(t, state.Apply.Completed, apply.State, "the in-memory apply is not marked completed")
+}
+
 // A local resume binds the apply's identity to a drive-scoped logger, so every
 // log line of the resume — including call sites that pass no identity attrs at
 // all, such as the task-less no-op completion — carries apply_id, repo, and pr

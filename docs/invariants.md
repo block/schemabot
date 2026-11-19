@@ -253,12 +253,14 @@ the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outco
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
 in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLanded`
 (`pkg/tern/local_apply_failure.go`) as the only proof that lets either gate adopt an outcome write
-that returned an error, the resume's refusal to record a failure over an outcome it already stored
-(the no-remaining-work branches of `resumeApplyWithTasks` and `launchAtomicResume` return a
-`postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
-`pkg/tern/local_control_resume.go`), the progress-poll error budget in the grouped drive and the
-resume's handling of a failed reattach to accepted engine work, whose pause disposition is
-`shouldPauseAcceptedWork` (`pkg/tern/local_apply_sequential.go`), the remote progress error
+that returned an error, the re-read before an outcome write that returns a failed or missing read
+as an error instead of writing (`storedTerminalApply`, `pkg/tern/local_apply_failure.go`), the
+resume's refusal to record a failure over an outcome it already stored (the no-remaining-work
+branches of `resumeApplyWithTasks` and `launchAtomicResume` return a `postTerminalReconcileError`
+that `handleGroupedResumeFailure` passes through, `pkg/tern/local_control_resume.go`), the
+progress-poll error budget in the grouped drive and the resume's handling of a failed reattach to
+accepted engine work, whose pause disposition is `shouldPauseAcceptedWork`
+(`pkg/tern/local_apply_sequential.go`), the remote progress error
 limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
 deploy call failed, which tracks a deploy that started instead of failing it and reports an
 unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
@@ -276,8 +278,9 @@ bad RPC must never take the server process down with it. The panic value stays s
 caller gets a fixed internal error, never the panic text or a stack. *Enforced:* the recover
 boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
 (`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`), local drives
-(`pkg/tern/local_apply.go`), and the startup target probe (`pkg/serve/serve.go`
-around enumeration, `pkg/targetprobe/targetprobe.go` around each target); the contained drive
+(`pkg/tern/local_apply.go`), the startup target probe (`pkg/serve/serve.go`
+around enumeration, `pkg/targetprobe/targetprobe.go` around each target), and the GitHub quota
+probe (`pkg/github/quota_probe.go` around the installation list and each budget read); the contained drive
 panic becomes a permanent `failed` in `failClaimedApplyAfterDrivePanic` (`pkg/api/operator.go`).
 
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
@@ -296,7 +299,8 @@ fields they do not recognize, because there an unknown field is a caller's mista
 operator's typo rather than a peer on a different release, and ignoring it would swallow intent.
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
-(`pkg/api/control_handlers.go`, `pkg/api/plan_handlers.go`) and on config load
+(`pkg/api/control_handlers.go`, `pkg/api/lock_handlers.go`, `pkg/api/plan_handlers.go`,
+`pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
@@ -551,6 +555,21 @@ timeout fails them. *Enforced:* the width refusal at apply and at apply creation
 (`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
 place recorded with a start request (`markResumed`, `pkg/storage/internal/sqlstore/control_requests.go`).
 
+### AV-17: An upgrade never needs a new GitHub App permission
+
+A GitHub App permission that existing installs do not already grant is used only by behavior a
+server config key turns on, and that key is off by default. With the key off, the server makes no
+request that needs the permission. With the key on and the permission still missing, the server
+serves pull requests as it would with the key off and logs which permission is missing.
+
+*Breaks if violated:* every install that upgrades without changing its App loses plans, Check Runs,
+or commands on the pull requests the new permission covers. *Enforced:* `skip_unrequired_branches`
+gating every PR target read (`pkg/api/config.go`, `pkg/webhook/pr_target.go`); the fallback that
+serves a target whose classic branch protection the App cannot read (`pkg/github/pr_target.go`);
+and `TestGitHubAppPermissionsAreRequiredOrGatedByConfig`
+(`pkg/api/github_app_permissions_test.go`), which fails when the setup guide lists a permission that
+is neither one existing installs grant nor optional behind a server config key.
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
@@ -781,6 +800,18 @@ multi-environment plans in `pkg/webhook/plan.go` on each refusal `planRefusedByN
 names), or, when that row cannot be stored, a failing aggregate carrying the same block, which only
 the auto-plan guards release (`failClosedOnNamespacePlacement` and `handleMultiEnvPlan` in
 `pkg/webhook/plan.go`).
+
+### MG-13: Branch exclusion never creates validation
+
+New PR plans, apply commands, and Check Run publication require an eligible target.
+Exclusion never produces a passing, neutral, or skipped result, and uncertainty
+never authorizes omission of required validation. Earlier results and accepted
+applies remain authoritative through a target change.
+*Enforced:* effective-target and protection discovery (`pkg/github/pr_target.go`);
+shared command and recovery policy (`pkg/webhook/pr_target.go`); auto-plan and
+aggregate publishers (`pkg/webhook/pull_request.go`, `pkg/webhook/check_publisher.go`);
+fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.go`,
+`pkg/webhook/apply_execute.go`).
 
 ## Apply state machine (ST)
 
@@ -1680,6 +1711,17 @@ statement count. *Enforced:* the shared plan counter and summary renderer
 `pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`), and the
 multi-environment CLI deduplication fingerprint (`planFingerprint` in `pkg/cmd/commands/plan.go`).
 
+### UX-7: A table's copy progress across targets reads the same on every surface
+
+While a rollout is copying a table on several targets, the table has one reading of its progress:
+the percent beside its bar, the rows copied of the rows to copy, how many targets those rows cover,
+its planned size, and whether its ETA is a floor. That reading is derived once from the targets'
+progress and rendered by the CLI and the PR comment alike, so the two never disagree about how far
+one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
+`AcrossTargetsPercent`, and `TargetsTableSizeClause` in `pkg/presentation`), and a test that
+renders the same rollouts through both surfaces and fails when they read differently
+(`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
+
 ## Recovery (RC)
 
 ### RC-1: Nothing is orphaned
@@ -2168,6 +2210,11 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   that the first does not. It drives the auto-plan on open and on push, the plan command, and the
   plan command in a repository whose tree GitHub truncates, so a lookup per changed file on those
   paths fails CI instead of exhausting the rate limit in production (AV-15).
+
+- **GitHub App permissions.** A test reads the setup guide's permission tables and fails on any
+  permission that existing installs do not already grant unless it is marked optional and names
+  the server config key that turns on the behavior needing it, so a release cannot quietly require
+  a new grant (AV-17).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.

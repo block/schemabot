@@ -230,15 +230,18 @@ type Service struct {
 	heldOperationClaimsMu       sync.Mutex
 	heldOperationClaims         map[int64]heldOperationClaim
 	heldOperationClaimsDraining bool
-	// resumeObservers records, per apply id, the GitHub comment of the stop
-	// summary this process last attached a progress comment observer to
-	// rotate, so later claims of the same resume here do not attach another.
-	// It narrows the durable signal, the stop's summary comment that stays
-	// unconsumed until an observer rotates it, to one attach per process per
-	// stop. Each stop posts its own summary comment, so a later stop of the
-	// same rollout never matches the entry an earlier resume left behind.
-	resumeObserversMu sync.Mutex
-	resumeObservers   map[int64]int64
+	// resumeObservers records, per apply id, the progress comment observer
+	// this process attached to an in-flight rollout, so later claims here do
+	// not attach another: observers in one process share one progress-comment
+	// authority owner, so two live ones could both edit. An entry names the
+	// stop summary comment it was attached against (zero when the rollout had
+	// not stopped), and each stop posts its own summary comment, so a later
+	// stop of the same rollout never matches the entry an earlier attach left
+	// behind. Its generation lets a drive forget only the entry it saw, never
+	// one another drive in this process attached since.
+	resumeObserversMu   sync.Mutex
+	resumeObservers     map[int64]resumeObserverEntry
+	resumeObserverCount uint64
 
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc

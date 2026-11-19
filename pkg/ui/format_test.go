@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -351,6 +352,57 @@ func TestFormatBytesBinary(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expect, FormatBytesBinary(tt.input))
+		})
+	}
+}
+
+func TestFormatNumber(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  int64
+		expect string
+	}{
+		{name: "zero", input: 0, expect: "0"},
+		{name: "three digits are not grouped", input: 999, expect: "999"},
+		{name: "first group boundary", input: 1000, expect: "1,000"},
+		{name: "six digits", input: 123456, expect: "123,456"},
+		{name: "seven digits", input: 1234567, expect: "1,234,567"},
+		{name: "largest value", input: math.MaxInt64, expect: "9,223,372,036,854,775,807"},
+		{name: "small negative", input: -999, expect: "-999"},
+		{name: "negative keeps its sign out of the groups", input: -123456, expect: "-123,456"},
+		{name: "negative first group boundary", input: -1000, expect: "-1,000"},
+		{name: "smallest value", input: math.MinInt64, expect: "-9,223,372,036,854,775,808"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expect, FormatNumber(tt.input))
+		})
+	}
+}
+
+// The engine counts rows inserted during the copy, so rows copied can pass the
+// estimated total. Progress shows the total and says the estimate was exceeded;
+// an unknown total (zero) shows the count as reported.
+func TestRowCopyEstimateHelpers(t *testing.T) {
+	tests := []struct {
+		name         string
+		copied       int64
+		total        int64
+		wantClamped  int64
+		wantExceeded bool
+	}{
+		{name: "copy under the estimate", copied: 400, total: 1000, wantClamped: 400, wantExceeded: false},
+		{name: "copy exactly at the estimate", copied: 1000, total: 1000, wantClamped: 1000, wantExceeded: false},
+		{name: "copy past the estimate", copied: 1200, total: 1000, wantClamped: 1000, wantExceeded: true},
+		{name: "unknown total", copied: 1200, total: 0, wantClamped: 1200, wantExceeded: false},
+		{name: "nothing copied yet", copied: 0, total: 1000, wantClamped: 0, wantExceeded: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantClamped, ClampRows(tt.copied, tt.total))
+			assert.Equal(t, tt.wantExceeded, EstimateExceeded(tt.copied, tt.total))
 		})
 	}
 }

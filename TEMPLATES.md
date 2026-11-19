@@ -52,8 +52,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -634,14 +634,16 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 <summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>
 
 **`orders`**
-- Primary key column `order_ref` has type `varchar`
+
+1. Primary key column `order_ref` has type `varchar`
 
 **`order_events`**
-- Index `idx_status_created` has `DATETIME` column `created_at` in position 3 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
-- Index `idx_region_created` has `DATETIME` column `created_at` in position 4 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
-- Primary key column `event_id` has type `mediumint`
-- Index `idx_status_created` on columns (`status`, `region`, `created_at`, `event_id`, `order_pk`) has a redundant PRIMARY KEY suffix `order_pk` — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (`order_pk`, `event_id`) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.
-- Column `event_id` in table `order_events` has type `mediumint(9)` but 2 other table(s) use type `int(11)` (e.g. shipments, invoices)
+
+2. Index `idx_status_created` has `DATETIME` column `created_at` in position 3 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+3. Index `idx_region_created` has `DATETIME` column `created_at` in position 4 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+4. Primary key column `event_id` has type `mediumint`
+5. Index `idx_status_created` on columns (`status`, `region`, `created_at`, `event_id`, `order_pk`) has a redundant PRIMARY KEY suffix `order_pk` — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (`order_pk`, `event_id`) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.
+6. Column `event_id` in table `order_events` has type `mediumint(9)` but 2 other table(s) use type `int(11)` (e.g. shipments, invoices)
 
 </details>
 
@@ -676,7 +678,7 @@ ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
 💡 **Lint Warnings**: 1 advisory finding
-- `customers`: Primary key column `id` has type `varchar`
+1. `customers`: Primary key column `id` has type `varchar`
 
 📖 **Related guidance:**
 
@@ -778,22 +780,28 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 <summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>
 
 **`customers`**
-- Primary key column `id` has type `varchar`
+
+1. Primary key column `id` has type `varchar`
 
 **`orders`**
-- Primary key column `id` has type `varchar`
+
+2. Primary key column `id` has type `varchar`
 
 **`invoices`**
-- Primary key column `id` has type `varchar`
+
+3. Primary key column `id` has type `varchar`
 
 **`shipments`**
-- Primary key column `id` has type `varchar`
+
+4. Primary key column `id` has type `varchar`
 
 **`sessions`**
-- Primary key column `id` has type `varchar`
+
+5. Primary key column `id` has type `varchar`
 
 **`events`**
-- Primary key column `id` has type `varchar`
+
+6. Primary key column `id` has type `varchar`
 
 </details>
 
@@ -2095,8 +2103,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2391,8 +2399,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2451,8 +2459,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2671,25 +2679,26 @@ ALTER TABLE `orders` ADD COLUMN `notes` varchar(255) NULL;
 ```
 
 💡 **Lint Warnings**: 4 advisory findings
-- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-- `users` on 28 of 32 targets: Column `last_login_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-  <details>
-  <summary>Target names</summary>
+1. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `users` on 28 of 32 targets: Column `last_login_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+   <details>
+   <summary>Target names</summary>
 
-  ```
-  us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
-  us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
-  us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
-  us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
-  us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
-  us/testapp_030  us/testapp_031  us/testapp_032
-  ```
+   ```
+   us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+   us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+   us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+   us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+   us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+   us/testapp_030  us/testapp_031  us/testapp_032
+   ```
 
-  </details>
+   </details>
 
 On targets `us/testapp_001`, `us/testapp_002`, `us/testapp_003`, `us/testapp_004`:
-- `orders`: Index `idx_user` on column `user_id` is redundant - covered by index `idx_user_status` on columns (`user_id`, `status`)
-- `orders`: AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type
+
+3. `orders`: Index `idx_user` on column `user_id` is redundant - covered by index `idx_user_status` on columns (`user_id`, `status`)
+4. `orders`: AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type
 
 📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 32 targets
 
@@ -2784,44 +2793,45 @@ ALTER TABLE `orders` ADD COLUMN `notes` varchar(255) NULL;
 ```
 
 💡 **Lint Warnings**: 4 advisory findings
-- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-- `users` on 124 of 128 targets: Column `last_login_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-  <details>
-  <summary>Target names</summary>
+1. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `users` on 124 of 128 targets: Column `last_login_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+   <details>
+   <summary>Target names</summary>
 
-  ```
-  us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
-  us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
-  us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
-  us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
-  us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
-  us/testapp_030  us/testapp_031  us/testapp_032  us/testapp_033  us/testapp_034
-  us/testapp_035  us/testapp_036  us/testapp_037  us/testapp_038  us/testapp_039
-  us/testapp_040  us/testapp_041  us/testapp_042  us/testapp_043  us/testapp_044
-  us/testapp_045  us/testapp_046  us/testapp_047  us/testapp_048  us/testapp_049
-  us/testapp_050  us/testapp_051  us/testapp_052  us/testapp_053  us/testapp_054
-  us/testapp_055  us/testapp_056  us/testapp_057  us/testapp_058  us/testapp_059
-  us/testapp_060  us/testapp_061  us/testapp_062  us/testapp_063  us/testapp_064
-  us/testapp_065  us/testapp_066  us/testapp_067  us/testapp_068  us/testapp_069
-  us/testapp_070  us/testapp_071  us/testapp_072  us/testapp_073  us/testapp_074
-  us/testapp_075  us/testapp_076  us/testapp_077  us/testapp_078  us/testapp_079
-  us/testapp_080  us/testapp_081  us/testapp_082  us/testapp_083  us/testapp_084
-  us/testapp_085  us/testapp_086  us/testapp_087  us/testapp_088  us/testapp_089
-  us/testapp_090  us/testapp_091  us/testapp_092  us/testapp_093  us/testapp_094
-  us/testapp_095  us/testapp_096  us/testapp_097  us/testapp_098  us/testapp_099
-  us/testapp_100  us/testapp_101  us/testapp_102  us/testapp_103  us/testapp_104
-  us/testapp_105  us/testapp_106  us/testapp_107  us/testapp_108  us/testapp_109
-  us/testapp_110  us/testapp_111  us/testapp_112  us/testapp_113  us/testapp_114
-  us/testapp_115  us/testapp_116  us/testapp_117  us/testapp_118  us/testapp_119
-  us/testapp_120  us/testapp_121  us/testapp_122  us/testapp_123  us/testapp_124
-  us/testapp_125  us/testapp_126  us/testapp_127  us/testapp_128
-  ```
+   ```
+   us/testapp_005  us/testapp_006  us/testapp_007  us/testapp_008  us/testapp_009
+   us/testapp_010  us/testapp_011  us/testapp_012  us/testapp_013  us/testapp_014
+   us/testapp_015  us/testapp_016  us/testapp_017  us/testapp_018  us/testapp_019
+   us/testapp_020  us/testapp_021  us/testapp_022  us/testapp_023  us/testapp_024
+   us/testapp_025  us/testapp_026  us/testapp_027  us/testapp_028  us/testapp_029
+   us/testapp_030  us/testapp_031  us/testapp_032  us/testapp_033  us/testapp_034
+   us/testapp_035  us/testapp_036  us/testapp_037  us/testapp_038  us/testapp_039
+   us/testapp_040  us/testapp_041  us/testapp_042  us/testapp_043  us/testapp_044
+   us/testapp_045  us/testapp_046  us/testapp_047  us/testapp_048  us/testapp_049
+   us/testapp_050  us/testapp_051  us/testapp_052  us/testapp_053  us/testapp_054
+   us/testapp_055  us/testapp_056  us/testapp_057  us/testapp_058  us/testapp_059
+   us/testapp_060  us/testapp_061  us/testapp_062  us/testapp_063  us/testapp_064
+   us/testapp_065  us/testapp_066  us/testapp_067  us/testapp_068  us/testapp_069
+   us/testapp_070  us/testapp_071  us/testapp_072  us/testapp_073  us/testapp_074
+   us/testapp_075  us/testapp_076  us/testapp_077  us/testapp_078  us/testapp_079
+   us/testapp_080  us/testapp_081  us/testapp_082  us/testapp_083  us/testapp_084
+   us/testapp_085  us/testapp_086  us/testapp_087  us/testapp_088  us/testapp_089
+   us/testapp_090  us/testapp_091  us/testapp_092  us/testapp_093  us/testapp_094
+   us/testapp_095  us/testapp_096  us/testapp_097  us/testapp_098  us/testapp_099
+   us/testapp_100  us/testapp_101  us/testapp_102  us/testapp_103  us/testapp_104
+   us/testapp_105  us/testapp_106  us/testapp_107  us/testapp_108  us/testapp_109
+   us/testapp_110  us/testapp_111  us/testapp_112  us/testapp_113  us/testapp_114
+   us/testapp_115  us/testapp_116  us/testapp_117  us/testapp_118  us/testapp_119
+   us/testapp_120  us/testapp_121  us/testapp_122  us/testapp_123  us/testapp_124
+   us/testapp_125  us/testapp_126  us/testapp_127  us/testapp_128
+   ```
 
-  </details>
+   </details>
 
 On targets `us/testapp_001`, `us/testapp_002`, `us/testapp_003`, `us/testapp_004`:
-- `orders`: Index `idx_user` on column `user_id` is redundant - covered by index `idx_user_status` on columns (`user_id`, `status`)
-- `orders`: AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type
+
+3. `orders`: Index `idx_user` on column `user_id` is redundant - covered by index `idx_user_status` on columns (`user_id`, `status`)
+4. `orders`: AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type
 
 📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 128 targets
 
@@ -3091,7 +3101,7 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 📋 **Plan**: **2** tables to alter
 
 💡 **Lint Warnings**: 1 advisory finding
-- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+1. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 
 📖 **Related guidance:**
 
@@ -3274,8 +3284,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
-- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -4030,6 +4040,17 @@ Apply in progress on 3 of 4 targets
 |----------|------|--------|--------|
 | `orders` | mysql | 1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004` | In progress |
 
+
+**Once shop-001 finishes**
+
+Apply in progress on 3 of 4 targets: 1 done
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | 1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004` | In progress · 1 of 3 done |
+
+- `orders` targets: 3 (1 in progress, 1 queued, 1 complete) · [progress](https://github.com/octocat/shop/pull/12#issuecomment-4242)
+
 </details>
 
 ## Locking
@@ -4156,6 +4177,38 @@ Options:
 
 🔒 Lock kept for testapp (mysql) despite --yield: apply apply-a1b2c3d4 is stopped and can still be resumed.
    Release it once nothing is left to run: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
+<summary><a name="lock-kept-nothing-submitted"></a><strong>Lock Kept (Nothing Submitted)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql): the server did not release it (API error (500): internal error).
+   Nothing was submitted, so release it now: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
+<summary><a name="nothing-submitted-lock-already-released"></a><strong>Nothing Submitted, Lock Already Released</strong></summary>
+
+```
+
+🔓 Lock for testapp (mysql) was already released, so nothing is left to unlock.
+
+```
+</details>
+
+<details>
+<summary><a name="nothing-submitted-lock-held-by-another-owner"></a><strong>Nothing Submitted, Lock Held By Another Owner</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is now held by another owner, so it was left in place.
+   Nothing was submitted and this command holds no lock. See who holds it: schemabot locks
 
 ```
 </details>
@@ -5549,7 +5602,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 - Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
-- ℹ️ _Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_
+- ℹ️ _Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling))_
 
 **`products`**: ⏳ Queued
 
@@ -5976,7 +6029,8 @@ ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
   - ◉ `f7-`: 12%
   - ◉ `c8-`: 55%
   - ◉ `dc-`: 55%
-  - … 49 more copying shards
+  - ◉ `f0-`: 55%
+  - … 48 more copying shards
 
 
 ---
@@ -8159,7 +8213,7 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
 
 
 ```
@@ -8751,11 +8805,13 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ fe-ff: 10.00% · 100,800 / 1,008,000 rows · ETA: 4m 40s
            ◉ ff-: 10.00% · 101,000 / 1,010,000 rows · ETA: 4m 40s
            ◉ fc-fd: 11.00% · 110,440 / 1,004,000 rows · ETA: 4m 38s
-           ... 223 more copying shards
+           ◉ fd-fe: 11.00% · 110,660 / 1,006,000 rows · ETA: 4m 38s
+           ... 222 more copying shards
            ● -01: waiting for cutover
            ● 01-02: waiting for cutover
            ● 02-03: waiting for cutover
-           ... 27 more shards past copying
+           ● 03-04: waiting for cutover
+           ... 26 more shards past copying
 
 ```
 </details>
@@ -8785,11 +8841,13 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ f8-: 23.00% · 347,300 / 1,510,000 rows · ETA: 2m 37s
            ◉ f0-f8: 26.00% · 390,000 / 1,500,000 rows · ETA: 2m 34s
            ◉ e8-f0: 29.00% · 432,100 / 1,490,000 rows · ETA: 2m 31s
-           ... 17 more copying shards
+           ◉ e0-e8: 32.00% · 473,600 / 1,480,000 rows · ETA: 2m 28s
+           ... 16 more copying shards
            ● -08: waiting for cutover
            ● 08-10: waiting for cutover
            ● 10-18: waiting for cutover
-           ... 9 more shards past copying
+           ● 18-20: waiting for cutover
+           ... 8 more shards past copying
 
   ── commerce_001 ──
 
@@ -9733,7 +9791,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_040`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
-  - … 1 more copying target
+  - ◉ `orders_043`: 62.38% · 914,707 / 1,466,232 rows
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 
@@ -9766,7 +9824,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_002`: 12.48% · 183,029 / 1,466,232 rows
-  - … 1 more copying target
+  - ◉ `orders_003`: 12.48% · 183,029 / 1,466,232 rows
 
 
 </dd></dl>
@@ -11367,7 +11425,8 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
            ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
            ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
            ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
-           ... 16 more copying targets
+           ◉ payments-045: 36.25% · 29,000 / 80,000 rows · ETA: 8m 45s
+           ... 15 more copying targets
 
   Targets needing attention:
     ❌ payments-041 — failed: duplicate key name 'idx_orders_source'
@@ -11413,6 +11472,54 @@ To stop this schema change:
 
 To run the cutover for prod/payments-001:
   schemabot cutover apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-creating-a-table-some-targets-lack"></a><strong>Multi-target Rollout Creating A Table Some Targets Lack</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        running                                │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Targets:      1 completed · 3 running                │
+└───────────────────────────────────────────────────────┘
+
+
+     + customers: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 50%
+       targets payments-003, payments-004
+       CREATE TABLE `customers` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `tier` varchar(16) DEFAULT NULL,
+           PRIMARY KEY(`id`)
+       );
+       • Targets: 2 (1 applying, 1 complete)
+           ✓ payments-003: complete
+           ◉ payments-004: applying
+
+     ~ customers: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       targets payments-001, payments-002
+       ALTER TABLE `customers` ADD COLUMN `tier` varchar(16) DEFAULT NULL;
+
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 52%
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+       • Rows: 168,000 / 240,000 across 3 of 4 targets · ETA: ≥ 4m 0s
+       • Targets: 4 (2 copying, 1 queued, 1 complete)
+           ◉ payments-001: 45.00% · 36,000 / 80,000 rows · ETA: 4m 0s
+           ◉ payments-002: 65.00% · 52,000 / 80,000 rows · ETA: 2m 30s
+           ✓ payments-003: 80,000 rows
+           ○ payments-004: queued
+
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
 
 ```
 </details>

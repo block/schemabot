@@ -204,6 +204,14 @@ type ServerConfig struct {
 	// Defaults to true (respond to all commands).
 	RespondToUnscoped *bool `yaml:"respond_to_unscoped"`
 
+	// SkipUnrequiredBranches skips plans, applies, and Check Runs on PRs whose
+	// final target is neither the repository's default branch nor a branch
+	// that requires a SchemaBot check. Off by default: SchemaBot serves PRs
+	// into every branch. Turn it on after granting the GitHub App the
+	// Administration: read permission and auditing which branches require
+	// SchemaBot checks.
+	SkipUnrequiredBranches bool `yaml:"skip_unrequired_branches,omitempty"`
+
 	// PendingDrops configures the pending drops quarantine for MySQL/Spirit
 	// databases. When enabled, DROP TABLE statements rename the table into the
 	// _pending_drops database instead of dropping it, and the background cleaner
@@ -3978,6 +3986,12 @@ func (c *ServerConfig) GitHubCheckNameBaseForRepo(repo string) string {
 		return appConfig.CheckRunNameBase()
 	}
 	return c.GitHub.CheckRunNameBase()
+}
+
+// SkipsUnrequiredBranches reports whether SchemaBot skips PRs whose final
+// target neither is the default branch nor requires a SchemaBot check.
+func (c *ServerConfig) SkipsUnrequiredBranches() bool {
+	return c != nil && c.SkipUnrequiredBranches
 }
 
 // PromotionCheckNameBaseForRepo returns the aggregate Check Run base name the

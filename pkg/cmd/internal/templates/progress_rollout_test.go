@@ -159,6 +159,25 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 		"stop closes the output:\n%s", out)
 }
 
+// A table copying on one target and complete on the other three carries its
+// planned size, summed across them, on its rows line beside the percent at a
+// single target's precision, the way the PR comment renders it. A completed
+// target counts in full even when its engine's row estimate ran ahead of the
+// rows it copied.
+func TestWriteProgress_TargetRollupRowsCarryTheTableSize(t *testing.T) {
+	sized := func(target rolloutTarget) rolloutTarget {
+		target.estimatedBytes = new(int64(1_000_000_000))
+		return target
+	}
+	completed := completedTarget()
+	completed.rowsCopied = 990
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{sized(copyingTarget(420)), sized(completed), sized(completed), sized(completed)}))
+
+	total := int64(4_000_000_000)
+	assert.Contains(t, out, "orders: "+ui.ProgressBarRowCopy(85)+" 85.50%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 3,420 / 4,000"+ui.FormatTableSizeClause(&total)+" · ETA: 2m 0s\n", "%s", out)
+}
+
 // A rollout no target has reported progress for yet has no table block to
 // list its targets under, so it counts them instead, the way the PR comment
 // says no details are available yet.
@@ -328,8 +347,10 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 		"           ✗ payments-041: failed\n"+
 		"           ◉ payments-042: 51.00% · 510 / 1,000 rows · ETA: 2m 0s\n"+
 		"           ◉ payments-043: 52.00% · 520 / 1,000 rows · ETA: 2m 0s\n"+
-		"           ◉ payments-044: 53.00% · 530 / 1,000 rows · ETA: 2m 0s\n",
-		"the failure and the three slowest copiers are named; the heading counts the rest")
+		"           ◉ payments-044: 53.00% · 530 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ◉ payments-045: 54.00% · 540 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ... 15 more copying targets\n",
+		"the failure and the four slowest copiers are named; the rest are counted")
 	assertLess(t, out, "Targets needing attention:", "❌ payments-041 — failed: Error 1062: Duplicate entry 'x' for key 'orders.idx'")
 	assertLess(t, out, "payments-041 — failed", "External operation ID: spirit-op-041")
 	assertLess(t, out, "External operation ID: spirit-op-041", "External apply ID: spirit-041")
@@ -500,7 +521,8 @@ func TestWriteProgress_WideTargetRollupNamesEveryPhase(t *testing.T) {
 		"           ◉ payments-001: catching up\n"+
 		"           ◉ payments-002: catching up\n"+
 		"           ◉ payments-003: catching up\n"+
-		"           ... 9 more targets past copying\n", "%s", out)
+		"           ◉ payments-004: checksumming\n"+
+		"           ... 8 more targets past copying\n", "%s", out)
 	assert.NotContains(t, out, "(none)")
 }
 
@@ -541,6 +563,23 @@ func TestWriteProgress_TargetRollupGroupsTablesByNamespace(t *testing.T) {
 	assertLess(t, out, "── billing ──", "ADD COLUMN `billing_region`")
 	assert.Equal(t, 1, strings.Count(out, "── orders ──"), "%s", out)
 	assert.Equal(t, 1, strings.Count(out, "── billing ──"), "%s", out)
+}
+
+// payments-001 and payments-002 alter `customers` while payments-003 and
+// payments-004 create it, and `orders` is copying on two targets. The running
+// CREATE copies no rows, so it reads as applying, never as copying, and the
+// two `customers` entries sit next to each other ahead of `orders`, so the
+// listing reads as the two tables the rollout changes.
+func TestWriteProgress_TargetRollupCreateAppliesAndListsBesideItsAlter(t *testing.T) {
+	out := renderRollout(t, mixedStatementsRolloutData())
+
+	assert.Contains(t, out, "• Targets: 2 (1 applying, 1 complete)", "%s", out)
+	assert.Contains(t, out, "◉ payments-004: applying", "%s", out)
+	assert.NotContains(t, out, "payments-004: copying", "%s", out)
+	assert.Contains(t, out, "• Targets: 4 (2 copying, 1 queued, 1 complete)", "the ALTER of orders still copies rows: %s", out)
+
+	assertLess(t, out, "CREATE TABLE `customers`", "ALTER TABLE `customers`")
+	assertLess(t, out, "ALTER TABLE `customers`", "ALTER TABLE `orders`")
 }
 
 // A table still in flight on any target reads as in flight, never as failed,

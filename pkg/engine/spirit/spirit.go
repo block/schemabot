@@ -388,10 +388,19 @@ func (e *Engine) DrainContext(ctx context.Context) error {
 		return nil
 	}
 	if err := waitForRunExit(ctx, rm); err != nil {
-		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", rm.database, rm.tables, err)
+		database, tables := e.runTarget(rm)
+		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
 	}
 	e.releaseDrained(rm, raceWindow)
 	return nil
+}
+
+// runTarget reads the database and tables of a run that may still be running.
+// The run is still publishing its tables under e.mu, so they are read under it.
+func (e *Engine) runTarget(rm *runningSchemaChange) (string, []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return rm.database, rm.tables
 }
 
 // trackedForDrain returns the schema change a drain waits for, if any.
@@ -1192,15 +1201,15 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 			tp.ETASeconds = etaSeconds
 		}
 		// Spirit reports a single runner-wide checksum estimate (rows verified so
-		// far / total to verify), populated only during the verify phase and zero
-		// otherwise. Every table copy is complete by the time the verify phase
+		// far / total to verify), populated only during the verification phase and zero
+		// otherwise. Every table copy is complete by the time the verification phase
 		// runs, so the estimate is stamped on all tables unconditionally.
 		tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
 		tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
 		// Spirit's throttle status is likewise runner-wide and already scoped to
-		// the paced phases (the row copy and the checksum verify; zero-valued
+		// the paced phases (the row copy and the checksum verification; zero-valued
 		// everywhere else). Stamp it on the tables participating in that paced
-		// work — a table still copying, or every table during the verify — so a
+		// work — a table still copying, or every table during the verification — so a
 		// completed table is never rendered as paused by another table's copy.
 		// The reason is stamped only with the flag, keeping the contract that
 		// an unthrottled table carries no reason.
@@ -1215,7 +1224,7 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 
 // tableInPacedPhase reports whether a table is doing work the runner's
 // throttler paces: its own row copy while incomplete, or the runner-wide
-// checksum verify (which runs only after every copy finished).
+// checksum verification (which runs only after every copy finished).
 func tableInPacedPhase(copyComplete bool, spiritState status.State) bool {
 	return !copyComplete || spiritState == status.Checksum
 }

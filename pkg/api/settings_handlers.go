@@ -2,7 +2,7 @@ package api
 
 import (
 	"cmp"
-	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -67,11 +67,19 @@ func (s *Service) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 
 // handleSettingsSet creates or updates a setting.
 func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
+	// Settings are deployment-wide, so there is no database to scope a grant
+	// to: admin-only. Nothing in the body decides that, so the check runs
+	// before the body is read and a caller who may not write settings gets
+	// the same refusal whatever they sent.
+	if !s.authorizeDirectAdminWrite(w, r, "settings_set") {
+		return
+	}
+
 	var req struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -81,9 +89,25 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Settings are deployment-wide, so there is no database to scope a grant
-	// to: admin-only.
-	if !s.authorizeDirectAdminWrite(w, r, "settings_set") {
+	// Storage can treat a key with an accented or full-width letter, or an
+	// invisible character, as naming another key's row. Printable ASCII keys
+	// differ to storage only by letter case, which the check below allows for.
+	if !storage.IsPrintableASCIISettingKey(req.Key) {
+		s.logger.Warn("refused settings write to a key with characters outside printable ASCII", "key", req.Key,
+			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
+		s.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("setting key %q must contain only printable ASCII characters", req.Key))
+		return
+	}
+
+	// Component-state rows share the settings table but belong to the
+	// component that writes them; an operator value there would silently
+	// steer that component, so the API reads them but never writes them.
+	if storage.IsComponentStateSettingKey(req.Key) {
+		s.logger.Warn("refused settings write to a component-state key", "key", req.Key,
+			"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
+		s.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("%q is kept by SchemaBot itself and cannot be set through the settings API", req.Key))
 		return
 	}
 
@@ -94,7 +118,9 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info("setting updated", "key", req.Key, "value", req.Value,
+	// The value is not logged: a setting can hold anything an operator
+	// stores, and the API response already returns it to the caller.
+	s.logger.Info("setting updated", "key", req.Key, "value_bytes", len(req.Value),
 		"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
 
 	s.writeJSON(w, http.StatusOK, map[string]any{

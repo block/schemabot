@@ -287,6 +287,10 @@ Presentation notes:
 - A long lint list collapses into a details block grouped by table so advisory
   findings never dominate the plan comment; the finding count stays visible in
   the collapsed header. Short lists render inline.
+- Lint findings in the plan comment are one numbered list, like the Issues
+  section, so a reviewer or an agent can cite a finding by its number. The
+  numbering continues across table and target headings and into the
+  collapsed block, so no two findings in the section share a number.
 - Quoted identifiers and types inside finding messages (index names, column
   types) render as inline code.
 - The CLI and the plan comment share the same severity reading: ⚠️ marks

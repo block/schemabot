@@ -1,7 +1,11 @@
 package commands
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
@@ -76,6 +80,55 @@ func TestPlanSource(t *testing.T) {
 	assert.Equal(t, "https://github.com/org/repo/pull/42", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo", PullRequest: 42}))
 	assert.Equal(t, "org/repo", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo"}))
 	assert.Equal(t, "ad-hoc", planSource(&apitypes.PlanSummaryResponse{}))
+}
+
+// A stored plan's repository and head SHA are whatever the caller that asked
+// for the plan sent, and another operator reads them when listing plans or
+// showing one. Neither reaches the terminal with its escape sequences, and
+// neither can add a line under the one it is printed on.
+func TestStoredPlanProvenanceDropsTerminalEscapes(t *testing.T) {
+	setHyperlinks(t, false)
+
+	t.Run("the source of a plan with no PR", func(t *testing.T) {
+		assert.Equal(t, "acme/shop"+terminalAttackCleaned,
+			planSource(&apitypes.PlanSummaryResponse{Repository: "acme/shop" + lineBreakAttack}))
+	})
+
+	t.Run("the source of a plan with a PR", func(t *testing.T) {
+		assert.Equal(t, "https://github.com/acme/shop"+terminalAttackCleaned+"/pull/42",
+			planSource(&apitypes.PlanSummaryResponse{Repository: "acme/shop" + lineBreakAttack, PullRequest: 42}))
+	})
+
+	t.Run("the header of a shown plan", func(t *testing.T) {
+		response := apitypes.StoredPlanResponse{
+			PlanSummaryResponse: apitypes.PlanSummaryResponse{
+				PlanID: "plan-1", Database: "orders", DatabaseType: "mysql", Environment: "staging",
+				Repository: "acme/shop" + lineBreakAttack, HeadSHA: "abc123" + lineBreakAttack,
+				CreatedAt: time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC),
+			},
+			Plan: &apitypes.PlanResponse{},
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			assert.NoError(t, json.NewEncoder(w).Encode(response))
+		}))
+		t.Cleanup(server.Close)
+
+		var err error
+		output := captureOutput(t, func() {
+			err = showStoredPlan(server.URL, "plan-1", "", false)
+		})
+		require.NoError(t, err)
+
+		assert.Contains(t, output, "plan-1\n"+
+			"  Database:    orders (mysql)\n"+
+			"  Environment: staging\n"+
+			"  Source:      acme/shop"+terminalAttackCleaned+"\n"+
+			"  Head SHA:    abc123"+terminalAttackCleaned+"\n"+
+			"  Created:     2026-03-04T05:06:07Z\n"+
+			"\n")
+		assert.NotContains(t, output, "\x1b", "the plan has no changes, so nothing in the output is colored")
+	})
 }
 
 // On an interactive terminal the plan's PR provenance renders as the short

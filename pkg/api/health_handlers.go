@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -96,6 +97,39 @@ func (s *Service) extendOperatorWriteDeadline(w http.ResponseWriter, r *http.Req
 // Clients should match on error_code rather than parsing the error message.
 func (s *Service) writeErrorCode(w http.ResponseWriter, status int, code, message string) {
 	s.writeJSON(w, status, apitypes.ErrorResponse{Error: message, ErrorCode: code})
+}
+
+// errRequestBodyHasTrailingData is the decode failure for a request body that
+// carries anything but white space after its JSON value.
+var errRequestBodyHasTrailingData = errors.New("the body must hold one JSON value, but more data follows it")
+
+// decodeStrictJSONBody decodes r's body into dest and refuses a body the
+// handler could not act on exactly as sent: one with a field dest does not
+// declare, or with anything but white space after its JSON value. Either
+// would otherwise be dropped without a word, and the request would do
+// something other than what the caller sent. The error is one
+// writeBodyDecodeError answers.
+func decodeStrictJSONBody(r *http.Request, dest any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dest); err != nil {
+		return err
+	}
+
+	var trailing json.RawMessage
+	err := decoder.Decode(&trailing)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	if err == nil || errors.Is(err, io.ErrUnexpectedEOF) {
+		return errRequestBodyHasTrailingData
+	}
+	if _, malformed := errors.AsType[*json.SyntaxError](err); malformed {
+		return errRequestBodyHasTrailingData
+	}
+	// Reading the rest of the body failed, for example at the request body
+	// limit. The failure keeps its own type so it gets its own answer.
+	return fmt.Errorf("read the request body after its JSON value: %w", err)
 }
 
 // writeBodyDecodeError maps a request-body decode failure to the right client

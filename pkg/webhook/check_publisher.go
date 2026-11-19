@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -45,19 +46,15 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 // error, both non-nil) apart from a genuinely superseded head (current=false,
 // err=nil), which must never be retried as if GitHub had failed. It records the
 // same metrics and logs as before. A superseded head is not an operational
-// failure, so it returns a nil error.
+// failure, so it returns a nil error. Verified branch exclusion instead returns
+// errPRTargetExcluded, allowing retry owners to stop without treating it as
+// infrastructure failure.
 func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string) (bool, error) {
 	if headSHA == "" {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:  operation,
-			Repository: repo,
-			Status:     "error",
-		})
-		h.logger.Error("refusing to update status check without head SHA", "repo", repo, "pr", pr, "operation", operation)
-		return false, fmt.Errorf("verify head SHA for %s#%d (%s): missing head SHA", repo, pr, operation)
+		return h.verifyPublicationPRInfo(ctx, client, repo, pr, headSHA, operation, nil)
 	}
 
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  operation,
@@ -68,6 +65,31 @@ func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.In
 			"repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation, "error", err)
 		return false, fmt.Errorf("verify head SHA for %s#%d (%s): %w", repo, pr, operation, err)
 	}
+	return h.verifyPublicationPRInfo(ctx, client, repo, pr, headSHA, operation, prInfo)
+}
+
+// verifyPublicationSnapshot validates the initial discovery snapshot without
+// spending another GitHub request. Every Check Run write still performs the
+// uncached verification above after its scope and stored inputs are read.
+func (h *Handler) verifyPublicationSnapshot(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string) (bool, error) {
+	snapshot, ok := ctx.Value(publicationTargetKey{}).(publicationTarget)
+	if !ok {
+		return false, fmt.Errorf("missing publication target snapshot for %s#%d", repo, pr)
+	}
+	return h.verifyPublicationPRInfo(ctx, client, repo, pr, headSHA, operation, &snapshot.info)
+}
+
+func (h *Handler) verifyPublicationPRInfo(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string, prInfo *ghclient.PullRequestInfo) (bool, error) {
+	if headSHA == "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  operation,
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("refusing to update status check without head SHA", "repo", repo, "pr", pr, "operation", operation)
+		return false, fmt.Errorf("verify head SHA for %s#%d (%s): missing head SHA", repo, pr, operation)
+	}
+
 	if prInfo.HeadSHA != headSHA {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  operation,
@@ -78,6 +100,21 @@ func (h *Handler) verifyHeadSHACurrency(ctx context.Context, client *ghclient.In
 			"repo", repo, "pr", pr, "operation", operation,
 			"stale_head_sha", headSHA, "current_head_sha", prInfo.HeadSHA)
 		return false, nil
+	}
+	if snapshot, ok := ctx.Value(publicationTargetKey{}).(publicationTarget); ok && snapshot.repository == repo && snapshot.pr == pr {
+		if !samePRTargetContext(&snapshot.info, prInfo) {
+			h.logger.Info("discarding check publication because PR target changed", "repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation)
+			return false, nil
+		}
+	}
+	decision, err := h.evaluatePRTarget(ctx, client, repo, prInfo)
+	if err != nil {
+		h.logger.Error("failed to verify status check target before update", "repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation, "error", err)
+		return false, fmt.Errorf("verify publication target for %s#%d: %w", repo, pr, err)
+	}
+	if !decision.Eligible {
+		h.logger.Info("check publication suppressed for excluded PR target", "repo", repo, "pr", pr, "head_sha", headSHA, "effective_target", decision.Target, "operation", operation)
+		return false, errPRTargetExcluded
 	}
 	return true, nil
 }
@@ -167,13 +204,21 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 		return aggregateFoldNoFollowUp, nil
 	}
 
-	current, err := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	ctx, snapshotErr := snapshotPublicationTarget(ctx, client, repo, pr)
+	if snapshotErr != nil {
+		return aggregateFoldScheduleRefold, snapshotErr
+	}
+
+	current, err := h.verifyPublicationSnapshot(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
 	if !current {
 		// A non-current head covers a transient PR-fetch failure (non-nil err)
 		// as well as a genuinely newer head (nil err); either way a leader's
 		// next re-fold fetches the then-current head, so arm a bounded re-fold
 		// instead of stranding an aggregate waiting on a participant re-read.
 		// verifyHeadSHACurrency already logged the reason.
+		if errors.Is(err, errPRTargetExcluded) {
+			return aggregateFoldNoFollowUp, nil
+		}
 		return aggregateFoldScheduleRefold, err
 	}
 
@@ -604,7 +649,9 @@ func prFilePaths(files []ghclient.PRFile) []string {
 // and with nothing serializing folds for a PR, a fold that read the older state
 // can be the last to publish. So once a fold that consulted the stopped set has
 // published, the set is read again, and if it moved the aggregate is folded
-// once more from the current state.
+// once more from the stored check state read again. A rollout's target counts are re-read the
+// same way, so a target that finishes while the fold publishes is not left
+// out of the counts the run shows.
 func (h *Handler) upsertAggregateCheckRunOnce(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,
@@ -624,15 +671,96 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			"environment", environment, "head_sha", headSHA, "error", err)
 		return nil
 	}
-	if maps.Equal(current, folded.stopped) {
+	if !maps.Equal(current, folded.stopped) {
+		h.logger.Info("re-folding aggregate check: an apply stopped or started again while the fold published",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA,
+			"folded_stopped_applies", len(folded.stopped), "current_stopped_applies", len(current))
+		return h.refoldAggregateFromCurrentState(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
+	}
+	currentProgress, err := h.loadRolloutProgress(ctx, folded.contributions)
+	if err != nil {
+		h.logger.Warn("aggregate check not re-checked against the rollout's target counts; the published counts stand until the next fold",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA, "error", err)
 		return nil
 	}
-	h.logger.Info("re-folding aggregate check: an apply stopped or started again while the fold published",
+	if maps.Equal(currentProgress, folded.progress) {
+		return nil
+	}
+	refresh, err := h.refreshAggregateRolloutCounts(ctx, client, repo, pr, environment, checkName)
+	if err != nil {
+		h.logger.Warn("aggregate check not refreshed with the rollout target that moved while the fold published; the published counts stand until the next fold",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA, "error", err)
+		return nil
+	}
+	if refresh != rolloutCountsNeedFold {
+		return nil
+	}
+	h.logger.Info("re-folding aggregate check: a rollout target moved while the fold published",
 		"repo", repo, "pr", pr, "check_name", checkName,
-		"environment", environment, "head_sha", headSHA,
-		"folded_stopped_applies", len(folded.stopped), "current_stopped_applies", len(current))
-	_, err = h.foldAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
+		"environment", environment, "head_sha", headSHA)
+	return h.refoldAggregateFromCurrentState(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
+}
+
+// refoldAggregateFromCurrentState folds the aggregate once more after the
+// state a fold read moved while it published. It reads the PR's stored check
+// state again first, so the run ends on the rows as they are now rather than
+// on the snapshot that was found stale.
+func (h *Handler) refoldAggregateFromCurrentState(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, headSHA string,
+	folded []*storage.Check, checkName string, environment string,
+) error {
+	current, err := h.currentContributions(ctx, repo, pr, headSHA, environment, folded)
+	if err != nil {
+		return fmt.Errorf("re-read stored check state to re-fold aggregate %s on %s#%d: %w", checkName, repo, pr, err)
+	}
+	_, err = h.foldAggregateCheckRun(ctx, client, repo, pr, headSHA, current, checkName, environment)
 	return err
+}
+
+// currentContributions rebuilds a fold's inputs for one environment from the
+// PR's stored check state as it is now: that environment's per-database rows
+// and the earlier environments' rows it waits on, or every per-database row for
+// the aggregate that spans all environments. Inputs that are not stored rows
+// (participant outcomes, and placeholders for a database with no row yet) are
+// carried over from the fold, except a placeholder a stored row now replaces.
+func (h *Handler) currentContributions(ctx context.Context, repo string, pr int, headSHA, environment string, folded []*storage.Check) ([]*storage.Check, error) {
+	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("fetch checks for %s#%d: %w", repo, pr, err)
+	}
+	var stored []*storage.Check
+	for _, c := range checks {
+		if !isAggregateCheck(c) {
+			stored = append(stored, c)
+		}
+	}
+	current := stored
+	if environment != aggregateSentinel {
+		current = filterChecksByEnvironment(stored, environment)
+		current = h.withLocalPrerequisites(current, stored, environment, repo, pr, headSHA)
+	}
+	for _, c := range folded {
+		if c.ID != 0 {
+			continue
+		}
+		if !isParticipantCheck(c) && hasStoredRowFor(stored, c) {
+			continue
+		}
+		current = append(current, c)
+	}
+	return current, nil
+}
+
+// hasStoredRowFor reports whether a stored per-database row exists for the
+// database a placeholder stands in for.
+func hasStoredRowFor(stored []*storage.Check, placeholder *storage.Check) bool {
+	return slices.ContainsFunc(stored, func(c *storage.Check) bool {
+		return c.Environment == placeholder.Environment && c.DatabaseType == placeholder.DatabaseType && c.DatabaseName == placeholder.DatabaseName
+	})
 }
 
 // aggregateFold is what one fold published from: the contributions after
@@ -641,6 +769,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 type aggregateFold struct {
 	contributions []*storage.Check
 	stopped       stoppedApplyIDs
+	progress      rolloutProgress
 }
 
 // foldAggregateCheckRun folds the given checks into one aggregate and publishes
@@ -715,27 +844,24 @@ func (h *Handler) foldAggregateCheckRun(
 			ownContributions = append(ownContributions, contribution)
 		}
 	}
-	title, summary := aggregateSummary(ownContributions, conclusion, stopped)
-	if notice := prerequisiteSummary(contributions, h.aggregateCheckNameForRepo(repo), repo, headSHA); notice != "" {
-		title = "Waiting for prerequisite environments"
-		summary = appendPrerequisiteSummary(summary, notice)
+	render := aggregateRender{
+		HeadSHA:            headSHA,
+		Status:             status,
+		Conclusion:         conclusion,
+		Contributions:      ownContributions,
+		Stopped:            stopped,
+		Progress:           h.rolloutProgressForPR(ctx, repo, pr, ownContributions),
+		PrerequisiteNotice: prerequisiteSummary(contributions, h.aggregateCheckNameForRepo(repo), repo, headSHA),
+		Inputs:             renderInputsOf(dbChecks),
 	}
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
 			"repo", repo, "pr", pr, "check_name", checkName,
 			"environment", environment, "head_sha", headSHA, "stale_rows", staleCount)
-		if status == checkStatusInProgress && !anyInProgressOnCommit(dbChecks, headSHA) {
-			title = awaitingCurrentCommitTitle
-		}
+		render.AwaitingCurrentCommit = status == checkStatusInProgress && !anyInProgressOnCommit(dbChecks, headSHA)
 	}
+	title, summary := render.text()
 
-	currentHead, err := client.FetchPullRequestNoCache(ctx, repo, pr)
-	if err != nil {
-		return aggregateFold{}, fmt.Errorf("reverify aggregate head for %s#%d: %w", repo, pr, err)
-	}
-	if currentHead.HeadSHA != headSHA {
-		return aggregateFold{}, fmt.Errorf("aggregate head changed for %s#%d", repo, pr)
-	}
 	opts := ghclient.CheckRunOptions{
 		Name:   checkName,
 		Status: status,
@@ -804,6 +930,13 @@ func (h *Handler) foldAggregateCheckRun(
 			"concluded_conclusion", liveRun.Conclusion, "check_status", status)
 		reuseExistingRun = false
 	}
+	current, err := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	if err != nil {
+		return aggregateFold{}, err
+	}
+	if !current {
+		return aggregateFold{}, fmt.Errorf("aggregate head or target changed for %s#%d", repo, pr)
+	}
 	var checkRunID int64
 	if reuseExistingRun {
 		if liveRun.ID != existing.CheckRunID {
@@ -862,6 +995,16 @@ func (h *Handler) foldAggregateCheckRun(
 		checkRunID = id
 	}
 
+	// The render is stored with the state it was published with, in the same
+	// write, so a refresh never pairs this run with another fold's text.
+	render.CheckRunID = checkRunID
+	renderJSON, err := json.Marshal(render)
+	if err != nil {
+		h.logger.Warn("aggregate check state stored without its render; the next rollout count refresh folds in full",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "check_run_id", checkRunID, "error", err)
+		renderJSON = nil
+	}
 	aggCheck := &storage.Check{
 		Repository:   repo,
 		PullRequest:  pr,
@@ -873,6 +1016,8 @@ func (h *Handler) foldAggregateCheckRun(
 		HasChanges:   conclusion != checkConclusionSuccess,
 		Status:       status,
 		Conclusion:   conclusion,
+
+		AggregateRender: renderJSON,
 	}
 	if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -900,7 +1045,7 @@ func (h *Handler) foldAggregateCheckRun(
 		"environment", environment, "check_run_id", checkRunID,
 		"check_status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
-	return aggregateFold{contributions: contributions, stopped: stopped}, nil
+	return aggregateFold{contributions: contributions, stopped: stopped, progress: render.Progress}, nil
 }
 
 // rewindsConcludedCheckRun reports whether publishing the recomputed status to
@@ -938,8 +1083,16 @@ func (h *Handler) postPassingAggregateTargets(ctx context.Context, client *ghcli
 		return nil
 	}
 
-	current, err := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	ctx, snapshotErr := snapshotPublicationTarget(ctx, client, repo, pr)
+	if snapshotErr != nil {
+		return snapshotErr
+	}
+
+	current, err := h.verifyPublicationSnapshot(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
 	if !current {
+		if errors.Is(err, errPRTargetExcluded) {
+			return nil
+		}
 		return err
 	}
 
@@ -1014,6 +1167,13 @@ func (h *Handler) postPassingAggregateTargets(ctx context.Context, client *ghcli
 			continue
 		}
 
+		current, verifyErr := h.verifyHeadSHACurrency(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+		if verifyErr != nil {
+			return verifyErr
+		}
+		if !current {
+			return nil
+		}
 		var checkRunID int64
 		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 			if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
@@ -1159,7 +1319,18 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 		return false
 	}
 
-	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+	ctx, snapshotErr := snapshotPublicationTarget(ctx, client, repo, pr)
+	if snapshotErr != nil {
+		h.logger.Error("could not snapshot failing aggregate target", "repo", repo, "pr", pr, "error", snapshotErr)
+		return false
+	}
+
+	current, verifyErr := h.verifyPublicationSnapshot(ctx, client, repo, pr, headSHA, "aggregate_check_sync")
+	if verifyErr != nil {
+		h.logger.Error("could not verify failing aggregate target", "repo", repo, "pr", pr, "error", verifyErr)
+		return false
+	}
+	if !current {
 		return false
 	}
 
@@ -1256,6 +1427,9 @@ func (h *Handler) postFailingAggregateTargetsWithBlock(ctx context.Context, clie
 			},
 		}
 
+		if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+			return false
+		}
 		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 		if err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{

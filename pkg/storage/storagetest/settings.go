@@ -47,6 +47,28 @@ func TestSettings(t *testing.T, h Harness) {
 		require.Equal(t, "updated_value", setting.Value)
 	})
 
+	// A trailing space is part of the key: storage.IsPrintableASCIISettingKey
+	// allows a space on the strength of it.
+	t.Run("Set_TrailingSpaceNamesAnotherKey", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		require.NoError(t, store.Settings().Set(ctx, "test_key", "unpadded"))
+		require.NoError(t, store.Settings().Set(ctx, "test_key ", "padded"))
+
+		setting, err := store.Settings().Get(ctx, "test_key")
+		require.NoError(t, err)
+		require.NotNil(t, setting)
+		require.Equal(t, "test_key", setting.Key)
+		require.Equal(t, "unpadded", setting.Value, "the padded key's write left this row alone")
+
+		padded, err := store.Settings().Get(ctx, "test_key ")
+		require.NoError(t, err)
+		require.NotNil(t, padded)
+		require.Equal(t, "test_key ", padded.Key)
+		require.Equal(t, "padded", padded.Value)
+	})
+
 	t.Run("CompareAndSet", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
