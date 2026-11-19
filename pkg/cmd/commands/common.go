@@ -623,13 +623,33 @@ func submitRefusedByServer(err error) bool {
 // every later apply on the database until someone unlocked it by hand. Only a
 // lock this command created is released: one the owner already held may guard
 // an apply an earlier command started.
+//
+// "Created" means this command's acquire inserted the lock row, not that this
+// command is the row's only user. The owner names the user and the host, so a
+// second command run at the same time under the same account acquires the same
+// row without creating it, and the release is by owner rather than by row. If
+// the server accepted that second command's apply before it refused this one,
+// the release removes the lock that apply runs under.
+//
+// A lock that is already gone, or that another owner now holds, is not a
+// failed release: this command holds nothing either way, so cause is returned
+// alone and no unlock command is offered.
 func releaseUnsubmittedLock(ep, database, dbType, owner string, cause error) error {
-	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
+	err := client.ReleaseLock(ep, database, dbType, owner)
+	switch {
+	case err == nil:
+		templates.WriteLockReleased(database, dbType)
+		return cause
+	case errors.Is(err, client.ErrLockNotFound):
+		templates.WriteUnsubmittedLockAlreadyReleased(database, dbType)
+		return cause
+	case errors.Is(err, client.ErrLockNotOwned):
+		templates.WriteUnsubmittedLockHeldByAnotherOwner(database, dbType)
+		return cause
+	default:
 		templates.WriteUnsubmittedLockKept(database, dbType, err)
 		return errors.Join(cause, fmt.Errorf("release lock for %s: %w", database, err))
 	}
-	templates.WriteLockReleased(database, dbType)
-	return cause
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {

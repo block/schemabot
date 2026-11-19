@@ -4182,6 +4182,38 @@ Options:
 </details>
 
 <details>
+<summary><a name="lock-kept-nothing-submitted"></a><strong>Lock Kept (Nothing Submitted)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql): the server did not release it (API error (500): internal error).
+   Nothing was submitted, so release it now: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
+<summary><a name="nothing-submitted-lock-already-released"></a><strong>Nothing Submitted, Lock Already Released</strong></summary>
+
+```
+
+🔓 Lock for testapp (mysql) was already released, so nothing is left to unlock.
+
+```
+</details>
+
+<details>
+<summary><a name="nothing-submitted-lock-held-by-another-owner"></a><strong>Nothing Submitted, Lock Held By Another Owner</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is now held by another owner, so it was left in place.
+   Nothing was submitted and this command holds no lock. See who holds it: schemabot locks
+
+```
+</details>
+
+<details>
 <summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
 
 ```
