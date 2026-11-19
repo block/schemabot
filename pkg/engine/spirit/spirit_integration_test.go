@@ -1198,7 +1198,7 @@ func TestEngine_FetchCurrentSchema(t *testing.T) {
 	require.NoError(t, err, "create internal table")
 
 	eng := New(Config{})
-	current, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
+	current, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{}, engine.DroppedTables{})
 	require.NoError(t, err, "fetchCurrentSchema()")
 
 	assert.Len(t, current.tables, 2)
@@ -1458,7 +1458,7 @@ func TestEngine_FetchCurrentSchema_EmptyDatabase(t *testing.T) {
 	cleanupTables(t, db) // Start with clean database
 
 	eng := New(Config{})
-	current, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
+	current, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{}, engine.DroppedTables{})
 	require.NoError(t, err, "fetchCurrentSchema()")
 
 	assert.Empty(t, current.tables, "expected 0 tables for empty database")
@@ -2207,7 +2207,7 @@ func TestEngine_FetchCurrentSchema_ConnectionError(t *testing.T) {
 	eng := New(Config{})
 
 	// Use invalid DSN
-	_, err := eng.fetchCurrentSchema(t.Context(), "invalid:invalid@tcp(localhost:9999)/nonexistent", "testdb", engine.IgnoredTables{})
+	_, err := eng.fetchCurrentSchema(t.Context(), "invalid:invalid@tcp(localhost:9999)/nonexistent", "testdb", engine.IgnoredTables{}, engine.DroppedTables{})
 	assert.Error(t, err, "expected error for invalid DSN")
 }
 

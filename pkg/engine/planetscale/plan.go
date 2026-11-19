@@ -83,6 +83,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	r := *req
 	r.Database = e.resolveDatabase(req.Credentials, req.Database)
 	req = &r
+	if err := engine.RefuseDropTables("PlanetScale", req.DropTables); err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", req.Database, err)
+	}
 
 	e.logger.Info("computing plan",
 		"database", req.Database,

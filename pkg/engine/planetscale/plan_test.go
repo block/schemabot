@@ -247,3 +247,30 @@ func TestPlan_DesiredSchemaErrorFailsThePlan(t *testing.T) {
 		})
 	}
 }
+
+// PlanetScale does not honor drop_tables, so a plan that carries the list is
+// refused before the engine reaches PlanetScale, rather than planned as if the
+// list were empty and the listed tables silently left in place.
+func TestPlan_RefusesDropTables(t *testing.T) {
+	clientCalls := 0
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) {
+			clientCalls++
+			return &emptyMainBranchClient{}, nil
+		})
+	result, err := e.Plan(t.Context(), &engine.PlanRequest{
+		Database: "commerce",
+		SchemaFiles: schema.SchemaFiles{"commerce": &schema.Namespace{Files: map[string]string{
+			"orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`));",
+		}}},
+		Credentials: &engine.Credentials{Metadata: map[string]string{
+			"organization": "org",
+			"token_name":   "tn",
+			"token_value":  "tv",
+		}},
+		DropTables: []string{"_orders_old"},
+	})
+	require.EqualError(t, err, "plan database commerce: drop_tables is supported only on MySQL, and this is a PlanetScale target. Remove drop_tables from schemabot.yaml")
+	assert.Nil(t, result)
+	assert.Zero(t, clientCalls, "the plan is refused before PlanetScale is asked for anything")
+}

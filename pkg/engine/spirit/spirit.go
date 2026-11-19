@@ -117,6 +117,11 @@ type Engine struct {
 	// sends, given the probe's context, so tests can make the server slow to
 	// answer and prove every statement runs under the probe's budget.
 	sizeProbeSQL func(ctx context.Context, stmt string) string
+
+	// dropTablesQuietPeriod is how long a drop_tables entry must have gone
+	// without a write before a plan proposes dropping it. New sets it to
+	// defaultDropTablesQuietPeriod; it is a field so tests can shorten it.
+	dropTablesQuietPeriod time.Duration
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -254,6 +259,8 @@ func New(cfg Config) *Engine {
 		lockWaitTimeout:     lockWaitTimeout,
 		disablePendingDrops: cfg.DisablePendingDrops,
 		checkpointMaxAge:    checkpointMaxAge,
+
+		dropTablesQuietPeriod: defaultDropTablesQuietPeriod,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -669,7 +676,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
-	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
+	drops, err := engine.NewDroppedTables(req.DropTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
+	if err := drops.RefuseIgnored(ignored); err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
+	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored, drops)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
@@ -732,6 +746,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
 			return nil, err
 		}
+		if err := drops.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
+			return nil, err
+		}
 		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
 			return nil, err
 		}
@@ -777,6 +794,20 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			ExistingCopiesChecked: true,
 			ExemptTables:          exemptTables,
 		}, nil
+	}
+
+	// A drop_tables entry is dropped only once the target shows it has gone
+	// the quiet period without a write. The check comes after the config's own
+	// contradictions are refused above, so an entry that should not be listed
+	// at all is reported as that, whatever the target says about its writes.
+	if !drops.Empty() {
+		db, err := target.get(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("plan database %s: check when drop_tables entries were last written: %w", database, err)
+		}
+		if err := e.requireQuietDropTables(ctx, db, database, drops); err != nil {
+			return nil, fmt.Errorf("plan database %s: %w", database, err)
+		}
 	}
 
 	// The engine's refusal checks compare a redeclared column against its
@@ -1379,7 +1410,10 @@ type liveSchema struct {
 // and archive tables that are maintained outside declarative schema files.
 //
 // ignored withholds the tables the repository's ignore_tables config names.
-func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) (*liveSchema, error) {
+// drops names tables the repository's drop_tables config asks to drop: one the
+// naming conventions would exclude is read back into the live schema, so the
+// diff proposes DROP TABLE for it like any other undeclared table.
+func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables, drops engine.DroppedTables) (*liveSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open target database: %w", err)
@@ -1401,8 +1435,12 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 	if err != nil {
 		return nil, fmt.Errorf("load schema: %w", err)
 	}
-	var underscore, archive []string
+	var underscore, archive, reclaimed []string
 	for _, ex := range excluded {
+		if drops.Names(ex.Name) {
+			reclaimed = append(reclaimed, ex.Name)
+			continue
+		}
 		switch ex.Filter {
 		case table.WithoutUnderscoreTables:
 			underscore = append(underscore, ex.Name)
@@ -1410,6 +1448,25 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			archive = append(archive, ex.Name)
 		default:
 			return nil, fmt.Errorf("load schema: the loader excluded table %q under filter option %d, which the plan cannot disclose", ex.Name, ex.Filter)
+		}
+	}
+	for _, name := range reclaimed {
+		ts, err := loadTableSchema(ctx, db, name)
+		if err != nil {
+			return nil, fmt.Errorf("load schema of drop_tables entry %q: %w", name, err)
+		}
+		tables = append(tables, ts)
+	}
+	if !drops.Empty() {
+		// Every listed table that exists is in tables by now: the loader
+		// returned it, or it was read back in above.
+		liveNames := make([]string, 0, len(tables))
+		for _, ts := range tables {
+			liveNames = append(liveNames, ts.Name)
+		}
+		if unmatched := drops.Unmatched(liveNames); len(unmatched) > 0 {
+			e.logger.Info("drop_tables entries name no table on the target, so the plan drops nothing for them",
+				"database", database, "entries", unmatched)
 		}
 	}
 
@@ -1427,11 +1484,15 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			withheld = append(withheld, ts.Name)
 			continue
 		}
-		if table.IsArchiveTable(ts.Name) {
+		if table.IsArchiveTable(ts.Name) && !drops.Names(ts.Name) {
 			archive = append(archive, ts.Name)
 			continue
 		}
 		kept = append(kept, ts)
+	}
+	if len(reclaimed) > 0 {
+		e.logger.Info("drop_tables entries read into the live schema so the plan drops them",
+			"database", database, "tables", reclaimed)
 	}
 	slices.Sort(withheld)
 	slices.Sort(underscore)
