@@ -210,6 +210,51 @@ func TestCleaner_ReportsAQuarantineLogItCannotRead(t *testing.T) {
 	})
 }
 
+// makeQuarantineLogReadOnly replaces the quarantine log with a view that lists
+// the given records but refuses deletes, as a log the account can read but not
+// write does.
+func makeQuarantineLogReadOnly(t *testing.T, db *sql.DB, records ...string) {
+	t.Helper()
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", Database),
+		fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", Database, LogTable),
+		fmt.Sprintf("CREATE TABLE `%s`.`log_base` (quarantine_table varchar(64) NOT NULL)", Database),
+		fmt.Sprintf("CREATE VIEW `%s`.`%s` AS SELECT DISTINCT quarantine_table FROM `%s`.`log_base`", Database, LogTable, Database),
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	for _, name := range records {
+		_, err := db.ExecContext(t.Context(),
+			fmt.Sprintf("INSERT INTO `%s`.`log_base` (quarantine_table) VALUES (?)", Database), name)
+		require.NoError(t, err)
+	}
+}
+
+// A pass that can read the quarantine log but cannot delete a record of a copy
+// that is gone fails under log_error, naming the record, after the expired
+// copies have still been dropped. The record stays for a later pass to delete.
+func TestCleaner_ReportsALogRecordItCannotDelete(t *testing.T) {
+	db := setupCleanerTest(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	expired := createQuarantinedTable(t, db, "old_orders", old)
+	gone := TableName("testdb", "never_moved", old)
+	makeQuarantineLogReadOnly(t, db, gone)
+	reader := newManualMetricReader(t)
+
+	err := testCleaner(t, DefaultRetention, false).Run(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "prune "+Database+"."+LogTable)
+	assert.Contains(t, err.Error(), "delete log record of "+gone)
+	assert.Equal(t, map[string]string{"testdb": "log_error"}, cleanupErrorReasonsByDatabase(t, reader))
+	assert.NotContains(t, quarantinedTables(t, db), expired, "the copies are still dropped")
+
+	var kept int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`log_base` WHERE quarantine_table = ?", Database), gone).Scan(&kept))
+	assert.Equal(t, 1, kept, "the record the pass could not delete is still there")
+}
+
 // The quarantine log lives in the pending drops database beside the copies it
 // describes. The cleaner never drops it or reports it unparseable, deletes the
 // record of a copy once that copy is gone and past retention, whether the

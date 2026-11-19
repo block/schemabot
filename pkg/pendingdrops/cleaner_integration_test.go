@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/testutil"
@@ -297,6 +300,89 @@ func TestCleaner_PassEndsWhenTheReleaseIsNeverAnswered(t *testing.T) {
 		acquired, err := namedlock.MySQL{}.Acquire(t.Context(), conn, targetLockName(target), 0)
 		return err == nil && acquired
 	}, 10*time.Second, 100*time.Millisecond, "the cleanup lock must be free once the pass has closed its pool")
+}
+
+// counterTotal collects the named counter and returns the sum of its
+// datapoints, or zero when nothing was counted.
+func counterTotal(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.Truef(t, ok, "%s must be an int64 sum", name)
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+			}
+		}
+	}
+	return total
+}
+
+// Two SchemaBot instances clean the same target. While one holds the cleanup
+// lock, the other skips the target for this pass: it drops nothing, reports
+// no error, and counts the skip, so two passes never race to drop the same
+// copies. Once the lock is free, the next pass drops the expired copy.
+func TestCleaner_SkipsATargetAnotherInstanceIsCleaning(t *testing.T) {
+	db := setupCleanerTest(t)
+	expired := createQuarantinedTable(t, db, "old_orders", time.Now().Add(-8*24*time.Hour))
+
+	cleaner := testCleaner(t, DefaultRetention, false)
+	lockName := targetLockName(cleaner.targets[0])
+	otherInstance, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(otherInstance)
+	acquired, err := namedlock.MySQL{}.Acquire(t.Context(), otherInstance, lockName, 0)
+	require.NoError(t, err)
+	require.True(t, acquired, "the other instance must hold the cleanup lock")
+
+	reader := newManualMetricReader(t)
+	require.NoError(t, cleaner.Run(t.Context()))
+
+	assert.Contains(t, quarantinedTables(t, db), expired, "a skipped pass drops nothing")
+	assert.Equal(t, int64(1), counterTotal(t, reader, "schemabot.pending_drops.cleanup_lock_skipped_total"))
+	assert.Empty(t, cleanupErrorReasonsByDatabase(t, reader), "a skipped pass is not a failure")
+
+	released, err := namedlock.MySQL{}.Release(t.Context(), otherInstance, lockName)
+	require.NoError(t, err)
+	require.True(t, released)
+	require.NoError(t, cleaner.Run(t.Context()))
+	assert.NotContains(t, quarantinedTables(t, db), expired, "the next pass with the lock free drops the expired copy")
+}
+
+// failingAcquireLocker is the real MySQL locker except that taking the lock
+// fails, as it does when the target rejects the lock call.
+type failingAcquireLocker struct {
+	namedlock.MySQL
+}
+
+func (failingAcquireLocker) Acquire(context.Context, *sql.Conn, string, time.Duration) (bool, error) {
+	return false, errors.New("lock call rejected by the target")
+}
+
+// A pass that cannot tell whether it holds the cleanup lock must not clean:
+// it fails the target under target_error and leaves every copy in place for
+// the next pass.
+func TestCleaner_FailsATargetWhoseLockCannotBeTaken(t *testing.T) {
+	db := setupCleanerTest(t)
+	expired := createQuarantinedTable(t, db, "old_orders", time.Now().Add(-8*24*time.Hour))
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	target := Target{Database: "testdb", Environment: "staging", DSN: sharedDSN, Locker: failingAcquireLocker{}}
+	cleaner := NewCleaner([]Target{target}, DefaultRetention, false, logger)
+	reader := newManualMetricReader(t)
+
+	err := cleaner.Run(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "acquire advisory lock on testdb/staging")
+	assert.Contains(t, err.Error(), "lock call rejected by the target")
+	assert.Equal(t, map[string]string{"testdb": "target_error"}, cleanupErrorReasonsByDatabase(t, reader))
+	assert.Contains(t, quarantinedTables(t, db), expired, "a pass without the lock drops nothing")
 }
 
 // An unreachable target fails the pass with an error but does not panic; the
