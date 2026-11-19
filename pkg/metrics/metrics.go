@@ -539,6 +539,7 @@ var knownPRCommandActorAuthReasons = map[string]bool{
 	"allowed_repo_admin_user": true,
 	"allowed_operator_team":   true,
 	"allowed_operator_user":   true,
+	"allowed_command_app":     true,
 	"missing_actor":           true,
 	"missing_server_config":   true,
 	"missing_database_config": true,

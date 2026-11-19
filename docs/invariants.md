@@ -2104,8 +2104,9 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 ### AZ-4: Applying takes an authorized actor
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
-admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval that the reviewer withdrew or that the repository
+admins, CODEOWNERS, or Apps the database lists as command Apps, per config), evaluated per
+database. The change's author cannot satisfy their own review requirement, and a command App's
+approval never satisfies it. An approval that the reviewer withdrew or that the repository
 dismissed does not count. By default an authorized approval counts on whichever commit of the
 change it was given. Where the review policy requires re-approval, an approval counts only for the
 schema change it reviewed: it was given on the commit being applied, or on an earlier commit at which the change's own

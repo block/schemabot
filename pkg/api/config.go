@@ -1296,6 +1296,15 @@ type DatabaseConfig struct {
 	// for this database when PR command authorization is enabled.
 	OperatorUsers []string `yaml:"operator_users,omitempty"`
 
+	// CommandApps are GitHub App slugs whose comments may run PR commands for
+	// this database, such as a deploy gate's test App. SchemaBot otherwise
+	// ignores every comment from an App. A listed App runs commands only for
+	// this database and only from repositories the database accepts, whether
+	// or not PR command authorization is enabled, and its approval never
+	// counts toward the review gate. A slug may not be one of this
+	// deployment's trusted-check-app-slugs, whose comments are SchemaBot's own.
+	CommandApps []string `yaml:"command_apps,omitempty"`
+
 	// OperatorGroups are forwarded identity groups (see auth.forward_auth)
 	// whose members may run mutating direct API/CLI operations against this
 	// database only, in the instance-wide environments listed in
@@ -2497,6 +2506,9 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
+			return err
+		}
+		if err := c.validateDatabaseCommandApps(name, dbConfig); err != nil {
 			return err
 		}
 		if err := c.validateDatabaseReviewPolicy(name, dbConfig); err != nil {
