@@ -104,3 +104,55 @@ func TestPRSchemaDiscoveryCountsOwnerOfDeletedInput(t *testing.T) {
 		require.Equal(t, []PRSchema{{Database: "orders"}}, schemas)
 	}
 }
+
+func TestPRSchemaDiscoveryRepairUsesRegisteredHeadConfig(t *testing.T) {
+	const valid = "database: orders\ntype: mysql\n"
+	const malformed = "database: [\n"
+	for _, tc := range []struct {
+		name, head, base, wantErr string
+		baseStatus                int
+		changedConfig, registered bool
+	}{
+		{"repair malformed YAML", valid, malformed, "", 200, true, true},
+		{"repair missing type", valid, "database: orders", "", 200, true, true},
+		{"invalid head", malformed, valid, "invalid schemabot.yaml", 200, true, true},
+		{"historical read failure", valid, "", "fetch config", 403, true, true},
+		{"unregistered replacement", valid, malformed, "invalid schemabot.yaml", 200, true, false},
+		{"SQL edit alone", valid, malformed, "invalid schemabot.yaml", 200, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			github, mux := setupConfigTestGitHubServer(t)
+			const route = "/repos/test/repo"
+			mux.HandleFunc(route+"/contents/schemabot.yaml", func(w http.ResponseWriter, r *http.Request) {
+				content := tc.head
+				if r.URL.Query().Get("ref") != "head" {
+					content = tc.base
+					w.WriteHeader(tc.baseStatus)
+				}
+				_, err := fmt.Fprintf(w, `{"type":"file","encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString([]byte(content)))
+				assert.NoError(t, err)
+			})
+			mux.HandleFunc(route+"/git/trees/{ref}", func(w http.ResponseWriter, r *http.Request) {
+				_, err := fmt.Fprintf(w, `{"sha":%q,"tree":[{"path":"items.sql","type":"blob","mode":"100644"}]}`, r.PathValue("ref"))
+				assert.NoError(t, err)
+			})
+			files := []PRFile{{Filename: "items.sql", Status: "modified"}}
+			if tc.changedConfig {
+				files = append(files, PRFile{Filename: "schemabot.yaml", Status: "modified"})
+			}
+			client := NewInstallationClient(github, slog.Default())
+			got, err := client.DiscoverPRSchemas(t.Context(), "test/repo", []string{"head", "base", "default-tip"}, files, func(config DiscoveredConfig) []string {
+				if tc.registered && config.Config.Database == "orders" {
+					return []string{"staging"}
+				}
+				return nil
+			})
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []PRSchema{{Database: "orders"}}, got)
+		})
+	}
+}

@@ -148,32 +148,51 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		return nil, fmt.Errorf("fetch config at %s: %w", configPath, err)
 	}
 
+	config, err := parseSchemaConfig(content)
+	if err != nil {
+		return nil, &invalidSchemaConfigError{path: configPath, cause: err}
+	}
+	return config, nil
+}
+
+type invalidSchemaConfigError struct {
+	path  string
+	cause error
+}
+
+func (e *invalidSchemaConfigError) Error() string {
+	return fmt.Sprintf("invalid schemabot.yaml at %s: %v", e.path, e.cause)
+}
+
+func (e *invalidSchemaConfigError) Unwrap() error { return e.cause }
+
+func parseSchemaConfig(content string) (*SchemabotConfig, error) {
 	var config SchemabotConfig
 	decoder := yaml.NewDecoder(strings.NewReader(content))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&config); err != nil {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
+		return nil, err
 	}
 	declaredType := config.Type
 	config.Database = storage.CanonicalKey(config.Database)
 	config.Type = DatabaseType(storage.CanonicalKey(string(config.Type)))
 
 	if config.Database == "" {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: database is required", configPath)
+		return nil, errors.New("database is required")
 	}
 	if config.Type == "" {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", configPath)
+		return nil, errors.New("type is required; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')")
 	}
 	switch config.Type {
 	case DatabaseTypeVitess, DatabaseTypeMySQL, DatabaseTypeStrata, DatabaseTypePostgres:
 	default:
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: unknown type '%s'; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", configPath, declaredType)
+		return nil, fmt.Errorf("unknown type '%s'; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", declaredType)
 	}
 	if err := schema.ValidateIgnoreNamespaces(config.IgnoreNamespaces); err != nil {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
+		return nil, err
 	}
 	if err := schema.ValidateIgnoreTables(config.IgnoreTables); err != nil {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
+		return nil, err
 	}
 
 	return &config, nil

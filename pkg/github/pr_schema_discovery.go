@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"path"
@@ -29,7 +30,11 @@ type prSchemaConfigImpact struct {
 // revision. Comparison refs supply the owners of removed or renamed inputs.
 func (ic *InstallationClient) DiscoverPRSchemas(ctx context.Context, repo string, refs []string, files []PRFile, environments func(DiscoveredConfig) []string) ([]PRSchema, error) {
 	changed := make(map[string]bool)
+	modifiedConfigs := make(map[string]bool)
 	for _, file := range files {
+		if isConfigFile(file.Filename) && file.Status == "modified" {
+			modifiedConfigs[file.Filename] = true
+		}
 		if isDiscoveryInputFile(file.Filename) || file.Symlink {
 			changed[file.Filename] = true
 		}
@@ -45,7 +50,7 @@ func (ic *InstallationClient) DiscoverPRSchemas(ctx context.Context, repo string
 	results := make([][]prSchemaConfigImpact, len(refs))
 	for i, ref := range refs {
 		g.Go(func() error {
-			schemas, err := ic.discoverPRSchemasAtRef(ctx, repo, ref, changed, environments)
+			schemas, err := ic.discoverPRSchemasAtRef(ctx, repo, ref, refs[0], changed, modifiedConfigs, environments)
 			results[i] = schemas
 			return err
 		})
@@ -78,13 +83,14 @@ func (ic *InstallationClient) DiscoverPRSchemas(ctx context.Context, repo string
 	return schemas, nil
 }
 
-func (ic *InstallationClient) discoverPRSchemasAtRef(ctx context.Context, repo, ref string, changed map[string]bool, environments func(DiscoveredConfig) []string) ([]prSchemaConfigImpact, error) {
+func (ic *InstallationClient) discoverPRSchemasAtRef(ctx context.Context, repo, ref, head string, changed, modifiedConfigs map[string]bool, environments func(DiscoveredConfig) []string) ([]prSchemaConfigImpact, error) {
 	type owner struct {
 		config DiscoveredConfig
 		paths  map[string]bool
 	}
 	owners := make(map[string]*owner)
 	probes := make(configProbeCache)
+	headProbes := make(configProbeCache)
 	for name := range changed {
 		// Configs own themselves. A config added in the PR need not exist
 		// on the base, and a removed config need not exist on the head.
@@ -97,6 +103,18 @@ func (ic *InstallationClient) discoverPRSchemasAtRef(ctx context.Context, repo, 
 			config, dir, err = ic.findNearestConfig(ctx, repo, ref, name, probes)
 		}
 		if err != nil {
+			// A malformed comparison config has no usable historical owner.
+			// Its repaired, registered copy at the same path is counted at head.
+			if invalid, ok := errors.AsType[*invalidSchemaConfigError](err); ok && ref != head && modifiedConfigs[invalid.path] {
+				configDir := path.Dir(invalid.path)
+				current, readErr := ic.probeConfigDir(ctx, repo, head, configDir, headProbes)
+				if readErr != nil {
+					return nil, readErr
+				}
+				if current != nil && len(environments(newDiscoveredConfig(current, configDir))) > 0 {
+					continue
+				}
+			}
 			return nil, fmt.Errorf("find schema config for %s at %s: %w", name, ref, err)
 		}
 		if config == nil {
