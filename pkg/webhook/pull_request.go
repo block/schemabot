@@ -7,14 +7,15 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -116,8 +117,8 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 
 	// Route PR actions
 	switch {
-	case h.isPRSchemaExceptionEvent("pull_request", payload):
-		h.handlePRSchemaExceptionEvent(ctx, w, "pull_request", body, deliveryID)
+	case h.isPRSchemaExceptionEvent(payload):
+		h.handlePRSchemaExceptionEvent(ctx, w, body, deliveryID)
 		return
 	case isAutoPlannablePullRequest(payload):
 		// proceed to auto-plan below
@@ -529,9 +530,6 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 	changedFiles, files := discovery.changedFiles, discovery.files
 	discovered, configs := discovery.discovered, discovery.managed
 	if policy.Limit > 0 {
-		if !policy.Observe {
-			configs = discovery.localConfigs
-		}
 		if cacheKey != h.prPlanDiscoveryKey(repo, pr, fresh) || !fresh.IsOpen() {
 			return autoPlanDispatch{message: "auto-plan discarded because the PR or registrations moved during discovery"}, nil
 		}
@@ -606,6 +604,13 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 	}
 
 	affectedDatabases := checkDatabaseKeysForConfigs(configs)
+
+	// Persist registration errors before cleanup or a successful sibling plan can
+	// publish an aggregate. Keep all discovered keys in the stale-check sweep.
+	planConfigs, err := h.registeredAutoPlanConfigs(ctx, client, repo, pr, headSHA, installationID, configs)
+	if err != nil {
+		return autoPlanDispatch{}, err
+	}
 
 	// Clean up stale checks from databases no longer in the PR, on the new HEAD
 	// SHA. This runs to completion before any plan below launches, so every
@@ -710,71 +715,40 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		tenant = config.Tenant
 	}
 	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles, files, discovered)
-	parent, _ := ctx.Value(durableSchemaPlanContextKey{}).(context.Context)
-	await := parent != nil && admission.exception != ""
-	var jobs sync.WaitGroup
-	var unfinished atomic.Bool
-	var claimErr error
-	seen := make(map[string]bool)
-	if source == "check_run.rerequested" {
-		admission.dispatchID = deliveryID
-	}
-	for _, cfg := range configs {
+	for _, cfg := range planConfigs {
 		database := cfg.Config.Database
-		var claim *storage.Setting
-		if policy.Limit > 0 && !policy.Observe {
-			if seen[database] {
-				continue
-			}
-			seen[database] = true
-		}
-		if admission.exception != "" && (source != "check_run.rerequested" || deliveryID != "") {
-			var claimed bool
-			claim, claimed, err = h.claimPRSchemaPlan(ctx, admission, database)
-			if errors.Is(err, errPRSchemaPlanClaimActive) {
-				unfinished.Store(true)
-				continue
-			}
-			if err != nil {
-				claimErr = errors.Join(claimErr, fmt.Errorf("claim %s for PR exception: %w", database, err))
-				continue
-			}
-			if !claimed {
-				continue
-			}
-		}
-		if await {
-			jobs.Add(1)
-		}
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			if await {
-				defer jobs.Done()
-			}
-			completed := false
-			if claim != nil {
-				defer func() {
-					h.finishPRSchemaPlan(claim, completed)
-					if !completed {
-						unfinished.Store(true)
-					}
-				}()
-			}
-			jobCtx := context.Background()
-			if await {
-				jobCtx = parent
-			}
-			completed = h.runMultiEnvPlan(jobCtx, repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote, admission)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote, admission)
 		})
-	}
-	jobs.Wait()
-	if await && unfinished.Load() {
-		claimErr = errors.Join(claimErr, fmt.Errorf("some plans admitted by the PR exception have not completed"))
-	}
-	if claimErr != nil {
-		return autoPlanDispatch{message: "PR database planning incomplete"}, claimErr
 	}
 
 	return autoPlanDispatch{message: "auto-plan started"}, nil
+}
+
+// registeredAutoPlanConfigs records a durable aggregate failure before returning
+// the databases that can proceed. A later successful plan folds that same block.
+func (h *Handler) registeredAutoPlanConfigs(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, configs []ghclient.DiscoveredConfig) ([]ghclient.DiscoveredConfig, error) {
+	if h.isRepoListenOnly(repo) || !h.config().AreChecksEnabled(repo) {
+		return configs, nil
+	}
+	var messages []string
+	var registered []ghclient.DiscoveredConfig
+	for _, cfg := range configs {
+		if _, err := h.configuredDatabaseEnvironments(cfg.Config.Database); err != nil {
+			messages = append(messages, fmt.Sprintf("%s: %s", cfg.Path, userFacingError(err)))
+			h.handleSchemaRequestError(repo, pr, installationID, "", cfg.Config.Database, "", action.Plan, err, false)
+			continue
+		}
+		registered = append(registered, cfg)
+	}
+	if len(messages) > 0 {
+		slices.Sort(messages)
+		if !h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,
+			h.aggregateMessagesForAllEnvironments(strings.Join(messages, "\n")), configDiscoveryFailedBlock) {
+			return nil, fmt.Errorf("could not record invalid schema configuration for %s#%d at %s", repo, pr, headSHA)
+		}
+	}
+	return registered, nil
 }
 
 // severalDatabases is the count that makes an auto-plan comment name its

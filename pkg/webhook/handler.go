@@ -695,7 +695,7 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		// for an apply, not for a plan. The stored check state it writes is the
 		// whole point. It re-plans the one database the settled apply held the
 		// check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, admission)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil, admission)
 	})
 }
 
@@ -1172,9 +1172,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		recordProcessed()
 	case "check_suite":
 		h.handleCheckSuite(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
-		recordProcessed()
-	case "pull_request_review":
-		h.handlePRSchemaExceptionEvent(ctx, sw, eventType, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "pull_request":
 		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))

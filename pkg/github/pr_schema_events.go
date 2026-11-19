@@ -19,15 +19,10 @@ type PRSchemaEvents struct {
 	LabelActor      string
 	LabelChangedAt  time.Time
 	RevisionEventID int64
-	RetargetedAt    time.Time
 }
 
 func (p *PullRequestInfo) HasLabel(label string) bool {
 	return slices.ContainsFunc(p.labels, func(name string) bool { return strings.EqualFold(name, label) })
-}
-
-func (p *PullRequestInfo) HasRequestedTeam(slug string) bool {
-	return slices.ContainsFunc(p.requestedTeams, func(name string) bool { return strings.EqualFold(name, slug) })
 }
 
 // FetchPRSchemaEvents reads the authoritative PR timeline. The PR endpoint
@@ -48,13 +43,7 @@ func (ic *InstallationClient) FetchPRSchemaEvents(ctx context.Context, repo stri
 		}
 		for _, event := range events {
 			switch event.GetEvent() {
-			case "base_ref_changed":
-				changedAt := event.GetCreatedAt().Time
-				if changedAt.After(state.RetargetedAt) {
-					state.RetargetedAt = changedAt
-				}
-				state.RevisionEventID = max(state.RevisionEventID, event.GetID())
-			case "head_ref_force_pushed", "base_ref_force_pushed":
+			case "base_ref_changed", "head_ref_force_pushed", "base_ref_force_pushed":
 				state.RevisionEventID = max(state.RevisionEventID, event.GetID())
 			case "labeled", "unlabeled":
 				if label != "" && event.GetID() > state.LabelEventID && strings.EqualFold(event.GetLabel().GetName(), label) {

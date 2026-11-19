@@ -549,16 +549,8 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // only an auto-plan reads it. unmanagedSchema lists the schema configs the PR
 // also changes that this environment-scoped deployment does not manage; the
 // comment names them, and posts even when it has no plan to show.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, queued ...prSchemaAdmission) {
-	var admission prSchemaAdmission
-	if len(queued) != 0 {
-		admission = queued[0]
-	}
-	h.runMultiEnvPlan(context.Background(), repo, pr, databaseName, tenant, installationID, requestedBy, isAutoPlan, commandScopeDatabases, postPlanComment, commentID, nil, admission)
-}
-
-func (h *Handler) runMultiEnvPlan(parent context.Context, repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData, queued prSchemaAdmission) (completed bool) {
-	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData, queued prSchemaAdmission) {
+	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
 		return
@@ -1027,9 +1019,6 @@ func (h *Handler) runMultiEnvPlan(parent context.Context, repo string, pr int, d
 			"environments", len(pendingWorkUnstored))
 	}
 
-	completed = len(planFailedEnvironments) == 0 && len(placementBlockUnstored) == 0 &&
-		len(driftBlockUnstored) == 0 && len(pendingWorkUnstored) == 0
-
 	slot := planCommentSlot{
 		Database:         multiEnvData.Database,
 		DatabaseType:     multiEnvData.DatabaseType,
@@ -1087,7 +1076,6 @@ func (h *Handler) runMultiEnvPlan(parent context.Context, repo string, pr int, d
 
 	// Post a single combined comment
 	h.postTrackedPlanComment(repo, pr, installationID, slot, templates.RenderMultiEnvPlanComment(multiEnvData))
-	return completed
 }
 
 // planCommentUpToDate reports whether the plan shows nothing to act on: no

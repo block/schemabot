@@ -967,11 +967,9 @@ type PullRequestInfo struct {
 	BaseRef      string
 	// DefaultBranch is the default branch of the repository the PR targets,
 	// read from the same response as BaseRef.
-	DefaultBranch  string
-	User           string
-	Draft          bool
-	labels         []string
-	requestedTeams []string
+	DefaultBranch string
+	User          string
+	labels        []string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
@@ -1433,14 +1431,10 @@ func pullRequestInfoFromGitHub(ghPR *pullRequestWithStack) PullRequestInfo {
 		User:          ghPR.GetUser().GetLogin(),
 		State:         ghPR.GetState(),
 		Merged:        ghPR.GetMerged(),
-		Draft:         ghPR.GetDraft(),
 		BaseSHA:       ghPR.GetBase().GetSHA(),
 	}
 	for _, label := range ghPR.Labels {
 		info.labels = append(info.labels, label.GetName())
-	}
-	for _, team := range ghPR.RequestedTeams {
-		info.requestedTeams = append(info.requestedTeams, team.GetSlug())
 	}
 	if ghPR.Stack != nil {
 		info.NativeStack = true

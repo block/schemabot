@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,7 +37,6 @@ type schemaCapTestFixture struct {
 	defaultTip atomic.Value
 	truncated  atomic.Bool
 	labels     atomic.Bool
-	draft      atomic.Bool
 	fileReads  atomic.Int64
 }
 
@@ -97,8 +94,8 @@ func newSchemaCapTestFixture(t *testing.T, configs, local int, policy api.PRSche
 		if f.labels.Load() {
 			labels = fmt.Sprintf(`[{"name":%q}]`, schemaCapTestLabel)
 		}
-		_, _ = fmt.Fprintf(w, `{"state":"open","draft":%t,"user":{"login":"author"},"head":{"sha":%q},"base":{"ref":%q,"sha":"base","repo":{"default_branch":"main"}},"labels":%s}`,
-			f.draft.Load(), f.head.Load(), f.base.Load(), labels)
+		_, _ = fmt.Fprintf(w, `{"state":"open","user":{"login":"author"},"head":{"sha":%q},"base":{"ref":%q,"sha":"base","repo":{"default_branch":"main"}},"labels":%s}`,
+			f.head.Load(), f.base.Load(), labels)
 	})
 	mux.HandleFunc("GET "+repoPath+"/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		f.fileReads.Add(1)
@@ -112,7 +109,10 @@ func newSchemaCapTestFixture(t *testing.T, configs, local int, policy api.PRSche
 		}
 		files := make([]map[string]string, 0, configs)
 		for i := range configs {
-			files = append(files, map[string]string{"filename": fmt.Sprintf("db%d/schemabot.yaml", i), "status": "added"})
+			files = append(files,
+				map[string]string{"filename": fmt.Sprintf("db%d/schemabot.yaml", i), "status": "added"},
+				map[string]string{"filename": fmt.Sprintf("db%d/users.sql", i), "status": "modified"},
+			)
 		}
 		assert.NoError(t, json.NewEncoder(w).Encode(files))
 	})
@@ -121,6 +121,7 @@ func newSchemaCapTestFixture(t *testing.T, configs, local int, policy api.PRSche
 		switch sha := r.PathValue("sha"); {
 		case strings.HasPrefix(sha, "base"):
 		case strings.HasPrefix(sha, "tree-db"):
+			entries = append(entries, map[string]string{"path": "users.sql", "mode": "100644", "type": "blob", "sha": "sql-" + sha})
 			entries = append(entries, map[string]string{"path": "schemabot.yaml", "mode": "100644", "type": "blob", "sha": "blob-" + sha})
 		default:
 			for i := range configs {
@@ -185,7 +186,8 @@ func TestPRSchemaCapCountsLocalLogicalDatabases(t *testing.T) {
 			dispatch, err := f.dispatchAutoPlanForPR(t.Context(), f.client, schemaCapTestRepo, 1, "head", 42,
 				"check-recovery", "recovery", "", "delivery", autoPlanOptions{deferSchemaPlans: true})
 			require.NoError(t, err)
-			require.Len(t, dispatch.deferredDatabases, sizes.local)
+			// Deferred work includes unknown databases so planning can report registration errors.
+			require.Len(t, dispatch.deferredDatabases, sizes.repo)
 		})
 	}
 	f := newSchemaCapTestFixture(t, 0, 1, api.PRSchemaCapConfig{Label: schemaCapTestLabel}, nil)
@@ -224,6 +226,37 @@ func (c *revokingSchemaCapPlanner) Plan(context.Context, *ternv1.PlanRequest) (*
 	c.calls++
 	c.revoke()
 	return nil, status.Error(codes.Unavailable, "retryable")
+}
+
+func TestPRSchemaCapApplyRefusalReleasesOnlyAutomaticIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		storedPlan   *storage.Plan
+		wantReleased []string
+	}{
+		{"automatic", &storage.Plan{}, []string{"original-plan"}},
+		{"manual confirmation", nil, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			planner := &flakyPlanTernClient{}
+			f := newSchemaCapTestFixture(t, 6, 6, api.PRSchemaCapConfig{Label: schemaCapTestLabel}, planner)
+			locks := &actorAuthLockStore{}
+			f.service.Storage().(*schemaCapTestStore).locks = locks
+			var admissions int
+			f.service.OnPRSchemaAdmission = func(context.Context, string, int, string) error {
+				admissions++
+				return errPRSchemaCapHeld
+			}
+			schema := &ghclient.SchemaRequestResult{Database: "db0", Type: "mysql", SchemaPath: "db0",
+				HeadSHA: "head", SchemaFiles: planRetryTestRequest().SchemaFiles}
+			f.executeApply(t.Context(), f.client, schemaCapTestRepo, 1, schema, "staging", 42, "author", CommandResult{},
+				tt.storedPlan, nil, "original-plan", nil)
+			require.Equal(t, 1, admissions)
+			require.Equal(t, tt.wantReleased, locks.releasedIfPending)
+			require.Empty(t, locks.released)
+			require.Zero(t, planner.calls())
+		})
+	}
 }
 
 // Removing the exception after the first Plan RPC prevents its transient retry.
@@ -265,37 +298,6 @@ func registerSchemaCapTimeline(mux *http.ServeMux, body string) {
 	})
 }
 
-func TestPRSchemaCapClaimsAnExceptedDatabaseOnce(t *testing.T) {
-	f := newSchemaCapTestFixture(t, 0, 0, api.PRSchemaCapConfig{Label: schemaCapTestLabel}, nil)
-	admission := prSchemaAdmission{key: prPlanDiscoveryKey{repo: schemaCapTestRepo, pr: 1}, exception: "label:13"}
-	claims := make(chan *storage.Setting, 8)
-	var wg sync.WaitGroup
-	for range 8 {
-		wg.Go(func() {
-			claim, claimed, err := f.claimPRSchemaPlan(t.Context(), admission, "db0")
-			assert.True(t, err == nil || errors.Is(err, errPRSchemaPlanClaimActive))
-			if claimed {
-				claims <- claim
-			}
-		})
-	}
-	wg.Wait()
-	require.Len(t, claims, 1)
-	f.finishPRSchemaPlan(<-claims, false)
-	retry, claimed, err := f.claimPRSchemaPlan(t.Context(), admission, "db0")
-	require.NoError(t, err)
-	require.True(t, claimed)
-	f.finishPRSchemaPlan(retry, true)
-	_, claimed, err = f.claimPRSchemaPlan(t.Context(), admission, "db0")
-	require.NoError(t, err)
-	require.False(t, claimed)
-	_, claimed, err = f.claimPRSchemaPlan(t.Context(), admission, "db1")
-	require.NoError(t, err)
-	require.True(t, claimed)
-}
-
-// The original label delivery cannot revive a removed label or acknowledge a
-// later label on a different base, even when the head SHA stayed the same.
 func TestPRSchemaCapLabelReorderingAndRetarget(t *testing.T) {
 	f := newSchemaCapTestFixture(t, 6, 6, api.PRSchemaCapConfig{Label: schemaCapTestLabel}, nil)
 	f.labels.Store(true)
@@ -346,87 +348,64 @@ func TestPRSchemaCapLabelReorderingAndRetarget(t *testing.T) {
 	require.Equal(t, "label:16", admission)
 }
 
-func TestPRSchemaCapRequiresCurrentEffectiveTeamApproval(t *testing.T) {
-	const date = "2026-11-18T21:00:00Z"
-	for _, tc := range []struct {
-		name, reviewUser, state, commit, timeline string
-		membership                                int
-		admitted, verificationError               bool
-	}{
-		{name: "current team approval", reviewUser: "alice", state: "APPROVED", commit: "head", admitted: true, membership: 200},
-		{name: "nonmember", reviewUser: "alice", state: "APPROVED", commit: "head", membership: 404},
-		{name: "unreadable membership", reviewUser: "alice", state: "APPROVED", commit: "head", membership: 403, verificationError: true},
-		{name: "author", reviewUser: "author", state: "APPROVED", commit: "head"},
-		{name: "prior commit", reviewUser: "alice", state: "APPROVED", commit: "previous"},
-		{name: "dismissed", reviewUser: "alice", state: "DISMISSED", commit: "head"},
-		{name: "retargeted", reviewUser: "alice", state: "APPROVED", commit: "head", timeline: `[{"id":44,"event":"base_ref_changed","created_at":"2026-11-18T22:00:00Z"}]`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newSchemaCapTestFixture(t, 0, 0, api.PRSchemaCapConfig{ReviewTeam: "octocat/database-reviewers"}, nil)
-			f.mux.HandleFunc("GET /repos/"+schemaCapTestRepo+"/pulls/1/reviews", func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = fmt.Fprintf(w, `[{"id":17,"user":{"login":%q},"state":%q,"commit_id":%q,"submitted_at":%q}]`, tc.reviewUser, tc.state, tc.commit, date)
-			})
-			timeline := tc.timeline
-			if timeline == "" {
-				timeline = "[]"
-			}
-			registerSchemaCapTimeline(f.mux, timeline)
-			f.mux.HandleFunc("GET /orgs/octocat/teams/database-reviewers/memberships/alice", func(w http.ResponseWriter, _ *http.Request) {
-				assert.NotZero(t, tc.membership)
-				w.WriteHeader(tc.membership)
-				_, _ = fmt.Fprint(w, `{"state":"active"}`)
-			})
-			f.mux.HandleFunc("GET /orgs/octocat/teams/database-reviewers", func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = fmt.Fprint(w, `{"slug":"database-reviewers"}`)
-			})
-			info, err := f.client.FetchPullRequest(t.Context(), schemaCapTestRepo, 1)
-			require.NoError(t, err)
-			token, _, err := f.evaluatePRSchemaReview(t.Context(), f.client, schemaCapTestRepo, 1, info, f.config().PRSchemaCapForRepo(schemaCapTestRepo), false)
-			if tc.verificationError {
-				require.ErrorIs(t, err, ghclient.ErrTeamMembershipUnreadable)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, tc.admitted, token != "")
-		})
+func TestPRSchemaCapReportsUnregisteredDatabase(t *testing.T) {
+	f := newSchemaCapTestFixture(t, 1, 0, api.PRSchemaCapConfig{Label: schemaCapTestLabel}, nil)
+	cfg := f.config()
+	repo := cfg.Repos[schemaCapTestRepo]
+	repo.EnableChecks = new(true)
+	cfg.Repos[schemaCapTestRepo] = repo
+	store := &schemaCapCheckStorage{schemaCapTestStore: f.service.Storage().(*schemaCapTestStore), checks: &foldCheckStore{}}
+	f.service = api.New(store, cfg, nil, testLogger())
+	type checkRun struct {
+		Name, Conclusion string
+		Output           struct{ Summary string }
 	}
+	checkRuns := make(chan checkRun, 1)
+	f.mux.HandleFunc("POST /repos/"+schemaCapTestRepo+"/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var posted checkRun
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&posted))
+		checkRuns <- posted
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprint(w, `{"id":39}`)
+	})
+	_, err := f.runAutoPlanForPR(t.Context(), f.client, schemaCapTestRepo, 1, "head", 42, "pull_request", "opened", "", "unknown-db")
+	require.NoError(t, err)
+	f.DrainInProcessWebhookWork(t.Context())
+	require.Len(t, checkRuns, 1)
+	posted := <-checkRuns
+	require.Equal(t, "SchemaBot", posted.Name)
+	require.Equal(t, "failure", posted.Conclusion)
+	require.Contains(t, posted.Output.Summary, "db0/schemabot.yaml")
+	require.Equal(t, configDiscoveryFailedBlock.blockingReason, store.checks.upserted[0].BlockingReason)
+	require.Contains(t, posted.Output.Summary, "not configured")
 }
 
-func TestPRSchemaCapRequestsReviewOnceAfterDraft(t *testing.T) {
-	f := newSchemaCapTestFixture(t, 0, 0, api.PRSchemaCapConfig{ReviewTeam: "octocat/database-reviewers", RequestTeamReview: true}, nil)
-	repoPath := "/repos/" + schemaCapTestRepo
-	f.mux.HandleFunc("GET "+repoPath+"/pulls/1/reviews", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprint(w, "[]")
+func TestPRSchemaCapMixedConfigsBlockBeforeValidPlanStarts(t *testing.T) {
+	f := newSchemaCapTestFixture(t, 2, 1, api.PRSchemaCapConfig{Label: schemaCapTestLabel}, nil)
+	cfg := f.config()
+	repo := cfg.Repos[schemaCapTestRepo]
+	repo.EnableChecks = new(true)
+	cfg.Repos[schemaCapTestRepo] = repo
+	store := &schemaCapCheckStorage{schemaCapTestStore: f.service.Storage().(*schemaCapTestStore), checks: &foldCheckStore{}}
+	f.service = api.New(store, cfg, nil, testLogger())
+	f.mux.HandleFunc("POST /repos/"+schemaCapTestRepo+"/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprint(w, `{"id":39}`)
 	})
-	registerSchemaCapTimeline(f.mux, "[]")
-	var requests atomic.Int64
-	f.mux.HandleFunc("POST "+repoPath+"/pulls/1/requested_reviewers", func(w http.ResponseWriter, r *http.Request) {
-		var payload struct {
-			TeamReviewers []string `json:"team_reviewers"`
-		}
-		assert.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
-		assert.Equal(t, []string{"database-reviewers"}, payload.TeamReviewers)
-		requests.Add(1)
-		w.WriteHeader(http.StatusForbidden)
-	})
-	f.draft.Store(true)
-	policy := f.config().PRSchemaCapForRepo(schemaCapTestRepo)
-	fresh, err := f.client.FetchPullRequestNoCache(t.Context(), schemaCapTestRepo, 1)
+	ctx := t.Context()
+	info, err := f.client.FetchPullRequest(ctx, schemaCapTestRepo, 1)
 	require.NoError(t, err)
-	_, notice, err := f.evaluatePRSchemaReview(t.Context(), f.client, schemaCapTestRepo, 1, fresh, policy, true)
+	discovery, err := f.readPRPlanDiscovery(ctx, f.client, schemaCapTestRepo, 1, info, "pull_request", "mixed")
 	require.NoError(t, err)
-	require.Empty(t, notice)
-	require.Zero(t, requests.Load())
-
-	f.draft.Store(false)
-	fresh, err = f.client.FetchPullRequestNoCache(t.Context(), schemaCapTestRepo, 1)
+	ready, err := f.registeredAutoPlanConfigs(ctx, f.client, schemaCapTestRepo, 1, info.HeadSHA, 42, discovery.managed)
 	require.NoError(t, err)
-	for range 2 {
-		_, notice, err := f.evaluatePRSchemaReview(t.Context(), f.client, schemaCapTestRepo, 1, fresh, policy, true)
-		require.NoError(t, err)
-		require.Contains(t, notice, "HTTP 403")
-	}
-	require.EqualValues(t, 1, requests.Load())
+	require.Equal(t, []string{"db0"}, managedDatabaseNames(ready))
+	require.Len(t, store.checks.upserted, 1)
+	block := store.checks.upserted[0]
+	require.Equal(t, configDiscoveryFailedBlock.blockingReason, block.BlockingReason)
+	require.Equal(t, "failure", block.Conclusion)
+	require.Contains(t, block.ErrorMessage, "db1/schemabot.yaml")
+	require.Contains(t, block.ErrorMessage, "not configured")
 }
 
 func TestPRSchemaCapPublishesActionRequiredAndAffectedDatabases(t *testing.T) {
@@ -475,17 +454,6 @@ type schemaCapCheckStorage struct {
 }
 
 func (s *schemaCapCheckStorage) Checks() storage.CheckStore { return s.checks }
-
-func TestPRSchemaCapTeamGrantChangesOnlyWhenRevoked(t *testing.T) {
-	f := newSchemaCapTestFixture(t, 0, 0, api.PRSchemaCapConfig{ReviewTeam: "octocat/database-reviewers"}, nil)
-	var seen []uint64
-	for _, granted := range []bool{false, true, true, false, false, true} {
-		cycle, err := f.updatePRSchemaReviewCycle(t.Context(), "review-cycle", granted)
-		require.NoError(t, err)
-		seen = append(seen, cycle)
-	}
-	require.Equal(t, []uint64{1, 1, 1, 2, 2, 2}, seen)
-}
 
 func TestPRSchemaCapRejectsIncompleteChangedFiles(t *testing.T) {
 	planner := &flakyPlanTernClient{}

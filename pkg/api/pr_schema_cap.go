@@ -12,14 +12,11 @@ import (
 // PRSchemaCapConfig controls admission for work associated with a repository's
 // pull requests. A configured cap defaults to five managed databases.
 type PRSchemaCapConfig struct {
-	Limit             int    `yaml:"limit,omitempty"`
-	Observe           bool   `yaml:"observe,omitempty"`
-	ControlPlane      string `yaml:"control_plane,omitempty"`
-	Label             string `yaml:"label,omitempty"`
-	ManageLabel       *bool  `yaml:"manage_label,omitempty"`
-	ReviewTeam        string `yaml:"review_team,omitempty"`
-	RequestTeamReview bool   `yaml:"request_team_review,omitempty"`
-	ReviewApp         string `yaml:"review_app,omitempty"`
+	Limit        int    `yaml:"limit,omitempty"`
+	Observe      bool   `yaml:"observe,omitempty"`
+	ControlPlane string `yaml:"control_plane,omitempty"`
+	Label        string `yaml:"label,omitempty"`
+	ManageLabel  *bool  `yaml:"manage_label,omitempty"`
 }
 
 func (c *ServerConfig) PRSchemaCapForRepo(repo string) PRSchemaCapConfig {
@@ -52,47 +49,16 @@ func (c *ServerConfig) validatePRSchemaCap(repo string, rc RepoConfig) error {
 	if cap.Limit < 0 {
 		return fmt.Errorf("%s.limit must be positive", field)
 	}
-	if (cap.Label == "") == (cap.ReviewTeam == "") {
-		return fmt.Errorf("%s needs exactly one of label or review_team", field)
+	if cap.Label == "" {
+		return fmt.Errorf("%s.label is required", field)
 	}
 	if cap.Label != strings.TrimSpace(cap.Label) || len(cap.Label) > 50 {
 		return fmt.Errorf("%s.label must be a GitHub label of up to 50 characters", field)
-	}
-	if cap.ReviewTeam != "" {
-		org, slug, ok := strings.Cut(cap.ReviewTeam, "/")
-		repoOrg, _, _ := strings.Cut(repo, "/")
-		if !ok || !strings.EqualFold(org, repoOrg) || !githubSlug(org) || !githubSlug(slug) {
-			return fmt.Errorf("%s.review_team must name a team in the repository's organization (org/team-slug)", field)
-		}
-	}
-	if (cap.RequestTeamReview || cap.ReviewApp != "") && cap.ReviewTeam == "" {
-		return fmt.Errorf("%s.request_team_review and review_app require review_team", field)
-	}
-	if cap.ManageLabel != nil && cap.Label == "" {
-		return fmt.Errorf("%s.manage_label requires label", field)
-	}
-	if cap.ReviewApp != "" {
-		if _, ok := c.Apps[cap.ReviewApp]; !ok {
-			return fmt.Errorf("%s.review_app must name a configured GitHub App", field)
-		}
 	}
 	if rc.ListenOnly && !cap.Observe {
 		return fmt.Errorf("%s requires observation mode for listen-only repositories", field)
 	}
 	return nil
-}
-
-func githubSlug(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' {
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 // PRSchemaAdmissionError reports a refusal before PR-associated work starts.

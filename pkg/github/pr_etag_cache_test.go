@@ -86,11 +86,9 @@ func (s *etagPRServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"ref": "main", "sha": "base111",
 			"repo": map[string]string{"default_branch": "main"},
 		},
-		"user":            map[string]string{"login": "octocat"},
-		"stack":           map[string]any{"base": map[string]string{"ref": "release"}},
-		"draft":           true,
-		"labels":          []map[string]string{{"name": "example"}},
-		"requested_teams": []map[string]string{{"slug": "reviewers"}},
+		"user":   map[string]string{"login": "octocat"},
+		"stack":  map[string]any{"base": map[string]string{"ref": "release"}},
+		"labels": []map[string]string{{"name": "example"}},
 	})
 }
 
@@ -119,7 +117,7 @@ func TestFetchPullRequest_UnchangedPRIsAnsweredNotModified(t *testing.T) {
 		HeadRef: "feature", HeadSHA: "head111", BaseRef: "main", BaseSHA: "base111",
 		DefaultBranch: "main", User: "octocat", State: "closed", Merged: true,
 		NativeStack: true, StackBaseRef: "release",
-		Draft: true, labels: []string{"example"}, requestedTeams: []string{"reviewers"},
+		labels: []string{"example"},
 	}
 
 	first, err := ic.FetchPullRequestNoCache(t.Context(), "octo/repo", 42)

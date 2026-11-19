@@ -20,12 +20,9 @@ func prSchemaHoldMessage(policy api.PRSchemaCapConfig, databases []string, label
 	var message strings.Builder
 	fmt.Fprintf(&message, "Planning is paused on %s. This PR changes %d databases managed by this control plane, above its limit of %d.\n\n",
 		schemaCapCode(policy.ControlPlane), len(databases), policy.Limit)
-	switch {
-	case policy.ReviewTeam != "":
-		fmt.Fprintf(&message, "Split the changes into smaller PRs, or ask a member of %s to approve this revision.\n", schemaCapCode(policy.ReviewTeam))
-	case labelPresent:
+	if labelPresent {
 		fmt.Fprintf(&message, "Split the changes into smaller PRs, or remove and re-add the %s label to acknowledge this revision. Planning all %d databases can delay other SchemaBot work.\n", schemaCapCode(policy.Label), len(databases))
-	default:
+	} else {
 		fmt.Fprintf(&message, "Split the changes into smaller PRs, or add the %s label with caution. Planning all %d databases can delay other SchemaBot work.\n", schemaCapCode(policy.Label), len(databases))
 	}
 	if notice != "" {

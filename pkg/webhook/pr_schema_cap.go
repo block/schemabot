@@ -29,7 +29,6 @@ type prSchemaAdmission struct {
 	discovery  *prPlanDiscovery
 	compareTip string
 	exception  string
-	dispatchID string
 }
 
 type prSchemaAdmissionKey struct{}
@@ -103,7 +102,7 @@ func (h *Handler) admitPRSchemaCommand(ctx context.Context, client *ghclient.Ins
 	}
 	if err == nil && admission.exception != "" {
 		info, err = h.verifyPRSchemaRevision(ctx, client, key, info.State)
-		if err == nil && policy.Label != "" && !info.HasLabel(policy.Label) {
+		if err == nil && !info.HasLabel(policy.Label) {
 			err = errPRSchemaCapHeld
 		}
 	}
@@ -165,14 +164,9 @@ func (h *Handler) evaluatePRSchemaCap(ctx context.Context, client *ghclient.Inst
 	admission := prSchemaAdmission{client: client}
 	aboveLimit := len(databases) > policy.Limit
 	var notice string
-	if info.IsOpen() {
+	if info.IsOpen() && info.HasLabel(policy.Label) {
 		var err error
-		switch {
-		case policy.Label != "" && info.HasLabel(policy.Label):
-			admission.exception, err = h.evaluatePRSchemaLabel(ctx, client, repo, pr, info, policy.Label)
-		case policy.ReviewTeam != "" && aboveLimit:
-			admission.exception, notice, err = h.evaluatePRSchemaReview(ctx, client, repo, pr, info, policy, mode != schemaCapVerify)
-		}
+		admission.exception, err = h.evaluatePRSchemaLabel(ctx, client, repo, pr, info, policy.Label)
 		if err != nil {
 			h.logger.Warn("could not verify the PR schema limit exception", "repo", repo, "pr", pr, "error", err)
 			notice = "SchemaBot could not verify the exception with GitHub. Retry the check."
@@ -211,7 +205,7 @@ func (h *Handler) verifyPRSchemaRevision(ctx context.Context, client *ghclient.I
 
 // Hold publication and release must be ordered across workers and replicas.
 // A valid-at-read exception must never clear a hold already published by a
-// concurrent dismissal or label removal on the same head.
+// concurrent label removal on the same head.
 func (h *Handler) withPRSchemaPublication(ctx context.Context, repo string, pr int, publish func() error) error {
 	policy := h.config().PRSchemaCapForRepo(repo)
 	settings := h.service.Storage().Settings()

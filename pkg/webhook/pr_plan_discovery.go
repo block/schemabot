@@ -35,11 +35,11 @@ type prPlanDiscoveryKey struct {
 }
 
 type prPlanDiscovery struct {
-	defaultTip                        string
-	changedFiles, files               []ghclient.PRFile
-	discovered, managed, localConfigs []ghclient.DiscoveredConfig
-	unmanagedFiles                    []string
-	localDatabases                    []string
+	defaultTip          string
+	changedFiles, files []ghclient.PRFile
+	discovered, managed []ghclient.DiscoveredConfig
+	unmanagedFiles      []string
+	localDatabases      []string
 }
 
 type cachedPRPlanDiscovery struct {
@@ -128,8 +128,8 @@ func (h *Handler) readPRPlanDiscovery(ctx context.Context, client *ghclient.Inst
 	managed := h.filterManagedDiscoveredConfigs(ctx, repo, pr, head, source, slices.Clone(discovered))
 	discovery := &prPlanDiscovery{defaultTip: defaultTip, changedFiles: changed, files: files, discovered: discovered, managed: managed, unmanagedFiles: unmanaged}
 	if h.config().PRSchemaCapForRepo(repo).Limit > 0 {
-		discovery.localConfigs = h.localPRPlanConfigs(repo, pr, managed)
-		discovery.localDatabases = managedDatabaseNames(discovery.localConfigs)
+		localConfigs := h.localPRPlanConfigs(repo, pr, managed)
+		discovery.localDatabases = managedDatabaseNames(localConfigs)
 	}
 	return discovery, nil
 }
