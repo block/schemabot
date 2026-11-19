@@ -43,6 +43,31 @@ func WriteLockKept(database, dbType, reason string) {
 	fmt.Printf("   Release it once nothing is left to run: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
+// WriteUnsubmittedLockKept writes the message when the lock a command took
+// for a schema change it never submitted could not be released. Nothing runs
+// under the lock, so the second line says it can be released now.
+func WriteUnsubmittedLockKept(database, dbType string, releaseErr error) {
+	fmt.Printf("🔒 Lock kept for %s (%s): the server did not release it (%v).\n", database, dbType, releaseErr)
+	fmt.Printf("   Nothing was submitted, so release it now: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
+}
+
+// WriteUnsubmittedLockAlreadyReleased writes the message when the lock a
+// command took for a schema change it never submitted was gone by the time the
+// command released it. Nothing is held, so no unlock command is offered.
+func WriteUnsubmittedLockAlreadyReleased(database, dbType string) {
+	fmt.Printf("🔓 Lock for %s (%s) was already released, so nothing is left to unlock.\n", database, dbType)
+}
+
+// WriteUnsubmittedLockHeldByAnotherOwner writes the message when the lock a
+// command took for a schema change it never submitted has since been released
+// and taken under another owner. That lock is not this command's, so it is
+// left held and no unlock command is offered: unlock would refuse it, and
+// forcing it would take the lock from whoever holds it now.
+func WriteUnsubmittedLockHeldByAnotherOwner(database, dbType string) {
+	fmt.Printf("🔒 Lock for %s (%s) is now held by another owner, so it was left in place.\n", database, dbType)
+	fmt.Printf("   Nothing was submitted and this command holds no lock. See who holds it: %s\n", cliname.Command("locks"))
+}
+
 // WriteLockForceReleased writes the force release message. The previous owner
 // is whatever the caller that took the lock named itself, so its control runes
 // are removed, as for every lock owner these templates print.

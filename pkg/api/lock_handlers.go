@@ -34,6 +34,10 @@ type LockReleaseRequest struct {
 // LockResponse is the response for lock operations.
 type LockResponse struct {
 	Lock *LockInfo `json:"lock,omitempty"`
+	// Created is set on an acquire that created the lock row it reports. It
+	// is false when the owner already held the lock, so a caller can tell a
+	// lock it took from one it found and release only the one it took.
+	Created bool `json:"created,omitempty"`
 }
 
 // LockInfo represents lock information in API responses.
@@ -176,7 +180,7 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
 
-	s.writeJSON(w, http.StatusOK, LockResponse{Lock: lockToInfo(acquired)})
+	s.writeJSON(w, http.StatusOK, LockResponse{Lock: lockToInfo(acquired), Created: lockCreatedByAcquire(lock.ID, acquired)})
 }
 
 // writeLockReadBackFailed answers an acquire whose read of the lock afterwards

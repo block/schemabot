@@ -683,6 +683,57 @@ func TestUnverifiedScopedLockAcquireRefusalIsCountedAndLogged(t *testing.T) {
 	assert.Equal(t, "org/payments-service", entry["repository"])
 }
 
+// rowIDLockStore acquires the way storage does: insertedID is the ID the
+// acquire assigns to a row it inserts, zero when the owner already held the
+// lock, and the row read back afterwards carries storedID.
+type rowIDLockStore struct {
+	storage.LockStore
+	insertedID int64
+	storedID   int64
+}
+
+func (s *rowIDLockStore) Acquire(_ context.Context, lock *storage.Lock) error {
+	lock.ID = s.insertedID
+	return nil
+}
+
+func (s *rowIDLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	return &storage.Lock{ID: s.storedID, DatabaseName: database, DatabaseType: dbType, Owner: "cli:bob@laptop"}, nil
+}
+
+// An acquire says whether it took the lock or found it already held under the
+// same owner, so the CLI releases only a lock it took when its schema change
+// is never submitted. A row another request inserted under the same owner
+// while this acquire ran is one this acquire found.
+func TestLockAcquireReportsWhetherItCreatedTheLock(t *testing.T) {
+	tests := []struct {
+		name       string
+		insertedID int64
+		storedID   int64
+		created    bool
+	}{
+		{name: "the acquire inserted the row read back", insertedID: 7, storedID: 7, created: true},
+		{name: "the owner already held the lock", insertedID: 0, storedID: 7, created: false},
+		{name: "another request's row replaced the one this acquire inserted", insertedID: 7, storedID: 9, created: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &rowIDLockStore{insertedID: tc.insertedID, storedID: tc.storedID}
+			body := `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop"}`
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/locks/acquire", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			newLockTestServer(store).ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			var resp LockResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			require.NotNil(t, resp.Lock)
+			assert.Equal(t, "payments", resp.Lock.Database)
+			assert.Equal(t, tc.created, resp.Created)
+		})
+	}
+}
+
 // A lock request body holds one JSON value. Anything after it but white space
 // is refused before anything changes, so a second object carrying "force", or
 // a value followed by stray text, is never acted on as if only its first part

@@ -520,10 +520,10 @@ func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResp
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
-		return "", fmt.Errorf("no plan_id in response")
+		return "", &notSubmittedError{err: fmt.Errorf("no plan_id in response")}
 	}
 	if ctx.Err() != nil {
-		return "", stoppedBeforeSubmit(ctx, operation)
+		return "", &notSubmittedError{err: stoppedBeforeSubmit(ctx, operation)}
 	}
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
@@ -536,6 +536,9 @@ func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResp
 		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, options)
 		return applyErr
 	})
+	if submitRefusedByServer(err) {
+		return "", &notSubmittedError{err: err}
+	}
 	if err != nil {
 		return "", err
 	}
@@ -586,6 +589,67 @@ func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResp
 func stoppedBeforeSubmit(ctx context.Context, operation string) error {
 	fmt.Fprintf(os.Stderr, "Stopped before the %s was submitted; nothing was started.\n", operation)
 	return interrupted(ctx)
+}
+
+// notSubmittedError is an applyAndWatch failure after which the server has
+// certainly not started the schema change: the command stopped before it sent
+// the apply, or the server refused it. Any other failure, such as a server
+// error, a lost connection, or an apply the server answered as not accepted,
+// leaves it unknown whether work started, so it is not one.
+type notSubmittedError struct{ err error }
+
+func (e *notSubmittedError) Error() string { return e.err.Error() }
+func (e *notSubmittedError) Unwrap() error { return e.err }
+
+// neverSubmitted reports whether err ended applyAndWatch before the server
+// started anything.
+func neverSubmitted(err error) bool {
+	_, ok := errors.AsType[*notSubmittedError](err)
+	return ok
+}
+
+// submitRefusedByServer reports whether err is the apply API refusing the
+// request with a client error. The server answers every refusal of an apply
+// before it creates one, so a 4xx means nothing was queued; a 5xx can come
+// after the apply was stored, so it is not a refusal.
+func submitRefusedByServer(err error) bool {
+	apiErr, ok := errors.AsType[*client.APIError](err)
+	return ok && apiErr.Status >= 400 && apiErr.Status < 500
+}
+
+// releaseUnsubmittedLock releases the database lock this command took for a
+// schema change it never submitted, and returns cause, joined with the release
+// failure if there was one. Kept, the lock would outlive the command and refuse
+// every later apply on the database until someone unlocked it by hand. Only a
+// lock this command created is released: one the owner already held may guard
+// an apply an earlier command started.
+//
+// "Created" means this command's acquire inserted the lock row, not that this
+// command is the row's only user. The owner names the user and the host, so a
+// second command run at the same time under the same account acquires the same
+// row without creating it, and the release is by owner rather than by row. If
+// the server accepted that second command's apply before it refused this one,
+// the release removes the lock that apply runs under.
+//
+// A lock that is already gone, or that another owner now holds, is not a
+// failed release: this command holds nothing either way, so cause is returned
+// alone and no unlock command is offered.
+func releaseUnsubmittedLock(ep, database, dbType, owner string, cause error) error {
+	err := client.ReleaseLock(ep, database, dbType, owner)
+	switch {
+	case err == nil:
+		templates.WriteLockReleased(database, dbType)
+		return cause
+	case errors.Is(err, client.ErrLockNotFound):
+		templates.WriteUnsubmittedLockAlreadyReleased(database, dbType)
+		return cause
+	case errors.Is(err, client.ErrLockNotOwned):
+		templates.WriteUnsubmittedLockHeldByAnotherOwner(database, dbType)
+		return cause
+	default:
+		templates.WriteUnsubmittedLockKept(database, dbType, err)
+		return errors.Join(cause, fmt.Errorf("release lock for %s: %w", database, err))
+	}
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {

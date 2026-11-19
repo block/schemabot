@@ -511,6 +511,7 @@ func previewCLILockingAllOutput() {
 		{"LOCK CONFLICT (CLI)", previewLockConflictByCLIOutput},
 		{"LOCK RELEASED", previewLockReleasedOutput},
 		{"LOCK KEPT (YIELD)", previewLockKeptOutput},
+		{"LOCK KEPT (NOTHING SUBMITTED)", previewUnsubmittedLockNotReleasedOutput},
 		{"NO LOCK FOUND", previewNoLockFoundOutput},
 		{"LOCK EXISTS UNDER OTHER TYPE", previewLockExistsUnderOtherTypeOutput},
 		{"UNLOCK NOT OWNED", previewUnlockNotOwnedOutput},
