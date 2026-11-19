@@ -372,7 +372,7 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		if err != nil {
 			return fmt.Errorf("parse --last: %w", err)
 		}
-		updatedSince = webhookRedriveNow().Add(-window).Format(time.RFC3339)
+		updatedSince = operatorNow().Add(-window).Format(time.RFC3339)
 	}
 	endpoint, err := g.Resolve()
 	if err != nil {
@@ -893,7 +893,7 @@ func backfillCanceledError(ctx context.Context, err error, stopProgress func()) 
 // not read the rate state) proceeds without pausing; GitHub's reactive
 // secondary-rate-limit handling still applies underneath.
 func pauseForRateLimit(ctx context.Context, rate *apitypes.GitHubRateLimit, floorPct int, updateProgress func(string)) error {
-	wait, ok := rateLimitPauseDuration(rate, floorPct, webhookRedriveNow())
+	wait, ok := rateLimitPauseDuration(rate, floorPct, operatorNow())
 	if !ok {
 		return nil
 	}
@@ -950,7 +950,7 @@ func scanObservedAt(chunk *apitypes.ChecksScanResponse) time.Time {
 			return observed
 		}
 	}
-	return webhookRedriveNow()
+	return operatorNow()
 }
 
 // stuckChecksPastThreshold flattens the scan's uncompleted Check Runs to one
@@ -1069,7 +1069,7 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 			// The server stops a batch at the first PR it reaches with the
 			// budget below the floor. Those PRs were not started, so they go
 			// back on the queue to send after the pause below.
-			_, pausing := rateLimitPauseDuration(resp.RateLimit, cmd.RateLimitFloor, webhookRedriveNow())
+			_, pausing := rateLimitPauseDuration(resp.RateLimit, cmd.RateLimitFloor, operatorNow())
 			var notStarted []int
 			for _, result := range resp.Results {
 				action, ok := actionByPR[repoPR{repo: repo, pr: result.PR}]
@@ -1144,7 +1144,7 @@ func (cmd *ChecksBackfillCmd) actOnMergeQueue(ctx context.Context, endpoint stri
 			}
 			// Heads the server did not start because the budget was below
 			// the floor go back on the queue to send after the pause.
-			_, pausing := rateLimitPauseDuration(resp.RateLimit, cmd.RateLimitFloor, webhookRedriveNow())
+			_, pausing := rateLimitPauseDuration(resp.RateLimit, cmd.RateLimitFloor, operatorNow())
 			var notStarted []string
 			for _, result := range resp.MergeQueue {
 				group, ok := groupByHead[repo+"@"+result.HeadSHA]

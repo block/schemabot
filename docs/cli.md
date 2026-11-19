@@ -1172,8 +1172,8 @@ Skipped repositories named by --skip-repo: acme/monorepo.
 No missing SchemaBot Check Runs found.
 ```
 
-A Ctrl-C or SIGTERM stops `checks backfill` and `webhooks redrive` where they
-are. Each says on stderr that it was canceled and exits 130, the status a
+A Ctrl-C or SIGTERM stops `checks backfill` where it is. It says on stderr
+that it was canceled and exits 130, the status a
 shell reports for an interrupted process, so a script can tell an interrupted
 run from one that failed or left findings.
 
@@ -1192,8 +1192,6 @@ What an interrupted run reports depends on where it stopped:
   may have acted on the request in flight. A PR in a later batch reads
   `not attempted: interrupted before this PR was sent`, because it never
   reached the server.
-- `webhooks redrive` prints the redelivery counts from the chunks that
-  completed, and prints none under `--dry-run`.
 
 ```console
 $ schemabot checks backfill acme/store -e production
@@ -1230,10 +1228,8 @@ sent for it. The same interrupted run, cut down to two of its PRs:
 }
 ```
 
-Treat the redrive counts as a lower bound: the server may have finished part
-of the chunk that was in flight. Checks already recreated and deliveries
-already redelivered are not undone. Run `checks backfill` again to finish the
-sweep; it only acts on PRs whose Check Runs are still missing.
+Checks already recreated are not undone. Run `checks backfill` again to finish
+the sweep; it only acts on PRs whose Check Runs are still missing.
 
 If `checks backfill` cannot write its interrupted report to stdout, for
 example because the disk behind a redirect is full, it says so on stderr,

@@ -665,7 +665,6 @@ var requestEffects = map[string]requestEffect{
 
 	// Changes that no single command shows.
 	"/api/checks/synthesize":    changesWithoutCommand,
-	"/api/webhooks/redrive":     changesWithoutCommand,
 	"/api/storage/schema/apply": changesWithoutCommand,
 }
 

@@ -1775,7 +1775,7 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 		case len(fa.WriteGroups) == 0 && len(operatorGroups) == 0:
 			logger.Warn("forward-auth enabled with no write groups configured: all write operations will be denied (read still works). Set auth.forward_auth.write_groups to allow writes.")
 		case len(fa.WriteGroups) == 0:
-			logger.Warn("forward-auth enabled with no write groups configured: only per-database operator writes will be allowed; operations with no target database (settings, checks, redrive) will be denied. Set auth.forward_auth.write_groups to allow admin writes.")
+			logger.Warn("forward-auth enabled with no write groups configured: only per-database operator writes will be allowed; operations with no target database (settings, checks) will be denied. Set auth.forward_auth.write_groups to allow admin writes.")
 		}
 		if len(fa.ReadGroups) == 0 {
 			logger.Info("forward-auth enabled with no read groups configured: read operations are open to any authenticated caller from the trusted proxy. Set auth.forward_auth.read_groups to restrict reads.")

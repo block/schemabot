@@ -195,61 +195,6 @@ func NewRateLimitedResponse(reason string, retryAfter time.Duration) ErrorRespon
 	}
 }
 
-type WebhookRedriveRequest struct {
-	WindowStart string `json:"window_start"`
-	WindowEnd   string `json:"window_end"`
-	App         string `json:"app,omitempty"`
-	Repo        string `json:"repo,omitempty"`
-	PR          int    `json:"pr,omitempty"`
-	MaxPages    int    `json:"max_pages"`
-	DryRun      bool   `json:"dry_run,omitempty"`
-	// Cursor continues a previous request's listing for one App. Each request
-	// processes a bounded number of pages so it finishes well within any
-	// intermediary HTTP timeout; the caller loops until next_cursor is empty.
-	Cursor string `json:"cursor,omitempty"`
-	// DeliveryIDs redelivers exactly these deliveries for App, skipping the
-	// window listing entirely — for callers that already identified the
-	// failed deliveries (for example a checks backfill classification pass).
-	DeliveryIDs []int64 `json:"delivery_ids,omitempty"`
-}
-
-type WebhookRedriveResponse struct {
-	Results []WebhookRedriveResult `json:"results"`
-}
-
-type WebhookRedriveResult struct {
-	AppName            string `json:"app_name"`
-	DryRun             bool   `json:"dry_run"`
-	Fetched            int    `json:"fetched"`
-	Pages              int    `json:"pages"`
-	OldestFetched      string `json:"oldest_fetched,omitempty"`
-	ReachedWindowStart bool   `json:"reached_window_start"`
-	// HistoryExhausted is true when GitHub's retained delivery history ended
-	// before the window start was reached: older deliveries no longer exist.
-	HistoryExhausted bool `json:"history_exhausted,omitempty"`
-	// NextCursor continues the listing in a follow-up request (with app set);
-	// empty when the window is covered or history is exhausted.
-	NextCursor string                    `json:"next_cursor,omitempty"`
-	Selected   []WebhookRedriveSelection `json:"selected"`
-	// Skipped counts in-window eligible deliveries whose detail could not be
-	// resolved for repo/PR filtering; they are left out of Selected rather
-	// than aborting the crawl.
-	Skipped     int `json:"skipped,omitempty"`
-	Redelivered int `json:"redelivered"`
-	Failed      int `json:"failed"`
-}
-
-type WebhookRedriveSelection struct {
-	ID          int64  `json:"id"`
-	DeliveredAt string `json:"delivered_at"`
-	Event       string `json:"event"`
-	Action      string `json:"action"`
-	Status      string `json:"status"`
-	StatusCode  int    `json:"status_code"`
-	Repo        string `json:"repo,omitempty"`
-	PR          int    `json:"pr,omitempty"`
-}
-
 type ChecksScanRequest struct {
 	Repo        string `json:"repo"`
 	Environment string `json:"environment,omitempty"`
@@ -408,8 +353,8 @@ type ChecksReposResponse struct {
 
 // ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
 // specific PRs by replaying the auto-plan flow, as if the check-creating
-// webhook delivery had arrived. Used for PRs with no delivery to redrive
-// (for example PRs opened before check enablement).
+// webhook delivery had arrived. Used for PRs whose check-creating delivery
+// never arrived or failed (for example PRs opened before check enablement).
 type ChecksSynthesizeRequest struct {
 	Repo string `json:"repo"`
 	PRs  []int  `json:"prs"`
