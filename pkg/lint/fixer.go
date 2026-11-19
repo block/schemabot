@@ -3,6 +3,7 @@ package lint
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -63,10 +64,17 @@ type FixFilesResult struct {
 
 // FixFiles applies auto-fixes to a set of SQL schema files.
 // Returns fixed files, any issues that couldn't be automatically fixed, and any error.
+// Files are processed in filename order, so the order of the results, the order
+// of the files in the remaining issues, and which file an error names are the
+// same on every run over the same input. Within one file, the remaining issues
+// keep the order Spirit's linters report them in, which Spirit leaves undefined.
 func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 	result := &FixFilesResult{}
+	filenames := slices.Sorted(maps.Keys(files))
+	fixedContent := make(map[string]string, len(files))
 
-	for filename, content := range files {
+	for _, filename := range filenames {
+		content := files[filename]
 		fileResult := FixResult{
 			Filename:    filename,
 			OriginalSQL: content,
@@ -84,6 +92,7 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 			fileResult.Changed = true
 			fileResult.Fixes = fixes
 			result.TotalFixed += len(fixes)
+			fixedContent[filename] = fixed
 		}
 
 		result.Files = append(result.Files, fileResult)
@@ -91,13 +100,11 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 
 	// Run lint after fixes to report any remaining unfixable issues
 	linter := New()
-	for filename, content := range files {
-		// Use fixed content if available
-		for _, fr := range result.Files {
-			if fr.Filename == filename && fr.Changed {
-				content = fr.FixedSQL
-				break
-			}
+	for _, filename := range filenames {
+		// Lint the fixed content where a fix was applied.
+		content, ok := fixedContent[filename]
+		if !ok {
+			content = files[filename]
 		}
 		lintResults, err := linter.LintSchema(map[string]string{filename: content})
 		if err != nil {
