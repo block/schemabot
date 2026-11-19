@@ -790,6 +790,10 @@ type atomicPollState struct {
 
 	// parked paces the poll while the drive holds at a deferred cutover.
 	parked parkedPoll
+	// pendingReads is the drive's handle on the reads of pending control
+	// requests it shares with the apply's other drives. Nil reads storage
+	// directly.
+	pendingReads *drivePendingControlReads
 
 	// progressWriteFailures counts consecutive ticks whose task progress
 	// writes did not all land; see pollTaskToCompletion's counterpart.
@@ -1136,6 +1140,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 	parked := newParkedPoll()
+	pendingReads := c.pendingControlReads.forDrive(c.taskPollInterval() / 2)
 
 	for {
 		select {
@@ -1144,10 +1149,10 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
 		case <-ticker.C:
-			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
+			if !parked.runFullPoll(ctx, pendingReads, c.storage, apply, time.Now(), logger) {
 				continue
 			}
-			pending, err := loadPendingControlOperations(ctx, c.storage, apply)
+			pending, err := pendingReads.load(ctx, c.storage, apply, logger)
 			if err != nil {
 				logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)

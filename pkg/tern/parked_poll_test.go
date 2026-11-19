@@ -58,7 +58,7 @@ func TestParkedPoll(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}}
 		p := newParkedPoll()
 		for i := range 3 {
-			assert.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start.Add(time.Duration(i)*time.Second), slog.Default()))
+			assert.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start.Add(time.Duration(i)*time.Second), slog.Default()))
 		}
 		assert.Zero(t, controls.reads, "only a held drive checks for pending requests")
 	})
@@ -67,24 +67,24 @@ func TestParkedPoll(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}}
 		store := newStore(controls)
 		p := newParkedPoll()
-		require.True(t, p.runFullPoll(t.Context(), store, apply, start, slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, store, apply, start, slog.Default()))
 		p.hold()
 
-		assert.False(t, p.runFullPoll(t.Context(), store, apply, start.Add(time.Second), slog.Default()))
-		assert.False(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval-time.Second), slog.Default()))
+		assert.False(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(time.Second), slog.Default()))
+		assert.False(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(parkedFullPollInterval-time.Second), slog.Default()))
 		assert.Equal(t, 2, controls.reads, "each skipped tick makes one check")
-		assert.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval), slog.Default()),
+		assert.True(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(parkedFullPollInterval), slog.Default()),
 			"the refresh poll keeps the task rows' liveness writes landing")
-		assert.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval+time.Second), slog.Default()),
+		assert.True(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(parkedFullPollInterval+time.Second), slog.Default()),
 			"the hold lasts only until a full poll that does not find the drive held again")
 	})
 
 	t.Run("a pending request wakes a held drive at once", func(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, pending: true}
 		p := newParkedPoll()
-		require.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start, slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start, slog.Default()))
 		p.hold()
-		assert.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start.Add(time.Second), slog.Default()))
+		assert.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start.Add(time.Second), slog.Default()))
 
 		// The poll that consumed the request can still find the engine holding
 		// while it starts the swap. The drive keeps polling every tick so it
@@ -93,7 +93,7 @@ func TestParkedPoll(t *testing.T) {
 		p.hold()
 		reads := controls.reads
 		for i := 2; i < 5; i++ {
-			assert.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start.Add(time.Duration(i)*time.Second), slog.Default()),
+			assert.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start.Add(time.Duration(i)*time.Second), slog.Default()),
 				"a woken drive runs the full poll on tick %d", i)
 			p.hold()
 		}
@@ -104,17 +104,17 @@ func TestParkedPoll(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}}
 		store := newStore(controls)
 		p := newParkedPoll()
-		require.True(t, p.runFullPoll(t.Context(), store, apply, start, slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, store, apply, start, slog.Default()))
 		p.hold()
 
 		// The refresh runs the full poll without a check, so the request it
 		// consumes is seen only by the poll's own control read.
-		require.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval), slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(parkedFullPollInterval), slog.Default()))
 		p.observe(pendingControlOperations{storage.ControlOperationCutover: {}})
 		p.hold()
 
 		reads := controls.reads
-		assert.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval+time.Second), slog.Default()),
+		assert.True(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(parkedFullPollInterval+time.Second), slog.Default()),
 			"the drive polls the next tick to see the swap the consumed request started")
 		assert.Equal(t, reads, controls.reads, "a woken drive no longer checks for pending requests")
 	})
@@ -123,19 +123,19 @@ func TestParkedPoll(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}}
 		store := newStore(controls)
 		p := newParkedPoll()
-		require.True(t, p.runFullPoll(t.Context(), store, apply, start, slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, store, apply, start, slog.Default()))
 		p.observe(pendingControlOperations{})
 		p.hold()
-		assert.False(t, p.runFullPoll(t.Context(), store, apply, start.Add(time.Second), slog.Default()))
+		assert.False(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(time.Second), slog.Default()))
 	})
 
 	for _, operation := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
 		t.Run("a pending "+string(operation)+" wakes a held drive", func(t *testing.T) {
 			controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, pending: true, operation: operation}
 			p := newParkedPoll()
-			require.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start, slog.Default()))
+			require.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start, slog.Default()))
 			p.hold()
-			assert.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start.Add(time.Second), slog.Default()))
+			assert.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start.Add(time.Second), slog.Default()))
 		})
 	}
 
@@ -146,32 +146,32 @@ func TestParkedPoll(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, pending: true, operation: storage.ControlOperationSkipRevert}
 		store := newStore(controls)
 		p := newParkedPoll()
-		require.True(t, p.runFullPoll(t.Context(), store, apply, start, slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, store, apply, start, slog.Default()))
 		p.observe(pendingControlOperations{storage.ControlOperationSkipRevert: {}})
 		p.hold()
-		assert.False(t, p.runFullPoll(t.Context(), store, apply, start.Add(time.Second), slog.Default()))
+		assert.False(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(time.Second), slog.Default()))
 		assert.Equal(t, 1, controls.reads)
-		assert.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval), slog.Default()),
+		assert.True(t, p.runFullPoll(t.Context(), nil, store, apply, start.Add(parkedFullPollInterval), slog.Default()),
 			"the refresh still runs, and resolves the request as a full-cadence poll would")
 	})
 
 	t.Run("a held drive whose context ended skips the check", func(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, err: assert.AnError}
 		p := newParkedPoll()
-		require.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start, slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start, slog.Default()))
 		p.hold()
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		assert.False(t, p.runFullPoll(ctx, newStore(controls), apply, start.Add(time.Second), slog.Default()))
+		assert.False(t, p.runFullPoll(ctx, nil, newStore(controls), apply, start.Add(time.Second), slog.Default()))
 		assert.Zero(t, controls.reads, "no storage read runs on an ended context")
 	})
 
 	t.Run("a failed check runs the full poll", func(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, err: assert.AnError}
 		p := newParkedPoll()
-		require.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start, slog.Default()))
+		require.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start, slog.Default()))
 		p.hold()
-		assert.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start.Add(time.Second), slog.Default()))
+		assert.True(t, p.runFullPoll(t.Context(), nil, newStore(controls), apply, start.Add(time.Second), slog.Default()))
 	})
 }
 

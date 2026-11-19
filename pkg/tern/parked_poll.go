@@ -65,8 +65,10 @@ func (p *parkedPoll) hold() {
 // runFullPoll reports whether this tick runs the drive's full poll. A tick
 // that runs it clears the hold, so the drive stays slowed only while each full
 // poll finds it still holding. A failed read runs the full poll, whose own
-// reads then surface whatever is wrong with storage.
-func (p *parkedPoll) runFullPoll(ctx context.Context, store storage.Storage, apply *storage.Apply, now time.Time, logger *slog.Logger) bool {
+// reads then surface whatever is wrong with storage. reads is the drive's
+// handle on the reads it shares with the apply's other drives; nil reads
+// storage directly.
+func (p *parkedPoll) runFullPoll(ctx context.Context, reads *drivePendingControlReads, store storage.Storage, apply *storage.Apply, now time.Time, logger *slog.Logger) bool {
 	if p.held && ctx.Err() != nil {
 		logger.DebugContext(ctx, "drive context ended while held at a deferred cutover; skipping the poll so the loop can exit",
 			apply.MutableLogAttrs()...)
@@ -76,7 +78,7 @@ func (p *parkedPoll) runFullPoll(ctx context.Context, store storage.Storage, app
 		p.beginFullPoll(now)
 		return true
 	}
-	pending, err := loadPendingControlOperations(ctx, store, apply)
+	pending, err := reads.load(ctx, store, apply, logger)
 	if err != nil {
 		logger.WarnContext(ctx, "could not check for a pending control request while held at a deferred cutover; running the full poll",
 			append(apply.MutableLogAttrs(), "error", err)...)

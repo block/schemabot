@@ -96,22 +96,23 @@ func (s targetRouterApplyStore) GetInProgress(context.Context) ([]*storage.Apply
 }
 
 type targetRouterRecordingClient struct {
-	compareReq         *ternv1.CompareSchemaFileChangeRequest
-	pullReq            *ternv1.PullSchemaRequest
-	planReq            *ternv1.PlanRequest
-	planDiffReq        *ternv1.PlanRequest
-	applyReq           *ternv1.ApplyRequest
-	progressReq        *ternv1.ProgressRequest
-	logsReq            *ternv1.LogsRequest
-	resumeApply        *storage.Apply
-	targetDSN          string
-	targetMetadata     map[string]string
-	schemaOverrides    map[string]string
-	tableOwner         string
-	pendingObserverSet bool
-	observerApplyID    int64
-	closed             bool
-	halted             bool
+	compareReq          *ternv1.CompareSchemaFileChangeRequest
+	pullReq             *ternv1.PullSchemaRequest
+	planReq             *ternv1.PlanRequest
+	planDiffReq         *ternv1.PlanRequest
+	applyReq            *ternv1.ApplyRequest
+	progressReq         *ternv1.ProgressRequest
+	logsReq             *ternv1.LogsRequest
+	resumeApply         *storage.Apply
+	targetDSN           string
+	targetMetadata      map[string]string
+	schemaOverrides     map[string]string
+	tableOwner          string
+	pendingControlReads *SharedPendingControlReads
+	pendingObserverSet  bool
+	observerApplyID     int64
+	closed              bool
+	halted              bool
 	// onPlan runs inside Plan, while the router still holds this client for
 	// the request, so a test can observe the router mid-dispatch.
 	onPlan func()
@@ -725,6 +726,31 @@ func TestTargetRouterPropagatesTableOwnerToLocalConfig(t *testing.T) {
 	assert.Equal(t, "app_owner", created["bikeshare"].tableOwner)
 }
 
+// The router builds one client per target, and an apply across several
+// targets runs one drive on each. Every client gets the router's one set of
+// shared control reads, so those drives share their checks for the apply's
+// pending control requests instead of each sending its own.
+func TestTargetRouterHandsEveryClientTheSameSharedControlReads(t *testing.T) {
+	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
+		"bikeshare-us": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(us:3306)/"},
+		"bikeshare-eu": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(eu:3306)/"},
+	}})
+	require.NoError(t, err)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	for _, target := range []string{"bikeshare-us", "bikeshare-eu"} {
+		_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "bikeshare", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: target})
+		require.NoError(t, err)
+	}
+
+	require.Len(t, created, 2, "each target gets its own client")
+	require.NotNil(t, router.pendingControlReads)
+	for key, client := range created {
+		assert.Same(t, router.pendingControlReads, client.pendingControlReads, "client %s", key)
+	}
+}
+
 func newStaticResolver(t *testing.T) *inventory.StaticResolver {
 	t.Helper()
 	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
@@ -748,7 +774,7 @@ func newTargetRouterForTest(t *testing.T, resolver inventory.Resolver, applyStor
 		Storage:  targetRouterStorage{applies: applyStore, plans: planStore},
 		Logger:   slog.Default(),
 		LocalClientFactory: func(cfg LocalConfig, _ storage.Storage, _ *slog.Logger) (Client, error) {
-			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata, schemaOverrides: cfg.SchemaOverrides, tableOwner: cfg.TableOwner}
+			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata, schemaOverrides: cfg.SchemaOverrides, tableOwner: cfg.TableOwner, pendingControlReads: cfg.PendingControlReads}
 			key := cfg.Database
 			if existing := created[key]; existing != nil {
 				key = fmt.Sprintf("%s#%d", cfg.Database, len(created)+1)

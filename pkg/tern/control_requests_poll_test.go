@@ -70,7 +70,7 @@ func TestGRPCClient_ProcessPendingControlRequestsAtPoll(t *testing.T) {
 		})
 		client.storage = store
 
-		standDown, err := client.processPendingControlRequestsAtPoll(t.Context(), apply, applyTaskScope{}, nil)
+		standDown, err := client.processPendingControlRequestsAtPoll(t.Context(), apply, applyTaskScope{}, nil, nil)
 		require.NoError(t, err)
 		assert.False(t, standDown)
 		assert.Equal(t, 1, controlRequests.listReads, "the poll reads the pending requests once")
@@ -88,7 +88,7 @@ func TestGRPCClient_ProcessPendingControlRequestsAtPoll(t *testing.T) {
 		})
 		client.storage = store
 
-		standDown, err := client.processPendingControlRequestsAtPoll(t.Context(), apply, applyTaskScope{}, nil)
+		standDown, err := client.processPendingControlRequestsAtPoll(t.Context(), apply, applyTaskScope{}, nil, nil)
 		require.NoError(t, err)
 		assert.False(t, standDown)
 		assert.Equal(t, "remote-poll-control-grpc", server.getRevertApplyID(), "revert proxied to the data plane")
@@ -112,7 +112,7 @@ func TestGRPCClient_ProcessPendingControlRequestsAtPoll(t *testing.T) {
 		controlRequests.listErr = readErr
 		client.storage = store
 
-		standDown, err := client.processPendingControlRequestsAtPoll(t.Context(), apply, applyTaskScope{}, nil)
+		standDown, err := client.processPendingControlRequestsAtPoll(t.Context(), apply, applyTaskScope{}, nil, nil)
 		require.ErrorIs(t, err, readErr)
 		assert.Contains(t, err.Error(), "apply-poll-control-grpc")
 		assert.False(t, standDown)
