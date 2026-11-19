@@ -310,12 +310,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			// aggregate role and -t-scoped plans acknowledge at dispatch, while
 			// an unscoped plan on an aggregate-role repo acknowledges at the
 			// handler's act-point once discovery resolves owned schema.
+			admission, err := h.admitPRSchemaBeforeQueue(ctx, repo, pr, installationID, prPlanDiscoveryKey{})
+			if err != nil {
+				h.answerPRSchemaPlanRefusal(w, repo, pr, installationID, "", requestedBy, err)
+				return
+			}
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
 			if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
 				h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			}
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, admission)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return

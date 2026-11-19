@@ -716,6 +716,7 @@ func (h *Handler) startDurableWebhookHeartbeat(ctx context.Context, driverID int
 }
 
 func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
+	ctx = context.WithValue(ctx, durableSchemaPlanContextKey{}, ctx)
 	if event.Provider != storage.WebhookProviderGitHub {
 		h.logger.Info("durable webhook delivery ignored because provider is unsupported",
 			"delivery_id", event.DeliveryID, "provider", event.Provider, "event", event.Event,
@@ -725,6 +726,12 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 	switch event.Event {
 	case "pull_request":
 		return h.processDurablePullRequest(ctx, event)
+	case "pull_request_review":
+		var payload pullRequestPayload
+		if err := decodeDurablePayload(event, &payload); err != nil {
+			return false, err
+		}
+		return h.processDurablePRSchemaException(ctx, event, payload)
 	case "check_run":
 		return h.processDurableCheckRun(ctx, event)
 	case "check_suite":
@@ -754,6 +761,8 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	}
 
 	switch {
+	case h.isPRSchemaExceptionEvent(event.Event, payload):
+		return h.processDurablePRSchemaException(ctx, event, payload)
 	case isAutoPlannablePullRequest(payload):
 		return h.processDurablePullRequestAutoPlan(ctx, event, payload)
 	case payload.Action == storage.PullRequestClosedAction:

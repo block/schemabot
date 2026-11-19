@@ -101,7 +101,7 @@ func TestExcludedPRCommandsRejectBeforeDiscovery(t *testing.T) {
 			case action.Plan:
 				h.handlePlanCommand(httptest.NewRecorder(), "octocat/hello-world", 1, "staging", "", "", "", 12345, "", "alice", 0)
 			case "plan-all":
-				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "alice", false, 1, true, 0, nil)
+				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "alice", false, 1, true, 0)
 			case action.Apply:
 				retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "alice", CommandResult{SuppressRetryComments: true})
 				require.NoError(t, err)

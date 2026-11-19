@@ -48,6 +48,13 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	admission, err := h.admitPRSchemaCommand(ctx, client, repo, pr, prPlanDiscoveryKey{})
+	if err != nil {
+		h.answerPRSchemaPlanRefusal(w, repo, pr, installationID, environment, requestedBy, err)
+		return
+	}
+	ctx = withPRSchemaAdmission(ctx, admission)
+
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
@@ -149,6 +156,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Execute plan via the service
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if _, refused := errors.AsType[*api.PRSchemaAdmissionError](err); refused {
+		h.answerPRSchemaPlanRefusal(w, repo, pr, installationID, environment, requestedBy, err)
+		return
+	}
 	if planRefusedByNamespacePlacement(err) {
 		h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
 			"repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "head_sha", schemaResult.HeadSHA, "error", err)
@@ -197,6 +208,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Roll up every deployment's diff against the primary plan so drift on a
 	// non-primary deployment fails the check closed at review time.
 	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+	if drift.admissionErr != nil {
+		h.answerPRSchemaPlanRefusal(w, repo, pr, installationID, environment, requestedBy, drift.admissionErr)
+		return
+	}
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
@@ -534,8 +549,16 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // only an auto-plan reads it. unmanagedSchema lists the schema configs the PR
 // also changes that this environment-scoped deployment does not manage; the
 // comment names them, and posts even when it has no plan to show.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData) {
-	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, queued ...prSchemaAdmission) {
+	var admission prSchemaAdmission
+	if len(queued) != 0 {
+		admission = queued[0]
+	}
+	h.runMultiEnvPlan(context.Background(), repo, pr, databaseName, tenant, installationID, requestedBy, isAutoPlan, commandScopeDatabases, postPlanComment, commentID, nil, admission)
+}
+
+func (h *Handler) runMultiEnvPlan(parent context.Context, repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData, queued prSchemaAdmission) (completed bool) {
+	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
 		return
@@ -558,6 +581,18 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if blocked {
 		return
 	}
+
+	admission, err := h.admitPRSchemaCommand(ctx, client, repo, pr, queued.key)
+	if err != nil {
+		if !isAutoPlan || !isPRSchemaRefusal(err) {
+			h.answerPRSchemaPlanRefusal(nil, repo, pr, installationID, "", requestedBy, err)
+		}
+		return
+	}
+	if queued.client != nil && (queued.compareTip != admission.compareTip || (queued.exception != "" && queued.exception != admission.exception)) {
+		return
+	}
+	ctx = withPRSchemaAdmission(ctx, admission)
 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
@@ -815,6 +850,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+		if _, refused := errors.AsType[*api.PRSchemaAdmissionError](err); refused {
+			if !isAutoPlan || !isPRSchemaRefusal(err) {
+				h.answerPRSchemaPlanRefusal(nil, repo, pr, installationID, env, requestedBy, err)
+			}
+			return
+		}
 		if planRefusedByNamespacePlacement(err) {
 			h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
 				"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
@@ -839,6 +880,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		// Roll up every deployment's diff against the primary plan so drift on a
 		// non-primary deployment fails the check closed at review time.
 		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
+		if drift.admissionErr != nil {
+			h.answerPRSchemaPlanRefusal(nil, repo, pr, installationID, env, requestedBy, drift.admissionErr)
+			return
+		}
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -982,6 +1027,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"environments", len(pendingWorkUnstored))
 	}
 
+	completed = len(planFailedEnvironments) == 0 && len(placementBlockUnstored) == 0 &&
+		len(driftBlockUnstored) == 0 && len(pendingWorkUnstored) == 0
+
 	slot := planCommentSlot{
 		Database:         multiEnvData.Database,
 		DatabaseType:     multiEnvData.DatabaseType,
@@ -1039,6 +1087,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 	// Post a single combined comment
 	h.postTrackedPlanComment(repo, pr, installationID, slot, templates.RenderMultiEnvPlanComment(multiEnvData))
+	return completed
 }
 
 // planCommentUpToDate reports whether the plan shows nothing to act on: no

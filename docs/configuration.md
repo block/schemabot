@@ -2001,6 +2001,53 @@ unlisted repository:
 
 If `repos` is not configured or empty, all repositories are allowed.
 
+### Pull request database limit
+
+Set `pr_schema_cap` under a repository to pause planning and new applies when
+a pull request changes more than five logical databases managed by this control
+plane. The count covers the full pull request, including when a command names
+one database or target. Environments, keyspaces, and shards of the same
+database count once. Each control plane evaluates its own registrations.
+
+```yaml
+repos:
+  example-org/service:
+    pr_schema_cap:
+      control_plane: payments
+      limit: 5
+      observe: true
+      label: "schemabot: allow-large-plan"
+```
+
+Use `observe: true` to record decisions and projected database planning fan-out
+before enforcement. Omit it to enforce the limit. Omit `limit` for the default of
+five. On shared repositories, give each deployment a distinct `control_plane`
+for the comment and Check Run summary. It defaults to the deployment's
+`tenant`, or the GitHub Check Run name when the deployment has no tenant.
+
+Configure one exception policy per repository.
+
+- **Label.** Provision the exact label in the repository before enabling
+  enforcement. Applying it deliberately acknowledges the current head and base.
+  SchemaBot holds new work when the label is removed or the revision changes.
+  On a shared repository, designate one deployment to remove stale labels
+  with `manage_label: true` and set it to `false` on the other deployments.
+  By default standalone deployments and aggregate leaders remove stale labels.
+  When a stale label remains visible, remove it and add it again to opt in.
+- **Team review.** Set `review_team: example-org/database-reviewers` in place of
+  `label`. SchemaBot requires an effective approval from a team member other
+  than the PR author, on the current head and after the latest retarget. Give
+  the verifying GitHub App organization Members read permission and subscribe
+  the webhook to `pull_request_review` submissions and dismissals. Set
+  `request_team_review: true` where automatic requests should originate. For a
+  shared repository, use `review_app` to name the same designated entry in
+  `apps` on each control plane that can originate a request. The designated App
+  needs repository access and Pull requests write permission. Requests wait
+  until the PR is ready for review. Team members can also review directly.
+
+The exception enables planning and new work on that revision. Existing apply
+approval policies are evaluated independently.
+
 ### Listen-only repositories
 
 A listen-only repository is one SchemaBot reads from but never writes to. Use it to measure what a repository would cost in GitHub requests before you onboard it. For example, a separate SchemaBot deployment with its own GitHub App and no required checks can listen to your largest repository, and catch a release whose reads grow with pull request size before any deployment that gates merges runs it.

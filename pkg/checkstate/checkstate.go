@@ -76,6 +76,7 @@ const (
 	BlockConfigDiscoveryUnavailable       = "github_schema_config_discovery_unavailable"
 	BlockConfigDiscoveryFailed            = "schema_config_discovery_failed"
 	BlockPlanPublishVerificationFailed    = "plan_publish_verification_failed"
+	BlockPRSchemaCapExceeded              = "pr_schema_cap_exceeded"
 	BlockPRFileCapExceeded                = "pr_file_cap_exceeded"
 	BlockManagedDirMissingConfig          = "managed_dir_missing_config"
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
@@ -131,6 +132,7 @@ var blockClasses = map[string]blockClass{
 	BlockConfigDiscoveryFailed:            blockGuard,
 	BlockPlanPublishVerificationFailed:    blockGuard,
 	BlockPRFileCapExceeded:                blockGuard,
+	BlockPRSchemaCapExceeded:              blockGuard,
 	BlockManagedDirMissingConfig:          blockGuard,
 	BlockNoAllowedConfiguredEnvironments:  blockGuard,
 	BlockNarrowedApply:                    blockGuard,
