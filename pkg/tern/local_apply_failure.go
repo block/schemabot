@@ -188,8 +188,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		if c.driveCancelled(ctx, apply, "while re-reading the apply before recording that it failed") {
 			return nil
 		}
-		logger.Error("could not re-read the apply before recording that it failed; current apply owner will exit for operator retry with the apply still active and no terminal summary posted",
-			append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
+		logOutcomeReReadFailure(logger, apply, "recording that it failed", err, "failure", errMsg)
 		return fmt.Errorf("record apply %s failed: %w", apply.ApplyIdentifier, err)
 	}
 	if fresh != nil {
@@ -247,6 +246,21 @@ func (c *LocalClient) storedTerminalApply(ctx context.Context, apply *storage.Ap
 		return nil, nil
 	}
 	return fresh, nil
+}
+
+// logOutcomeReReadFailure logs a storedTerminalApply error that leaves the
+// apply's outcome unrecorded. A missing row and a failed read get separate
+// lines, because the next step differs: a failed read leaves the stored apply
+// for the next claim, and a missing row has nothing left to claim. The
+// in-memory state in the attributes is the drive's copy, not what storage
+// holds, so the message does not say what the stored state is.
+func logOutcomeReReadFailure(logger *slog.Logger, apply *storage.Apply, outcome string, err error, attrs ...any) {
+	attrs = append(append(apply.MutableLogAttrs(), attrs...), "error", err)
+	if errors.Is(err, storage.ErrApplyNotFound) {
+		logger.Error("apply row was not found when re-reading it before "+outcome+"; current apply owner will exit without recording an outcome", attrs...)
+		return
+	}
+	logger.Error("could not re-read the apply before "+outcome+"; current apply owner will exit for operator retry, leaving the stored apply as it is", attrs...)
 }
 
 // outcomeWriteLanded re-reads the apply after a write recording it in
@@ -431,8 +445,7 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 		if c.driveCancelled(ctx, apply, "while re-reading the apply before pausing it for retry") {
 			return nil
 		}
-		logger.Error("could not re-read the apply before pausing it for retry; current apply owner will exit for operator retry with the apply still active",
-			append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
+		logOutcomeReReadFailure(logger, apply, "pausing it for retry", err, "failure", errMsg)
 		return fmt.Errorf("pause apply %s for retry: %w", apply.ApplyIdentifier, err)
 	}
 	if fresh != nil {
