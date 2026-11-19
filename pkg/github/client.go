@@ -417,29 +417,31 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 		return 0, fmt.Errorf("resolve installation for %s: %w", repo, ctx.Err())
 	}
 	lookup, _ := result.Val.(ownerInstallationLookup)
-	if result.Err != nil {
-		if lookup.repo != repo {
-			// The shared lookup ran for another repository of this owner. Its
-			// failure says nothing certain about this one, so ErrAppNotInstalled
-			// is not carried over: a 404 for that repository does not mean the
-			// App is missing from this one.
-			return 0, fmt.Errorf("resolve installation for %s: the lookup for owner %s, made through %s, failed: %s", repo, owner, lookup.repo, result.Err.Error())
-		}
-		return 0, result.Err
-	}
-	if lookup.repo != repo && !lookup.ownerWide {
-		// The shared lookup found an installation for another repository that
-		// does not stand for the whole owner, so it says nothing about this
-		// repository. Ask GitHub about this one.
-		c.logger.Debug("shared installation lookup does not cover the owner; looking up this repository on its own",
-			"repo", repo, "owner", owner, "shared_lookup_repo", lookup.repo)
+	if lookup.repo != repo && !sharedLookupAnswersOwner(lookup, result.Err) {
+		// The shared lookup went through another repository of this owner and
+		// either failed or found an installation that does not stand for the
+		// whole owner. Its outcome says nothing certain about this repository,
+		// so ask GitHub about this one; the answer then depends only on the
+		// repository asked about.
+		c.logger.Debug("shared installation lookup does not answer for the owner; looking up this repository on its own",
+			"repo", repo, "owner", owner, "shared_lookup_repo", lookup.repo, "shared_lookup_error", result.Err)
 		own, err := c.lookUpRepoInstallation(ctx, repo, owner, name)
 		if err != nil {
 			return 0, err
 		}
 		return own.id, nil
 	}
+	if result.Err != nil {
+		return 0, result.Err
+	}
 	return lookup.id, nil
+}
+
+// sharedLookupAnswersOwner reports whether a lookup made through one
+// repository also answers for the owner's other repositories: it succeeded and
+// found the installation of the owner's own account.
+func sharedLookupAnswersOwner(lookup ownerInstallationLookup, err error) bool {
+	return err == nil && lookup.ownerWide
 }
 
 // ownerInstallationLookup is the result of one owner's installation lookup,

@@ -411,3 +411,52 @@ func waitForLookup(t *testing.T, server *installationLookupServer, repo string) 
 		require.FailNow(t, "installation lookup did not start", "repo %s", repo)
 	}
 }
+
+// On an installation limited to selected repositories, a delivery for a
+// covered repository that shares a lookup with an uncovered sibling does not
+// inherit the sibling's 404: it looks up its own repository and resolves, and
+// the sibling alone reports that the App is not installed on it.
+func TestInstallationIDForRepoDoesNotInheritASiblingsFailedLookup(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(owner, name string) (int, int64, string) {
+		if name == "outside" {
+			return http.StatusNotFound, 0, ""
+		}
+		return http.StatusOK, 7, owner
+	})
+	release := server.holdLookups()
+	t.Cleanup(release)
+
+	outside := make(chan error, 1)
+	go func() {
+		_, err := client.InstallationIDForRepo(t.Context(), "octo/outside")
+		outside <- err
+	}()
+	waitForLookup(t, server, "octo/outside")
+
+	type answer struct {
+		id  int64
+		err error
+	}
+	inside := make(chan answer, 1)
+	go func() {
+		id, err := client.InstallationIDForRepo(t.Context(), "octo/inside")
+		inside <- answer{id, err}
+	}()
+	release()
+
+	select {
+	case err := <-outside:
+		require.ErrorIs(t, err, ErrAppNotInstalled)
+	case <-time.After(installationTestTimeout):
+		require.FailNow(t, "lookup for the uncovered repository did not return after release")
+	}
+	select {
+	case got := <-inside:
+		require.NoError(t, got.err)
+		assert.Equal(t, int64(7), got.id)
+	case <-time.After(installationTestTimeout):
+		require.FailNow(t, "lookup for the covered repository did not return after release")
+	}
+	assert.Equal(t, 1, server.count("octo/outside"))
+	assert.Equal(t, 1, server.count("octo/inside"))
+}
