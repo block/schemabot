@@ -136,11 +136,21 @@ func TestWebhookMergeGroupPostsNoChecksOnListenOnlyRepository(t *testing.T) {
 // by another deployment, not this one, and the release must not warn that
 // merge stays blocked. It still reads the PR head once, as a deployment that
 // serves the repository does, so the listener measures that read.
-func TestClearAggregateBlocksReadsHeadAndWarnsNothingOnListenOnlyRepository(t *testing.T) {
+// listenOnlyAggregateClear runs the aggregate block release on a listen-only
+// repository whose PR read answers with status, and returns the number of PR
+// reads and the log entries. The context carries a request-scoped PR-info cache
+// already holding the PR, as an auto-plan delivery's context does after its
+// first read, so the count shows whether the release reads around that cache.
+func listenOnlyAggregateClear(t *testing.T, status int) (int32, []map[string]any) {
+	t.Helper()
 	client, mux := setupGitHubServer(t)
 	var prReads atomic.Int32
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		prReads.Add(1)
+		if status != http.StatusOK {
+			http.Error(w, `{"message":"Not Found"}`, status)
+			return
+		}
 		require.NoError(t, json.NewEncoder(w).Encode(gh.PullRequest{
 			State: new("open"),
 			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
@@ -160,13 +170,44 @@ func TestClearAggregateBlocksReadsHeadAndWarnsNothingOnListenOnlyRepository(t *t
 		logger:    logger,
 	}
 
+	ctx := ghclient.WithPRInfo(t.Context(), "octocat/hello-world", 1, &ghclient.PullRequestInfo{HeadSHA: "abc123", State: "open"})
 	configs := []ghclient.DiscoveredConfig{{Config: &ghclient.SchemabotConfig{Database: "orders", Type: "mysql"}}}
-	h.clearAggregateBlocksForVerifiedPR(t.Context(), ghclient.NewInstallationClient(client, logger), "octocat/hello-world", 1, "abc123", configs)
+	h.clearAggregateBlocksForVerifiedPR(ctx, ghclient.NewInstallationClient(client, logger), "octocat/hello-world", 1, "abc123", configs)
 
-	assert.Equal(t, int32(1), prReads.Load(), "the PR head is read once, as a serving deployment reads it")
+	var entries []map[string]any
 	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
 		var entry map[string]any
 		require.NoError(t, json.Unmarshal([]byte(line), &entry), line)
+		entries = append(entries, entry)
+	}
+	return prReads.Load(), entries
+}
+
+func TestClearAggregateBlocksReadsHeadAndWarnsNothingOnListenOnlyRepository(t *testing.T) {
+	reads, entries := listenOnlyAggregateClear(t, http.StatusOK)
+
+	assert.Equal(t, int32(1), reads, "the PR head is read once from GitHub, past the warm request cache, as a serving deployment reads it")
+	for _, entry := range entries {
 		assert.NotContains(t, []any{"WARN", "ERROR"}, entry["level"], "nothing blocks a listen-only repository's merge: %v", entry["msg"])
 	}
+}
+
+func TestClearAggregateBlocksNamesTheMeasurementWhenListenOnlyHeadReadFails(t *testing.T) {
+	reads, entries := listenOnlyAggregateClear(t, http.StatusNotFound)
+
+	assert.Equal(t, int32(1), reads)
+	var warned bool
+	for _, entry := range entries {
+		msg, _ := entry["msg"].(string)
+		assert.NotEqual(t, "ERROR", entry["level"], "a failed listen-only read is not a failed check write: %s", msg)
+		assert.NotContains(t, msg, "status check", "a listen-only repository has no status check to update")
+		if entry["level"] == "WARN" && strings.HasPrefix(msg, "listen-only PR head read failed") {
+			warned = true
+			assert.Equal(t, true, entry["listen_only"])
+		}
+	}
+	assert.True(t, warned, "the failed read logs a warning that names the measurement")
 }

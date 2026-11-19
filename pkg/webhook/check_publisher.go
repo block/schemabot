@@ -1530,9 +1530,14 @@ func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client 
 		// block to release. Its databases are usually registered by another
 		// deployment, and the registry check below would warn on every pull
 		// request that merge stays blocked, though nothing blocks it. Make
-		// the head read a deployment that serves the repository makes, so the
-		// listener measures it, and stop.
-		h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_block_clear")
+		// the uncached head read a deployment that serves the repository
+		// makes, so the listener measures it, and stop. The read goes around
+		// the verification helper because that helper records status-check
+		// metrics and logs for a check this repository never has.
+		if _, err := client.FetchPullRequestNoCache(ctx, repo, pr); err != nil {
+			h.logger.Warn("listen-only PR head read failed; this delivery's GitHub request measurement misses the head read a serving deployment makes",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "listen_only", true, "error", err)
+		}
 		return
 	}
 	for _, cfg := range configs {
