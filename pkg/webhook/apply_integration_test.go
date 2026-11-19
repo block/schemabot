@@ -2562,8 +2562,7 @@ func TestE2EPlanRejectsWhenHEADAdvanced(t *testing.T) {
 	}
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-	// The eligibility read and discovery see the same commit; it advances afterward.
-	result.HeadSHAs = []string{"abc123", "abc123", "newsha456"}
+	result.HeadSHAs = []string{"abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{

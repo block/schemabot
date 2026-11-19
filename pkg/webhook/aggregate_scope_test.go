@@ -341,7 +341,7 @@ func TestAggregateScopeRejectsMovingPR(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.change, func(t *testing.T) {
 			store := &foldCheckStore{}
-			cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
+			cfg := &api.ServerConfig{SkipUnrequiredBranches: true, AllowedEnvironments: []string{"sandbox"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {}}}
 			h, mux, client := newFoldHandler(t, cfg, store)
 			reads := 0
 			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {

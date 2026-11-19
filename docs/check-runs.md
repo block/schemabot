@@ -32,10 +32,14 @@ the PR has either been applied successfully or resolved by a new plan.
 
 ## PR target eligibility
 
-SchemaBot plans and publishes checks for PRs targeting the repository's configured
-**default branch**. It also runs on another branch when active repository or
-organization rulesets, or classic branch protection, require its aggregate or
-promotion check. Check names and GitHub App identity pins remain unchanged.
+By default, SchemaBot plans and publishes checks for PRs into every branch.
+With `skip_unrequired_branches: true` in the server config, it serves only PRs
+targeting the repository's configured **default branch**, plus another branch
+when active repository or organization rulesets, or classic branch protection,
+require its aggregate or promotion check. Check names and GitHub App identity
+pins remain unchanged. The rest of this section describes behavior with
+`skip_unrequired_branches` on; with it off, no target is excluded and no branch
+policy is read.
 
 For an ordinary PR, the target is its direct base. For a native GitHub stack,
 the target is the stack's ultimate base: every member receives real validation
@@ -103,12 +107,20 @@ uncached PR metadata reads. A two-environment
 no-work publisher reads one initial target snapshot and performs one final
 uncached check per published environment, in addition to scope discovery and
 revalidation. Existing snapshots are reused for the initial currency check. A successful null
-classic rule proves absence; an ambiguous REST 404 does not. Missing metadata,
+classic rule proves absence; an ambiguous REST 404 does not. Except for the
+missing permission described next, missing metadata,
 permission failures, and incomplete lookup responses stop processing rather
-than permitting exclusion. The GitHub App needs **Administration: read** access
-for protection discovery, in addition to its existing permissions.
+than permitting exclusion.
 
-Before rollout, audit repository and organization rulesets plus classic branch
+Reading classic branch protection needs the GitHub App's **Administration:
+read** permission. Without it, SchemaBot cannot tell whether a non-default
+branch requires its check, so it treats every such target as enforced: it
+plans, applies, and publishes Check Runs there, as it did before target
+enforcement existed, and logs a warning naming the missing permission. Rulesets
+are read with the Metadata permission every App has. Grant Administration: read
+to limit SchemaBot to the default branch and the branches that require it.
+
+Before turning on `skip_unrequired_branches`, grant Administration: read and audit repository and organization rulesets plus classic branch
 protection. Scope SchemaBot requirements to the default branch and intentionally
 included release refs. If a shared ruleset covers additional branches, split out
 only SchemaBot's requirements; preserve other builds and App pins. Existing

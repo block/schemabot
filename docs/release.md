@@ -274,6 +274,12 @@ Diff the config structs. Additions are safe. Removals and renames need a
 deprecation path, and the release notes have to name the exact key so operators
 can grep their own configs.
 
+A key is never removed in the release that adds it or changes its default.
+Operators need one release in which the key still parses, so they can delete it
+from their configs before upgrading. When a removal does land, the release notes
+list deleting the key as an upgrade step, and the parse error names the key and
+says to delete it, as the removed `spirit` keys do.
+
 ### 2. Storage schema changes
 
 SchemaBot bootstraps its own storage schema at startup (`EnsureSchema`), diffing
@@ -380,7 +386,19 @@ fields with new numbers, no removals, no renumbering, no type changes. Diff the
 `.proto` sources rather than the generated code, where regeneration noise buries
 the field-level change.
 
-### 6. Error baseline
+### 6. New GitHub App permissions
+
+Installs upgrade without changing their GitHub App, so a release that needs a
+permission they do not already grant loses plans, Check Runs, or commands on
+every install that has not granted it (AV-17 in
+[invariants.md](./invariants.md)). Diff the permission tables in
+[github-app-setup.md](./github-app-setup.md). A new permission must be marked
+optional and name the server config key that turns on the behavior needing it,
+and that key must be off by default; `TestGitHubAppPermissionsAreRequiredOrGatedByConfig`
+fails otherwise. The release notes' upgrade notes name the permission and the key,
+so operators know to grant one before turning on the other.
+
+### 7. Error baseline
 
 Record the deployed version's error rate before the tag goes out. Without a
 baseline, pre-existing noise reads as a regression and a real regression hides
@@ -402,8 +420,14 @@ inside it.
    ```bash
    docker manifest inspect ghcr.io/block/schemabot:vX.Y.Z
    ```
-5. Write the release notes, operator actions first: config keys added or removed,
-   changed defaults, deploy ordering constraints, storage schema changes.
+5. Write the release notes. Open them with an **Upgrade notes** section that
+   lists every operator action the pre-tag checks found, before any other
+   change: config keys added or removed, changed defaults, new GitHub App
+   permissions with the config key that needs each one, deploy ordering
+   constraints, and storage schema changes. Name each key and permission
+   exactly, so operators can search their own configs and App settings for it.
+   When a release asks nothing of operators, say so in that section instead of
+   leaving it out.
 
 ## Fixing a bad release
 
