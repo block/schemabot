@@ -274,3 +274,23 @@ func TestRenderMultiEnvPlanComment_ManyExemptTablesCollapsePerEnv(t *testing.T) 
 	assert.Contains(t, out, "<summary>ℹ️ <b>Staging</b>: 7 ignored tables in namespace <code>app</code> (ignore_tables)</summary>")
 	assert.Contains(t, out, "ℹ️ **Production**: ignored tables in namespace `app`")
 }
+
+// A target can hold thousands of archive tables partition rotation created.
+// The disclosure names the first ones and counts the rest, so the plan comment
+// stays under GitHub's size limit and the change it exists to show survives.
+func TestRenderPlanComment_ThousandsOfExemptTablesKeepThePlan(t *testing.T) {
+	names := make([]string, 3000)
+	for i := range names {
+		names[i] = fmt.Sprintf("orders_archive_2025_%04d", i)
+	}
+	data := exemptPlanData()
+	data.Changes = []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` INT;"}}}
+	data.ExemptTables = []ExemptTablesData{{Namespace: "app", Tables: names, Reason: "archive naming"}}
+
+	out, replaced := FitGitHubComment(RenderPlanComment(data), "", "staging")
+	assert.False(t, replaced, "the disclosure must not push the plan past the comment limit")
+	assert.Contains(t, out, "ADD COLUMN `note`")
+	assert.Contains(t, out, "3000 ignored tables in namespace <code>app</code> (archive naming)")
+	assert.Contains(t, out, "`orders_archive_2025_0049`, and 2950 more")
+	assert.NotContains(t, out, "orders_archive_2025_0050")
+}

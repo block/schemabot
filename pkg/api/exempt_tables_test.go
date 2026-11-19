@@ -546,3 +546,16 @@ func TestExecuteRollbackPlanRefusesADropOfAWithheldTable(t *testing.T) {
 		"the same data plane answers every retry the same way, so the failure must not be re-driven")
 	assert.Nil(t, plans.created, "a rollback plan that would drop a withheld table is not stored")
 }
+
+// An ignore_tables entry naming a "_" table withholds nothing, because the
+// MySQL planner skips the table by its name first. That entry is redundant,
+// not a typo, so it is told apart from an entry that reached no table at all.
+func TestSplitEntriesSkippedByNaming(t *testing.T) {
+	groups := []*ternv1.ExemptTables{
+		{Namespace: "app", Tables: []string{"flyway_schema_history"}, Reason: engine.ExemptReasonIgnoreTables},
+		{Namespace: "app", Tables: []string{"_orders_old"}, Reason: engine.ExemptReasonLeadingUnderscore},
+	}
+	unmatched, redundant := splitEntriesSkippedByNaming([]string{"_orders_old", "flyway_schema_histroy"}, groups)
+	assert.Equal(t, []string{"flyway_schema_histroy"}, unmatched)
+	assert.Equal(t, []string{"_orders_old"}, redundant)
+}

@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/lintguidance"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -505,8 +506,13 @@ func WriteExemptTables(groups []*apitypes.ExemptTablesResponse) {
 		if group == nil || len(group.Tables) == 0 {
 			continue
 		}
+		shown, more := presentation.ExemptTableNames(group.Tables)
+		names := strings.Join(shown, ", ")
+		if more > 0 {
+			names += fmt.Sprintf(", and %d more", more)
+		}
 		fmt.Printf(glyph.Info+"  Ignored tables in namespace %s (%s): %s\n",
-			group.Namespace, group.Reason, strings.Join(group.Tables, ", "))
+			group.Namespace, group.Reason, names)
 		wrote = true
 	}
 	if wrote {

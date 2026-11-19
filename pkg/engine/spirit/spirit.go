@@ -36,6 +36,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
@@ -722,6 +723,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
 			return nil, err
 		}
+		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
+			return nil, err
+		}
 	}
 
 	// Use Spirit's PlanChanges to diff + lint in one call.
@@ -907,6 +911,31 @@ func exemptLiveTables(ignored engine.IgnoredTables, req *engine.PlanRequest, dat
 		groups = append(groups, &engine.ExemptTables{Namespace: namespace, Tables: live.archive, Reason: engine.ExemptReasonArchiveNaming})
 	}
 	return groups
+}
+
+// refuseDeclaredSkippedTables refuses a schema file that declares a live table
+// a naming convention keeps out of the diff. The diff never sees the live
+// table, so it would propose CREATE TABLE for a table that already exists, and
+// the apply would fail part way. Names compare ignoring case, the way
+// IgnoredTables.RefuseDeclared compares them, because whether two spellings
+// are one table is the target's answer.
+func refuseDeclaredSkippedTables(namespace string, declared []string, live *liveSchema) error {
+	skipped := make(map[string]string, len(live.underscore)+len(live.archive))
+	for _, name := range live.underscore {
+		skipped[schema.CaseFoldKey(name)] = "its name starts with \"_\""
+	}
+	for _, name := range live.archive {
+		skipped[schema.CaseFoldKey(name)] = "its name follows the archive convention <name>_archive_YYYY"
+	}
+	for _, table := range declared {
+		why, ok := skipped[schema.CaseFoldKey(table)]
+		if !ok {
+			continue
+		}
+		return fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
+			namespace, table, why)
+	}
+	return nil
 }
 
 // Apply starts executing a schema change plan using Spirit.
@@ -1325,8 +1354,10 @@ type liveSchema struct {
 	withheld []string
 	// underscore and archive are the live tables the naming conventions kept
 	// out of the diff, sorted, for the plan to disclose the same way: a table
-	// starting with "_" and a table named <name>_archive_YYYY[_MM[_DD]]. A
-	// table ignore_tables also names is reported in withheld instead.
+	// starting with "_" and a table named <name>_archive_YYYY[_MM[_DD]]. An
+	// archive table ignore_tables also names is reported in withheld instead;
+	// a "_" table is always reported here, because the loader drops it before
+	// the config is matched.
 	underscore []string
 	archive    []string
 	// lowerCaseTableNames is the target's @@lower_case_table_names, which

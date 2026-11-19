@@ -410,6 +410,28 @@ func TestEngine_Plan_DisclosesTablesExcludedByNamingConvention(t *testing.T) {
 	}, result.ExemptTables)
 }
 
+// A schema file declaring a live "_" table asks the planner to manage a table
+// it never reads, so the diff would propose creating a table that already
+// exists. The plan fails naming the table, and the target is left as it was.
+func TestEngine_Plan_RefusesADeclaredTableTheNamingConventionSkips(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `_legacy` (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"legacy.sql": "CREATE TABLE `_legacy` (id INT PRIMARY KEY)",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.Error(t, err, "Plan() must refuse to plan a CREATE for a live table it skips")
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), `declares table "_legacy", which the MySQL planner never manages because its name starts with "_"`)
+}
+
 func droppedTables(result *engine.PlanResult) []string {
 	var dropped []string
 	for _, change := range result.FlatTableChanges() {

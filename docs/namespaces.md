@@ -480,7 +480,13 @@ tables their own naming conventions leave in place:
 The MySQL planner applies the leading-underscore convention before
 `ignore_tables`, so an entry naming a `_` table is reported under
 `leading underscore`, not as withheld by the config. The PlanetScale planner
-leaves the same tables out without disclosing them.
+leaves `_` tables out without disclosing them, and does not skip archive
+tables. The PR comment and CLI name the first 50 tables of a group and count
+the rest.
+
+A schema file that declares a live table one of these conventions skips is
+refused on MySQL, naming the table: the planner never sees the live table, so
+it would propose creating a table that already exists.
 
 When reviewing a PR that *introduces* an `ignore_tables` entry, the disclosure
 plus the config diff is the review surface: the plan stops seeing that table

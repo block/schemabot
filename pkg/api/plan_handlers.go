@@ -1194,7 +1194,19 @@ func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.Plan
 	if req.PullRequest != nil {
 		prInt = int(*req.PullRequest)
 	}
-	if unmatched := ignored.Unmatched(withheldTablesFromProto(resp.ExemptTables)); len(unmatched) > 0 {
+	unmatched := ignored.Unmatched(withheldTablesFromProto(resp.ExemptTables))
+	unmatched, redundant := splitEntriesSkippedByNaming(unmatched, resp.ExemptTables)
+	if len(redundant) > 0 {
+		s.logger.Info("ignore_tables entries name tables the planner already skips by their names; the entries are not needed",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"pull_request", prInt,
+			"redundant_entries", redundant,
+		)
+	}
+	if len(unmatched) > 0 {
 		s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
 			"database", req.Database,
 			"environment", req.Environment,

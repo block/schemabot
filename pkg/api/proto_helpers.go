@@ -300,6 +300,31 @@ func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
 	return slices.Compact(tables)
 }
 
+// splitEntriesSkippedByNaming separates, from ignore_tables entries that
+// withheld nothing, the ones naming a live table the planner already skips by
+// a naming convention, such as a "_" table on MySQL. Those entries did reach a
+// table; they are redundant rather than mistaken, and the plan discloses the
+// table under the convention.
+func splitEntriesSkippedByNaming(unmatched []string, groups []*ternv1.ExemptTables) (stillUnmatched, redundant []string) {
+	skipped := make(map[string]bool)
+	for _, group := range groups {
+		if group == nil || group.Reason == engine.ExemptReasonIgnoreTables {
+			continue
+		}
+		for _, table := range group.Tables {
+			skipped[table] = true
+		}
+	}
+	for _, entry := range unmatched {
+		if skipped[entry] {
+			redundant = append(redundant, entry)
+			continue
+		}
+		stillUnmatched = append(stillUnmatched, entry)
+	}
+	return stillUnmatched, redundant
+}
+
 // plannedDropsWithheldBy returns the tables the plan proposes dropping, in its
 // namespace changes or its per-shard changes, that ignored withholds, sorted. A
 // planner that honored the config never sees those tables, so any such drop
