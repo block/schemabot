@@ -27,6 +27,7 @@ import (
 func TestExcludedPRPreservesConfirmation(t *testing.T) {
 	database := "webhook_target_confirmation"
 	svc := setupE2EService(t, database)
+	svc.Config().EnforcePRTargets = true
 	client, mux := setupGitHubServer(t)
 	var base atomic.Value
 	base.Store("parent")
@@ -69,6 +70,7 @@ func TestExcludedPRPreservesConfirmation(t *testing.T) {
 func TestExcludedPRRecordsAcceptedApplyOutcomeWithoutPublishing(t *testing.T) {
 	database := "webhook_target_outcome"
 	svc := setupE2EService(t, database)
+	svc.Config().EnforcePRTargets = true
 	client, mux := setupGitHubServer(t)
 	var base atomic.Value
 	base.Store("parent")

@@ -52,7 +52,7 @@ func TestExcludedPRSkipsDiscoveryAndPublication(t *testing.T) {
 	for _, role := range []string{"", api.AggregateRoleLeader, api.AggregateRoleParticipant} {
 		t.Run("role="+role, func(t *testing.T) {
 			checks := &foldCheckStore{byPR: []*storage.Check{{HeadSHA: "same-head", Conclusion: checkConclusionSuccess, CheckRunID: 123}}}
-			cfg := &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: role}}}}
+			cfg := &api.ServerConfig{EnforcePRTargets: true, Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: role}}}}
 			h, mux, client := newFoldHandler(t, cfg, checks)
 			var base atomic.Value
 			base.Store("parent")
@@ -90,7 +90,7 @@ func TestExcludedPRSkipsDiscoveryAndPublication(t *testing.T) {
 func TestExcludedPRCommandsRejectBeforeDiscovery(t *testing.T) {
 	for _, command := range []string{action.Plan, "plan-all", action.Apply, action.ApplyConfirm} {
 		t.Run(command, func(t *testing.T) {
-			h, mux, _ := newFoldHandler(t, &api.ServerConfig{}, &foldCheckStore{})
+			h, mux, _ := newFoldHandler(t, &api.ServerConfig{EnforcePRTargets: true}, &foldCheckStore{})
 			var base atomic.Value
 			base.Store("parent")
 			serveMutablePRTarget(t, mux, &base)
@@ -121,7 +121,7 @@ func TestExcludedPRCommandsRejectBeforeDiscovery(t *testing.T) {
 // Publication and the final acceptance gate bypass an earlier cached eligible
 // snapshot. A same-SHA return becomes eligible through the normal gate again.
 func TestPRTargetRechecksUncachedAndAllowsSameSHAReturn(t *testing.T) {
-	h, mux, client := newFoldHandler(t, &api.ServerConfig{}, &foldCheckStore{})
+	h, mux, client := newFoldHandler(t, &api.ServerConfig{EnforcePRTargets: true}, &foldCheckStore{})
 	var base atomic.Value
 	base.Store("trunk")
 	serveMutablePRTarget(t, mux, &base)
@@ -284,4 +284,38 @@ func TestRecoveryReevaluatesSameSHARoundTrip(t *testing.T) {
 			assert.Zero(t, synthesized)
 		})
 	}
+}
+
+// With enforce_pr_targets off, a PR into a branch that does not require
+// SchemaBot is still planned and checked, and SchemaBot reads neither the
+// branch policy nor a fresh copy of the PR to decide that.
+func TestPRTargetsServedWhenEnforcementIsOff(t *testing.T) {
+	h, mux, client := newFoldHandler(t, &api.ServerConfig{}, &foldCheckStore{})
+	var policyReads, prReads atomic.Int32
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/", func(w http.ResponseWriter, _ *http.Request) {
+		policyReads.Add(1)
+		_, err := fmt.Fprint(w, `[]`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		policyReads.Add(1)
+		_, err := fmt.Fprint(w, `{"data":{"repository":{"ref":{"name":"parent","branchProtectionRule":null}}}}`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		prReads.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	info := &ghclient.PullRequestInfo{HeadSHA: "same-head", BaseRef: "parent", DefaultBranch: "trunk"}
+	decision, err := h.evaluatePRTarget(t.Context(), client, "octocat/hello-world", info)
+	require.NoError(t, err)
+	assert.Equal(t, ghclient.PRTargetEligibility{Target: "parent", Eligible: true}, decision)
+
+	blocked, err := h.enforcePRTarget(t.Context(), client, "octocat/hello-world", 1, 12345, action.Apply, "staging", "alice", false, false)
+	require.NoError(t, err)
+	assert.False(t, blocked)
+
+	assert.Zero(t, policyReads.Load(), "branch policy reads")
+	assert.Zero(t, prReads.Load(), "PR reads")
 }

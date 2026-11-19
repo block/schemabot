@@ -32,10 +32,14 @@ the PR has either been applied successfully or resolved by a new plan.
 
 ## PR target eligibility
 
-SchemaBot plans and publishes checks for PRs targeting the repository's configured
-**default branch**. It also runs on another branch when active repository or
-organization rulesets, or classic branch protection, require its aggregate or
-promotion check. Check names and GitHub App identity pins remain unchanged.
+By default, SchemaBot plans and publishes checks for PRs into every branch.
+With `enforce_pr_targets: true` in the server config, it serves only PRs
+targeting the repository's configured **default branch**, plus another branch
+when active repository or organization rulesets, or classic branch protection,
+require its aggregate or promotion check. Check names and GitHub App identity
+pins remain unchanged. The rest of this section describes behavior with
+`enforce_pr_targets` on; with it off, no target is excluded and no branch
+policy is read.
 
 For an ordinary PR, the target is its direct base. For a native GitHub stack,
 the target is the stack's ultimate base: every member receives real validation
@@ -116,7 +120,7 @@ enforcement existed, and logs a warning naming the missing permission. Rulesets
 are read with the Metadata permission every App has. Grant Administration: read
 to limit SchemaBot to the default branch and the branches that require it.
 
-Before rollout, audit repository and organization rulesets plus classic branch
+Before turning on `enforce_pr_targets`, grant Administration: read and audit repository and organization rulesets plus classic branch
 protection. Scope SchemaBot requirements to the default branch and intentionally
 included release refs. If a shared ruleset covers additional branches, split out
 only SchemaBot's requirements; preserve other builds and App pins. Existing

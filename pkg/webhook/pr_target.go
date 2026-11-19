@@ -17,7 +17,23 @@ import (
 var errPRTargetExcluded = errors.New("pull request target is excluded from SchemaBot")
 
 func (h *Handler) evaluatePRTarget(ctx context.Context, client *ghclient.InstallationClient, repo string, info *ghclient.PullRequestInfo) (ghclient.PRTargetEligibility, error) {
+	if !h.prTargetEnforcementEnabled() {
+		return unenforcedPRTarget(info), nil
+	}
 	return client.EvaluatePRTarget(ctx, repo, info, h.prTargetCheckBases(repo))
+}
+
+// prTargetEnforcementEnabled reports whether enforce_pr_targets is on. With
+// it off, every PR target is served, so no branch policy is read.
+func (h *Handler) prTargetEnforcementEnabled() bool {
+	config, ok := h.serverConfig()
+	return ok && config.PRTargetEnforcementEnabled()
+}
+
+// unenforcedPRTarget is the decision for every PR while target enforcement is
+// off: the target is served.
+func unenforcedPRTarget(info *ghclient.PullRequestInfo) ghclient.PRTargetEligibility {
+	return ghclient.PRTargetEligibility{Target: info.BaseRef, Eligible: true}
 }
 
 func (h *Handler) prTargetCheckBases(repo string) []string {
@@ -38,6 +54,10 @@ func (h *Handler) enforcePRTarget(ctx context.Context, client *ghclient.Installa
 type prTargetEvaluator func(context.Context, string, *ghclient.PullRequestInfo, []string) (ghclient.PRTargetEligibility, error)
 
 func (h *Handler) enforcePRTargetWithPolicy(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, command, environment, requestedBy string, silent, suppressRetryComments bool, evaluate prTargetEvaluator) (bool, error) {
+	if !h.prTargetEnforcementEnabled() {
+		h.logger.Debug("PR target not checked because enforce_pr_targets is off", "repo", repo, "pr", pr, "command", command)
+		return false, nil
+	}
 	info, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		return h.prTargetVerificationFailure(repo, pr, installationID, command, environment, requestedBy, silent, suppressRetryComments, err)
