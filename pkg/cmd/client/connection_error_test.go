@@ -2,10 +2,20 @@ package client
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -231,6 +241,271 @@ func TestWarningNamesNoCommandWhenNoneShowsTheResult(t *testing.T) {
 	assert.NotContains(t, msg, "Run '")
 }
 
+// A plan, a pull and a storage schema plan are POSTs that start nothing. One
+// that fails is safe to send again, so its message names the cause and carries
+// no warning, whether no answer arrived or the answer was cut off.
+func TestFailedReadOnlyPostCarriesNoWarning(t *testing.T) {
+	tests := []struct {
+		name      string
+		server    func(t *testing.T) *httptest.Server
+		path      string
+		wantCause string
+	}{
+		{name: "a plan that times out", server: stalledServer, path: "/api/plan", wantCause: "timed out: "},
+		{name: "a pull whose connection is dropped", server: droppingServer, path: "/api/pull", wantCause: ": EOF"},
+		{name: "a rollback plan whose answer is cut off", server: truncatedOK, path: "/api/rollback/plan", wantCause: "read response: unexpected EOF"},
+		{name: "a storage schema plan whose answer is cut off", server: truncatedOK, path: "/api/storage/schema/plan", wantCause: "read response: unexpected EOF"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := tc.server(t)
+
+			var result map[string]any
+			err := doPostIntoWithClient(t.Context(), shortTimeoutClient, srv.URL, tc.path, map[string]string{"database": "orders"}, &result)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantCause)
+			assert.NotContains(t, err.Error(), "\n", "a read fails with one line")
+			assert.NotContains(t, err.Error(), "may already have acted")
+		})
+	}
+}
+
+// Every path the client sends with a method other than GET says what a failed
+// request may have left behind: nothing, a change one command shows, or a
+// change no single command shows. A path added to the client without an entry
+// fails here, as does an entry for a path the client no longer sends.
+func TestEveryNonGetRequestPathIsClassified(t *testing.T) {
+	want := map[string]requestEffect{
+		"/api/plan":                 {},
+		"/api/pull":                 {},
+		"/api/rollback/plan":        {},
+		"/api/storage/schema/plan":  {},
+		"/api/checks/scan":          {},
+		"/api/checks/repos":         {},
+		"/api/apply":                {changes: true, check: "status"},
+		"/api/cutover":              {changes: true, check: "status"},
+		"/api/stop":                 {changes: true, check: "status"},
+		"/api/cancel":               {changes: true, check: "status"},
+		"/api/start":                {changes: true, check: "status"},
+		"/api/release":              {changes: true, check: "status"},
+		"/api/revert":               {changes: true, check: "status"},
+		"/api/skip-revert":          {changes: true, check: "status"},
+		"/api/settings":             {changes: true, check: "settings"},
+		"/api/locks":                {changes: true, check: "locks"},
+		"/api/locks/acquire":        {changes: true, check: "locks"},
+		"/api/checks/synthesize":    {changes: true},
+		"/api/webhooks/redrive":     {changes: true},
+		"/api/storage/schema/apply": {changes: true},
+	}
+
+	assert.Equal(t, want, requestEffects)
+	assert.Equal(t, slices.Sorted(maps.Keys(want)), nonGetPathsTheClientSends(t))
+}
+
+// nonGetPathsTheClientSends reads this package's source and returns, sorted,
+// every API path written out in a call to one of the helpers that send a POST
+// or a DELETE, or in a request built by hand with a method other than GET.
+func nonGetPathsTheClientSends(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+
+	paths := map[string]bool{}
+	collect := func(node ast.Node) {
+		ast.Inspect(node, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(lit.Value)
+			require.NoError(t, err)
+			if strings.HasPrefix(value, "/api/") {
+				paths[value] = true
+			}
+			return true
+		})
+	}
+
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		require.NoError(t, err)
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			switch calledFunction(call) {
+			case "doPostInto", "doSlowPostIntoCtx", "doPostIntoWithClient", "doSendBody", "callControlAPI":
+				for _, arg := range call.Args {
+					collect(arg)
+				}
+			case "NewRequestWithContext":
+				// The method is the second argument and the URL the third.
+				if len(call.Args) == 4 && !namesMethodGet(call.Args[1]) {
+					collect(call.Args[2])
+				}
+			}
+			return true
+		})
+	}
+	return slices.Sorted(maps.Keys(paths))
+}
+
+// calledFunction returns the name of the function a call invokes, without its
+// package or type arguments.
+func calledFunction(call *ast.CallExpr) string {
+	fun := call.Fun
+	if index, ok := fun.(*ast.IndexExpr); ok {
+		fun = index.X
+	}
+	switch fun := fun.(type) {
+	case *ast.Ident:
+		return fun.Name
+	case *ast.SelectorExpr:
+		return fun.Sel.Name
+	}
+	return ""
+}
+
+func namesMethodGet(expr ast.Expr) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "MethodGet"
+}
+
+// The warning depends on what was sent and when it failed. A request that only
+// reads never warns. A request that failed before any of it was sent never
+// warns either: the server cannot have acted on what it never received.
+func TestWarningDependsOnTheRequestAndWhenItFailed(t *testing.T) {
+	const endpoint = "http://schemabot.test"
+	tests := []struct {
+		name        string
+		err         *url.Error
+		wantMessage string
+	}{
+		{
+			name:        "a HEAD request that lost its connection",
+			err:         &url.Error{Op: "Head", URL: endpoint + "/api/apply", Err: io.ErrUnexpectedEOF},
+			wantMessage: "connection failed: " + endpoint + ": unexpected EOF",
+		},
+		{
+			name:        "a DELETE that lost its connection",
+			err:         &url.Error{Op: "Delete", URL: endpoint + "/api/locks", Err: io.ErrUnexpectedEOF},
+			wantMessage: "connection failed: " + endpoint + ": unexpected EOF\n" + mayHaveActed + " " + checkHint("locks"),
+		},
+		{
+			name:        "a request to a path nobody classified",
+			err:         &url.Error{Op: "Post", URL: endpoint + "/api/reports", Err: io.ErrUnexpectedEOF},
+			wantMessage: "connection failed: " + endpoint + ": unexpected EOF\n" + mayHaveActed + " Check what it did before you send it again.",
+		},
+		{
+			name: "an apply whose connection took too long to open",
+			err: &url.Error{Op: "Post", URL: endpoint + "/api/apply",
+				Err: &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}},
+			wantMessage: "request to " + endpoint + " timed out: dial tcp: i/o timeout",
+		},
+		{
+			name: "an apply whose proxy refused to open a tunnel",
+			err: &url.Error{Op: "Post", URL: endpoint + "/api/apply",
+				Err: &net.OpError{Op: "proxyconnect", Net: "tcp", Err: errors.New("Forbidden")}},
+			wantMessage: "connection failed: " + endpoint + ": proxyconnect tcp: Forbidden",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.wantMessage, FormatConnectionError(endpoint, tc.err).Error())
+		})
+	}
+}
+
+// A certificate the client does not trust fails the TLS handshake, before the
+// apply is sent. The message names the certificate problem and does not say
+// the server may have acted.
+func TestUntrustedCertificateCarriesNoWarning(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the request reached the server: %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+
+	var result map[string]any
+	err := doPostIntoWithClient(t.Context(), &http.Client{Timeout: 5 * time.Second}, srv.URL, "/api/apply", map[string]string{"database": "orders"}, &result)
+
+	msg := requireConnectionError(t, err).Error()
+	assert.Contains(t, msg, "connection failed: "+srv.URL+": tls: failed to verify certificate")
+	assert.NotContains(t, msg, "may already have acted")
+}
+
+// An https endpoint that reaches a plain HTTP server fails the TLS handshake
+// too, so the apply was never sent and the message carries no warning.
+func TestPlainHTTPServerBehindAnHTTPSEndpointCarriesNoWarning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the request reached the server: %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	endpoint := "https://" + srv.Listener.Addr().String()
+
+	var result map[string]any
+	err := doPostIntoWithClient(t.Context(), &http.Client{Timeout: 5 * time.Second}, endpoint, "/api/apply", map[string]string{"database": "orders"}, &result)
+
+	msg := requireConnectionError(t, err).Error()
+	assert.Equal(t, "connection failed: "+endpoint+": http: server gave HTTP response to HTTPS client", msg)
+}
+
+// An https endpoint that reaches something that speaks neither TLS nor HTTP,
+// such as a database port, fails the TLS handshake as well.
+func TestNonTLSServerBehindAnHTTPSEndpointCarriesNoWarning(t *testing.T) {
+	var lc net.ListenConfig
+	lis, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(lis) })
+	go func() {
+		conn, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		// A server that greets first, the way a database does.
+		_, _ = conn.Write([]byte("\x4a\x00\x00\x00\x0a8.0.36\x00"))
+		utils.CloseAndLog(conn)
+	}()
+	endpoint := "https://" + lis.Addr().String()
+
+	var result map[string]any
+	err = doPostIntoWithClient(t.Context(), &http.Client{Timeout: 5 * time.Second}, endpoint, "/api/apply", map[string]string{"database": "orders"}, &result)
+
+	msg := requireConnectionError(t, err).Error()
+	assert.Contains(t, msg, "connection failed: "+endpoint+": tls: first record does not look like a TLS handshake")
+	assert.NotContains(t, msg, "may already have acted")
+}
+
+// The hint is a command the operator can paste, so it carries the routing
+// flags this run was given and reaches the same server.
+func TestWarningHintKeepsTheRoutingFlags(t *testing.T) {
+	cliname.SetRoute(cliname.Flag{Name: "--profile", Value: "prod"})
+	t.Cleanup(func() { cliname.SetRoute() })
+	srv := droppingServer(t)
+
+	err := doSendBody(srv.URL, http.MethodPost, "/api/stop", map[string]string{"apply_id": "apply-abc"})
+
+	msg := requireConnectionError(t, err).Error()
+	assert.Contains(t, msg, "Run '"+cliname.Name()+" status --profile prod' to check before you send it again.")
+}
+
+// The cause comes from the network path, a proxy included, so control
+// characters are removed before it reaches the operator's terminal.
+func TestCauseIsStrippedOfControlCharacters(t *testing.T) {
+	err := FormatConnectionError("http://schemabot.test", &url.Error{
+		Op: "Post", URL: "http://schemabot.test/api/apply", Err: errors.New("proxy said \x1b[2Jno"),
+	})
+
+	assert.NotContains(t, err.Error(), "\x1b")
+	assert.Contains(t, err.Error(), "connection failed: http://schemabot.test: proxy said ")
+}
+
 // A refused connection never delivered the request, so the message stays the
 // short "is the server running?" form with no warning.
 func TestRefusedPostKeepsTheShortMessage(t *testing.T) {
@@ -247,6 +522,36 @@ func TestRefusedPostKeepsTheShortMessage(t *testing.T) {
 func TestUnresolvedHostKeepsTheShortMessage(t *testing.T) {
 	err := FormatConnectionError("http://schemabot.invalid", &net.DNSError{
 		Err: "no such host", Name: "schemabot.invalid", IsNotFound: true,
+	})
+
+	assert.Equal(t, "cannot resolve host: http://schemabot.invalid", err.Error())
+}
+
+// errnoInOtherWords is a cause that carries an errno under wording of its own,
+// as an operating system that words the errno differently does.
+type errnoInOtherWords struct {
+	text  string
+	errno syscall.Errno
+}
+
+func (e errnoInOtherWords) Error() string { return e.text }
+func (e errnoInOtherWords) Unwrap() error { return e.errno }
+
+// A refused connection is recognised by its errno, whatever its wording.
+func TestRefusedCauseInOtherWordsKeepsTheShortMessage(t *testing.T) {
+	err := FormatConnectionError("http://schemabot.test", errnoInOtherWords{
+		text:  "No connection could be made because the target machine actively refused it.",
+		errno: syscall.ECONNREFUSED,
+	})
+
+	assert.Equal(t, "cannot connect to http://schemabot.test (is the server running?)", err.Error())
+}
+
+// A host name that does not resolve is recognised by the resolver's verdict,
+// whatever its wording.
+func TestUnresolvedHostInOtherWordsKeepsTheShortMessage(t *testing.T) {
+	err := FormatConnectionError("http://schemabot.invalid", &net.DNSError{
+		Err: "nodename nor servname provided, or not known", Name: "schemabot.invalid", IsNotFound: true,
 	})
 
 	assert.Equal(t, "cannot resolve host: http://schemabot.invalid", err.Error())

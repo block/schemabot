@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -344,9 +345,9 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 // not an APIError. The cause varies with the protocol in use, which is why
 // callers that poll match this type instead of the cause.
 //
-// Method and Path name a request that changes something, such as a stop. The
-// server received that request before its answer failed, so the message
-// carries the same warning a ConnectionError does. Both are empty for a read.
+// Method and Path name the request when it was not a GET. The server received
+// it before its answer failed, so when the request changes something, such as
+// a stop, the message carries the same warning a ConnectionError does.
 type ResponseReadError struct {
 	Method string
 	Path   string
@@ -355,8 +356,8 @@ type ResponseReadError struct {
 
 func (e *ResponseReadError) Error() string {
 	msg := "read response: " + e.Err.Error()
-	if changesServerState(e.Method) {
-		msg += "\n" + mayHaveActedWarning(e.Path)
+	if warning := effectOf(e.Method, e.Path).warning(); warning != "" {
+		msg += "\n" + warning
 	}
 	return msg
 }
@@ -591,6 +592,8 @@ func (e *ConnectionError) Unwrap() error {
 // Any other failure of a request that changes something, such as an apply or
 // a stop, may have happened after the server received it, so the message says
 // so and names the command that shows what the server did with that request.
+// A request that only reads, or one that failed before any of it was sent,
+// gets no such line.
 func (e *ConnectionError) message() string {
 	if isConnectionRefused(e.Err) {
 		return fmt.Sprintf("cannot connect to %s (is the server running?)", e.Endpoint)
@@ -605,66 +608,142 @@ func (e *ConnectionError) message() string {
 	} else {
 		msg = fmt.Sprintf("connection failed: %s: %s", e.Endpoint, cause)
 	}
-	if mayHaveReachedServer(e.Err) {
-		msg += "\n" + mayHaveActedWarning(failedRequestPath(e.Err))
+	if failedBeforeSending(e.Err) {
+		return msg
+	}
+	if warning := effectOf(failedRequest(e.Err)).warning(); warning != "" {
+		msg += "\n" + warning
 	}
 	return msg
 }
 
-// checkCommands maps each API path that changes something to the command that
-// shows the result: the apply for an apply or a control request, the settings
-// for a settings update, the locks for a lock change. A path that is not
-// listed has no single command that shows what the server did.
-var checkCommands = map[string]string{
-	"/api/apply":         "status",
-	"/api/cutover":       "status",
-	"/api/stop":          "status",
-	"/api/cancel":        "status",
-	"/api/start":         "status",
-	"/api/release":       "status",
-	"/api/revert":        "status",
-	"/api/skip-revert":   "status",
-	"/api/settings":      "settings",
-	"/api/locks":         "locks",
-	"/api/locks/acquire": "locks",
+// requestEffect says what a failed request may have left behind on the
+// server, which decides what the operator is told before sending it again.
+type requestEffect struct {
+	// changes is false for a request that only reads or computes an answer.
+	// Sending it again is safe, so its failure carries no warning.
+	changes bool
+	// check is the command that shows what the server did with the request,
+	// or "" when no single command shows it.
+	check string
 }
 
-// mayHaveActedWarning is the line a failed request that changes something
-// ends with. It names the command that shows what the server did with a
-// request to path, so the operator checks the thing they tried to change. A
-// path with no such command gets the warning without one.
-func mayHaveActedWarning(path string) string {
-	const warning = "The server may already have acted on this request."
+var (
+	readsOnly             = requestEffect{}
+	changesWithoutCommand = requestEffect{changes: true}
+)
+
+// shownBy is the effect of a request whose result command shows.
+func shownBy(command string) requestEffect {
+	return requestEffect{changes: true, check: command}
+}
+
+// requestEffects classifies every API path the client sends with a method
+// other than GET. An apply or a control request shows up in status, a settings
+// update in settings, and a lock change in locks.
+var requestEffects = map[string]requestEffect{
+	// Reads that are POSTs because their input travels in the body. A plan
+	// stores a plan record, but sending it again starts nothing.
+	"/api/plan":                readsOnly,
+	"/api/pull":                readsOnly,
+	"/api/rollback/plan":       readsOnly,
+	"/api/storage/schema/plan": readsOnly,
+	"/api/checks/scan":         readsOnly,
+	"/api/checks/repos":        readsOnly,
+
+	"/api/apply":         shownBy("status"),
+	"/api/cutover":       shownBy("status"),
+	"/api/stop":          shownBy("status"),
+	"/api/cancel":        shownBy("status"),
+	"/api/start":         shownBy("status"),
+	"/api/release":       shownBy("status"),
+	"/api/revert":        shownBy("status"),
+	"/api/skip-revert":   shownBy("status"),
+	"/api/settings":      shownBy("settings"),
+	"/api/locks":         shownBy("locks"),
+	"/api/locks/acquire": shownBy("locks"),
+
+	// Changes that no single command shows.
+	"/api/checks/synthesize":    changesWithoutCommand,
+	"/api/webhooks/redrive":     changesWithoutCommand,
+	"/api/storage/schema/apply": changesWithoutCommand,
+}
+
+// effectOf returns what a request with this method to this path may change. A
+// GET or a HEAD changes nothing, and neither does a request whose method is
+// not known, since nothing says it changed anything. A path that is not
+// listed is treated as a change that no command shows, so a request nobody
+// classified still warns.
+func effectOf(method, path string) requestEffect {
+	if !changesServerState(method) {
+		return readsOnly
+	}
 	// The endpoint may carry a path of its own ahead of the API path.
 	if i := strings.LastIndex(path, "/api/"); i >= 0 {
 		path = path[i:]
 	}
-	command, ok := checkCommands[path]
-	if !ok {
-		return warning + " Check what it did before you send it again."
+	if effect, ok := requestEffects[path]; ok {
+		return effect
 	}
-	return fmt.Sprintf("%s Run '%s' to check before you send it again.", warning, cliname.Command(command))
+	return changesWithoutCommand
+}
+
+// warning is the line a failed request that changes something ends with, or
+// "" for one that only reads. It names the command that shows what the server
+// did, so the operator checks the thing they tried to change.
+func (e requestEffect) warning() string {
+	const warning = "The server may already have acted on this request."
+	switch {
+	case !e.changes:
+		return ""
+	case e.check == "":
+		return warning + " Check what it did before you send it again."
+	default:
+		return fmt.Sprintf("%s Run '%s' to check before you send it again.", warning, cliname.Command(e.check))
+	}
 }
 
 // changesServerState reports whether a request with this method can change
-// something on the server. An empty method is a read, since nothing says it
-// changed anything.
+// something on the server. The HTTP client records the method of a failed
+// request as "Post", not "POST", so the comparison ignores case.
 func changesServerState(method string) bool {
 	return method != "" && !strings.EqualFold(method, http.MethodGet) && !strings.EqualFold(method, http.MethodHead)
 }
 
-// failedRequestPath returns the URL path of the request the HTTP client
-// failed to complete, or "" when the cause does not name it.
-func failedRequestPath(err error) string {
+// failedRequest returns the method and URL path of the request the HTTP
+// client failed to complete, or two empty strings when the cause does not
+// name them.
+func failedRequest(err error) (method, path string) {
 	var urlErr *url.Error
 	if !errors.As(err, &urlErr) {
-		return ""
+		return "", ""
 	}
 	u, parseErr := url.Parse(urlErr.URL)
 	if parseErr != nil {
-		return ""
+		return urlErr.Op, ""
 	}
-	return u.Path
+	return urlErr.Op, u.Path
+}
+
+// failedBeforeSending reports whether the request failed before any of it was
+// sent, so the server cannot have acted on it: while opening the connection to
+// the server or to a proxy, or during the TLS handshake. The HTTP client
+// replaces the handshake error with its own text when a plain HTTP server
+// answers, so that case is matched by text.
+func failedBeforeSending(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect") {
+		return true
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return true
+	}
+	return strings.Contains(err.Error(), "server gave HTTP response to HTTPS client")
 }
 
 // isConnectionRefused reports whether the server's host refused the
@@ -704,28 +783,6 @@ func requestFailureCause(err error) string {
 		return urlErr.Err.Error()
 	}
 	return err.Error()
-}
-
-// mayHaveReachedServer reports whether a failed request could have been
-// received by the server before it failed. Only a request that changes
-// something needs the warning, and only when the failure came after the
-// connection opened: a failure while dialing never sent the request. A cause
-// that does not name its method is treated as a read, since nothing says it
-// changed anything.
-func mayHaveReachedServer(err error) bool {
-	var urlErr *url.Error
-	if !errors.As(err, &urlErr) {
-		return false
-	}
-	// The HTTP client records the method as "Post", not "POST".
-	if !changesServerState(urlErr.Op) {
-		return false
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == "dial" {
-		return false
-	}
-	return true
 }
 
 // FormatConnectionError returns a ConnectionError wrapping the underlying cause.
