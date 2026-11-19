@@ -1029,6 +1029,12 @@ func (s *Server) Service() *api.Service { return s.svc }
 // them with the non-chained grpc.UnaryInterceptor / grpc.StreamInterceptor
 // options, which grpc-go runs ahead of the entire chain. The server that Run
 // serves installs both by construction.
+//
+// Registration also cannot raise gs's receive limit. Plan and apply requests
+// carry every declared CREATE TABLE, so on gRPC's 4 MiB default a database with
+// a few thousand tables is refused with ResourceExhausted. Construct gs with
+// grpc.MaxRecvMsgSize(tern.DefaultMaxRecvMsgBytes), as the server Run serves
+// does.
 func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 	client := s.dataPlaneClient
 	if client == nil {
