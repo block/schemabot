@@ -1471,6 +1471,7 @@ var knownRecoveredPanicOperations = map[string]bool{
 	"observer_poll":          true,
 	"grpc_handler":           true,
 	"target_probe":           true,
+	"quota_probe":            true,
 }
 
 // RecordRecoveredPanic increments the recovered-panic counter for a background
@@ -1588,12 +1589,14 @@ const (
 	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
 	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
+	GitHubOperationFetchRateLimit                = "fetch_rate_limit"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
+	GitHubOperationListAppInstallations          = "list_app_installations"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
 	GitHubOperationListPRFiles                   = "list_pr_files"
 	GitHubOperationListReviews                   = "list_reviews"
@@ -1799,12 +1802,14 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchBranchRules,
 		GitHubOperationGraphQLBranchProtection,
 		GitHubOperationFetchPullRequest,
+		GitHubOperationFetchRateLimit,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationGraphQLTreeEntries,
+		GitHubOperationListAppInstallations,
 		GitHubOperationListCheckRunsForRef,
 		GitHubOperationListPRFiles,
 		GitHubOperationListReviews,

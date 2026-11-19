@@ -16,7 +16,11 @@ import (
 // without the operation and repository dimensions of diagnostic samples.
 const GitHubOperationRateLimitSnapshot = "rate_limit_snapshot"
 
-const githubRateLimitMaxAge = 120 * time.Second
+// GitHubRateLimitSnapshotMaxAge is how long an installation snapshot stays
+// exported after GitHub reported it. Past this age the budget is unknown, so
+// anything that keeps an idle installation's quota visible has to observe it
+// again more often than this.
+const GitHubRateLimitSnapshotMaxAge = 120 * time.Second
 
 // Like the global OTel provider, the active recorder is installed once during
 // telemetry setup. Each provider's callback owns its own state and lifetime.
@@ -74,7 +78,7 @@ func (r *githubRateLimitRecorder) register(provider otelmetric.MeterProvider) er
 		gauges[name] = gauge
 	}
 	age, err := meter.Float64ObservableGauge("schemabot.github.rate_limit.observation_age_seconds",
-		otelmetric.WithDescription("Age of the last trustworthy GitHub installation quota observation; idle installations become unknown"),
+		otelmetric.WithDescription("Age of the last trustworthy GitHub installation quota observation; past the export age the budget is unknown"),
 		otelmetric.WithUnit("s"))
 	if err != nil {
 		return fmt.Errorf("register GitHub quota observation age: %w", err)
@@ -90,7 +94,7 @@ func (r *githubRateLimitRecorder) register(provider otelmetric.MeterProvider) er
 			opts := otelmetric.WithAttributes(gitHubMetricAttributes(GitHubOperationRateLimitSnapshot,
 				sample.Resource, "", sample.GitHubApp, sample.InstallationID)...)
 			observer.ObserveFloat64(age, elapsed.Seconds(), opts)
-			if elapsed >= 0 && elapsed <= githubRateLimitMaxAge && now.Before(sample.ResetAt) {
+			if elapsed >= 0 && elapsed <= GitHubRateLimitSnapshotMaxAge && now.Before(sample.ResetAt) {
 				observer.ObserveInt64(gauges["remaining"], sample.Remaining, opts)
 			}
 		}
