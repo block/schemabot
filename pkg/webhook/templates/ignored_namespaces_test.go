@@ -115,10 +115,10 @@ func TestRenderMultiEnvPlanComment_IgnoredNamespacesOnAllClean(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "✅ **No schema changes detected** for any environment.")
+	assert.Contains(t, out, "✅ **No schema changes detected** in Staging or Production.")
 	disclosure := "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `local_fixtures`"
 	assert.Equal(t, 1, strings.Count(out, disclosure))
-	assert.Greater(t, strings.Index(out, disclosure), strings.Index(out, "✅ **No schema changes detected** for any environment."),
+	assert.Greater(t, strings.Index(out, disclosure), strings.Index(out, "✅ **No schema changes detected** in Staging or Production."),
 		"disclosure should render under the no-changes message")
 }
 
@@ -134,7 +134,7 @@ func TestRenderMultiEnvPlanComment_IgnoredNamespacesOnAllCleanPerEnv(t *testing.
 		},
 	})
 
-	assert.Contains(t, out, "✅ **No schema changes detected** for any environment.")
+	assert.Contains(t, out, "✅ **No schema changes detected** in Staging or Production.")
 	assert.Contains(t, out, "ℹ️ **Staging**: namespaces excluded from this plan by `ignore_namespaces`: `fixtures_staging`")
 	assert.Contains(t, out, "ℹ️ **Production**: namespaces excluded from this plan by `ignore_namespaces`: `fixtures_production`")
 }

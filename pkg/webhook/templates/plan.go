@@ -3847,7 +3847,7 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 	// needs to see that a namespace was withheld rather than genuinely
 	// unchanged.
 	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) && !AnyEnvHasBaseSchemaNotice(data) {
-		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
+		fmt.Fprintf(&sb, "✅ **No schema changes detected** in %s.\n", multiEnvEnvironmentNames(data.Environments))
 		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) {
 			sb.WriteString("\n")
 			writeMultiEnvIgnoredNamespaces(&sb, data)
@@ -3949,6 +3949,17 @@ func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool)
 		merged.ApplyAuthorization = data.ApplyAuthorization
 	}
 	return merged, true
+}
+
+// multiEnvEnvironmentNames names a multi-environment comment's environments as
+// prose, in display order and capitalized as their section headings are, so a
+// comment with no sections still says which environments it covers.
+func multiEnvEnvironmentNames(environments []string) string {
+	names := make([]string, 0, len(environments))
+	for _, env := range environments {
+		names = append(names, capitalizeFirst(env))
+	}
+	return joinWithOr(names)
 }
 
 func singleEnvironmentTitleEnvironment(environments []string) string {

@@ -123,7 +123,7 @@ func TestRenderMultiEnvPlanCommentEmptyPlansKeepBaseSchemaNotice(t *testing.T) {
 
 			out := RenderMultiEnvPlanComment(data)
 			assert.Contains(t, out, base.notice)
-			assert.NotContains(t, out, "No schema changes detected** for any environment")
+			assert.NotContains(t, out, "No schema changes detected** in ")
 		})
 	}
 }

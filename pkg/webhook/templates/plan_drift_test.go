@@ -208,9 +208,9 @@ func TestRenderMultiEnvPlanComment_NoChangesShortCircuitDoesNotHideDrift(t *test
 	}
 
 	out := RenderMultiEnvPlanComment(data)
-	// The top-level "no changes for any environment" short-circuit must not fire,
+	// The top-level "no changes in any environment" short-circuit must not fire,
 	// because it would return before rendering any drift.
-	assert.NotContains(t, out, "No schema changes detected** for any environment")
+	assert.NotContains(t, out, "No schema changes detected** in ")
 	assert.Contains(t, out, "Deployment drift detected")
 	assert.Contains(t, out, "`au`")
 }
@@ -369,7 +369,7 @@ func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) 
 	}
 
 	out := RenderMultiEnvPlanComment(data)
-	assert.NotContains(t, out, "**No schema changes detected** for any environment.")
+	assert.NotContains(t, out, "**No schema changes detected** in Staging or Production.")
 	assert.Contains(t, out, "ADD COLUMN `email`")
 	// Staging is genuinely converged, so its own section keeps the green line.
 	// Production still has work, so it carries no ✅ at all: the plan the
@@ -385,7 +385,7 @@ func TestRenderMultiEnvPlanComment_ConvergingRolloutIsNotAllClear(t *testing.T) 
 	// With every environment's rollout converged, the all-clear is correct and
 	// still renders.
 	data.Plans["production"] = &PlanCommentData{Database: "testapp", Environment: "production", IsMySQL: true, DeploymentDrift: convergedDrift}
-	assert.Contains(t, RenderMultiEnvPlanComment(data), "**No schema changes detected** for any environment.")
+	assert.Contains(t, RenderMultiEnvPlanComment(data), "**No schema changes detected** in Staging or Production.")
 }
 
 // When one deployment addresses several targets, the deployment name alone

@@ -2123,6 +2123,20 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="multienv-plan-no-changes"></a><strong>Multi-env Plan (No Changes)</strong></summary>
+
+
+## Schema Change Plan
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **No schema changes detected** in Staging or Production.
+
+</details>
+
+<details>
 <summary><a name="deployment-drift-clean"></a><strong>Deployment Drift (Clean)</strong></summary>
 
 

@@ -2504,6 +2504,27 @@ func PreviewCommentMultiEnvPlan() string {
 	})
 }
 
+// PreviewCommentMultiEnvPlanNoChanges renders a sample multi-environment plan
+// comment where every environment's plan is empty, so the comment names the
+// environments it checked in place of their sections.
+func PreviewCommentMultiEnvPlanNoChanges() string {
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		RequestedBy:  previewRequestedBy,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{
+			"staging":    {Database: "testapp", Environment: "staging", RequestedBy: previewRequestedBy, IsMySQL: true, DatabaseType: "mysql"},
+			"production": {Database: "testapp", Environment: "production", RequestedBy: previewRequestedBy, IsMySQL: true, DatabaseType: "mysql"},
+		},
+		Errors: map[string]string{},
+	})
+}
+
 // PreviewCommentMultiEnvPlanLint renders a sample multi-environment plan comment
 // with lint violations included in each environment's plan.
 func PreviewCommentMultiEnvPlanLint() string {
