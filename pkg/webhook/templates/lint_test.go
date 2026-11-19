@@ -28,8 +28,8 @@ func TestRenderPlanComment_LintInlineBelowFoldThreshold(t *testing.T) {
 	}))
 
 	assert.Contains(t, plan, "💡 **Lint Warnings**: 2 advisory findings")
-	assert.Contains(t, plan, "- `users`: Index `idx_email` should be made invisible before dropping")
-	assert.Contains(t, plan, "- `sessions`: Using `varchar` as primary key is discouraged")
+	assert.Contains(t, plan, "1. `users`: Index `idx_email` should be made invisible before dropping")
+	assert.Contains(t, plan, "2. `sessions`: Using `varchar` as primary key is discouraged")
 	assert.NotContains(t, plan, "<summary>💡", "a short list never hides behind a fold")
 }
 
@@ -48,10 +48,11 @@ func TestRenderPlanComment_LintFoldsAndGroupsAboveThreshold(t *testing.T) {
 	}))
 
 	assert.Contains(t, plan, "<summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>")
-	assert.Contains(t, plan, "**`users`**\n- first users finding\n- second users finding\n- third users finding")
-	assert.Contains(t, plan, "**`sessions`**\n- first sessions finding\n- second sessions finding")
+	assert.Contains(t, plan, "1. a general schema note\n\n**`users`**\n\n2. first users finding\n3. second users finding\n4. third users finding\n\n"+
+		"**`sessions`**\n\n5. first sessions finding\n6. second sessions finding\n",
+		"one numbered list runs on across the table headings, so every finding has its own number")
 
-	generalIdx := strings.Index(plan, "- a general schema note")
+	generalIdx := strings.Index(plan, "1. a general schema note")
 	usersIdx := strings.Index(plan, "**`users`**")
 	sessionsIdx := strings.Index(plan, "**`sessions`**")
 	assert.Greater(t, generalIdx, -1)

@@ -35,6 +35,24 @@ type operationScopedApplyFixture struct {
 // waves. repo scopes the rows so tests do not interfere with each other.
 func seedOperationScopedApply(t *testing.T, repo, database string) *operationScopedApplyFixture {
 	t.Helper()
+	return seedOperationScopedApplyWithOperations(t, repo, database, []seededOperation{
+		{deployment: "primary", key: "orders/-80"},
+		{deployment: "primary", key: "orders/80-"},
+	})
+}
+
+// seededOperation is one non-terminal operation row of a seeded
+// operation-scoped apply. An empty key is a whole target on a deployment of
+// its own.
+type seededOperation struct {
+	deployment string
+	key        string
+}
+
+// seedOperationScopedApplyWithOperations is seedOperationScopedApply with the
+// apply's operation rows chosen by the caller.
+func seedOperationScopedApplyWithOperations(t *testing.T, repo, database string, operations []seededOperation) *operationScopedApplyFixture {
+	t.Helper()
 	ctx := t.Context()
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
@@ -71,14 +89,14 @@ func seedOperationScopedApply(t *testing.T, repo, database string) *operationSco
 	applyID, err := st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
 
-	// Two operation-keyed rows still copying under their own operation leases,
-	// while the parent applies row records no lease at all.
+	// Operation rows still copying under their own operation leases, while the
+	// parent applies row records no lease at all.
 	var firstOpID int64
-	for i, key := range []string{"orders/-80", "orders/80-"} {
+	for i, op := range operations {
 		res, err := schemabotDB.ExecContext(ctx, `
 			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
 			VALUES (?, ?, ?, ?, ?, ?)
-		`, applyID, "primary", key, state.ApplyOperation.Running,
+		`, applyID, op.deployment, op.key, state.ApplyOperation.Running,
 			fmt.Sprintf("driver-host/%d/op", i), fmt.Sprintf("op-token-%d", i))
 		require.NoError(t, err)
 		if i == 0 {
@@ -194,6 +212,47 @@ func TestObserverEditsProgressCommentForOperationScopedApply(t *testing.T) {
 
 	// The edit was performed under the durable authority recorded on the
 	// tracked comment row, owned by this process's observer identity.
+	owner := progressObserverOwner(t, fx.db, fx.apply.ID)
+	require.True(t, owner.Valid, "the observer must record its authority on the tracked comment row")
+	assert.Equal(t, storage.LeaseOwnerProcess()+"/comment-observer", owner.String)
+}
+
+// A rollout across targets that each sit on a deployment of their own has
+// operation rows with no key, and the operator drives them under operation
+// leases just as it does keyed shards. The parent apply holds no lease, so
+// the observer edits the PR progress comment under the durable
+// progress-comment authority, and the comment follows the copy instead of
+// freezing.
+func TestObserverEditsProgressCommentForWholeTargetRollout(t *testing.T) {
+	fx := seedOperationScopedApplyWithOperations(t, "org/authority-whole-target", "authority_whole_target_db", []seededOperation{
+		{deployment: "region-a"},
+		{deployment: "region-b"},
+	})
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	capture.setBody(fx.progressCommentID, "seed progress body")
+
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       &fakeClientFactory{client: installClient},
+		Storage:        fx.st,
+		Repo:           fx.apply.Repository,
+		PR:             fx.apply.PullRequest,
+		InstallationID: fx.apply.InstallationID,
+		ApplyID:        fx.apply.ID,
+		Logger:         &capturingLogger{},
+	})
+
+	obs.OnProgress(fx.apply, fx.tasks)
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, fx.progressCommentID, edited.CommentID)
+		assert.Contains(t, edited.Body, fx.apply.ApplyIdentifier, "progress edit must render the live apply")
+		assert.Contains(t, edited.Body, "running table copy", "progress edit must render the in-flight operations")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the progress comment edit")
+	}
+
 	owner := progressObserverOwner(t, fx.db, fx.apply.ID)
 	require.True(t, owner.Valid, "the observer must record its authority on the tracked comment row")
 	assert.Equal(t, storage.LeaseOwnerProcess()+"/comment-observer", owner.String)

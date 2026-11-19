@@ -483,6 +483,14 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
 	}
 
+	decision, targetErr := h.evaluatePRTarget(ctx, client, repo, prInfo)
+	if targetErr != nil {
+		return headSHA, nil, targetErr
+	}
+	if !decision.Eligible {
+		return headSHA, nil, errPRTargetExcluded
+	}
+
 	// A check passes only when no rollout member has work (MG-12), so work on a
 	// member counts even when the primary plan is empty.
 	hasChanges := planResp.HasChanges() || drift.work.pending > 0

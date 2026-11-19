@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // PlansCmd lists recently generated plans, or shows one stored plan's content.
@@ -171,7 +172,7 @@ func showStoredPlan(endpoint, planID, environment string, outputJSON bool) error
 	fmt.Printf("  Environment: %s\n", result.Environment)
 	fmt.Printf("  Source:      %s\n", planSource(&result.PlanSummaryResponse))
 	if result.HeadSHA != "" {
-		fmt.Printf("  Head SHA:    %s\n", result.HeadSHA)
+		fmt.Printf("  Head SHA:    %s\n", ui.TerminalSafeLine(result.HeadSHA))
 	}
 	fmt.Printf("  Created:     %s\n", result.CreatedAt.Format(time.RFC3339))
 	fmt.Println()
@@ -196,12 +197,14 @@ func checkStoredPlanEnvironment(plan *apitypes.StoredPlanResponse, environment s
 // apply's source: the short "owner/repo#pr" as an OSC 8 hyperlink to the PR on
 // an interactive terminal (the full URL everywhere else), the repository alone
 // when the plan names no PR, and "ad-hoc" for a plan created without either.
+// Whoever asked for the plan chose its repository and its head SHA, so control
+// runes are removed from both where they are printed.
 func planSource(p *apitypes.PlanSummaryResponse) string {
 	if p.Repository != "" && p.PullRequest > 0 {
 		return templates.PullRequestLink(p.Repository, p.PullRequest)
 	}
 	if p.Repository != "" {
-		return p.Repository
+		return ui.TerminalSafeLine(p.Repository)
 	}
 	return "ad-hoc"
 }

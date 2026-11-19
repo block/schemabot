@@ -1585,6 +1585,8 @@ const (
 	GitHubOperationFetchDiff                     = "fetch_diff"
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
+	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
@@ -1626,6 +1628,11 @@ const (
 	// operation is a genuine failure (a suspended App installation answers
 	// every token exchange with 404) and stays GitHubRequestStatusError.
 	GitHubRequestStatusNotFound = "not_found"
+	// GitHubRequestStatusNotModified marks conditional reads GitHub answered
+	// with HTTP 304 because the resource still matches the ETag SchemaBot
+	// sent. The caller reuses its stored copy, and GitHub does not count the
+	// request against the installation's primary rate limit.
+	GitHubRequestStatusNotModified = "not_modified"
 	// GitHubRequestStatusSuppressed marks write requests SchemaBot refused to
 	// send because the target repository is configured listen-only. They never
 	// reach GitHub and spend no rate limit, so they show what a deployment
@@ -1789,6 +1796,8 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchDiff,
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
+		GitHubOperationFetchBranchRules,
+		GitHubOperationGraphQLBranchProtection,
 		GitHubOperationFetchPullRequest,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
@@ -1826,6 +1835,7 @@ func isKnownGitHubRequestStatus(status string) bool {
 	case GitHubRequestStatusCancelled,
 		GitHubRequestStatusError,
 		GitHubRequestStatusNotFound,
+		GitHubRequestStatusNotModified,
 		GitHubRequestStatusSuppressed,
 		GitHubRequestStatusTransportError,
 		GitHubRequestStatusSuccess,

@@ -732,7 +732,9 @@ func cliOwner(username, hostname string) string {
 
 // AcquireLock attempts to acquire a lock on a database.
 // Returns the lock info on success, or an error with ErrLockHeld if already locked.
-func AcquireLock(endpoint, database, dbType, owner, repo string, pr int) (*LockInfo, error) {
+// created reports whether this acquire took the lock rather than finding it
+// already held under owner; a server that does not report it reads as false.
+func AcquireLock(endpoint, database, dbType, owner, repo string, pr int) (*LockInfo, bool, error) {
 	reqBody := map[string]any{
 		"database":      database,
 		"database_type": dbType,
@@ -747,23 +749,23 @@ func AcquireLock(endpoint, database, dbType, owner, repo string, pr int) (*LockI
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request body: %w", err)
+		return nil, false, fmt.Errorf("marshal request body: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint+"/api/locks/acquire", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, FormatConnectionError(endpoint, err)
+		return nil, false, FormatConnectionError(endpoint, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, &ResponseReadError{Method: http.MethodPost, Path: "/api/locks/acquire", Err: err}
+		return nil, false, &ResponseReadError{Method: http.MethodPost, Path: "/api/locks/acquire", Err: err}
 	}
 
 	// Check for lock conflict (HTTP 409)
@@ -773,23 +775,24 @@ func AcquireLock(endpoint, database, dbType, owner, repo string, pr int) (*LockI
 			CurrentLock *LockInfo `json:"current_lock"`
 		}
 		if err := json.Unmarshal(respBody, &result); err == nil && result.CurrentLock != nil {
-			return result.CurrentLock, ErrLockHeld
+			return result.CurrentLock, false, ErrLockHeld
 		}
-		return nil, ErrLockHeld
+		return nil, false, ErrLockHeld
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("acquire lock failed: %s", FormatAPIError(resp.StatusCode, respBody))
+		return nil, false, fmt.Errorf("acquire lock failed: %s", FormatAPIError(resp.StatusCode, respBody))
 	}
 
 	var result struct {
-		Lock *LockInfo `json:"lock"`
+		Lock    *LockInfo `json:"lock"`
+		Created bool      `json:"created"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+		return nil, false, fmt.Errorf("parse response: %w", err)
 	}
 
-	return result.Lock, nil
+	return result.Lock, result.Created, nil
 }
 
 // ReleaseLock releases a lock. Returns ErrLockNotOwned if not the owner.

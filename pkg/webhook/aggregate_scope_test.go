@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -324,22 +325,18 @@ func TestParticipantSelectedPathsWithoutSchemaWork(t *testing.T) {
 	}
 }
 
-// A PR that moves while the aggregate fold discovers its scope never gets a
-// no-work success. A push retires the discovered head: a failing aggregate on
-// it would gate nothing, so the fold stops quietly and re-folds onto the new
-// head. A retarget keeps the same head, so its aggregate fails closed, and so
-// does a PR the fold cannot re-read. The final PR read bypasses the request
-// cache before any aggregate can pass.
+// A changed or unreadable PR stops publication for the inputs the fold read.
+// A new fold can publish once it verifies an eligible target.
 func TestAggregateScopeRejectsMovingPR(t *testing.T) {
 	tests := []struct {
-		change           string
-		wantErr          bool
-		wantFollowUp     aggregateFoldFollowUp
-		wantFailingPosts int
+		change       string
+		wantErr      bool
+		wantFollowUp aggregateFoldFollowUp
 	}{
-		{change: "head", wantErr: false, wantFollowUp: aggregateFoldScheduleRefold, wantFailingPosts: 0},
-		{change: "base", wantErr: true, wantFollowUp: aggregateFoldScheduleParticipantRefold, wantFailingPosts: 1},
-		{change: "unreadable", wantErr: true, wantFollowUp: aggregateFoldScheduleParticipantRefold, wantFailingPosts: 0},
+		{change: "head", wantFollowUp: aggregateFoldScheduleRefold},
+		{change: "eligible base", wantErr: true, wantFollowUp: aggregateFoldScheduleParticipantRefold},
+		{change: "excluded base", wantErr: true, wantFollowUp: aggregateFoldScheduleParticipantRefold},
+		{change: "unreadable", wantErr: true, wantFollowUp: aggregateFoldScheduleParticipantRefold},
 	}
 	for _, tt := range tests {
 		t.Run(tt.change, func(t *testing.T) {
@@ -350,42 +347,66 @@ func TestAggregateScopeRejectsMovingPR(t *testing.T) {
 			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 				reads++
 				head, base := "abc123", "main"
-				if reads >= 3 {
+				if reads >= 2 {
 					switch tt.change {
 					case "head":
 						head = "newsha"
-					case "base":
+					case "eligible base":
 						base = "release"
+					case "excluded base":
+						base = "parent"
 					case "unreadable":
 						http.Error(w, "denied", http.StatusForbidden)
 						return
 					}
 				}
-				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"head": map[string]string{"sha": head}, "base": map[string]string{"ref": base}}))
+				require.NoError(t, json.NewEncoder(w).Encode(gh.PullRequest{
+					Head: &gh.PullRequestBranch{SHA: new(head)},
+					Base: &gh.PullRequestBranch{Ref: new(base), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
+				}))
 			})
 			serveAggregateScopeInputs(t, mux, []string{"README.md"}, "")
-			var failingPosts int
+			serveUnrequiredTarget(t, mux)
+			mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/release", func(w http.ResponseWriter, _ *http.Request) {
+				_, err := fmt.Fprint(w, `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"SchemaBot (sandbox)"}]}}]`)
+				require.NoError(t, err)
+			})
+			mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/release", func(w http.ResponseWriter, _ *http.Request) {
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+					"ref": "refs/heads/release", "object": map[string]string{"sha": "def456"},
+				}))
+			})
+			conclusions := make(chan string, 4)
 			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-				var body map[string]any
+				var body gh.CreateCheckRunOptions
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-				assert.NotEqual(t, checkConclusionSuccess, body["conclusion"], "a moving PR never gets a passing aggregate")
-				if body["conclusion"] == checkConclusionFailure {
-					failingPosts++
-				}
+				conclusions <- body.GetConclusion()
 				w.WriteHeader(http.StatusCreated)
 				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
 			})
 
-			followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+			followUp, err := h.updateAggregateCheckOnce(ghclient.WithPRInfoCache(t.Context()), client, "octocat/hello-world", 1, "abc123")
 			if tt.wantErr {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
 			}
 			assert.Equal(t, tt.wantFollowUp, followUp)
-			assert.Equal(t, tt.wantFailingPosts, failingPosts)
-			for _, check := range store.upserted {
-				assert.NotEqual(t, checkConclusionSuccess, check.Conclusion)
+			assert.Empty(t, conclusions)
+			assert.Empty(t, store.upserted)
+
+			switch tt.change {
+			case "eligible base":
+				_, err = h.updateAggregateCheckOnce(ghclient.WithPRInfoCache(t.Context()), client, "octocat/hello-world", 1, "abc123")
+				require.NoError(t, err)
+				require.Len(t, conclusions, 1)
+				assert.Equal(t, checkConclusionSuccess, <-conclusions)
+			case "excluded base":
+				followUp, err = h.updateAggregateCheckOnce(ghclient.WithPRInfoCache(t.Context()), client, "octocat/hello-world", 1, "abc123")
+				require.NoError(t, err)
+				assert.Equal(t, aggregateFoldNoFollowUp, followUp)
+				assert.Empty(t, conclusions)
+				assert.Empty(t, store.upserted)
 			}
 		})
 	}

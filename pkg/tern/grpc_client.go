@@ -206,7 +206,10 @@ type Config struct {
 	MaxRecvMsgBytes int
 }
 
-// DefaultMaxRecvMsgBytes bounds a single response from a Tern deployment.
+// DefaultMaxRecvMsgBytes bounds a single response from a Tern deployment. The
+// Tern gRPC server that serve.Run starts applies the same bound to requests,
+// since plan and apply requests carry the declared schema and grow the same
+// way. Changing it changes both ceilings, and those of embedders that import it.
 //
 // A pull response carries the canonical CREATE TABLE text for every table in
 // every namespace, so its size tracks the schema rather than the request: a

@@ -195,7 +195,7 @@ func TestWarningNamesTheCommandThatShowsWhatTheRequestChanged(t *testing.T) {
 		return ReleaseLock(endpoint, "orders", "mysql", "cli:alice")
 	}
 	acquireLock := func(endpoint string) error {
-		_, err := AcquireLock(endpoint, "orders", "mysql", "cli:alice", "", 0)
+		_, _, err := AcquireLock(endpoint, "orders", "mysql", "cli:alice", "", 0)
 		return err
 	}
 	setSetting := func(endpoint string) error {

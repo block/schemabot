@@ -65,6 +65,12 @@ type CommentObserver struct {
 	// Optional — nil means no hook.
 	OnTerminalHook func(apply *storage.Apply)
 
+	// onTargetsFinished is CommentObserverConfig.OnTargetsFinishedHook, and
+	// finishedTargetsReported is the count of finished targets it last took,
+	// guarded by mu.
+	onTargetsFinished       func(apply *storage.Apply) bool
+	finishedTargetsReported int
+
 	// clock is the time source used for adaptive rate-limit math. Defaults
 	// to clock.Real{} in NewCommentObserver; tests may inject a *clock.Fake
 	// via clock.NewFake(start).
@@ -220,6 +226,13 @@ type CommentObserverConfig struct {
 	// Used to update check runs on terminal state.
 	OnTerminalHook func(apply *storage.Apply)
 
+	// OnTargetsFinishedHook is called on a progress tick that edits the
+	// comment of a rollout across several targets after one more of its targets
+	// finished, so the Check Run can show the new count. It reports whether it
+	// took the refresh; one it declines is offered again on a later tick.
+	// Optional — nil means no hook.
+	OnTargetsFinishedHook func(apply *storage.Apply) bool
+
 	// Clock is the time source for adaptive rate-limit math. Optional —
 	// nil or typed-nil defaults to clock.Real{} (via clock.Default). Tests
 	// inject a *clock.Fake via clock.NewFake(start) to make the
@@ -296,23 +309,24 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		shardedPlans = newShardedPlanCache()
 	}
 	return &CommentObserver{
-		ghClient:       cfg.GHClient,
-		stor:           cfg.Storage,
-		repo:           cfg.Repo,
-		pr:             cfg.PR,
-		installationID: cfg.InstallationID,
-		applyID:        cfg.ApplyID,
-		applyLease:     cfg.ApplyLease,
-		deferCutover:   cfg.DeferCutover,
-		supportChannel: cfg.SupportChannel,
-		cliName:        cfg.CLIName,
-		tenant:         cfg.Tenant,
-		engineLogs:     cfg.EngineLogs,
-		shardedPlans:   shardedPlans,
-		logger:         cfg.Logger,
-		OnTerminalHook: cfg.OnTerminalHook,
-		clock:          clk,
-		authorityOwner: storage.LeaseOwnerProcess() + "/comment-observer",
+		ghClient:          cfg.GHClient,
+		stor:              cfg.Storage,
+		repo:              cfg.Repo,
+		pr:                cfg.PR,
+		installationID:    cfg.InstallationID,
+		applyID:           cfg.ApplyID,
+		applyLease:        cfg.ApplyLease,
+		deferCutover:      cfg.DeferCutover,
+		supportChannel:    cfg.SupportChannel,
+		cliName:           cfg.CLIName,
+		tenant:            cfg.Tenant,
+		engineLogs:        cfg.EngineLogs,
+		shardedPlans:      shardedPlans,
+		logger:            cfg.Logger,
+		OnTerminalHook:    cfg.OnTerminalHook,
+		onTargetsFinished: cfg.OnTargetsFinishedHook,
+		clock:             clk,
+		authorityOwner:    storage.LeaseOwnerProcess() + "/comment-observer",
 	}
 }
 
@@ -456,6 +470,35 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 
 	body := o.statusCommentFromOps(apply, ops, opsErr, tasks, o.shardsByTable(ctx, apply, ops))
 	o.editTrackedComment(apply, state.Comment.Progress, body)
+	if opsErr == nil {
+		o.reportFinishedTargets(apply, ops)
+	}
+}
+
+// reportFinishedTargets hands the hook a rollout whose count of finished
+// targets rose since the hook last took one. It runs only on a tick that is
+// due a comment edit, so the Check Run is refreshed no more often than the
+// comment. A single-target apply is left to the terminal refresh, which
+// already reports its one target.
+func (o *CommentObserver) reportFinishedTargets(apply *storage.Apply, ops []*storage.ApplyOperation) {
+	if o.onTargetsFinished == nil {
+		return
+	}
+	tally := tallyTargets(ops)
+	if tally.Total <= 1 || tally.Complete <= o.finishedTargetsReported {
+		return
+	}
+	if !o.leaseStillOwnsObserver(apply, "refresh Check Run for finished rollout targets") {
+		return
+	}
+	if !o.onTargetsFinished(apply) {
+		o.logger.Debug("observer: Check Run refresh for finished rollout targets declined; a later tick offers it again",
+			append(apply.LogAttrs(), "complete_targets", tally.Complete, "total_targets", tally.Total)...)
+		return
+	}
+	o.logger.Debug("observer: refreshing Check Run for finished rollout targets",
+		append(apply.LogAttrs(), "complete_targets", tally.Complete, "total_targets", tally.Total)...)
+	o.finishedTargetsReported = tally.Complete
 }
 
 // progressSnapshot is the freshness signal for the tracked progress comment:
@@ -1109,15 +1152,16 @@ func (o *CommentObserver) decideProgressCommentAuthority(apply *storage.Apply, o
 // parent apply lease is legitimately unheld mid-apply. True when the apply is
 // non-terminal and either its generation manifest still lists keys with no
 // attached operation (the dispatcher owes more dispatch waves) or the apply
-// has multiple attached operations with a keyed row not yet terminal. A
-// single attached operation is deliberately not counted, matching the
-// operator's drive-mode split: that shape drives under the parent apply
-// lease, so an unheld lease there means no driver and the lease checks stay
-// authoritative. (The one single-operation drive that runs under the
-// operation lease — a task-less operation — fails closed here too; it has no
-// task progress to report and its terminal comment is published by the
-// aggregate projection winner.) Whole-deployment operations (empty key) are
-// likewise not counted, whatever their number.
+// has multiple attached operations with one not yet terminal. This matches the
+// operator's drive-mode split (tern.DecideApplyDriveMode), which drives every
+// apply with more than one operation under operation leases, whether its
+// operations are keyed shards or whole targets on deployments of their own. A
+// single attached operation is deliberately not counted: that shape drives
+// under the parent apply lease, so an unheld lease there means no driver and
+// the lease checks stay authoritative. (The one single-operation drive that
+// runs under the operation lease — a task-less operation — fails closed here
+// too; it has no task progress to report and its terminal comment is
+// published by the aggregate projection winner.)
 func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply *storage.Apply) (bool, error) {
 	if state.IsTerminalApplyState(apply.State) {
 		return false, nil
@@ -1133,7 +1177,7 @@ func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply
 		return false, nil
 	}
 	for _, op := range ops {
-		if op.OperationKey != "" && !state.IsApplyOperationTerminal(op.State) {
+		if !state.IsApplyOperationTerminal(op.State) {
 			return true, nil
 		}
 	}

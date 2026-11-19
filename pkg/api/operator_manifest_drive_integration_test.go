@@ -74,8 +74,8 @@ func TestOperatorManifestKeyedApplyWaitsForLateSiblings(t *testing.T) {
 	assert.Nil(t, held.CompletedAt, "a held apply must not carry a completion time")
 	assert.Zero(t, svc.matrixSummary.count(),
 		"no terminal summary may publish while the generation is incomplete")
-	assert.Zero(t, svc.matrixSummary.recoveredCount(),
-		"a manifest-carrying apply must not take the per-driver parent-lease path")
+	assert.Equal(t, 1, svc.matrixSummary.recoveredCount(),
+		"the claiming process attaches one progress comment observer to the rollout")
 
 	// The sibling dispatch arrives late, exactly as a control plane fanning out
 	// a large generation delivers it. It must attach to a still-active apply.

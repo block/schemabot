@@ -607,7 +607,7 @@ func publishHeadCtx(ctx context.Context, a *storage.Apply, prInfo *github.PullRe
 	if prInfo.HeadSHA == "" {
 		return ctx
 	}
-	return github.WithPRInfo(ctx, a.Repository, a.PullRequest, prInfo)
+	return withExpectedPRTarget(github.WithPRInfo(ctx, a.Repository, a.PullRequest, prInfo), a.Repository, a.PullRequest, prInfo)
 }
 
 // aggregatePublishSHA picks the commit a terminal apply's aggregate is
@@ -797,6 +797,8 @@ func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo
 		EngineLogs:     h.engineLogReader(),
 		shardedPlans:   h.shardedPlans,
 		Logger:         h.logger,
+
+		OnTargetsFinishedHook: h.rolloutTargetsFinishedHook(),
 	}
 }
 

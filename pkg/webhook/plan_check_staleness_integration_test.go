@@ -5,6 +5,8 @@ package webhook
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 
@@ -90,7 +92,15 @@ func TestE2EPlanResultOfAMovedHeadIsNotStored(t *testing.T) {
 			p := newMultiEnvPlanHarness(t, targets, production, nil)
 			production.onPlan = func() { p.pushNewerHead(t) }
 
-			assert.NotEmpty(t, p.comment(t, "schemabot plan -e production"))
+			if tc.fail {
+				assert.NotEmpty(t, p.comment(t, "schemabot plan -e production"))
+			} else {
+				response := httptest.NewRecorder()
+				p.handler.ServeHTTP(response, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e production", isPR: true}, nil))
+				require.Equal(t, http.StatusOK, response.Code)
+				assert.Contains(t, response.Body.String(), "plan generated successfully")
+				assert.Empty(t, p.github.comments, "a plan from the previous head leaves no comment")
+			}
 
 			row := p.checksByEnv(t)["production"]
 			require.NotNil(t, row, "the newer head's production row is still stored")

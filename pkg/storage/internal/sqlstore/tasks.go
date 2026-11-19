@@ -747,6 +747,27 @@ func (s *taskStore) GetByDatabase(ctx context.Context, database string) ([]*stor
 	return scanTasks(rows)
 }
 
+// GetNonTerminalByDatabase returns the tasks for a database whose state is not
+// terminal, in the same order as GetByDatabase. A state outside the terminal
+// set, including one this build does not know, is returned rather than hidden.
+func (s *taskStore) GetNonTerminalByDatabase(ctx context.Context, database string) ([]*storage.Task, error) {
+	database = storage.CanonicalKey(database)
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE database_name = ?
+		  AND state NOT IN (`+terminalTaskStatesSQL+`)
+		ORDER BY created_at DESC, id DESC
+	`, database)
+	if err != nil {
+		return nil, fmt.Errorf("query non-terminal tasks for database %s: %w", database, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanTasks(rows)
+}
+
 // GetActive returns all tasks in non-terminal states.
 func (s *taskStore) GetActive(ctx context.Context) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `

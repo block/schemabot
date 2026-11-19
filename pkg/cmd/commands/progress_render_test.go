@@ -142,7 +142,7 @@ func TestProgressThrottleReferenceOncePerView(t *testing.T) {
 				model := WatchModel{initialized: true, state: state.Apply.Running, tables: tables, operations: operations}
 				outputs := []string{captureOutput(t, func() { templates.WriteProgress(data) }), model.View()}
 				for _, output := range outputs {
-					assert.Equal(t, 1, strings.Count(output, ui.ThrottleDocURL), output)
+					assert.Equal(t, 1, strings.Count(output, ui.MySQLThrottleDocURL), output)
 					assert.Equal(t, 8, strings.Count(output, "Throttled: commit-latency"), output)
 				}
 			})

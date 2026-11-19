@@ -1,6 +1,8 @@
 package storagetest
 
 import (
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +63,111 @@ func TestTasks(t *testing.T, h Harness) {
 		require.Len(t, owners, 1)
 		assert.Equal(t, "mixedcase/sample-repo", owners[0].Repository)
 		assert.Equal(t, 813, owners[0].PullRequest)
+	})
+
+	// GetNonTerminalByDatabase returns every task of the database whose stored
+	// state is not one of the four finished states, and no other database's
+	// tasks. Work that is running, waiting, stopped or waiting for a retry comes
+	// back, and so does a state this build does not know.
+	t.Run("GetNonTerminalByDatabase_ReturnsEveryStateExceptTheFinishedOnes", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_non_terminal_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_non_terminal", 820)
+		otherLock := CreateLock(t, store, "task_non_terminal_other_db", storage.DatabaseTypeMySQL)
+		otherApply := CreateApply(t, store, otherLock, "apply_task_non_terminal_other", 821)
+		createdAt := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+		// The states in which a task is finished for good. Every other state in
+		// the registry is unsettled work, the resting states stopped and
+		// failed_retryable included.
+		finished := []string{state.Task.Completed, state.Task.Failed, state.Task.Reverted, state.Task.Cancelled}
+		const (
+			unknownState = "state_from_a_newer_build"
+			// An engine's own name for a finished schema change. Reads report it
+			// as completed, but the stored value is not one of the finished states.
+			engineNameForCompleted = "complete"
+		)
+		identifierFor := func(taskState string) string { return "task_non_terminal_" + taskState }
+
+		var want []string
+		for _, taskState := range append(registeredTaskStates(t), unknownState, engineNameForCompleted) {
+			task := newTask(apply, identifierFor(taskState), "table_"+taskState, createdAt)
+			task.State = taskState
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+			if !slices.Contains(finished, taskState) {
+				want = append(want, identifierFor(taskState))
+			}
+		}
+		other := newTask(otherApply, "task_non_terminal_other_running", "other_table", createdAt)
+		other.State = state.Task.Running
+		_, err := store.Tasks().Create(ctx, other)
+		require.NoError(t, err)
+
+		got, err := store.Tasks().GetNonTerminalByDatabase(ctx, "TASK_NON_TERMINAL_DB")
+		require.NoError(t, err)
+		readState := make(map[string]string, len(got))
+		gotIdentifiers := make([]string, 0, len(got))
+		for _, task := range got {
+			assert.Equal(t, "task_non_terminal_db", task.Database)
+			readState[task.TaskIdentifier] = task.State
+			gotIdentifiers = append(gotIdentifiers, task.TaskIdentifier)
+		}
+		assert.ElementsMatch(t, want, gotIdentifiers)
+		// A task read back reports an unknown state as running, so the row
+		// stays visible and keeps blocking rather than reading as settled.
+		assert.Equal(t, state.Task.Running, readState[identifierFor(unknownState)])
+		// The filter compares the stored value, so this row is returned even
+		// though it reads back as completed. A caller that acts only on
+		// unsettled work checks the state it reads.
+		assert.Equal(t, state.Task.Completed, readState[identifierFor(engineNameForCompleted)])
+
+		none, err := store.Tasks().GetNonTerminalByDatabase(ctx, "task_non_terminal_missing_db")
+		require.NoError(t, err)
+		assert.Empty(t, none)
+	})
+
+	// GetNonTerminalByDatabase returns tasks newest first. The tasks of one
+	// apply are created within the same second, so among tasks that share a
+	// creation time the one created later comes first.
+	t.Run("GetNonTerminalByDatabase_OrdersNewestFirstThenLatestCreated", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_non_terminal_order_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_non_terminal_order", 822)
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+		// Listed in the order the tasks are created, which is not the order of
+		// their creation times: the newest task is created second.
+		tasks := []struct {
+			identifier string
+			createdAt  time.Time
+		}{
+			{"task_order_oldest", base},
+			{"task_order_newest", base.Add(2 * time.Minute)},
+			{"task_order_same_second_created_first", base.Add(time.Minute)},
+			{"task_order_same_second_created_second", base.Add(time.Minute)},
+		}
+		for _, tt := range tasks {
+			task := newTask(apply, tt.identifier, "table_"+tt.identifier, tt.createdAt)
+			task.State = state.Task.Running
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+		}
+
+		got, err := store.Tasks().GetNonTerminalByDatabase(ctx, "task_non_terminal_order_db")
+		require.NoError(t, err)
+		gotIdentifiers := make([]string, 0, len(got))
+		for _, task := range got {
+			gotIdentifiers = append(gotIdentifiers, task.TaskIdentifier)
+		}
+		assert.Equal(t, []string{
+			"task_order_newest",
+			"task_order_same_second_created_second",
+			"task_order_same_second_created_first",
+			"task_order_oldest",
+		}, gotIdentifiers)
 	})
 
 	// A task's planned table size and row count are written once when the
@@ -593,6 +700,12 @@ func TestTasks(t *testing.T, h Harness) {
 		require.Error(t, err)
 	})
 
+	t.Run("GetNonTerminalByDatabase_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetNonTerminalByDatabase(t.Context(), "database")
+		require.Error(t, err)
+	})
+
 	t.Run("GetActive_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.Tasks().GetActive(t.Context())
@@ -778,6 +891,20 @@ func TestTasks(t *testing.T, h Harness) {
 		_, err := store.Tasks().ReapStrandedActive(t.Context(), 0)
 		require.Error(t, err)
 	})
+}
+
+// registeredTaskStates returns every state in the task state registry, so a
+// test that sweeps it covers a state the moment it is added.
+func registeredTaskStates(t *testing.T) []string {
+	t.Helper()
+	v := reflect.ValueOf(state.Task)
+	states := make([]string, 0, v.NumField())
+	for i := 0; i < v.NumField(); i++ {
+		value := v.Field(i).String()
+		require.NotEmptyf(t, value, "state.Task.%s is empty", v.Type().Field(i).Name)
+		states = append(states, value)
+	}
+	return states
 }
 
 func newTask(apply *storage.Apply, identifier, table string, createdAt time.Time) *storage.Task {

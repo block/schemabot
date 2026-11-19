@@ -3400,7 +3400,10 @@ const unsafeFindingsFoldThreshold = lintWarningsFoldThreshold
 // writeLintViolations writes advisory lint findings. Lint warnings never block
 // an apply, so they render with a lighter marker than the unsafe-change Issues
 // section but share its visual language: a bold count in the header, backticked
-// table prefixes, and identifiers as inline code.
+// table prefixes, identifiers as inline code, and one numbered list. The
+// numbering runs on across the table and target headings and into the fold,
+// so a reader or an agent can cite a finding by a number nothing else in the
+// section shares.
 func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	n := len(warnings)
 	if n == 0 {
@@ -3409,15 +3412,16 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	count := fmt.Sprintf("%d advisory %s", n, pluralize("finding", n))
 
 	labeled, shared := groupLintWarningsByTargets(warnings)
+	var number int
 	if n <= lintWarningsFoldThreshold {
 		fmt.Fprintf(sb, "%s **Lint Warnings**: %s\n", glyph.Tip, count)
 		for _, w := range labeled {
-			writeLintLine(sb, w.Table, w)
+			writeLintLine(sb, &number, w.Table, w)
 		}
 		for i, set := range shared {
 			writeLintTargetsHeading(sb, set, i > 0 || len(labeled) > 0)
 			for _, w := range set.warnings {
-				writeLintLine(sb, w.Table, w)
+				writeLintLine(sb, &number, w.Table, w)
 			}
 		}
 		sb.WriteString("\n")
@@ -3427,22 +3431,25 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
 	fmt.Fprintf(sb, "<details>\n<summary>%s <b>Lint Warnings</b>: %s</summary>\n\n", glyph.Tip, count)
-	writeLintTableGroups(sb, labeled)
+	writeLintTableGroups(sb, &number, labeled)
 	for _, set := range shared {
 		writeLintTargetsHeading(sb, set, false)
-		writeLintTableGroups(sb, set.warnings)
+		writeLintTableGroups(sb, &number, set.warnings)
 	}
 	sb.WriteString("</details>\n\n")
 }
 
 // writeLintTableGroups writes folded findings under a bold heading per table.
-func writeLintTableGroups(sb *strings.Builder, warnings []LintViolationData) {
+// A blank line follows each heading: Markdown lets only a list that starts at
+// 1 interrupt a paragraph, so a later group's list would otherwise run into
+// its heading as text.
+func writeLintTableGroups(sb *strings.Builder, number *int, warnings []LintViolationData) {
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
-			fmt.Fprintf(sb, "**%s**\n", inlineCode(group.table))
+			fmt.Fprintf(sb, "**%s**\n\n", inlineCode(group.table))
 		}
 		for _, w := range group.warnings {
-			writeLintLine(sb, "", w)
+			writeLintLine(sb, number, "", w)
 		}
 		sb.WriteString("\n")
 	}
@@ -3522,26 +3529,28 @@ func writeLintTargetsHeading(sb *strings.Builder, set lintTargetSet, afterFindin
 	if afterFindings && !strings.HasSuffix(sb.String(), "\n\n") {
 		sb.WriteString("\n")
 	}
-	fmt.Fprintf(sb, "On %s:\n", planGroupList(targetNoun, set.targets, set.total))
+	fmt.Fprintf(sb, "On %s:\n\n", planGroupList(targetNoun, set.targets, set.total))
 	if len(set.targets) > shardNamesInlineLimit {
-		sb.WriteString("\n")
 		writeCollapsedNameGrid(sb, "", "Target names", set.targets)
 	}
 }
 
-// writeLintLine writes one finding as a list item, led by its table, if
-// given, and by the targets that raised it when not every target did. Targets
-// too many to name inline read as coverage on the line, with their names
-// in a collapsed grid beneath it.
-func writeLintLine(sb *strings.Builder, table string, w LintViolationData) {
+// writeLintLine writes one finding as the next item of the section's numbered
+// list, led by its table, if given, and by the targets that raised it when not
+// every target did. Targets too many to name inline read as coverage on the
+// line, with their names in a collapsed grid beneath it, indented to sit
+// inside the item.
+func writeLintLine(sb *strings.Builder, number *int, table string, w LintViolationData) {
+	*number++
+	marker := fmt.Sprintf("%d. ", *number)
 	message := markdownReason(w.Message)
 	if label := lintLabel(table, w); label != "" {
-		fmt.Fprintf(sb, "- %s: %s\n", label, message)
+		fmt.Fprintf(sb, "%s%s: %s\n", marker, label, message)
 	} else {
-		fmt.Fprintf(sb, "- %s\n", message)
+		fmt.Fprintf(sb, "%s%s\n", marker, message)
 	}
 	if len(w.Targets) > shardNamesInlineLimit {
-		writeCollapsedNameGrid(sb, "  ", "Target names", w.Targets)
+		writeCollapsedNameGrid(sb, strings.Repeat(" ", len(marker)), "Target names", w.Targets)
 	}
 }
 
