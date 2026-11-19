@@ -637,8 +637,16 @@ func (h *Handler) walkOpenPRPages(ctx context.Context, store storage.WebhookEven
 			return result
 		}
 		prs, nextPage, _, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookReconcilePageSize)
+		if github.IsNotFoundError(err) {
+			// The installation id comes from the repository owner's
+			// installation, which does not confirm it covers this repository.
+			h.logger.Warn("webhook reconciler skipping repository: GitHub answered 404 listing its pull requests, so the App's installation does not cover it or it does not exist; install the App on the repository or remove it from the repos config",
+				"repo", repo, "installation_id", installationID, "page", page, "error", err)
+			result.listFailed = true
+			return result
+		}
 		if err != nil {
-			h.logger.Warn("webhook reconciler failed to list open pull requests", "repo", repo, "page", page, "error", err)
+			h.logger.Warn("webhook reconciler failed to list open pull requests", "repo", repo, "installation_id", installationID, "page", page, "error", err)
 			result.listFailed = true
 			return result
 		}

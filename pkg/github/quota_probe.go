@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
-	"github.com/bradleyfalzon/ghinstallation/v2"
 	gh "github.com/google/go-github/v86/github"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -203,12 +201,10 @@ func (p *QuotaProbe) recordPanic(ctx context.Context, recovered *panicsafe.Error
 // listActiveInstallations lists the App's installations through the App JWT,
 // skipping suspended ones, which cannot mint the token a budget read needs.
 func (c *Client) listActiveInstallations(ctx context.Context) ([]int64, error) {
-	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
+	appClient, err := c.jwtClient()
 	if err != nil {
-		return nil, fmt.Errorf("create app transport to list installations: %w", err)
+		return nil, fmt.Errorf("list installations: %w", err)
 	}
-	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
-	appClient.DisableRateLimitCheck = true
 	return activeInstallationIDs(ctx, appClient, c.logger)
 }
 

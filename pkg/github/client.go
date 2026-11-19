@@ -95,13 +95,27 @@ type Client struct {
 	installationsMu sync.Mutex
 	installations   map[int64]*InstallationClient
 
-	// repoInstallations caches the App's installation id for a repository,
-	// resolved via the App JWT. Repo-level webhook deliveries (unlike
-	// App-installed webhook deliveries) carry no installation id in the
-	// payload, so repo-webhook dispatch must look it up. A GitHub App installs
-	// once per account/org, so the id is stable per repo and safe to memoise.
-	repoInstallationsMu sync.Mutex
-	repoInstallations   map[string]int64
+	// appClientOnce builds appClient, the go-github client that signs its
+	// requests with the App JWT (the slug fetch, installation lookups, the
+	// installation list), once per Client so those calls share one transport.
+	// appClientErr holds the construction error, which only an unusable
+	// private key produces and which retrying cannot fix.
+	appClientOnce sync.Once
+	appClient     *gh.Client
+	appClientErr  error
+
+	// ownerInstallations caches the App's installation id per repository
+	// owner, keyed by the owner's lowercased login, resolved via the App JWT.
+	// Repo-level webhook deliveries (unlike App-installed webhook deliveries)
+	// carry no installation id in the payload, so repo-webhook dispatch and
+	// the webhook reconciler must look it up. A GitHub App has at most one
+	// installation per account, so every repository of one owner shares the
+	// id, and one lookup serves them all however many repositories are
+	// configured. ownerInstallationLookups collapses concurrent misses for one
+	// owner into a single lookup.
+	ownerInstallationsMu     sync.Mutex
+	ownerInstallations       map[string]int64
+	ownerInstallationLookups singleflight.Group
 
 	// checkStatusSingleflight coalesces concurrent GetPRCheckStatuses
 	// calls for the same (repo, sha) into a single upstream request via
@@ -193,7 +207,7 @@ func NewClient(appID int64, privateKey []byte, logger *slog.Logger, opts ...Clie
 		privateKey:              privateKey,
 		logger:                  logger,
 		installations:           make(map[int64]*InstallationClient),
-		repoInstallations:       make(map[string]int64),
+		ownerInstallations:      make(map[string]int64),
 		checkStatusSingleflight: NewCheckStatusSingleflight(),
 	}
 	for _, opt := range opts {
@@ -221,6 +235,25 @@ func (c *Client) appBaseTransport() http.RoundTripper {
 	return newGitHubRateLimitTransport(newGitHubMetricsTransport(base, 0, c.loadAppSlug))
 }
 
+// jwtClient returns the Client's App-JWT go-github client, building it on
+// first use.
+// appJWTRequestTimeout bounds one request made with the App JWT.
+const appJWTRequestTimeout = 10 * time.Second
+
+func (c *Client) jwtClient() (*gh.Client, error) {
+	c.appClientOnce.Do(func() {
+		appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
+		if err != nil {
+			c.appClientErr = fmt.Errorf("create GitHub App JWT transport for app %d: %w", c.appID, err)
+			return
+		}
+		client := gh.NewClient(&http.Client{Transport: appTransport, Timeout: appJWTRequestTimeout})
+		client.DisableRateLimitCheck = true
+		c.appClient = client
+	})
+	return c.appClient, c.appClientErr
+}
+
 // fetchAppSlug fetches the app slug from GitHub via GET /app, bounded by ctx
 // and the App client's own timeout. On failure, logs an error and leaves
 // appSlug empty.
@@ -229,13 +262,11 @@ func (c *Client) fetchAppSlug(ctx context.Context) {
 	c.lastSlugAttempt = time.Now()
 	c.slugFetchMu.Unlock()
 
-	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
+	appClient, err := c.jwtClient()
 	if err != nil {
 		c.logger.Error("failed to create app transport for slug fetch", "error", err)
 		return
 	}
-	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
-	appClient.DisableRateLimitCheck = true
 	app, _, err := appClient.Apps.Get(ctx, "")
 	if err != nil {
 		c.logger.Error("failed to fetch app slug from GitHub — check gate will not exclude own checks",
@@ -343,44 +374,127 @@ func (c *Client) forInstallation(ctx context.Context, installationID int64) (*In
 }
 
 // InstallationIDForRepo resolves this App's installation id for repo (in
-// "owner/name" form) via the App JWT, caching the result. Repo-level webhook
-// deliveries carry no installation id in the payload — only App-installed
-// webhook deliveries do — so repo-webhook dispatch uses this to obtain the id
-// needed to mint an installation client for API calls.
+// "owner/name" form) via the App JWT. Repo-level webhook deliveries carry no
+// installation id in the payload — only App-installed webhook deliveries do —
+// so repo-webhook dispatch and the webhook reconciler use this to obtain the
+// id needed to mint an installation client for API calls.
+//
+// The id is cached per owner, so the first repository of an owner pays the
+// lookup and every later one is answered from memory. A cached answer does not
+// confirm the App's installation covers repo: on an installation limited to
+// selected repositories, a repository outside the selection gets the owner's
+// id and fails on its first installation-scoped call instead, with a 404. A
+// caller that must tell "the App is not installed on this repository" apart
+// from other failures through ErrAppNotInstalled needs a Client whose cache
+// has not seen the owner.
 func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64, error) {
-	c.repoInstallationsMu.Lock()
-	if id, ok := c.repoInstallations[repo]; ok {
-		c.repoInstallationsMu.Unlock()
-		return id, nil
-	}
-	c.repoInstallationsMu.Unlock()
-
 	owner, name := splitRepo(repo)
 	if owner == "" || name == "" {
 		return 0, fmt.Errorf("resolve installation for %q: repository must be in owner/name form", repo)
 	}
-
-	appTransport, err := ghinstallation.NewAppsTransport(c.appBaseTransport(), c.appID, c.privateKey)
-	if err != nil {
-		return 0, fmt.Errorf("create app transport to resolve installation for %s: %w", repo, err)
+	ownerKey := strings.ToLower(owner)
+	if id, ok := c.cachedOwnerInstallation(ownerKey); ok {
+		return id, nil
 	}
-	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
-	appClient.DisableRateLimitCheck = true
 
+	// The shared lookup runs on a context detached from this caller's
+	// cancellation and bounded by the App client's own timeout, so a caller
+	// that gives up cannot fail the other callers waiting on the same owner.
+	results := c.ownerInstallationLookups.DoChan(ownerKey, func() (any, error) {
+		// A lookup that finished while this caller waited to enter the
+		// flight has already cached the owner.
+		if id, ok := c.cachedOwnerInstallation(ownerKey); ok {
+			return ownerInstallationLookup{repo: repo, id: id, ownerWide: true}, nil
+		}
+		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), appJWTRequestTimeout)
+		defer cancel()
+		return c.lookUpRepoInstallation(lookupCtx, repo, owner, name)
+	})
+	var result singleflight.Result
+	select {
+	case result = <-results:
+	case <-ctx.Done():
+		return 0, fmt.Errorf("resolve installation for %s: %w", repo, ctx.Err())
+	}
+	lookup, _ := result.Val.(ownerInstallationLookup)
+	if lookup.repo != repo && !sharedLookupAnswersOwner(lookup, result.Err) {
+		// The shared lookup went through another repository of this owner and
+		// either failed or found an installation that does not stand for the
+		// whole owner. Its outcome says nothing certain about this repository,
+		// so ask GitHub about this one; the answer then depends only on the
+		// repository asked about.
+		c.logger.Debug("shared installation lookup does not answer for the owner; looking up this repository on its own",
+			"repo", repo, "owner", owner, "shared_lookup_repo", lookup.repo, "shared_lookup_error", result.Err)
+		own, err := c.lookUpRepoInstallation(ctx, repo, owner, name)
+		if err != nil {
+			return 0, err
+		}
+		return own.id, nil
+	}
+	if result.Err != nil {
+		return 0, result.Err
+	}
+	return lookup.id, nil
+}
+
+// sharedLookupAnswersOwner reports whether a lookup made through one
+// repository also answers for the owner's other repositories: it succeeded and
+// found the installation of the owner's own account.
+func sharedLookupAnswersOwner(lookup ownerInstallationLookup, err error) bool {
+	return err == nil && lookup.ownerWide
+}
+
+// ownerInstallationLookup is the result of one owner's installation lookup,
+// naming the repository the lookup went through. ownerWide reports that the
+// installation belongs to the owner's account and was cached for it, so it
+// answers every repository of the owner; otherwise it answers only repo.
+type ownerInstallationLookup struct {
+	repo      string
+	id        int64
+	ownerWide bool
+}
+
+func (c *Client) cachedOwnerInstallation(ownerKey string) (int64, bool) {
+	c.ownerInstallationsMu.Lock()
+	defer c.ownerInstallationsMu.Unlock()
+	id, ok := c.ownerInstallations[ownerKey]
+	return id, ok
+}
+
+// lookUpRepoInstallation asks GitHub for the installation covering repo and
+// caches its id under the repository's owner. A failed lookup caches nothing,
+// so the next repository of the owner, or the next pass, asks again.
+func (c *Client) lookUpRepoInstallation(ctx context.Context, repo, owner, name string) (ownerInstallationLookup, error) {
+	failed := ownerInstallationLookup{repo: repo}
+	appClient, err := c.jwtClient()
+	if err != nil {
+		return failed, fmt.Errorf("resolve installation for %s: %w", repo, err)
+	}
 	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
 	if err != nil {
-		return 0, findInstallationError(repo, err)
+		return failed, findInstallationError(repo, err)
 	}
 	id := installation.GetID()
 	if id == 0 {
-		return 0, fmt.Errorf("find installation for %s: GitHub returned installation id 0", repo)
+		return failed, fmt.Errorf("find installation for %s: GitHub returned installation id 0", repo)
 	}
-
-	c.repoInstallationsMu.Lock()
-	c.repoInstallations[repo] = id
-	c.repoInstallationsMu.Unlock()
-	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
-	return id, nil
+	account := installation.GetAccount().GetLogin()
+	if !strings.EqualFold(account, owner) {
+		// The installation belongs to an account other than the repository's
+		// owner, so it cannot stand for the owner's other repositories. The id
+		// still answers this repository; it is just not cached.
+		c.logger.Warn("GitHub App installation for repository belongs to another account; using it for this repository without caching it for the owner",
+			"repo", repo, "owner", owner, "installation_account", account, "installation_id", id)
+		return ownerInstallationLookup{repo: repo, id: id}, nil
+	}
+	c.ownerInstallationsMu.Lock()
+	if c.ownerInstallations == nil {
+		c.ownerInstallations = make(map[string]int64)
+	}
+	c.ownerInstallations[strings.ToLower(owner)] = id
+	c.ownerInstallationsMu.Unlock()
+	c.logger.Info("resolved GitHub App installation for repository owner", "repo", repo, "owner", owner, "installation_id", id)
+	return ownerInstallationLookup{repo: repo, id: id, ownerWide: true}, nil
 }
 
 // ErrAppNotInstalled reports that GitHub has no installation of this App
