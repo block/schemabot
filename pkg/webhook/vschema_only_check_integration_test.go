@@ -64,7 +64,7 @@ func TestUpsertPlanCheckRecord_VSchemaOnlyPlanRequiresApply(t *testing.T) {
 	mux.HandleFunc("GET /repos/"+repo+"/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(headSHA)},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("base456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("base456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})

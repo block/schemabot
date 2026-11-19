@@ -296,7 +296,8 @@ fields they do not recognize, because there an unknown field is a caller's mista
 operator's typo rather than a peer on a different release, and ignoring it would swallow intent.
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
-(`pkg/api/control_handlers.go`, `pkg/api/plan_handlers.go`) and on config load
+(`pkg/api/control_handlers.go`, `pkg/api/lock_handlers.go`, `pkg/api/plan_handlers.go`,
+`pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
@@ -781,6 +782,18 @@ multi-environment plans in `pkg/webhook/plan.go` on each refusal `planRefusedByN
 names), or, when that row cannot be stored, a failing aggregate carrying the same block, which only
 the auto-plan guards release (`failClosedOnNamespacePlacement` and `handleMultiEnvPlan` in
 `pkg/webhook/plan.go`).
+
+### MG-13: Branch exclusion never creates validation
+
+New PR plans, apply commands, and Check Run publication require an eligible target.
+Exclusion never produces a passing, neutral, or skipped result, and uncertainty
+never authorizes omission of required validation. Earlier results and accepted
+applies remain authoritative through a target change.
+*Enforced:* effective-target and protection discovery (`pkg/github/pr_target.go`);
+shared command and recovery policy (`pkg/webhook/pr_target.go`); auto-plan and
+aggregate publishers (`pkg/webhook/pull_request.go`, `pkg/webhook/check_publisher.go`);
+fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.go`,
+`pkg/webhook/apply_execute.go`).
 
 ## Apply state machine (ST)
 

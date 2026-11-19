@@ -684,3 +684,11 @@ health signal; retain heartbeat coverage. Baseline cooldown reports and outer
 waiting separately before choosing warning thresholds. Quota silence alone does
 not prove blocked checks recovered: verify fresh successful work for the same
 installation/resource.
+
+## GitHub branch protection reads
+
+PR target eligibility attributes its bounded non-default-branch reads to the
+existing `schemabot.github.requests_total` operation values `fetch_branch_rules`
+and `graphql_branch_protection`. Default-target PRs make neither request. Compare
+these reads and remaining installation budgets during rollout; a permission
+failure blocks target evaluation and requires fixing the App's read access.

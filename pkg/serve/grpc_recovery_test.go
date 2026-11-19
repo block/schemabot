@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,9 +19,12 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/block/schemabot/pkg/panicsafe"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // A handler panic must fail only that RPC: the client sees a fixed Internal
@@ -212,6 +216,147 @@ func TestNewTernGRPCServerContainsHandlerPanicOverWire(t *testing.T) {
 	assert.Equal(t, "internal error; see server logs", st.Message())
 	assert.Contains(t, logs.String(), "connection refused")
 	assert.Contains(t, logs.String(), "/test.Panicker/Boom")
+}
+
+// wideSchemaTernServer answers Plan and Apply with empty responses and records
+// how many tables each request declared, so a test can tell that the server
+// decoded the whole request rather than refusing it at the transport.
+type wideSchemaTernServer struct {
+	ternv1.UnimplementedTernServer
+	receivedTables chan int
+}
+
+func countDeclaredTables(schemaFiles map[string]*ternv1.SchemaFiles) int {
+	tables := 0
+	for _, namespace := range schemaFiles {
+		tables += len(namespace.GetFiles())
+	}
+	return tables
+}
+
+func (s *wideSchemaTernServer) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	s.receivedTables <- countDeclaredTables(req.GetSchemaFiles())
+	return &ternv1.PlanResponse{}, nil
+}
+
+func (s *wideSchemaTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
+	s.receivedTables <- countDeclaredTables(req.GetSchemaFiles())
+	return &ternv1.ApplyResponse{}, nil
+}
+
+// wideSchemaFiles declares tableCount tables of ddlBytes each in one
+// namespace, the shape a plan or apply request takes for a database with
+// thousands of tables.
+func wideSchemaFiles(tableCount, ddlBytes int) map[string]*ternv1.SchemaFiles {
+	ddl := strings.Repeat("x", ddlBytes)
+	files := make(map[string]string, tableCount)
+	for i := range tableCount {
+		files[fmt.Sprintf("table_%05d.sql", i)] = ddl
+	}
+	return map[string]*ternv1.SchemaFiles{"wide": {Files: files}}
+}
+
+func widePlanRequest(tableCount, ddlBytes int) *ternv1.PlanRequest {
+	return &ternv1.PlanRequest{
+		Database:    "wide",
+		Type:        "mysql",
+		Environment: "staging",
+		SchemaFiles: wideSchemaFiles(tableCount, ddlBytes),
+	}
+}
+
+// wideApplyRequest carries the declared schema and one change per table, as
+// an apply of a plan that changes every table does, so it is larger than the
+// plan request for the same schema.
+func wideApplyRequest(tableCount, ddlBytes int) *ternv1.ApplyRequest {
+	changes := make([]*ternv1.TableChange, tableCount)
+	for i := range tableCount {
+		changes[i] = &ternv1.TableChange{
+			TableName: fmt.Sprintf("table_%05d", i),
+			Ddl:       strings.Repeat("y", ddlBytes),
+			Namespace: "wide",
+		}
+	}
+	return &ternv1.ApplyRequest{
+		Database:    "wide",
+		Environment: "staging",
+		SchemaFiles: wideSchemaFiles(tableCount, ddlBytes),
+		DdlChanges:  changes,
+	}
+}
+
+// Plan and apply requests for a database with thousands of tables are larger
+// than gRPC's 4 MiB default, because they carry every declared CREATE TABLE,
+// and an apply also carries the plan's changes. The server Run constructs must
+// accept both up to the same ceiling the client applies to pull responses, and
+// must still refuse a request beyond that ceiling rather than buffer an
+// unbounded message.
+func TestNewTernGRPCServerAcceptsRequestsUpToTheReceiveCeiling(t *testing.T) {
+	const ddlBytes = 1024
+	require.Equal(t, 16<<20, tern.DefaultMaxRecvMsgBytes,
+		"the request ceiling is a reviewed value; change this assertion together with the constant")
+
+	server := newTernGRPCServer(slog.New(slog.DiscardHandler))
+	planServer := &wideSchemaTernServer{receivedTables: make(chan int, 1)}
+	ternv1.RegisterTernServer(server, planServer)
+
+	listener := bufconn.Listen(1024 * 1024)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		require.NoError(t, <-serveErr)
+	})
+
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return listener.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	client := ternv1.NewTernClient(conn)
+
+	t.Run("a request above gRPC's default is planned", func(t *testing.T) {
+		tableCount := (6 << 20) / ddlBytes
+		req := widePlanRequest(tableCount, ddlBytes)
+		require.Greater(t, proto.Size(req), 4<<20, "the request must exceed gRPC's 4 MiB default")
+		require.Less(t, proto.Size(req), tern.DefaultMaxRecvMsgBytes, "the request must fit under the server's ceiling")
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		_, err := client.Plan(ctx, req)
+
+		require.NoError(t, err)
+		assert.Equal(t, tableCount, <-planServer.receivedTables)
+	})
+
+	t.Run("an apply request above gRPC's default is accepted", func(t *testing.T) {
+		tableCount := (3 << 20) / ddlBytes
+		req := wideApplyRequest(tableCount, ddlBytes)
+		require.Greater(t, proto.Size(req), 4<<20, "the request must exceed gRPC's 4 MiB default")
+		require.Less(t, proto.Size(req), tern.DefaultMaxRecvMsgBytes, "the request must fit under the server's ceiling")
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		_, err := client.Apply(ctx, req)
+
+		require.NoError(t, err)
+		assert.Equal(t, tableCount, <-planServer.receivedTables)
+	})
+
+	t.Run("a request above the ceiling is refused", func(t *testing.T) {
+		req := widePlanRequest(tern.DefaultMaxRecvMsgBytes/ddlBytes+64, ddlBytes)
+		require.Greater(t, proto.Size(req), tern.DefaultMaxRecvMsgBytes)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		_, err := client.Plan(ctx, req)
+
+		require.Error(t, err)
+		assert.Equal(t, codes.ResourceExhausted, status.Code(err))
+		assert.Empty(t, planServer.receivedTables, "the handler must not run for a refused request")
+	})
 }
 
 type testServerStream struct {

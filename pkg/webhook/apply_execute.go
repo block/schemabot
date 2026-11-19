@@ -111,6 +111,11 @@ func (h *Handler) executeApply(
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final PR freshness fetch failure")
 		return
 	}
+	if blocked, gateErr := h.enforcePRTargetSnapshot(ctx, client, repo, pr, installationID, freshPRInfo, actionName, environment, requestedBy, false, false); gateErr != nil {
+		return
+	} else if blocked {
+		return
+	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, actionName); rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
 		return
@@ -521,6 +526,17 @@ func (h *Handler) executeApply(
 	if factoryErr != nil {
 		h.logger.Error("apply blocked: cannot resolve GitHub App client for repo",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", factoryErr)
+		return
+	}
+
+	// Re-read both the PR target and its policy before durable acceptance.
+	// A cached eligibility result cannot authorize database work.
+	blocked, gateErr := h.enforcePRTargetWithPolicy(ctx, client, repo, pr, installationID, actionName, environment, requestedBy, false, false, client.EvaluatePRTargetFresh)
+	if gateErr != nil {
+		return
+	}
+	if blocked {
+		// Preserve the pending confirmation and lock intent for a later eligible retry.
 		return
 	}
 

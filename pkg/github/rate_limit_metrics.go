@@ -199,6 +199,7 @@ type githubRoutePattern struct {
 }
 
 var githubRoutePatterns = []githubRoutePattern{
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/rules/branches/{branch...}", operation: metrics.GitHubOperationFetchBranchRules},
 	{
 		method:    http.MethodGet,
 		path:      "/app",
@@ -435,6 +436,8 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationFetchDiff,
 		metrics.GitHubOperationFetchFileContent,
 		metrics.GitHubOperationFetchGitTree,
+		metrics.GitHubOperationFetchBranchRules,
+		metrics.GitHubOperationGraphQLBranchProtection,
 		metrics.GitHubOperationFetchPullRequest,
 		metrics.GitHubOperationGetCombinedStatus,
 		metrics.GitHubOperationGetTeam,

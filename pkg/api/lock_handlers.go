@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -62,7 +61,7 @@ type LockConflictResponse struct {
 // handleLockAcquire handles POST /api/locks/acquire.
 func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	var req LockAcquireRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -258,7 +257,7 @@ func lockCreatedByAcquire(createdID int64, acquired *storage.Lock) bool {
 // handleLockRelease handles DELETE /api/locks.
 func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	var req LockReleaseRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
