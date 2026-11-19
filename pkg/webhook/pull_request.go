@@ -1154,16 +1154,22 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 }
 
 // releaseLocksForClosedPR releases the closed PR's locks, except locks on
-// databases that still have an in-flight apply. Every release is attempted even
-// if an earlier one fails, and the failures are joined and returned so a caller
-// with a retry mechanism re-attempts the still-held locks. Release itself is
-// not idempotent — a missing row returns storage.ErrLockNotFound and a
-// re-acquired lock returns storage.ErrLockNotOwned — so re-running converges
-// only because each attempt re-lists the PR's locks first and a released
-// lock's row is deleted, never reappearing in a later attempt. A concurrent
-// manual unlock between the list and the release surfaces as a spurious
-// ErrLockNotFound that fails that attempt; the next retry no longer sees the
-// row and converges.
+// databases that still have an in-flight apply. Each release deletes only the
+// lock row this pass listed, held for the pending plan it listed, so a lock
+// taken after the listing is never released by it.
+//
+// A listed lock that is already gone, released by an unlock or an apply's own
+// cleanup in between, is what cleanup wanted, so it is logged and not an
+// error. A database locked again since the listing, by a new row or by the
+// same row for a new plan, stays held and is returned as an error: the PR may
+// have reopened and planned again after cleanup read its live state, so this
+// pass must not go on to delete its check state. The retry re-reads the live
+// PR first, and releases the lock only if the PR is still closed.
+//
+// Every release is attempted even if an earlier one fails, and the failures
+// are joined and returned so a caller with a retry mechanism re-attempts the
+// still-held locks. Each attempt re-lists the PR's locks first, and a released
+// lock's row is deleted, so a retry converges.
 func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) error {
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
 	if err != nil {
@@ -1177,7 +1183,21 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType)
 			continue
 		}
-		if err := h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner); err != nil {
+		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		if isVettedLockGone(err) {
+			h.logger.Info("lock already released before PR close cleanup reached it",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "error", err)
+			continue
+		}
+		if isLockAcquiredSinceVetting(err) {
+			h.logger.Warn("lock acquired again after PR close cleanup listed it; keeping it and retrying cleanup, which re-checks the PR is still closed",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "listed_pending_plan_id", lock.PendingPlanID, "error", err)
+			releaseErrs = append(releaseErrs, fmt.Errorf("lock on %s (%s) acquired again after close cleanup listed it: %w", lock.DatabaseName, lock.DatabaseType, err))
+			continue
+		}
+		if err != nil {
 			h.logger.Error("failed to release lock on PR close",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			releaseErrs = append(releaseErrs, fmt.Errorf("release lock on %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err))

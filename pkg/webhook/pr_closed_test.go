@@ -37,13 +37,28 @@ type prClosedLockStore struct {
 	storage.LockStore
 	locks    []*storage.Lock
 	released []string
+	// releasedRows records the row ID and pending plan each release was pinned
+	// to, in call order.
+	releasedRows []pinnedRelease
+	// releaseErr, keyed by database, is what a release of that database's lock
+	// returns instead of deleting it: the lock already gone, or held again.
+	releaseErr map[string]error
+}
+
+type pinnedRelease struct {
+	id            int64
+	pendingPlanID string
 }
 
 func (s *prClosedLockStore) GetByPR(_ context.Context, _ string, _ int) ([]*storage.Lock, error) {
 	return s.locks, nil
 }
 
-func (s *prClosedLockStore) Release(_ context.Context, database, _, _ string) error {
+func (s *prClosedLockStore) ReleaseByID(_ context.Context, id int64, database, _, _, pendingPlanID string) error {
+	s.releasedRows = append(s.releasedRows, pinnedRelease{id: id, pendingPlanID: pendingPlanID})
+	if err := s.releaseErr[database]; err != nil {
+		return err
+	}
 	s.released = append(s.released, database)
 	return nil
 }
@@ -320,6 +335,73 @@ func TestPRClosedCleanupReadsLivePRPastCachedSnapshot(t *testing.T) {
 	assert.Equal(t, int32(1), fetches.Load(), "cleanup reads the live PR instead of the cached snapshot")
 	assert.Empty(t, lockStore.released, "the lock taken after the reopen must stay held")
 	assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive a close delivery for a reopened PR")
+}
+
+// TestPRClosedReleasesTheListedLockRow verifies that close cleanup deletes the
+// lock row it listed, for the pending plan it listed, rather than whatever lock
+// the PR holds on the database when the delete runs.
+func TestPRClosedReleasesTheListedLockRow(t *testing.T) {
+	lock := prClosedLock("orders")
+	lock.ID = 314
+	lock.PendingPlanID = "plan-closed"
+	lockStore := &prClosedLockStore{locks: []*storage.Lock{lock}}
+	st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: &prClosedCheckStore{}}
+
+	h := prClosedTestHandler(t, st)
+	_, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, []pinnedRelease{{id: 314, pendingPlanID: "plan-closed"}}, lockStore.releasedRows)
+}
+
+// TestPRClosedTreatsAnAlreadyReleasedLockAsReleased covers a close delivery
+// whose listed lock is gone by the time cleanup deletes it, because an unlock
+// or an apply's own cleanup released it in between. That is the outcome
+// cleanup wanted, so the delivery completes and the PR's stored check state
+// is deleted instead of retrying against a lock that will never come back.
+func TestPRClosedTreatsAnAlreadyReleasedLockAsReleased(t *testing.T) {
+	lockStore := &prClosedLockStore{
+		locks:      []*storage.Lock{prClosedLock("orders"), prClosedLock("billing")},
+		releaseErr: map[string]error{"orders": storage.ErrLockNotFound},
+	}
+	checkStore := &prClosedCheckStore{}
+	st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: checkStore}
+
+	h := prClosedTestHandler(t, st)
+	ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+	require.NoError(t, err)
+	assert.True(t, ran)
+
+	assert.Equal(t, []string{"billing"}, lockStore.released, "the lock still held is released")
+	assert.Equal(t, 1, checkStore.deleteCalls, "stored check state is deleted once every listed lock is gone")
+}
+
+// TestPRClosedKeepsALockAcquiredAgainAfterTheListing covers a close delivery
+// that lists the PR's lock on orders, after which the PR reopens and a new
+// plan takes the orders lock again before cleanup deletes it. The new lock
+// protects work the closed PR's cleanup never saw, so it stays held. Cleanup
+// still releases the PR's other lock, but returns an error and leaves the
+// stored check state alone, so the durable retry re-reads the live PR before
+// deciding anything about the new lock or the new plan's check state.
+func TestPRClosedKeepsALockAcquiredAgainAfterTheListing(t *testing.T) {
+	for _, reacquired := range []error{storage.ErrLockIntentChanged, storage.ErrLockReplaced} {
+		t.Run(reacquired.Error(), func(t *testing.T) {
+			lockStore := &prClosedLockStore{
+				locks:      []*storage.Lock{prClosedLock("orders"), prClosedLock("billing")},
+				releaseErr: map[string]error{"orders": reacquired},
+			}
+			checkStore := &prClosedCheckStore{}
+			st := &prClosedTestStorage{locks: lockStore, applies: &prClosedApplyStore{}, checks: checkStore}
+
+			h := prClosedTestHandler(t, st)
+			ran, err := h.runPRCloseCleanup(t.Context(), "octocat/hello-world", 1, 12345, true)
+			require.ErrorIs(t, err, reacquired, "a lock taken again must make the delivery retry")
+			assert.False(t, ran)
+
+			assert.Equal(t, []string{"billing"}, lockStore.released, "the lock acquired again stays held; the other is released")
+			assert.Equal(t, 0, checkStore.deleteCalls, "stored check state must survive while a lock was taken again after the listing")
+		})
+	}
 }
 
 // TestPRClosedCleanupFailsClosedWhenLivePRUnreadable covers a close delivery

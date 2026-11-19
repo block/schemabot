@@ -1513,23 +1513,24 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 const unlockStaleCommandMessage = "At least one current lock matched by this unlock command was acquired after the command was received, and this command released nothing. Comment `schemabot unlock` again to release the current locks."
 
 // isLockAcquiredSinceVetting reports whether a row-pinned release found the
-// database locked again since unlock looked the lock up: a different row now
-// holds it (ErrLockReplaced), or the vetted row was acquired again for another
-// pending plan (ErrLockIntentChanged). Either way a lock is still held and
-// this command never vetted it, so the answer is the stale-command prompt to
-// comment again, not that nothing is left to unlock. The caller logs the
-// specific error so the two causes stay distinguishable.
+// database locked again since the caller (unlock, or PR close cleanup) looked
+// the lock up: a different row now holds it (ErrLockReplaced), or the vetted
+// row was acquired again for another pending plan (ErrLockIntentChanged).
+// Either way a lock is still held that the caller never vetted, so it must not
+// be released: unlock answers with the stale-command prompt to comment again,
+// and close cleanup retries. The caller logs the specific error so the two
+// causes stay distinguishable.
 func isLockAcquiredSinceVetting(err error) bool {
 	return errors.Is(err, storage.ErrLockReplaced) ||
 		errors.Is(err, storage.ErrLockIntentChanged)
 }
 
 // isVettedLockGone reports whether a row-pinned release found that the lock
-// row unlock vetted no longer holds the lock: no lock is held at all
-// (ErrLockNotFound), or the row is held under another owner (ErrLockNotOwned).
-// Each means the lock the command targeted is gone and nothing this command
-// vetted is left to release; the caller logs the specific error so the cause
-// stays distinguishable.
+// row the caller (unlock, or PR close cleanup) vetted no longer holds the
+// lock: no lock is held at all (ErrLockNotFound), or the row is held under
+// another owner (ErrLockNotOwned). Each means the lock the caller targeted is
+// gone and nothing it vetted is left to release; the caller logs the specific
+// error so the cause stays distinguishable.
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
 		errors.Is(err, storage.ErrLockNotOwned)
