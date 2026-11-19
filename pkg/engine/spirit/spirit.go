@@ -669,7 +669,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
-	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
+	drops, err := engine.NewDroppedTables(req.DropTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
+	if err := drops.RefuseIgnored(ignored); err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
+	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored, drops)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
@@ -730,6 +737,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// same namespace on every run.
 	for _, namespace := range slices.Sorted(maps.Keys(declaredByNamespace)) {
 		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
+			return nil, err
+		}
+		if err := drops.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
 			return nil, err
 		}
 		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
@@ -1379,7 +1389,10 @@ type liveSchema struct {
 // and archive tables that are maintained outside declarative schema files.
 //
 // ignored withholds the tables the repository's ignore_tables config names.
-func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) (*liveSchema, error) {
+// drops names tables the repository's drop_tables config asks to drop: one the
+// naming conventions would exclude is read back into the live schema, so the
+// diff proposes DROP TABLE for it like any other undeclared table.
+func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables, drops engine.DroppedTables) (*liveSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open target database: %w", err)
@@ -1401,8 +1414,12 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 	if err != nil {
 		return nil, fmt.Errorf("load schema: %w", err)
 	}
-	var underscore, archive []string
+	var underscore, archive, reclaimed []string
 	for _, ex := range excluded {
+		if drops.Names(ex.Name) {
+			reclaimed = append(reclaimed, ex.Name)
+			continue
+		}
 		switch ex.Filter {
 		case table.WithoutUnderscoreTables:
 			underscore = append(underscore, ex.Name)
@@ -1410,6 +1427,18 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			archive = append(archive, ex.Name)
 		default:
 			return nil, fmt.Errorf("load schema: the loader excluded table %q under filter option %d, which the plan cannot disclose", ex.Name, ex.Filter)
+		}
+	}
+	for _, name := range reclaimed {
+		ts, err := loadTableSchema(ctx, db, name)
+		if err != nil {
+			return nil, fmt.Errorf("load schema of drop_tables entry %q: %w", name, err)
+		}
+		tables = append(tables, ts)
+	}
+	if !drops.Empty() {
+		if err := refuseRecentlyWrittenDrops(ctx, db, database, drops); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1427,11 +1456,15 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			withheld = append(withheld, ts.Name)
 			continue
 		}
-		if table.IsArchiveTable(ts.Name) {
+		if table.IsArchiveTable(ts.Name) && !drops.Names(ts.Name) {
 			archive = append(archive, ts.Name)
 			continue
 		}
 		kept = append(kept, ts)
+	}
+	if len(reclaimed) > 0 {
+		e.logger.Info("drop_tables entries read into the live schema so the plan drops them",
+			"database", database, "tables", reclaimed)
 	}
 	slices.Sort(withheld)
 	slices.Sort(underscore)

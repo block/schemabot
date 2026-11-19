@@ -225,6 +225,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if req.Credentials == nil || req.Credentials.DSN == "" {
 		return nil, fmt.Errorf("plan PostgreSQL database %q: DSN credentials are required", req.Database)
 	}
+	if err := engine.RefuseDropTables("PostgreSQL", req.DropTables); err != nil {
+		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+	}
 
 	pool, closePool, err := openTargetPool(ctx, req.Credentials)
 	if err != nil {
