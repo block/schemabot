@@ -93,6 +93,9 @@ func TestResolve_SecretsManager_Integration(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_REGION", "us-east-1")
+	// Build the resolver's shared client from this environment, and drop it
+	// afterwards so it does not outlive this test's container.
+	useSecretsManagerBuilder(t, loadSecretsManagerClient)
 
 	// Create a Secrets Manager client pointing to MiniStack
 	cfg, err := config.LoadDefaultConfig(t.Context(),

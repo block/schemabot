@@ -149,8 +149,9 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 				SHA: new("newsha222"),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -443,8 +444,9 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 				SHA: new("newsha222"),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -598,7 +600,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(gh.PullRequest{
 					Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 					User: &gh.User{Login: new("testuser")},
 				})
 			})
@@ -728,7 +730,7 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
@@ -806,7 +808,7 @@ func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
@@ -872,7 +874,7 @@ func TestE2ECheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("newsha222")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
@@ -934,7 +936,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 		headSHA := currentHead.Load().(string)
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
@@ -1047,8 +1049,9 @@ func TestE2EAggregateUpdateSkipsStaleHeadSHA(t *testing.T) {
 				SHA: new("newsha222"),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -1203,7 +1206,7 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
@@ -1286,7 +1289,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
@@ -1448,7 +1451,7 @@ func setupFakeGitHubHeadAndCheckRuns(t *testing.T, mux *http.ServeMux, headSHA s
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(headSHA)},
-			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})

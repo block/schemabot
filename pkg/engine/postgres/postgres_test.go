@@ -51,7 +51,7 @@ func TestBaselinePolicyTableMembership(t *testing.T) {
 		{table: "flyway_schema_history", wantRollbackReason: engine.ExemptReasonIgnoreTables},
 		{table: "Flyway_schema_history"},
 		{table: "audit_log_archive_2019"},
-		{table: "audit_log_archive_2020", wantRollbackReason: exemptReasonArchiveNaming},
+		{table: "audit_log_archive_2020", wantRollbackReason: engine.ExemptReasonArchiveNaming},
 		{table: "audit_log_archive_2018", wantRollbackReason: engine.ExemptReasonIgnoreTables},
 	}
 	for _, tt := range tests {

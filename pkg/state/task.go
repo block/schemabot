@@ -130,11 +130,11 @@ func normalizeTaskStatus(raw string) (string, bool) {
 	case spiritstatus.ApplyChangeset.String():
 		return Task.CatchingUp, true
 
-	// Post-checksum — the verify passed and Spirit is applying the changes
+	// Post-checksum — the verification passed and Spirit is applying the changes
 	// that accumulated while it ran. Same catch-up mechanics as CatchingUp,
 	// but it is a distinct, later phase: mapping it back to CatchingUp would
 	// pin the stored (monotonic) task state at Checksumming for the whole
-	// second drain, rendering an indeterminate verify that already finished.
+	// second drain, rendering an indeterminate verification that already finished.
 	case spiritstatus.PostChecksum.String():
 		return Task.PostChecksum, true
 

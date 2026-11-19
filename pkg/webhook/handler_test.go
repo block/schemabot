@@ -462,7 +462,7 @@ func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 			"head": map[string]any{"sha": "newsha222", "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"base": map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 			"user": map[string]any{"login": "testuser"},
 		}))
 	})
@@ -1315,8 +1315,8 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
-		assert.Contains(t, rendered, "- `users`: Column uses utf8 charset")
+		assert.Contains(t, rendered, "1. `bad_table`: Primary key uses signed integer type")
+		assert.Contains(t, rendered, "2. `users`: Column uses utf8 charset")
 		assert.Contains(t, rendered, "CREATE TABLE")
 	})
 
@@ -1347,7 +1347,7 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderMultiEnvPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
+		assert.Contains(t, rendered, "1. `bad_table`: Primary key uses signed integer type")
 		assert.Contains(t, rendered, "CREATE TABLE")
 		// Identical plans get deduplicated — combined header
 		assert.Contains(t, rendered, "Staging & Production")

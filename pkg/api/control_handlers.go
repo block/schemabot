@@ -572,6 +572,62 @@ func ternApplyIDForStoredApply(apply *storage.Apply) string {
 	return apply.ApplyIdentifier
 }
 
+// immediateControlReach says whether an immediate control attempt can address
+// an apply on the data plane, and when it cannot, why not.
+type immediateControlReach int
+
+const (
+	// immediateControlAddressable means the apply row holds the ID the data
+	// plane knows the apply by. Local Tern shares SchemaBot's storage and its
+	// apply_identifier, so a local apply is always addressable.
+	immediateControlAddressable immediateControlReach = iota
+	// immediateControlUndispatched means the apply has not been sent to remote
+	// Tern, so no remote apply exists to address.
+	immediateControlUndispatched
+	// immediateControlHeldByOperation means the apply has been sent to remote
+	// Tern and its remote apply ID is recorded on an operation row, not on the
+	// apply. A drive under the operation lease records it there, and that drive
+	// resolves which ID its control calls carry.
+	immediateControlHeldByOperation
+	// immediateControlDispatchUnknown means the operation rows could not be
+	// read, so whether the apply has been sent is not known.
+	immediateControlDispatchUnknown
+)
+
+// immediateControlReachFor reports whether an immediate control attempt has an
+// apply to address. Remote Tern names an apply by the ID it returns at
+// dispatch, which SchemaBot stores as external_id, so until that ID is on the
+// apply row nothing the handler holds identifies the apply to the data plane:
+// SchemaBot's own apply_identifier is unknown there, and an empty ID is
+// refused. The durable control request already recorded is then the only path
+// to the apply, and the immediate attempt is skipped rather than sent to fail.
+//
+// An empty external_id on the apply row does not by itself mean the apply is
+// unsent: a drive under the operation lease records the remote ID on its
+// operation row and leaves the apply row empty. The operation rows are read so
+// the reason given for the skip is the true one.
+func (s *Service) immediateControlReachFor(ctx context.Context, client tern.Client, apply *storage.Apply, operation, caller string) immediateControlReach {
+	if !client.IsRemote() || apply.ExternalID != "" {
+		return immediateControlAddressable
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		s.logger.Warn("could not read apply operations to tell whether the apply has been sent to remote Tern; immediate "+operation+" skipped and the durable request remains pending for the apply owner",
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+		return immediateControlDispatchUnknown
+	}
+	for _, op := range ops {
+		if op.RemoteApplyID() != "" {
+			s.logger.Info("immediate "+operation+" skipped because the remote apply ID is recorded on the apply's operation and not on the apply; the drive that owns the operation delivers the durable request",
+				append(apply.LogAttrs(), "requested_by", caller, "apply_operation_id", op.ID, "operation_deployment", op.Deployment)...)
+			return immediateControlHeldByOperation
+		}
+	}
+	s.logger.Info("immediate "+operation+" skipped because the apply has not been sent to remote Tern yet, so there is no remote apply to address; durable request remains pending for the apply owner",
+		append(apply.LogAttrs(), "requested_by", caller)...)
+	return immediateControlUndispatched
+}
+
 // CutoverRequest is the HTTP request body for POST /api/cutover.
 type CutoverRequest struct {
 	ApplyID     string `json:"apply_id"`
@@ -1245,6 +1301,21 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 				"requested_by", caller)...)
 		return
 	}
+	switch s.immediateControlReachFor(ctx, client, apply, "stop", caller) {
+	case immediateControlAddressable:
+	case immediateControlUndispatched:
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
+			"Stop queued; the apply has not been sent to the engine yet, so the apply owner completes the durable stop request")
+		return
+	case immediateControlHeldByOperation:
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
+			"Stop queued; the apply owner delivers the durable stop request to the engine")
+		return
+	case immediateControlDispatchUnknown:
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
+			"Stop queued; the apply owner completes the durable stop request")
+		return
+	}
 	if client.IsRemote() {
 		s.logger.Info("propagating stop request to remote Tern durable queue",
 			append(apply.LogAttrs(),
@@ -1508,10 +1579,10 @@ func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, ap
 			append(apply.LogAttrs(), "requested_by", caller)...)
 		return
 	}
-	ternApplyID := apply.ApplyIdentifier
-	if client.IsRemote() {
-		ternApplyID = apply.ExternalID
+	if s.immediateControlReachFor(ctx, client, apply, "cancel", caller) != immediateControlAddressable {
+		return
 	}
+	ternApplyID := ternApplyIDForStoredApply(apply)
 	resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: ternApplyID, Environment: apply.Environment, Caller: caller})
 	if err != nil {
 		s.logger.Warn("immediate cancel failed; durable cancel request remains pending for apply owner retry",
@@ -2652,6 +2723,13 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
+	if resp == nil {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		s.logger.Warn("immediate revert returned no response; durable request remains pending for apply owner retry",
+			apply.LogAttrs()...)
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
 	metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 
 	if resp.Accepted {
@@ -2807,6 +2885,13 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.logger.Warn("immediate skip-revert failed; durable request remains pending for apply owner retry",
 			append(apply.LogAttrs(), "error", err)...)
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+	if resp == nil {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
+		s.logger.Warn("immediate skip-revert returned no response; durable request remains pending for apply owner retry",
+			apply.LogAttrs()...)
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}

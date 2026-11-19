@@ -37,6 +37,18 @@ func previewLockKeptOutput() {
 	WriteLockKept("testapp", "mysql", "apply apply-a1b2c3d4 is stopped and can still be resumed")
 }
 
+func previewUnsubmittedLockNotReleasedOutput() {
+	WriteUnsubmittedLockKept("testapp", "mysql", fmt.Errorf("API error (500): internal error"))
+	fmt.Println()
+	fmt.Println("--- Nothing submitted, lock already released ---")
+	fmt.Println()
+	WriteUnsubmittedLockAlreadyReleased("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Nothing submitted, lock held by another owner ---")
+	fmt.Println()
+	WriteUnsubmittedLockHeldByAnotherOwner("testapp", "mysql")
+}
+
 func previewLocksListOutput() {
 	locks := []LockData{
 		{

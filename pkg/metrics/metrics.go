@@ -1471,6 +1471,7 @@ var knownRecoveredPanicOperations = map[string]bool{
 	"observer_poll":          true,
 	"grpc_handler":           true,
 	"target_probe":           true,
+	"quota_probe":            true,
 }
 
 // RecordRecoveredPanic increments the recovered-panic counter for a background
@@ -1585,13 +1586,17 @@ const (
 	GitHubOperationFetchDiff                     = "fetch_diff"
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
+	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
+	GitHubOperationFetchRateLimit                = "fetch_rate_limit"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
+	GitHubOperationListAppInstallations          = "list_app_installations"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
 	GitHubOperationListPRFiles                   = "list_pr_files"
 	GitHubOperationListReviews                   = "list_reviews"
@@ -1626,6 +1631,11 @@ const (
 	// operation is a genuine failure (a suspended App installation answers
 	// every token exchange with 404) and stays GitHubRequestStatusError.
 	GitHubRequestStatusNotFound = "not_found"
+	// GitHubRequestStatusNotModified marks conditional reads GitHub answered
+	// with HTTP 304 because the resource still matches the ETag SchemaBot
+	// sent. The caller reuses its stored copy, and GitHub does not count the
+	// request against the installation's primary rate limit.
+	GitHubRequestStatusNotModified = "not_modified"
 	// GitHubRequestStatusSuppressed marks write requests SchemaBot refused to
 	// send because the target repository is configured listen-only. They never
 	// reach GitHub and spend no rate limit, so they show what a deployment
@@ -1789,13 +1799,17 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchDiff,
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
+		GitHubOperationFetchBranchRules,
+		GitHubOperationGraphQLBranchProtection,
 		GitHubOperationFetchPullRequest,
+		GitHubOperationFetchRateLimit,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationGraphQLTreeEntries,
+		GitHubOperationListAppInstallations,
 		GitHubOperationListCheckRunsForRef,
 		GitHubOperationListPRFiles,
 		GitHubOperationListReviews,
@@ -1826,6 +1840,7 @@ func isKnownGitHubRequestStatus(status string) bool {
 	case GitHubRequestStatusCancelled,
 		GitHubRequestStatusError,
 		GitHubRequestStatusNotFound,
+		GitHubRequestStatusNotModified,
 		GitHubRequestStatusSuppressed,
 		GitHubRequestStatusTransportError,
 		GitHubRequestStatusSuccess,

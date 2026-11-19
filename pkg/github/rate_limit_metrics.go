@@ -199,10 +199,21 @@ type githubRoutePattern struct {
 }
 
 var githubRoutePatterns = []githubRoutePattern{
+	{method: http.MethodGet, path: "/repos/{owner}/{repo}/rules/branches/{branch...}", operation: metrics.GitHubOperationFetchBranchRules},
 	{
 		method:    http.MethodGet,
 		path:      "/app",
 		operation: metrics.GitHubOperationFetchAppSlug,
+	},
+	{
+		method:    http.MethodGet,
+		path:      "/app/installations",
+		operation: metrics.GitHubOperationListAppInstallations,
+	},
+	{
+		method:    http.MethodGet,
+		path:      "/rate_limit",
+		operation: metrics.GitHubOperationFetchRateLimit,
 	},
 	{
 		method:    http.MethodPost,
@@ -435,12 +446,16 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationFetchDiff,
 		metrics.GitHubOperationFetchFileContent,
 		metrics.GitHubOperationFetchGitTree,
+		metrics.GitHubOperationFetchBranchRules,
+		metrics.GitHubOperationGraphQLBranchProtection,
 		metrics.GitHubOperationFetchPullRequest,
+		metrics.GitHubOperationFetchRateLimit,
 		metrics.GitHubOperationGetCombinedStatus,
 		metrics.GitHubOperationGetTeam,
 		metrics.GitHubOperationGetTeamMembership,
 		metrics.GitHubOperationGraphQLStatusCheckRollup,
 		metrics.GitHubOperationGraphQLTreeEntries,
+		metrics.GitHubOperationListAppInstallations,
 		metrics.GitHubOperationListCheckRunsForRef,
 		metrics.GitHubOperationListPRFiles,
 		metrics.GitHubOperationListReviews,
@@ -457,6 +472,9 @@ func gitHubResponseStatus(resp *http.Response, operation string) string {
 	}
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		return metrics.GitHubRequestStatusSuccess
+	}
+	if resp.StatusCode == http.StatusNotModified {
+		return metrics.GitHubRequestStatusNotModified
 	}
 	// Only read operations get the not_found relabel: reads routinely probe
 	// paths whose expected answer is 404 (schemabot.yaml lookups, deleted

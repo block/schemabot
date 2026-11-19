@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -35,6 +34,10 @@ type LockReleaseRequest struct {
 // LockResponse is the response for lock operations.
 type LockResponse struct {
 	Lock *LockInfo `json:"lock,omitempty"`
+	// Created is set on an acquire that created the lock row it reports. It
+	// is false when the owner already held the lock, so a caller can tell a
+	// lock it took from one it found and release only the one it took.
+	Created bool `json:"created,omitempty"`
 }
 
 // LockInfo represents lock information in API responses.
@@ -62,7 +65,7 @@ type LockConflictResponse struct {
 // handleLockAcquire handles POST /api/locks/acquire.
 func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	var req LockAcquireRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
@@ -177,7 +180,7 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
 
-	s.writeJSON(w, http.StatusOK, LockResponse{Lock: lockToInfo(acquired)})
+	s.writeJSON(w, http.StatusOK, LockResponse{Lock: lockToInfo(acquired), Created: lockCreatedByAcquire(lock.ID, acquired)})
 }
 
 // writeLockReadBackFailed answers an acquire whose read of the lock afterwards
@@ -258,7 +261,7 @@ func lockCreatedByAcquire(createdID int64, acquired *storage.Lock) bool {
 // handleLockRelease handles DELETE /api/locks.
 func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	var req LockReleaseRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSONBody(r, &req); err != nil {
 		s.writeBodyDecodeError(w, err)
 		return
 	}

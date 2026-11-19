@@ -159,6 +159,25 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 		"stop closes the output:\n%s", out)
 }
 
+// A table copying on one target and complete on the other three carries its
+// planned size, summed across them, on its rows line beside the percent at a
+// single target's precision, the way the PR comment renders it. A completed
+// target counts in full even when its engine's row estimate ran ahead of the
+// rows it copied.
+func TestWriteProgress_TargetRollupRowsCarryTheTableSize(t *testing.T) {
+	sized := func(target rolloutTarget) rolloutTarget {
+		target.estimatedBytes = new(int64(1_000_000_000))
+		return target
+	}
+	completed := completedTarget()
+	completed.rowsCopied = 990
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{sized(copyingTarget(420)), sized(completed), sized(completed), sized(completed)}))
+
+	total := int64(4_000_000_000)
+	assert.Contains(t, out, "orders: "+ui.ProgressBarRowCopy(85)+" 85.50%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 3,420 / 4,000"+ui.FormatTableSizeClause(&total)+" · ETA: 2m 0s\n", "%s", out)
+}
+
 // A rollout no target has reported progress for yet has no table block to
 // list its targets under, so it counts them instead, the way the PR comment
 // says no details are available yet.
@@ -544,6 +563,23 @@ func TestWriteProgress_TargetRollupGroupsTablesByNamespace(t *testing.T) {
 	assertLess(t, out, "── billing ──", "ADD COLUMN `billing_region`")
 	assert.Equal(t, 1, strings.Count(out, "── orders ──"), "%s", out)
 	assert.Equal(t, 1, strings.Count(out, "── billing ──"), "%s", out)
+}
+
+// payments-001 and payments-002 alter `customers` while payments-003 and
+// payments-004 create it, and `orders` is copying on two targets. The running
+// CREATE copies no rows, so it reads as applying, never as copying, and the
+// two `customers` entries sit next to each other ahead of `orders`, so the
+// listing reads as the two tables the rollout changes.
+func TestWriteProgress_TargetRollupCreateAppliesAndListsBesideItsAlter(t *testing.T) {
+	out := renderRollout(t, mixedStatementsRolloutData())
+
+	assert.Contains(t, out, "• Targets: 2 (1 applying, 1 complete)", "%s", out)
+	assert.Contains(t, out, "◉ payments-004: applying", "%s", out)
+	assert.NotContains(t, out, "payments-004: copying", "%s", out)
+	assert.Contains(t, out, "• Targets: 4 (2 copying, 1 queued, 1 complete)", "the ALTER of orders still copies rows: %s", out)
+
+	assertLess(t, out, "CREATE TABLE `customers`", "ALTER TABLE `customers`")
+	assertLess(t, out, "ALTER TABLE `customers`", "ALTER TABLE `orders`")
 }
 
 // A table still in flight on any target reads as in flight, never as failed,

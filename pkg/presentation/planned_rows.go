@@ -1,6 +1,11 @@
 package presentation
 
-import "github.com/block/schemabot/pkg/state"
+import (
+	"fmt"
+
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
+)
 
 // CopyStillAhead reports whether a target whose engine has reported no row
 // total will still copy the table, so the plan's row estimate may stand in for
@@ -27,4 +32,17 @@ func PlannedRowsSpan(targets int) string {
 		return " on " + TargetNoun.Count(targets)
 	}
 	return " across " + TargetNoun.Count(targets)
+}
+
+// TargetsTableSizeClause is a table's planned size on the rows line of a
+// table rolled up across targets: " · ~575 GB". The size is every target's,
+// so beside rows that leave some targets out (partial) it names the full span
+// rather than reading as the reporting targets' size. Empty when the plan
+// did not size the table on every target.
+func TargetsTableSizeClause(estimatedBytes *int64, partial bool, targets int) string {
+	clause := ui.FormatTableSizeClause(estimatedBytes)
+	if clause == "" || !partial {
+		return clause
+	}
+	return fmt.Sprintf("%s across all %d targets", clause, targets)
 }

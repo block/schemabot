@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,11 +16,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/html"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -335,18 +338,28 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 	return nil
 }
 
-// ResponseReadError means the server started answering a read request and the
+// ResponseReadError means the server started answering a request and the
 // response body then failed before it was complete: the connection was reset,
 // an HTTP/2 stream was reset, or the read timed out. The server was reached,
 // so this is not a ConnectionError, and no complete answer arrived, so it is
 // not an APIError. The cause varies with the protocol in use, which is why
 // callers that poll match this type instead of the cause.
+//
+// Method and Path name the request when it was not a GET. The server received
+// it before its answer failed, so when the request changes something, such as
+// a stop, the message carries the same warning a ConnectionError does.
 type ResponseReadError struct {
-	Err error
+	Method string
+	Path   string
+	Err    error
 }
 
 func (e *ResponseReadError) Error() string {
-	return "read response: " + e.Err.Error()
+	msg := "read response: " + e.Err.Error()
+	if warning := effectOf(e.Method, e.Path).warning(); warning != "" {
+		msg += "\n" + warning
+	}
+	return msg
 }
 
 func (e *ResponseReadError) Unwrap() error {
@@ -373,7 +386,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return &ResponseReadError{Method: method, Path: path, Err: err}
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -419,7 +432,7 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return &ResponseReadError{Method: http.MethodPost, Path: path, Err: err}
 	}
 
 	// Control endpoints answer 202 Accepted when the request is durably
@@ -574,18 +587,202 @@ func (e *ConnectionError) Unwrap() error {
 	return e.Err
 }
 
+// message names the failure and its cause. A refused connection or an
+// unknown host never reached the server, so those keep their short messages.
+// Any other failure of a request that changes something, such as an apply or
+// a stop, may have happened after the server received it, so the message says
+// so and names the command that shows what the server did with that request.
+// A request that only reads, or one that failed before any of it was sent,
+// gets no such line.
 func (e *ConnectionError) message() string {
-	msg := e.Err.Error()
-	if strings.Contains(msg, "connection refused") {
+	if isConnectionRefused(e.Err) {
 		return fmt.Sprintf("cannot connect to %s (is the server running?)", e.Endpoint)
 	}
-	if strings.Contains(msg, "no such host") {
+	if isHostNotFound(e.Err) {
 		return fmt.Sprintf("cannot resolve host: %s", e.Endpoint)
 	}
-	if strings.Contains(msg, "timeout") {
-		return fmt.Sprintf("connection timeout: %s", e.Endpoint)
+	cause := ui.TerminalSafe(requestFailureCause(e.Err))
+	var msg string
+	if isTimeout(e.Err) {
+		msg = fmt.Sprintf("request to %s timed out: %s", e.Endpoint, cause)
+	} else {
+		msg = fmt.Sprintf("connection failed: %s: %s", e.Endpoint, cause)
 	}
-	return fmt.Sprintf("connection failed: %s", e.Endpoint)
+	if failedBeforeSending(e.Err) {
+		return msg
+	}
+	if warning := effectOf(failedRequest(e.Err)).warning(); warning != "" {
+		msg += "\n" + warning
+	}
+	return msg
+}
+
+// requestEffect says what a failed request may have left behind on the
+// server, which decides what the operator is told before sending it again.
+type requestEffect struct {
+	// changes is false for a request that only reads or computes an answer.
+	// Sending it again is safe, so its failure carries no warning.
+	changes bool
+	// check is the command that shows what the server did with the request,
+	// or "" when no single command shows it.
+	check string
+}
+
+var (
+	readsOnly             = requestEffect{}
+	changesWithoutCommand = requestEffect{changes: true}
+)
+
+// shownBy is the effect of a request whose result command shows.
+func shownBy(command string) requestEffect {
+	return requestEffect{changes: true, check: command}
+}
+
+// requestEffects classifies every API path the client sends with a method
+// other than GET. An apply or a control request shows up in status, a settings
+// update in settings, and a lock change in locks.
+var requestEffects = map[string]requestEffect{
+	// Reads that are POSTs because their input travels in the body. A plan
+	// stores a plan record, but sending it again starts nothing.
+	"/api/plan":                readsOnly,
+	"/api/pull":                readsOnly,
+	"/api/rollback/plan":       readsOnly,
+	"/api/storage/schema/plan": readsOnly,
+	"/api/checks/scan":         readsOnly,
+	"/api/checks/repos":        readsOnly,
+
+	"/api/apply":         shownBy("status"),
+	"/api/cutover":       shownBy("status"),
+	"/api/stop":          shownBy("status"),
+	"/api/cancel":        shownBy("status"),
+	"/api/start":         shownBy("status"),
+	"/api/release":       shownBy("status"),
+	"/api/revert":        shownBy("status"),
+	"/api/skip-revert":   shownBy("status"),
+	"/api/settings":      shownBy("settings"),
+	"/api/locks":         shownBy("locks"),
+	"/api/locks/acquire": shownBy("locks"),
+
+	// Changes that no single command shows.
+	"/api/checks/synthesize":    changesWithoutCommand,
+	"/api/webhooks/redrive":     changesWithoutCommand,
+	"/api/storage/schema/apply": changesWithoutCommand,
+}
+
+// effectOf returns what a request with this method to this path may change. A
+// GET or a HEAD changes nothing, and neither does a request whose method is
+// not known, since nothing says it changed anything. A path that is not
+// listed is treated as a change that no command shows, so a request nobody
+// classified still warns.
+func effectOf(method, path string) requestEffect {
+	if !changesServerState(method) {
+		return readsOnly
+	}
+	// The endpoint may carry a path of its own ahead of the API path.
+	if i := strings.LastIndex(path, "/api/"); i >= 0 {
+		path = path[i:]
+	}
+	if effect, ok := requestEffects[path]; ok {
+		return effect
+	}
+	return changesWithoutCommand
+}
+
+// warning is the line a failed request that changes something ends with, or
+// "" for one that only reads. It names the command that shows what the server
+// did, so the operator checks the thing they tried to change.
+func (e requestEffect) warning() string {
+	const warning = "The server may already have acted on this request."
+	switch {
+	case !e.changes:
+		return ""
+	case e.check == "":
+		return warning + " Check what it did before you send it again."
+	default:
+		return fmt.Sprintf("%s Run '%s' to check before you send it again.", warning, cliname.Command(e.check))
+	}
+}
+
+// changesServerState reports whether a request with this method can change
+// something on the server. The HTTP client records the method of a failed
+// request as "Post", not "POST", so the comparison ignores case.
+func changesServerState(method string) bool {
+	return method != "" && !strings.EqualFold(method, http.MethodGet) && !strings.EqualFold(method, http.MethodHead)
+}
+
+// failedRequest returns the method and URL path of the request the HTTP
+// client failed to complete, or two empty strings when the cause does not
+// name them.
+func failedRequest(err error) (method, path string) {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return "", ""
+	}
+	u, parseErr := url.Parse(urlErr.URL)
+	if parseErr != nil {
+		return urlErr.Op, ""
+	}
+	return urlErr.Op, u.Path
+}
+
+// failedBeforeSending reports whether the request failed before any of it was
+// sent, so the server cannot have acted on it: while opening the connection to
+// the server or to a proxy, or during the TLS handshake. The HTTP client
+// replaces the handshake error with its own text when a plain HTTP server
+// answers, so that case is matched by text.
+func failedBeforeSending(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect") {
+		return true
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return true
+	}
+	return strings.Contains(err.Error(), "server gave HTTP response to HTTPS client")
+}
+
+// isConnectionRefused reports whether the server's host refused the
+// connection. The text match covers causes that carry no errno, such as one
+// relayed by a proxy.
+func isConnectionRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(err.Error(), "connection refused")
+}
+
+// isHostNotFound reports whether the server's host name did not resolve. The
+// text match covers causes that carry no DNS error, such as one relayed by a
+// proxy.
+func isHostNotFound(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return true
+	}
+	return strings.Contains(err.Error(), "no such host")
+}
+
+// isTimeout reports whether the request ran out of time, whether the client's
+// own timeout or a network read or write deadline ended it.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// requestFailureCause returns the text of the underlying cause. The HTTP
+// client wraps it with the method and full URL, which the message already
+// names through the endpoint, so that wrapper is dropped.
+func requestFailureCause(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
 }
 
 // FormatConnectionError returns a ConnectionError wrapping the underlying cause.

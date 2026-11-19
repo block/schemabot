@@ -149,8 +149,10 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 		return fmt.Errorf("database is locked")
 	}
 
+	var lockCreated bool
 	err = withLoading("Acquiring database lock...", true, func() error {
-		_, lockErr := client.AcquireLock(ep, database, dbType, owner, "", 0)
+		var lockErr error
+		_, lockCreated, lockErr = client.AcquireLock(ep, database, dbType, owner, "", 0)
 		return lockErr
 	})
 	if errors.Is(err, client.ErrLockHeld) {
@@ -174,5 +176,8 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// none of them has a rollback plan. So showing this plan shows what runs
 	// on every member, though not which members those are.
 	_, err = applyAndWatch(ctx, ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
+	if err != nil && lockCreated && neverSubmitted(err) {
+		return releaseUnsubmittedLock(ep, database, dbType, owner, err)
+	}
 	return err
 }

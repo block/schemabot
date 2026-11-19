@@ -682,3 +682,158 @@ func TestUnverifiedScopedLockAcquireRefusalIsCountedAndLogged(t *testing.T) {
 	assert.Equal(t, "cli:bob@laptop", entry["owner"])
 	assert.Equal(t, "org/payments-service", entry["repository"])
 }
+
+// rowIDLockStore acquires the way storage does: insertedID is the ID the
+// acquire assigns to a row it inserts, zero when the owner already held the
+// lock, and the row read back afterwards carries storedID.
+type rowIDLockStore struct {
+	storage.LockStore
+	insertedID int64
+	storedID   int64
+}
+
+func (s *rowIDLockStore) Acquire(_ context.Context, lock *storage.Lock) error {
+	lock.ID = s.insertedID
+	return nil
+}
+
+func (s *rowIDLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	return &storage.Lock{ID: s.storedID, DatabaseName: database, DatabaseType: dbType, Owner: "cli:bob@laptop"}, nil
+}
+
+// An acquire says whether it took the lock or found it already held under the
+// same owner, so the CLI releases only a lock it took when its schema change
+// is never submitted. A row another request inserted under the same owner
+// while this acquire ran is one this acquire found.
+func TestLockAcquireReportsWhetherItCreatedTheLock(t *testing.T) {
+	tests := []struct {
+		name       string
+		insertedID int64
+		storedID   int64
+		created    bool
+	}{
+		{name: "the acquire inserted the row read back", insertedID: 7, storedID: 7, created: true},
+		{name: "the owner already held the lock", insertedID: 0, storedID: 7, created: false},
+		{name: "another request's row replaced the one this acquire inserted", insertedID: 7, storedID: 9, created: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &rowIDLockStore{insertedID: tc.insertedID, storedID: tc.storedID}
+			body := `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop"}`
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/locks/acquire", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			newLockTestServer(store).ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			var resp LockResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			require.NotNil(t, resp.Lock)
+			assert.Equal(t, "payments", resp.Lock.Database)
+			assert.Equal(t, tc.created, resp.Created)
+		})
+	}
+}
+
+// A lock request body holds one JSON value. Anything after it but white space
+// is refused before anything changes, so a second object carrying "force", or
+// a value followed by stray text, is never acted on as if only its first part
+// had been sent.
+func TestLockRequestsRejectDataAfterTheJSONValue(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+	const ownerRelease = `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop"}`
+
+	release := func(t *testing.T, body string) (*httptest.ResponseRecorder, *memoryLockStore) {
+		t.Helper()
+		locks := &memoryLockStore{lock: paymentsLock(7, "cli:bob@laptop", nil)}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		return scopedDenialRequest(t, svc.handleLockRelease, admin, http.MethodDelete, "/api/locks", body), locks
+	}
+
+	refused := []struct {
+		name string
+		body string
+	}{
+		{name: "a second object", body: ownerRelease + `{"force":true}`},
+		{name: "a second object on its own line", body: ownerRelease + "\n" + `{"force":true}`},
+		{name: "stray text", body: `{"database":"payments","database_type":"mysql","force":true} xx`},
+		{name: "a value that is cut short", body: ownerRelease + `{"force":`},
+	}
+	for _, tt := range refused {
+		t.Run("release followed by "+tt.name+" is refused", func(t *testing.T) {
+			rec, locks := release(t, tt.body)
+
+			assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+			assert.Contains(t, rec.Body.String(), "invalid request body: the body must hold one JSON value, but more data follows it")
+			assert.Equal(t, paymentsLock(7, "cli:bob@laptop", nil), locks.lock, "the lock stays held")
+		})
+	}
+
+	t.Run("release followed by white space is carried out", func(t *testing.T) {
+		rec, locks := release(t, ownerRelease+" \r\n\t")
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Nil(t, locks.lock, "the lock is released")
+	})
+
+	t.Run("acquire followed by a second object is refused", func(t *testing.T) {
+		locks := &memoryLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockAcquire, admin, http.MethodPost, "/api/locks/acquire",
+			`{"database":"payments","database_type":"mysql","owner":"cli:alice@laptop"}{"repository":"org/payments-service"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "more data follows it")
+		assert.Nil(t, locks.lock, "no lock is taken")
+	})
+}
+
+// A body that runs past the request body limit after its JSON value is
+// answered as too large, with the limit, the same as one that runs past it
+// inside the value.
+func TestLockReleaseBodyOverTheLimitAfterItsJSONValueIsTooLarge(t *testing.T) {
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop"}` + strings.Repeat(" ", maxAPIRequestBodyBytes)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodDelete, "/api/locks", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "request body exceeds the 32 MiB limit")
+}
+
+// A misspelt field in a lock request is refused before anything changes. A
+// tolerant decode would drop "forcce" and fall through to an owner release
+// the caller did not ask for, or take a lock without the field they meant.
+func TestLockRequestsRejectUnknownFields(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	admin := &auth.User{Subject: "alice", Groups: []string{"schema-admins"}}
+
+	t.Run("release", func(t *testing.T) {
+		held := paymentsLock(7, "cli:bob@laptop", nil)
+		locks := &memoryLockStore{lock: paymentsLock(7, "cli:bob@laptop", nil)}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockRelease, admin, http.MethodDelete, "/api/locks",
+			`{"database":"payments","database_type":"mysql","forcce":true}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), `unknown field \"forcce\"`)
+		assert.Equal(t, held, locks.lock, "the lock stays held")
+	})
+
+	t.Run("acquire", func(t *testing.T) {
+		locks := &memoryLockStore{}
+		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
+		rec := scopedDenialRequest(t, svc.handleLockAcquire, admin, http.MethodPost, "/api/locks/acquire",
+			`{"database":"payments","database_type":"mysql","owner":"cli:alice@laptop","repo":"org/payments-service"}`)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), `unknown field \"repo\"`)
+		assert.Nil(t, locks.lock, "no lock is taken")
+	})
+}

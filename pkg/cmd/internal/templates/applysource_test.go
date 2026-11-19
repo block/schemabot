@@ -77,6 +77,29 @@ func TestCallerAndSourceBoxRows(t *testing.T) {
 	})
 }
 
+// Whoever starts an apply chooses its caller, and every operator who lists or
+// opens that apply has it printed to their terminal. The status list's SOURCE
+// column and the detail box's Caller row show it with its control runes
+// removed and on one line.
+func TestCallerDropsTerminalEscapes(t *testing.T) {
+	t.Run("the status list shows a CLI caller cleaned", func(t *testing.T) {
+		assert.Equal(t, "cli:jdoe"+lineAttackCleaned, applySource("cli:jdoe"+lineAttack+"@macbook.local"))
+	})
+
+	t.Run("the detail box shows a CLI caller cleaned", func(t *testing.T) {
+		rows := callerAndSourceBoxRows("cli:jdoe"+lineAttack+"@macbook.local", "")
+		assert.Equal(t, []BoxRow{{"Caller", "cli:jdoe" + lineAttackCleaned + "@macbook.local"}}, rows)
+	})
+
+	t.Run("the detail box shows a webhook caller's short form cleaned", func(t *testing.T) {
+		rows := callerAndSourceBoxRows("github:octo"+lineAttack+"cat@acme/shop#412", "")
+		assert.Equal(t, []BoxRow{
+			{"Caller", "github:octo" + lineAttackCleaned + "cat"},
+			{"Source", "https://github.com/acme/shop/pull/412"},
+		}, rows)
+	})
+}
+
 // On an interactive terminal the PR provenance renders as the short
 // "owner/repo#pr" hyperlinked to the PR, so wide URLs stop dominating the
 // table while staying clickable. Everywhere else (pipes, logs) the full URL

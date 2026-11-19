@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
-	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
@@ -148,8 +147,8 @@ func (p baselinePolicy) exclusionReason(table string) string {
 	if p.ignoredTables.Withholds(table) {
 		return engine.ExemptReasonIgnoreTables
 	}
-	if p.skipUndeclaredArchiveTables && !p.declaredTables[table] && spirittable.IsArchiveTable(table) {
-		return exemptReasonArchiveNaming
+	if p.skipUndeclaredArchiveTables && !p.declaredTables[table] && engine.IsArchiveTable(table) {
+		return engine.ExemptReasonArchiveNaming
 	}
 	return ""
 }

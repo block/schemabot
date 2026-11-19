@@ -159,8 +159,9 @@ func setupFakeGitHubForPlanComments(t *testing.T) (*ghclient.InstallationClient,
 				SHA: new(fake.currentHead()),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("basesha"),
+				Ref:  new("main"),
+				SHA:  new("basesha"),
+				Repo: &gh.Repository{DefaultBranch: new("main")},
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -590,14 +591,9 @@ func TestPlanCommentMinimizeFailureRetriesOnNextSupersede(t *testing.T) {
 	assert.Equal(t, []string{"shaC"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"))
 }
 
-// TestPlanCommentPostForStaleHeadRetiresNothing covers the concurrent-push
-// safety of the post-path sweep: a push can land while the plan that produced
-// a comment was still running, so the comment posts for a head the PR has
-// already moved past. Its sweep must not retire anything — retiring cross-head
-// priors anchored to the stale head could take down the current head's live
-// comment with nothing replacing it. The current head's own plan outcome
-// sweeps the slot instead, including the stale comment.
-func TestPlanCommentPostForStaleHeadRetiresNothing(t *testing.T) {
+// A plan for an older head is suppressed before posting. Existing comments
+// remain available until the current head's own plan outcome supersedes them.
+func TestStalePlanCommentPreservesExistingComments(t *testing.T) {
 	const repo = "org/plan-retire-stale-post"
 	h, st, fake := setupPlanCommentHandler(t, repo, true)
 
@@ -613,8 +609,9 @@ func TestPlanCommentPostForStaleHeadRetiresNothing(t *testing.T) {
 
 	assert.Empty(t, fake.deletedCommentIDs(), "a stale-head post must not retire other comments")
 	assert.Empty(t, fake.minimizedNodes())
-	assert.ElementsMatch(t, []string{"sha1", "shaOld"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"),
-		"every comment stays expanded until the current head's own sweep")
+	assert.Equal(t, 0, fake.createCount(), "a stale plan is not posted")
+	assert.Equal(t, []string{"sha1"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"),
+		"the existing comment stays expanded until the current head's own plan")
 }
 
 // TestPlanCommentSweepSkipsRowsPostedAfterAnchor covers the ordering guard on

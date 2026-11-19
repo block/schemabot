@@ -317,6 +317,10 @@ type CheckStore interface {
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
 	Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*Check, error)
 
+	// GetAggregateRender returns the AggregateRender the row was last upserted
+	// with, or nil when the row is missing or none is stored.
+	GetAggregateRender(ctx context.Context, repo string, pr int, environment, dbType, database string) ([]byte, error)
+
 	// GetByCheckRunID returns stored check state by GitHub's check run ID, or nil if not found.
 	// Used for handling check_run webhooks from GitHub.
 	GetByCheckRunID(ctx context.Context, checkRunID int64) (*Check, error)
@@ -1393,6 +1397,12 @@ type TaskStore interface {
 	// and resumable. A state outside the terminal set, including an unknown one,
 	// is returned. Callers that act only on unsettled work read this instead of
 	// GetByDatabase, whose cost grows with the database's whole task history.
+	//
+	// The filter compares the stored state, and a returned task carries the
+	// normalized one. A row stored under an engine's own name for a terminal
+	// state is therefore returned and reads as terminal, so a caller that must
+	// act only on unsettled work still checks state.IsTerminalTaskState on the
+	// tasks it gets.
 	GetNonTerminalByDatabase(ctx context.Context, database string) ([]*Task, error)
 
 	// GetActive returns all tasks in non-terminal states.

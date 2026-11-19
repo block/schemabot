@@ -92,21 +92,26 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			// The counts describe the change summary, so they are kept with it.
 			{Column: "rollout_targets", Expr: "CASE WHEN COALESCE(" + s.dialect.ExcludedValue("change_summary") + ", '') = '' THEN checks.rollout_targets ELSE " + s.dialect.ExcludedValue("rollout_targets") + " END"},
 			{Column: "rollout_targets_with_work", Expr: "CASE WHEN COALESCE(" + s.dialect.ExcludedValue("change_summary") + ", '') = '' THEN checks.rollout_targets_with_work ELSE " + s.dialect.ExcludedValue("rollout_targets_with_work") + " END"},
+			{Column: "aggregate_render"},
 			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
 		},
 	)
+	var aggregateRender any
+	if len(check.AggregateRender) > 0 {
+		aggregateRender = string(check.AggregateRender)
+	}
 	return withLockRetry(ctx, s.classifier, op, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO checks (
 				repository, pull_request, head_sha,
 				environment, database_type, database_name,
 				check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message, change_summary,
-				rollout_targets, rollout_targets_with_work
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				rollout_targets, rollout_targets_with_work, aggregate_render
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			`+upsert, check.Repository, check.PullRequest, check.HeadSHA,
 			check.Environment, check.DatabaseType, check.DatabaseName,
 			checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
-			check.RolloutTargets, check.RolloutTargetsWithWork)
+			check.RolloutTargets, check.RolloutTargetsWithWork, aggregateRender)
 		return err
 	})
 }
@@ -927,6 +932,32 @@ func (s *checkStore) Get(ctx context.Context, repo string, pr int, environment, 
 	`, repo, pr, environment, dbType, database)
 
 	return scanCheck(row)
+}
+
+// GetAggregateRender returns the stored aggregate render, or nil when none is
+// stored.
+func (s *checkStore) GetAggregateRender(ctx context.Context, repo string, pr int, environment, dbType, database string) ([]byte, error) {
+	repo = storage.CanonicalKey(repo)
+	environment = storage.CanonicalKey(environment)
+	dbType = storage.CanonicalKey(dbType)
+	database = storage.CanonicalKey(database)
+	var render sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT aggregate_render
+		FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+	`, repo, pr, environment, dbType, database).Scan(&render)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load aggregate render for %s#%d %s: %w", repo, pr, environment, err)
+	}
+	if !render.Valid {
+		return nil, nil
+	}
+	return []byte(render.String), nil
 }
 
 // GetByCheckRunID returns a check by GitHub's check run ID, or nil if not found.

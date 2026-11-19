@@ -276,8 +276,9 @@ bad RPC must never take the server process down with it. The panic value stays s
 caller gets a fixed internal error, never the panic text or a stack. *Enforced:* the recover
 boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
 (`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`), local drives
-(`pkg/tern/local_apply.go`), and the startup target probe (`pkg/serve/serve.go`
-around enumeration, `pkg/targetprobe/targetprobe.go` around each target); the contained drive
+(`pkg/tern/local_apply.go`), the startup target probe (`pkg/serve/serve.go`
+around enumeration, `pkg/targetprobe/targetprobe.go` around each target), and the GitHub quota
+probe (`pkg/github/quota_probe.go` around the installation list and each budget read); the contained drive
 panic becomes a permanent `failed` in `failClaimedApplyAfterDrivePanic` (`pkg/api/operator.go`).
 
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
@@ -296,7 +297,8 @@ fields they do not recognize, because there an unknown field is a caller's mista
 operator's typo rather than a peer on a different release, and ignoring it would swallow intent.
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
 ([release.md](release.md)); strict decoding on the HTTP API handlers
-(`pkg/api/control_handlers.go`, `pkg/api/plan_handlers.go`) and on config load
+(`pkg/api/control_handlers.go`, `pkg/api/lock_handlers.go`, `pkg/api/plan_handlers.go`,
+`pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`) and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
@@ -781,6 +783,18 @@ multi-environment plans in `pkg/webhook/plan.go` on each refusal `planRefusedByN
 names), or, when that row cannot be stored, a failing aggregate carrying the same block, which only
 the auto-plan guards release (`failClosedOnNamespacePlacement` and `handleMultiEnvPlan` in
 `pkg/webhook/plan.go`).
+
+### MG-13: Branch exclusion never creates validation
+
+New PR plans, apply commands, and Check Run publication require an eligible target.
+Exclusion never produces a passing, neutral, or skipped result, and uncertainty
+never authorizes omission of required validation. Earlier results and accepted
+applies remain authoritative through a target change.
+*Enforced:* effective-target and protection discovery (`pkg/github/pr_target.go`);
+shared command and recovery policy (`pkg/webhook/pr_target.go`); auto-plan and
+aggregate publishers (`pkg/webhook/pull_request.go`, `pkg/webhook/check_publisher.go`);
+fresh-snapshot and uncached apply-acceptance gates (`pkg/webhook/apply_handlers.go`,
+`pkg/webhook/apply_execute.go`).
 
 ## Apply state machine (ST)
 
@@ -1679,6 +1693,17 @@ statement count. *Enforced:* the shared plan counter and summary renderer
 (`pkg/ui/plan_summary.go`); each surface's statement selection (`RenderedTables` in
 `pkg/apitypes/apitypes.go`, `keyspaceStatements` in `pkg/webhook/templates/plan.go`), and the
 multi-environment CLI deduplication fingerprint (`planFingerprint` in `pkg/cmd/commands/plan.go`).
+
+### UX-7: A table's copy progress across targets reads the same on every surface
+
+While a rollout is copying a table on several targets, the table has one reading of its progress:
+the percent beside its bar, the rows copied of the rows to copy, how many targets those rows cover,
+its planned size, and whether its ETA is a floor. That reading is derived once from the targets'
+progress and rendered by the CLI and the PR comment alike, so the two never disagree about how far
+one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
+`AcrossTargetsPercent`, and `TargetsTableSizeClause` in `pkg/presentation`), and a test that
+renders the same rollouts through both surfaces and fails when they read differently
+(`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
 
 ## Recovery (RC)
 
