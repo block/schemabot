@@ -1463,6 +1463,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
+	handlerOpts = append(handlerOpts, synchronizeQuietPeriodOptions(logger)...)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
@@ -1554,6 +1555,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
+	handlerOpts = append(handlerOpts, synchronizeQuietPeriodOptions(logger)...)
 	handler := webhook.NewHandlerWithDispatch(
 		svc,
 		ghclient.NewClientSet(clients),
@@ -1653,6 +1655,46 @@ func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookbac
 		}
 	}
 	return maxPages, lookback
+}
+
+// synchronizeQuietPeriodOptions returns the handler option that defers durable
+// synchronize deliveries by WEBHOOK_SYNCHRONIZE_QUIET_PERIOD (a Go duration
+// such as 15s), so a burst of pushes to one PR plans only its newest head.
+// Unset keeps webhook.DefaultSynchronizeQuietPeriod; 0 turns the deferral
+// off and plans every push as soon as it arrives. Like the scan bounds, this
+// is tuning with no safe direction to fail in, so a malformed or negative
+// value is logged and ignored and the default stays in force.
+func synchronizeQuietPeriodOptions(logger *slog.Logger) []webhook.HandlerOption {
+	period := parseSynchronizeQuietPeriod(logger)
+	if period == 0 {
+		logger.Info("synchronize quiet period disabled by WEBHOOK_SYNCHRONIZE_QUIET_PERIOD; every push will be planned as soon as it arrives")
+		return nil
+	}
+	logger.Info("synchronize deliveries will wait out a quiet period before planning, so a later push in the same burst supersedes them",
+		"quiet_period", period)
+	return []webhook.HandlerOption{webhook.WithSynchronizeQuietPeriod(period)}
+}
+
+// parseSynchronizeQuietPeriod reads WEBHOOK_SYNCHRONIZE_QUIET_PERIOD,
+// returning the default when it is unset or rejected and zero when the
+// operator turned the quiet period off.
+func parseSynchronizeQuietPeriod(logger *slog.Logger) time.Duration {
+	value := os.Getenv("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD")
+	if value == "" {
+		return webhook.DefaultSynchronizeQuietPeriod
+	}
+	switch parsed, err := time.ParseDuration(value); {
+	case err != nil:
+		logger.Error("invalid WEBHOOK_SYNCHRONIZE_QUIET_PERIOD value; the default synchronize quiet period stays in force",
+			"value", value, "default", webhook.DefaultSynchronizeQuietPeriod, "error", err)
+		return webhook.DefaultSynchronizeQuietPeriod
+	case parsed < 0:
+		logger.Error("WEBHOOK_SYNCHRONIZE_QUIET_PERIOD must not be negative; the default synchronize quiet period stays in force",
+			"value", value, "default", webhook.DefaultSynchronizeQuietPeriod)
+		return webhook.DefaultSynchronizeQuietPeriod
+	default:
+		return parsed
+	}
 }
 
 // checkSuiteRecoveryOptions returns the handler option enabling durable

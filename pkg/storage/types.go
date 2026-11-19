@@ -2990,6 +2990,13 @@ var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
 // always run.
 const PullRequestClosedAction = "closed"
 
+// PullRequestSynchronizeAction is the pull_request action GitHub delivers when
+// new commits are pushed to a PR's head branch, force-pushes included. It is
+// the only action whose payload names the head it replaced (the before SHA),
+// so it is the only delivery that can prove an older delivery's head stale
+// from storage alone (SupersedeIfPushedPast).
+const PullRequestSynchronizeAction = "synchronize"
+
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a
 // series is always present even when a state is momentarily empty.
@@ -3039,6 +3046,7 @@ type WebhookEvent struct {
 	Repository     string
 	PullRequest    int
 	HeadSHA        string
+	BeforeSHA      string // the head a synchronize push replaced; empty for other actions and synthesized deliveries
 	TenantID       string
 	Payload        []byte
 	State          string

@@ -529,6 +529,26 @@ type WebhookEventStore interface {
 	// auto-plan-only guard on the updated row enforces.
 	SupersedeIfCovered(ctx context.Context, event *WebhookEvent) (bool, error)
 
+	// SupersedeIfPushedPast marks a claimed auto-plannable pull_request event
+	// superseded when a later push provably moved the PR's head off the
+	// claimed head, and returns the delivery that superseded it, or nil when
+	// none qualifies. Unlike SupersedeIfCovered it needs no live-PR
+	// confirmation, because the successor itself proves push order: it is a
+	// synchronize delivery (PullRequestSynchronizeAction) for the same
+	// (provider, repository, pull request) whose BeforeSHA is the claimed
+	// head and whose HeadSHA differs from it. The successor also comes after
+	// the claimed row in (received_at, id) order, so an operator Redeliver
+	// of the claimed row (which refreshes its received_at) still wins, while
+	// two pushes received within one tick of the timestamp precision still
+	// coalesce; the order is strict, so no two rows supersede each other.
+	// As in SupersedeIfCovered, the successor covers only while its own work
+	// will run, is running, or has run.
+	// The claimed row must carry a head SHA, and the write is guarded by its
+	// lease token and processing state, returning ErrWebhookEventLeaseLost /
+	// ErrWebhookEventNotFound like the other lease-guarded writes. Closed
+	// deliveries and non-pull_request rows are never superseded.
+	SupersedeIfPushedPast(ctx context.Context, event *WebhookEvent) (*WebhookEvent, error)
+
 	// FindNext atomically claims one pending, retryable, or lease-expired event.
 	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
 	// lease expiry in the same transaction. A pending row with a future
@@ -547,7 +567,8 @@ type WebhookEventStore interface {
 	// at its original insertion position once due — ahead of rows created
 	// during its deferral — not at its due time. Stale auto-plan claims are
 	// coalesced after the claim, not here: for each claimed auto-plannable
-	// pull_request event the driver probes HasCoveringSuccessor, confirms
+	// pull_request event the driver first tries SupersedeIfPushedPast, which
+	// needs no GitHub call; otherwise it probes HasCoveringSuccessor, confirms
 	// against the live PR that the claimed head is no longer current, and
 	// only then calls SupersedeIfCovered.
 	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)

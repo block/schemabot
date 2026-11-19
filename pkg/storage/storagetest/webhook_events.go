@@ -1063,6 +1063,235 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		assert.True(t, superseded, "the redelivered row's live claim must cover the older delivery")
 	})
 
+	// newPushEvent builds a synchronize delivery whose push moved the PR's
+	// head from beforeSHA to headSHA.
+	newPushEvent := func(deliveryID string, pr int, beforeSHA, headSHA string, receivedAt time.Time) *storage.WebhookEvent {
+		event := newPullRequestEvent(deliveryID, storage.PullRequestSynchronizeAction, pr, headSHA, receivedAt)
+		event.BeforeSHA = beforeSHA
+		return event
+	}
+
+	// A later push that names the claimed head as the head it replaced proves
+	// the claimed head stale, so the claim is superseded from storage alone
+	// and the write reports which delivery superseded it. The newest push has
+	// no such successor and keeps its claim.
+	t.Run("SupersedeIfPushedPast_DiscardsHeadALaterPushReplaced", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		claimed := claimOldAgainstSuccessor(t, store, newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC()))
+		successor, err := store.WebhookEvents().SupersedeIfPushedPast(ctx, claimed)
+		require.NoError(t, err)
+		require.NotNil(t, successor)
+		assert.Equal(t, "new", successor.DeliveryID)
+		assert.Equal(t, "new-head", successor.HeadSHA)
+		assert.Equal(t, storage.WebhookEventSuperseded, claimed.State, "the claimed struct must reflect the supersede")
+
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "old")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, storage.WebhookEventSuperseded, got.State)
+		assert.NotNil(t, got.CompletedAt)
+
+		claimedNew := claimExpecting(t, store, "new")
+		assert.Equal(t, "old-head", claimedNew.BeforeSHA, "the before SHA must round-trip through storage")
+		successor, err = store.WebhookEvents().SupersedeIfPushedPast(ctx, claimedNew)
+		require.NoError(t, err)
+		assert.Nil(t, successor)
+		got, err = store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "new")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, storage.WebhookEventProcessing, got.State, "the newest push must keep its claim")
+	})
+
+	// Two pushes received within one tick of the timestamp precision still
+	// coalesce: insertion order breaks the tie, and the order is strict, so
+	// the later push never treats the earlier one as its own successor.
+	t.Run("SupersedeIfPushedPast_OrdersEqualTimestampsByInsertion", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		receivedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+		createEvent(t, store, newPushEvent("first", 7, "base-head", "head-1", receivedAt))
+		createEvent(t, store, newPushEvent("second", 7, "head-1", "head-2", receivedAt))
+		claimed := claimExpecting(t, store, "first")
+		successor, err := store.WebhookEvents().SupersedeIfPushedPast(ctx, claimed)
+		require.NoError(t, err)
+		require.NotNil(t, successor)
+		assert.Equal(t, "second", successor.DeliveryID)
+
+		claimedSecond := claimExpecting(t, store, "second")
+		successor, err = store.WebhookEvents().SupersedeIfPushedPast(ctx, claimedSecond)
+		require.NoError(t, err)
+		assert.Nil(t, successor)
+	})
+
+	// Only a push that provably replaced the claimed head supersedes it:
+	// arrival order, another head, another PR, or a non-push action is not
+	// proof, so in each case the claim stays processing for the
+	// GitHub-confirmed coalescing check and normal processing.
+	t.Run("SupersedeIfPushedPast_RequiresProofTheClaimedHeadWasReplaced", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			successor *storage.WebhookEvent
+		}{
+			{"push from another head", newPushEvent("new", 7, "other-head", "new-head", time.Now().UTC())},
+			{"push for another PR", newPushEvent("new", 8, "old-head", "new-head", time.Now().UTC())},
+			{"push that arrived earlier", newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC().Add(-time.Hour))},
+			{"push that kept the claimed head", newPushEvent("new", 7, "old-head", "old-head", time.Now().UTC())},
+			{"reopened delivery naming the claimed head", func() *storage.WebhookEvent {
+				event := newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC())
+				event.Action = "reopened"
+				return event
+			}()},
+			{"check_run row naming the claimed head", func() *storage.WebhookEvent {
+				event := newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC())
+				event.Event = "check_run"
+				return event
+			}()},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+
+				createEvent(t, store, newPullRequestEvent("old", "synchronize", 7, "old-head", time.Now().UTC().Add(-time.Minute)))
+				createEvent(t, store, tc.successor)
+				claimed := claimExpecting(t, store, "old")
+				successor, err := store.WebhookEvents().SupersedeIfPushedPast(ctx, claimed)
+				require.NoError(t, err)
+				assert.Nil(t, successor)
+
+				got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "old")
+				require.NoError(t, err)
+				require.NotNil(t, got)
+				assert.Equal(t, storage.WebhookEventProcessing, got.State)
+			})
+		}
+	})
+
+	// A later push supersedes the claim only while its own work will run,
+	// is running, or has run. A push that terminally failed or was itself
+	// superseded never plans, so discarding the claim on its strength could
+	// leave the PR unplanned.
+	t.Run("SupersedeIfPushedPast_IgnoresPushThatWillNotRun", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			// terminate drives the pending "new" push to a state whose work
+			// will never run.
+			terminate func(t *testing.T, store storage.Storage)
+		}{
+			{"terminally failed", func(t *testing.T, store storage.Storage) {
+				claimed := claimExpecting(t, store, "new")
+				require.NoError(t, store.WebhookEvents().MarkFailed(t.Context(), claimed.ID, claimed.LeaseToken, "failed", nil))
+			}},
+			{"dead-lettered", func(t *testing.T, store storage.Storage) {
+				claimed := claimExpecting(t, store, "new")
+				require.NoError(t, store.WebhookEvents().MarkFailedPermanent(t.Context(), claimed.ID, claimed.LeaseToken, "failed"))
+			}},
+			{"superseded", func(t *testing.T, store storage.Storage) {
+				createEvent(t, store, newPushEvent("newest", 7, "new-head", "newest-head", time.Now().UTC().Add(time.Second)))
+				claimed := claimExpecting(t, store, "new")
+				successor, err := store.WebhookEvents().SupersedeIfPushedPast(t.Context(), claimed)
+				require.NoError(t, err)
+				require.NotNil(t, successor)
+				// Finish the push that superseded it so the next claim lands
+				// on the older delivery under test.
+				newest := claimExpecting(t, store, "newest")
+				require.NoError(t, store.WebhookEvents().MarkCompleted(t.Context(), newest.ID, newest.LeaseToken))
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+
+				// The successor is inserted first so it can be driven to its
+				// terminal state before the older-received claim is taken.
+				createEvent(t, store, newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC()))
+				tc.terminate(t, store)
+				createEvent(t, store, newPullRequestEvent("old", "synchronize", 7, "old-head", time.Now().UTC().Add(-time.Minute)))
+				claimed := claimExpecting(t, store, "old")
+				successor, err := store.WebhookEvents().SupersedeIfPushedPast(ctx, claimed)
+				require.NoError(t, err)
+				assert.Nil(t, successor, "a push that will not run must not supersede older work")
+			})
+		}
+	})
+
+	// A claimed closed delivery's cleanup must always run, so a later push
+	// never supersedes it.
+	t.Run("SupersedeIfPushedPast_NeverSupersedesClosed", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		createEvent(t, store, newPullRequestEvent("closed-old", storage.PullRequestClosedAction, 7, "old-head", time.Now().UTC().Add(-time.Minute)))
+		createEvent(t, store, newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC()))
+		claimed := claimExpecting(t, store, "closed-old")
+		successor, err := store.WebhookEvents().SupersedeIfPushedPast(ctx, claimed)
+		require.NoError(t, err)
+		assert.Nil(t, successor, "a closed delivery must never be superseded")
+
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "closed-old")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, storage.WebhookEventProcessing, got.State)
+	})
+
+	// An operator Redeliver of a superseded delivery reopens it with a fresh
+	// received_at, so the push that superseded it once cannot discard the
+	// operator's explicit request again.
+	t.Run("SupersedeIfPushedPast_RedeliveryWins", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		claimed := claimOldAgainstSuccessor(t, store, newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC().Add(-5*time.Second)))
+		successor, err := store.WebhookEvents().SupersedeIfPushedPast(ctx, claimed)
+		require.NoError(t, err)
+		require.NotNil(t, successor)
+
+		inserted, err := store.WebhookEvents().Create(ctx, newPullRequestEvent("old", "synchronize", 7, "old-head", time.Time{}))
+		require.NoError(t, err)
+		require.True(t, inserted)
+		reclaimed := claimExpecting(t, store, "old")
+		successor, err = store.WebhookEvents().SupersedeIfPushedPast(ctx, reclaimed)
+		require.NoError(t, err)
+		assert.Nil(t, successor, "a push that predates the redelivery must not supersede it")
+	})
+
+	// SupersedeIfPushedPast is a lease-guarded write: a stale token reports
+	// the lost lease, and a claim without a lease token, the coalescing key,
+	// or a head SHA is rejected.
+	t.Run("SupersedeIfPushedPast_GuardsLeaseAndInputs", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		claimed := claimOldAgainstSuccessor(t, store, newPushEvent("new", 7, "old-head", "new-head", time.Now().UTC()))
+
+		missingToken := *claimed
+		missingToken.LeaseToken = ""
+		_, err := store.WebhookEvents().SupersedeIfPushedPast(ctx, &missingToken)
+		require.ErrorContains(t, err, "lease token is required")
+
+		missingHead := *claimed
+		missingHead.HeadSHA = ""
+		_, err = store.WebhookEvents().SupersedeIfPushedPast(ctx, &missingHead)
+		require.ErrorContains(t, err, "repository, pull request, and head SHA are required")
+
+		missingKey := *claimed
+		missingKey.Repository = ""
+		_, err = store.WebhookEvents().SupersedeIfPushedPast(ctx, &missingKey)
+		require.ErrorContains(t, err, "repository, pull request, and head SHA are required")
+
+		staleToken := *claimed
+		staleToken.LeaseToken = "some-other-driver's-token"
+		_, err = store.WebhookEvents().SupersedeIfPushedPast(ctx, &staleToken)
+		require.ErrorIs(t, err, storage.ErrWebhookEventLeaseLost)
+
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "old")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, storage.WebhookEventProcessing, got.State, "a stale token must not supersede the row")
+	})
+
 	// InboxStats gives operators a steady-state view of the durable inbox:
 	// every canonical state is present (zero when empty), the backlog age
 	// tracks the oldest ready-to-claim row, and a deferred row is not backlog
@@ -1382,6 +1611,15 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		event.ID = 1
 		event.LeaseToken = "token"
 		_, err := store.WebhookEvents().SupersedeIfCovered(t.Context(), event)
+		require.Error(t, err)
+	})
+
+	t.Run("SupersedeIfPushedPast_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		event := newEvent("delivery-error")
+		event.ID = 1
+		event.LeaseToken = "token"
+		_, err := store.WebhookEvents().SupersedeIfPushedPast(t.Context(), event)
 		require.Error(t, err)
 	})
 

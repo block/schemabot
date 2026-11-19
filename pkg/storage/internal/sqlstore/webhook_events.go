@@ -15,7 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const webhookEventColumns = `id, provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
+const webhookEventColumns = `id, provider, delivery_id, event, action, repository, pull_request, head_sha, before_sha, tenant_id,
 	payload, state, attempts, lease_owner, lease_token, lease_expires_at, retry_after, last_error,
 	received_at, started_at, completed_at, created_at, updated_at`
 
@@ -66,10 +66,10 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	// without holding the delivery outside the inbox.
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO webhook_events (
-			provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
+			provider, delivery_id, event, action, repository, pull_request, head_sha, before_sha, tenant_id,
 			payload, state, attempts, retry_after, received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.BeforeSHA, event.TenantID,
 		payload, state, event.Attempts, nullTimePtr(event.RetryAfter), receivedAt)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
@@ -256,13 +256,11 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 // write can never drift apart on what counts as a covering successor.
 func (s *webhookEventStore) coveringSuccessorQuery(provider string, event *storage.WebhookEvent) (string, []any) {
 	autoPlanIn := placeholders(len(storage.AutoPlanPullRequestActions))
+	willRun, willRunArgs := s.successorWorkWillRunPredicate()
 	args := []any{provider, event.Repository, event.PullRequest, event.ReceivedAt}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
-	args = append(args,
-		storage.PullRequestClosedAction,
-		storage.WebhookEventPending, storage.WebhookEventCompleted,
-		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
-		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	args = append(args, storage.PullRequestClosedAction)
+	args = append(args, willRunArgs...)
 	query := `
 		SELECT 1
 		FROM webhook_events
@@ -270,13 +268,132 @@ func (s *webhookEventStore) coveringSuccessorQuery(provider string, event *stora
 			AND received_at > ?
 			AND event = 'pull_request'
 			AND (action IN (` + autoPlanIn + `) OR action = ?)
-			AND (
+			AND ` + willRun + `
+		LIMIT 1`
+	return query, args
+}
+
+// successorWorkWillRunPredicate matches a successor delivery whose own work
+// will run, is running, or has run: pending, completed, retryable under the
+// attempt cap, or processing with a live lease or reclaimable under the cap.
+// Both coalescing predicates share it, so what may justify discarding older
+// work cannot drift between them. Bind its placeholders with the returned
+// arguments.
+func (s *webhookEventStore) successorWorkWillRunPredicate() (string, []any) {
+	return `(
 				state IN (?, ?)
 				OR (state = ? AND attempts < ?)
 				OR (state = ? AND (lease_expires_at > ` + s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond) + ` OR attempts < ?))
-			)
+			)`, []any{
+			storage.WebhookEventPending, storage.WebhookEventCompleted,
+			storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
+			storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts,
+		}
+}
+
+// pushSuccessorQuery builds the push-successor predicate shared by the read
+// and the guarded write in SupersedeIfPushedPast, as a SELECT over the
+// successor's identifying columns, so the two can never drift apart on what
+// counts as a push successor. A push successor is a synchronize delivery for
+// the same PR whose before SHA is the claimed head: GitHub reports that push
+// as having moved the PR's head off the claimed head, which proves push
+// order where received_at proves only arrival order.
+//
+// The successor must still come after the claimed row in (received_at, id)
+// order. That bound is not what proves the claimed head stale; it keeps an
+// operator's Redeliver of the claimed row, which refreshes its received_at,
+// from being discarded by rows that predate it. Two pushes received within
+// one tick of the column's timestamp precision are ordered by insertion, so
+// a quick burst still coalesces, and because the order is strict no two
+// rows can ever supersede each other.
+func (s *webhookEventStore) pushSuccessorQuery(provider string, event *storage.WebhookEvent, columns string) (string, []any) {
+	willRun, willRunArgs := s.successorWorkWillRunPredicate()
+	args := []any{provider, event.Repository, event.PullRequest, event.ReceivedAt, event.ReceivedAt, event.ID,
+		storage.PullRequestSynchronizeAction, event.HeadSHA, event.HeadSHA}
+	args = append(args, willRunArgs...)
+	query := `
+		SELECT ` + columns + `
+		FROM webhook_events
+		WHERE provider = ? AND repository = ? AND pull_request = ?
+			AND (received_at > ? OR (received_at = ? AND id > ?))
+			AND event = 'pull_request' AND action = ?
+			AND before_sha = ? AND head_sha <> ?
+			AND ` + willRun + `
+		ORDER BY received_at DESC, id DESC
 		LIMIT 1`
 	return query, args
+}
+
+// SupersedeIfPushedPast marks a claimed auto-plannable pull_request event
+// superseded when a later push for the same PR provably moved the head off
+// the claimed head, and returns the delivery that supersedes it (nil when
+// none does). It reads only storage: the successor's before SHA is the proof
+// that the claimed head is stale, so no live-PR confirmation is needed.
+//
+// The successor read and the lease-guarded write are separate statements so
+// the caller can log which delivery superseded the claim; the write
+// re-evaluates the same predicate, so a successor that stopped qualifying in
+// between leaves the claim to process normally.
+func (s *webhookEventStore) SupersedeIfPushedPast(ctx context.Context, event *storage.WebhookEvent) (*storage.WebhookEvent, error) {
+	repository := storage.CanonicalKey(event.Repository)
+	if event.LeaseToken == "" {
+		return nil, fmt.Errorf("webhook event lease token is required")
+	}
+	if repository == "" || event.PullRequest == 0 || event.HeadSHA == "" {
+		return nil, fmt.Errorf("supersede webhook event %d by a later push: repository, pull request, and head SHA are required", event.ID)
+	}
+	provider := event.Provider
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
+	}
+	queryEvent := *event
+	queryEvent.Repository = repository
+
+	readQuery, readArgs := s.pushSuccessorQuery(provider, &queryEvent, "delivery_id, head_sha")
+	var successor storage.WebhookEvent
+	err := s.db.QueryRowContext(ctx, readQuery, readArgs...).Scan(&successor.DeliveryID, &successor.HeadSHA)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find later push for webhook event %d (repo=%s, pr=%d, head_sha=%s): %w", event.ID, repository, event.PullRequest, event.HeadSHA, err)
+	}
+
+	autoPlanIn := placeholders(len(storage.AutoPlanPullRequestActions))
+	successorQuery, successorArgs := s.pushSuccessorQuery(provider, &queryEvent, "1")
+	args := []any{storage.WebhookEventSuperseded, event.ID, event.LeaseToken, storage.WebhookEventProcessing}
+	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
+	args = append(args, successorArgs...)
+	// The successor subquery is wrapped in a derived table because MySQL
+	// rejects a direct self-reference to the update target in a subquery.
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE id = ? AND lease_token = ? AND state = ?
+			AND event = 'pull_request' AND action IN (`+autoPlanIn+`)
+			AND EXISTS (
+				SELECT 1 FROM (`+successorQuery+`) AS push_successor
+			)
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("supersede webhook event %d by a later push (repo=%s, pr=%d): %w", event.ID, repository, event.PullRequest, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("read superseded webhook event %d rows affected: %w", event.ID, err)
+	}
+	if rows > 0 {
+		event.State = storage.WebhookEventSuperseded
+		return &successor, nil
+	}
+	// No row updated: the claimed row is not an auto-plan delivery, the
+	// successor stopped qualifying, or the claim was lost.
+	// checkWebhookEventLeaseResult tells the last case apart by re-reading
+	// the lease token.
+	if err := s.checkWebhookEventLeaseResult(ctx, result, event.ID, event.LeaseToken); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // HasCoveringSuccessor is the read-only advisory probe for the covering
@@ -640,7 +757,7 @@ func scanWebhookEventInto(row scanner) (*storage.WebhookEvent, error) {
 	var leaseExpiresAt, retryAfter, startedAt, completedAt sql.NullTime
 	err := row.Scan(
 		&event.ID, &event.Provider, &event.DeliveryID, &event.Event, &event.Action, &event.Repository, &event.PullRequest,
-		&event.HeadSHA, &event.TenantID, &event.Payload, &event.State, &event.Attempts,
+		&event.HeadSHA, &event.BeforeSHA, &event.TenantID, &event.Payload, &event.State, &event.Attempts,
 		&leaseOwner, &leaseToken, &leaseExpiresAt, &retryAfter, &lastError,
 		&event.ReceivedAt, &startedAt, &completedAt, &event.CreatedAt, &event.UpdatedAt,
 	)

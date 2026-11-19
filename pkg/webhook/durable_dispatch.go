@@ -303,6 +303,9 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	}
 
 	if event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) {
+		if h.supersedeAutoPlanPushedPast(ctx, driverID, store, event, appName, claimedAt) {
+			return
+		}
 		if h.supersedeCoveredAutoPlan(ctx, driverID, store, event, appName, claimedAt) {
 			return
 		}
@@ -472,6 +475,55 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+}
+
+// supersedeAutoPlanPushedPast discards a freshly claimed auto-plannable
+// pull_request delivery when a later synchronize delivery for the same PR
+// records the claimed head as the head its push replaced. That record proves
+// the claimed head stale without asking GitHub, so a burst of pushes plans
+// only its newest head and the discarded deliveries cost no GitHub requests.
+// It reports whether the claim was finished here — superseded, or ownership
+// lost while superseding — so the caller skips processing. A storage error
+// keeps the claim alive: the delivery falls through to the GitHub-confirmed
+// coalescing check and then to normal processing, and re-planning a
+// possibly-stale head is idempotent.
+func (h *Handler) supersedeAutoPlanPushedPast(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent, appName string, claimedAt time.Time) bool {
+	if event.HeadSHA == "" {
+		// claimedAutoPlanHeadConfirmedStale warns about the missing head SHA
+		// on the covering-successor check that runs next.
+		h.logger.Debug("durable webhook driver cannot match a claimed delivery without a head SHA against a later push",
+			"driver", driverID, "delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
+		return false
+	}
+	successor, err := store.SupersedeIfPushedPast(ctx, event)
+	if err != nil {
+		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "lease_lost", time.Since(claimedAt))
+			h.logger.Warn("durable webhook driver lost the delivery lease while checking for a later push; another driver owns the delivery or the row is gone",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest, "head_sha", event.HeadSHA)
+			return true
+		}
+		h.logger.Warn("durable webhook driver could not check the delivery for a later push; checking for a covering successor instead",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+			"head_sha", event.HeadSHA, "error", err)
+		return false
+	}
+	if successor == nil {
+		h.logger.Debug("durable webhook driver found no later push for the claimed delivery",
+			"driver", driverID, "delivery_id", event.DeliveryID, "repo", event.Repository,
+			"pr", event.PullRequest, "head_sha", event.HeadSHA)
+		return false
+	}
+	metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "superseded", time.Since(claimedAt))
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_superseded")
+	h.logger.Info("durable webhook driver superseded auto-plan delivery without a GitHub request; a later push moved the pull request past its head",
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA,
+		"superseding_delivery_id", successor.DeliveryID, "superseding_head_sha", successor.HeadSHA)
+	return true
 }
 
 // supersedeCoveredAutoPlan coalesces a freshly claimed auto-plannable
@@ -1073,7 +1125,7 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 }
 
 func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullRequestPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
-	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+	event := &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "pull_request",
@@ -1083,7 +1135,21 @@ func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullReq
 		HeadSHA:     payload.PullRequest.Head.SHA,
 		TenantID:    strconv.FormatInt(installationID, 10),
 		Payload:     body,
-	})
+	}
+	if payload.Action == storage.PullRequestSynchronizeAction {
+		event.BeforeSHA = payload.Before
+		if h.synchronizeQuietPeriod > 0 {
+			// Hold the push back for the quiet period so a following push in
+			// the same burst supersedes it (SupersedeIfPushedPast) before it
+			// spends any GitHub requests. Only synchronize waits: an opened or
+			// reopened PR has no earlier head to coalesce with.
+			now := time.Now()
+			notBefore := now.Add(h.synchronizeQuietPeriod)
+			event.ReceivedAt = now
+			event.RetryAfter = &notBefore
+		}
+	}
+	return h.enqueueDurableWebhookEvent(ctx, event)
 }
 
 func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPayload, body []byte, deliveryID string, pr int, installationID int64) (bool, error) {
