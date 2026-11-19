@@ -473,6 +473,18 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 	return FormatTableProgressWithActivity(t, activityBar, "Finalizing copy")
 }
 
+// runningWord names t's parts while they work on its change: copying, unless
+// the change copies no rows, which a CREATE TABLE, a DROP TABLE and an instant
+// ALTER do not. The table's own line says "Applying..." for those, and its
+// parts read the same way.
+func runningWord(t TableProgress) string {
+	switch ddl.OpToStatementType(t.ChangeType) {
+	case ddl.StatementCreateTable, ddl.StatementDropTable:
+		return presentation.RunningApplying
+	}
+	return presentation.RunningWord(!isInstantAlter(t))
+}
+
 // isInstantAlter reports whether the table should be described as applying
 // instantly: the engine flagged it instant and it is an ALTER. Other
 // operations may complete without a row copy, but they are not instant DDL,
@@ -592,7 +604,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data against the
 		// source. On a large table this can run for hours, so show how far the
-		// verify has progressed once Spirit has reported a total.
+		// verification has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
 			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
 			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
@@ -614,7 +626,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Task.PostChecksum:
-		// The verify passed and the engine is applying the changes that
+		// The verification passed and the engine is applying the changes that
 		// accumulated while it ran. Named separately from the pre-checksum
 		// catch-up so the display doesn't rewind to an earlier phase.
 		writeTableLine(&b, t, "%s ⏩ Data verified, applying final changes...", ui.ProgressBarRowCopy(100))
@@ -867,7 +879,7 @@ func FormatThrottleReference(tables []TableProgress) string {
 		if !state.IsState(table.Status, state.Task.Running, state.Task.Checksumming) {
 			continue
 		}
-		return "  " + DocsLine(ui.ThrottleDocURL) + "\n\n"
+		return "  " + DocsLine(ui.MySQLThrottleDocURL) + "\n\n"
 	}
 	return ""
 }

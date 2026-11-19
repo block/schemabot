@@ -1,9 +1,16 @@
 package secrets
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -67,8 +74,246 @@ func TestResolve_LiteralWithColon(t *testing.T) {
 	assert.Equal(t, "host:port:path", result)
 }
 
-// Note: secretsmanager: tests would require mocking AWS SDK or integration tests
-// The AWS functionality is tested via integration tests with MiniStack
+// fakeSecretsManager serves secret strings by name.
+type fakeSecretsManager struct {
+	values map[string]string
+}
+
+func (f *fakeSecretsManager) GetSecretValue(_ context.Context, in *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+	value, ok := f.values[aws.ToString(in.SecretId)]
+	if !ok {
+		return nil, fmt.Errorf("secret %s not found", aws.ToString(in.SecretId))
+	}
+	return &secretsmanager.GetSecretValueOutput{SecretString: aws.String(value)}, nil
+}
+
+// useSecretsManagerBuilder makes build the way the resolver gets its client
+// for the rest of the test, starting from no shared client, and restores the
+// real builder afterwards.
+func useSecretsManagerBuilder(t *testing.T, build func(context.Context) (secretGetter, error)) {
+	t.Helper()
+	secretsManagerMu.Lock()
+	secretsManagerClient = nil
+	secretsManagerBuild = nil
+	newSecretsManagerClient = build
+	secretsManagerMu.Unlock()
+	t.Cleanup(func() {
+		secretsManagerMu.Lock()
+		secretsManagerClient = nil
+		secretsManagerBuild = nil
+		newSecretsManagerClient = loadSecretsManagerClient
+		secretsManagerMu.Unlock()
+	})
+}
+
+// A target's password is resolved again on every connection. The resolves
+// share one client, so the AWS config and credentials are loaded once, while
+// each resolve still reads the secret's current value and picks up a rotation.
+func TestResolve_SecretsManagerReusesClientAndReadsCurrentValue(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{
+		"/example/orders": `{"username":"schemabot","password":"first"}`,
+	}}
+	builds := 0
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds++
+		return fake, nil
+	})
+
+	password, err := ResolveContext(t.Context(), "secretsmanager:/example/orders#password", "")
+	require.NoError(t, err)
+	assert.Equal(t, "first", password)
+
+	fake.values["/example/orders"] = `{"username":"schemabot","password":"rotated"}`
+	password, err = ResolveContext(t.Context(), "secretsmanager:/example/orders#password", "")
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", password, "a rotated secret takes effect on the next resolve")
+
+	document, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"username":"schemabot","password":"rotated"}`, document)
+
+	assert.Equal(t, 1, builds, "every resolve uses the one shared client")
+}
+
+// A client that fails to build is not kept: the resolve that hit the failure
+// returns it, and the next resolve builds the client again.
+func TestResolve_SecretsManagerRetriesFailedClientBuild(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{"/example/orders": "s3cret"}}
+	builds := 0
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds++
+		if builds == 1 {
+			return nil, errors.New("load AWS config: no region")
+		}
+		return fake, nil
+	})
+
+	_, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.ErrorContains(t, err, "load AWS config: no region")
+
+	value, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", value)
+	assert.Equal(t, 2, builds)
+}
+
+// While one resolve is still loading the AWS config, another resolve whose
+// context is cancelled returns straight away instead of waiting for that load.
+// When the load finishes, the first resolve gets its value and later resolves
+// reuse the client it built.
+func TestResolve_SecretsManagerWaiterHonorsItsContext(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{"/example/orders": "s3cret"}}
+	building := make(chan struct{})
+	release := make(chan struct{})
+	var builds atomic.Int32
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds.Add(1)
+		close(building)
+		<-release
+		return fake, nil
+	})
+
+	type result struct {
+		value string
+		err   error
+	}
+	first := make(chan result, 1)
+	go func() {
+		value, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+		first <- result{value, err}
+	}()
+	<-building
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := ResolveContext(cancelled, "secretsmanager:/example/orders", "")
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case <-first:
+		t.Fatal("the first resolve finished before its client build was released")
+	default:
+	}
+
+	close(release)
+	got := <-first
+	require.NoError(t, got.err)
+	assert.Equal(t, "s3cret", got.value)
+
+	value, err := ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", value)
+	assert.Equal(t, int32(1), builds.Load(), "the waiter did not build, and later resolves reuse the client")
+}
+
+// waitersBlocked reports how many goroutines are parked waiting on another
+// resolve's client build.
+func waitersBlocked() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	count := 0
+	for g := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+		if strings.Contains(g, "[select") && strings.Contains(g, "sharedSecretsManagerClient") {
+			count++
+		}
+	}
+	return count
+}
+
+// Several connections start at once on a cold process. One resolve builds the
+// client while the others wait with live contexts. When the build succeeds,
+// every waiter uses that client; when it fails, the resolve that built it
+// returns the error and exactly one waiter builds again, which the rest share.
+func TestResolve_SecretsManagerWaitersFollowTheBuildOutcome(t *testing.T) {
+	const waiters = 3
+	for _, tc := range []struct {
+		name       string
+		firstFails bool
+		wantBuilds int32
+	}{
+		{"build succeeds", false, 1},
+		{"build fails", true, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeSecretsManager{values: map[string]string{"/example/orders": "s3cret"}}
+			building := make(chan struct{})
+			release := make(chan struct{})
+			var builds atomic.Int32
+			useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+				if builds.Add(1) == 1 {
+					close(building)
+					<-release
+					if tc.firstFails {
+						return nil, errors.New("load AWS config: transient")
+					}
+				}
+				return fake, nil
+			})
+
+			type result struct {
+				value string
+				err   error
+			}
+			resolve := func() chan result {
+				ch := make(chan result, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+					defer cancel()
+					value, err := ResolveContext(ctx, "secretsmanager:/example/orders", "")
+					ch <- result{value, err}
+				}()
+				return ch
+			}
+			first := resolve()
+			<-building
+			var waiting []chan result
+			for range waiters {
+				waiting = append(waiting, resolve())
+			}
+			require.Eventually(t, func() bool { return waitersBlocked() == waiters }, 5*time.Second, 5*time.Millisecond)
+
+			close(release)
+			gotFirst := <-first
+			if tc.firstFails {
+				require.ErrorContains(t, gotFirst.err, "transient")
+			} else {
+				require.NoError(t, gotFirst.err)
+				assert.Equal(t, "s3cret", gotFirst.value)
+			}
+			for _, ch := range waiting {
+				got := <-ch
+				require.NoError(t, got.err)
+				assert.Equal(t, "s3cret", got.value)
+			}
+			assert.Equal(t, tc.wantBuilds, builds.Load())
+		})
+	}
+}
+
+// A panic while building the client, recovered by its caller, does not leave
+// the build marked as running: the next resolve builds the client and gets its
+// value instead of waiting until its deadline.
+func TestResolve_SecretsManagerRecoveredBuildPanicDoesNotBlockLaterResolves(t *testing.T) {
+	fake := &fakeSecretsManager{values: map[string]string{"/example/orders": "s3cret"}}
+	builds := 0
+	useSecretsManagerBuilder(t, func(context.Context) (secretGetter, error) {
+		builds++
+		if builds == 1 {
+			panic("config loader panicked")
+		}
+		return fake, nil
+	})
+
+	require.Panics(t, func() {
+		_, _ = ResolveContext(t.Context(), "secretsmanager:/example/orders", "")
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	value, err := ResolveContext(ctx, "secretsmanager:/example/orders", "")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", value)
+	assert.Equal(t, 2, builds)
+}
 
 func TestValueFromGetSecretOutput(t *testing.T) {
 	// The string form is used when present.

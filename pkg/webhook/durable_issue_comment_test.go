@@ -450,6 +450,7 @@ func TestDurableIssueCommentDriverDispatchesParticipantFanOut(t *testing.T) {
 // without creating a client — config can drop a repo between enqueue and
 // drive, and the driver re-validates the allowlist fail-closed.
 func TestDurableIssueCommentDriverCompletesUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot apply -e production"))
 	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"other/repo": {}}}
 	factory := &fakeClientFactory{forInstallationStarted: make(chan struct{})}
@@ -468,6 +469,7 @@ func TestDurableIssueCommentDriverCompletesUnregisteredRepo(t *testing.T) {
 		t.Fatal("unregistered repo must not create a GitHub client")
 	default:
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "issue_comment", "created")
 }
 
 // An apply command enqueued before its repository became listen-only completes
@@ -519,7 +521,7 @@ func newDurableIssueCommentCoreHarness(t *testing.T, store storage.WebhookEventS
 		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
 			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 				"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
-				"base": map[string]any{"sha": "def456", "ref": "main"},
+				"base": map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 				"user": map[string]any{"login": "testuser"},
 			}))
 		})

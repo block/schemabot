@@ -255,6 +255,8 @@ role `USAGE` and `CREATE` on each target schema. The setting is valid only for
 PostgreSQL targets; when omitted, tables are created as the connected role.
 An owner the engine role cannot assume, or one the target has no role for,
 blocks the create step at plan time with the grant or correction it needs.
+[Table ownership](postgresql.md#table-ownership) explains what the owner
+controls and shows the full set of grants.
 
 `table_owner` is one role per target, deliberately scalar. A per-namespace
 map mirroring `schema_overrides` is a later extension for a target whose

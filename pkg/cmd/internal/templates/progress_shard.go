@@ -18,7 +18,7 @@ var (
 
 // FormatShardProgress returns per-shard progress for a Vitess table as a string.
 func FormatShardProgress(shards []ShardProgress) string {
-	return formatPartProgress(shards, presentation.ShardNoun, presentation.PendingQueued)
+	return formatPartProgress(shards, presentation.ShardNoun, presentation.PendingQueued, presentation.RunningCopying)
 }
 
 // formatTableParts renders a table's per-part progress: its shards, or its
@@ -31,9 +31,9 @@ func formatTableParts(t TableProgress) string {
 		if !listsTargets(t) {
 			return ""
 		}
-		return formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t))
+		return formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), runningWord(t))
 	}
-	return formatPartProgress(t.Shards, presentation.ShardNoun, presentation.PendingQueued)
+	return formatPartProgress(t.Shards, presentation.ShardNoun, presentation.PendingQueued, runningWord(t))
 }
 
 // keepsShardedBar reports whether a sharded table past its row copy still
@@ -87,21 +87,24 @@ func listsTargets(t TableProgress) bool {
 // shards of a keyspace or the targets of a rollout — named by noun: a heading
 // counting them by state, then the lines presentation.ListParts picks, the
 // listing the PR comment shows too. pendingWord names the parts still
-// pending (presentation.PendingWord).
-func formatPartProgress(shards []ShardProgress, noun presentation.Noun, pendingWord string) string {
+// pending (presentation.PendingWord), and runningWord the parts working on the
+// change (runningWord).
+func formatPartProgress(shards []ShardProgress, noun presentation.Noun, pendingWord, runningWord string) string {
 	if len(shards) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	c := presentation.CountParts(len(shards), func(i int) string { return shards[i].Status })
 	c.PendingLabel = pendingWord
+	c.RunningLabel = runningWord
 	fmt.Fprintf(&b, indentShardHeader+"%s%s: %d (%s)%s\n", ANSIDim, ui.CapitalizeFirst(noun.Plural), len(shards), strings.Join(c.Phrases(), ", "), ANSIReset)
-	for _, line := range presentation.ListParts(len(shards), func(i int) presentation.Part { return shardPart(shards[i]) }, noun) {
+	part := func(i int) presentation.Part { return listedPart(shards[i], runningWord) }
+	for _, line := range presentation.ListParts(len(shards), part, noun) {
 		if line.Summary != "" {
 			fmt.Fprintf(&b, indentShardMore+"%s... %s%s\n", ANSIDim, line.Summary, ANSIReset)
 			continue
 		}
-		b.WriteString(formatShardLine(shards[line.Part], pendingWord))
+		b.WriteString(formatShardLine(shards[line.Part], pendingWord, runningWord))
 	}
 	return b.String()
 }
@@ -116,12 +119,21 @@ func shardPart(s ShardProgress) presentation.Part {
 	}
 }
 
+// listedPart is s as a table's part listing names it, runningWord naming it
+// while it works on the change.
+func listedPart(s ShardProgress, runningWord string) presentation.Part {
+	p := shardPart(s)
+	p.RunningLabel = runningWord
+	return p
+}
+
 // formatShardLine renders one part's line: its mark and name in the color of
 // its state, then its state in words, with a copying part's ETA. Every phase
 // an engine works through is colored as working; only a part that is not
-// working on the change is dimmed. pendingWord names a part still pending.
-func formatShardLine(s ShardProgress, pendingWord string) string {
-	detail := presentation.PartDetail(shardPart(s), pendingWord)
+// working on the change is dimmed. pendingWord names a part still pending, and
+// runningWord one working on the change.
+func formatShardLine(s ShardProgress, pendingWord, runningWord string) string {
+	detail := presentation.PartDetail(listedPart(s, runningWord), pendingWord)
 	glyph := presentation.PartGlyph(s.Status)
 	switch s.Status {
 	case state.Task.Completed:

@@ -109,7 +109,7 @@ type TableProgress struct {
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
 	// The engine's throttler is pausing this table's active phase (row copy
-	// or checksum verify). ThrottleReason names the signal for display and is
+	// or checksum verification). ThrottleReason names the signal for display and is
 	// empty when Throttled is false.
 	Throttled      bool
 	ThrottleReason string
@@ -162,7 +162,9 @@ const (
 	TaskCancelled = "cancelled" // Table was never executed due to earlier failure
 )
 
-// ParseProgressResponse converts a typed ProgressResponse to ProgressData for rendering.
+// ParseProgressResponse converts a typed ProgressResponse to ProgressData for
+// rendering. Failure and throttle text is relayed from the engine and the
+// database, so control runes are removed before it reaches the terminal.
 func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	data := ProgressData{
 		ApplyID:        result.ApplyID,
@@ -172,7 +174,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		PullRequestURL: result.PullRequest,
 		State:          state.NormalizeState(result.State),
 		Engine:         result.Engine,
-		ErrorMessage:   result.ErrorMessage,
+		ErrorMessage:   ui.TerminalSafe(result.ErrorMessage),
 		StartedAt:      result.StartedAt,
 		CompletedAt:    result.CompletedAt,
 		Options:        result.Options,
@@ -203,7 +205,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			State:               state.NormalizeState(op.State),
 			CutoverPolicy:       op.CutoverPolicy,
 			OnFailure:           op.OnFailure,
-			ErrorMessage:        op.ErrorMessage,
+			ErrorMessage:        ui.TerminalSafe(op.ErrorMessage),
 			ErrorCode:           op.ErrorCode,
 			AlreadyConverged:    op.AlreadyConverged,
 			EndedBy:             progressOperationRef(op.EndedBy),
@@ -240,7 +242,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
 			ChecksumRowsTotal:   tbl.ChecksumRowsTotal,
 			Throttled:           tbl.Throttled,
-			ThrottleReason:      tbl.ThrottleReason,
+			ThrottleReason:      ui.TerminalSafe(tbl.ThrottleReason),
 			IsInstant:           tbl.IsInstant,
 		}
 		for _, sh := range tbl.Shards {

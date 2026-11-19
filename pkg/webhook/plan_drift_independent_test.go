@@ -331,9 +331,9 @@ func TestReviewDriftComment_LintNamesTheTargetsThatRaisedIt(t *testing.T) {
 	body := renderLintComment(t, primary, second, third)
 
 	assert.Contains(t, body, "💡 **Lint Warnings**: 3 advisory findings\n"+
-		"- `orders` on target `commerce/orders-001`: column `email` should not be nullable\n"+
-		"- `orders` on targets `commerce/orders-002`, `commerce/orders-003`: table has no index on `phone`\n"+
-		"- `orders` on target `commerce/orders-003`: table `orders` has no primary key\n",
+		"1. `orders` on target `commerce/orders-001`: column `email` should not be nullable\n"+
+		"2. `orders` on targets `commerce/orders-002`, `commerce/orders-003`: table has no index on `phone`\n"+
+		"3. `orders` on target `commerce/orders-003`: table `orders` has no primary key\n",
 		"each finding renders once, naming the targets that raised it")
 	assert.NotContains(t, body, "is unsafe", "an error-severity finding is an unsafe change, not advisory lint")
 	assertLintFollowsTargetPlans(t, body)
@@ -359,8 +359,8 @@ func TestReviewDriftComment_LintEveryTargetRaisesNamesNoTargets(t *testing.T) {
 	body := renderLintComment(t, primary, second, third, converged)
 
 	assert.Contains(t, body, "💡 **Lint Warnings**: 2 advisory findings\n"+
-		"- `orders`: "+shared+"\n"+
-		"- `orders` on target `commerce/orders-003`: "+counter+"\n",
+		"1. `orders`: "+shared+"\n"+
+		"2. `orders` on target `commerce/orders-003`: "+counter+"\n",
 		"the shared finding names no target; the counter finding names the one target that raised it")
 	assertLintFollowsTargetPlans(t, body)
 }
@@ -384,14 +384,14 @@ func TestReviewDriftComment_LintSortsByTableAndCollapsesWideTargetLists(t *testi
 	body := renderLintComment(t, diffs...)
 
 	assert.Contains(t, body, "💡 **Lint Warnings**: 2 advisory findings\n"+
-		"- `docks`: "+shared+"\n"+
-		"- `riders` on 9 of 10 targets: "+ui.CodeQuoteIdentifiers(drift)+"\n"+
-		"  <details>\n  <summary>Target names</summary>\n\n"+
-		"  ```\n"+
-		"  commerce/orders-001  commerce/orders-002  commerce/orders-003\n"+
-		"  commerce/orders-004  commerce/orders-005  commerce/orders-006\n"+
-		"  commerce/orders-007  commerce/orders-008  commerce/orders-009\n"+
-		"  ```\n\n  </details>\n",
+		"1. `docks`: "+shared+"\n"+
+		"2. `riders` on 9 of 10 targets: "+ui.CodeQuoteIdentifiers(drift)+"\n"+
+		"   <details>\n   <summary>Target names</summary>\n\n"+
+		"   ```\n"+
+		"   commerce/orders-001  commerce/orders-002  commerce/orders-003\n"+
+		"   commerce/orders-004  commerce/orders-005  commerce/orders-006\n"+
+		"   commerce/orders-007  commerce/orders-008  commerce/orders-009\n"+
+		"   ```\n\n   </details>\n",
 		"findings sort by table, and a wide target list collapses under its coverage as a grid")
 }
 
@@ -423,12 +423,12 @@ func TestReviewDriftComment_LintNamesSharedTargetsOnce(t *testing.T) {
 	body := renderLintComment(t, diffs...)
 
 	assert.Contains(t, body, "💡 **Lint Warnings**: 4 advisory findings\n"+
-		"- `docks`: "+shared+"\n"+
-		"- `trips` on target `commerce/orders-004`: "+counter+"\n"+
+		"1. `docks`: "+shared+"\n"+
+		"2. `trips` on target `commerce/orders-004`: "+counter+"\n"+
 		"\n"+
-		"On targets `commerce/orders-001`, `commerce/orders-002`:\n"+
-		"- `bikes`: "+created+"\n"+
-		"- `bikes`: "+updated+"\n\n",
+		"On targets `commerce/orders-001`, `commerce/orders-002`:\n\n"+
+		"3. `bikes`: "+created+"\n"+
+		"4. `bikes`: "+updated+"\n\n",
 		"findings that name their own targets come first, then each set of shared targets is named once above its findings")
 	assert.Equal(t, 1, strings.Count(body, "`commerce/orders-001`"), "the targets the findings share are named once")
 	assertLintFollowsTargetPlans(t, body)

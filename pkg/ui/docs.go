@@ -21,10 +21,19 @@ const (
 	// directory that sits beside it.
 	SchemaConfigDocURL = DocsBaseURL + "github-app-setup.md#6-add-schemabotyaml-config-to-your-repository"
 
-	// ThrottleDocURL explains each throttle signal and how to remediate it.
+	// MySQLThrottleDocURL explains each Spirit throttle signal and how to
+	// remediate it. Throttle tips cover only Spirit signals, so the link goes to
+	// the MySQL guide; another engine documents its own signals on its page.
 	// Rendered next to a throttle tip so an operator can jump from the
 	// one-line tip to the full prose.
-	ThrottleDocURL = DocsBaseURL + "throttle.md"
+	MySQLThrottleDocURL = DocsBaseURL + "mysql.md#throttling"
+
+	// DirectExecutionDocURL documents how a direct statement takes its
+	// table's metadata lock: the wait, the kill, its attempts, and the
+	// blockers it spares. Rendered in the direct-execution disclosure, which
+	// names those limits without printing the values the policy and the
+	// engine own.
+	DirectExecutionDocURL = DocsBaseURL + "direct-execution.md"
 )
 
 // DocLinks is every documentation link rendered on a user-facing surface. The
@@ -32,11 +41,12 @@ const (
 // here rather than by remembering to extend a test.
 var DocLinks = []string{
 	SchemaConfigDocURL,
-	ThrottleDocURL,
+	MySQLThrottleDocURL,
+	DirectExecutionDocURL,
 }
 
 // DocRef is the short form a documentation link is displayed as on a terminal:
-// the page's path inside the repository, such as "docs/throttle.md", the way a
+// the page's path inside the repository, such as "docs/mysql.md", the way a
 // PR is displayed as "owner/repo#pr". It identifies the page on its own when a
 // terminal drops the hyperlink escape, and stays short enough to sit on one
 // line beside a label. A section anchor stays on the link target but is left

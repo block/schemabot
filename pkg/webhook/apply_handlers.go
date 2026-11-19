@@ -84,6 +84,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	if blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
+		return false, nil
+	}
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
@@ -543,6 +549,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	if blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
+		return false, nil
+	}
+
 	// Acquire lock. PendingPlanID pins the confirmation plan this lock was
 	// posted with so apply-confirm can load the exact plan the human reviewed
 	// (not whatever happens to be newest in the plans table at confirm time).
@@ -837,6 +849,12 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
+	if blocked, gateErr := h.enforcePRTarget(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
+		return false, nil
+	}
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply-confirm command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
@@ -904,6 +922,12 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to fetch PR info. Retry, and see server logs if it persists.")
 		}
 		return true, fmt.Errorf("apply-confirm command fetch PR for checks gate %s#%d: %w", repo, pr, err)
+	}
+
+	if blocked, gateErr := h.enforcePRTargetSnapshot(ctx, client, repo, pr, installationID, confirmPRInfo, action.ApplyConfirm, environment, requestedBy, false, result.SuppressRetryComments); gateErr != nil {
+		return true, gateErr
+	} else if blocked {
+		return false, nil
 	}
 
 	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {

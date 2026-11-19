@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // StatusCmd shows schema change status.
@@ -232,7 +233,7 @@ func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.Acti
 		State:               a.State,
 		Engine:              a.Engine,
 		Caller:              a.Caller,
-		ErrorMessage:        a.ErrorMessage,
+		ErrorMessage:        ui.TerminalSafe(a.ErrorMessage),
 		StartedAt:           a.StartedAt,
 		CompletedAt:         a.CompletedAt,
 		UpdatedAt:           a.UpdatedAt,
@@ -284,6 +285,19 @@ func deploymentNotConfigured(err error) bool {
 	return apiErr.ErrorCode == apitypes.ErrCodeDeploymentNotFound
 }
 
+func applyHistoryDataFromResponse(a *apitypes.ApplyHistoryResponse) templates.ApplyHistoryData {
+	return templates.ApplyHistoryData{
+		ApplyID:     a.ApplyID,
+		Environment: a.Environment,
+		State:       a.State,
+		Engine:      a.Engine,
+		Caller:      a.Caller,
+		StartedAt:   a.StartedAt,
+		CompletedAt: a.CompletedAt,
+		Error:       ui.TerminalSafe(a.Error),
+	}
+}
+
 // showDatabaseHistory shows all applies for a database.
 func showDatabaseHistory(endpoint, database, environment string, outputJSON, showLoader bool) error {
 	var result *apitypes.DatabaseHistoryResponse
@@ -303,16 +317,7 @@ func showDatabaseHistory(endpoint, database, environment string, outputJSON, sho
 	// Convert to template format
 	applies := make([]templates.ApplyHistoryData, 0, len(result.Applies))
 	for _, a := range result.Applies {
-		applies = append(applies, templates.ApplyHistoryData{
-			ApplyID:     a.ApplyID,
-			Environment: a.Environment,
-			State:       a.State,
-			Engine:      a.Engine,
-			Caller:      a.Caller,
-			StartedAt:   a.StartedAt,
-			CompletedAt: a.CompletedAt,
-			Error:       a.Error,
-		})
+		applies = append(applies, applyHistoryDataFromResponse(a))
 	}
 
 	templates.WriteDatabaseHistory(templates.DatabaseHistoryData{

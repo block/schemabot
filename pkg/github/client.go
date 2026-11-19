@@ -27,6 +27,7 @@ import (
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	gh "github.com/google/go-github/v86/github"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // schemaDiscoveryConcurrency bounds the parallel per-namespace directory
@@ -435,6 +436,11 @@ type InstallationClient struct {
 	// (e.g. tests).
 	checkStatusSingleflight *CheckStatusSingleflight
 
+	// branchPolicyReads shares overlapping policy lookups for this API client
+	// and installation. The factory reuses the client across deliveries.
+	branchPolicyReads singleflight.Group
+	branchPolicies    branchPolicyCache
+
 	// treeLevels holds tree levels read by SHA across calls, so the
 	// listings and comparisons a delivery repeats read each level once.
 	treeLevels *treeLevelCache
@@ -811,9 +817,12 @@ func (ic *InstallationClient) AddReactionToComment(ctx context.Context, repo str
 // branch tip, so callers that need the current base commit must resolve
 // BaseRef themselves.
 type PullRequestInfo struct {
-	HeadRef string
-	HeadSHA string
-	BaseRef string
+	// NativeStack distinguishes an ordinary branch-based stack from GitHub stack metadata.
+	NativeStack  bool
+	StackBaseRef string
+	HeadRef      string
+	HeadSHA      string
+	BaseRef      string
 	// DefaultBranch is the default branch of the repository the PR targets,
 	// read from the same response as BaseRef.
 	DefaultBranch string
@@ -833,12 +842,15 @@ type PullRequestInfo struct {
 
 // OpenPullRequest holds the PR metadata needed for operator scans.
 type OpenPullRequest struct {
-	Number  int
-	Title   string
-	HeadRef string
-	HeadSHA string
-	BaseRef string
-	User    string
+	DefaultBranch string
+	NativeStack   bool
+	StackBaseRef  string
+	Number        int
+	Title         string
+	HeadRef       string
+	HeadSHA       string
+	BaseRef       string
+	User          string
 	// UpdatedAt is the PR's last-activity time. The listing orders by it
 	// (newest first), so a caller sweeping a time window can stop paging once
 	// a page crosses the window start.
@@ -872,8 +884,14 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		},
 	}
 	var resp *gh.Response
-	ghPRs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
-		list, listResp, listErr := ic.client.PullRequests.List(ctx, owner, repoName, opts)
+	ghPRs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*pullRequestWithStack, error) {
+		endpoint := fmt.Sprintf("repos/%s/%s/pulls?state=open&sort=updated&direction=desc&per_page=%d&page=%d", owner, repoName, opts.PerPage, opts.Page)
+		req, reqErr := ic.client.NewRequest(ctx, http.MethodGet, endpoint, nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		var list []*pullRequestWithStack
+		listResp, listErr := ic.client.Do(req, &list)
 		if listErr != nil {
 			return nil, classifyGitHubAPIError(listErr)
 		}
@@ -884,15 +902,21 @@ func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo
 		return nil, 0, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
 	}
 	for _, pr := range ghPRs {
-		prs = append(prs, OpenPullRequest{
-			Number:    pr.GetNumber(),
-			Title:     pr.GetTitle(),
-			HeadRef:   pr.GetHead().GetRef(),
-			HeadSHA:   pr.GetHead().GetSHA(),
-			BaseRef:   pr.GetBase().GetRef(),
-			User:      pr.GetUser().GetLogin(),
-			UpdatedAt: pr.GetUpdatedAt().Time,
-		})
+		info := OpenPullRequest{
+			DefaultBranch: pr.GetBase().GetRepo().GetDefaultBranch(),
+			Number:        pr.GetNumber(),
+			Title:         pr.GetTitle(),
+			HeadRef:       pr.GetHead().GetRef(),
+			HeadSHA:       pr.GetHead().GetSHA(),
+			BaseRef:       pr.GetBase().GetRef(),
+			User:          pr.GetUser().GetLogin(),
+			UpdatedAt:     pr.GetUpdatedAt().Time,
+		}
+		if pr.Stack != nil {
+			info.NativeStack = true
+			info.StackBaseRef = pr.Stack.Base.Ref
+		}
+		prs = append(prs, info)
 	}
 	if resp != nil {
 		nextPage = resp.NextPage
@@ -984,8 +1008,13 @@ func (ic *InstallationClient) FetchPullRequestNoCache(ctx context.Context, repo 
 
 func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string, pr int) (*PullRequestInfo, error) {
 	owner, repoName := splitRepo(repo)
-	ghPR, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*gh.PullRequest, error) {
-		ghPR, _, err := ic.client.PullRequests.Get(ctx, owner, repoName, pr)
+	ghPR, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*pullRequestWithStack, error) {
+		req, err := ic.client.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repoName, pr), nil)
+		if err != nil {
+			return nil, fmt.Errorf("build pull request lookup: %w", err)
+		}
+		ghPR := new(pullRequestWithStack)
+		_, err = ic.client.Do(req, ghPR)
 		if err != nil {
 			return nil, fmt.Errorf("fetch pull request %s#%d: %w", repo, pr, classifyGitHubAPIError(err))
 		}
@@ -994,7 +1023,7 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 	if err != nil {
 		return nil, err
 	}
-	return &PullRequestInfo{
+	info := &PullRequestInfo{
 		HeadRef:       ghPR.GetHead().GetRef(),
 		HeadSHA:       ghPR.GetHead().GetSHA(),
 		BaseRef:       ghPR.GetBase().GetRef(),
@@ -1003,7 +1032,12 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		State:         ghPR.GetState(),
 		Merged:        ghPR.GetMerged(),
 		BaseSHA:       ghPR.GetBase().GetSHA(),
-	}, nil
+	}
+	if ghPR.Stack != nil {
+		info.NativeStack = true
+		info.StackBaseRef = ghPR.Stack.Base.Ref
+	}
+	return info, nil
 }
 
 // PRFile represents a file changed in a PR.

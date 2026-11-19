@@ -462,7 +462,7 @@ func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 			"head": map[string]any{"sha": "newsha222", "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"base": map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
 			"user": map[string]any{"login": "testuser"},
 		}))
 	})
@@ -1315,8 +1315,8 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
-		assert.Contains(t, rendered, "- `users`: Column uses utf8 charset")
+		assert.Contains(t, rendered, "1. `bad_table`: Primary key uses signed integer type")
+		assert.Contains(t, rendered, "2. `users`: Column uses utf8 charset")
 		assert.Contains(t, rendered, "CREATE TABLE")
 	})
 
@@ -1347,7 +1347,7 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderMultiEnvPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
+		assert.Contains(t, rendered, "1. `bad_table`: Primary key uses signed integer type")
 		assert.Contains(t, rendered, "CREATE TABLE")
 		// Identical plans get deduplicated — combined header
 		assert.Contains(t, rendered, "Staging & Production")
@@ -1391,6 +1391,7 @@ func TestWebhookConcurrentRequests(t *testing.T) {
 }
 
 func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -1434,6 +1435,7 @@ func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
 		t.Fatalf("unexpected rejection comment: %s", body)
 	case <-time.After(100 * time.Millisecond):
 	}
+	requireUnregisteredRepositoryCounted(t, reader, "issue_comment", "created")
 }
 
 func TestWebhookRepoAllowlistAllowsRegisteredRepo(t *testing.T) {
@@ -1511,6 +1513,7 @@ func TestWebhookRepoAllowlistEmptyAllowsAll(t *testing.T) {
 }
 
 func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	service := api.New(nil, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{
 			"org/allowed-repo": {},
@@ -1529,6 +1532,7 @@ func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "repository not registered")
+	requireUnregisteredRepositoryCounted(t, reader, "pull_request", "opened")
 }
 
 // PR close bypass of the allowlist is tested in the integration suite

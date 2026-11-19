@@ -6,16 +6,58 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
-
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
+
+func TestPostTrackedPlanCommentLogsSuppression(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		target   string
+		planHead string
+		message  string
+	}{
+		{name: "excluded target", target: "parent", planHead: "same-head", message: "skipping plan comment because PR target is excluded"},
+		{name: "moved head", target: "trunk", planHead: "previous-head", message: "skipping plan comment because PR head moved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, mux, _ := newFoldHandler(t, &api.ServerConfig{}, &foldCheckStore{})
+			var logs bytes.Buffer
+			h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+			var base atomic.Value
+			base.Store(tc.target)
+			serveMutablePRTarget(t, mux, &base)
+			serveUnrequiredTarget(t, mux)
+			posted := make(chan struct{}, 1)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+				posted <- struct{}{}
+				http.Error(w, "unexpected plan comment", http.StatusBadRequest)
+			})
+
+			h.postTrackedPlanComment("octocat/hello-world", 1, 12345, planCommentSlot{Database: "orders", HeadSHA: tc.planHead}, "plan")
+			require.Empty(t, posted, "a suppressed plan comment is never sent to GitHub")
+
+			var entry map[string]any
+			require.NoError(t, json.Unmarshal(logs.Bytes(), &entry))
+			assert.Equal(t, "INFO", entry["level"])
+			assert.Equal(t, tc.message, entry["msg"])
+			assert.Equal(t, "octocat/hello-world", entry["repo"])
+			assert.Equal(t, float64(1), entry["pr"])
+			assert.Equal(t, tc.planHead, entry["plan_head_sha"])
+			assert.Equal(t, "same-head", entry["current_head_sha"])
+			assert.Equal(t, tc.target, entry["effective_target"])
+		})
+	}
+}
 
 func TestPlanCommentSupersedes(t *testing.T) {
 	tests := []struct {

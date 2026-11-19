@@ -25,6 +25,16 @@ import (
 // no applies keep their not-found and empty results.
 func TestDatabaseReadHandlersCanonicalizePathAndQuery(t *testing.T) {
 	applies := []*storage.Apply{
+		// The newest apply for testdb is in another environment, so a read
+		// scoped to staging only finds apply-history when the handler passes
+		// the environment on.
+		{
+			ID:              9,
+			ApplyIdentifier: "apply-production",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "production",
+		},
 		{
 			ID:              7,
 			ApplyIdentifier: "apply-history",

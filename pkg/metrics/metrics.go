@@ -1585,6 +1585,8 @@ const (
 	GitHubOperationFetchDiff                     = "fetch_diff"
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchBranchRules              = "fetch_branch_rules"
+	GitHubOperationGraphQLBranchProtection       = "graphql_branch_protection"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeam                       = "get_team"
@@ -1789,6 +1791,8 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchDiff,
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
+		GitHubOperationFetchBranchRules,
+		GitHubOperationGraphQLBranchProtection,
 		GitHubOperationFetchPullRequest,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeam,
@@ -1929,7 +1933,8 @@ func webhookEventAttributes(appName, eventType, action, repo, status string) []a
 // webhook metric label is folded to "unknown". metric names the instrument the
 // fold happened on; status is the webhook event status being recorded and must
 // be empty for instruments that do not carry one, so the event_status log field
-// only ever holds real statuses.
+// only ever holds real statuses. repo is empty when the instrument records no
+// repository, and the repo log field is then left out rather than logged empty.
 func logUnknownWebhookMetricLabel(metric, label, value, appName, repo, status string) {
 	key := metric + "\x00" + label + "\x00" + value + "\x00" + appName + "\x00" + repo + "\x00" + status
 	if _, loaded := seenUnknownWebhookMetricLabels.LoadOrStore(key, struct{}{}); loaded {
@@ -1940,7 +1945,9 @@ func logUnknownWebhookMetricLabel(metric, label, value, appName, repo, status st
 		"label", label,
 		"value", value,
 		"app_name", appName,
-		"repo", repo,
+	}
+	if repo != "" {
+		attrs = append(attrs, "repo", repo)
 	}
 	if status != "" {
 		attrs = append(attrs, "event_status", status)
@@ -1951,14 +1958,18 @@ func logUnknownWebhookMetricLabel(metric, label, value, appName, repo, status st
 // RecordUnregisteredRepositoryWebhook increments the counter for webhook events
 // ignored because the repository is outside this SchemaBot instance's configured
 // ownership. A spike means GitHub is delivering events for repositories that this
-// deployment will not process.
-func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType, action, repo string) {
+// deployment will not process. The counter carries no repository label: the set
+// of repositories that can deliver to an App is not bounded by SchemaBot's
+// configuration, so callers log the repository instead. For the same reason the
+// warning for an event type or action folded to "unknown" names no repository,
+// and is logged once per App and value rather than once per repository.
+func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType, action string) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "event_type", eventType, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "event_type", eventType, appName, "", "ignored")
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
-		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "action", action, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "action", action, appName, "", "ignored")
 		action = "unknown"
 	}
 	if appName == "" {
@@ -1969,7 +1980,6 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 		EnvironmentAttribute(""),
 		attribute.String("app_name", appName),
 		attribute.String("event_type", eventType),
-		attribute.String("repository", repo),
 	}
 	if action != "" {
 		attrs = append(attrs, attribute.String("action", action))

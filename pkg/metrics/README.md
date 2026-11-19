@@ -71,7 +71,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
 | `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
-| `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
+| `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action | Webhook events ignored because the repository is not configured (`action` is omitted for events that carry none, such as `push`; no `repository` label: any repository that installs the App can deliver, so the log line for each ignored event names it instead, at warn level, or at debug level for a `push` handled on the request path) |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
 | `schemabot.webhook.inbox_claimable_depth` | Gauge | environment | Rows ready to claim now; excludes scheduled work, active leases and exhausted retries. Use max across replicas sharing an inbox. |
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
@@ -684,3 +684,11 @@ health signal; retain heartbeat coverage. Baseline cooldown reports and outer
 waiting separately before choosing warning thresholds. Quota silence alone does
 not prove blocked checks recovered: verify fresh successful work for the same
 installation/resource.
+
+## GitHub branch protection reads
+
+PR target eligibility attributes its bounded non-default-branch reads to the
+existing `schemabot.github.requests_total` operation values `fetch_branch_rules`
+and `graphql_branch_protection`. Default-target PRs make neither request. Compare
+these reads and remaining installation budgets during rollout; a permission
+failure blocks target evaluation and requires fixing the App's read access.

@@ -103,13 +103,13 @@ func TestWriteLintViolations_FoldedSharedWideTargetsNamedOnce(t *testing.T) {
 	out := sb.String()
 
 	assert.Contains(t, out, "<summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>\n\n"+
-		"**`accounts`**\n- table has no primary key\n\n"+
+		"**`accounts`**\n\n1. table has no primary key\n\n"+
 		"On 28 of 32 targets:\n\n"+
 		"<details>\n<summary>Target names</summary>\n\n```\n"+
 		"acme/orders-005  acme/orders-006  acme/orders-007  acme/orders-008\n"+
 		"acme/orders-009  acme/orders-010  acme/orders-011  acme/orders-012\n",
 		"the finding every target raised comes first, then the shared targets lead their findings")
-	assert.Contains(t, out, "</details>\n\n**`trips`**\n- Column created_at uses TIMESTAMP\n- Column updated_at uses TIMESTAMP\n")
+	assert.Contains(t, out, "</details>\n\n**`trips`**\n\n2. Column created_at uses TIMESTAMP\n3. Column updated_at uses TIMESTAMP\n")
 	assert.Equal(t, 1, strings.Count(out, "acme/orders-032"), "the shared targets are listed once, not once per finding")
 	assert.NotContains(t, out, "on 28 of 32 targets", "no finding repeats the targets on its own line")
 }

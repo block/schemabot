@@ -1443,6 +1443,65 @@ func TestApplyStore_GetByDatabase(t *testing.T) {
 	require.Equal(t, "apply_db1", applies[0].ApplyIdentifier)
 }
 
+// MySQL; TestPostgresStorageParity runs the same scenario against PostgreSQL.
+func TestApplyStore_GetLatestByDatabaseOrdersByCreationThenID(t *testing.T) {
+	testGetLatestByDatabaseOrdersByCreationThenID(t, func(t *testing.T) *Storage {
+		t.Helper()
+		clearTables(t)
+		return NewMySQL(testDB)
+	})
+}
+
+// testGetLatestByDatabaseOrdersByCreationThenID pins which apply a logs lookup
+// without an apply ID reads. The latest apply is the one created last, so an
+// apply with a higher id and an earlier creation time is not it. Between
+// applies created in the same instant the higher id wins, so the same lookup
+// names the same apply every time.
+func testGetLatestByDatabaseOrdersByCreationThenID(t *testing.T, newStore func(t *testing.T) *Storage) {
+	ctx := t.Context()
+	store := newStore(t)
+	created := time.Date(2024, time.March, 1, 12, 0, 0, 0, time.UTC)
+	seed := func(t *testing.T, lock *storage.Lock, identifier string, planID int64, createdAt time.Time) *storage.Apply {
+		t.Helper()
+		apply := createTestApplyWithStateAndEnv(t, store, lock, identifier, planID, state.Apply.Completed, "staging")
+		_, err := store.db.ExecContext(ctx,
+			"UPDATE applies SET created_at = ?, updated_at = updated_at WHERE id = ?", createdAt, apply.ID)
+		require.NoError(t, err)
+		stored, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		return stored
+	}
+
+	t.Run("a higher id with an earlier creation time is not the latest", func(t *testing.T) {
+		lock := createTestLock(t, store, "latest_by_creation", storage.DatabaseTypeMySQL)
+		createdLast := seed(t, lock, "apply_created_last_lower_id", 240, created)
+		createdFirst := seed(t, lock, "apply_created_first_higher_id", 241, created.Add(-time.Hour))
+		require.Greater(t, createdFirst.ID, createdLast.ID, "the apply created first holds the higher id")
+		require.True(t, createdFirst.CreatedAt.Before(createdLast.CreatedAt), "the higher id holds the earlier creation time")
+
+		latest, err := store.Applies().GetLatestByDatabase(ctx, "latest_by_creation", storage.DatabaseTypeMySQL, "staging")
+		require.NoError(t, err)
+		require.NotNil(t, latest)
+		assert.Equal(t, "apply_created_last_lower_id", latest.ApplyIdentifier)
+		assert.Equal(t, createdLast.ID, latest.ID)
+	})
+
+	t.Run("the higher id wins between applies created in the same instant", func(t *testing.T) {
+		lock := createTestLock(t, store, "latest_by_id", storage.DatabaseTypeMySQL)
+		lowerID := seed(t, lock, "apply_same_instant_lower_id", 242, created)
+		higherID := seed(t, lock, "apply_same_instant_higher_id", 243, created)
+		require.Greater(t, higherID.ID, lowerID.ID)
+		require.True(t, higherID.CreatedAt.Equal(lowerID.CreatedAt), "both applies hold the same creation time")
+
+		latest, err := store.Applies().GetLatestByDatabase(ctx, "latest_by_id", storage.DatabaseTypeMySQL, "staging")
+		require.NoError(t, err)
+		require.NotNil(t, latest)
+		assert.Equal(t, "apply_same_instant_higher_id", latest.ApplyIdentifier)
+		assert.Equal(t, higherID.ID, latest.ID)
+	})
+}
+
 func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

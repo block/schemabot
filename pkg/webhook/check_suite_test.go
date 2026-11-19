@@ -69,7 +69,7 @@ func newCheckSuiteProcessHandler(t *testing.T, store storage.WebhookEventStore, 
 	t.Helper()
 	ghc, mux := setupGitHubServer(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	service := api.New(&durableWebhookTestStorage{webhookEvents: store}, &api.ServerConfig{Repos: repos}, nil, logger)
+	service := api.New(&durableWebhookTestStorage{webhookEvents: store, settings: newMemorySettingsStore()}, &api.ServerConfig{Repos: repos}, nil, logger)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
 	h := NewHandler(service, factory, nil, logger,
 		append([]HandlerOption{WithDurableWebhookDispatch(), WithCheckSuiteRecovery()}, opts...)...)
@@ -153,14 +153,14 @@ func writeSinglePR(t *testing.T, w http.ResponseWriter, number int, state, headS
 		"state":  state,
 		"merged": state == "closed",
 		"head":   map[string]any{"sha": headSHA, "ref": "feature"},
-		"base":   map[string]any{"ref": "main"},
+		"base":   map[string]any{"ref": "main", "repo": map[string]any{"default_branch": "main"}},
 		"user":   map[string]any{"login": "octocat"},
 	}))
 }
 
 // coveringAutoPlanRow is an organic pull_request delivery that already plans
 // the head, so recovery must no-op on it.
-func coveringAutoPlanRow(t *testing.T, store storage.WebhookEventStore, pr int, headSHA string) {
+func coveringAutoPlanRow(t *testing.T, store storage.WebhookEventStore, pr int, headSHA, state string) {
 	t.Helper()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
@@ -170,6 +170,7 @@ func coveringAutoPlanRow(t *testing.T, store storage.WebhookEventStore, pr int, 
 		Repository:  "octocat/hello-world",
 		PullRequest: pr,
 		HeadSHA:     headSHA,
+		State:       state,
 		Payload:     []byte(`{}`),
 	})
 	require.NoError(t, err)
@@ -299,6 +300,7 @@ func TestCheckSuiteWebhookIgnoredWhenDurableDispatchDisabled(t *testing.T) {
 // A delivery from a repository outside the allowlist is acknowledged without
 // occupying an inbox row.
 func TestCheckSuiteWebhookRejectsUnregisteredRepo(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newRecordingWebhookEventStore()
 	h := newCheckSuiteIngressHandler(t, store, map[string]api.RepoConfig{"octocat/other-repo": {}})
 
@@ -313,6 +315,7 @@ func TestCheckSuiteWebhookRejectsUnregisteredRepo(t *testing.T) {
 	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-cs-1")
 	require.NoError(t, err)
 	require.Nil(t, row)
+	requireUnregisteredRepositoryCounted(t, reader, "check_suite", "requested")
 }
 
 // check_suite.requested fires for every push to every branch, but GitHub
@@ -410,20 +413,39 @@ func TestCheckSuiteWebhookDedupesRedelivery(t *testing.T) {
 // grace and planned the head, so processing finds coverage and synthesizes
 // nothing.
 func TestDurableCheckSuiteCoveredHeadNoOps(t *testing.T) {
-	store := newRecordingWebhookEventStore()
-	coveringAutoPlanRow(t, store, 7, "suite-sha")
-	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
-	mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
-		writeSinglePR(t, w, 7, "open", "suite-sha")
-	})
+	for _, tc := range []struct {
+		name            string
+		withObservation bool
+	}{
+		{name: "current delivery", withObservation: true},
+		{name: "legacy delivery"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRecordingWebhookEventStore()
+			coveringAutoPlanRow(t, store, 7, "suite-sha", storage.WebhookEventCompleted)
+			h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+			if tc.withObservation {
+				recordMainTargetObservation(t, h, "octocat/hello-world", 7, "suite-sha", "delivery-organic-1")
+			}
 
-	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "suite-sha", 7))
+			mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+				writeSinglePR(t, w, 7, "open", "suite-sha")
+			})
 
-	require.NoError(t, err)
-	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
-	require.NoError(t, err)
-	require.Nil(t, row, "a covered head must not get a recovery row")
+			retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "suite-sha", 7))
+
+			require.NoError(t, err)
+			require.False(t, retry)
+			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
+			require.NoError(t, err)
+			require.Nil(t, row, "a covered head must not get a recovery row")
+			if !tc.withObservation {
+				observed, err := h.loadPRTargetObservation(t.Context(), "octocat/hello-world", 7)
+				require.NoError(t, err)
+				require.Nil(t, observed, "legacy coverage does not create a target observation")
+			}
+		})
+	}
 }
 
 // The recovery case: an open PR still at the suite head has no auto-plan
@@ -440,7 +462,7 @@ func TestDurableCheckSuiteSynthesizesMissingCoverage(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	assert.Equal(t, "pull_request", row.Event)
@@ -464,7 +486,7 @@ func TestDurableCheckSuiteCanonicalizesStoredRepository(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	assert.Equal(t, "octocat/hello-world", row.Repository)
@@ -490,7 +512,7 @@ func TestDurableCheckSuiteSynthesizesPerPR(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, retry)
 	for _, pr := range []int{7, 8} {
-		row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", pr, "suite-sha"))
+		row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", pr, "suite-sha"))
 		require.NoError(t, err)
 		require.NotNil(t, row, "PR %d must get its own recovery row", pr)
 	}
@@ -520,7 +542,7 @@ func TestDurableCheckSuiteSkipsClosedAndMovedPRs(t *testing.T) {
 
 			require.NoError(t, err)
 			require.False(t, retry)
-			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 			require.NoError(t, err)
 			require.Nil(t, row)
 		})
@@ -544,10 +566,10 @@ func TestDurableCheckSuiteEmptyPayloadFallsBackToOpenPRScan(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row, "the open PR at the suite head must be recovered")
-	other, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 8, "other-sha"))
+	other, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 8, "other-sha"))
 	require.NoError(t, err)
 	require.Nil(t, other, "PRs at other heads must be untouched")
 }
@@ -584,7 +606,7 @@ func TestDurableCheckSuiteTruncatedOpenPRWalkStillRecoversVisitedMatches(t *test
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row, "a PR matched on a visited page must still be recovered")
 }
@@ -637,7 +659,7 @@ func TestDurableCheckSuiteSameRepoEmptyPRListSkipsOpenPRWalk(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row)
 }
@@ -647,8 +669,9 @@ func TestDurableCheckSuiteSameRepoEmptyPRListSkipsOpenPRWalk(t *testing.T) {
 // an uncovered sibling in the same pass still gets its recovery row.
 func TestDurableCheckSuiteMixedCoverageSynthesizesOnlyUncovered(t *testing.T) {
 	store := newRecordingWebhookEventStore()
-	coveringAutoPlanRow(t, store, 7, "suite-sha")
+	coveringAutoPlanRow(t, store, 7, "suite-sha", storage.WebhookEventPending)
 	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	recordMainTargetObservation(t, h, "octocat/hello-world", 7, "suite-sha")
 	for _, pr := range []string{"7", "8"} {
 		mux.HandleFunc("/repos/octocat/hello-world/pulls/"+pr, func(w http.ResponseWriter, r *http.Request) {
 			num := 7
@@ -663,10 +686,10 @@ func TestDurableCheckSuiteMixedCoverageSynthesizesOnlyUncovered(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	covered, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	covered, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.Nil(t, covered, "the covered PR must not get a recovery row")
-	uncovered, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 8, "suite-sha"))
+	uncovered, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 8, "suite-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, uncovered, "the uncovered sibling must still be recovered")
 }
@@ -700,7 +723,7 @@ func TestDurableCheckSuiteDriverFailsMalformedTerminally(t *testing.T) {
 // another recovery attempt.
 func TestDurableCheckSuiteResynthesizesFailedRecoveryRow(t *testing.T) {
 	store := newRecordingWebhookEventStore()
-	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha")
+	guid := reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha")
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  guid,
@@ -714,6 +737,7 @@ func TestDurableCheckSuiteResynthesizesFailedRecoveryRow(t *testing.T) {
 	})
 	require.NoError(t, err)
 	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+
 	mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
 		writeSinglePR(t, w, 7, "open", "suite-sha")
 	})
@@ -747,6 +771,7 @@ func TestDurableCheckSuiteRecoversFailedOrganicRowOnlyAfterCoolOff(t *testing.T)
 			store := newRecordingWebhookEventStore()
 			seedFailedOrganicDelivery(t, store, time.Now().Add(-tt.failedAgo))
 			h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+			recordMainTargetObservation(t, h, "octocat/hello-world", 7, "head-sha", "organic-github-guid")
 			mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
 				writeSinglePR(t, w, 7, "open", "head-sha")
 			})
@@ -755,7 +780,7 @@ func TestDurableCheckSuiteRecoversFailedOrganicRowOnlyAfterCoolOff(t *testing.T)
 
 			require.NoError(t, err)
 			require.False(t, retry)
-			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "head-sha"))
 			require.NoError(t, err)
 			if tt.wantRecovered {
 				require.NotNil(t, row, "a recovery delivery is enqueued for the head")
@@ -790,6 +815,7 @@ func TestDurableCheckSuiteGitHubFailureRetries(t *testing.T) {
 // Config can change between enqueue and claim: a repository deregistered in
 // the interim must not have work synthesized for it.
 func TestDurableCheckSuiteRevalidatesAllowlist(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
 	store := newRecordingWebhookEventStore()
 	h, _ := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/other-repo": {}})
 
@@ -797,9 +823,10 @@ func TestDurableCheckSuiteRevalidatesAllowlist(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row)
+	requireUnregisteredRepositoryCounted(t, reader, "check_suite", "requested")
 }
 
 // The kill switch must stop synthesis with a restart, including rows already
@@ -818,7 +845,7 @@ func TestDurableCheckSuiteHonorsKillSwitchForQueuedRows(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, reconcileMainTargetGUID("octocat/hello-world", 7, "suite-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row)
 }

@@ -71,7 +71,7 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 		prFetches.Add(1)
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(headSHA)},
-			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("base456")},
+			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("base456"), Repo: &gh.Repository{DefaultBranch: new("main")}},
 			User:  &gh.User{Login: new("testuser")},
 			State: new("closed"),
 		})

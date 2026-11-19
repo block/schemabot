@@ -3923,6 +3923,38 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 	return scanApplies(rows)
 }
 
+// GetLatestByDatabase returns the most recently created apply for a database,
+// or nil when it has none. An empty dbType or environment is not used as a
+// filter. Applies created in the same instant are ordered by id, so the answer
+// does not depend on how the database breaks the tie.
+func (s *applyStore) GetLatestByDatabase(ctx context.Context, database, dbType, environment string) (*storage.Apply, error) {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	environment = storage.CanonicalKey(environment)
+
+	query := `
+		SELECT ` + applyColumns + `
+		FROM applies
+		WHERE database_name = ?`
+	args := []any{database}
+
+	if dbType != "" {
+		query += " AND database_type = ?"
+		args = append(args, dbType)
+	}
+	if environment != "" {
+		query += " AND environment = ?"
+		args = append(args, environment)
+	}
+	query += " ORDER BY created_at DESC, id DESC LIMIT 1"
+
+	apply, err := scanApply(s.db.QueryRowContext(ctx, query, args...))
+	if err != nil {
+		return nil, fmt.Errorf("query latest apply for database %s: %w", database, err)
+	}
+	return apply, nil
+}
+
 // FindMissingSummaryComment returns GitHub-backed applies that reached a
 // terminal state recently but whose progress comment was never followed by a
 // summary comment. Used by summary reconciliation to post missing summaries.

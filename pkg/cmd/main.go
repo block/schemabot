@@ -17,6 +17,8 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/commands"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Set by ldflags at build time.
@@ -104,7 +106,7 @@ func main() {
 			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)
 			cancelLocal()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				fmt.Fprint(os.Stderr, errorLine("", "Error", err))
 				os.Exit(1)
 			}
 			if connection != nil {
@@ -121,10 +123,10 @@ func main() {
 			// failure; a non-empty token with an error is a non-fatal warning (the
 			// returned token is still usable and re-login can fix it).
 			if token == "" {
-				fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+				fmt.Fprint(os.Stderr, errorLine(templates.ANSIRed, "Error", err))
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
+			fmt.Fprint(os.Stderr, errorLine(templates.ANSIYellow, "Warning", err))
 		}
 		client.SetAuthToken(token)
 		if localEndpoint != "" {
@@ -174,10 +176,25 @@ func main() {
 		// scripting it needs to tell two successful-but-different outcomes
 		// apart (see commands.ExitCodeFor); anything else exits 1.
 		if !errors.Is(err, commands.ErrSilent) {
-			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+			fmt.Fprint(os.Stderr, errorLine(templates.ANSIRed, "Error", err))
 		}
 		os.Exit(commands.ExitCodeFor(err))
 	}
+}
+
+// errorLine is the line main writes to the operator's terminal to report err:
+// the label ("Error" or "Warning"), then the text of err, wrapped in color
+// when one is given. An error a command returns can quote the server, or a
+// proxy that answered in its place, so control runes are removed here, where
+// every such error is printed, rather than by each command that builds one.
+// The color is main's own and is added around the cleaned text. main writes to
+// stderr only through this function.
+func errorLine(color, label string, err error) string {
+	line := label + ": " + ui.TerminalSafe(err.Error())
+	if color != "" {
+		line = color + line + templates.ANSIReset
+	}
+	return line + "\n"
 }
 
 // Only commands that use the schema API may implicitly start a selected runtime.

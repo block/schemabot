@@ -86,7 +86,7 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
 		h.logger.Debug("push webhook from unregistered repository",
 			"repo", repo, "head_sha", headSHA, "installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "push", "", repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "push", "")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "repository not registered"})
 		return
 	}
@@ -248,7 +248,7 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
 		h.logger.Warn("durable push delivery from unregistered repository",
 			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "push", "", repo)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "push", "")
 		return false, nil
 	}
 

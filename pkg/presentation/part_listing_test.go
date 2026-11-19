@@ -37,6 +37,19 @@ func TestPartCountsPhrases(t *testing.T) {
 	assert.Equal(t, []string{"20 copying", "2 waiting for cutover", "10 complete"}, PartCounts{Complete: 10, Running: 20, WaitingForCutover: 2}.Phrases())
 	assert.Equal(t, []string{"1 failed", "2 cutting over", "1 queued"}, PartCounts{CuttingOver: 2, Queued: 1, Failed: 1}.Phrases())
 	assert.Equal(t, []string{"none"}, PartCounts{}.Phrases())
+	// A CREATE TABLE, DROP TABLE or instant ALTER copies no rows, so its
+	// running parts read as applying.
+	assert.Equal(t, []string{"1 applying", "3 complete"}, PartCounts{Complete: 3, Running: 1, RunningLabel: RunningApplying}.Phrases())
+}
+
+func TestRunningWord(t *testing.T) {
+	assert.Equal(t, RunningCopying, RunningWord(true))
+	assert.Equal(t, RunningApplying, RunningWord(false))
+}
+
+func TestTargetCoverageNamesTheRunningWord(t *testing.T) {
+	assert.Equal(t, " · 2 complete, 1 applying", TargetCoverage(2, 1, 0, 0, 0, RunningApplying, PendingQueued))
+	assert.Equal(t, " · 2 copying, 1 queued", TargetCoverage(0, 2, 1, 0, 0, RunningCopying, PendingQueued))
 }
 
 func TestPartDetail(t *testing.T) {
@@ -64,6 +77,8 @@ func TestPartDetail(t *testing.T) {
 			assert.Equal(t, tt.want, PartDetail(tt.part, PendingQueued))
 		})
 	}
+	// A part that copies no rows reads as applying until it reports.
+	assert.Equal(t, "applying", PartDetail(Part{Status: task.Running, RunningLabel: RunningApplying}, PendingQueued))
 	// A part a settled rollout will never run reads as not started.
 	assert.Equal(t, "not started", PartDetail(Part{Status: task.Pending}, PendingWord(true)))
 	assert.Equal(t, "not started · ~1.2k rows", PartDetail(Part{Status: task.Pending, PlannedRows: new(int64(1_200))}, PendingWord(true)))
@@ -100,7 +115,7 @@ func TestListParts(t *testing.T) {
 			}
 		}
 		add(12, Part{Status: task.Failed})
-		add(4, Part{Status: task.WaitingForCutover})
+		add(5, Part{Status: task.WaitingForCutover})
 		for i := range 7 {
 			add(1, Part{Status: task.Running, RowsCopied: int64(100 * (7 - i)), RowsTotal: 1000})
 		}
@@ -114,10 +129,10 @@ func TestListParts(t *testing.T) {
 		}
 		want = append(want, PartListLine{Part: -1, Summary: "7 more failed targets"})
 		// The slowest copying targets, furthest behind first.
-		want = append(want, PartListLine{Part: 22}, PartListLine{Part: 21}, PartListLine{Part: 20})
-		want = append(want, PartListLine{Part: -1, Summary: "4 more copying targets"})
+		want = append(want, PartListLine{Part: 23}, PartListLine{Part: 22}, PartListLine{Part: 21}, PartListLine{Part: 20})
+		want = append(want, PartListLine{Part: -1, Summary: "3 more copying targets"})
 		// The targets working past the copy, in order, each as live as a copier.
-		want = append(want, PartListLine{Part: 12}, PartListLine{Part: 13}, PartListLine{Part: 14})
+		want = append(want, PartListLine{Part: 12}, PartListLine{Part: 13}, PartListLine{Part: 14}, PartListLine{Part: 15})
 		want = append(want, PartListLine{Part: -1, Summary: "1 more target past copying"})
 		assert.Equal(t, want, got)
 	})
@@ -126,7 +141,7 @@ func TestListParts(t *testing.T) {
 		for i := range 6 {
 			parts = append(parts, Part{Name: fmt.Sprintf("failed%d", i), Status: task.Failed})
 		}
-		for i := range 4 {
+		for i := range 5 {
 			parts = append(parts, Part{Name: fmt.Sprintf("copying%d", i), Status: task.Running, RowsCopied: int64(100 * (i + 1)), RowsTotal: 1000})
 		}
 		var summaries []string
@@ -153,7 +168,7 @@ func TestListParts(t *testing.T) {
 			}
 			names = append(names, parts[line.Part].Name)
 		}
-		assert.Equal(t, []string{"measured0", "measured1", "measured2", "7 more copying shards"}, names,
+		assert.Equal(t, []string{"measured0", "measured1", "measured2", "measured3", "6 more copying shards"}, names,
 			"the slowest measured copiers set the pace; ones with nothing reported are not named ahead of them")
 	})
 	t.Run("the heading counts an unlisted phase before cancelled", func(t *testing.T) {

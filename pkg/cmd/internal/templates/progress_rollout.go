@@ -288,23 +288,20 @@ func targetSubsetLabel(targets []ShardProgress, total int) string {
 }
 
 // sortRolledTables orders tables rolled up across targets by
-// presentation.TableRolloutRank, the order the PR comment lists them in, so a
-// table finished on some targets stays above one no target has started. Tables
-// of equal rank keep plan order. Each table's rank is computed once, so a
-// watch frame does not rebuild it on every comparison.
+// presentation.TableChangeOrder, the order the PR comment lists them in, so a
+// table finished on some targets stays above one no target has started, and a
+// table its targets change with different statements lists them together.
+// Each table's rank is computed once, so a watch frame does not rebuild it on
+// every comparison.
 func sortRolledTables(tables []TableProgress) {
-	type ranked struct {
-		table TableProgress
-		rank  int
+	order := presentation.TableChangeOrder(len(tables),
+		func(i int) string { return tables[i].Namespace + "\x00" + tables[i].TableName },
+		func(i int) int { return rolledTableRank(tables[i]) })
+	sorted := make([]TableProgress, len(tables))
+	for i, j := range order {
+		sorted[i] = tables[j]
 	}
-	byRank := make([]ranked, len(tables))
-	for i, t := range tables {
-		byRank[i] = ranked{t, rolledTableRank(t)}
-	}
-	slices.SortStableFunc(byRank, func(a, b ranked) int { return a.rank - b.rank })
-	for i, r := range byRank {
-		tables[i] = r.table
-	}
+	copy(tables, sorted)
 }
 
 // rolledTableRank is a rolled-up table's presentation.TableRolloutRank, from
@@ -553,7 +550,7 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 		b.WriteString(line + "\n")
 	}
 	writeThrottleTooltip(&b, t)
-	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t)))
+	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), runningWord(t)))
 	return b.String(), true
 }
 
@@ -799,7 +796,7 @@ func targetsCoverage(t TableProgress) string {
 			retrying++
 		}
 	}
-	return presentation.TargetCoverage(done, running, queued, failed, retrying, pendingTargetsWord(t))
+	return presentation.TargetCoverage(done, running, queued, failed, retrying, runningWord(t), pendingTargetsWord(t))
 }
 
 // haltedAcrossTargetsPhrase names a halted table's state across its targets.

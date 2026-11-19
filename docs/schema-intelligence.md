@@ -655,7 +655,7 @@ live view:
   • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
 ```
 
 Use `schemabot status apply-example-73` for a single snapshot. SQL rendering
@@ -1116,7 +1116,7 @@ Output excerpt:
   • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
 ```
 
 Here, `orders` is 60% copied with an estimated 42 minutes remaining. The
@@ -2021,6 +2021,11 @@ Response excerpt (illustrative values):
 ```
 
 </details>
+
+Without `apply_id`, `GET /api/logs/{database}?environment=…` reads the newest
+apply for the database in that environment, which is the one created last. When
+two applies were created in the same instant, the same one is read every time.
+A database with no applies in that environment returns an empty `logs` list.
 
 The database-independent route, `GET /api/logs?apply_id=apply-example-73`,
 returns the same shape. The default window is the latest 50 entries, returned

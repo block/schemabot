@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"golang.org/x/text/width"
 )
@@ -51,7 +52,7 @@ func stdoutSupportsHyperlinks() bool {
 // so they cannot inject escapes on the plain path either.
 func Link(text, url string) string {
 	if !Hyperlinks || !osc8SafeURL(url) || containsControl(text) {
-		return stripControl(url)
+		return TerminalSafeLine(url)
 	}
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
@@ -76,9 +77,11 @@ func containsControl(s string) bool {
 	return strings.ContainsFunc(s, isControl)
 }
 
-// stripControl removes control runes so a value from a server response is
-// safe to print as plain terminal output.
-func stripControl(s string) string {
+// TerminalSafeLine is TerminalSafe for a value printed on one line, such as a
+// lock owner, an apply's caller, or a URL: the newline and the tab go with the
+// other control runes, so the value cannot start a line of its own under the
+// one it was printed on or push the rest of the row out of its column.
+func TerminalSafeLine(s string) string {
 	return strings.Map(func(r rune) rune {
 		if isControl(r) {
 			return -1
@@ -87,8 +90,42 @@ func stripControl(s string) string {
 	}, s)
 }
 
+// isControl reports whether a terminal acts on r instead of displaying it. That
+// is the C0 range, DEL, and the C1 range, which some terminals treat the way
+// they treat ESC, plus the bidirectional controls, which reorder the text
+// around them so that a line reads differently from what was sent. Other
+// invisible runes are not included: the joiners inside an emoji sequence, and
+// inside ordinary words in several scripts, change no other text.
 func isControl(r rune) bool {
-	return r < 32 || r == 127
+	return unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r)
+}
+
+// TerminalSafe removes the control runes from text a server sent, such as an
+// error message, so printing it cannot move the cursor, recolor or clear the
+// screen, set the window title, plant a hyperlink, or reorder the text around
+// it. Newlines and tabs are kept because multi-line error messages rely on
+// them. Bytes that are not valid UTF-8 come out as U+FFFD, so the result is not
+// byte for byte the input. A value that belongs on one line takes
+// TerminalSafeLine instead, and a message printed inside a line takes
+// TerminalSafeInline.
+func TerminalSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if isControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// TerminalSafeInline is TerminalSafe for a message printed inside a line the
+// CLI writes, such as the reason that ends a warning. Each run of white space,
+// line breaks included, becomes one space: the words stay apart, and the
+// message cannot start a line of its own under the one it was printed on.
+func TerminalSafeInline(s string) string {
+	return strings.Join(strings.Fields(TerminalSafe(s)), " ")
 }
 
 // terminalEscapePattern matches the zero-width escape sequences this CLI

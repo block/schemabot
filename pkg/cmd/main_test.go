@@ -1,12 +1,18 @@
 package main
 
 import (
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"testing"
 
 	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 )
 
 func TestRollbackRequiresEnvironmentFlag(t *testing.T) {
@@ -90,4 +96,75 @@ func TestInitWithoutFlagsReachesWizard(t *testing.T) {
 	require.NoError(t, err)
 	_, err = parser.Parse([]string{"init"})
 	require.NoError(t, err)
+}
+
+// main prints the error a command returns, and that error can quote text the
+// server relayed from an engine or a database. Escape sequences in it are
+// removed where it is printed, while the line break of a multi-line error stays.
+// The label and the color around the line are main's own and stay.
+func TestErrorLineDropsTerminalEscapes(t *testing.T) {
+	err := errors.New("cutover failed: lock wait timeout\x1b[2J\rcompleted\n  retry the apply")
+
+	assert.Equal(t, "Error: cutover failed: lock wait timeout[2Jcompleted\n  retry the apply\n",
+		errorLine("", "Error", err))
+	assert.Equal(t, "\x1b[31mError: cutover failed: lock wait timeout[2Jcompleted\n  retry the apply\x1b[0m\n",
+		errorLine(templates.ANSIRed, "Error", err))
+	assert.Equal(t, "\x1b[33mWarning: cutover failed: lock wait timeout[2Jcompleted\n  retry the apply\x1b[0m\n",
+		errorLine(templates.ANSIYellow, "Warning", err))
+}
+
+// errorLine only protects the terminal if main uses it every time it reports
+// an error, and main cannot be run by a test because it exits the process. So
+// this reads main.go and requires every write to stderr to be
+// fmt.Fprint(os.Stderr, errorLine(...)): a line added later that prints an
+// error as it arrived fails here.
+func TestMainWritesToStderrOnlyThroughErrorLine(t *testing.T) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "main.go", nil, 0)
+	require.NoError(t, err, "parse main.go")
+
+	isStderr := func(expr ast.Expr) bool {
+		selector, ok := expr.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "Stderr" {
+			return false
+		}
+		pkg, ok := selector.X.(*ast.Ident)
+		return ok && pkg.Name == "os"
+	}
+
+	var stderrUses, errorLineWrites int
+	ast.Inspect(file, func(node ast.Node) bool {
+		if expr, ok := node.(ast.Expr); ok && isStderr(expr) {
+			stderrUses++
+		}
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 || !isStderr(call.Args[0]) {
+			return true
+		}
+		where := fileSet.Position(call.Pos())
+		fn, ok := call.Fun.(*ast.SelectorExpr)
+		if !assert.True(t, ok, "%s: stderr is written by something other than fmt.Fprint", where) {
+			return true
+		}
+		pkg, ok := fn.X.(*ast.Ident)
+		if !assert.True(t, ok && pkg.Name == "fmt" && fn.Sel.Name == "Fprint",
+			"%s: stderr is written by something other than fmt.Fprint", where) {
+			return true
+		}
+		if !assert.Len(t, call.Args, 2, "%s: fmt.Fprint(os.Stderr, ...) takes the one line errorLine built", where) {
+			return true
+		}
+		line, ok := call.Args[1].(*ast.CallExpr)
+		if !assert.True(t, ok, "%s: the line written to stderr is not built by errorLine", where) {
+			return true
+		}
+		builder, ok := line.Fun.(*ast.Ident)
+		if assert.True(t, ok && builder.Name == "errorLine", "%s: the line written to stderr is not built by errorLine", where) {
+			errorLineWrites++
+		}
+		return true
+	})
+
+	assert.Positive(t, errorLineWrites, "main.go reports errors on stderr")
+	assert.Equal(t, errorLineWrites, stderrUses, "os.Stderr is used somewhere other than as the destination of an errorLine write")
 }
