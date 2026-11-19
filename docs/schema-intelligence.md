@@ -608,7 +608,7 @@ schemabot status apply-example-42
 Output excerpt:
 
 ```text
-~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
   ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32);
 ```
 
@@ -668,6 +668,24 @@ Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
 as zero time remaining. Throttled tasks can include `throttle_reason`.
+`attempt` is how many times SchemaBot has redispatched the apply after a
+recoverable failure, and is omitted while it is zero. While the apply is
+`failed_retryable`, the retry under way is `attempt` + 1 of SchemaBot's
+recovery limit, and the CLI and the PR comment both name it on the table's
+line. Response excerpt for an apply on its third retry:
+
+```json
+{
+  "state": "failed_retryable",
+  "attempt": 2,
+  "tables": [
+    {"table_name": "orders", "status": "failed_retryable", "rows_copied": 420000, "rows_total": 1000000, "percent_complete": 42}
+  ]
+}
+```
+
+Both surfaces read that table as
+`🟨🟨🟨🟨🟨🟨🟨🟨⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically (attempt 3/10)`.
 `estimated_bytes` is the table's on-disk size when the change was planned,
 the same figure the plan comment shows. It is fixed for the life of the apply
 and does not grow as rows copy. It is omitted when the plan had no estimate,

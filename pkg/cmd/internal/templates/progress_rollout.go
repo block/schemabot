@@ -505,10 +505,7 @@ func keepsAcrossTargetsBar(t TableProgress) bool {
 // is copied and no target's rows are known, reported or planned, which leaves
 // the table to its phase.
 func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
-	parts := make([]presentation.Part, len(t.Shards))
-	for i, s := range t.Shards {
-		parts[i] = shardPart(s)
-	}
+	parts := shardParts(t.Shards)
 	rows := presentation.SumTargetRows(parts)
 	targets := len(t.Shards)
 	pct := ui.RowCopyDisplayPercent(presentation.PercentAcrossTargets(parts, 0), rows.Copied)
@@ -527,26 +524,6 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	writeThrottleTooltip(&b, t)
 	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t), runningWord(t)))
 	return b.String(), true
-}
-
-// stoppedRowsAcrossTargets sums the rows a stopped table's targets copied, for
-// its "Stopped at" line. A target that completed the change counts in full,
-// and every other target counts the rows it copied, capped at its own total.
-// It cannot use presentation.SumTargetRows, which leaves stopped targets out
-// because their rows are not progressing: here the rows a stopped target
-// copied are the point. The caller has every target's own row total, so no
-// plan's estimate is in the sum.
-func stoppedRowsAcrossTargets(targets []ShardProgress) (copied, total int64) {
-	for _, target := range targets {
-		if state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow) {
-			total += target.RowsTotal
-			copied += target.RowsTotal
-			continue
-		}
-		total += target.RowsTotal
-		copied += ui.ClampRows(target.RowsCopied, target.RowsTotal)
-	}
-	return copied, total
 }
 
 // isHaltedAcrossTargets reports whether a table rolled up across targets has
@@ -593,7 +570,7 @@ func partlyCompletedCounts(targets []ShardProgress) (completed, queued int) {
 func formatPartlyCompletedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
 	completed, queued := partlyCompletedCounts(t.Shards)
-	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d %s\n", t.TableName, completed, len(t.Shards), queued, pendingTargetsWord(t))
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s on %d of %d targets · %d %s\n", t.TableName, presentation.Complete, completed, len(t.Shards), queued, pendingTargetsWord(t))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
@@ -652,7 +629,7 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 		b.WriteString("\n")
 		return b.String()
 	}
-	stopped, ok := stoppedAcrossTargets(t.Shards)
+	stopped, ok := presentation.StoppedAcrossTargets(shardParts(t.Shards))
 	if !ok || !state.IsState(t.Status, state.Task.Stopped) || !anyTargetStarted(t.Shards) {
 		writeTableLine(&b, t, "%s%s", haltedAcrossTargetsPhrase(t), coverage)
 		if t.DDL != "" {
@@ -664,42 +641,13 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 	}
 	// Laid out the way a stopped table of one target is: its bar, its DDL,
 	// and the rows its targets copied.
-	writeTableLine(&b, t, "%s ⏹️ Stopped at %s%s", ui.ProgressBarStopped(stopped.pct), stopped.text, coverage)
+	writeTableLine(&b, t, "%s%s", stopped.Headline(), coverage)
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
-	fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(stopped.copied), ui.FormatNumber(stopped.total))
+	b.WriteString(indentDetail + stopped.RowsLine() + "\n")
 	b.WriteString(formatTableParts(t))
 	return b.String()
-}
-
-// stoppedAcrossTargets is how far a stopped table got across its targets: the
-// rows its targets copied of the rows they had to copy, where a target that
-// completed the change counts in full. ok is false when a target's rows are
-// not known, since a bar would then guess at how far that target got.
-func stoppedAcrossTargets(targets []ShardProgress) (stoppedProgress, bool) {
-	for _, target := range targets {
-		if target.RowsTotal <= 0 {
-			return stoppedProgress{}, false
-		}
-	}
-	var p stoppedProgress
-	p.copied, p.total = stoppedRowsAcrossTargets(targets)
-	if p.total == 0 {
-		return stoppedProgress{}, false
-	}
-	whole := min(int(p.copied*100/p.total), 99)
-	p.pct = ui.RowCopyDisplayPercent(whole, p.copied)
-	p.text = presentation.AcrossTargetsPercent(whole, true, p.copied, p.total)
-	return p, true
-}
-
-// stoppedProgress is where a stopped table's targets stopped, as rows, as the
-// percent its bar fills, and as the percent its line reads.
-type stoppedProgress struct {
-	copied, total int64
-	pct           int
-	text          string
 }
 
 // targetsCoverage counts a rolled-up table's targets for its line, as the PR

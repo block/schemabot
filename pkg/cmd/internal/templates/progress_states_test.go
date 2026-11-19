@@ -851,7 +851,7 @@ func TestFormatTableProgress_InstantLabelIsAlterOnly(t *testing.T) {
 
 		tp.Status = state.Apply.Completed
 		output = FormatTableProgress(tp)
-		assert.Contains(t, output, "✓ Complete", "%s completes with the generic label", changeType)
+		assert.Contains(t, output, "✅ Complete", "%s completes with the generic label", changeType)
 		assert.NotContains(t, output, "Applied instantly", "%s is not instant DDL", changeType)
 	}
 }
@@ -908,14 +908,15 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 		Status:     state.Apply.CuttingOver,
 	}
 	output := FormatTableProgress(tp)
-	assert.Contains(t, output, "Cutting over...")
+	assert.Contains(t, output, "🔄 Cutting over...")
 
+	// Without row counts the engine's whole-number percent says nothing about
+	// how far recovery has got, so the bar shows activity, as the PR comment
+	// shows it.
 	tp.Status = state.Apply.Recovering
 	tp.PercentComplete = 45
 	output = FormatTableProgress(tp)
-	assert.Contains(t, output, "Recovering state...")
-	assert.Contains(t, output, ui.ProgressBarRowCopy(45))
-	assert.NotContains(t, output, ui.ProgressBarRowCopy(100))
+	assert.Contains(t, output, ui.ProgressBarActivity()+" Recovering state...")
 
 	// Once row counts arrive, the displayed percent is computed from them
 	// rather than the engine's stale whole-number percent.
@@ -978,7 +979,7 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 		}
 
 		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBar(45, ui.ColorYellow)+" Retrying")
+		assert.Contains(t, output, ui.ProgressBar(45, ui.ColorYellow)+" 🔄 Interrupted — retrying automatically\n")
 	})
 
 	t.Run("without progress", func(t *testing.T) {
@@ -989,7 +990,7 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 		}
 
 		output := FormatTableProgress(tp)
-		assert.Contains(t, output, "users: Retrying")
+		assert.Contains(t, output, "users: 🔄 Interrupted — retrying automatically\n")
 		assert.NotContains(t, output, ui.ColorYellow)
 	})
 }

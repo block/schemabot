@@ -790,7 +790,7 @@ $ schemabot status apply-example-73
 
   ── shop ──
 
-     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
 ```
 
@@ -1286,7 +1286,7 @@ bar returns to blue):
 
 **Complete** — green bar at 100%:
 ```
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
 ```
 

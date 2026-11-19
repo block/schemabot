@@ -2252,9 +2252,10 @@ func TestRenderMultiDeploymentApplyComment_TableByTableRolloutCountsTables(t *te
 }
 
 // An operator stopped a rollout with testapp-001 done and testapp-002 part-way
-// through `orders`. The table reads as stopped and lists its targets, the
-// stopped one saying where it stopped, since that is where it resumes: the
-// lines the CLI's progress view prints for the same rollout.
+// through `orders`. The table keeps its bar at where its targets stopped, with
+// the rows they copied, and lists its targets, the stopped one saying where it
+// stopped, since that is where it resumes: the lines the CLI's progress view
+// prints for the same rollout.
 func TestRenderMultiDeploymentApplyComment_StoppedTableListsWhereEachTargetStopped(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		parallelTarget("primary", "testapp-001", so.Completed),
@@ -2270,8 +2271,8 @@ func TestRenderMultiDeploymentApplyComment_StoppedTableListsWhereEachTargetStopp
 		orders("testapp_002", state.Task.Stopped, 400),
 	)
 
-	assert.Contains(t, out, "**`orders`**: ⏹️ Stopped\n", "%s", out)
-	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 complete)\n  - ✓ `testapp-001`: 1,000 rows\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarStopped(70)+" ⏹️ Stopped at 70.00%\n", "%s", out)
+	assert.Contains(t, out, "- Rows: 1,400 / 2,000\n- Targets: 2 (1 stopped, 1 complete)\n  - ✓ `testapp-001`: 1,000 rows\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
 }
 
 // A rollout of `orders` then `refunds` table by table is stopped while both

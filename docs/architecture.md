@@ -874,7 +874,7 @@ canonical task states:
 | `postChecksum` | `post_checksum` | "⏩ Data verified, applying final changes..." |
 | `waitingOnSentinelTable` | `waiting_for_cutover` | "Waiting for cutover" |
 | `cutOver` | `cutting_over` | "🔄 Cutting over..." |
-| `close` | `completed` | "✓ Complete" |
+| `close` | `completed` | "✅ Complete" |
 
 Only the mid-flight phases refine a running task (`tablePhaseTaskState` accepts
 `catching_up`, `checksumming`, `post_checksum`, `cutting_over`). A per-table

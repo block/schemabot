@@ -140,7 +140,7 @@ func TestRenderApplyStatusComment_MultiStatementTableRowsStayTogether(t *testing
 	data := multiStatementApplyData(state.Apply.Running, multiStatementTableRows(state.Task.Completed, state.Task.Running, state.Task.Pending))
 	out := RenderApplyStatusComment(data)
 
-	running := "**`users`**: Running..."
+	running := "**`users`**: " + ui.ProgressBarActivity() + " Running..."
 	complete := "**`users`**: " + ui.ProgressBarComplete() + " ✅ Complete"
 	queued := "**`sessions`**: ⏳ Queued"
 	require.Contains(t, out, running)

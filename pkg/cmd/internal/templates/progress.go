@@ -15,6 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -482,17 +483,7 @@ func runningWord(t TableProgress) string {
 	case ddl.StatementCreateTable, ddl.StatementDropTable:
 		return presentation.RunningApplying
 	}
-	return presentation.RunningWord(!isInstantAlter(t))
-}
-
-// isInstantAlter reports whether the table should be described as applying
-// instantly: the engine flagged it instant and it is an ALTER. Other
-// operations may complete without a row copy, but they are not instant DDL,
-// so they keep their generic applying labels. ChangeType is populated for
-// every stored DDL change (storage rejects a blank operation), so an empty
-// value here means an unknown operation, not a missing field.
-func isInstantAlter(t TableProgress) bool {
-	return t.IsInstant && ddl.OpToStatementType(t.ChangeType) == ddl.StatementAlterTable
+	return presentation.RunningWord(!presentation.IsInstantAlter(t.IsInstant, t.ChangeType))
 }
 
 // writeTableLine writes a table's status line: the table, then its state as
@@ -575,11 +566,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		return b.String()
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
-		label := "✓ Complete"
-		if isInstantAlter(t) {
-			label = "⚡ Applied instantly"
-		}
-		writeTableLine(&b, t, "%s %s", bar, label)
+		writeTableLine(&b, t, "%s %s", bar, presentation.CompletePhrase(t.IsInstant, t.ChangeType))
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
@@ -670,8 +657,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			b.WriteString(formatTableParts(t))
 			return b.String()
 		}
-		bar := ui.ProgressBarRowCopy(t.PercentComplete)
-		writeTableLine(&b, t, "%s Recovering state...", bar)
+		// Blue activity bar: the engine is working on its own with no
+		// meaningful percentage, as the PR comment shows it.
+		writeTableLine(&b, t, "%s Recovering state...", ui.ProgressBarActivity())
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
@@ -679,13 +667,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.CuttingOver:
-		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
-		label := "Cutting over..."
-		op := ddl.OpToStatementType(t.ChangeType)
-		if op == ddl.StatementCreateTable || op == ddl.StatementDropTable {
-			label = "Applying..."
-		}
-		writeTableLine(&b, t, "%s %s", bar, label)
+		writeTableLine(&b, t, "%s %s", ui.ProgressBarActivity(), presentation.CuttingOverPhrase(t.ChangeType))
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
@@ -693,8 +675,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Failed:
-		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
-		writeTableLine(&b, t, "%s "+glyph.Failed+" Failed", bar)
+		writeTableLine(&b, t, "%s", presentation.FailedTableHeadline(t.PercentComplete, t.RowsCopied, t.IsInstant))
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
@@ -702,13 +683,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.FailedRetryable:
-		if t.PercentComplete > 0 || t.RowsCopied > 0 {
-			retryPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-			bar := ui.ProgressBar(retryPercent, ui.ColorYellow)
-			writeTableLine(&b, t, "%s Retrying", bar)
-		} else {
-			writeTableLine(&b, t, "Retrying")
-		}
+		writeTableLine(&b, t, "%s", presentation.RetryingTableHeadline(t.PercentComplete, t.RowsCopied, t.RetryAttempt, storage.MaxRecoveryAttempts))
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
@@ -834,16 +809,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	default:
 		// No row copy data — CREATE/DROP, instant DDL, or VSchema-only.
 		// Show a full blue bar with a state label.
-		bar := ui.ProgressBarRowCopy(100)
-		op := ddl.OpToStatementType(t.ChangeType)
-		switch {
-		case isInstantAlter(t):
-			writeTableLine(&b, t, "%s Applying instantly...%s", bar, throttledSuffix(t))
-		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
-			writeTableLine(&b, t, "%s Applying...%s", bar, throttledSuffix(t))
-		default:
-			writeTableLine(&b, t, "%s Running...%s", bar, throttledSuffix(t))
-		}
+		writeTableLine(&b, t, "%s %s%s", ui.ProgressBarActivity(), presentation.ApplyingPhrase(t.IsInstant, t.ChangeType), throttledSuffix(t))
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}

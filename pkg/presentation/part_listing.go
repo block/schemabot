@@ -785,3 +785,52 @@ func PercentAcrossTargets(parts []Part, silent int) int {
 	}
 	return percent
 }
+
+// StoppedTargets is how far a stopped table got across its targets: the rows
+// its targets copied of the rows they had to copy, the percent its bar fills,
+// and the percent its line reads.
+type StoppedTargets struct {
+	Copied, Total int64
+	barPercent    int
+	text          string
+}
+
+// StoppedAcrossTargets sums the rows a stopped table's targets copied. A
+// target that completed the change counts in full, and every other target
+// counts the rows it copied, capped at its own total. It cannot use
+// SumTargetRows, which leaves stopped targets out because their rows are not
+// progressing: here the rows a stopped target copied are the point. ok is
+// false when a target's rows are not known, since a bar would then guess at
+// how far that target got, and when no target has rows to copy.
+func StoppedAcrossTargets(parts []Part) (StoppedTargets, bool) {
+	var s StoppedTargets
+	for _, p := range parts {
+		if p.RowsTotal <= 0 {
+			return StoppedTargets{}, false
+		}
+		s.Total += p.RowsTotal
+		if state.IsState(p.Status, state.Task.Completed, state.Task.RevertWindow) {
+			s.Copied += p.RowsTotal
+			continue
+		}
+		s.Copied += ui.ClampRows(p.RowsCopied, p.RowsTotal)
+	}
+	if s.Total == 0 {
+		return StoppedTargets{}, false
+	}
+	whole := min(int(s.Copied*100/s.Total), 99)
+	s.barPercent = ui.RowCopyDisplayPercent(whole, s.Copied)
+	s.text = AcrossTargetsPercent(whole, true, s.Copied, s.Total)
+	return s, true
+}
+
+// Headline is the stopped table's bar and state, as the line for a stopped
+// table of one target reads.
+func (s StoppedTargets) Headline() string {
+	return ui.ProgressBarStopped(s.barPercent) + " ⏹️ Stopped at " + s.text
+}
+
+// RowsLine is the rows the stopped table's targets copied.
+func (s StoppedTargets) RowsLine() string {
+	return fmt.Sprintf("Rows: %s / %s", ui.FormatNumber(s.Copied), ui.FormatNumber(s.Total))
+}

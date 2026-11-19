@@ -22,10 +22,12 @@ import (
 // same table produces several rows carrying that table's name, so rows are
 // counted by progressUnit rather than assumed to be distinct tables.
 type TableProgressData struct {
-	TaskID          string
-	Namespace       string
-	TableName       string
-	DDL             string
+	TaskID    string
+	Namespace string
+	TableName string
+	DDL       string
+	// ChangeType is the table's operation: "create", "alter", or "drop".
+	ChangeType      string
 	Status          string // canonical lowercase: "pending", "running", "completed", etc.
 	RowsCopied      int64
 	RowsTotal       int64
@@ -1099,8 +1101,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		writePlannedRows(sb, table.EstimatedRows, table.EstimatedBytes, "")
 
 	case state.Task.Completed:
-		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(sb, "**%s**: %s \u2705 Complete\n", inlineCode(table.TableName), bar)
+		fmt.Fprintf(sb, "**%s**: %s %s\n", inlineCode(table.TableName), ui.ProgressBarComplete(), presentation.CompletePhrase(table.IsInstant, table.ChangeType))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.CatchingUp:
@@ -1168,40 +1169,26 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 
 	case state.Task.CuttingOver:
 		bar := ui.ProgressBarActivity() // blue — automatic work, no operator action
-		fmt.Fprintf(sb, "**%s**: %s \U0001f504 Cutting over...\n", inlineCode(table.TableName), bar)
+		fmt.Fprintf(sb, "**%s**: %s %s\n", inlineCode(table.TableName), bar, presentation.CuttingOverPhrase(table.ChangeType))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Failed:
-		// A progress bar asserts that row copy happened. When the engine failed
-		// before copying a single row (e.g. a preflight check rejected the
-		// change), a red 0% bar reads as a copy that started and stalled — render
-		// the failure without one. An instant DDL change has no row copy phase
-		// at all, so its failure label does not mention one.
-		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
-		case pct > 0:
-			fmt.Fprintf(sb, "**%s**: %s "+glyph.Failed+" Failed\n", inlineCode(table.TableName), ui.ProgressBarFailed(pct))
-		case table.IsInstant:
-			fmt.Fprintf(sb, "**%s**: "+glyph.Failed+" Failed\n", inlineCode(table.TableName))
-		default:
-			fmt.Fprintf(sb, "**%s**: "+glyph.Failed+" Failed (before row copy started)\n", inlineCode(table.TableName))
-		}
+		fmt.Fprintf(sb, "**%s**: %s\n", inlineCode(table.TableName), presentation.FailedTableHeadline(table.PercentComplete, table.RowsCopied, table.IsInstant))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
 			writeTableErrorLine(sb, glyph.Failed, table.ErrorMessage)
 		}
 
 	case state.Task.FailedRetryable:
-		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
+		// Only an apply SchemaBot is redispatching has a retry count. One
+		// paused by a data plane that retries on its own does not carry its
+		// count across the wire, so the retry is announced without a number.
+		attempt := 0
 		if state.IsState(applyState, state.Apply.FailedRetryable) {
-			fmt.Fprintf(sb, "**%s**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
-				inlineCode(table.TableName), bar, applyAttempt+1, storage.MaxRecoveryAttempts)
-		} else {
-			// The apply is paused by a data plane that retries on its own; its
-			// attempt count does not cross the wire, so announce the retry
-			// without inventing a number.
-			fmt.Fprintf(sb, "**%s**: %s \U0001f504 Interrupted — retrying automatically\n",
-				inlineCode(table.TableName), bar)
+			attempt = applyAttempt + 1
 		}
+		fmt.Fprintf(sb, "**%s**: %s\n", inlineCode(table.TableName),
+			presentation.RetryingTableHeadline(table.PercentComplete, table.RowsCopied, attempt, storage.MaxRecoveryAttempts))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 		if table.ErrorMessage != "" {
 			// The row above says SchemaBot is retrying on its own, so the
@@ -1210,7 +1197,11 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		}
 
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), cancelledTablePhrase(table))
+		if bar, ok := presentation.CancelledTableBar(table.PercentComplete, table.RowsCopied); ok {
+			fmt.Fprintf(sb, "**%s**: %s 🚫 %s\n", inlineCode(table.TableName), bar, cancelledTablePhrase(table))
+		} else {
+			fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), cancelledTablePhrase(table))
+		}
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.RevertWindow:
@@ -1312,8 +1303,10 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 		writeDDLLine(sb, dialect, table.DDL, budget)
 		writeRowsAndETA(sb, table)
 	} else {
-		// No row data yet (initializing or instant DDL)
-		fmt.Fprintf(sb, "**%s**: Running...%s\n", inlineCode(table.TableName), throttledSuffix(table))
+		// No row data yet: a change with no row copy (CREATE, DROP, instant
+		// DDL) or one whose engine has not reported its rows.
+		fmt.Fprintf(sb, "**%s**: %s %s%s\n", inlineCode(table.TableName), ui.ProgressBarActivity(),
+			presentation.ApplyingPhrase(table.IsInstant, table.ChangeType), throttledSuffix(table))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 	}
 }
@@ -2121,6 +2114,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		data.Tables = append(data.Tables, TableProgressData{
 			TableName:       t.TableName,
 			DDL:             t.DDL,
+			ChangeType:      t.ChangeType,
 			Status:          state.NormalizeState(t.Status),
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,

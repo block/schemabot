@@ -114,6 +114,11 @@ type TableProgress struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
+	// RetryAttempt is the retry under way on a table interrupted by a
+	// recoverable failure, counted from 1 of storage.MaxRecoveryAttempts. Zero
+	// when no retry count is known: the apply is not one SchemaBot is
+	// redispatching, as when a data plane retries on its own.
+	RetryAttempt int
 	// Shards is the table's per-part progress: one entry per shard, or one per
 	// target when AcrossTargets is set.
 	Shards []ShardProgress
@@ -238,6 +243,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			EstimatedRows:       tbl.EstimatedRows,
 			PlannedShards:       int(tbl.PlannedShards),
 			PercentComplete:     int(tbl.PercentComplete),
+			RetryAttempt:        retryAttempt(data.State, result.Attempt),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
 			ChecksumRowsTotal:   tbl.ChecksumRowsTotal,
@@ -302,4 +308,14 @@ func progressOperationRef(ref *apitypes.ProgressOperationRef) *presentation.Oper
 		return nil
 	}
 	return &presentation.OperationRef{Deployment: ref.Deployment, OperationKey: ref.OperationKey}
+}
+
+// retryAttempt is the retry under way on an apply SchemaBot is redispatching
+// after a recoverable failure, counted from 1, or zero when the apply is not
+// one, as the PR comment counts it.
+func retryAttempt(applyState string, attempt int) int {
+	if !state.IsState(applyState, state.Apply.FailedRetryable) {
+		return 0
+	}
+	return attempt + 1
 }

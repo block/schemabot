@@ -16,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -540,7 +541,7 @@ func finishAfterCutover(result *apitypes.ProgressResponse, tables []*apitypes.Ta
 		// Show green completion bar
 		for _, tbl := range tables {
 			bar := ui.ProgressBarComplete()
-			fmt.Printf("%*s: %s ✓ Complete\n", maxTableNameLen, tbl.TableName, bar)
+			fmt.Printf("%*s: %s %s\n", maxTableNameLen, tbl.TableName, bar, presentation.CompletePhrase(tbl.IsInstant, tbl.ChangeType))
 		}
 		fmt.Printf("\n\n%s\n", templates.FormatApplyCompleteWithSummary(countProgressResponseChanges(tables).summary(), applyID))
 		return nil
