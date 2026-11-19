@@ -574,6 +574,13 @@ type ExemptTables struct {
 	Reason    string
 }
 
+// ExemptReasonLeadingUnderscore is the exemption reason a MySQL plan carries
+// for a live table whose name starts with "_". Online schema change tools name
+// their shadow, checkpoint and leftover tables that way, so the planner never
+// diffs, drops or creates one, and a no-change plan is where a reviewer learns
+// that such a table is still on the target.
+const ExemptReasonLeadingUnderscore = "leading underscore"
+
 // HasErrors returns true if any lint warning has error severity.
 // Error-severity violations block apply unless overridden with --allow-unsafe.
 func (r *PlanResult) HasErrors() bool {

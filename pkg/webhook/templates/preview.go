@@ -135,7 +135,8 @@ func PreviewCommentPlanExemptTables() string {
 // comment that the table was seen and deliberately left alone rather than
 // missed. The disclosure names the config key the decision is recorded in, so
 // a reviewer can tell a table the config withheld from one an engine exempted
-// for reasons of its own.
+// for reasons of its own, such as the leftover tables of an earlier online
+// schema change that the MySQL planner skips by their leading underscore.
 func PreviewCommentPlanIgnoreTables() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -151,6 +152,10 @@ func PreviewCommentPlanIgnoreTables() string {
 			Namespace: "testapp",
 			Tables:    []string{"flyway_schema_history"},
 			Reason:    "ignore_tables",
+		}, {
+			Namespace: "testapp",
+			Tables:    []string{"_orders_old", "_users_old"},
+			Reason:    engine.ExemptReasonLeadingUnderscore,
 		}},
 	})
 }

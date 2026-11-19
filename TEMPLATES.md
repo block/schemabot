@@ -609,6 +609,8 @@ schemabot apply -e staging
 
 ℹ️ Ignored tables in namespace `testapp` (ignore_tables): `flyway_schema_history`
 
+ℹ️ Ignored tables in namespace `testapp` (leading underscore): `_orders_old`, `_users_old`
+
 
 </details>
 

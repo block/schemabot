@@ -469,8 +469,19 @@ is distinguishable from a declared one), and the CLI prints the same disclosure
 for `plan` and `apply`. Past five tables the line leads with its count and
 folds the names into a collapsed block, so how many were withheld stays visible
 unexpanded. The reason in parentheses says who withheld the table:
-`ignore_tables` is this config, and the PostgreSQL planner uses the same line
-to disclose the archive-named tables its own naming convention leaves in place.
+`ignore_tables` is this config, and the planners use the same line for the
+tables their own naming conventions leave in place:
+
+| Reason | Engines | Tables |
+|---|---|---|
+| `archive naming` | MySQL, PostgreSQL | `<name>_archive_YYYY`, with an optional month and day |
+| `leading underscore` | MySQL | Names starting with `_`, such as an online schema change's shadow, checkpoint or leftover tables |
+
+The MySQL planner applies the leading-underscore convention before
+`ignore_tables`, so an entry naming a `_` table is reported under
+`leading underscore`, not as withheld by the config. The PlanetScale planner
+leaves the same tables out without disclosing them.
+
 When reviewing a PR that *introduces* an `ignore_tables` entry, the disclosure
 plus the config diff is the review surface: the plan stops seeing that table
 from this PR onward.
