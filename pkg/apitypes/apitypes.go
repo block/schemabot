@@ -280,6 +280,12 @@ type ChecksScanRequest struct {
 	// gets an error, so a client that predates the field never reads an unread
 	// repository as one scanned clean.
 	ReportAppNotInstalled bool `json:"report_app_not_installed,omitempty"`
+	// PRs, when set, scans only these PR numbers instead of paging the
+	// repository's open PRs. Each is read on its own, so the scan costs what
+	// the named PRs cost rather than what the repository's open PRs cost. A
+	// named PR that is not open is left out. Page and UpdatedSince must be
+	// unset alongside it.
+	PRs []int `json:"prs,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -325,6 +331,23 @@ type ChecksScanResponse struct {
 	// the live webhook path that shares the same budget. Nil when the rate
 	// state could not be read (advisory only; the scan itself succeeded).
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+	// Supports names the backfill behaviors this server implements. A server
+	// that predates one ignores the request field that asks for it, so the
+	// CLI checks this before relying on a behavior rather than finding out
+	// from what the server did.
+	Supports ChecksBackfillSupport `json:"supports"`
+}
+
+// ChecksBackfillSupport lists the backfill behaviors a server confirms it
+// implements. A field a server leaves unset is a behavior it lacks.
+type ChecksBackfillSupport struct {
+	// NamedPRs means a scan request with prs reads only those PRs, instead of
+	// paging through the repository's open PRs.
+	NamedPRs bool `json:"named_prs,omitempty"`
+	// DeferSchemaPRs means a synthesize request without plan defers each PR
+	// that changes managed schema before writing any Check Run or check state,
+	// and checks rate_limit_floor_percent before every PR it starts.
+	DeferSchemaPRs bool `json:"defer_schema_prs,omitempty"`
 }
 
 // GitHubRateLimit is a point-in-time snapshot of a GitHub installation's
@@ -356,6 +379,14 @@ type ChecksReposResponse struct {
 type ChecksSynthesizeRequest struct {
 	Repo string `json:"repo"`
 	PRs  []int  `json:"prs"`
+	// Plan runs the auto-plans of PRs that change managed schema. Without it
+	// such a PR is deferred: the result names its databases, and nothing is
+	// written for it, so its missing check keeps blocking the merge.
+	Plan bool `json:"plan,omitempty"`
+	// RateLimitFloorPercent stops the batch before a PR when the GitHub
+	// budget left is below this percentage of its limit. The PRs not started
+	// come back with RateLimited set. Zero turns the check off.
+	RateLimitFloorPercent int `json:"rate_limit_floor_percent,omitempty"`
 }
 
 type ChecksSynthesizeResponse struct {
@@ -370,6 +401,17 @@ type ChecksSynthesizeResult struct {
 	PR      int    `json:"pr"`
 	Outcome string `json:"outcome"`
 	Error   string `json:"error,omitempty"`
+	// Deferred is true when the PR changes managed schema and the request did
+	// not ask for plans. Nothing was written for the PR.
+	Deferred bool `json:"deferred,omitempty"`
+	// Databases are the managed databases a deferred PR would plan.
+	Databases []string `json:"databases,omitempty"`
+	// ChangedFiles counts the files a deferred PR proposes, as a size hint
+	// for its plan.
+	ChangedFiles int `json:"changed_files,omitempty"`
+	// RateLimited is true when the batch stopped before this PR because the
+	// GitHub budget fell below the request's floor. Nothing was done for it.
+	RateLimited bool `json:"rate_limited,omitempty"`
 }
 
 type MissingCheckPR struct {

@@ -380,19 +380,124 @@ func discardLogger() *slog.Logger {
 
 type fakeCheckRunBackfiller struct {
 	calls    []int
+	opts     []CheckRunBackfillOptions
 	failPR   int
 	outcomes map[int]string
+	// deferred maps a PR to the databases it changes; without Plan the fake
+	// defers it, as the webhook handler defers a PR that changes schema.
+	deferred map[int][]string
 }
 
-func (f *fakeCheckRunBackfiller) BackfillPRCheckRuns(_ context.Context, _ string, pr int, _ int64) (string, error) {
+func (f *fakeCheckRunBackfiller) BackfillPRCheckRuns(_ context.Context, _ string, pr int, _ int64, opts CheckRunBackfillOptions) (CheckRunBackfillResult, error) {
 	f.calls = append(f.calls, pr)
+	f.opts = append(f.opts, opts)
 	if pr == f.failPR {
-		return "", errors.New("boom")
+		return CheckRunBackfillResult{Outcome: "config discovery failed"}, errors.New("boom")
+	}
+	if databases, ok := f.deferred[pr]; ok && !opts.Plan {
+		return CheckRunBackfillResult{Outcome: "deferred: PR changes managed schema", Deferred: true, Databases: databases, ChangedFiles: 3}, nil
 	}
 	if outcome, ok := f.outcomes[pr]; ok {
-		return outcome, nil
+		return CheckRunBackfillResult{Outcome: outcome}, nil
 	}
-	return "auto-plan started", nil
+	return CheckRunBackfillResult{Outcome: "auto-plan started"}, nil
+}
+
+// fakeCoreRateLimit serves a sequence of budget readings, one per call, and
+// repeats the last once the sequence runs out.
+type fakeCoreRateLimit struct {
+	remaining []int
+	limit     int
+	err       error
+	calls     int
+}
+
+func (f *fakeCoreRateLimit) CoreRateLimit(context.Context) (int, int, time.Time, error) {
+	f.calls++
+	if f.err != nil {
+		return 0, 0, time.Time{}, f.err
+	}
+	i := min(f.calls-1, len(f.remaining)-1)
+	return f.remaining[i], f.limit, time.Now().Add(time.Hour), nil
+}
+
+// A synthesize batch defers each PR that changes managed schema unless the
+// request asks for plans, and carries the databases back so the operator can
+// see what planning it would cost.
+func TestBackfillPRsWithinBudgetDefersSchemaPRsUnlessPlanned(t *testing.T) {
+	t.Parallel()
+
+	backfiller := &fakeCheckRunBackfiller{deferred: map[int][]string{2: {"orders", "payments"}}}
+	results := backfillPRsWithinBudget(t.Context(), &fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, 7, discardLogger())
+
+	require.Len(t, results, 2)
+	assert.Equal(t, ChecksSynthesizeResult{PR: 1, Outcome: "auto-plan started"}, results[0])
+	assert.Equal(t, ChecksSynthesizeResult{PR: 2, Outcome: "deferred: PR changes managed schema", Deferred: true, Databases: []string{"orders", "payments"}, ChangedFiles: 3}, results[1])
+	assert.Equal(t, []CheckRunBackfillOptions{{Plan: false}, {Plan: false}}, backfiller.opts)
+
+	planned := &fakeCheckRunBackfiller{deferred: map[int][]string{2: {"orders"}}}
+	results = backfillPRsWithinBudget(t.Context(), &fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, planned,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{2}, Plan: true}, 7, discardLogger())
+	require.Len(t, results, 1)
+	assert.Equal(t, ChecksSynthesizeResult{PR: 2, Outcome: "auto-plan started"}, results[0])
+	assert.Equal(t, []CheckRunBackfillOptions{{Plan: true}}, planned.opts)
+}
+
+// The budget floor is checked before every PR, not only between batches:
+// once the budget drops below it, the batch stops and the PRs not started
+// come back marked RateLimited for the caller to resend after the reset.
+func TestBackfillPRsWithinBudgetStopsAtTheFloor(t *testing.T) {
+	t.Parallel()
+
+	backfiller := &fakeCheckRunBackfiller{}
+	rate := &fakeCoreRateLimit{remaining: []int{3000, 1500, 900}, limit: 5000}
+	results := backfillPRsWithinBudget(t.Context(), rate, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2, 3, 4}, RateLimitFloorPercent: 20}, 7, discardLogger())
+
+	assert.Equal(t, []int{1, 2}, backfiller.calls)
+	require.Len(t, results, 4)
+	assert.Equal(t, "auto-plan started", results[1].Outcome)
+	for _, result := range results[2:] {
+		assert.True(t, result.RateLimited, "PR %d", result.PR)
+		assert.Equal(t, "not started: GitHub budget is below 20% (900 of 5000 requests left)", result.Outcome)
+		assert.Empty(t, result.Error)
+	}
+	assert.Equal(t, []int{3, 4}, []int{results[2].PR, results[3].PR})
+}
+
+// The floor is pacing, not a safety gate: with no floor the budget is never
+// read, and a budget that cannot be read does not stop the batch.
+func TestBackfillPRsWithinBudgetWithoutAReadableFloor(t *testing.T) {
+	t.Parallel()
+
+	unread := &fakeCoreRateLimit{remaining: []int{0}, limit: 5000}
+	backfiller := &fakeCheckRunBackfiller{}
+	results := backfillPRsWithinBudget(t.Context(), unread, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, 7, discardLogger())
+	assert.Len(t, results, 2)
+	assert.Equal(t, 0, unread.calls)
+
+	failing := &fakeCoreRateLimit{err: errors.New("rate limit endpoint unavailable")}
+	backfiller = &fakeCheckRunBackfiller{}
+	results = backfillPRsWithinBudget(t.Context(), failing, backfiller, ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}, RateLimitFloorPercent: 20}, 7, discardLogger())
+	assert.Equal(t, []int{1, 2}, backfiller.calls)
+	for _, result := range results {
+		assert.False(t, result.RateLimited)
+	}
+}
+
+// A PR whose backfill fails reports the error with the outcome, and the batch
+// keeps going.
+func TestBackfillPRsWithinBudgetReportsFailuresAndContinues(t *testing.T) {
+	t.Parallel()
+
+	backfiller := &fakeCheckRunBackfiller{failPR: 1}
+	results := backfillPRsWithinBudget(t.Context(), &fakeCoreRateLimit{remaining: []int{5000}, limit: 5000}, backfiller,
+		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, 7, discardLogger())
+
+	require.Len(t, results, 2)
+	assert.Equal(t, ChecksSynthesizeResult{PR: 1, Outcome: "config discovery failed", Error: "boom"}, results[0])
+	assert.Equal(t, ChecksSynthesizeResult{PR: 2, Outcome: "auto-plan started"}, results[1])
 }
 
 // Synthesize requests are validated before any GitHub work: request-shaped
@@ -724,6 +829,17 @@ func (f fakeWebhookMissingCheckScanClient) ListOpenPullRequestsPage(_ context.Co
 	return f.prs[start:end], nextPage, lastPage, nil
 }
 
+// FetchOpenPullRequest serves a named PR from prs; a PR not among them reads
+// as closed, the way a named PR that is no longer open does.
+func (f fakeWebhookMissingCheckScanClient) FetchOpenPullRequest(_ context.Context, _ string, number int) (ghclient.OpenPullRequest, bool, error) {
+	for _, pr := range f.prs {
+		if pr.Number == number {
+			return pr, true, nil
+		}
+	}
+	return ghclient.OpenPullRequest{}, false, nil
+}
+
 func (f fakeWebhookMissingCheckScanClient) FindCheckRunByName(_ context.Context, _ string, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error) {
 	return f.runs[headSHA+"/"+checkName], f.untrusted[headSHA+"/"+checkName], nil
 }
@@ -969,6 +1085,7 @@ func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
 	assert.Equal(t, "octo/repo", response.Repo)
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 }
 
 // fakeChecksScanClient adds the installation budget read a scan page ends
@@ -1024,6 +1141,7 @@ func TestExecuteChecksScanSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
 	assert.Empty(t, response.CheckNames)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 
 	var entry map[string]any
 	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log line: %s", logs.String())
@@ -1099,6 +1217,7 @@ func TestExecuteChecksScanScansThroughTheResolvedInstallation(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, response.AppNotInstalled)
 	assert.Empty(t, response.GitHubApp)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports)
 	assert.Equal(t, 1, response.Scanned)
 	require.Len(t, response.Missing, 1)
 	assert.Equal(t, 7, response.Missing[0].Number)
@@ -1699,4 +1818,59 @@ func TestWebhookExpectedCheckNamesUsesRegisteredEnvironments(t *testing.T) {
 	assert.Equal(t, []webhookExpectedCheckName{
 		{Name: "SchemaBot (staging)", Environment: "staging"},
 	}, webhookExpectedCheckNames(cfg, "octocat/repo", "", ""))
+}
+
+// A scan of named PRs reads only those PRs instead of paging the repository,
+// leaves out a named PR that is no longer open, and reports each one's
+// missing checks exactly as a paged scan would.
+func TestExecuteChecksScanOfNamedPRsReadsOnlyThosePRs(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main"}},
+	}
+	client := fakeChecksScanClient{fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 1, HeadSHA: "sha1", Title: "one"},
+			{Number: 2, HeadSHA: "sha2", Title: "two"},
+			{Number: 3, HeadSHA: "sha3", Title: "three"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha3/SchemaBot": {ID: 30, Name: "SchemaBot", Status: "completed", Conclusion: "success"},
+		},
+	}}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{"octo/repo": client}, nil)
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", PRs: []int{2, 3, 99}}, discardLogger(), resolve)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, response.Scanned, "PR 99 is not open, so it is left out")
+	assert.Zero(t, response.NextPage)
+	require.Len(t, response.Missing, 1)
+	assert.Equal(t, 2, response.Missing[0].Number)
+	assert.Equal(t, []string{"SchemaBot"}, response.Missing[0].MissingNames)
+}
+
+// A scan of named PRs refuses the paging and time-window fields, which only
+// apply to a scan of the repository's open PRs, and bounds how many PRs one
+// request reads.
+func TestExecuteChecksScanOfNamedPRsValidation(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{}
+	for name, tc := range map[string]struct {
+		req  ChecksScanRequest
+		want string
+	}{
+		"page":          {ChecksScanRequest{Repo: "octo/repo", PRs: []int{1}, Page: 2}, "page does not apply to a scan of named prs"},
+		"updated since": {ChecksScanRequest{Repo: "octo/repo", PRs: []int{1}, UpdatedSince: "2026-11-19T00:00:00Z"}, "updated_since does not apply to a scan of named prs"},
+		"non-positive":  {ChecksScanRequest{Repo: "octo/repo", PRs: []int{1, 0}}, "pr numbers must be positive; got 0"},
+		"too many":      {ChecksScanRequest{Repo: "octo/repo", PRs: make([]int, checksScanMaxNamedPRs+1)}, "at most 30 prs per scan"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := executeChecksScan(t.Context(), cfg, nil, tc.req, discardLogger())
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
 }

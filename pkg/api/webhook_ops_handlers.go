@@ -149,15 +149,35 @@ type IncompleteCheckRun = apitypes.IncompleteCheckRun
 // webhook handler implements it; the API service holds it so the checks
 // operator endpoints can reach the webhook pipeline.
 type CheckRunBackfiller interface {
-	BackfillPRCheckRuns(ctx context.Context, repo string, pr int, installationID int64) (string, error)
+	BackfillPRCheckRuns(ctx context.Context, repo string, pr int, installationID int64, opts CheckRunBackfillOptions) (CheckRunBackfillResult, error)
+}
+
+// CheckRunBackfillOptions controls how much work one PR's backfill may start.
+type CheckRunBackfillOptions struct {
+	// Plan runs the auto-plans of a PR that changes managed schema. Without
+	// it that PR is deferred, and no Check Run or check state is written for it.
+	Plan bool
+}
+
+// CheckRunBackfillResult is what one PR's backfill did.
+type CheckRunBackfillResult struct {
+	Outcome string
+	// Deferred is true when the PR changes managed schema and was not planned
+	// because the request did not ask for plans.
+	Deferred bool
+	// Databases are the managed databases a deferred PR would plan.
+	Databases []string
+	// ChangedFiles counts the files a deferred PR proposes, as a size hint.
+	ChangedFiles int
 }
 
 type ChecksSynthesizeRequest = apitypes.ChecksSynthesizeRequest
 type ChecksSynthesizeResponse = apitypes.ChecksSynthesizeResponse
 type ChecksSynthesizeResult = apitypes.ChecksSynthesizeResult
 
-// checksSynthesizeMaxPRsPerRequest bounds one synthesize request; each PR's
-// heavy plan work runs asynchronously, so a chunk only pays discovery.
+// checksSynthesizeMaxPRsPerRequest bounds one synthesize request. A PR's plans
+// run asynchronously and only when the request asks for them, so a chunk pays
+// for discovery alone.
 const checksSynthesizeMaxPRsPerRequest = 10
 
 // checksDisabledSkipOutcome is the per-PR outcome when a synthesize request
@@ -220,24 +240,90 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	if backfiller == nil {
 		return nil, fmt.Errorf("check run backfill is unavailable: no GitHub webhook runtime is configured")
 	}
+	if req.RateLimitFloorPercent < 0 || req.RateLimitFloorPercent > 99 {
+		return nil, webhookOpsRequestErrorf("rate_limit_floor_percent must be between 0 and 99; got %d", req.RateLimitFloorPercent)
+	}
 	installationClient, installationID, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
 	if err != nil {
 		return nil, err
 	}
-	response := &ChecksSynthesizeResponse{Repo: req.Repo}
-	for _, pr := range req.PRs {
-		outcome, err := backfiller.BackfillPRCheckRuns(ctx, req.Repo, pr, installationID)
-		result := ChecksSynthesizeResult{PR: pr, Outcome: outcome}
+	response := &ChecksSynthesizeResponse{
+		Repo:    req.Repo,
+		Results: backfillPRsWithinBudget(ctx, installationClient, backfiller, req, installationID, logger),
+	}
+	response.RateLimit = gitHubRateLimitSnapshot(ctx, installationClient, logger, "checks synthesize batch")
+	return response, nil
+}
+
+// coreRateLimitReader reads an installation's remaining core GitHub budget.
+type coreRateLimitReader interface {
+	CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error)
+}
+
+// backfillPRsWithinBudget backfills req's PRs in order. Before each PR it
+// re-reads the GitHub budget, and once the budget is below the request's floor
+// it stops: the PR and every one after it come back marked RateLimited, for
+// the caller to send again after the reset. The budget is shared with live
+// webhook traffic, and one PR's discovery can cost hundreds of requests, so
+// checking only between batches lets a single batch drain it.
+//
+// A budget that cannot be read does not stop the batch. The floor is pacing,
+// not a safety gate, and GitHub's own rate limiting still applies underneath.
+func backfillPRsWithinBudget(ctx context.Context, rate coreRateLimitReader, backfiller CheckRunBackfiller, req ChecksSynthesizeRequest, installationID int64, logger *slog.Logger) []ChecksSynthesizeResult {
+	opts := CheckRunBackfillOptions{Plan: req.Plan}
+	results := make([]ChecksSynthesizeResult, 0, len(req.PRs))
+	for i, pr := range req.PRs {
+		if below, remaining, limit := budgetBelowFloor(ctx, rate, req.RateLimitFloorPercent, logger, req.Repo, pr); below {
+			logger.Info("Check Run backfill stopping the batch because the GitHub budget is below the floor; the caller will resend the rest after the reset",
+				"repo", req.Repo, "pr", pr, "remaining", remaining, "limit", limit,
+				"floor_percent", req.RateLimitFloorPercent, "prs_not_started", len(req.PRs)-i)
+			for _, skipped := range req.PRs[i:] {
+				results = append(results, ChecksSynthesizeResult{
+					PR:          skipped,
+					Outcome:     fmt.Sprintf("not started: GitHub budget is below %d%% (%d of %d requests left)", req.RateLimitFloorPercent, remaining, limit),
+					RateLimited: true,
+				})
+			}
+			return results
+		}
+		backfilled, err := backfiller.BackfillPRCheckRuns(ctx, req.Repo, pr, installationID, opts)
+		result := ChecksSynthesizeResult{
+			PR:           pr,
+			Outcome:      backfilled.Outcome,
+			Deferred:     backfilled.Deferred,
+			Databases:    backfilled.Databases,
+			ChangedFiles: backfilled.ChangedFiles,
+		}
 		if err != nil {
 			// Each PR's backfill is independent; report the failure and keep
 			// going so one bad PR does not strand the rest of the batch.
 			logger.Warn("check run backfill failed for PR", "repo", req.Repo, "pr", pr, "error", err)
 			result.Error = err.Error()
 		}
-		response.Results = append(response.Results, result)
+		results = append(results, result)
 	}
-	response.RateLimit = gitHubRateLimitSnapshot(ctx, installationClient, logger, "checks synthesize batch")
-	return response, nil
+	return results
+}
+
+// budgetBelowFloor reports whether the installation's GitHub budget is below
+// floorPct percent of its limit. A floor of zero, or a budget that cannot be
+// read, is never below.
+func budgetBelowFloor(ctx context.Context, rate coreRateLimitReader, floorPct int, logger *slog.Logger, repo string, pr int) (below bool, remaining, limit int) {
+	if floorPct <= 0 {
+		return false, 0, 0
+	}
+	remaining, limit, _, err := rate.CoreRateLimit(ctx)
+	if err != nil {
+		logger.Warn("failed to read the GitHub budget before backfilling a PR; backfilling it without the floor check",
+			"repo", repo, "pr", pr, "error", err)
+		return false, 0, 0
+	}
+	if limit <= 0 {
+		logger.Warn("GitHub reported no core budget limit; backfilling the PR without the floor check",
+			"repo", repo, "pr", pr, "remaining", remaining, "limit", limit)
+		return false, remaining, limit
+	}
+	return remaining*100 < limit*floorPct, remaining, limit
 }
 
 // gitHubRateLimitSnapshot reads the installation's remaining core budget so
@@ -245,9 +331,7 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 // path that shares the same budget. The snapshot is advisory: the operation
 // that produced the response already succeeded, so a read failure is logged
 // and the pacing info omitted rather than failing the request.
-func gitHubRateLimitSnapshot(ctx context.Context, client interface {
-	CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error)
-}, logger *slog.Logger, operation string) *apitypes.GitHubRateLimit {
+func gitHubRateLimitSnapshot(ctx context.Context, client coreRateLimitReader, logger *slog.Logger, operation string) *apitypes.GitHubRateLimit {
 	remaining, limit, resetAt, err := client.CoreRateLimit(ctx)
 	if err != nil {
 		logger.Warn("failed to read GitHub rate limit; response omits pacing info and the caller will not pause",
@@ -373,7 +457,7 @@ func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRe
 // repository's open PRs, the Check Runs on their heads, and the installation's
 // remaining budget.
 type checksScanClient interface {
-	webhookMissingCheckScanClient
+	namedPullRequestScanClient
 	CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error)
 }
 
@@ -395,7 +479,21 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Sto
 	return executeChecksScanWith(ctx, cfg, store, req, logger, installationChecksScanClient)
 }
 
+// checksBackfillSupport is every backfill behavior this server implements.
+// Each scan response carries it, so a CLI can refuse a run that would rely on
+// a behavior an older server lacks.
+var checksBackfillSupport = apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}
+
 func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger, resolve checksScanClientResolver) (*ChecksScanResponse, error) {
+	response, err := scanChecks(ctx, cfg, store, req, logger, resolve)
+	if err != nil {
+		return nil, err
+	}
+	response.Supports = checksBackfillSupport
+	return response, nil
+}
+
+func scanChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger, resolve checksScanClientResolver) (*ChecksScanResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
@@ -405,6 +503,9 @@ func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage
 	}
 	if req.Page < 0 {
 		return nil, webhookOpsRequestErrorf("page must be non-negative")
+	}
+	if err := validateNamedScanPRs(req); err != nil {
+		return nil, err
 	}
 	req.Environment = canonicalEnvironment(req.Environment)
 	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
@@ -459,7 +560,14 @@ func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger, checkScanScope{config: cfg, environment: req.Environment, override: req.CheckName})
+	expectedNames := webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName)
+	scope := checkScanScope{config: cfg, environment: req.Environment, override: req.CheckName}
+	var response *ChecksScanResponse
+	if len(req.PRs) > 0 {
+		response, err = scanNamedPullRequestsForMissingChecks(ctx, installationClient, store, req.Repo, expectedNames, req.PRs, annotateAfter, logger, scope)
+	} else {
+		response, err = scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, expectedNames, req.Page, updatedSince, annotateAfter, logger, scope)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -940,6 +1048,13 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
+// namedPullRequestScanClient scans PRs the caller names instead of paging
+// the repository's open PRs.
+type namedPullRequestScanClient interface {
+	webhookMissingCheckScanClient
+	FetchOpenPullRequest(ctx context.Context, repo string, number int) (pr ghclient.OpenPullRequest, open bool, err error)
+}
+
 // scanObservedNow is the clock a scan page ages its runs against, at the
 // precision the page reports it.
 //
@@ -1000,24 +1115,95 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		return nil, err
 	}
 	now := scanObservedNow()
+	result := newChecksScanResponse(repo, expectedNames, now)
+	result.NextPage = nextPage
+	result.EstimatedOpenPRs = estimateOpenPRCount(page, lastPage, len(prs))
+	for i, pr := range prs {
+		if !updatedSince.IsZero() && pr.UpdatedAt.Before(updatedSince) {
+			// The listing is ordered newest-updated first, so every PR from
+			// here on is older than the requested window: the sweep is done.
+			prs = prs[:i]
+			result.NextPage = 0
+			break
+		}
+	}
+	if err := scanPullRequestsForMissingChecks(ctx, client, store, repo, expectedNames, prs, annotateAfter, now, logger, result, scopes...); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// scanNamedPullRequestsForMissingChecks scans only the named PRs, reading
+// each one instead of paging the repository, so an operator who already knows
+// which PRs to act on pays for those alone. A closed PR is left out, as the
+// open-PR listing would leave it out.
+func scanNamedPullRequestsForMissingChecks(ctx context.Context, client namedPullRequestScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, numbers []int, annotateAfter time.Duration, logger *slog.Logger, scopes ...checkScanScope) (*ChecksScanResponse, error) {
+	now := scanObservedNow()
+	result := newChecksScanResponse(repo, expectedNames, now)
+	prs := make([]ghclient.OpenPullRequest, 0, len(numbers))
+	for _, number := range numbers {
+		pr, open, err := client.FetchOpenPullRequest(ctx, repo, number)
+		if err != nil {
+			return nil, fmt.Errorf("read %s#%d to scan it for missing or stuck Check Runs: %w", repo, number, err)
+		}
+		if !open {
+			logger.Info("checks scan leaving out a named PR that is not open", "repo", repo, "pr", number)
+			continue
+		}
+		prs = append(prs, pr)
+	}
+	result.EstimatedOpenPRs = len(prs)
+	if err := scanPullRequestsForMissingChecks(ctx, client, store, repo, expectedNames, prs, annotateAfter, now, logger, result, scopes...); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// checksScanMaxNamedPRs bounds a scan of named PRs to one listing page's
+// worth, so it finishes within the same deadline a paged scan does.
+const checksScanMaxNamedPRs = webhookScanPRPageSize
+
+// validateNamedScanPRs rejects a named-PR scan that also asks for paging or a
+// time window, which only apply to a scan of the repository's open PRs.
+func validateNamedScanPRs(req ChecksScanRequest) error {
+	if len(req.PRs) == 0 {
+		return nil
+	}
+	if len(req.PRs) > checksScanMaxNamedPRs {
+		return webhookOpsRequestErrorf("at most %d prs per scan; send the rest in follow-up requests", checksScanMaxNamedPRs)
+	}
+	if req.Page > 0 {
+		return webhookOpsRequestErrorf("page does not apply to a scan of named prs")
+	}
+	if req.UpdatedSince != "" {
+		return webhookOpsRequestErrorf("updated_since does not apply to a scan of named prs")
+	}
+	for _, pr := range req.PRs {
+		if pr <= 0 {
+			return webhookOpsRequestErrorf("pr numbers must be positive; got %d", pr)
+		}
+	}
+	return nil
+}
+
+// newChecksScanResponse starts a scan response for repo, stamped with the
+// clock the scan ages its runs against.
+func newChecksScanResponse(repo string, expectedNames []webhookExpectedCheckName, now time.Time) *ChecksScanResponse {
 	checkNames := make([]string, 0, len(expectedNames))
 	for _, expected := range expectedNames {
 		checkNames = append(checkNames, expected.Name)
 	}
-	result := &ChecksScanResponse{
-		Repo:             repo,
-		CheckNames:       checkNames,
-		NextPage:         nextPage,
-		EstimatedOpenPRs: estimateOpenPRCount(page, lastPage, len(prs)),
-		ObservedAt:       now.Format(time.RFC3339),
+	return &ChecksScanResponse{
+		Repo:       repo,
+		CheckNames: checkNames,
+		ObservedAt: now.Format(time.RFC3339),
 	}
+}
+
+// scanPullRequestsForMissingChecks asks of each PR whether its expected Check
+// Runs are present and completed, and records the answers in result.
+func scanPullRequestsForMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, prs []ghclient.OpenPullRequest, annotateAfter time.Duration, now time.Time, logger *slog.Logger, result *ChecksScanResponse, scopes ...checkScanScope) error {
 	for _, pr := range prs {
-		if !updatedSince.IsZero() && pr.UpdatedAt.Before(updatedSince) {
-			// The listing is ordered newest-updated first, so every PR from
-			// here on is older than the requested window: the sweep is done.
-			result.NextPage = 0
-			break
-		}
 		result.Scanned++
 		var missing []string
 		var untrustedConflicts []string
@@ -1038,24 +1224,25 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		var annotate []bool
 		prNames := expectedNames
 		var stored []*storage.Check
+		var err error
 		storedRead := false
 		// Fixed names need no retained coverage. Storage is only an optional
 		// source of annotations for their stuck runs.
 		if len(scopes) > 0 && scopes[0].requiresCoverageDiscovery() {
 			stored, err = store.Checks().GetByPR(ctx, repo, pr.Number)
 			if err != nil {
-				return nil, fmt.Errorf("read retained check coverage %s#%d: %w", repo, pr.Number, err)
+				return fmt.Errorf("read retained check coverage %s#%d: %w", repo, pr.Number, err)
 			}
 			storedRead = true
 			prNames, err = resolvedWebhookCheckNames(ctx, scopes[0].config, client, repo, pr.HeadSHA, scopes[0].environment, scopes[0].override, stored)
 			if err != nil {
-				return nil, err
+				return err
 			}
 		}
 		for _, expected := range prNames {
 			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
 			if err != nil {
-				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, expected.Name, pr.HeadSHA, err)
+				return fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, expected.Name, pr.HeadSHA, err)
 			}
 			if run != nil {
 				if !checkRunCompleted(run) {
@@ -1124,7 +1311,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 			UntrustedConflictNames: untrustedConflicts,
 		})
 	}
-	return result, nil
+	return nil
 }
 
 // estimateOpenPRCount derives the repository's total open-PR count from one

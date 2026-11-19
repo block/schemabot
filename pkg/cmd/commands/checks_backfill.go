@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -43,22 +44,57 @@ type ChecksCmd struct {
 // not installed on, so one repository mid-onboarding does not hide the rest of
 // the fleet; the skip still makes the run exit nonzero. Every other scan
 // failure stops the sweep, since a repository that could not be read is not
-// one with nothing to backfill.
+// one with nothing to backfill. --skip-repo leaves named repositories out of a
+// sweep, so an operator can do the largest repositories first, on their own.
+//
+// A PR that changes managed schema is deferred unless --plan is given:
+// planning reads each changed database's schema once per environment, so one
+// large schema PR can cost more of the GitHub budget than every other PR in
+// the sweep. The report lists each deferred PR with its databases and prints
+// the command that plans them, which names them with --pr so that run scans
+// and plans those PRs alone.
 type ChecksBackfillCmd struct {
-	Repo           string `arg:"" optional:"" help:"Repository to backfill, in owner/name form; omit with --all-repos"`
-	AllRepos       bool   `help:"Scan every repository declared in the server's repos config, skipping and reporting any the server's GitHub App is not installed on"`
-	Last           string `help:"Only scan PRs updated within this window, for example 1h or 1d; by default every open PR is scanned"`
-	Environment    string `short:"e" help:"Only backfill this environment's SchemaBot Check Run name"`
-	CheckName      string `help:"Override the SchemaBot Check Run name to look for"`
-	Limit          int    `help:"Maximum open PRs to consider across all scanned repositories; 0 considers all" default:"0"`
-	StuckAfter     string `help:"Report an existing but uncompleted Check Run as stuck once it has been sitting this long, for example 1h or 2d" default:"1h"`
-	RateLimitFloor int    `help:"Pause whenever the GitHub budget drops below this percentage of its limit, resuming after it resets, so live webhook traffic keeps headroom; 0 disables pacing" default:"20"`
-	DryRun         bool   `help:"Report missing and stuck Check Runs without synthesizing"`
-	JSON           bool   `help:"Output as JSON"`
+	Repo           string   `arg:"" optional:"" help:"Repository to backfill, in owner/name form; omit with --all-repos"`
+	AllRepos       bool     `help:"Scan every repository declared in the server's repos config, skipping and reporting any the server's GitHub App is not installed on"`
+	SkipRepo       []string `name:"skip-repo" sep:"," help:"With --all-repos, leave out these repositories (owner/name); repeat the flag or separate them with commas"`
+	PR             []int    `name:"pr" sep:"," help:"Only scan these PR numbers in the named repository; repeat the flag or separate them with commas"`
+	Plan           bool     `help:"Plan the PRs that change managed schema; without it they are deferred and listed. Requires --pr, because each plan reads every changed database's schema once per environment"`
+	Last           string   `help:"Only scan PRs updated within this window, for example 1h or 1d; by default every open PR is scanned"`
+	Environment    string   `short:"e" help:"Only backfill this environment's SchemaBot Check Run name"`
+	CheckName      string   `help:"Override the SchemaBot Check Run name to look for"`
+	Limit          int      `help:"Maximum open PRs to consider across all scanned repositories; 0 considers all" default:"0"`
+	StuckAfter     string   `help:"Report an existing but uncompleted Check Run as stuck once it has been sitting this long, for example 1h or 2d" default:"1h"`
+	RateLimitFloor int      `help:"Pause whenever the GitHub budget drops below this percentage of its limit, resuming after it resets, so live webhook traffic keeps headroom; 0 disables pacing" default:"20"`
+	DryRun         bool     `help:"Report missing and stuck Check Runs without synthesizing"`
+	JSON           bool     `help:"Output as JSON"`
+
+	// waitForBudget replaces pauseForRateLimit in tests, so a run that pauses
+	// for the budget reset does not wait for a real one.
+	waitForBudget func(ctx context.Context, rate *apitypes.GitHubRateLimit, floorPct int, updateProgress func(string)) error `kong:"-"`
+}
+
+// pauseForBudget waits for the GitHub budget reset when rate is below the
+// --rate-limit-floor.
+func (cmd *ChecksBackfillCmd) pauseForBudget(ctx context.Context, rate *apitypes.GitHubRateLimit, updateProgress func(string)) error {
+	if cmd.waitForBudget != nil {
+		return cmd.waitForBudget(ctx, rate, cmd.RateLimitFloor, updateProgress)
+	}
+	return pauseForRateLimit(ctx, rate, cmd.RateLimitFloor, updateProgress)
 }
 
 // checksSynthesizeBatchSize matches the server's per-request PR cap.
 const checksSynthesizeBatchSize = 10
+
+// checksScanNamedBatchSize matches the server's cap on named PRs per scan.
+const checksScanNamedBatchSize = 30
+
+// checksBackfillDryRunStatus is a dry run's planned action for a PR that is
+// not held. Without --plan the server defers a PR that changes managed schema,
+// which a dry run cannot tell apart before discovery, so it says both.
+const (
+	checksBackfillDryRunStatus     = "recreate via auto-plan; a PR that changes managed schema is deferred"
+	checksBackfillDryRunPlanStatus = "recreate via auto-plan, planning managed schema"
+)
 
 // checksBackfillHeldStatus explains a held PR in the action table. The server
 // refuses these too (a non-terminal apply refuses its PR's backfill), but the
@@ -135,6 +171,14 @@ type checksBackfillAction struct {
 	Held    bool   `json:"held,omitempty"`
 	Outcome string `json:"outcome,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// Deferred marks a PR the server did not plan because it changes managed
+	// schema and the run did not pass --plan. Nothing was written for it, so
+	// its missing check still blocks the merge.
+	Deferred bool `json:"deferred,omitempty"`
+	// Databases are the managed databases a deferred PR would plan.
+	Databases []string `json:"databases,omitempty"`
+	// ChangedFiles counts the files a deferred PR proposes, as a size hint.
+	ChangedFiles int `json:"changed_files,omitempty"`
 	// sent records that this PR was in a batch handed to the server, and
 	// answered that the server sent its result. An interrupted run uses them
 	// to tell the PRs it heard back about from the batch in flight, and that
@@ -188,12 +232,21 @@ type checksBackfillReport struct {
 	// repository this is a misconfiguration, so it counts toward the run's
 	// nonzero exit.
 	SkippedAppNotInstalled []string `json:"skipped_app_not_installed,omitempty"`
-	CheckNames             []string `json:"check_names"`
-	Scanned                int      `json:"scanned"`
+	// SkippedByOperator are repositories --skip-repo left out of the sweep.
+	SkippedByOperator []string `json:"skipped_by_operator,omitempty"`
+	CheckNames        []string `json:"check_names"`
+	Scanned           int      `json:"scanned"`
 	// Last echoes the --last window bounding the sweep; empty means every
 	// open PR was scanned.
 	Last   string `json:"last,omitempty"`
 	DryRun bool   `json:"dry_run"`
+	// Plan echoes --plan: whether PRs that change managed schema were planned
+	// rather than deferred.
+	Plan bool `json:"plan"`
+	// Environment and CheckName echo -e and --check-name, the filters that
+	// chose which missing checks the run acted on.
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
 	// Interrupted says an operator's Ctrl-C or SIGTERM cut the run short, so
 	// the report holds only what the run learned before it. It is always
 	// present, false on a run that finished.
@@ -238,6 +291,9 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.RateLimitFloor < 0 || cmd.RateLimitFloor > 99 {
 		return fmt.Errorf("--rate-limit-floor must be between 0 and 99")
 	}
+	if err := cmd.validateScope(); err != nil {
+		return err
+	}
 	stuckAfter, err := parseOperatorDuration(cmd.StuckAfter)
 	if err != nil {
 		return fmt.Errorf("parse --stuck-after: %w", err)
@@ -277,6 +333,10 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		// empty enabled list leaves nothing to scan; the report says so.
 		repos = declared.Repos
 		skippedDisabled = declared.Disabled
+		repos, err = withoutSkippedRepos(repos, declared.Disabled, cmd.SkipRepo)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Scan phase: page through each repository's open PRs and ask the two
@@ -284,11 +344,20 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 	// complete? The listing is newest-updated first, so a --last window stops
 	// each repo's paging as soon as it crosses the window start.
 	report := &checksBackfillReport{
-		Repos:           repos,
-		SkippedDisabled: skippedDisabled,
-		Last:            cmd.Last,
-		DryRun:          cmd.DryRun,
-		StuckAfter:      cmd.StuckAfter,
+		Repos:             repos,
+		SkippedDisabled:   skippedDisabled,
+		SkippedByOperator: cmd.SkipRepo,
+		Last:              cmd.Last,
+		DryRun:            cmd.DryRun,
+		Plan:              cmd.Plan,
+		Environment:       cmd.Environment,
+		CheckName:         cmd.CheckName,
+		StuckAfter:        cmd.StuckAfter,
+	}
+	namedPRs := chunkPRNumbers(cmd.PR, checksScanNamedBatchSize)
+	named := make(map[int]bool, len(cmd.PR))
+	for _, pr := range cmd.PR {
+		named[pr] = true
 	}
 	checkNamesSeen := map[string]bool{}
 	skippedByServer := map[string]bool{}
@@ -304,11 +373,18 @@ scanning:
 		repoEstimate := 0
 		repoStart := report.mark()
 		for {
+			scanPage, scanPRs := page, []int(nil)
+			if len(namedPRs) > 0 {
+				// A named scan reads its PRs in server-sized groups; page
+				// counts the groups here and is not sent.
+				scanPage, scanPRs = 0, namedPRs[page-1]
+			}
 			chunk, err := cmdclient.ChecksScan(ctx, endpoint, apitypes.ChecksScanRequest{
 				Repo:         repo,
 				Environment:  cmd.Environment,
 				CheckName:    cmd.CheckName,
-				Page:         page,
+				Page:         scanPage,
+				PRs:          scanPRs,
 				UpdatedSince: updatedSince,
 				// Sent normalized, not as typed: this flag accepts operator
 				// spellings the server's own parser does not, so forwarding
@@ -325,6 +401,9 @@ scanning:
 			}
 			if err != nil {
 				return fmt.Errorf("scan %s open PRs for missing or stuck Check Runs: %w", repo, err)
+			}
+			if err := cmd.requireServerSupport(chunk.Supports); err != nil {
+				return err
 			}
 			// The server skips repos whose Check Run publishing is turned
 			// off rather than reporting every open PR as missing; record the
@@ -367,6 +446,13 @@ scanning:
 			// Every uncompleted run holds its PR, regardless of how long it has
 			// been sitting — --stuck-after shapes the stuck *report*, but an
 			// uncompleted run of any age could belong to an in-flight apply.
+			if len(named) > 0 {
+				// The server scans only the named PRs; filtering here too
+				// keeps a server that predates named scans from widening the
+				// run to every PR on the page.
+				chunk.Missing = slices.DeleteFunc(chunk.Missing, func(pr apitypes.MissingCheckPR) bool { return !named[pr.Number] })
+				chunk.Stuck = slices.DeleteFunc(chunk.Stuck, func(pr apitypes.StuckCheckPR) bool { return !named[pr.Number] })
+			}
 			uncompleted := make(map[int]bool, len(chunk.Stuck))
 			for _, stuckPR := range chunk.Stuck {
 				uncompleted[stuckPR.Number] = true
@@ -392,17 +478,24 @@ scanning:
 			if cmd.Limit > 0 && report.Scanned >= cmd.Limit {
 				break scanning
 			}
-			if chunk.NextPage == 0 {
+			nextPage := chunk.NextPage
+			if len(namedPRs) > 0 {
+				nextPage = 0
+				if page < len(namedPRs) {
+					nextPage = page + 1
+				}
+			}
+			if nextPage == 0 {
 				break
 			}
-			if err := pauseForRateLimit(ctx, chunk.RateLimit, cmd.RateLimitFloor, updateProgress); err != nil {
+			if err := cmd.pauseForBudget(ctx, chunk.RateLimit, updateProgress); err != nil {
 				if canceled := backfillCanceledError(ctx, err, stopProgress); canceled != nil {
 					scanCanceled = canceled
 					break scanning
 				}
 				return err
 			}
-			page = chunk.NextPage
+			page = nextPage
 		}
 	}
 	sort.Strings(report.CheckNames)
@@ -453,6 +546,72 @@ scanning:
 		return err
 	}
 	return attentionExitError(report)
+}
+
+// validateScope checks that the flags choosing which repositories and PRs to
+// scan, and whether to plan, fit together.
+func (cmd *ChecksBackfillCmd) validateScope() error {
+	if len(cmd.SkipRepo) > 0 && !cmd.AllRepos {
+		return fmt.Errorf("--skip-repo only applies with --all-repos")
+	}
+	if len(cmd.PR) > 0 {
+		if cmd.AllRepos {
+			return fmt.Errorf("--pr needs a repository argument; PR numbers belong to one repository")
+		}
+		if cmd.Last != "" {
+			return fmt.Errorf("--pr and --last cannot be used together; --pr already names the PRs to scan")
+		}
+		for _, pr := range cmd.PR {
+			if pr <= 0 {
+				return fmt.Errorf("--pr numbers must be positive; got %d", pr)
+			}
+		}
+	}
+	if cmd.Plan && len(cmd.PR) == 0 {
+		return fmt.Errorf("--plan requires --pr: each plan reads every changed database's schema once per environment, so name the PRs to plan")
+	}
+	return nil
+}
+
+// requireServerSupport refuses a run that relies on a backfill behavior the
+// server does not confirm. A server that predates one ignores the request
+// field asking for it, so the run would do something other than what the
+// operator asked for rather than fail.
+func (cmd *ChecksBackfillCmd) requireServerSupport(supports apitypes.ChecksBackfillSupport) error {
+	if len(cmd.PR) > 0 && !supports.NamedPRs {
+		return fmt.Errorf("the server does not support --pr: it would scan the repository's open PRs page by page instead of the PRs you named. Upgrade the server, or run without --pr")
+	}
+	if !cmd.DryRun && !supports.DeferSchemaPRs {
+		return fmt.Errorf("the server does not defer PRs that change managed schema: it would plan every one and skip the --rate-limit-floor check between PRs, which can drain the GitHub budget live webhooks share. Upgrade the server, or run with --dry-run to report missing Check Runs without recreating them")
+	}
+	return nil
+}
+
+// withoutSkippedRepos removes the repositories named by --skip-repo from the
+// declared ones. A name the server does not declare is an error, so a typo
+// cannot quietly sweep the repository the operator meant to leave out.
+func withoutSkippedRepos(enabled, disabled, skip []string) ([]string, error) {
+	declared := func(repo string) bool {
+		match := func(r string) bool { return strings.EqualFold(r, repo) }
+		return slices.ContainsFunc(enabled, match) || slices.ContainsFunc(disabled, match)
+	}
+	for _, repo := range skip {
+		if !declared(repo) {
+			return nil, fmt.Errorf("--skip-repo names %s, which the server does not declare; check the spelling against the server's repos config", repo)
+		}
+	}
+	return slices.DeleteFunc(slices.Clone(enabled), func(repo string) bool {
+		return slices.ContainsFunc(skip, func(s string) bool { return strings.EqualFold(s, repo) })
+	}), nil
+}
+
+// chunkPRNumbers splits prs into groups of at most size, in order.
+func chunkPRNumbers(prs []int, size int) [][]int {
+	var chunks [][]int
+	for start := 0; start < len(prs); start += size {
+		chunks = append(chunks, prs[start:min(start+size, len(prs))])
+	}
+	return chunks
 }
 
 // checksScanMark is how much of a report existed before one repository's scan
@@ -522,17 +681,24 @@ func attentionExitError(report *checksBackfillReport) error {
 			parts = append(parts, part)
 		}
 	} else {
-		held, failed := 0, 0
+		held, failed, deferred := 0, 0, 0
 		for _, action := range report.Actions {
 			switch {
 			case action.Held:
 				held++
 			case action.Error != "":
 				failed++
+			case action.Deferred:
+				deferred++
 			}
 		}
 		if held > 0 {
 			parts = append(parts, fmt.Sprintf("%d held %s", held, ui.Pluralize("PR", held)))
+		}
+		// A deferred PR's check is still missing, so its merge stays blocked
+		// until someone plans it.
+		if deferred > 0 {
+			parts = append(parts, fmt.Sprintf("%d deferred schema %s", deferred, ui.Pluralize("PR", deferred)))
 		}
 		if failed > 0 {
 			parts = append(parts, fmt.Sprintf("%d failed Check Run %s", failed, ui.Pluralize("recreation", failed)))
@@ -744,9 +910,11 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 	failed := 0
 	for _, repo := range sortedKeys(synthesizeByRepo) {
 		prs := synthesizeByRepo[repo]
-		for start := 0; start < len(prs); start += checksSynthesizeBatchSize {
-			batch := prs[start:min(start+checksSynthesizeBatchSize, len(prs))]
-			progressLine := fmt.Sprintf("synthesizing Check Runs for %d/%d PRs in %s...", min(start+len(batch), len(prs)), len(prs), repo)
+		pending := prs
+		for len(pending) > 0 {
+			batch := pending[:min(checksSynthesizeBatchSize, len(pending))]
+			pending = pending[len(batch):]
+			progressLine := fmt.Sprintf("synthesizing Check Runs for %d/%d PRs in %s...", len(prs)-len(pending), len(prs), repo)
 			if failed > 0 {
 				// Surface failures as they happen so the operator can interrupt a
 				// failing sweep instead of discovering it in the final table.
@@ -758,26 +926,58 @@ func (cmd *ChecksBackfillCmd) act(ctx context.Context, endpoint string, report *
 			for _, pr := range batch {
 				actionByPR[repoPR{repo: repo, pr: pr}].sent = true
 			}
-			resp, err := cmdclient.ChecksSynthesize(ctx, endpoint, apitypes.ChecksSynthesizeRequest{Repo: repo, PRs: batch})
+			resp, err := cmdclient.ChecksSynthesize(ctx, endpoint, apitypes.ChecksSynthesizeRequest{
+				Repo:                  repo,
+				PRs:                   batch,
+				Plan:                  cmd.Plan,
+				RateLimitFloorPercent: cmd.RateLimitFloor,
+			})
 			if err != nil {
 				return fmt.Errorf("synthesize Check Runs for %s: %w", repo, err)
 			}
+			// The server stops a batch at the first PR it reaches with the
+			// budget below the floor. Those PRs were not started, so they go
+			// back on the queue to send after the pause below.
+			_, pausing := rateLimitPauseDuration(resp.RateLimit, cmd.RateLimitFloor, webhookRedriveNow())
+			var notStarted []int
 			for _, result := range resp.Results {
-				if result.Error != "" {
+				action, ok := actionByPR[repoPR{repo: repo, pr: result.PR}]
+				if !ok {
+					continue
+				}
+				if result.RateLimited && pausing {
+					action.sent = false
+					notStarted = append(notStarted, result.PR)
+					continue
+				}
+				applySynthesizeResult(action, result)
+				if action.Error != "" {
 					failed++
 				}
-				if action, ok := actionByPR[repoPR{repo: repo, pr: result.PR}]; ok {
-					action.Outcome = result.Outcome
-					action.Error = result.Error
-					action.answered = true
-				}
 			}
-			if err := pauseForRateLimit(ctx, resp.RateLimit, cmd.RateLimitFloor, updateProgress); err != nil {
+			pending = append(notStarted, pending...)
+			if err := cmd.pauseForBudget(ctx, resp.RateLimit, updateProgress); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// applySynthesizeResult records the server's answer for one PR on its action.
+// A PR the server did not start because the budget was below the floor, and
+// that the run is not about to resend, is a failure: its check is still
+// missing, and the run cannot say when it would be recreated.
+func applySynthesizeResult(action *checksBackfillAction, result apitypes.ChecksSynthesizeResult) {
+	action.Outcome = result.Outcome
+	action.Error = result.Error
+	if result.RateLimited && action.Error == "" {
+		action.Error = result.Outcome
+	}
+	action.Deferred = result.Deferred
+	action.Databases = result.Databases
+	action.ChangedFiles = result.ChangedFiles
+	action.answered = true
 }
 
 func (cmd *ChecksBackfillCmd) write(report *checksBackfillReport) error {
@@ -867,12 +1067,18 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 		return err
 	}
 	for _, action := range report.Actions {
-		status := "synthesize via auto-plan"
+		status := checksBackfillDryRunStatus
+		if report.Plan {
+			status = checksBackfillDryRunPlanStatus
+		}
 		if action.Held {
 			status = checksBackfillHeldStatus
 		}
 		if acted {
 			status = action.Outcome
+			if action.Deferred {
+				status = deferredStatus(action)
+			}
 			if action.Error != "" {
 				status = "failed: " + action.Error
 			}
@@ -893,7 +1099,74 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 			}
 		}
 	}
+	return writeChecksDeferredHint(w, report)
+}
+
+// deferredStatus is the outcome cell of a PR deferred because it changes
+// managed schema: the databases its plan would read, and how many files it
+// changes, so the operator can tell a one-table change from a sweeping one.
+func deferredStatus(action checksBackfillAction) string {
+	databases := strings.Join(action.Databases, ", ")
+	if len(action.Databases) > 3 {
+		databases = fmt.Sprintf("%s and %d more", strings.Join(action.Databases[:3], ", "), len(action.Databases)-3)
+	}
+	return fmt.Sprintf("deferred: changes schema in %d %s (%s); %d changed %s",
+		len(action.Databases), ui.PluralizeLabel("database", "databases", len(action.Databases)), databases,
+		action.ChangedFiles, ui.PluralizeLabel("file", "files", action.ChangedFiles))
+}
+
+// writeChecksDeferredHint prints, per repository, the command that plans the
+// PRs this run deferred.
+func writeChecksDeferredHint(w io.Writer, report *checksBackfillReport) error {
+	deferredByRepo := make(map[string][]string)
+	total := 0
+	for _, action := range report.Actions {
+		if action.Deferred && action.Error == "" {
+			deferredByRepo[action.Repo] = append(deferredByRepo[action.Repo], strconv.Itoa(action.PR))
+			total++
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(w, "\n%d %s managed schema and %s not planned, so %s Check %s still missing and the merge stays blocked. Each plan reads every changed database's schema once per environment. To plan them:\n",
+		total, ui.PluralizeLabel("PR changes", "PRs change", total), ui.PluralizeLabel("was", "were", total),
+		ui.PluralizeLabel("its", "their", total), ui.PluralizeLabel("Run is", "Runs are", total)); err != nil {
+		return err
+	}
+	for _, repo := range sortedKeys(deferredByRepo) {
+		if _, err := fmt.Fprintf(w, "  schemabot checks backfill %s%s --plan --pr %s\n", repo, checksBackfillFilterFlags(report), strings.Join(deferredByRepo[repo], ",")); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// checksBackfillFilterFlags repeats the run's -e and --check-name filters for
+// a follow-up command, so it acts on the same missing checks this run found.
+// Without them, a PR missing only its production check could be held for an
+// uncompleted staging check and never planned.
+func checksBackfillFilterFlags(report *checksBackfillReport) string {
+	var flags strings.Builder
+	if report.Environment != "" {
+		fmt.Fprintf(&flags, " -e %s", shellQuoteArg(report.Environment))
+	}
+	if report.CheckName != "" {
+		fmt.Fprintf(&flags, " --check-name %s", shellQuoteArg(report.CheckName))
+	}
+	return flags.String()
+}
+
+// shellQuoteArg quotes arg for a POSIX shell when it holds anything beyond
+// characters a shell reads literally, so a printed command pastes as one word.
+func shellQuoteArg(arg string) string {
+	plain := arg != "" && strings.IndexFunc(arg, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("@%_+=:,./-", r)
+	}) < 0
+	if plain {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
 // writeChecksInterruptedNote says, under the headline, that an interrupt cut
@@ -920,6 +1193,11 @@ func writeChecksSkippedRepos(w io.Writer, report *checksBackfillReport) error {
 	}
 	if len(report.SkippedAppNotInstalled) > 0 {
 		if _, err := fmt.Fprintf(w, "Skipped repositories the server's GitHub App is not installed on: %s. Install the App on each, or remove it from the server's repos config.\n", strings.Join(report.SkippedAppNotInstalled, ", ")); err != nil {
+			return err
+		}
+	}
+	if len(report.SkippedByOperator) > 0 {
+		if _, err := fmt.Fprintf(w, "Skipped repositories named by --skip-repo: %s.\n", strings.Join(report.SkippedByOperator, ", ")); err != nil {
 			return err
 		}
 	}

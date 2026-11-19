@@ -193,6 +193,15 @@ func (h *Handler) planBaseSchema(ctx context.Context, client *ghclient.Installat
 // paths are compared in it, so a plan comment's GitHub cost does not grow with
 // the number of environments beyond the tree levels their paths add (AV-15).
 func (h *Handler) planBaseSchemas(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schemas map[string]*ghclient.SchemaRequestResult) map[string]*templates.BaseSchemaData {
+	return h.compareBaseSchemas(ctx, client, repo, pr, schemas, h.logger.Warn)
+}
+
+// compareBaseSchemas is planBaseSchemas with the caller choosing how its
+// findings are logged. A plan logs them as warnings, because each one changes
+// the plan comment or blocks apply. A caller that posts no comment and gates
+// no apply logs them some other way, since the warnings would describe a
+// comment and a block that do not exist.
+func (h *Handler) compareBaseSchemas(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schemas map[string]*ghclient.SchemaRequestResult, report func(msg string, args ...any)) map[string]*templates.BaseSchemaData {
 	results := make(map[string]*templates.BaseSchemaData, len(schemas))
 	envsByHead := map[string][]string{}
 	for env, schema := range schemas {
@@ -207,7 +216,7 @@ func (h *Handler) planBaseSchemas(ctx context.Context, client *ghclient.Installa
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		for headSHA, envs := range envsByHead {
-			h.logger.Warn("plan comment will say the base branch could not be checked for newer schema changes: fetch PR failed; apply checks again before it runs",
+			report("plan comment will say the base branch could not be checked for newer schema changes: fetch PR failed; apply checks again before it runs",
 				append(baseSchemaLogAttrs(repo, pr, headSHA, envs, schemas), "error", err)...)
 			unverified("", envs)
 		}
@@ -226,7 +235,7 @@ func (h *Handler) planBaseSchemas(ctx context.Context, client *ghclient.Installa
 		}
 		changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, headSHA, paths)
 		if err != nil && len(changed) == 0 {
-			h.logger.Warn("plan comment will say the base branch could not be checked for newer schema changes; apply checks again before it runs",
+			report("plan comment will say the base branch could not be checked for newer schema changes; apply checks again before it runs",
 				append(logAttrs, "error", err)...)
 			unverified(prInfo.BaseRef, envs)
 			continue
@@ -241,7 +250,7 @@ func (h *Handler) planBaseSchemas(ctx context.Context, client *ghclient.Installa
 			if err != nil && len(envChanged) == 0 {
 				// A later path failed to read before this environment's paths
 				// were all checked, so nothing proves it current.
-				h.logger.Warn("plan comment will say the base branch could not be checked for newer schema changes: a schema path failed to read; apply checks again before it runs",
+				report("plan comment will say the base branch could not be checked for newer schema changes: a schema path failed to read; apply checks again before it runs",
 					append(logAttrs, "environment", env, "error", err)...)
 				unverified(prInfo.BaseRef, []string{env})
 				continue
@@ -253,7 +262,7 @@ func (h *Handler) planBaseSchemas(ctx context.Context, client *ghclient.Installa
 					// failed to read; the branch is stale either way.
 					attrs = append(attrs, "unchecked_paths_error", err)
 				}
-				h.logger.Warn("plan is of a branch missing newer schema changes from its base branch; the plan comment says so and apply is blocked until the branch has them", attrs...)
+				report("plan is of a branch missing newer schema changes from its base branch; the plan comment says so and apply is blocked until the branch has them", attrs...)
 			}
 			results[env] = &templates.BaseSchemaData{BaseBranch: prInfo.BaseRef, ChangedPaths: envChanged}
 		}
