@@ -1461,6 +1461,9 @@ type backfillServer struct {
 	// queueError, when set, is the error the scan reports for a merge queue
 	// it failed to read.
 	queueError string
+	// failMergeQueueSynthesize, when set, fails every synthesize request
+	// that posts merge queue checks with a 502.
+	failMergeQueueSynthesize bool
 }
 
 func (s *backfillServer) scanRequests() []apitypes.ChecksScanRequest {
@@ -1514,7 +1517,13 @@ func newBackfillServer(t *testing.T, missing []int, synthesize func(call int, re
 			server.mu.Lock()
 			server.synthesizes = append(server.synthesizes, req)
 			call := len(server.synthesizes)
+			failMergeQueue := server.failMergeQueueSynthesize
 			server.mu.Unlock()
+			if failMergeQueue && len(req.MergeQueueHeads) > 0 {
+				w.WriteHeader(http.StatusBadGateway)
+				assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ErrorResponse{Error: "upstream unavailable"}))
+				return
+			}
 			assert.NoError(t, json.NewEncoder(w).Encode(synthesize(call, req)))
 		default:
 			t.Errorf("unexpected request path %s", r.URL.Path)
@@ -1811,6 +1820,34 @@ func TestChecksBackfillDryRunListsMergeGroupsMissingChecks(t *testing.T) {
 	assert.Equal(t, []string{"https://github.com/octo/repo/pull/412", "main", "SchemaBot (production)", checksBackfillMergeQueueDryRunStatus},
 		renderedCells(lineContaining(t, output, "/pull/412 ")))
 	assert.Less(t, strings.Index(output, "/pull/412 "), strings.Index(output, "/pull/7 "), "the blocked merge queue is listed before the PRs")
+}
+
+// A merge queue request that fails does not stop the sweep. The PRs' own
+// checks are still recreated, the merge groups in the failed request are
+// reported as not confirmed, since the server may have posted some of them,
+// and the run exits nonzero for them.
+func TestChecksBackfillRecreatesPRChecksWhenAMergeQueueRequestFails(t *testing.T) {
+	server := newBackfillServer(t, []int{7}, createdForEach)
+	server.queue = []apitypes.MissingMergeQueueCheck{testMergeGroup(412, "mq412")}
+	server.queueScanned = 1
+	server.failMergeQueueSynthesize = true
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	require.EqualError(t, runErr, "checks backfill left 1 merge group still missing Check Runs needing attention")
+	synthesizes := server.synthesizeRequests()
+	require.Len(t, synthesizes, 2)
+	assert.Equal(t, []string{"mq412"}, synthesizes[0].MergeQueueHeads)
+	assert.Equal(t, []int{7}, synthesizes[1].PRs, "the PR pass runs after the failed merge queue request")
+	groupCells := renderedCells(lineContaining(t, output, "/pull/412 "))
+	require.Len(t, groupCells, 4)
+	assert.Contains(t, groupCells[3], "failed: request failed before the server answered, so the check may or may not have been posted")
+	assert.Equal(t, []string{"https://github.com/octo/repo/pull/7", "SchemaBot (production)", "created 1 Check Run"},
+		renderedCells(lineContaining(t, output, "/pull/7 ")))
 }
 
 // The backfill posts the merge queue checks before it recreates any PR's

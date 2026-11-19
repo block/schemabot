@@ -371,10 +371,11 @@ type mergeQueueSynthesizeClient interface {
 // no longer holds gets nothing. If the queue cannot be listed, nothing is
 // posted (MG-1).
 //
-// A merge queue head is a commit on a gh-readonly-queue/ branch, and nothing
-// here proves the queue made that branch. A head that is also an open PR's
-// head is refused, because the passing check would pass that PR's own
-// required check too. If that cannot be checked, nothing is posted on it.
+// The listing returns only heads GitHub's merge queue itself reports as an
+// entry's head commit, so a gh-readonly-queue/ branch the queue did not make
+// gets nothing. As a second guard, a head that is also an open PR's head is
+// refused, because the passing check would pass that PR's own required check
+// too. If that cannot be checked, nothing is posted on it.
 func backfillMergeQueueWithinBudget(ctx context.Context, client mergeQueueSynthesizeClient, backfiller CheckRunBackfiller, req ChecksSynthesizeRequest, installationID int64, logger *slog.Logger) []ChecksMergeQueueResult {
 	if len(req.MergeQueueHeads) == 0 {
 		return nil

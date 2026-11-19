@@ -1094,10 +1094,17 @@ type MergeQueueHead struct {
 }
 
 // ListMergeQueueHeads lists the merge groups a repository's merge queues are
-// testing right now, across every base branch. GitHub deletes a merge group's
-// branch once the group merges or leaves the queue, so every head returned is
-// a commit the queue is still waiting on. GitHub returns every matching branch
-// in one response, so this is one request however long the queues are.
+// testing right now, across every base branch.
+//
+// A gh-readonly-queue/ branch alone does not prove the merge queue made it, so
+// a branch is returned only when GitHub's merge queue for its base branch has
+// an entry whose head commit is the branch's commit. A branch whose name does
+// not say which base branch it targets cannot be checked that way and is left
+// out. GitHub deletes a merge group's branch once the group merges or leaves
+// the queue, so every head returned is a commit the queue is still waiting on.
+//
+// The cost is one request for the branches, plus one merge queue read per base
+// branch that has a queued group.
 func (ic *InstallationClient) ListMergeQueueHeads(ctx context.Context, repo string) ([]MergeQueueHead, error) {
 	owner, repoName := splitRepo(repo)
 	refs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list merge queue refs", []any{"repo", repo}, func(ctx context.Context) ([]*gh.Reference, error) {
@@ -1110,11 +1117,123 @@ func (ic *InstallationClient) ListMergeQueueHeads(ctx context.Context, repo stri
 	if err != nil {
 		return nil, fmt.Errorf("list merge queue refs for %s: %w", repo, err)
 	}
+	entryHeadsByBase := make(map[string]map[string]bool)
 	heads := make([]MergeQueueHead, 0, len(refs))
 	for _, ref := range refs {
-		heads = append(heads, mergeQueueHeadFrom(strings.TrimPrefix(ref.GetRef(), "refs/"), ref.GetObject().GetSHA()))
+		head := mergeQueueHeadFrom(strings.TrimPrefix(ref.GetRef(), "refs/"), ref.GetObject().GetSHA())
+		if head.BaseRef == "" {
+			ic.warnMergeQueueHeadLeftOut(repo, head, "the branch name does not say which base branch it targets, so the merge queue cannot confirm it")
+			continue
+		}
+		entryHeads, read := entryHeadsByBase[head.BaseRef]
+		if !read {
+			entryHeads, err = ic.mergeQueueEntryHeads(ctx, repo, head.BaseRef)
+			if err != nil {
+				return nil, fmt.Errorf("confirm merge queue groups for %s: %w", repo, err)
+			}
+			entryHeadsByBase[head.BaseRef] = entryHeads
+		}
+		if !entryHeads[head.HeadSHA] {
+			ic.warnMergeQueueHeadLeftOut(repo, head, "no entry in the base branch's merge queue has this commit as its head")
+			continue
+		}
+		heads = append(heads, head)
 	}
 	return heads, nil
+}
+
+func (ic *InstallationClient) warnMergeQueueHeadLeftOut(repo string, head MergeQueueHead, reason string) {
+	if ic.logger == nil {
+		return
+	}
+	ic.logger.Warn("merge queue head left out: SchemaBot will not report or backfill a check on it",
+		"repo", repo, "ref", head.Ref, "head_sha", head.HeadSHA, "reason", reason)
+}
+
+// mergeQueueEntryHeads returns the head commit of every entry in the merge
+// queue for base. It is an error, never an empty set, when GitHub returns no
+// merge queue for a base branch that has queue branches, so a caller cannot
+// mistake a queue it could not read for an empty one.
+func (ic *InstallationClient) mergeQueueEntryHeads(ctx context.Context, repo, base string) (map[string]bool, error) {
+	owner, name := splitRepo(repo)
+	heads := make(map[string]bool)
+	cursor := ""
+	for {
+		variables := map[string]any{"owner": owner, "name": name, "branch": base}
+		if cursor != "" {
+			variables["after"] = cursor
+		}
+		payload, err := json.Marshal(map[string]any{
+			"query":     `query($owner: String!, $name: String!, $branch: String!, $after: String) { repository(owner: $owner, name: $name) { mergeQueue(branch: $branch) { entries(first: 100, after: $after) { nodes { headCommit { oid } } pageInfo { hasNextPage endCursor } } } } }`,
+			"variables": variables,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode merge queue query for branch %s: %w", base, err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ic.graphQLURL(), bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("build merge queue query for branch %s: %w", base, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := ic.client.Client().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("read merge queue for branch %s: %w", base, err)
+		}
+		var result struct {
+			Data struct {
+				Repository *struct {
+					MergeQueue *struct {
+						Entries struct {
+							Nodes []struct {
+								HeadCommit *struct {
+									OID string `json:"oid"`
+								} `json:"headCommit"`
+							} `json:"nodes"`
+							PageInfo struct {
+								HasNextPage bool   `json:"hasNextPage"`
+								EndCursor   string `json:"endCursor"`
+							} `json:"pageInfo"`
+						} `json:"entries"`
+					} `json:"mergeQueue"`
+				} `json:"repository"`
+			} `json:"data"`
+			Errors []graphQLError `json:"errors"`
+		}
+		status := resp.StatusCode
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		closeErr := resp.Body.Close()
+		if status != http.StatusOK {
+			return nil, fmt.Errorf("read merge queue for branch %s: GraphQL endpoint returned %d", base, status)
+		}
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode merge queue for branch %s: %w", base, decodeErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close merge queue response for branch %s: %w", base, closeErr)
+		}
+		if len(result.Errors) > 0 {
+			return nil, fmt.Errorf("read merge queue for branch %s: %s", base, result.Errors[0].Message)
+		}
+		if result.Data.Repository == nil {
+			return nil, fmt.Errorf("merge queue query for branch %s returned no repository", base)
+		}
+		queue := result.Data.Repository.MergeQueue
+		if queue == nil {
+			return nil, fmt.Errorf("GitHub returned no merge queue for branch %s, which has merge queue branches", base)
+		}
+		for _, entry := range queue.Entries.Nodes {
+			if entry.HeadCommit != nil && entry.HeadCommit.OID != "" {
+				heads[entry.HeadCommit.OID] = true
+			}
+		}
+		if !queue.Entries.PageInfo.HasNextPage {
+			return heads, nil
+		}
+		if queue.Entries.PageInfo.EndCursor == "" {
+			return nil, fmt.Errorf("merge queue query for branch %s reported another page but no cursor to read it", base)
+		}
+		cursor = queue.Entries.PageInfo.EndCursor
+	}
 }
 
 // OpenPullRequestHeadedAt returns the number of an open pull request whose

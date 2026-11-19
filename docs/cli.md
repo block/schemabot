@@ -1155,7 +1155,10 @@ A scan of named PRs (`--pr`) leaves the merge queue out. If the server
 cannot read a repository's merge queue, because it is older or because the
 read failed, the backfill still recreates the PRs' checks. The report names
 the repositories whose queue went unchecked, and the run exits nonzero,
-since an unchecked queue may still be blocked.
+since an unchecked queue may still be blocked. A request to post merge queue
+checks that fails does not stop the sweep either: the PRs' checks are still
+recreated, the groups in that request are reported as failed, and the run
+exits nonzero.
 
 `--skip-repo` leaves repositories out of an `--all-repos` sweep, for example
 one you have already backfilled by hand. Separate names with commas or repeat

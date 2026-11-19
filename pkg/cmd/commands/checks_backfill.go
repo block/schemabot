@@ -1126,7 +1126,21 @@ func (cmd *ChecksBackfillCmd) actOnMergeQueue(ctx context.Context, endpoint stri
 				RateLimitFloorPercent: cmd.RateLimitFloor,
 			})
 			if err != nil {
-				return fmt.Errorf("post merge queue checks for %s: %w", repo, err)
+				if endedByInterrupt(ctx, err) {
+					return fmt.Errorf("post merge queue checks for %s: %w", repo, err)
+				}
+				// A failed request leaves this batch unconfirmed, since the
+				// server may have posted some of its checks before failing.
+				// The run keeps going: the PRs' own checks do not depend on
+				// the merge queue, and the unconfirmed groups still make the
+				// run exit nonzero.
+				updateProgress(fmt.Sprintf("posting merge queue checks in %s failed; continuing with the rest of the sweep", repo))
+				for _, head := range batch {
+					group := groupByHead[repo+"@"+head]
+					group.Error = fmt.Sprintf("request failed before the server answered, so the check may or may not have been posted: %v", err)
+					group.answered = true
+				}
+				continue
 			}
 			// Heads the server did not start because the budget was below
 			// the floor go back on the queue to send after the pause.
