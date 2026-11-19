@@ -29,7 +29,7 @@ func TestPostTrackedPlanCommentLogsSuppression(t *testing.T) {
 		{name: "moved head", target: "trunk", planHead: "previous-head", message: "skipping plan comment because PR head moved"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h, mux, _ := newFoldHandler(t, &api.ServerConfig{EnforcePRTargets: true}, &foldCheckStore{})
+			h, mux, _ := newFoldHandler(t, &api.ServerConfig{SkipUnrequiredBranches: true}, &foldCheckStore{})
 			var logs bytes.Buffer
 			h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 

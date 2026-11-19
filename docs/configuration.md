@@ -29,7 +29,7 @@
 - [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
-- [PR Target Enforcement](#pr-target-enforcement)
+- [Skipping Unrequired Branches](#skipping-unrequired-branches)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
 - [Authentication](#authentication)
@@ -2056,16 +2056,16 @@ If the GitHub API is unreachable when checking statuses, the apply is blocked (f
 
 Set `require_passing_checks: false` to disable this gate.
 
-## PR Target Enforcement
+## Skipping Unrequired Branches
 
 By default, SchemaBot plans, applies, and publishes Check Runs for PRs into
-every branch. Turn on `enforce_pr_targets` to serve only PRs whose final
+every branch. Turn on `skip_unrequired_branches` to serve only PRs whose final
 target is the repository's default branch or a branch whose rulesets or
 classic branch protection require a SchemaBot check:
 
 ```yaml
 # Skip PRs into branches that do not require SchemaBot (default: false)
-enforce_pr_targets: true
+skip_unrequired_branches: true
 ```
 
 Before turning it on, grant the GitHub App the **Administration: read**

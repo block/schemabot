@@ -53,7 +53,7 @@ Under **Repository permissions**, grant:
 
 | Permission | Access | Used For |
 |-----------|--------|----------|
-| **Administration** | Read | Optional. Needed only with `enforce_pr_targets` on: read classic branch protection, so SchemaBot skips PRs into non-default branches that do not require its check. Without it, SchemaBot plans and checks PRs into every branch |
+| **Administration** | Read | Optional. Needed only with `skip_unrequired_branches` on: read classic branch protection, so SchemaBot skips PRs into non-default branches that do not require its check. Without it, SchemaBot plans and checks PRs into every branch |
 | **Checks** | Read & Write | Create SchemaBot check runs and read GitHub check runs for the `require_passing_checks` gate |
 | **Commit statuses** | Read | Read legacy commit statuses for the `require_passing_checks` gate |
 | **Contents** | Read | Read `schemabot.yaml`, schema files, CODEOWNERS, and commit refs |

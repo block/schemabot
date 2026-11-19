@@ -52,7 +52,7 @@ func TestExcludedPRSkipsDiscoveryAndPublication(t *testing.T) {
 	for _, role := range []string{"", api.AggregateRoleLeader, api.AggregateRoleParticipant} {
 		t.Run("role="+role, func(t *testing.T) {
 			checks := &foldCheckStore{byPR: []*storage.Check{{HeadSHA: "same-head", Conclusion: checkConclusionSuccess, CheckRunID: 123}}}
-			cfg := &api.ServerConfig{EnforcePRTargets: true, Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: role}}}}
+			cfg := &api.ServerConfig{SkipUnrequiredBranches: true, Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: role}}}}
 			h, mux, client := newFoldHandler(t, cfg, checks)
 			var base atomic.Value
 			base.Store("parent")
@@ -90,7 +90,7 @@ func TestExcludedPRSkipsDiscoveryAndPublication(t *testing.T) {
 func TestExcludedPRCommandsRejectBeforeDiscovery(t *testing.T) {
 	for _, command := range []string{action.Plan, "plan-all", action.Apply, action.ApplyConfirm} {
 		t.Run(command, func(t *testing.T) {
-			h, mux, _ := newFoldHandler(t, &api.ServerConfig{EnforcePRTargets: true}, &foldCheckStore{})
+			h, mux, _ := newFoldHandler(t, &api.ServerConfig{SkipUnrequiredBranches: true}, &foldCheckStore{})
 			var base atomic.Value
 			base.Store("parent")
 			serveMutablePRTarget(t, mux, &base)
@@ -121,7 +121,7 @@ func TestExcludedPRCommandsRejectBeforeDiscovery(t *testing.T) {
 // Publication and the final acceptance gate bypass an earlier cached eligible
 // snapshot. A same-SHA return becomes eligible through the normal gate again.
 func TestPRTargetRechecksUncachedAndAllowsSameSHAReturn(t *testing.T) {
-	h, mux, client := newFoldHandler(t, &api.ServerConfig{EnforcePRTargets: true}, &foldCheckStore{})
+	h, mux, client := newFoldHandler(t, &api.ServerConfig{SkipUnrequiredBranches: true}, &foldCheckStore{})
 	var base atomic.Value
 	base.Store("trunk")
 	serveMutablePRTarget(t, mux, &base)
@@ -286,10 +286,10 @@ func TestRecoveryReevaluatesSameSHARoundTrip(t *testing.T) {
 	}
 }
 
-// With enforce_pr_targets off, a PR into a branch that does not require
+// With skip_unrequired_branches off, a PR into a branch that does not require
 // SchemaBot is still planned and checked, and SchemaBot reads neither the
 // branch policy nor a fresh copy of the PR to decide that.
-func TestPRTargetsServedWhenEnforcementIsOff(t *testing.T) {
+func TestEveryPRTargetServedByDefault(t *testing.T) {
 	h, mux, client := newFoldHandler(t, &api.ServerConfig{}, &foldCheckStore{})
 	var policyReads, prReads atomic.Int32
 	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/", func(w http.ResponseWriter, _ *http.Request) {
