@@ -956,7 +956,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 				SkippedCount: skippedCount,
 			}, nil
 		}
-		return c.handleStopAllTasksTerminal(ctx, applyID, skippedCount)
+		return c.handleStopAllTasksTerminal(ctx, applyID, skippedCount, caller)
 	}
 
 	return &ternv1.StopResponse{
@@ -2487,11 +2487,14 @@ func ensureApplyFailureMessage(apply *storage.Apply, tasks []*storage.Task) {
 // record. An ErrorMessage already on the apply is authoritative and kept.
 //
 // Fails closed when the apply still owns active tasks this client could not
-// see, because recording an outcome over them would leave live work running
-// under a finished apply and drop the stop it was meant to receive. An apply
-// that another writer finishes between this read and the write keeps the
-// outcome that writer recorded, and the stop is accepted against it.
-func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID int64, skippedCount int64) (*ternv1.StopResponse, error) {
+// see, or when storage returns no tasks at all for an apply whose tasks the
+// stop just found finished, because recording an outcome over either would
+// leave work unaccounted for under a finished apply. The error leaves the
+// durable stop request pending, so a later drive retries it and it resolves
+// once the apply's other tasks finish. An apply that another writer finishes
+// between this read and the write keeps the outcome that writer recorded, and
+// the stop is accepted against it.
+func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID int64, skippedCount int64, caller string) (*ternv1.StopResponse, error) {
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
 		return nil, fmt.Errorf("load apply %d after stop found all tasks terminal: %w", applyID, err)
@@ -2507,7 +2510,7 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 	// turn an accepted stop into a drive error the claim loop re-runs forever.
 	if suppressParentApplyWrites(ctx) {
 		c.logger.Info("stop found all tasks terminal; operation drive leaves the apply outcome to the operator's projection",
-			append(apply.LogAttrs(), "skipped_count", skippedCount)...)
+			append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller)...)
 		return &ternv1.StopResponse{Accepted: true, SkippedCount: skippedCount}, nil
 	}
 
@@ -2516,12 +2519,17 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		if err != nil {
 			return nil, fmt.Errorf("load tasks for apply %s to derive final state: %w", apply.ApplyIdentifier, err)
 		}
+		if len(tasks) == 0 {
+			c.logger.Warn("stop found every targeted task terminal, but storage returned no tasks for the apply; failing closed rather than deriving an outcome from nothing",
+				append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller, "client_database", c.config.Database)...)
+			return nil, fmt.Errorf("stop cannot settle apply %s: storage returned no tasks for it after the stop found %d finished", apply.ApplyIdentifier, skippedCount)
+		}
 		// The derived state cannot be the guard: it ranks a stopped, failed,
 		// or cancelled task above a running one, so a sibling still running
 		// on another database would hide behind a finished-looking outcome.
 		if unfinished := firstUnfinishedTask(tasks); unfinished != nil {
 			c.logger.Warn("stop found every targeted task terminal, but another of the apply's tasks is unfinished; failing closed rather than recording an outcome over active task work",
-				append(apply.LogAttrs(), "task_id", unfinished.TaskIdentifier, "task_database", unfinished.Database, "task_state", unfinished.State, "task_count", len(tasks), "client_database", c.config.Database)...)
+				append(apply.LogAttrs(), "task_id", unfinished.TaskIdentifier, "task_database", unfinished.Database, "task_state", unfinished.State, "task_count", len(tasks), "client_database", c.config.Database, "requested_by", caller)...)
 			return nil, fmt.Errorf("stop cannot settle apply %s: task %s on database %s is %s, not finished or stopped", apply.ApplyIdentifier, unfinished.TaskIdentifier, unfinished.Database, unfinished.State)
 		}
 		derivedState := state.DeriveApplyState(taskStates(tasks))
@@ -2537,12 +2545,12 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 			if !anotherWriterFinishedTheApply(err) {
 				return nil, fmt.Errorf("update apply %s to derived state %s: %w", apply.ApplyIdentifier, derivedState, err)
 			}
-			return c.acceptStopOverFinishedApply(ctx, apply, skippedCount, err)
+			return c.acceptStopOverFinishedApply(ctx, apply, skippedCount, caller, err)
 		}
 		adjustActiveAppliesForTransition(ctx, apply, oldState)
 
 		c.logger.Info("stop found all tasks terminal; apply state derived from tasks",
-			append(apply.LogAttrs(), "old_state", oldState, "skipped_count", skippedCount)...)
+			append(apply.LogAttrs(), "old_state", oldState, "skipped_count", skippedCount, "requested_by", caller)...)
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("All tasks terminal before stop took effect; apply state derived from tasks: %s", derivedState), oldState, derivedState)
 	}
@@ -2576,7 +2584,7 @@ func anotherWriterFinishedTheApply(err error) bool {
 // and the stop is accepted, so its durable request completes instead of
 // retrying against an outcome that can no longer change. A reloaded apply that
 // is still active contradicts the refusal, so the refusal is returned instead.
-func (c *LocalClient) acceptStopOverFinishedApply(ctx context.Context, apply *storage.Apply, skippedCount int64, refusal error) (*ternv1.StopResponse, error) {
+func (c *LocalClient) acceptStopOverFinishedApply(ctx context.Context, apply *storage.Apply, skippedCount int64, caller string, refusal error) (*ternv1.StopResponse, error) {
 	current, err := c.storage.Applies().Get(ctx, apply.ID)
 	if err != nil {
 		return nil, fmt.Errorf("reload apply %s after stop lost the race to finish it: %w", apply.ApplyIdentifier, err)
@@ -2586,11 +2594,11 @@ func (c *LocalClient) acceptStopOverFinishedApply(ctx context.Context, apply *st
 	}
 	if !state.IsTerminalApplyState(current.State) {
 		c.logger.Warn("storage refused the stop's apply write as already finished, but the reloaded apply is still active; returning the refusal",
-			append(current.LogAttrs(), "skipped_count", skippedCount, "refusal", refusal)...)
+			append(current.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller, "refusal", refusal)...)
 		return nil, fmt.Errorf("update apply %s after stop: %w", apply.ApplyIdentifier, refusal)
 	}
 	c.logger.Info("stop arrived after the apply finished; keeping the recorded outcome",
-		append(current.LogAttrs(), "skipped_count", skippedCount, "refusal", refusal)...)
+		append(current.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller, "refusal", refusal)...)
 	return stopAlreadyFinishedResponse(current.State, skippedCount), nil
 }
 
