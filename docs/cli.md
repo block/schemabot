@@ -1092,6 +1092,14 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+`checks backfill` replaces the removed `webhooks redrive` command and its
+`POST /api/webhooks/redrive` endpoint. To recover missing Check Runs, run
+`checks backfill`, then run the `--plan --pr` command it prints for deferred
+schema PRs. To inspect or redeliver one specific failed delivery, use
+**Recent Deliveries** on the GitHub App's **Advanced** settings page. Scripts
+that sent delivery IDs to the removed endpoint should move to that page or to
+GitHub's App delivery API.
+
 A missing check on a PR that changes no managed schema costs a few GitHub
 requests to recreate. A PR that does change managed schema needs a plan, and
 a plan reads every changed database's schema once per environment, so one
