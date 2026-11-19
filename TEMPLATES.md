@@ -4193,6 +4193,17 @@ Options:
 </details>
 
 <details>
+<summary><a name="nothing-submitted-release-request-got-no-answer"></a><strong>Nothing Submitted, Release Request Got No Answer</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) may still be held: the release request failed, so its result is unknown.
+   Nothing was submitted. Release it if it is still held: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
 <summary><a name="nothing-submitted-lock-already-released"></a><strong>Nothing Submitted, Lock Already Released</strong></summary>
 
 ```

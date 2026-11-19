@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -418,7 +419,70 @@ func TestWarningDependsOnTheRequestAndWhenItFailed(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.wantMessage, FormatConnectionError(endpoint, tc.err).Error())
+			err := FormatConnectionError(endpoint, tc.err)
+			assert.Equal(t, tc.wantMessage, err.Error())
+			assert.Equal(t, strings.Contains(tc.wantMessage, mayHaveActed), ServerMayHaveActed(err),
+				"ServerMayHaveActed agrees with the warning in the message")
+		})
+	}
+}
+
+// ServerMayHaveActed answers for real failures the way their messages do: yes
+// when a request that changes something got no complete answer, and no when
+// the server answered, the request never reached it, or it only reads.
+func TestServerMayHaveActedMatchesWhatTheFailureMessageSays(t *testing.T) {
+	release := map[string]string{"database": "orders", "database_type": "mysql", "owner": "cli:alice@laptop"}
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"storage unavailable"}`, http.StatusInternalServerError)
+	}))
+	t.Cleanup(refusing.Close)
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "a lock release the server read and never answered",
+			err:  doSendBody(droppingServer(t).URL, http.MethodDelete, "/api/locks", release),
+			want: true,
+		},
+		{
+			name: "a lock release whose answer was cut off",
+			err:  doSendBody(truncatedOK(t).URL, http.MethodDelete, "/api/locks", release),
+			want: true,
+		},
+		{
+			name: "a lock release wrapped by its caller",
+			err:  fmt.Errorf("release lock for orders: %w", doSendBody(droppingServer(t).URL, http.MethodDelete, "/api/locks", release)),
+			want: true,
+		},
+		{
+			name: "a lock release the server answered with an error",
+			err:  doSendBody(refusing.URL, http.MethodDelete, "/api/locks", release),
+			want: false,
+		},
+		{
+			name: "a lock release whose connection was refused",
+			err:  doSendBody(closedPortEndpoint(t), http.MethodDelete, "/api/locks", release),
+			want: false,
+		},
+		{
+			name: "a read the server never answered",
+			err:  doGetInto(droppingServer(t).URL, "/api/locks", &map[string]any{}),
+			want: false,
+		},
+		{
+			name: "an error that is not a failed request",
+			err:  ErrLockNotFound,
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, tc.err)
+			assert.Equal(t, tc.want, ServerMayHaveActed(tc.err), tc.err.Error())
+			assert.Equal(t, tc.want, strings.Contains(tc.err.Error(), mayHaveActed), tc.err.Error())
 		})
 	}
 }
