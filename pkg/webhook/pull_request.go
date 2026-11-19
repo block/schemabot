@@ -403,8 +403,9 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 // autoPlanOptions changes what one auto-plan dispatch is allowed to start.
 type autoPlanOptions struct {
-	// deferSchemaPlans stops before any write when the PR changes schema this
-	// deployment manages, and reports the databases it would have planned.
+	// deferSchemaPlans stops before any Check Run or check state is written
+	// when the PR changes schema this deployment manages, and reports the
+	// databases it would have planned.
 	// Planning is the expensive part of an auto-plan: every database reads its
 	// schema files once per environment. An operator recovering checks across
 	// many PRs sets this so the cheap PRs settle first and each schema PR is

@@ -155,7 +155,7 @@ type CheckRunBackfiller interface {
 // CheckRunBackfillOptions controls how much work one PR's backfill may start.
 type CheckRunBackfillOptions struct {
 	// Plan runs the auto-plans of a PR that changes managed schema. Without
-	// it that PR is deferred and nothing is written for it.
+	// it that PR is deferred, and no Check Run or check state is written for it.
 	Plan bool
 }
 

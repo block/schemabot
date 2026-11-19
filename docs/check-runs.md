@@ -781,8 +781,8 @@ uncompleted run can belong to a genuinely in-flight apply.
 
 A PR that changes managed schema needs a plan to recreate its check, and a
 plan reads every changed database's schema once per environment. Without
-`--plan`, the server defers those PRs before writing anything: no Check Run
-and no stored check state, so the missing required check keeps the merge
+`--plan`, the server defers those PRs before it writes any Check Run or
+stored check state, so the missing required check keeps the merge
 blocked (MG-1). The report names the databases each deferred PR changes and
 prints the `--plan --pr` command that plans them. The server also re-reads
 the GitHub budget before each PR and stops the batch below

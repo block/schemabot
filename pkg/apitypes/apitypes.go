@@ -345,8 +345,8 @@ type ChecksBackfillSupport struct {
 	// paging through the repository's open PRs.
 	NamedPRs bool `json:"named_prs,omitempty"`
 	// DeferSchemaPRs means a synthesize request without plan defers each PR
-	// that changes managed schema before writing anything, and checks
-	// rate_limit_floor_percent before every PR it starts.
+	// that changes managed schema before writing any Check Run or check state,
+	// and checks rate_limit_floor_percent before every PR it starts.
 	DeferSchemaPRs bool `json:"defer_schema_prs,omitempty"`
 }
 
