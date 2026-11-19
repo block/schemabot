@@ -1163,8 +1163,12 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 // error. A database locked again since the listing, by a new row or by the
 // same row for a new plan, stays held and is returned as an error: the PR may
 // have reopened and planned again after cleanup read its live state, so this
-// pass must not go on to delete its check state. The retry re-reads the live
-// PR first, and releases the lock only if the PR is still closed.
+// pass must not go on to delete its check state. A new row can also belong to
+// another owner, which locked the database once the listed lock was released;
+// the release cannot tell the two apart, so it treats both the same way. A
+// caller that retries re-reads the live PR first and lists the PR's locks
+// again, so it releases a lock only if the PR is still closed and still holds
+// it.
 //
 // Every release is attempted even if an earlier one fails, and the failures
 // are joined and returned so a caller with a retry mechanism re-attempts the
@@ -1184,27 +1188,31 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 			continue
 		}
 		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
-		if isVettedLockGone(err) {
+		switch {
+		case err == nil:
+			h.logger.Info("released lock on PR close",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName)
+		case isVettedLockGone(err):
 			h.logger.Info("lock already released before PR close cleanup reached it",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
 				"owner", lock.Owner, "error", err)
-			continue
-		}
-		if isLockAcquiredSinceVetting(err) {
-			h.logger.Warn("lock acquired again after PR close cleanup listed it; keeping it and retrying cleanup, which re-checks the PR is still closed",
+		case errors.Is(err, storage.ErrLockReplaced):
+			// The new row can belong to this PR or to another owner that
+			// locked the database after the listed lock was released.
+			h.logger.Warn("a different lock row holds the database since PR close cleanup listed its lock; that row is kept and this cleanup pass deletes no check state",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
 				"owner", lock.Owner, "listed_pending_plan_id", lock.PendingPlanID, "error", err)
-			releaseErrs = append(releaseErrs, fmt.Errorf("lock on %s (%s) acquired again after close cleanup listed it: %w", lock.DatabaseName, lock.DatabaseType, err))
-			continue
-		}
-		if err != nil {
+			releaseErrs = append(releaseErrs, fmt.Errorf("lock on %s (%s) is held by a different lock row than the one close cleanup listed: %w", lock.DatabaseName, lock.DatabaseType, err))
+		case errors.Is(err, storage.ErrLockIntentChanged):
+			h.logger.Warn("lock acquired again for another pending plan after PR close cleanup listed it; it is kept and this cleanup pass deletes no check state",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "listed_pending_plan_id", lock.PendingPlanID, "error", err)
+			releaseErrs = append(releaseErrs, fmt.Errorf("lock on %s (%s) was acquired again for another pending plan after close cleanup listed it: %w", lock.DatabaseName, lock.DatabaseType, err))
+		default:
 			h.logger.Error("failed to release lock on PR close",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			releaseErrs = append(releaseErrs, fmt.Errorf("release lock on %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err))
-			continue
 		}
-		h.logger.Info("released lock on PR close",
-			"repo", repo, "pr", pr, "database", lock.DatabaseName)
 	}
 	return errors.Join(releaseErrs...)
 }
