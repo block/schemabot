@@ -201,10 +201,6 @@ func (s *recordingWebhookEventStore) SupersedeIfCovered(context.Context, *storag
 	return false, errors.New("SupersedeIfCovered not implemented by recordingWebhookEventStore")
 }
 
-func (s *recordingWebhookEventStore) SupersedeIfPushedPast(context.Context, *storage.WebhookEvent) (*storage.WebhookEvent, error) {
-	return nil, errors.New("SupersedeIfPushedPast not implemented by recordingWebhookEventStore")
-}
-
 func (s *recordingWebhookEventStore) InboxStats(context.Context) (*storage.WebhookInboxStats, error) {
 	return nil, errors.New("InboxStats not implemented by recordingWebhookEventStore")
 }
@@ -351,14 +347,6 @@ type scriptedWebhookEventStore struct {
 	// supersedeCalls counts SupersedeIfCovered invocations so tests can
 	// assert the guarded write only runs after live-head confirmation.
 	supersedeCalls int
-	// pushSuccessor is the later-push delivery SupersedeIfPushedPast reports
-	// for every claimed event; nil reports none.
-	pushSuccessor *storage.WebhookEvent
-	// pushSuccessorErr is returned by SupersedeIfPushedPast so tests can
-	// exercise the driver's fall-through path.
-	pushSuccessorErr error
-	// pushSupersedeCalls counts SupersedeIfPushedPast invocations.
-	pushSupersedeCalls int
 
 	// Optional injected finish errors, returned before the corresponding
 	// outcome channel send so tests can exercise the storage-failure paths.
@@ -456,20 +444,6 @@ func (s *scriptedWebhookEventStore) SupersedeIfCovered(_ context.Context, event 
 	}
 	event.State = storage.WebhookEventSuperseded
 	return true, nil
-}
-
-func (s *scriptedWebhookEventStore) SupersedeIfPushedPast(_ context.Context, event *storage.WebhookEvent) (*storage.WebhookEvent, error) {
-	s.queueMu.Lock()
-	s.pushSupersedeCalls++
-	s.queueMu.Unlock()
-	if s.pushSuccessorErr != nil {
-		return nil, s.pushSuccessorErr
-	}
-	if s.pushSuccessor == nil {
-		return nil, nil
-	}
-	event.State = storage.WebhookEventSuperseded
-	return s.pushSuccessor, nil
 }
 
 func (s *scriptedWebhookEventStore) MarkCompleted(_ context.Context, id int64, leaseToken string) error {
@@ -967,55 +941,9 @@ func TestDurableWebhookDriverProcessesWhenLiveHeadFetchFails(t *testing.T) {
 	require.Zero(t, supersedes, "an unconfirmed head must never reach the supersede write")
 }
 
-// A later push that names the claimed head as the head it replaced proves the
-// claimed head stale, so the driver supersedes the claim without asking
-// GitHub anything: the discarded delivery costs no GitHub requests and never
-// plans.
-func TestDurableWebhookDriverSupersedesAutoPlanALaterPushReplaced(t *testing.T) {
-	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
-	store.pushSuccessor = &storage.WebhookEvent{DeliveryID: "delivery-driver-2", HeadSHA: "newer-head"}
-	factory, fetches := newLiveHeadGitHubFactory(t, "newer-head", "open")
-	h := newDurableDriverHandler(t, store, nil, factory)
-	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		t.Error("a superseded delivery must not be processed")
-		return false, nil
-	}
-
-	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
-
-	require.Empty(t, store.completed, "a superseded delivery must not be marked completed")
-	require.Empty(t, store.failed, "a superseded delivery must not be marked failed")
-	require.Zero(t, fetches.Load(), "a delivery superseded by a later push must not cost a GitHub request")
-	store.queueMu.Lock()
-	defer store.queueMu.Unlock()
-	require.Equal(t, 1, store.pushSupersedeCalls)
-	require.Zero(t, store.coveringSuccessorCalls, "a delivery superseded by a later push needs no covering-successor check")
-}
-
-// The later-push check is an optimization: when it fails, the driver falls
-// back to the GitHub-confirmed covering-successor check and then processes
-// the delivery normally, never dropping the claim on a query error.
-func TestDurableWebhookDriverFallsBackWhenLaterPushCheckFails(t *testing.T) {
-	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
-	store.pushSuccessorErr = errors.New("storage briefly unavailable")
-	h := newDurableDriverHandler(t, store, nil, nil)
-	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		return false, nil
-	}
-
-	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
-
-	require.Len(t, store.completed, 1, "a delivery whose later-push check failed must process normally")
-	require.Empty(t, store.failed)
-	store.queueMu.Lock()
-	defer store.queueMu.Unlock()
-	require.Equal(t, 1, store.coveringSuccessorCalls, "the covering-successor check must still run")
-}
-
 // The synchronize quiet period defers only pushes. An opened or reopened PR
 // has no earlier head to coalesce with, so it is claimable at once, while a
-// synchronize delivery waits out the window with the head its push replaced
-// recorded for the coalescing check.
+// synchronize delivery waits out the window.
 func TestDurablePullRequestWebhookDefersOnlySynchronize(t *testing.T) {
 	const quietPeriod = time.Minute
 	for _, tc := range []struct {
@@ -1023,12 +951,11 @@ func TestDurablePullRequestWebhookDefersOnlySynchronize(t *testing.T) {
 		quietPeriod time.Duration
 		action      string
 		wantDefer   bool
-		wantBefore  string
 	}{
-		{"opened is never deferred", quietPeriod, "opened", false, ""},
-		{"reopened is never deferred", quietPeriod, "reopened", false, ""},
-		{"synchronize waits out the quiet period", quietPeriod, "synchronize", true, "previous-head"},
-		{"synchronize is claimable at once without a quiet period", 0, "synchronize", false, "previous-head"},
+		{"opened is never deferred", quietPeriod, "opened", false},
+		{"reopened is never deferred", quietPeriod, "reopened", false},
+		{"synchronize waits out the quiet period", quietPeriod, "synchronize", true},
+		{"synchronize is claimable at once without a quiet period", 0, "synchronize", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := newRecordingWebhookEventStore()
@@ -1047,7 +974,6 @@ func TestDurablePullRequestWebhookDefersOnlySynchronize(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, event)
 			assert.Equal(t, tc.action, event.Action)
-			assert.Equal(t, tc.wantBefore, event.BeforeSHA)
 			if !tc.wantDefer {
 				assert.Nil(t, event.RetryAfter, "the delivery must be claimable as soon as it is stored")
 				return

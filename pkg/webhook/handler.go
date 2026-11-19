@@ -294,12 +294,12 @@ const DefaultSynchronizeQuietPeriod = 15 * time.Second
 
 // WithSynchronizeQuietPeriod defers every durable pull_request synchronize
 // delivery until the quiet period after its receipt has passed. A push that
-// follows within the window records the earlier head as the one it replaced,
-// so the earlier delivery is superseded at claim time without a single GitHub
-// request and only the newest head of a burst is planned. Opened and reopened
-// deliveries are never deferred. A non-positive period is a no-op, leaving
-// synchronize deliveries immediately claimable. It takes effect only
-// alongside WithDurableWebhookDispatch.
+// follows within the window is in the inbox by the time the earlier delivery
+// is claimed, so the earlier delivery is superseded at claim time, once the
+// live PR confirms its head is no longer current, and only the newest head of
+// a burst is planned. Opened and reopened deliveries are never deferred. A
+// non-positive period is a no-op, leaving synchronize deliveries immediately
+// claimable. It takes effect only alongside WithDurableWebhookDispatch.
 func WithSynchronizeQuietPeriod(period time.Duration) HandlerOption {
 	return func(h *Handler) {
 		if period > 0 {

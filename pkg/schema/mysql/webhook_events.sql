@@ -7,7 +7,6 @@ CREATE TABLE `webhook_events` (
   `repository` varchar(255) NOT NULL DEFAULT '',
   `pull_request` int unsigned NOT NULL DEFAULT '0',
   `head_sha` varchar(64) NOT NULL DEFAULT '',
-  `before_sha` varchar(64) NOT NULL DEFAULT '',
   `tenant_id` varchar(255) NOT NULL DEFAULT '',
   `payload` json NOT NULL,
   `state` varchar(50) NOT NULL,

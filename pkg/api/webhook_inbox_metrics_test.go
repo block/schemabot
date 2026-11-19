@@ -73,10 +73,6 @@ func (f *fakeWebhookEventStore) SupersedeIfCovered(context.Context, *storage.Web
 	return false, errors.New("unused")
 }
 
-func (f *fakeWebhookEventStore) SupersedeIfPushedPast(context.Context, *storage.WebhookEvent) (*storage.WebhookEvent, error) {
-	return nil, errors.New("unused")
-}
-
 func (f *fakeWebhookEventStore) TerminateStuckProcessing(context.Context, string) (int64, error) {
 	return 0, errors.New("unused")
 }
