@@ -181,8 +181,13 @@ type webhookRuntime struct {
 	quotaProbes []*ghclient.QuotaProbe
 }
 
-// startQuotaProbes starts every App's quota probe.
+// startQuotaProbes starts every App's quota probe. Every App is marked
+// unresolved before any probe starts, so no App's first pass can export a
+// healthy aggregate while another App has not reported yet.
 func (r webhookRuntime) startQuotaProbes(ctx context.Context) {
+	for _, probe := range r.quotaProbes {
+		probe.MarkUnresolved()
+	}
 	for _, probe := range r.quotaProbes {
 		probe.Start(ctx)
 	}

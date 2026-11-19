@@ -273,6 +273,20 @@ func TestQuotaProbeReportsItsTargetsEachPass(t *testing.T) {
 	assert.Equal(t, []quotaTargets{{installations: []int64{11}, unresolved: 1}}, reported)
 }
 
+// Before its first pass, an App counts one unobserved installation, and a
+// first pass that resolves its targets replaces that.
+func TestQuotaProbeIsUnresolvedUntilItsFirstPass(t *testing.T) {
+	probe, reads, _ := recordingQuotaProbe(t, nil, 11)
+	var reported []quotaTargets
+	probe.reportTargets = func(targets quotaTargets) { reported = append(reported, targets) }
+
+	probe.MarkUnresolved()
+	probe.probeOnce(t.Context())
+
+	assert.Equal(t, int64(11), receiveRead(t, reads))
+	assert.Equal(t, []quotaTargets{{unresolved: 1}, {installations: []int64{11}}}, reported)
+}
+
 // A pass that cannot list installations reports nothing, so the targets from
 // the last good pass stay in place and their budgets age out to unobserved.
 func TestQuotaProbeKeepsPreviousTargetsWhenListingFails(t *testing.T) {

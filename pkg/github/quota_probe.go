@@ -119,6 +119,16 @@ func (c *Client) newQuotaProbe(listInstallations func(ctx context.Context) (quot
 	}
 }
 
+// MarkUnresolved records the App as having one unobserved installation until
+// its first pass resolves real targets, so the App exports a failing
+// unobserved count from the moment it is marked rather than no series at all.
+// Without it, a gate that aggregates across Apps could pass on the Apps that
+// have finished a pass while another's budget is still unknown. A first pass
+// that cannot list installations leaves the mark in place.
+func (p *QuotaProbe) MarkUnresolved() {
+	p.reportTargets(quotaTargets{unresolved: 1})
+}
+
 // Start reads every installation's budget now and then once per interval,
 // until ctx is canceled or Stop is called. Calling Start on a running probe
 // does nothing.
