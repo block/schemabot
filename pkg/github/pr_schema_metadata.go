@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -47,13 +48,40 @@ func (t schemaRevisionTree) directory(ctx context.Context, name string) ([]TreeE
 	return t.client.treeLevel(ctx, t.repo, sha, t.levels)
 }
 
-func (t schemaRevisionTree) locators(ctx context.Context, root string) ([]schemaFileLocator, error) {
+// schemaRootEntry returns the top-level entry for a flat file, namespace
+// file, or namespace link. Deeper backing paths have no direct logical name.
+func schemaRootEntry(root, name string) (string, bool) {
+	relative, under := strings.CutPrefix(name, root+"/")
+	if root == "." {
+		relative, under = name, true
+	}
+	entry, rest, _ := strings.Cut(relative, "/")
+	return entry, under && !strings.Contains(rest, "/")
+}
+
+func (t schemaRevisionTree) schemaPaths(ctx context.Context, root string, changed map[string]bool, wholeRoot bool) ([]string, error) {
+	// Open only the immediate entries named by changed paths, unless the
+	// config or environment link itself changed the entire schema root.
+	entriesToRead := make(map[string]bool)
+	if !wholeRoot {
+		for name := range changed {
+			if entry, direct := schemaRootEntry(root, name); direct {
+				entriesToRead[entry] = true
+			}
+		}
+		if len(entriesToRead) == 0 {
+			return nil, nil
+		}
+	}
 	entries, err := t.directory(ctx, root)
 	if err != nil {
 		return nil, err
 	}
-	var locators []schemaFileLocator
+	var paths []string
 	for _, entry := range entries {
+		if !wholeRoot && !entriesToRead[entry.Path] {
+			continue
+		}
 		logicalPath := path.Join(root, entry.Path)
 		switch {
 		case entry.Type == "tree", entry.Mode == gitSymlinkMode:
@@ -74,14 +102,12 @@ func (t schemaRevisionTree) locators(ctx context.Context, root string) ([]schema
 			}
 			for _, child := range children {
 				if child.Type == "blob" && child.Mode != gitSymlinkMode && isManagedSchemaFile(child.Path) {
-					locators = append(locators, schemaFileLocator{
-						fetchPath: path.Join(source, child.Path), displayPath: path.Join(logicalPath, child.Path),
-					})
+					paths = append(paths, path.Join(logicalPath, child.Path))
 				}
 			}
 		case entry.Type == "blob" && isManagedSchemaFile(entry.Path):
-			locators = append(locators, schemaFileLocator{fetchPath: logicalPath, displayPath: logicalPath})
+			paths = append(paths, logicalPath)
 		}
 	}
-	return locators, nil
+	return paths, nil
 }

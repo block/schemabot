@@ -17,15 +17,21 @@ func TestChangedPRSchemasUsesLogicalNamespaces(t *testing.T) {
 		Path:   "schema/schemabot.yaml",
 	}
 	matches := make(map[PRSchema]struct{})
-	changed := map[string]bool{"shared/orders.sql": true, "schema/staging/old/items.sql": true}
-	addChangedPRSchemas(matches, cfg, "staging", "schema/staging", "", []schemaFileLocator{
-		{fetchPath: "shared/orders.sql", displayPath: "schema/staging/orders_{env}/orders.sql"},
-		{fetchPath: "shared/orders.sql", displayPath: "schema/staging/returns_{env}/orders.sql"},
-		{fetchPath: "shared/orders.sql", displayPath: "schema/staging/ignored_{env}/orders.sql"},
-		{fetchPath: "schema/staging/old/items.sql", displayPath: "schema/staging/old/items.sql"},
+	changed := map[string]bool{
+		"schema/staging/orders_{env}/orders.sql":   true,
+		"schema/production/orders_$ENV/orders.sql": true,
+		"schema/staging/ignored_{env}/orders.sql":  true,
+		"schema/staging/returns_{env}":             true,
+		"schema/staging/old/items.sql":             true,
+	}
+	addChangedPRSchemas(matches, cfg, "staging", "schema/staging", false, []string{
+		"schema/staging/orders_{env}/orders.sql",
+		"schema/staging/returns_{env}/orders.sql",
+		"schema/staging/ignored_{env}/orders.sql",
+		"schema/staging/old/items.sql",
 	}, changed)
-	addChangedPRSchemas(matches, cfg, "production", "schema/production", "", []schemaFileLocator{
-		{fetchPath: "shared/orders.sql", displayPath: "schema/production/orders_$ENV/orders.sql"},
+	addChangedPRSchemas(matches, cfg, "production", "schema/production", false, []string{
+		"schema/production/orders_$ENV/orders.sql",
 	}, changed)
 	require.Equal(t, map[PRSchema]struct{}{
 		{Database: "orders", Namespace: "orders_{env}"}:  {},
@@ -38,38 +44,34 @@ func TestChangedPRSchemasCountsFlatEnvironmentRootsOnce(t *testing.T) {
 	cfg := DiscoveredConfig{Config: &SchemabotConfig{Database: "payments"}, Path: "schema/schemabot.yaml"}
 	matches := make(map[PRSchema]struct{})
 	changed := map[string]bool{cfg.Path: true}
-	addChangedPRSchemas(matches, cfg, "staging", "schema/staging", "", []schemaFileLocator{
-		{fetchPath: "schema/staging/charges.sql", displayPath: "schema/staging/charges.sql"},
-		{fetchPath: "schema/staging/refunds.sql", displayPath: "schema/staging/refunds.sql"},
+	addChangedPRSchemas(matches, cfg, "staging", "schema/staging", true, []string{
+		"schema/staging/charges.sql",
+		"schema/staging/refunds.sql",
 	}, changed)
-	addChangedPRSchemas(matches, cfg, "production", "schema/production", "", []schemaFileLocator{
-		{fetchPath: "schema/production/charges.sql", displayPath: "schema/production/charges.sql"},
+	addChangedPRSchemas(matches, cfg, "production", "schema/production", true, []string{
+		"schema/production/charges.sql",
 	}, changed)
 	require.Equal(t, map[PRSchema]struct{}{{Database: "payments"}: {}}, matches)
 }
 
-// One shared input feeds three namespaces on each control plane. Its deletion
-// still resolves the consumers from the base tree without reading its SQL blob.
-func TestPRSchemaDiscoveryFindsSharedConsumersOfDeletedInput(t *testing.T) {
+// The base still owns a deleted input. Its unchanged aliases, both in the
+// same config and in another registration, are outside the changed paths.
+func TestPRSchemaDiscoveryCountsOwnerOfDeletedInput(t *testing.T) {
 	github, mux := setupConfigTestGitHubServer(t)
 	const repo = "test/repo"
-
-	// Serve both the recursive config inventory and the shallow path lookups.
 	trees := map[string]string{
-		"head":        `[{"path":"db","sha":"db-tree","type":"tree"},{"path":"shared","sha":"empty","type":"tree"}]`,
-		"base":        `[{"path":"db","sha":"db-tree","type":"tree"},{"path":"shared","sha":"shared-tree","type":"tree"}]`,
-		"db-tree":     `[{"path":"first","sha":"schemas","type":"tree"},{"path":"second","sha":"schemas","type":"tree"}]`,
-		"schemas":     `[{"path":"schemabot.yaml","sha":"config","type":"blob"},{"path":"a","sha":"link","type":"blob","mode":"120000"},{"path":"b","sha":"link","type":"blob","mode":"120000"},{"path":"c","sha":"link","type":"blob","mode":"120000"}]`,
-		"shared-tree": `[{"path":"orders.sql","sha":"sql","type":"blob","mode":"100644"}]`,
-		"empty":       `[]`,
+		"head":    `[{"path":"owner","sha":"new","type":"tree"},{"path":"other","sha":"other","type":"tree"}]`,
+		"base":    `[{"path":"owner","sha":"old","type":"tree"},{"path":"other","sha":"other","type":"tree"}]`,
+		"backing": `[{"path":"nested","sha":"nested","type":"tree"}]`,
+		"nested":  `[{"path":"items.sql","type":"blob","mode":"100644"}]`,
+		"old":     `[{"path":"backing","sha":"backing","type":"tree"},{"path":"items.sql","type":"blob","mode":"100644"},{"path":"staging","sha":"stage","type":"tree"},{"path":"alias","sha":"link","type":"blob","mode":"120000"}]`,
+		"new":     `[{"path":"staging","sha":"stage","type":"tree"},{"path":"alias","sha":"link","type":"blob","mode":"120000"}]`,
 	}
 	mux.HandleFunc("/repos/"+repo+"/git/trees/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.URL.Query().Get("recursive"))
 		ref := r.PathValue("ref")
-		entries := trees[ref]
-		if r.URL.Query().Get("recursive") == "1" {
-			entries = `[{"path":"db/first/schemabot.yaml","sha":"config-first","type":"blob"},{"path":"db/second/schemabot.yaml","sha":"config-second","type":"blob"}]`
-		}
-		if entries == "" {
+		entries, ok := trees[ref]
+		if !ok {
 			t.Errorf("unexpected tree request for %s", ref)
 			http.NotFound(w, r)
 			return
@@ -77,33 +79,28 @@ func TestPRSchemaDiscoveryFindsSharedConsumersOfDeletedInput(t *testing.T) {
 		_, err := fmt.Fprintf(w, `{"sha":%q,"tree":%s}`, ref, entries)
 		assert.NoError(t, err)
 	})
-	for _, database := range []string{"first", "second"} {
-		mux.HandleFunc("/repos/"+repo+"/contents/db/"+database+"/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
-			content := base64.StdEncoding.EncodeToString([]byte("database: " + database + "\ntype: mysql\n"))
-			_, err := fmt.Fprintf(w, `{"type":"file","encoding":"base64","content":%q}`, content)
-			assert.NoError(t, err)
-		})
-	}
-	mux.HandleFunc("/repos/"+repo+"/git/blobs/{sha}", func(w http.ResponseWriter, r *http.Request) {
-		if r.PathValue("sha") != "link" {
-			t.Errorf("discovery fetched schema blob %s", r.PathValue("sha"))
-			http.NotFound(w, r)
-			return
-		}
-		_, err := fmt.Fprint(w, `{"content":"../../shared","encoding":"utf-8"}`)
+	mux.HandleFunc("/repos/"+repo+"/contents/owner/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		content := base64.StdEncoding.EncodeToString([]byte("database: orders\ntype: mysql\n"))
+		_, err := fmt.Fprintf(w, `{"type":"file","encoding":"base64","content":%q}`, content)
 		assert.NoError(t, err)
 	})
-
+	for _, dir := range []string{"owner/backing", "owner/backing/nested"} {
+		mux.HandleFunc("/repos/"+repo+"/contents/"+dir+"/schemabot.yaml", http.NotFound)
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected discovery request: %s", r.URL.Path)
+		http.NotFound(w, r)
+	})
 	client := NewInstallationClient(github, slog.Default())
-	schemas, configs, err := client.DiscoverPRSchemas(t.Context(), repo, []string{"head", "base"}, nil,
-		[]PRFile{{Filename: "shared/orders.sql", Status: "removed"}},
-		func(DiscoveredConfig) []string { return []string{"staging", "production"} })
-	require.NoError(t, err)
-	require.Equal(t, []PRSchema{
-		{Database: "first", Namespace: "a"}, {Database: "first", Namespace: "b"}, {Database: "first", Namespace: "c"},
-		{Database: "second", Namespace: "a"}, {Database: "second", Namespace: "b"}, {Database: "second", Namespace: "c"},
-	}, schemas)
-	require.Len(t, configs, 2)
-	require.Equal(t, "first", configs[0].Config.Database)
-	require.Equal(t, "second", configs[1].Config.Database)
+	for _, tc := range []struct{ file, env string }{
+		{"owner/items.sql", "production"},
+		{"owner/items.sql", "staging"},
+		{"owner/backing/nested/items.sql", "production"},
+	} {
+		schemas, err := client.DiscoverPRSchemas(t.Context(), repo, []string{"head", "base"},
+			[]PRFile{{Filename: tc.file, Status: "removed"}},
+			func(DiscoveredConfig) []string { return []string{tc.env} })
+		require.NoError(t, err)
+		require.Equal(t, []PRSchema{{Database: "orders"}}, schemas)
+	}
 }

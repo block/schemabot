@@ -145,8 +145,7 @@ func discoverPRSchemaInputs(ctx context.Context, client *ghclient.InstallationCl
 				refs = append(refs, ref)
 			}
 		}
-		var affected []ghclient.DiscoveredConfig
-		discovery.schemas, affected, err = client.DiscoverPRSchemas(ctx, key.Repo, refs, dirs, proposed,
+		discovery.schemas, err = client.DiscoverPRSchemas(ctx, key.Repo, refs, proposed,
 			func(cfg ghclient.DiscoveredConfig) []string {
 				r, ok := registrations[cfg.Config.Database]
 				if !ok || r.Type != string(cfg.Config.Type) || !r.AllowsPath(cfg.SchemaDir) {
@@ -157,15 +156,7 @@ func discoverPRSchemaInputs(ctx context.Context, client *ghclient.InstallationCl
 		if err != nil {
 			return nil, err
 		}
-		paths := make(map[string]bool, len(configs))
-		for _, config := range configs {
-			paths[config.Path] = true
-		}
-		for _, config := range affected {
-			if !paths[config.Path] {
-				discovery.configs = append(discovery.configs, config)
-			}
-		}
+
 	}
 	// FetchPRFiles is a live read. Before caching under immutable commits,
 	// confirm that the inputs were still the PR's actual revision as it ran.
