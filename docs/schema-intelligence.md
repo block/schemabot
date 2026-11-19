@@ -1783,19 +1783,26 @@ Two things populate it. Tables withheld by the repository's `ignore_tables`
 config (see [Ignoring Tables](namespaces.md#ignoring-tables)) are reported by
 every engine, with `reason` naming the config key. The configured entries,
 patterns included, are persisted with the plan as written, so a rollback or
-resume re-plan withholds by the same rules the reviewed plan did.
-Archive-named tables are reported by PostgreSQL targets only — the
-MySQL-family engines exempt them from their live-schema view without reporting
-which ones.
+resume re-plan withholds by the same rules the reviewed plan did. Tables a
+planner skips by their names are reported with the naming convention as the
+`reason`: `archive naming` on MySQL and PostgreSQL targets, and
+`leading underscore` on MySQL targets. PlanetScale targets skip tables whose
+names start with `_` without reporting them. The PR comment and CLI name the
+first 50 tables of a group and count the rest; the response lists them all.
 
 Response excerpt from the plan request (illustrative values):
 
 ```json
 {
   "plan_id": "plan_01j9x4k8m2",
-  "engine": "postgres",
+  "engine": "spirit",
   "changes": [],
   "exempt_tables": [
+    {
+      "namespace": "app",
+      "tables": ["_orders_old"],
+      "reason": "leading underscore"
+    },
     {
       "namespace": "app",
       "tables": ["events_archive_2025_01", "orders_archive_2024"],

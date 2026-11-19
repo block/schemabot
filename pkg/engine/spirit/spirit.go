@@ -36,6 +36,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
@@ -672,12 +673,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
-	currentSchema, withheld, lowerCaseTableNames := current.tables, current.withheld, current.lowerCaseTableNames
+	currentSchema, lowerCaseTableNames := current.tables, current.lowerCaseTableNames
 	e.logger.Debug("fetched current schema", "database", database, "tables", len(currentSchema))
 	for i, ts := range currentSchema {
 		e.logger.Debug("current schema table", "index", i, "stmt", ts.Schema[:min(200, len(ts.Schema))])
 	}
-	exemptTables := exemptWithheldTables(ignored, req, database, withheld)
+	exemptTables := exemptLiveTables(ignored, req, database, current)
 
 	// Build list of desired table schemas from all namespaces. Every namespace
 	// is diffed as one set against the database, so a table two schema files
@@ -729,6 +730,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// same namespace on every run.
 	for _, namespace := range slices.Sorted(maps.Keys(declaredByNamespace)) {
 		if err := ignored.RefuseDeclared(namespace, declaredByNamespace[namespace]); err != nil {
+			return nil, err
+		}
+		if err := refuseDeclaredSkippedTables(namespace, declaredByNamespace[namespace], current); err != nil {
 			return nil, err
 		}
 	}
@@ -891,23 +895,56 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}, nil
 }
 
-// exemptWithheldTables builds the plan's ignore_tables disclosure. A withheld
-// table has no declaring file, so the file-based attribution the table changes
-// use cannot place it in a namespace: with one namespace in the request it
-// belongs to that namespace, and with several the unit being diffed is the
+// exemptLiveTables builds the plan's disclosure of the live tables the diff
+// never saw: the ones ignore_tables withheld, then the ones the underscore and
+// archive naming conventions excluded, one group per reason. None of these
+// tables has a declaring file, so the file-based attribution the table changes
+// use cannot place them in a namespace: with one namespace in the request they
+// belong to that namespace, and with several the unit being diffed is the
 // database itself, which is what the disclosure then names.
-func exemptWithheldTables(ignored engine.IgnoredTables, req *engine.PlanRequest, database string, withheld []string) []*engine.ExemptTables {
+func exemptLiveTables(ignored engine.IgnoredTables, req *engine.PlanRequest, database string, live *liveSchema) []*engine.ExemptTables {
 	namespace := database
 	if len(req.SchemaFiles) == 1 {
 		for ns := range req.SchemaFiles {
 			namespace = ns
 		}
 	}
-	exemption := ignored.Exemption(namespace, withheld)
-	if exemption == nil {
-		return nil
+	var groups []*engine.ExemptTables
+	if exemption := ignored.Exemption(namespace, live.withheld); exemption != nil {
+		groups = append(groups, exemption)
 	}
-	return []*engine.ExemptTables{exemption}
+	if len(live.underscore) > 0 {
+		groups = append(groups, &engine.ExemptTables{Namespace: namespace, Tables: live.underscore, Reason: engine.ExemptReasonLeadingUnderscore})
+	}
+	if len(live.archive) > 0 {
+		groups = append(groups, &engine.ExemptTables{Namespace: namespace, Tables: live.archive, Reason: engine.ExemptReasonArchiveNaming})
+	}
+	return groups
+}
+
+// refuseDeclaredSkippedTables refuses a schema file that declares a live table
+// a naming convention keeps out of the diff. The diff never sees the live
+// table, so it would propose CREATE TABLE for a table that already exists, and
+// the apply would fail part way. Names compare ignoring case, the way
+// IgnoredTables.RefuseDeclared compares them, because whether two spellings
+// are one table is the target's answer.
+func refuseDeclaredSkippedTables(namespace string, declared []string, live *liveSchema) error {
+	skipped := make(map[string]string, len(live.underscore)+len(live.archive))
+	for _, name := range live.underscore {
+		skipped[schema.CaseFoldKey(name)] = "its name starts with \"_\""
+	}
+	for _, name := range live.archive {
+		skipped[schema.CaseFoldKey(name)] = "its name follows the archive convention <name>_archive_YYYY"
+	}
+	for _, table := range declared {
+		why, ok := skipped[schema.CaseFoldKey(table)]
+		if !ok {
+			continue
+		}
+		return fmt.Errorf("a schema file in namespace %q declares table %q, which the MySQL planner never manages because %s. Rename the table, or remove its schema file",
+			namespace, table, why)
+	}
+	return nil
 }
 
 // Apply starts executing a schema change plan using Spirit.
@@ -1280,9 +1317,10 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // config does not name would have to come from the loader, which already holds
 // the full list from SHOW TABLES before it reads a definition.
 //
-// The leading-underscore exclusion stays with the loader unconditionally: it
-// discards the names it drops, so an entry naming one cannot be disclosed as
-// withheld from here whatever the ordering.
+// The leading-underscore exclusion stays with the loader unconditionally, so a
+// table it excludes is disclosed under the naming convention, never as
+// withheld by an ignore_tables entry that also names it. The loader reports
+// every table either exclusion dropped, which is what the plan discloses.
 func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption {
 	opts := []table.FilterOption{table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement}
 	if !ignored.MayWithhold(table.IsArchiveTable) {
@@ -1323,6 +1361,14 @@ type liveSchema struct {
 	// disclosure a withheld table would be indistinguishable from an
 	// unchanged one.
 	withheld []string
+	// underscore and archive are the live tables the naming conventions kept
+	// out of the diff, sorted, for the plan to disclose the same way: a table
+	// starting with "_" and a table named <name>_archive_YYYY[_MM[_DD]]. An
+	// archive table ignore_tables also names is reported in withheld instead;
+	// a "_" table is always reported here, because the loader drops it before
+	// the config is matched.
+	underscore []string
+	archive    []string
 	// lowerCaseTableNames is the target's @@lower_case_table_names, which
 	// decides whether the diff compares table names case-insensitively.
 	lowerCaseTableNames int
@@ -1351,9 +1397,20 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		return nil, fmt.Errorf("read lower_case_table_names: %w", err)
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
+	tables, excluded, err := table.LoadSchemaAndExcludedTablesFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
 	if err != nil {
 		return nil, fmt.Errorf("load schema: %w", err)
+	}
+	var underscore, archive []string
+	for _, ex := range excluded {
+		switch ex.Filter {
+		case table.WithoutUnderscoreTables:
+			underscore = append(underscore, ex.Name)
+		case table.WithoutArchiveTables:
+			archive = append(archive, ex.Name)
+		default:
+			return nil, fmt.Errorf("load schema: the loader excluded table %q under filter option %d, which the plan cannot disclose", ex.Name, ex.Filter)
+		}
 	}
 
 	// The archive-naming exclusion is applied here when the loader was not
@@ -1371,11 +1428,14 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 			continue
 		}
 		if table.IsArchiveTable(ts.Name) {
+			archive = append(archive, ts.Name)
 			continue
 		}
 		kept = append(kept, ts)
 	}
 	slices.Sort(withheld)
+	slices.Sort(underscore)
+	slices.Sort(archive)
 	if len(withheld) > 0 {
 		// The plan discloses this too; the log is where an operator tracing
 		// "why does the plan not mention table X" finds the answer without a
@@ -1383,7 +1443,13 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		e.logger.Info("live tables withheld from the plan by ignore_tables",
 			"database", database, "tables", withheld)
 	}
-	return &liveSchema{tables: kept, withheld: withheld, lowerCaseTableNames: lowerCaseTableNames}, nil
+	return &liveSchema{
+		tables:              kept,
+		withheld:            withheld,
+		underscore:          underscore,
+		archive:             archive,
+		lowerCaseTableNames: lowerCaseTableNames,
+	}, nil
 }
 
 // tableSizeEstimate is one table's approximate plan-time size read from
