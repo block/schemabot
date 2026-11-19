@@ -705,3 +705,49 @@ func TestFixFiles_ErrorNamesTheFirstFileByName(t *testing.T) {
 		require.NotContains(t, err.Error(), "zones.sql")
 	}
 }
+
+// fix-lint lists the issues that need a manual fix in the order FixFiles
+// returns them, so files with such issues are listed in filename order on
+// every run.
+func TestFixFiles_UnfixableIssuesAreInFilenameOrder(t *testing.T) {
+	// A counter this close to the end of BIGINT is an error no fix resolves.
+	const nearlyExhausted = " (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=9000000000000000000"
+	files := map[string]string{
+		"payments.sql": "CREATE TABLE payments" + nearlyExhausted,
+		"accounts.sql": "CREATE TABLE accounts" + nearlyExhausted,
+		"orders.sql":   "CREATE TABLE orders" + nearlyExhausted,
+		"ledger.sql":   "CREATE TABLE ledger" + nearlyExhausted,
+	}
+
+	for range fixRuns {
+		result, err := NewFixer().FixFiles(files)
+		require.NoError(t, err)
+
+		var tables []string
+		for _, issue := range result.UnfixableIssues {
+			tables = append(tables, issue.Table)
+		}
+		require.Equal(t, []string{"accounts", "ledger", "orders", "payments"}, tables)
+	}
+}
+
+// An issue a fix resolves is not also reported as needing a manual fix: the
+// counter is past the end of INT, and widening the key to BIGINT gives it room.
+func TestFixFiles_ResolvedIssueIsNotReportedAsUnfixable(t *testing.T) {
+	const orders = "CREATE TABLE orders (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AUTO_INCREMENT=3000000000"
+
+	unfixed, err := New().LintSchema(map[string]string{"orders.sql": orders})
+	require.NoError(t, err)
+	var errorLinters []string
+	for _, issue := range unfixed {
+		if issue.Severity == "error" {
+			errorLinters = append(errorLinters, issue.Linter)
+		}
+	}
+	require.Equal(t, []string{"auto_inc_capacity"}, errorLinters, "the file as written has the error the fix resolves")
+
+	result, err := NewFixer().FixFiles(map[string]string{"orders.sql": orders})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.TotalFixed)
+	assert.Empty(t, result.UnfixableIssues)
+}

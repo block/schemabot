@@ -64,8 +64,10 @@ type FixFilesResult struct {
 
 // FixFiles applies auto-fixes to a set of SQL schema files.
 // Returns fixed files, any issues that couldn't be automatically fixed, and any error.
-// Files are processed in filename order, so the results, the remaining issues,
-// and which file an error names are the same on every run over the same input.
+// Files are processed in filename order, so the order of the results, the order
+// of the files in the remaining issues, and which file an error names are the
+// same on every run over the same input. Within one file, the remaining issues
+// keep the order Spirit's linters report them in, which Spirit leaves undefined.
 func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 	result := &FixFilesResult{}
 	filenames := slices.Sorted(maps.Keys(files))
