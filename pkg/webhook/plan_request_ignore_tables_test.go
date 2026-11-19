@@ -47,11 +47,11 @@ func TestPlanRequestBuildersCarryIgnoreAndDropTables(t *testing.T) {
 				return true
 			}
 			builders++
-			assert.True(t, litSetsField(lit, "IgnoreTables"),
-				"%s builds a PlanRequest without IgnoreTables; the plan would drop every table the repository withholds",
+			assert.True(t, litSetsFieldFromConfig(lit, "IgnoreTables"),
+				"%s builds a PlanRequest without IgnoreTables from the config; the plan would drop every table the repository withholds",
 				fset.Position(lit.Pos()))
-			assert.True(t, litSetsField(lit, "DropTables"),
-				"%s builds a PlanRequest without DropTables; the plan would leave out the drops the repository asked for",
+			assert.True(t, litSetsFieldFromConfig(lit, "DropTables"),
+				"%s builds a PlanRequest without DropTables from the config; the plan would leave out the drops the repository asked for",
 				fset.Position(lit.Pos()))
 			return true
 		})
@@ -61,14 +61,29 @@ func TestPlanRequestBuildersCarryIgnoreAndDropTables(t *testing.T) {
 
 // litSetsField reports whether a composite literal assigns the named field.
 func litSetsField(lit *ast.CompositeLit, field string) bool {
+	return litFieldValue(lit, field) != nil
+}
+
+// litSetsFieldFromConfig reports whether a composite literal assigns the named
+// field from the same-named field of the parsed config, such as
+// schemaResult.DropTables. A field set to anything else, nil included, does
+// not carry what the repository asked for.
+func litSetsFieldFromConfig(lit *ast.CompositeLit, field string) bool {
+	value, ok := litFieldValue(lit, field).(*ast.SelectorExpr)
+	return ok && value.Sel.Name == field
+}
+
+// litFieldValue returns the expression a composite literal assigns to the
+// named field, or nil when it does not assign it.
+func litFieldValue(lit *ast.CompositeLit, field string) ast.Expr {
 	for _, element := range lit.Elts {
 		kv, ok := element.(*ast.KeyValueExpr)
 		if !ok {
 			continue
 		}
 		if key, ok := kv.Key.(*ast.Ident); ok && key.Name == field {
-			return true
+			return kv.Value
 		}
 	}
-	return false
+	return nil
 }

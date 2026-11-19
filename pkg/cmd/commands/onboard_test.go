@@ -456,7 +456,9 @@ func TestOnboardRejectsDiscoveredNamespacePlaceholders(t *testing.T) {
 // Onboarding verifies the pulled files on every rollout member's plan, so its
 // plan says it reads the rollout, and the server answers it with every
 // member's plan rather than refusing a caller that would see only the
-// primary's.
+// primary's. It checks that the files mirror the target, so it plans without
+// the config's drop_tables: a listed table still on the target is a drop the
+// repository asked for, not a file the pull got wrong.
 func TestVerifyOnboardPlan_SaysItReadsTheRollout(t *testing.T) {
 	var got apitypes.PlanRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -475,13 +477,15 @@ func TestVerifyOnboardPlan_SaysItReadsTheRollout(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	}, client.PlanExclusions{})
+	}, client.PlanExclusions{Tables: []string{"flyway_schema_history"}, DropTables: []string{"_users_old"}})
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 
 	require.NoError(t, verifyOnboardPlan(server.URL, "orders", "production", plan))
 	assert.Equal(t, "orders", got.Database)
 	assert.True(t, got.RendersRollout, "onboarding's verification reads every rollout member's plan")
+	assert.Empty(t, got.DropTables, "the verification checks the files against the target, not the drops the config asks for")
+	assert.Equal(t, []string{"flyway_schema_history"}, got.IgnoreTables, "the verification still withholds what the config withholds")
 }
 
 func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {

@@ -631,6 +631,53 @@ func TestDropTablesEntriesUnmatched(t *testing.T) {
 	assert.Nil(t, dropTablesEntriesUnmatched(nil, nil, changes, shards), "a plan with no drop_tables has nothing to report")
 }
 
+// A drop_tables entry that names no live table plans nothing, and the plan
+// still succeeds. The server logs the entry with the identifiers an operator
+// needs to find the config, since that log is the only sign the entry is stale
+// and should be removed.
+func TestPlanHandler_LogsDropTablesEntriesThatNameNoLiveTable(t *testing.T) {
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-stale-entry"}}
+	svc := withheldDropService(&capturingPlanStore{}, mockClient)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	pr := int32(42)
+	body, err := json.Marshal(PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		Repository:  "acme/payments",
+		PullRequest: &pr,
+		DropTables:  []string{"_payouts_old"},
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.handlePlan(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var entry map[string]any
+	for line := range bytes.Lines(logs.Bytes()) {
+		var record map[string]any
+		require.NoError(t, json.Unmarshal(line, &record))
+		if record["unmatched_entries"] != nil {
+			entry = record
+		}
+	}
+	require.NotNil(t, entry, "the stale entry is logged: %s", logs.String())
+	assert.Equal(t, "INFO", entry["level"])
+	assert.Equal(t, []any{"_payouts_old"}, entry["unmatched_entries"])
+	assert.Equal(t, "payments", entry["database"])
+	assert.Equal(t, "staging", entry["environment"])
+	assert.Equal(t, DefaultDeployment, entry["deployment"])
+	assert.Equal(t, "acme/payments", entry["repository"])
+	assert.InDelta(t, 42, entry["pull_request"], 0)
+}
+
 // POST /api/plan holds drop_tables to the rule the engine indexes it by, so an
 // entry that is not one exact table name is the request's error, answered
 // before any data plane is asked to plan.

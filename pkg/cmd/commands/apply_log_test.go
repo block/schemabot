@@ -555,6 +555,42 @@ func TestWatchApplyProgressLog_MixedTaskStates(t *testing.T) {
 	assert.Contains(t, output, `tables="2/2 succeeded"`)
 }
 
+// A drop_tables entry plans the drop of a leftover `_` table, and the operator
+// who consented to it sees that drop in the apply log and in the output after
+// cutover, like any other table, rather than an apply that seems to have done
+// nothing.
+func TestWatchShowsTheDropOfAnUnderscoreTable(t *testing.T) {
+	dropped := func() *apitypes.ProgressResponse {
+		return &apitypes.ProgressResponse{
+			ApplyID: "apply-drop", State: state.Apply.Completed,
+			Tables: []*apitypes.TableProgressResponse{{
+				TableName: "_orders_old", DDL: "DROP TABLE `_orders_old`", Status: state.Apply.Completed,
+			}},
+		}
+	}
+
+	t.Run("apply log", func(t *testing.T) {
+		output := runLogProgress(t, dropped())
+		assert.Contains(t, output, "Table started table=_orders_old", output)
+		assert.Contains(t, output, "Table complete table=_orders_old", output)
+	})
+
+	t.Run("after cutover", func(t *testing.T) {
+		poller := &progressPoller{
+			ctx:     t.Context(),
+			applyID: "apply-drop",
+			fetch:   func() (*apitypes.ProgressResponse, error) { return dropped(), nil },
+			sleep:   func(time.Duration) {},
+		}
+		var err error
+		output := captureOutput(t, func() {
+			err = watchAfterCutover(poller)
+		})
+		require.NoError(t, err)
+		assert.Contains(t, stripANSI(output), "_orders_old: ", output)
+	})
+}
+
 func TestTableLogKey(t *testing.T) {
 	t.Run("durable task ID wins over table and member names", func(t *testing.T) {
 		first := &apitypes.TableProgressResponse{TaskID: "task-001", TableName: "orders", Target: "shop-001"}
