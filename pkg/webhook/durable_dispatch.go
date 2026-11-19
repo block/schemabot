@@ -580,6 +580,10 @@ func (h *Handler) claimedAutoPlanHeadConfirmedStale(ctx context.Context, driverI
 			"head_sha", event.HeadSHA)
 		return false
 	}
+	h.logger.Info("durable webhook driver confirmed against the live pull request that a claimed delivery's head is no longer current; superseding the delivery",
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA, "live_head_sha", prInfo.HeadSHA, "pr_closed", prInfo.IsClosed())
 	return true
 }
 
@@ -1072,8 +1076,11 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 	return false, nil
 }
 
-func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullRequestPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
-	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+// enqueueDurablePullRequest stores a pull_request delivery in the inbox. It
+// reports whether the delivery was new and, for a synchronize delivery held
+// back for the quiet period, the time before which no driver can claim it.
+func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullRequestPayload, body []byte, deliveryID string, installationID int64) (inserted bool, notBefore *time.Time, err error) {
+	event := &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "pull_request",
@@ -1083,7 +1090,21 @@ func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullReq
 		HeadSHA:     payload.PullRequest.Head.SHA,
 		TenantID:    strconv.FormatInt(installationID, 10),
 		Payload:     body,
-	})
+	}
+	if payload.Action == storage.PullRequestSynchronizeAction && h.synchronizeQuietPeriod > 0 {
+		// Hold the push back for the quiet period, so a following push in the
+		// same burst is already in the inbox when a driver claims this one.
+		// The claim then finds a covering successor, confirms against the live
+		// PR that this head is no longer current, and is superseded
+		// (supersedeCoveredAutoPlan) instead of planning. Only synchronize
+		// waits: an opened or reopened PR has no earlier head to coalesce with.
+		now := time.Now()
+		claimableAt := now.Add(h.synchronizeQuietPeriod)
+		event.ReceivedAt = now
+		event.RetryAfter = &claimableAt
+	}
+	inserted, err = h.enqueueDurableWebhookEvent(ctx, event)
+	return inserted, event.RetryAfter, err
 }
 
 func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPayload, body []byte, deliveryID string, pr int, installationID int64) (bool, error) {
