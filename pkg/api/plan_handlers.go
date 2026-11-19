@@ -2026,8 +2026,15 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		s.rememberResumeObserver(storedApplyID, 0)
 	}
 
-	if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
-		return nil, 0, err
+	// Recovery remains available after the PR closes or its exception is revoked.
+	// Both guards are internal. Storage verifies the owner and exact rollback pin
+	// in the transaction that creates the apply, including after a concurrent repin.
+	pinnedRollback := req.ExpectedLockOwner != "" && plan.PlanIdentifier != "" &&
+		req.ExpectedPendingPlanID == storage.RollbackPendingPlanPrefix+plan.PlanIdentifier
+	if !pinnedRollback {
+		if err := s.admitPRSchemaWork(ctx, plan.Repository, plan.PullRequest, plan.HeadSHA); err != nil {
+			return nil, 0, err
+		}
 	}
 	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {

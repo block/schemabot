@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	rollbackPendingPlanPrefix = "rollback:"
+	rollbackPendingPlanPrefix = storage.RollbackPendingPlanPrefix
 
 	// rollbackLockReleaseTimeout bounds the lock release that runs after a
 	// rollback will not proceed. The release runs detached from the command's
