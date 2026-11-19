@@ -93,13 +93,16 @@ func cutoverRequest(boundTo int64) *storage.ApplyControlRequest {
 func TestOperationCutoverRequestTurn(t *testing.T) {
 	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-turn"}
 	tests := []struct {
-		name     string
-		boundTo  int64
-		euState  string
-		usTasks  []*storage.Task
-		blocker  bool
-		want     cutoverRequestTurn
-		wantSeen bool // whether CutoverBlocker was consulted for us
+		name    string
+		boundTo int64
+		euState string
+		usTasks []*storage.Task
+		blocker bool
+		want    cutoverRequestTurn
+		// wantBlocker is whether the turn names eu as the member that holds
+		// or held the request.
+		wantBlocker bool
+		wantSeen    bool // whether CutoverBlocker was consulted for us
 	}{
 		{
 			name:     "us parked and nothing earlier holds it takes the request",
@@ -121,6 +124,15 @@ func TestOperationCutoverRequestTurn(t *testing.T) {
 			wantSeen: true,
 		},
 		{
+			name: "us with one table parked and another still copying takes the request",
+			usTasks: []*storage.Task{
+				turnTask(turnUSOperationID, state.Task.WaitingForCutover),
+				turnTask(turnUSOperationID, state.Task.Running),
+			},
+			want:     cutoverRequestTurn{ready: true},
+			wantSeen: true,
+		},
+		{
 			name: "us still copying leaves the request even though eu is parked",
 			usTasks: []*storage.Task{
 				turnTask(turnEUOperationID, state.Task.WaitingForCutover),
@@ -138,39 +150,60 @@ func TestOperationCutoverRequestTurn(t *testing.T) {
 			want: cutoverRequestTurn{reason: "this member has not reached cutover"},
 		},
 		{
-			name:     "us parked behind an earlier member that holds the cutover leaves the request",
-			usTasks:  []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
-			blocker:  true,
-			want:     cutoverRequestTurn{reason: "an earlier member holds the cutover"},
-			wantSeen: true,
+			name:        "us parked behind an earlier member that holds the cutover leaves the request",
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
+			blocker:     true,
+			want:        cutoverRequestTurn{reason: "an earlier member holds the cutover"},
+			wantBlocker: true,
+			wantSeen:    true,
 		},
 		{
-			name:    "a request bound to eu while eu can still cut over is left for eu",
-			boundTo: turnEUOperationID,
-			euState: state.ApplyOperation.WaitingForCutover,
-			usTasks: []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
-			want:    cutoverRequestTurn{reason: "the request is bound to another member"},
+			name:        "a request bound to eu while eu can still cut over is left for eu",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.WaitingForCutover,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
+			want:        cutoverRequestTurn{reason: "the request is bound to another member"},
+			wantBlocker: true,
 		},
 		{
-			name:    "a request bound to eu after eu completed is settled as landed",
-			boundTo: turnEUOperationID,
-			euState: state.ApplyOperation.Completed,
-			usTasks: []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
-			want:    cutoverRequestTurn{reason: "the member the request was bound to has cut over", settle: cutoverRequestLanded},
+			name:        "a request bound to eu after eu completed is settled as landed",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.Completed,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
+			want:        cutoverRequestTurn{reason: "the member the request was bound to has cut over", settle: cutoverRequestLanded},
+			wantBlocker: true,
 		},
 		{
-			name:    "a request bound to eu after eu failed is settled as ended",
-			boundTo: turnEUOperationID,
-			euState: state.ApplyOperation.Failed,
-			usTasks: []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
-			want:    cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
+			name:        "a request bound to eu after eu failed is settled as ended",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.Failed,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
+			want:        cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
+			wantBlocker: true,
 		},
 		{
-			name:    "a request bound to eu after eu stopped is settled as ended",
-			boundTo: turnEUOperationID,
-			euState: state.ApplyOperation.Stopped,
-			usTasks: []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
-			want:    cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
+			name:        "a request bound to eu after eu stopped is settled as ended",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.Stopped,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
+			want:        cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
+			wantBlocker: true,
+		},
+		{
+			name:        "a request bound to eu after eu was cancelled is settled as ended",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.Cancelled,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
+			want:        cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
+			wantBlocker: true,
+		},
+		{
+			name:        "a request bound to eu after eu was reverted is settled as ended",
+			boundTo:     turnEUOperationID,
+			euState:     state.ApplyOperation.Reverted,
+			usTasks:     []*storage.Task{turnTask(turnUSOperationID, state.Task.WaitingForCutover)},
+			want:        cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", settle: cutoverRequestEnded},
+			wantBlocker: true,
 		},
 	}
 	for _, tt := range tests {
@@ -191,7 +224,7 @@ func TestOperationCutoverRequestTurn(t *testing.T) {
 			require.NoError(t, err)
 
 			want := tt.want
-			if tt.blocker || (tt.boundTo != 0 && tt.boundTo != us.ID) {
+			if tt.wantBlocker {
 				want.blocker = eu
 			}
 			assert.Equal(t, want, turn)
@@ -309,4 +342,15 @@ func TestOperationCutoverRequestTurnFailsClosed(t *testing.T) {
 			assert.Equal(t, cutoverRequestTurn{}, turn, "a failed read must never yield a turn")
 		})
 	}
+}
+
+// The gRPC drive also asks whether its own member is parked before it sends a
+// pending cutover to its remote operation. Without storage it cannot tell, so
+// it gets an error and never a member reported as parked.
+func TestOperationParkedAtCutoverFailsClosedWithoutStorage(t *testing.T) {
+	us := turnMember(turnUSOperationID, "us", state.ApplyOperation.WaitingForCutover)
+
+	parked, err := operationParkedAtCutover(t.Context(), nil, &storage.Apply{ApplyIdentifier: "apply-turn"}, usDriveScope(us))
+	require.ErrorContains(t, err, "storage is not available")
+	assert.False(t, parked, "a drive without storage must never report its member as parked")
 }
