@@ -29,6 +29,7 @@
 - [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
+- [PR Target Enforcement](#pr-target-enforcement)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
 - [Authentication](#authentication)
