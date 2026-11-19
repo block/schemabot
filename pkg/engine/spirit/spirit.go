@@ -388,10 +388,19 @@ func (e *Engine) DrainContext(ctx context.Context) error {
 		return nil
 	}
 	if err := waitForRunExit(ctx, rm); err != nil {
-		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", rm.database, rm.tables, err)
+		database, tables := e.runTarget(rm)
+		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", database, tables, err)
 	}
 	e.releaseDrained(rm, raceWindow)
 	return nil
+}
+
+// runTarget reads the database and tables of a run that may still be running.
+// The run is still publishing its tables under e.mu, so they are read under it.
+func (e *Engine) runTarget(rm *runningSchemaChange) (string, []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return rm.database, rm.tables
 }
 
 // trackedForDrain returns the schema change a drain waits for, if any.
