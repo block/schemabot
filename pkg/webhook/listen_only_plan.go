@@ -22,10 +22,13 @@ func (h *Handler) readListenOnlyPlanInputs(ctx context.Context, client *ghclient
 	cfg := h.service.Config()
 	environments := cfg.OrderedEnvironments(cfg.AllowedEnvironments)
 	if len(environments) == 0 {
-		// A deployment that serves every environment has none to name, so
-		// read the config directory itself: the root an environment with no
-		// directory of its own resolves to.
-		environments = []string{""}
+		// A deployment that serves every environment names none, so read the
+		// environments of the promotion order. Each resolves to its own
+		// directory where the repository keeps one, and to the config
+		// directory otherwise. Reading the config directory alone would miss
+		// a repository that keeps one directory per environment, because
+		// the reader looks only one namespace level below the root.
+		environments = cfg.PromotionEnvironmentOrder()
 	}
 
 	schemas := make(map[string]*ghclient.SchemaRequestResult, len(environments))

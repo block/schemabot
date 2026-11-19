@@ -30,7 +30,48 @@ import (
 // deployment serves, and one base-branch comparison for all of them. Nothing
 // is planned and nothing is written: no comment, no Check Run.
 func TestE2EAutoPlanOnListenOnlyRepositoryReadsPlanInputsForUnregisteredDatabase(t *testing.T) {
+	entry := runListenOnlyAutoPlan(t, []string{"staging", "production"}, nil, map[string]string{"users.sql": baseSchemaUsersTable})
+
+	assert.ElementsMatch(t, []any{"staging", "production"}, entry["environments"])
+	assert.EqualValues(t, 2, entry["schema_files"], "users.sql, once for each environment")
+}
+
+// A deployment without allowed_environments serves every environment, so it
+// has none to name. It reads the environments of its promotion order, and a
+// repository that keeps one directory per environment is read from each
+// environment's own directory. Reading the config directory alone would find
+// the environment directories as namespaces and skip the files one level
+// below them.
+func TestE2EAutoPlanOnListenOnlyRepositoryReadsEnvironmentDirectoriesWhenEnvironmentsAreUnscoped(t *testing.T) {
+	entry := runListenOnlyAutoPlan(t, nil, []string{"staging", "production"}, map[string]string{
+		"staging/listen_only_orders/users.sql":    baseSchemaUsersTable,
+		"production/listen_only_orders/users.sql": baseSchemaUsersTable,
+	})
+
+	assert.ElementsMatch(t, []any{"staging", "production"}, entry["environments"])
+	assert.EqualValues(t, 2, entry["schema_files"], "each environment's users.sql, from its own directory")
+}
+
+// runListenOnlyAutoPlan sends a synchronize webhook for a listen-only
+// repository whose database the deployment does not register, waits for the
+// auto-plan, and checks what every such auto-plan must do: write nothing,
+// read schema blobs at the head, and compare against the base branch once. It
+// returns the log entry that reports the reads. environmentDirectories names
+// the directories under schema/ that the repository keeps for environments,
+// each holding the listen_only_orders namespace.
+func runListenOnlyAutoPlan(t *testing.T, allowedEnvironments, environmentDirectories []string, schemaSQL map[string]string) map[string]any {
+	t.Helper()
 	mux := http.NewServeMux()
+	for _, env := range environmentDirectories {
+		dir := "schema/" + env
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+dir, func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]*gh.RepositoryContent{{
+				Type: new("dir"),
+				Name: new("listen_only_orders"),
+				Path: new(dir + "/listen_only_orders"),
+			}}))
+		})
+	}
 	var mu sync.Mutex
 	var reads, writes []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,15 +91,14 @@ func TestE2EAutoPlanOnListenOnlyRepositoryReadsPlanInputsForUnregisteredDatabase
 	client.BaseURL, err = url.Parse(server.URL + "/")
 	require.NoError(t, err)
 
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": baseSchemaUsersTable},
-		"database: listen_only_orders\ntype: mysql\n", "listen_only_orders")
+	result := setupFakeGitHubForPlan(t, mux, schemaSQL, "database: listen_only_orders\ntype: mysql\n", "listen_only_orders")
 	var compares atomic.Int32
 	registerStaleBaseSchemaComparisonWithHook(t, mux, result, func() { compares.Add(1) })
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	svc := api.New(&emptyStorage{}, &api.ServerConfig{
-		AllowedEnvironments: []string{"staging", "production"},
+		AllowedEnvironments: allowedEnvironments,
 		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {ListenOnly: true}},
 	}, nil, logger)
 	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")}, nil, logger)
@@ -78,12 +118,11 @@ func TestE2EAutoPlanOnListenOnlyRepositoryReadsPlanInputsForUnregisteredDatabase
 	assert.Empty(t, result.checkRuns)
 	assert.True(t, containsPrefix(reads, "GET /repos/octocat/hello-world/git/blobs/"),
 		"the schema files at the head are read, as a plan would read them: %v", reads)
-	assert.Equal(t, int32(1), compares.Load(), "one base-branch comparison covers both environments")
+	assert.Equal(t, int32(1), compares.Load(), "one base-branch comparison covers every environment")
 
 	entry := findLogEntry(t, &logs, "read a listen-only repository's plan inputs for a database this deployment does not register; nothing was planned or posted")
 	assert.Equal(t, "listen_only_orders", entry["database"])
-	assert.ElementsMatch(t, []any{"staging", "production"}, entry["environments"])
-	assert.EqualValues(t, 2, entry["schema_files"], "users.sql, once for each environment")
+	return entry
 }
 
 func containsPrefix(requests []string, prefix string) bool {
