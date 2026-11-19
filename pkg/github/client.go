@@ -312,6 +312,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		configDirHints:          c.configDirHints,
 		checkStatusSingleflight: c.checkStatusSingleflight,
 		treeLevels:              newTreeLevelCache(),
+		prETags:                 newPRETagCache(),
 	}
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
@@ -395,6 +396,7 @@ func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSl
 		logger:               logger,
 		trustedCheckAppSlugs: trustedCheckAppSlugs,
 		treeLevels:           newTreeLevelCache(),
+		prETags:              newPRETagCache(),
 	}
 	ic.storeAppSlug(appSlug)
 	return ic
@@ -444,6 +446,11 @@ type InstallationClient struct {
 	// treeLevels holds tree levels read by SHA across calls, so the
 	// listings and comparisons a delivery repeats read each level once.
 	treeLevels *treeLevelCache
+
+	// prETags holds the ETag of each pull request read on this installation,
+	// so a repeat read of an unchanged pull request is a conditional request
+	// that GitHub answers with 304 without spending primary rate limit.
+	prETags *prETagCache
 }
 
 // InstallationID returns the GitHub App installation this client is scoped
@@ -1006,24 +1013,44 @@ func (ic *InstallationClient) FetchPullRequestNoCache(ctx context.Context, repo 
 	return ic.fetchPullRequest(ctx, repo, pr)
 }
 
+// fetchPullRequest reads the pull request from GitHub. When an earlier read on
+// this installation stored an ETag for it, the request is conditional: a 304
+// Not Modified answer means the pull request is unchanged since that read, so
+// the stored info is returned without spending primary rate limit. Any other
+// answer is parsed in full and replaces the stored entry.
 func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string, pr int) (*PullRequestInfo, error) {
 	owner, repoName := splitRepo(repo)
-	ghPR, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*pullRequestWithStack, error) {
+	return retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationFetchPullRequest, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*PullRequestInfo, error) {
 		req, err := ic.client.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repoName, pr), nil)
 		if err != nil {
-			return nil, fmt.Errorf("build pull request lookup: %w", err)
+			return nil, fmt.Errorf("build pull request read %s#%d: %w", repo, pr, err)
 		}
+		cached, conditional := ic.prETags.get(repo, pr)
+		if conditional {
+			req.Header.Set("If-None-Match", cached.etag)
+		}
+
 		ghPR := new(pullRequestWithStack)
-		_, err = ic.client.Do(req, ghPR)
+		resp, err := ic.client.Do(req, ghPR)
+		if conditional && isNotModified(resp) {
+			info := cached.info
+			return &info, nil
+		}
 		if err != nil {
 			return nil, fmt.Errorf("fetch pull request %s#%d: %w", repo, pr, classifyGitHubAPIError(err))
 		}
-		return ghPR, nil
+
+		info := pullRequestInfoFromGitHub(ghPR)
+		ic.prETags.put(repo, pr, resp.Header.Get("ETag"), info)
+		return &info, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	info := &PullRequestInfo{
+}
+
+// pullRequestInfoFromGitHub maps a full pull request read to the fields
+// SchemaBot keeps. The ETag cache stores its result, so every field it sets
+// must come from the pull request response itself, never from another read.
+func pullRequestInfoFromGitHub(ghPR *pullRequestWithStack) PullRequestInfo {
+	info := PullRequestInfo{
 		HeadRef:       ghPR.GetHead().GetRef(),
 		HeadSHA:       ghPR.GetHead().GetSHA(),
 		BaseRef:       ghPR.GetBase().GetRef(),
@@ -1037,7 +1064,14 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		info.NativeStack = true
 		info.StackBaseRef = ghPR.Stack.Base.Ref
 	}
-	return info, nil
+	return info
+}
+
+// isNotModified reports whether GitHub answered a conditional read with 304
+// Not Modified. go-github returns that answer as an error, so callers check
+// the response before handling the error.
+func isNotModified(resp *gh.Response) bool {
+	return resp != nil && resp.Response != nil && resp.StatusCode == http.StatusNotModified
 }
 
 // PRFile represents a file changed in a PR.
