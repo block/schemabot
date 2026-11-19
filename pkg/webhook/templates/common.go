@@ -283,17 +283,24 @@ var (
 	ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 )
 
+// grpcStatusPrefixRe matches the "rpc error: code = X desc = " text a gRPC
+// status adds to an error from a remote data plane. The code is transport
+// detail for operators, not something a PR author acts on, and the message
+// after it is the engine's own.
+var grpcStatusPrefixRe = regexp.MustCompile(`rpc error: code = [A-Za-z]+ desc = `)
+
 // sanitizeCommentError makes an untrusted engine or task error safe to render
 // in a public PR comment: it normalizes line endings, strips control and
 // format characters (including bidi overrides usable for visual spoofing),
-// redacts connection details that leak credentials, identifiers, or internal
-// infrastructure, trims surrounding whitespace, and clamps the length by rune
-// count. The raw error remains available server-side in the apply logs, so
+// drops gRPC status prefixes, redacts connection details that leak
+// credentials, identifiers, or internal infrastructure, trims surrounding
+// whitespace, and clamps the length by rune count. The raw error remains available server-side in the apply logs, so
 // nothing is lost for triage.
 func sanitizeCommentError(msg string) string {
 	msg = strings.ReplaceAll(msg, "\r\n", "\n")
 	msg = strings.ReplaceAll(msg, "\r", "\n")
 	msg = stripControlText(msg)
+	msg = grpcStatusPrefixRe.ReplaceAllString(msg, "")
 	msg = redactConnectionDetails(msg)
 	msg = strings.TrimSpace(msg)
 	if runes := []rune(msg); len(runes) > maxCommentErrorLen {
