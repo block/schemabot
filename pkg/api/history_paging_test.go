@@ -3,9 +3,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 func getHistoryPage(t *testing.T, mux *http.ServeMux, database string, query url.Values) (int, apitypes.DatabaseHistoryResponse, apitypes.ErrorResponse) {
@@ -130,4 +133,60 @@ func TestHandleDatabaseHistoryKeepsTheStorageErrorOutOfTheResponse(t *testing.T)
 	code, _, errResp := getHistoryPage(t, mux, "orders", url.Values{})
 	assert.Equal(t, http.StatusInternalServerError, code)
 	assert.Equal(t, "failed to get apply history", errResp.Error)
+}
+
+// newHistoryServer serves the history from a store that filters on database,
+// environment and starting_after, so a test sees what a page actually holds.
+func newHistoryServer(t *testing.T, applies storage.ApplyStore) *http.ServeMux {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{applies: applies}, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	return mux
+}
+
+// A database with exactly a page's worth of applies fits in one page, so the
+// page reports no more and a client never asks for an empty one.
+func TestHistoryExactFitPageHasNoMore(t *testing.T) {
+	mux := newHistoryServer(t, &staticApplyStore{applies: pagingTestApplies(time.Now().UTC())})
+
+	code, resp, errResp := getHistoryPage(t, mux, "orders", url.Values{"environment": {"staging"}, "limit": {"3"}})
+	require.Equal(t, http.StatusOK, code, errResp.Error)
+	assert.Len(t, resp.Applies, 3)
+	assert.False(t, resp.HasMore, "three applies in a page of three leave nothing more")
+}
+
+// A page after the oldest apply is an empty list, not null, reports no more,
+// and echoes the apply it continued from.
+func TestHistoryPageAfterTheOldestIsEmpty(t *testing.T) {
+	mux := newHistoryServer(t, &staticApplyStore{applies: pagingTestApplies(time.Now().UTC())})
+
+	code, resp, errResp := getHistoryPage(t, mux, "orders", url.Values{"environment": {"staging"}, "starting_after": {"apply-10"}})
+	require.Equal(t, http.StatusOK, code, errResp.Error)
+	assert.NotNil(t, resp.Applies)
+	assert.Empty(t, resp.Applies)
+	assert.False(t, resp.HasMore)
+	assert.Equal(t, "apply-10", resp.StartingAfter)
+}
+
+// An apply created between two page requests sits above every page already
+// read, so the next page holds the same applies it would have without it.
+func TestHistoryInsertBetweenPagesLeavesTheNextPageAlone(t *testing.T) {
+	store := &staticApplyStore{applies: pagingTestApplies(time.Now().UTC())}
+	mux := newHistoryServer(t, store)
+
+	code, first, errResp := getHistoryPage(t, mux, "orders", url.Values{"environment": {"staging"}, "limit": {"2"}})
+	require.Equal(t, http.StatusOK, code, errResp.Error)
+	require.Len(t, first.Applies, 2)
+
+	newer := *store.applies[0]
+	newer.ID, newer.ApplyIdentifier = 40, "apply-40"
+	store.applies = append([]*storage.Apply{&newer}, store.applies...)
+
+	code, second, errResp := getHistoryPage(t, mux, "orders", url.Values{"environment": {"staging"}, "limit": {"2"}, "starting_after": {"apply-20"}})
+	require.Equal(t, http.StatusOK, code, errResp.Error)
+	require.Len(t, second.Applies, 1)
+	assert.Equal(t, "apply-10", second.Applies[0].ApplyID)
+	assert.False(t, second.HasMore)
 }

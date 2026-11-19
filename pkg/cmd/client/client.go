@@ -398,11 +398,20 @@ func GetProgressCtx(ctx context.Context, endpoint, applyID string) (*apitypes.Pr
 	return &result, nil
 }
 
-// GetDatabaseHistory fetches the apply history for a database.
-func GetDatabaseHistory(endpoint, database, environment string) (*apitypes.DatabaseHistoryResponse, error) {
+// GetDatabaseHistory fetches one page of a database's apply history, newest
+// first. after names the last apply of the previous page; empty fetches the
+// first page.
+func GetDatabaseHistory(endpoint, database, environment, after string) (*apitypes.DatabaseHistoryResponse, error) {
 	path := fmt.Sprintf("/api/history/%s", database)
+	values := url.Values{}
 	if environment != "" {
-		path += "?environment=" + environment
+		values.Set("environment", environment)
+	}
+	if after != "" {
+		values.Set("starting_after", after)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
 	}
 	var result apitypes.DatabaseHistoryResponse
 	if err := doGetInto(endpoint, path, &result); err != nil {
