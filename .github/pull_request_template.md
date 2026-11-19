@@ -22,7 +22,9 @@ anything else. AGENTS.md (Git section) has the full rules.
 <!--
 Required when the change has a shape: a flow, a state change, a lifecycle,
 concurrency, or ownership. Delete this section only for a change with no
-shape (a comment, a test, a copy edit, a dependency bump). Trace one
+shape (a comment, a test, a copy edit, a dependency bump), or one whose
+shape a single sentence states in full, such as a one-line predicate
+change. Trace one
 concrete example through both halves, named in the sentence above the
 diagram. Draw both halves in the same form and node order, and mark with
 ✗ where the old behavior goes wrong. Keep it in the fenced block, then
