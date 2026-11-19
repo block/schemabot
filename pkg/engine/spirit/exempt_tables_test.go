@@ -35,6 +35,9 @@ func TestIsArchiveTable_MatchesSpiritLoaderConvention(t *testing.T) {
 		{"orders_archive_24", false},
 		{"orders_archive_2024_1", false},
 		{"orders_archive_2024_01_15_09", false},
+		{"orders_archive_2024_01_", false},
+		{"orders_archive_202401", false},
+		{"orders_archive_2024-01", false},
 		{"orders_archive_2024x", false},
 		{"orders_archived_2024", false},
 		{"archive_2024", false},
@@ -46,6 +49,69 @@ func TestIsArchiveTable_MatchesSpiritLoaderConvention(t *testing.T) {
 			assert.Equal(t, tc.want, table.IsArchiveTable(tc.name), "Spirit table.IsArchiveTable")
 		})
 	}
+}
+
+// TestIsArchiveTable_MatchesSpiritLoaderConvention checks a sample of names, so
+// a change to either convention that keeps those verdicts would pass it. This
+// test compares the two predicates on every generated name instead.
+func TestIsArchiveTable_AgreesWithSpiritAcrossGeneratedNames(t *testing.T) {
+	var archives, others int
+	var disagreements []string
+	for _, name := range generatedArchiveNameCandidates() {
+		ours := engine.IsArchiveTable(name)
+		if ours {
+			archives++
+		} else {
+			others++
+		}
+		if ours != table.IsArchiveTable(name) && len(disagreements) < 10 {
+			disagreements = append(disagreements, name)
+		}
+	}
+
+	assert.Empty(t, disagreements, "engine.IsArchiveTable and Spirit's table.IsArchiveTable disagree on these names")
+	assert.Positive(t, archives, "the generated names include archive names")
+	assert.Positive(t, others, "the generated names include names outside the convention")
+}
+
+// generatedArchiveNameCandidates builds table names on both sides of the
+// archive convention from the parts a change to it would most plausibly touch:
+// the marker's spelling and letter case, how many digits each date part has,
+// what separates the parts, and what follows them.
+func generatedArchiveNameCandidates() []string {
+	prefixes := []string{"", "orders", "orders_archive_2020"}
+	markers := []string{"_archive_", "_ARCHIVE_", "archive_", "_archive", "_archives_"}
+	years := []string{"", "24", "2024", "20245", "2O24", "２０２４"}
+	tails := []string{"", "_", "_09", "\n"}
+
+	// A month or a day is either absent or one separator followed by one part.
+	optionalParts := []string{""}
+	for _, separator := range []string{"_", "-", ""} {
+		for _, part := range []string{"1", "01", "001"} {
+			optionalParts = append(optionalParts, separator+part)
+		}
+	}
+
+	var dates []string
+	for _, year := range years {
+		for _, month := range optionalParts {
+			for _, day := range optionalParts {
+				dates = append(dates, year+month+day)
+			}
+		}
+	}
+
+	var names []string
+	for _, prefix := range prefixes {
+		for _, marker := range markers {
+			for _, date := range dates {
+				for _, tail := range tails {
+					names = append(names, prefix+marker+date+tail)
+				}
+			}
+		}
+	}
+	return names
 }
 
 // The loader drops an archive table before reading its definition. Moving that
