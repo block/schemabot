@@ -83,8 +83,8 @@ func (c *Client) NewQuotaProbe() *QuotaProbe {
 }
 
 // NewServingQuotaProbe returns a probe over the installations that serve the
-// configured repos, resolved through the same per-owner installation lookup
-// webhook dispatch uses. An installation of the App that serves none of them,
+// configured repos, resolved each pass with one installation lookup per
+// repository owner. An installation of the App that serves none of them,
 // such as one on an account the server is not configured for, is not read, so
 // its untouched budget neither stands in for a serving installation running
 // low nor holds back a rollout gate.
@@ -255,14 +255,23 @@ func (c *Client) listActiveInstallations(ctx context.Context) (quotaTargets, err
 }
 
 // servingInstallations resolves the installations serving repos, one owner at
-// a time. An owner's lookup normally caches the installation for the whole
-// owner, so the first repository answers for the rest and later passes are
-// answered from memory. A lookup that fails for any reason other than the App
-// not being installed counts the owner as unresolved and moves on, so GitHub
-// being down costs one lookup per owner per pass and fails closed. A
-// repository the App is not installed on has no budget to observe; the owner's
-// other repositories are still tried, since an installation limited to
-// selected repositories can cover some of them.
+// a time, with a fresh lookup on every pass rather than the cached answer, so
+// an App that was uninstalled and reinstalled is followed to its new
+// installation within a pass instead of being probed under its retired id
+// until the server restarts. An owner-wide answer also refreshes the cache
+// webhook dispatch reads. The lookup uses the App JWT, which does not spend an
+// installation's budget, and costs one request per owner per pass, not one per
+// repository: the first repository's answer stands for the whole owner when
+// the installation belongs to the owner's account.
+//
+// A lookup that fails for any reason other than the App not being installed
+// counts the owner as unresolved and moves on, so GitHub being down fails
+// closed at one lookup per owner. Once the pass's deadline has passed, the
+// owners not yet resolved count as unresolved without a lookup. A repository
+// the App is not installed on has no budget to observe; the owner's other
+// repositories are still tried, as they are after an answer that stands only
+// for the repository asked about, since an installation limited to selected
+// repositories, or on another account, can cover some of them.
 func (c *Client) servingInstallations(ctx context.Context, repos []string) quotaTargets {
 	byOwner := make(map[string][]string)
 	for _, repo := range repos {
@@ -270,11 +279,20 @@ func (c *Client) servingInstallations(ctx context.Context, repos []string) quota
 		ownerKey := strings.ToLower(owner)
 		byOwner[ownerKey] = append(byOwner[ownerKey], repo)
 	}
+	owners := slices.Sorted(maps.Keys(byOwner))
 	var targets quotaTargets
 	seen := make(map[int64]bool)
-	for _, ownerKey := range slices.Sorted(maps.Keys(byOwner)) {
+	for i, ownerKey := range owners {
+		if err := ctx.Err(); err != nil {
+			skipped := len(owners) - i
+			c.logger.Warn("GitHub quota probe ran out of time resolving installations; counting the remaining owners' budgets as unobserved",
+				"unresolved_owners", skipped, "error", err)
+			targets.unresolved += skipped
+			break
+		}
 		for _, repo := range byOwner[ownerKey] {
-			id, err := c.InstallationIDForRepo(ctx, repo)
+			owner, name := splitRepo(repo)
+			lookup, err := c.lookUpRepoInstallation(ctx, repo, owner, name)
 			if errors.Is(err, ErrAppNotInstalled) {
 				c.logger.Warn("GitHub quota probe found a configured repository the App is not installed on; no installation serves it, so it has no budget to observe",
 					"repo", repo, "error", err)
@@ -286,13 +304,15 @@ func (c *Client) servingInstallations(ctx context.Context, repos []string) quota
 				targets.unresolved++
 				break
 			}
-			if !seen[id] {
-				seen[id] = true
-				targets.installations = append(targets.installations, id)
+			if !seen[lookup.id] {
+				seen[lookup.id] = true
+				targets.installations = append(targets.installations, lookup.id)
 			}
-			if _, ownerWide := c.cachedOwnerInstallation(ownerKey); ownerWide {
+			if lookup.ownerWide {
 				break
 			}
+			c.logger.Debug("GitHub quota probe installation answers only the repository asked about; resolving the owner's other repositories",
+				"repo", repo, "installation_id", lookup.id)
 		}
 	}
 	return targets

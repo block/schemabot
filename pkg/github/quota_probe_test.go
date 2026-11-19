@@ -318,6 +318,64 @@ func TestServingInstallationsCountUnresolvedOwnerAsUnobserved(t *testing.T) {
 	assert.Zero(t, server.count("octo/b"))
 }
 
+// Every pass resolves each owner afresh, so an App that was uninstalled and
+// reinstalled is probed under its new installation on the next pass rather
+// than under the retired one until the server restarts. The fresh answer also
+// replaces the cached installation webhook dispatch reads.
+func TestServingInstallationsFollowAReinstall(t *testing.T) {
+	ids := map[string]int64{"octo": 7}
+	var mu sync.Mutex
+	client, server := newInstallationLookupClient(t, func(owner, _ string) (int, int64, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		return http.StatusOK, ids[owner], owner
+	})
+
+	assert.Equal(t, quotaTargets{installations: []int64{7}}, client.servingInstallations(t.Context(), []string{"octo/a", "octo/b"}))
+	mu.Lock()
+	ids["octo"] = 8
+	mu.Unlock()
+	assert.Equal(t, quotaTargets{installations: []int64{8}}, client.servingInstallations(t.Context(), []string{"octo/a", "octo/b"}))
+
+	assert.Equal(t, 2, server.total(), "one lookup per owner per pass")
+	cached, ok := client.cachedOwnerInstallation("octo")
+	require.True(t, ok)
+	assert.Equal(t, int64(8), cached)
+}
+
+// An installation on an account other than the repository's owner answers only
+// the repository asked about, so the owner's other repositories are resolved
+// too and every installation serving them is read.
+func TestServingInstallationsResolveEachRepositoryWhenAnswerIsNotOwnerWide(t *testing.T) {
+	client, server := newInstallationLookupClient(t, func(owner, name string) (int, int64, string) {
+		if name == "a" {
+			return http.StatusOK, 5, "another-account"
+		}
+		return http.StatusOK, 7, owner
+	})
+
+	targets := client.servingInstallations(t.Context(), []string{"octo/a", "octo/b", "octo/c"})
+
+	assert.Equal(t, quotaTargets{installations: []int64{5, 7}}, targets)
+	assert.Equal(t, 1, server.count("octo/a"))
+	assert.Equal(t, 1, server.count("octo/b"))
+	assert.Zero(t, server.count("octo/c"), "the owner-wide answer stands for the rest")
+}
+
+// Once the pass's deadline has passed, no further lookups start, and every
+// owner not yet resolved counts as unobserved, so a slow GitHub fails the gate
+// closed instead of leaving owners out of it.
+func TestServingInstallationsCountOwnersLeftAfterTheDeadlineAsUnobserved(t *testing.T) {
+	client, server := newInstallationLookupClient(t, installedFor(map[string]int64{"octo": 7, "other": 9}))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	targets := client.servingInstallations(ctx, []string{"octo/a", "other/b"})
+
+	assert.Equal(t, quotaTargets{unresolved: 2}, targets)
+	assert.Zero(t, server.total())
+}
+
 // A configured repository the App is not installed on is served by no
 // installation, so it has no budget to observe and is not counted as
 // unobserved. The owner's other repositories are still tried, since an

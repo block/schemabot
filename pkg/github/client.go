@@ -492,9 +492,14 @@ func (c *Client) lookUpRepoInstallation(ctx context.Context, repo, owner, name s
 	if c.ownerInstallations == nil {
 		c.ownerInstallations = make(map[string]int64)
 	}
+	previous, cached := c.ownerInstallations[strings.ToLower(owner)]
 	c.ownerInstallations[strings.ToLower(owner)] = id
 	c.ownerInstallationsMu.Unlock()
-	c.logger.Info("resolved GitHub App installation for repository owner", "repo", repo, "owner", owner, "installation_id", id)
+	if cached && previous == id {
+		c.logger.Debug("GitHub App installation for repository owner is unchanged", "repo", repo, "owner", owner, "installation_id", id)
+	} else {
+		c.logger.Info("resolved GitHub App installation for repository owner", "repo", repo, "owner", owner, "installation_id", id, "previous_installation_id", previous)
+	}
 	return ownerInstallationLookup{repo: repo, id: id, ownerWide: true}, nil
 }
 

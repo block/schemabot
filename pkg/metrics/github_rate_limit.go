@@ -119,10 +119,17 @@ func (r *githubRateLimitRecorder) register(provider otelmetric.MeterProvider) er
 				observer.ObserveInt64(gauges["remaining"], sample.Remaining, opts)
 			}
 		}
+		// Two Apps report under one label while neither slug is known yet, so
+		// counts are summed per label: one observation per attribute set, and
+		// neither App's unobserved installations can hide the other's.
+		unobservedByApp := make(map[string]int64)
 		for _, targets := range r.probeTargets {
+			unobservedByApp[targets.githubApp] += r.unobservedInstallations(targets, now)
+		}
+		for githubApp, count := range unobservedByApp {
 			opts := otelmetric.WithAttributes(gitHubMetricAttributes(GitHubOperationRateLimitSnapshot,
-				GitHubRateLimitResourceCore, "", targets.githubApp, 0)...)
-			observer.ObserveInt64(unobserved, r.unobservedInstallations(targets, now), opts)
+				GitHubRateLimitResourceCore, "", githubApp, 0)...)
+			observer.ObserveInt64(unobserved, count, opts)
 		}
 		for _, diagnostic := range r.diagnostics {
 			opts := otelmetric.WithAttributes(diagnostic.attrs...)

@@ -337,8 +337,10 @@ recorded like any other request, as `operation="fetch_rate_limit"`. An idle
 server therefore keeps exporting its installations' budgets.
 
 The probe is responsible for the installations that serve the App's configured
-repositories, resolved through the same cached per-owner installation lookup
-webhook dispatch uses. An installation of the App on an account the server
+repositories. It resolves them on every pass with one installation lookup per
+repository owner (`GET /repos/{owner}/{repo}/installation` through the App
+JWT, which does not spend an installation's budget), so an App that is
+reinstalled is followed to its new installation within a pass. An installation of the App on an account the server
 serves no repository of is not read, so its untouched budget neither stands in
 for a serving installation running low nor fails a quota gate; it exports a
 snapshot only while it has traffic of its own. A server whose config lists no
@@ -362,7 +364,7 @@ without App credentials serves a disabled webhook endpoint and starts no probe,
 so a deployment that only runs schema changes and never talks to GitHub sends
 no probe requests and exports no snapshot. Every replica of a server with an App
 runs its own probe, so the reads scale with replicas: 20 replicas make 20
-budget reads per installation each minute.
+installation lookups per owner and 20 budget reads per installation each minute.
 None of those reads spends the core budget. Each replica exports the same budget
 under its own series, so query the snapshot with an aggregation across replicas
 (`min` for headroom), not a single series.

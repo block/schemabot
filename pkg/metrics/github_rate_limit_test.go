@@ -326,3 +326,16 @@ func TestGitHubQuotaProbeTargetsReplacedPerApp(t *testing.T) {
 	assert.Contains(t, body, `github_app="example-app"`)
 	assert.Contains(t, body, `github_app="other-app"`)
 }
+
+// Until their slugs are known, two Apps report under the same empty label. Their
+// counts are summed into the one series, so an App with nothing unobserved
+// cannot overwrite another App's unobserved installations.
+func TestGitHubQuotaUnobservedInstallationsSumAppsSharingALabel(t *testing.T) {
+	_, scrape := newQuotaRegistry(t)
+	SetGitHubQuotaProbeTargets(1, "", nil, 0)
+	SetGitHubQuotaProbeTargets(2, "", nil, 2)
+
+	lines := snapshotLines(scrape(), "schemabot_github_rate_limit_unobserved_installations")
+	require.Len(t, lines, 1)
+	assert.True(t, strings.HasSuffix(lines[0], " 2"), lines[0])
+}
