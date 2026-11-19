@@ -392,7 +392,8 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 // runAutoPlanForPR discovers schema configs for the PR and launches auto-plan
 // work. The returned message describes the dispatch outcome. The returned error
 // is non-nil only for discovery failures (typically transient GitHub API
-// errors), so durable callers can retry the delivery; request-path callers may
+// errors) and for a size refusal whose block could not be stored, so durable
+// callers can retry the delivery; request-path callers may
 // ignore it because the failure is logged and best-effort posted as a failing
 // check here (the post re-verifies the head SHA and can no-op during a GitHub
 // outage).
@@ -524,7 +525,11 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// budget. The refusal stores a block that only a later automatic plan of a
 	// head within the limits clears, so it runs before the clear below.
 	if size, databases := autoPlanSizeOf(files, configs); h.service.Config().AutoPlanLimits.Exceeded(size) {
-		h.refuseOversizedAutoPlan(ctx, client, repo, pr, installationID, headSHA, source, deliveryID, size, databases, shouldPostComment)
+		if err := h.refuseOversizedAutoPlan(ctx, client, repo, pr, installationID, headSHA, source, action, beforeSHA, deliveryID, size, databases); err != nil {
+			h.logger.Error("auto-plan size refusal failed to store its block; the delivery will retry",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+			return "auto-plan size refusal failed", fmt.Errorf("refuse oversized auto-plan for %s#%d: %w", repo, pr, err)
+		}
 		// The refusal posts no plan comment, so an earlier head's plan comment
 		// would otherwise stay expanded beside it, still offering to apply.
 		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)

@@ -377,6 +377,10 @@ type planFlowResult struct {
 	// "closed" before issuing the webhook request.
 	PRState atomic.Pointer[string]
 
+	// FailCheckRunCreate makes every check run POST fail, so tests can
+	// exercise the paths that must not report a block GitHub never received.
+	FailCheckRunCreate atomic.Bool
+
 	// FailCommentPost makes every comment POST fail, so tests can exercise the
 	// paths that must not record durable state describing a comment the
 	// operator never received.
@@ -1034,6 +1038,10 @@ func setupFakeGitHubForPlanInRepository(t *testing.T, mux *http.ServeMux, schema
 	// resolves its reuse/rewind decision from that list.
 	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		if result.FailCheckRunCreate.Load() {
+			http.Error(w, `{"message":"Validation Failed"}`, http.StatusUnprocessableEntity)
+			return
+		}
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body

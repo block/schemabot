@@ -4,10 +4,12 @@ package webhook
 
 import (
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +21,8 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/checkstate"
+	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // oversizedPRFixture is a pull request that changes one schema file in each of
@@ -27,6 +31,8 @@ import (
 type oversizedPRFixture struct {
 	svc      *api.Service
 	h        *Handler
+	client   *ghclient.InstallationClient
+	mux      *http.ServeMux
 	result   *planFlowResult
 	requests *githubRequestCounter
 }
@@ -61,9 +67,13 @@ func setupOversizedPR(t *testing.T, dbName string, otherDatabases []string, limi
 	}
 	result := setupFakeGitHubForPlanWithConfigs(t, mux, schemaFiles, configs, dbName, nil)
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	return &oversizedPRFixture{
 		svc:      svc,
-		h:        newE2EHandler(t, svc, client),
+		h:        NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
+		client:   installClient,
+		mux:      mux,
 		result:   result,
 		requests: requests,
 	}
@@ -115,6 +125,38 @@ func (f *oversizedPRFixture) waitForFailingAggregate(t *testing.T) checkRunCaptu
 	}
 }
 
+// autoPlan runs one automatic plan of the PR at headSHA directly, so the test
+// sees the error a durable delivery would retry on, then waits for the work it
+// started to finish.
+func (f *oversizedPRFixture) autoPlan(t *testing.T, action, beforeSHA, headSHA string) (string, error) {
+	t.Helper()
+	outcome, err := f.h.runAutoPlanForPR(t.Context(), f.client, "octocat/hello-world", 1, headSHA, 0,
+		"pull_request."+action, action, beforeSHA, "")
+	f.h.DrainInProcessWebhookWork(t.Context())
+	return outcome, err
+}
+
+// storedAggregate reads the PR's stored aggregate check state.
+func (f *oversizedPRFixture) storedAggregate(t *testing.T) *storage.Check {
+	t.Helper()
+	stored, err := f.svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	return stored
+}
+
+// postedComments drains the comments posted so far.
+func (f *oversizedPRFixture) postedComments() []string {
+	var comments []string
+	for {
+		select {
+		case body := <-f.result.comments:
+			comments = append(comments, body)
+		default:
+			return comments
+		}
+	}
+}
+
 // TestE2EAutoPlanRefusesPRLargerThanOneAutomaticPlan covers a PR that changes
 // schema in three databases on a deployment that plans at most two at once.
 // The automatic plan reads no schema file: it fails the aggregate check closed
@@ -159,6 +201,8 @@ func TestE2EAutoPlanRefusesPRLargerThanOneAutomaticPlan(t *testing.T) {
 	body = f.deliver(t, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e staging -d " + dbName, isPR: true}, nil))
 	assert.Contains(t, body, "This PR is too large to plan automatically, so SchemaBot will not apply it.")
 	assert.NotContains(t, body, "Schema Change Plan")
+	body = f.deliver(t, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply-confirm -e staging -d " + dbName, isPR: true}, nil))
+	assert.Contains(t, body, "This PR is too large to plan automatically, so SchemaBot will not apply it.", "a confirmation cannot run an apply the block refuses")
 
 	body = f.deliver(t, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -d " + dbName + " -e staging", isPR: true}, nil))
 	assert.Contains(t, body, "Schema Change Plan")
@@ -203,4 +247,101 @@ func TestE2EAutoPlanPlansPRAtTheLimit(t *testing.T) {
 	assert.Contains(t, body, "Schema Change Plan")
 	assert.NotContains(t, body, "too large to plan automatically")
 	assert.NotEmpty(t, f.schemaReads(t))
+}
+
+// TestE2EAutoPlanSizeRefusalRetriesWhenItsBlockIsNotStored covers a refusal
+// whose failing aggregate Check Run GitHub rejects. The block is not stored,
+// so the run returns an error a durable delivery retries on, and posts no
+// comment claiming a block that does not exist. The retry stores the block and
+// posts the comment.
+func TestE2EAutoPlanSizeRefusalRetriesWhenItsBlockIsNotStored(t *testing.T) {
+	dbName := "webhook_autoplan_size_retry"
+	f := setupOversizedPR(t, dbName, []string{"size_retry_ledger"}, api.AutoPlanLimitsConfig{MaxDatabases: 1})
+
+	f.result.FailCheckRunCreate.Store(true)
+	_, err := f.autoPlan(t, "opened", "", "abc123")
+	require.Error(t, err, "a refusal that stored no block is retried")
+	assert.Nil(t, f.storedAggregate(t), "no block is stored")
+	assert.Empty(t, f.postedComments(), "no comment claims a block that was not stored")
+
+	f.result.FailCheckRunCreate.Store(false)
+	_, err = f.autoPlan(t, "opened", "", "abc123")
+	require.NoError(t, err)
+	stored := f.storedAggregate(t)
+	require.NotNil(t, stored)
+	assert.Equal(t, checkstate.BlockAutoPlanSizeLimit, stored.BlockingReason)
+	assert.Equal(t, "abc123", stored.HeadSHA)
+	comments := f.postedComments()
+	require.Len(t, comments, 1)
+	assert.Contains(t, comments[0], "This PR is too large to plan automatically")
+}
+
+// TestE2EAutoPlanSizeRefusalDiscardedWhenHeadMoved covers a refusal computed
+// for a head the PR has already moved past. It stores no block and posts no
+// comment, since the push that moved the head plans the PR again.
+func TestE2EAutoPlanSizeRefusalDiscardedWhenHeadMoved(t *testing.T) {
+	dbName := "webhook_autoplan_size_stale"
+	f := setupOversizedPR(t, dbName, []string{"size_stale_ledger"}, api.AutoPlanLimitsConfig{MaxDatabases: 1})
+
+	newer := "newer456"
+	f.result.MovedHeadSHA.Store(&newer)
+	outcome, err := f.autoPlan(t, "opened", "", "abc123")
+	require.NoError(t, err)
+	assert.Equal(t, "auto-plan discarded because the PR moved during discovery", outcome)
+	assert.Nil(t, f.storedAggregate(t), "a stale head stores no block")
+	assert.Empty(t, f.postedComments(), "a stale head posts no comment")
+}
+
+// TestE2EAutoPlanSizeRefusalCommentsOncePerSchemaChange covers pushes to a PR
+// that stays over the limit. A push that changes no schema inputs keeps the
+// block on the new head without another comment. A push that changes a schema
+// file posts the comment again, as a plan comment would be.
+func TestE2EAutoPlanSizeRefusalCommentsOncePerSchemaChange(t *testing.T) {
+	dbName := "webhook_autoplan_size_repeat"
+	f := setupOversizedPR(t, dbName, []string{"size_repeat_ledger"}, api.AutoPlanLimitsConfig{MaxDatabases: 1})
+
+	_, err := f.autoPlan(t, "opened", "", "abc123")
+	require.NoError(t, err)
+	require.Len(t, f.postedComments(), 1)
+
+	readmeHead := "readme789"
+	f.result.MovedHeadSHA.Store(&readmeHead)
+	registerFreshBaseComparison(t, f.mux, readmeHead)
+	registerCompareFiles(t, f.mux, "abc123", readmeHead, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}})
+	_, err = f.autoPlan(t, "synchronize", "abc123", readmeHead)
+	require.NoError(t, err)
+	assert.Empty(t, f.postedComments(), "a push that changes no schema inputs posts no second comment")
+	stored := f.storedAggregate(t)
+	require.NotNil(t, stored)
+	assert.Equal(t, checkstate.BlockAutoPlanSizeLimit, stored.BlockingReason)
+	assert.Equal(t, readmeHead, stored.HeadSHA, "the block moves to the new head")
+
+	schemaHead := "schema012"
+	f.result.MovedHeadSHA.Store(&schemaHead)
+	registerFreshBaseComparison(t, f.mux, schemaHead)
+	registerCompareFiles(t, f.mux, readmeHead, schemaHead, []*gh.CommitFile{{Filename: new(schemaFixturePath(dbName, dbName+"/users.sql")), Status: new("modified")}})
+	_, err = f.autoPlan(t, "synchronize", readmeHead, schemaHead)
+	require.NoError(t, err)
+	comments := f.postedComments()
+	require.Len(t, comments, 1, "a push that changes a schema file posts the comment again")
+	assert.Contains(t, comments[0], "This PR is too large to plan automatically")
+}
+
+// TestE2EAutoPlanSizeRefusalWithChecksDisabled covers a repository whose
+// status checks are disabled. Nothing gates its merge, so the refusal stores
+// no block and its comment asks for the split without claiming a blocked
+// check or a refused apply.
+func TestE2EAutoPlanSizeRefusalWithChecksDisabled(t *testing.T) {
+	dbName := "webhook_autoplan_size_nochecks"
+	f := setupOversizedPR(t, dbName, []string{"size_nochecks_ledger"}, api.AutoPlanLimitsConfig{MaxDatabases: 1})
+	disabled := false
+	f.svc.Config().Repos = map[string]api.RepoConfig{"octocat/hello-world": {EnableChecks: &disabled}}
+
+	_, err := f.autoPlan(t, "opened", "", "abc123")
+	require.NoError(t, err)
+	comments := f.postedComments()
+	require.Len(t, comments, 1)
+	assert.Contains(t, comments[0], "**What to do next:** split this PR into smaller PRs.\n")
+	assert.NotContains(t, comments[0], "check stays blocked")
+	assert.Nil(t, f.storedAggregate(t), "no block is stored where nothing gates merge")
 }

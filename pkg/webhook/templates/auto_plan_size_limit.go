@@ -28,6 +28,10 @@ type AutoPlanSizeLimitData struct {
 	// TooManyDatabases reports which limit the PR is over: the database limit
 	// when true, otherwise the schema file limit.
 	TooManyDatabases bool
+	// GatesMerge reports whether SchemaBot blocks the PR's merge and its
+	// applies until it is split. It is false on a repository with status
+	// checks disabled, where nothing SchemaBot stores gates either.
+	GatesMerge bool
 	// Tenant is the deployment's tenant, appended to the command hint so it
 	// reaches this deployment.
 	Tenant string
@@ -41,7 +45,11 @@ func RenderAutoPlanSizeLimit(data AutoPlanSizeLimitData) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "## %s This PR is too large to plan automatically\n\n", glyph.Attention)
 	sb.WriteString(AutoPlanSizeLimitReason(data) + "\n\n")
-	sb.WriteString("**What to do next:** split this PR into smaller PRs. Until then its SchemaBot check stays blocked and `schemabot apply` is refused.\n\n")
+	if data.GatesMerge {
+		sb.WriteString("**What to do next:** split this PR into smaller PRs. Until then its SchemaBot check stays blocked and `schemabot apply` is refused.\n\n")
+	} else {
+		sb.WriteString("**What to do next:** split this PR into smaller PRs.\n\n")
+	}
 	if len(data.Databases) > 0 {
 		sb.WriteString("To see one database's plan now, comment:\n\n")
 		command := appendTenantFlag("schemabot plan -d "+flattenIdentifier(data.Databases[0]), data.Tenant)
@@ -89,6 +97,7 @@ func PreviewAutoPlanSizeLimitDatabases() string {
 		MaxDatabases:     10,
 		MaxSchemaFiles:   100,
 		TooManyDatabases: true,
+		GatesMerge:       true,
 	})
 }
 
@@ -101,5 +110,6 @@ func PreviewAutoPlanSizeLimitSchemaFiles() string {
 		SchemaFiles:    240,
 		MaxDatabases:   10,
 		MaxSchemaFiles: 100,
+		GatesMerge:     true,
 	})
 }
