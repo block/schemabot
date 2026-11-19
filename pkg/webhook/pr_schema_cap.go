@@ -164,11 +164,11 @@ func (h *Handler) evaluatePRSchemaCap(ctx context.Context, client *ghclient.Inst
 	admission := prSchemaAdmission{client: client}
 	aboveLimit := len(databases) > policy.Limit
 	var notice string
+	var verificationErr error
 	if info.IsOpen() && info.HasLabel(policy.Label) {
-		var err error
-		admission.exception, err = h.evaluatePRSchemaLabel(ctx, client, repo, pr, info, policy.Label)
-		if err != nil {
-			h.logger.Warn("could not verify the PR schema limit exception", "repo", repo, "pr", pr, "error", err)
+		admission.exception, verificationErr = h.evaluatePRSchemaLabel(ctx, client, repo, pr, info, policy.Label)
+		if verificationErr != nil {
+			h.logger.Warn("could not verify the PR schema limit exception", "repo", repo, "pr", pr, "error", verificationErr)
 			notice = "SchemaBot could not verify the exception with GitHub. Retry the check."
 		}
 	}
@@ -188,6 +188,9 @@ func (h *Handler) evaluatePRSchemaCap(ctx context.Context, client *ghclient.Inst
 		if err := h.publishPRSchemaHold(ctx, client, repo, pr, info, policy, databases, notice); err != nil {
 			return prSchemaAdmission{}, fmt.Errorf("publish database limit hold: %w", err)
 		}
+	}
+	if verificationErr != nil {
+		return prSchemaAdmission{}, fmt.Errorf("verify database limit exception for %s#%d: %w", repo, pr, verificationErr)
 	}
 	return prSchemaAdmission{}, errPRSchemaCapHeld
 }

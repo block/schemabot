@@ -259,6 +259,39 @@ func TestPRSchemaCapApplyRefusalReleasesOnlyAutomaticIntent(t *testing.T) {
 	}
 }
 
+func TestPRSchemaCapRetriesLabelVerification(t *testing.T) {
+	f := newSchemaCapTestFixture(t, 2, 2, api.PRSchemaCapConfig{Limit: 1, Label: schemaCapTestLabel}, &flakyPlanTernClient{})
+	f.labels.Store(true)
+	now := time.Now().UTC().Truncate(time.Second)
+	var unavailable atomic.Bool
+	f.mux.HandleFunc("GET /repos/"+schemaCapTestRepo+"/issues/1/timeline", func(w http.ResponseWriter, _ *http.Request) {
+		if unavailable.Load() {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `[{"id":13,"event":"labeled","label":{"name":%q},"actor":{"login":"alice"},"created_at":%q}]`, schemaCapTestLabel, now.Format(time.RFC3339))
+	})
+	ctx := t.Context()
+	info, err := f.client.FetchPullRequest(ctx, schemaCapTestRepo, 1)
+	require.NoError(t, err)
+	adopted, err := f.recordPRSchemaLabel(ctx, f.client, schemaCapTestRepo, 1, info, schemaCapTestLabel, schemaCapLabelPayload(now), now)
+	require.NoError(t, err)
+	require.True(t, adopted)
+
+	run := func() (string, error) {
+		return f.runAutoPlanForPR(ctx, f.client, schemaCapTestRepo, 1, "head", 42, "pull_request", "opened", "", "same-delivery")
+	}
+	unavailable.Store(true)
+	_, err = run()
+	require.ErrorContains(t, err, "503")
+	require.NotErrorIs(t, err, errPRSchemaCapHeld)
+	require.False(t, autoPlanFailureIsPermanent(err))
+	unavailable.Store(false)
+	message, err := run()
+	require.NoError(t, err)
+	require.Equal(t, "auto-plan started", message)
+}
+
 // Removing the exception after the first Plan RPC prevents its transient retry.
 func TestPRSchemaCapStopsRetryAfterLabelRemoval(t *testing.T) {
 	planner := &revokingSchemaCapPlanner{}
