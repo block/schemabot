@@ -159,6 +159,25 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 		"stop closes the output:\n%s", out)
 }
 
+// A table copying on one target and complete on the other three carries its
+// planned size, summed across them, on its rows line beside the percent at a
+// single target's precision, the way the PR comment renders it. A completed
+// target counts in full even when its engine's row estimate ran ahead of the
+// rows it copied.
+func TestWriteProgress_TargetRollupRowsCarryTheTableSize(t *testing.T) {
+	sized := func(target rolloutTarget) rolloutTarget {
+		target.estimatedBytes = new(int64(1_000_000_000))
+		return target
+	}
+	completed := completedTarget()
+	completed.rowsCopied = 990
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{sized(copyingTarget(420)), sized(completed), sized(completed), sized(completed)}))
+
+	total := int64(4_000_000_000)
+	assert.Contains(t, out, "orders: "+ui.ProgressBarRowCopy(85)+" 85.50%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 3,420 / 4,000"+ui.FormatTableSizeClause(&total)+" · ETA: 2m 0s\n", "%s", out)
+}
+
 // A rollout no target has reported progress for yet has no table block to
 // list its targets under, so it counts them instead, the way the PR comment
 // says no details are available yet.
