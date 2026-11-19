@@ -467,6 +467,16 @@ already-completed, already-gated apply. A repository SchemaBot does not manage,
 or one with check publishing disabled, gets no merge-group check because its
 check is not required there.
 
+A `checks_requested` delivery lost during a GitHub or SchemaBot outage leaves
+its merge group without the check, and the queue stalls behind it.
+[`checks backfill`](#backfilling-missing-check-runs) reads the merge queue of
+each repository it sweeps and posts the same passing check on every merge
+group missing one. Before it posts, the server lists the queue again and
+posts only on heads the queue still holds, and it skips the repositories this
+webhook would skip. If the queue cannot be listed, it posts nothing (MG-1).
+Listing the queue reads branches, which the App's Contents read permission
+already grants.
+
 ### Auto-Plan
 
 A PR is synchronized when GitHub sends a `pull_request` webhook with action
@@ -788,6 +798,12 @@ prints the `--plan --pr` command that plans them. The server also re-reads
 the GitHub budget before each PR and stops the batch below
 `--rate-limit-floor`; the CLI resends the PRs it did not start after the
 budget resets.
+
+A sweep of a repository also reads its merge queue and posts the passing
+check on each merge group missing one, before it recreates any PR's check,
+because a blocked group holds every PR queued behind it. See
+[Merge Queue Events](#merge-queue-events). A scan of named PRs leaves the
+merge queue out.
 
 Each reported run carries the stored check state behind it, classified the
 same way [`checks show`](#explaining-a-blocked-check) classifies it: the

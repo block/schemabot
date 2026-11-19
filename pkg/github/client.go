@@ -17,6 +17,7 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1073,6 +1074,65 @@ func (ic *InstallationClient) FetchOpenPullRequest(ctx context.Context, repo str
 		return OpenPullRequest{}, false, fmt.Errorf("get pull request %s#%d: %w", repo, number, err)
 	}
 	return openPullRequestFrom(ghPR), ghPR.GetState() == "open", nil
+}
+
+// mergeQueueRefPrefix is the branch namespace GitHub's merge queue creates a
+// temporary branch in for each merge group: gh-readonly-queue/<base>/pr-<n>-<sha>.
+const mergeQueueRefPrefix = "heads/gh-readonly-queue/"
+
+// MergeQueueHead is one merge group GitHub's merge queue is testing: the
+// temporary branch it created and the commit required checks must pass on.
+type MergeQueueHead struct {
+	// Ref is the branch name without the refs/heads/ prefix.
+	Ref string
+	// BaseRef is the branch the merge group lands on.
+	BaseRef string
+	// PR is the pull request whose entry created this merge group; 0 when the
+	// branch name does not carry one.
+	PR      int
+	HeadSHA string
+}
+
+// ListMergeQueueHeads lists the merge groups a repository's merge queues are
+// testing right now, across every base branch. GitHub deletes a merge group's
+// branch once the group merges or leaves the queue, so every head returned is
+// a commit the queue is still waiting on. GitHub returns every matching branch
+// in one response, so this is one request however long the queues are.
+func (ic *InstallationClient) ListMergeQueueHeads(ctx context.Context, repo string) ([]MergeQueueHead, error) {
+	owner, repoName := splitRepo(repo)
+	refs, err := retryGitHubUnavailableRead(ctx, ic, metrics.GitHubOperationUnknown, "list merge queue refs", []any{"repo", repo}, func(ctx context.Context) ([]*gh.Reference, error) {
+		listed, _, listErr := ic.client.Git.ListMatchingRefs(ctx, owner, repoName, mergeQueueRefPrefix)
+		if listErr != nil {
+			return nil, classifyGitHubAPIError(listErr)
+		}
+		return listed, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list merge queue refs for %s: %w", repo, err)
+	}
+	heads := make([]MergeQueueHead, 0, len(refs))
+	for _, ref := range refs {
+		heads = append(heads, mergeQueueHeadFrom(strings.TrimPrefix(ref.GetRef(), "refs/"), ref.GetObject().GetSHA()))
+	}
+	return heads, nil
+}
+
+// mergeQueueHeadFrom reads the base branch and PR number out of a merge group
+// branch name, heads/gh-readonly-queue/<base>/pr-<n>-<sha>. The base can itself
+// contain slashes, so the PR segment is found from the end.
+func mergeQueueHeadFrom(ref, sha string) MergeQueueHead {
+	head := MergeQueueHead{Ref: strings.TrimPrefix(ref, "heads/"), HeadSHA: sha}
+	rest := strings.TrimPrefix(ref, mergeQueueRefPrefix)
+	cut := strings.LastIndex(rest, "/pr-")
+	if cut < 0 {
+		return head
+	}
+	head.BaseRef = rest[:cut]
+	number, _, _ := strings.Cut(rest[cut+len("/pr-"):], "-")
+	if pr, err := strconv.Atoi(number); err == nil {
+		head.PR = pr
+	}
+	return head
 }
 
 func openPullRequestFrom(pr *pullRequestWithStack) OpenPullRequest {

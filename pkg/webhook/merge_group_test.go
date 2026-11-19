@@ -293,3 +293,67 @@ func TestWebhookMergeGroupLeaderStillPosts(t *testing.T) {
 		t.Fatal("timed out waiting for the leader's merge_group check run")
 	}
 }
+
+// A checks backfill posts the same passing check on a merge group head that
+// the merge_group webhook would have, so a queue entry whose delivery was lost
+// stops blocking the PRs behind it.
+func TestBackfillMergeQueueCheckPostsPassingChecks(t *testing.T) {
+	h, created := mergeGroupTestHandler(t,
+		[]string{"staging", "production"},
+		map[string]api.RepoConfig{"octocat/hello-world": {}},
+	)
+
+	outcome, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412")
+	require.NoError(t, err)
+	assert.Equal(t, "posted passing merge queue check", outcome)
+
+	got := map[string]checkRunCapture{}
+	for range []int{0, 1} {
+		select {
+		case c := <-created:
+			got[c.Name] = c
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for the backfilled merge queue check run")
+		}
+	}
+	for _, name := range []string{"SchemaBot (staging)", "SchemaBot (production)"} {
+		c, ok := got[name]
+		require.True(t, ok, "expected a check run named %q", name)
+		assert.Equal(t, "group-412", c.HeadSHA)
+		assert.Equal(t, "completed", c.Status)
+		assert.Equal(t, "success", c.Conclusion)
+	}
+}
+
+// A backfill skips a merge group for the same reasons the merge_group webhook
+// does: an unregistered repository, or an aggregate participant whose leader
+// posts the required check. Neither posts anything.
+func TestBackfillMergeQueueCheckSkipsWhereTheWebhookWould(t *testing.T) {
+	for name, tc := range map[string]struct {
+		repos map[string]api.RepoConfig
+		want  string
+	}{
+		"unregistered repository": {
+			repos: map[string]api.RepoConfig{"octocat/other-repo": {}},
+			want:  mergeGroupSkipUnregistered,
+		},
+		"aggregate participant": {
+			repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}}},
+			want:  mergeGroupSkipParticipant,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, created := mergeGroupTestHandler(t, []string{"production"}, tc.repos)
+
+			outcome, err := h.BackfillMergeQueueCheck(t.Context(), "octocat/hello-world", 12345, "group-412")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, outcome)
+
+			select {
+			case c := <-created:
+				t.Fatalf("backfill posted a merge queue check run it should have skipped: %q", c.Name)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}

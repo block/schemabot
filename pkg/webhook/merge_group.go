@@ -225,26 +225,10 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return false, err
 	}
 
-	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
-		h.logger.Warn("durable merge_group delivery from unregistered repository",
-			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
-		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "merge_group", payload.Action)
-		return false, nil
-	}
-
-	if h.isAggregateParticipant(repo) {
-		h.logger.Info("durable merge_group delivery skipped: aggregate participant stays silent; the leader posts the required checks",
-			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA, "installation_id", installationID)
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:  "merge_group_check",
-			Repository: repo,
-			Status:     "skipped",
-		})
-		return false, nil
-	}
-
-	if !h.shouldRunPassingAggregateChecks(ctx, repo, "merge_group_check") {
-		// shouldRunPassingAggregateChecks logs and records the skip.
+	if skip := h.mergeGroupCheckSkipReason(ctx, repo, "delivery_id", event.DeliveryID, "head_sha", headSHA, "installation_id", installationID); skip != "" {
+		if skip == mergeGroupSkipUnregistered {
+			metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "merge_group", payload.Action)
+		}
 		return false, nil
 	}
 
@@ -277,6 +261,72 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 	h.logger.Info("durable merge_group checks posted",
 		"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
 	return false, nil
+}
+
+// Reasons this instance posts no merge-queue check for a repository.
+const (
+	mergeGroupSkipUnregistered = "skipped: repository is not registered"
+	mergeGroupSkipParticipant  = "skipped: aggregate participant; the leader posts the required checks"
+	mergeGroupSkipDisabled     = "skipped: Check Run publishing is disabled"
+)
+
+// mergeGroupCheckSkipReason reports why this instance posts no merge-queue
+// check for repo, or "" when it posts one. Each reason means SchemaBot's check
+// is not required on the merge group, so posting nothing cannot wedge the
+// queue. attrs identify the caller's work in the logs.
+func (h *Handler) mergeGroupCheckSkipReason(ctx context.Context, repo string, attrs ...any) string {
+	logAttrs := append([]any{"repo", repo}, attrs...)
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("merge_group check skipped: repository is not registered", logAttrs...)
+		return mergeGroupSkipUnregistered
+	}
+	if h.isAggregateParticipant(repo) {
+		h.logger.Info("merge_group check skipped: aggregate participant stays silent; the leader posts the required checks", logAttrs...)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "merge_group_check",
+			Repository: repo,
+			Status:     "skipped",
+		})
+		return mergeGroupSkipParticipant
+	}
+	// shouldRunPassingAggregateChecks logs and records its own skip.
+	if !h.shouldRunPassingAggregateChecks(ctx, repo, "merge_group_check") {
+		return mergeGroupSkipDisabled
+	}
+	return ""
+}
+
+// BackfillMergeQueueCheck posts the passing merge-queue check on headSHA, as
+// the merge_group delivery for that merge group would have. The caller must
+// have verified that headSHA is a merge group the queue is still testing:
+// the check passes unconditionally, which is right only for a commit the
+// queue built from PRs whose own checks already passed.
+func (h *Handler) BackfillMergeQueueCheck(ctx context.Context, repo string, installationID int64, headSHA string) (string, error) {
+	repo = storage.CanonicalKey(repo)
+	if skip := h.mergeGroupCheckSkipReason(ctx, repo, "head_sha", headSHA, "installation_id", installationID, "source", "checks.backfill"); skip != "" {
+		return skip, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		return "", fmt.Errorf("create GitHub client for merge queue check %s@%s: %w", repo, headSHA, err)
+	}
+	if err := h.postPassingAggregateChecks(ctx, client, repo, headSHA, mergeGroupCheckContent()); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "merge_group_check",
+			Repository: repo,
+			Status:     "error",
+		})
+		return "", fmt.Errorf("post merge queue checks for %s@%s: %w", repo, headSHA, err)
+	}
+	if h.isRepoListenOnly(repo) {
+		h.logger.Info("merge queue check backfill posted nothing because the repository is listen-only",
+			"repo", repo, "head_sha", headSHA)
+		return "skipped: listen-only repository", nil
+	}
+	h.logger.Info("merge queue check backfilled", "repo", repo, "head_sha", headSHA, "installation_id", installationID)
+	return "posted passing merge queue check", nil
 }
 
 // passingAggregateCheckContent carries the operation name and Check Run output

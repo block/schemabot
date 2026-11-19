@@ -806,3 +806,60 @@ func writeGitHubSecondaryRateLimitError(t *testing.T, w http.ResponseWriter, sta
 		DocumentationURL: "https://docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api#about-secondary-rate-limits",
 	}))
 }
+
+// The merge queue is read in one request for every base branch, and each
+// group's base branch and PR come from its branch name, including a base
+// branch whose own name contains slashes.
+func TestListMergeQueueHeadsReadsEveryMergeGroup(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	requests := 0
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/matching-refs/heads/gh-readonly-queue/", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.Reference{
+			{Ref: new("refs/heads/gh-readonly-queue/main/pr-412-0a1b2c3d"), Object: &gh.GitObject{SHA: new("group-412")}},
+			{Ref: new("refs/heads/gh-readonly-queue/release/2026-11/pr-418-4e5f6a7b"), Object: &gh.GitObject{SHA: new("group-418")}},
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	heads, err := ic.ListMergeQueueHeads(t.Context(), "octocat/hello-world")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests)
+	assert.Equal(t, []MergeQueueHead{
+		{Ref: "gh-readonly-queue/main/pr-412-0a1b2c3d", BaseRef: "main", PR: 412, HeadSHA: "group-412"},
+		{Ref: "gh-readonly-queue/release/2026-11/pr-418-4e5f6a7b", BaseRef: "release/2026-11", PR: 418, HeadSHA: "group-418"},
+	}, heads)
+}
+
+// A merge group branch whose name does not follow the pr-<n>-<sha> shape is
+// still a head the queue is testing; only the base branch and PR are unknown.
+func TestMergeQueueHeadFromUnexpectedBranchName(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, MergeQueueHead{Ref: "gh-readonly-queue/main/group-7", HeadSHA: "sha7"},
+		mergeQueueHeadFrom("heads/gh-readonly-queue/main/group-7", "sha7"))
+	assert.Equal(t, MergeQueueHead{Ref: "gh-readonly-queue/main/pr-x-1a2b", BaseRef: "main", HeadSHA: "sha8"},
+		mergeQueueHeadFrom("heads/gh-readonly-queue/main/pr-x-1a2b", "sha8"))
+}
+
+// A failed listing is an error, never an empty queue, so a caller cannot
+// mistake a GitHub failure for a queue with nothing blocked in it.
+func TestListMergeQueueHeadsReturnsListingFailure(t *testing.T) {
+	t.Parallel()
+
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/matching-refs/heads/gh-readonly-queue/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		require.NoError(t, json.NewEncoder(w).Encode(gh.ErrorResponse{Message: "Resource not accessible by integration"}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	heads, err := ic.ListMergeQueueHeads(t.Context(), "octocat/hello-world")
+
+	require.Error(t, err)
+	assert.Nil(t, heads)
+	assert.Contains(t, err.Error(), "list merge queue refs for octocat/hello-world")
+}

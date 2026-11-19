@@ -286,6 +286,11 @@ type ChecksScanRequest struct {
 	// named PR that is not open is left out. Page and UpdatedSince must be
 	// unset alongside it.
 	PRs []int `json:"prs,omitempty"`
+	// MergeQueue also scans the merge groups the repository's merge queues
+	// are testing, on the first page only. A merge group missing SchemaBot's
+	// required check blocks every PR queued behind it. It cannot be set
+	// alongside PRs.
+	MergeQueue bool `json:"merge_queue,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -331,6 +336,11 @@ type ChecksScanResponse struct {
 	// the live webhook path that shares the same budget. Nil when the rate
 	// state could not be read (advisory only; the scan itself succeeded).
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+	// MergeQueueScanned counts the merge groups this page read, when the
+	// request set MergeQueue.
+	MergeQueueScanned int `json:"merge_queue_scanned,omitempty"`
+	// MergeQueue lists the merge groups missing an expected SchemaBot check.
+	MergeQueue []MissingMergeQueueCheck `json:"merge_queue,omitempty"`
 	// Supports names the backfill behaviors this server implements. A server
 	// that predates one ignores the request field that asks for it, so the
 	// CLI checks this before relying on a behavior rather than finding out
@@ -348,6 +358,26 @@ type ChecksBackfillSupport struct {
 	// that changes managed schema before writing any Check Run or check state,
 	// and checks rate_limit_floor_percent before every PR it starts.
 	DeferSchemaPRs bool `json:"defer_schema_prs,omitempty"`
+	// MergeQueue means a scan request with merge_queue reports the merge
+	// groups missing a check, and a synthesize request with
+	// merge_queue_heads posts their passing checks.
+	MergeQueue bool `json:"merge_queue,omitempty"`
+}
+
+// MissingMergeQueueCheck is a merge group the merge queue is testing whose
+// head commit lacks an expected SchemaBot check.
+type MissingMergeQueueCheck struct {
+	// Ref is the merge group's temporary branch.
+	Ref     string `json:"ref"`
+	BaseRef string `json:"base_ref"`
+	// PR is the pull request whose queue entry built this merge group, and URL
+	// its address; both are empty when the branch name does not carry it.
+	PR           int      `json:"pr,omitempty"`
+	URL          string   `json:"url,omitempty"`
+	HeadSHA      string   `json:"head_sha"`
+	MissingNames []string `json:"missing_check_names"`
+	// UntrustedConflictNames mirrors MissingCheckPR.UntrustedConflictNames.
+	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
 }
 
 // GitHubRateLimit is a point-in-time snapshot of a GitHub installation's
@@ -387,11 +417,18 @@ type ChecksSynthesizeRequest struct {
 	// budget left is below this percentage of its limit. The PRs not started
 	// come back with RateLimited set. Zero turns the check off.
 	RateLimitFloorPercent int `json:"rate_limit_floor_percent,omitempty"`
+	// MergeQueueHeads are merge group head commits to post SchemaBot's
+	// passing merge-queue check on. The server lists the merge queue again
+	// and posts only on heads it is still testing, so a commit that is not a
+	// live merge group never gets a passing check. They are handled before
+	// PRs, since each one blocks the PRs queued behind it.
+	MergeQueueHeads []string `json:"merge_queue_heads,omitempty"`
 }
 
 type ChecksSynthesizeResponse struct {
-	Repo    string                   `json:"repo"`
-	Results []ChecksSynthesizeResult `json:"results"`
+	Repo       string                   `json:"repo"`
+	Results    []ChecksSynthesizeResult `json:"results"`
+	MergeQueue []ChecksMergeQueueResult `json:"merge_queue,omitempty"`
 	// RateLimit mirrors ChecksScanResponse.RateLimit: the installation's
 	// remaining GitHub budget after this batch, for caller-side pacing.
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
@@ -411,6 +448,16 @@ type ChecksSynthesizeResult struct {
 	ChangedFiles int `json:"changed_files,omitempty"`
 	// RateLimited is true when the batch stopped before this PR because the
 	// GitHub budget fell below the request's floor. Nothing was done for it.
+	RateLimited bool `json:"rate_limited,omitempty"`
+}
+
+// ChecksMergeQueueResult is what a synthesize request did for one merge
+// group head.
+type ChecksMergeQueueResult struct {
+	HeadSHA string `json:"head_sha"`
+	Outcome string `json:"outcome"`
+	Error   string `json:"error,omitempty"`
+	// RateLimited mirrors ChecksSynthesizeResult.RateLimited.
 	RateLimited bool `json:"rate_limited,omitempty"`
 }
 
