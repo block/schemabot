@@ -478,6 +478,39 @@ func (h *Handler) recordPlanFailuresAndFold(ctx context.Context, client *ghclien
 	}
 }
 
+// findPlanConfig resolves the config a plan of databaseName acts on. An
+// auto-plan hands down the configs its discovery read, and the plan selects
+// from them when the head this plan reads is the commit discovery read them
+// at, so planning N databases reads each config once rather than N times. When
+// the head has moved, and for every command, the plan discovers the config
+// again at its own head.
+func (h *Handler) findPlanConfig(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, databaseName string, discovered *autoPlanDiscovery) (*ghclient.SchemabotConfig, string, error) {
+	if discovered == nil {
+		return client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+	}
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch PR %s#%d to resolve the config of %s: %w", repo, pr, databaseName, err)
+	}
+	if prInfo.HeadSHA != discovered.headSHA {
+		h.logger.Info("PR head moved after auto-plan discovery; discovering the config again at the head this plan reads",
+			"repo", repo, "pr", pr, "database", databaseName,
+			"discovered_head_sha", discovered.headSHA, "head_sha", prInfo.HeadSHA)
+		return client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+	}
+	config, configDir, ok, err := ghclient.SelectConfigByDatabaseName(databaseName, discovered.configs)
+	if err != nil {
+		return nil, "", fmt.Errorf("select the config of %s from auto-plan discovery of %s#%d at %s: %w", databaseName, repo, pr, prInfo.HeadSHA, err)
+	}
+	if !ok {
+		h.logger.Warn("auto-plan discovery holds no config for the database it dispatched; discovering the config again",
+			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", databaseName,
+			"discovered_configs", len(discovered.configs))
+		return client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+	}
+	return config, configDir, nil
+}
+
 // planForResolvedDatabaseBlocked enforces actor authorization once a
 // user-issued plan has resolved which database it targets. A plan reads the
 // database's live schema, so it requires the same configured principals as
@@ -531,7 +564,7 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // only an auto-plan reads it. unmanagedSchema lists the schema configs the PR
 // also changes that this environment-scoped deployment does not manage; the
 // comment names them, and posts even when it has no plan to show.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData) {
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData, discovered *autoPlanDiscovery) {
 	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -578,9 +611,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	}
 
 	// Find config to get the database identity. Environments are server-owned.
+	// Every environment's schema request below is built from this one config,
+	// read at the head commit the PR-info cache on ctx pins for this plan.
 	var schemaDatabase string
+	var planConfig *ghclient.SchemabotConfig
+	var planConfigDir string
 	if databaseName != "" {
-		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+		config, configDir, findErr := h.findPlanConfig(ctx, client, repo, pr, databaseName, discovered)
 		if findErr != nil {
 			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
@@ -603,8 +640,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			return
 		}
 		schemaDatabase = config.Database
+		planConfig, planConfigDir = config, configDir
 	} else {
-		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Plan)
+		config, configDir, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Plan)
 		if findErr != nil {
 			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
@@ -618,6 +656,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			return
 		}
 		schemaDatabase = config.Database
+		planConfig, planConfigDir = config, configDir
 	}
 	// A user-issued plan reads the resolved database's live schema, so it
 	// requires that database's configured principals. Auto-plans are
@@ -743,7 +782,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// their base-schema freshness is checked together once every one has planned.
 	plannedSchemas := map[string]*ghclient.SchemaRequestResult{}
 	for _, env := range environments {
-		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
+		schemaResult, err := h.createManagedSchemaRequestForConfig(ctx, client, repo, pr, env, databaseName, planConfig, planConfigDir, action.Plan)
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			planFailed(env, err)

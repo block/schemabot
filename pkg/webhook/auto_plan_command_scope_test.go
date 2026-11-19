@@ -75,7 +75,7 @@ func discoveredAt(dir, database string) ghclient.DiscoveredConfig {
 // bare command chosen from it can reach a database the comment is not about.
 // What auto-plan already discovered answers for the files it kept, so only the
 // files narrowing set aside are read from GitHub again.
-func TestAutoPlanCommandScopeDatabases(t *testing.T) {
+func TestAutoPlanCommandScope(t *testing.T) {
 	h := &Handler{logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))}
 
 	twoConfigs := map[string]string{
@@ -88,7 +88,7 @@ func TestAutoPlanCommandScopeDatabases(t *testing.T) {
 		// Every read fails, so any count of one came from discovery alone.
 		client := scopeFixtureClient(t, twoConfigs, true)
 		files := changedFiles("schema/orders/users.sql", "schema/orders/items.sql")
-		count := h.autoPlanCommandScopeDatabases(t.Context(), client, "octocat/hello-world", 1, "abc123", files, files, orders)
+		count, _ := h.autoPlanCommandScope(t.Context(), client, "octocat/hello-world", 1, "abc123", files, files, orders)
 		assert.Equal(t, 1, count)
 	})
 
@@ -96,7 +96,7 @@ func TestAutoPlanCommandScopeDatabases(t *testing.T) {
 		// The command path discovers over the raw changed files, so a file
 		// auto-plan drops as inherited is still one the pasted command sees.
 		client := scopeFixtureClient(t, twoConfigs, false)
-		count := h.autoPlanCommandScopeDatabases(t.Context(), client, "octocat/hello-world", 1, "abc123",
+		count, _ := h.autoPlanCommandScope(t.Context(), client, "octocat/hello-world", 1, "abc123",
 			changedFiles("schema/orders/users.sql", "schema/billing/invoices.sql"),
 			changedFiles("schema/orders/users.sql"), orders)
 		assert.Equal(t, 2, count, "two databases in the raw file list make a bare command ambiguous")
@@ -104,7 +104,7 @@ func TestAutoPlanCommandScopeDatabases(t *testing.T) {
 
 	t.Run("an inherited file under the discovered database counts once", func(t *testing.T) {
 		client := scopeFixtureClient(t, twoConfigs, false)
-		count := h.autoPlanCommandScopeDatabases(t.Context(), client, "octocat/hello-world", 1, "abc123",
+		count, _ := h.autoPlanCommandScope(t.Context(), client, "octocat/hello-world", 1, "abc123",
 			changedFiles("schema/orders/users.sql", "schema/orders/items.sql"),
 			changedFiles("schema/orders/users.sql"), orders)
 		assert.Equal(t, 1, count)
@@ -118,7 +118,7 @@ func TestAutoPlanCommandScopeDatabases(t *testing.T) {
 		renamed := ghclient.PRFile{Filename: "schema/orders/users.sql", PreviousFilename: "schema/billing/users.sql", Status: "renamed"}
 		kept := renamed
 		kept.PreviousFilename = ""
-		count := h.autoPlanCommandScopeDatabases(t.Context(), client, "octocat/hello-world", 1, "abc123",
+		count, _ := h.autoPlanCommandScope(t.Context(), client, "octocat/hello-world", 1, "abc123",
 			[]ghclient.PRFile{renamed}, []ghclient.PRFile{kept}, orders)
 		assert.Equal(t, 2, count)
 	})
@@ -126,14 +126,14 @@ func TestAutoPlanCommandScopeDatabases(t *testing.T) {
 	t.Run("several configs for one database count once", func(t *testing.T) {
 		client := scopeFixtureClient(t, nil, true)
 		files := changedFiles("schema/orders/users.sql", "schema/orders/eu/users.sql")
-		count := h.autoPlanCommandScopeDatabases(t.Context(), client, "octocat/hello-world", 1, "abc123", files, files,
+		count, _ := h.autoPlanCommandScope(t.Context(), client, "octocat/hello-world", 1, "abc123", files, files,
 			[]ghclient.DiscoveredConfig{discoveredAt("schema/orders", "orders"), discoveredAt("schema/orders/eu", "orders")})
 		assert.Equal(t, 1, count, "the flag names a database, so duplicate configs for one are not ambiguous")
 	})
 
 	t.Run("a failure resolving a narrowed file names the database", func(t *testing.T) {
 		client := scopeFixtureClient(t, twoConfigs, true)
-		count := h.autoPlanCommandScopeDatabases(t.Context(), client, "octocat/hello-world", 1, "abc123",
+		count, _ := h.autoPlanCommandScope(t.Context(), client, "octocat/hello-world", 1, "abc123",
 			changedFiles("schema/orders/users.sql", "schema/billing/invoices.sql"),
 			changedFiles("schema/orders/users.sql"), orders)
 		assert.Equal(t, severalDatabases, count, "an unanswerable question degrades to the scoped rendering, which always resolves")

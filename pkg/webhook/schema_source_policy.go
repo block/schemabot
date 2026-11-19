@@ -443,10 +443,32 @@ func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *
 	if err != nil {
 		return nil, err
 	}
-	// Re-check the resolved schema root: environment resolution can retarget it
-	// (for example through an environment symlink), so ownership must hold for
-	// the path the schema files were actually fetched from, not just the
-	// discovered config directory.
+	return h.ownedSchemaRequest(ctx, repo, pr, schemaResult, source)
+}
+
+// createManagedSchemaRequestForConfig is createManagedSchemaRequestFromPR for
+// a config the caller already resolved from this PR, so a plan that builds one
+// request per environment discovers the config once instead of once per
+// environment. databaseName is the command's -d value, empty when it named
+// none, and gets the same registry check. The caller must have resolved config
+// under the same request-scoped PR-info cache as ctx, so the config and the
+// schema files are read at one head commit.
+func (h *Handler) createManagedSchemaRequestForConfig(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, databaseName string, config *ghclient.SchemabotConfig, configDir, source string) (*ghclient.SchemaRequestResult, error) {
+	if err := h.unregisteredDatabaseError(repo, databaseName); err != nil {
+		return nil, err
+	}
+	schemaResult, err := client.CreateSchemaRequestForConfig(ctx, repo, pr, environment, config, configDir, h.validateRequestedDatabaseEnvironment)
+	if err != nil {
+		return nil, err
+	}
+	return h.ownedSchemaRequest(ctx, repo, pr, schemaResult, source)
+}
+
+// ownedSchemaRequest re-checks the resolved schema root: environment
+// resolution can retarget it (for example through an environment symlink), so
+// ownership must hold for the path the schema files were actually fetched
+// from, not just the discovered config directory.
+func (h *Handler) ownedSchemaRequest(ctx context.Context, repo string, pr int, schemaResult *ghclient.SchemaRequestResult, source string) (*ghclient.SchemaRequestResult, error) {
 	if !h.shouldProcessSchemaConfig(ctx, repo, pr, schemaResult.HeadSHA, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath, source) {
 		return nil, h.unownedSchemaConfigError(repo, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath)
 	}

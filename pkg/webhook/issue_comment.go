@@ -313,7 +313,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 				h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			}
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil, nil)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return

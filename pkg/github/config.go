@@ -430,7 +430,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInPR(ctx context.Context, 
 	if err != nil {
 		return nil, "", false, fmt.Errorf("find configs for PR: %w", err)
 	}
-	config, configDir, ok, err := selectConfigByDatabaseName(databaseName, prConfigs)
+	config, configDir, ok, err := SelectConfigByDatabaseName(databaseName, prConfigs)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -462,7 +462,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 	}
 
 	if scoped {
-		config, configDir, ok, err := selectConfigByDatabaseName(databaseName, result.ValidConfigs)
+		config, configDir, ok, err := SelectConfigByDatabaseName(databaseName, result.ValidConfigs)
 		if err != nil {
 			return nil, "", err
 		}
@@ -482,7 +482,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 		return nil, "", ErrNoConfig
 	}
 
-	config, configDir, ok, err := selectConfigByDatabaseName(databaseName, result.ValidConfigs)
+	config, configDir, ok, err := SelectConfigByDatabaseName(databaseName, result.ValidConfigs)
 	if err != nil {
 		return nil, "", err
 	}
@@ -790,10 +790,13 @@ func newDiscoveredConfig(config *SchemabotConfig, dir string) DiscoveredConfig {
 	}
 }
 
-// selectConfigByDatabaseName matches the requested database against discovered
-// configs by canonical key: FetchConfig folds every declared database at parse,
-// so folding the request here is the only comparison needed.
-func selectConfigByDatabaseName(databaseName string, configs []DiscoveredConfig) (*SchemabotConfig, string, bool, error) {
+// SelectConfigByDatabaseName picks the named database's config from configs
+// already discovered from a PR. ok is false when none of them declares it, and
+// a database declared by more than one config is an error, since a plan or an
+// apply acts on one schema directory. It matches by canonical key: FetchConfig
+// folds every declared database at parse, so folding the request here is the
+// only comparison needed.
+func SelectConfigByDatabaseName(databaseName string, configs []DiscoveredConfig) (*SchemabotConfig, string, bool, error) {
 	databaseName = storage.CanonicalKey(databaseName)
 	var matches []DiscoveredConfig
 	for _, dc := range configs {

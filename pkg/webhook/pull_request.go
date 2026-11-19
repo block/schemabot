@@ -630,11 +630,15 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
 	}
-	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles, files, discovered)
+	commandScopeDatabases, commandConfigs := h.autoPlanCommandScope(ctx, client, repo, pr, headSHA, changedFiles, files, discovered)
+	var planConfigs *autoPlanDiscovery
+	if commandConfigs != nil {
+		planConfigs = &autoPlanDiscovery{headSHA: headSHA, configs: commandConfigs}
+	}
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote, planConfigs)
 		})
 	}
 
@@ -645,14 +649,14 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 // database, used where discovery cannot answer how many a bare command reaches.
 const severalDatabases = 2
 
-// autoPlanCommandScopeDatabases counts the databases a bare command offered by
-// an auto-plan comment would reach, which is not the set this deployment plans.
-// The command path discovers over the PR's raw changed files, without the
-// proposed-against-default-branch narrowing applied above, and an unscoped
-// command reaches every deployment rather than this one's managed slice. Either
-// gap lets a deployment hold one database where the command finds two, and the
-// bare command it would then offer comes back rejected as ambiguous, or starts
-// a database its comment is not about.
+// autoPlanCommandScope counts the databases a bare command offered by an
+// auto-plan comment would reach, which is not the set this deployment plans,
+// and returns the configs it counted. The command path discovers over the PR's
+// raw changed files, without the proposed-against-default-branch narrowing
+// applied above, and an unscoped command reaches every deployment rather than
+// this one's managed slice. Either gap lets a deployment hold one database
+// where the command finds two, and the bare command it would then offer comes
+// back rejected as ambiguous, or starts a database its comment is not about.
 //
 // Discovery resolves each file's config on its own, so the raw files reach what
 // auto-plan discovered over the proposed files plus what the files narrowing
@@ -660,25 +664,54 @@ const severalDatabases = 2
 // deadline with discovery, and a second walk over every file can find that
 // deadline already spent on a large PR.
 //
-// A discovery failure counts as several: naming the database always yields a
-// command that resolves, so an unanswerable question degrades to the scoped
-// rendering rather than to a command that may not work.
-func (h *Handler) autoPlanCommandScopeDatabases(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, changedFiles, proposedFiles []ghclient.PRFile, discovered []ghclient.DiscoveredConfig) int {
+// The configs are also what each database's plan would discover again to
+// resolve its own config, so the plans select from them instead of reading
+// every config once per database.
+//
+// A discovery failure counts as several and returns no configs: naming the
+// database always yields a command that resolves, so an unanswerable question
+// degrades to the scoped rendering rather than to a command that may not work,
+// and each plan discovers its config itself.
+func (h *Handler) autoPlanCommandScope(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, changedFiles, proposedFiles []ghclient.PRFile, discovered []ghclient.DiscoveredConfig) (int, []ghclient.DiscoveredConfig) {
 	configs := slices.Clone(discovered)
 	if narrowed := filesNarrowedAway(changedFiles, proposedFiles); len(narrowed) > 0 {
 		narrowedConfigs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, narrowed)
 		if err != nil {
-			h.logger.Warn("failed to resolve which databases a bare command would reach; auto-plan comments will name their database",
+			h.logger.Warn("failed to resolve which databases a bare command would reach; auto-plan comments will name their database, and each database's plan will discover its config again",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "narrowed_files", len(narrowed), "error", err)
-			return severalDatabases
+			return severalDatabases, nil
 		}
 		configs = append(configs, narrowedConfigs...)
 	}
+	configs = uniqueConfigsByDir(configs)
 	databases := make(map[string]struct{}, len(configs))
 	for _, cfg := range configs {
 		databases[cfg.Config.Database] = struct{}{}
 	}
-	return len(databases)
+	return len(databases), configs
+}
+
+// uniqueConfigsByDir drops repeats of a config directory, which the proposed
+// files and the files narrowed away can both reach.
+func uniqueConfigsByDir(configs []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
+	seen := make(map[string]bool, len(configs))
+	unique := configs[:0]
+	for _, cfg := range configs {
+		if seen[cfg.SchemaDir] {
+			continue
+		}
+		seen[cfg.SchemaDir] = true
+		unique = append(unique, cfg)
+	}
+	return unique
+}
+
+// autoPlanDiscovery is what an auto-plan's discovery read: the configs a
+// command would resolve from the PR's changed files, at the head commit
+// discovery read them at.
+type autoPlanDiscovery struct {
+	headSHA string
+	configs []ghclient.DiscoveredConfig
 }
 
 // filesNarrowedAway returns the changed files the proposed list does not carry
