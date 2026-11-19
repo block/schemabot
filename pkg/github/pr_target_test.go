@@ -621,5 +621,30 @@ func TestFreshPRTargetEnforcesWhenClassicProtectionIsUnreadable(t *testing.T) {
 	assert.Contains(t, logs.String(), "level=WARN")
 	assert.Contains(t, logs.String(), "lacks Administration: read")
 	assert.Contains(t, logs.String(), "repo=octocat/hello-world")
-	assert.Contains(t, logs.String(), "effective_target=feature")
+	assert.Contains(t, logs.String(), "branch=feature")
+}
+
+// The missing-permission warning comes from the GitHub read, not from each
+// evaluation, so the many evaluations of one push served from the branch
+// policy cache log it once.
+func TestCachedPRTargetWarnsOncePerPolicyRead(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/rules/branches/feature", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, `[]`)
+		require.NoError(t, err)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(w, `{"data":{"repository":{"ref":{"name":"feature","branchProtectionRule":null}}},"errors":[{"type":"FORBIDDEN","path":["repository","ref","branchProtectionRule"],"message":"Resource not accessible by integration"}]}`)
+		require.NoError(t, err)
+	})
+	var logs bytes.Buffer
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(&logs, nil)))
+	info := &PullRequestInfo{BaseRef: "feature", DefaultBranch: "main"}
+
+	for range 3 {
+		decision, err := ic.EvaluatePRTarget(t.Context(), "octocat/hello-world", info, []string{"SchemaBot"})
+		require.NoError(t, err)
+		assert.Equal(t, PRTargetEligibility{Target: "feature", Eligible: true, ClassicProtectionUnreadable: true}, decision)
+	}
+	assert.Equal(t, 1, strings.Count(logs.String(), "lacks Administration: read"))
 }

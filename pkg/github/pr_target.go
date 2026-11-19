@@ -74,9 +74,7 @@ func (p branchPolicy) clone() branchPolicy {
 // conservatively even when GitHub pins a different App: a pin never permits
 // silently omitting a required check.
 func (ic *InstallationClient) EvaluatePRTarget(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string) (PRTargetEligibility, error) {
-	result, err := evaluatePRTarget(ctx, repo, info, checkBases, ic.requiredChecksForBranch)
-	ic.logClassicProtectionUnreadable(repo, result)
-	return result, err
+	return evaluatePRTarget(ctx, repo, info, checkBases, ic.requiredChecksForBranch)
 }
 
 // EvaluatePRTargetFresh uses live policy reads before accepting an apply.
@@ -84,17 +82,7 @@ func (ic *InstallationClient) EvaluatePRTarget(ctx context.Context, repo string,
 func (ic *InstallationClient) EvaluatePRTargetFresh(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string) (PRTargetEligibility, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, sharedFetchTimeout)
 	defer cancel()
-	result, err := evaluatePRTarget(fetchCtx, repo, info, checkBases, ic.fetchRequiredChecks)
-	ic.logClassicProtectionUnreadable(repo, result)
-	return result, err
-}
-
-func (ic *InstallationClient) logClassicProtectionUnreadable(repo string, result PRTargetEligibility) {
-	if !result.ClassicProtectionUnreadable || ic.logger == nil {
-		return
-	}
-	ic.logger.Warn("classic branch protection is unreadable because the GitHub App lacks Administration: read; SchemaBot plans and publishes checks for this PR target",
-		"repo", repo, "effective_target", result.Target)
+	return evaluatePRTarget(fetchCtx, repo, info, checkBases, ic.fetchRequiredChecks)
 }
 
 func evaluatePRTarget(ctx context.Context, repo string, info *PullRequestInfo, checkBases []string, readPolicy func(context.Context, string, string) (branchPolicy, error)) (PRTargetEligibility, error) {
@@ -212,6 +200,11 @@ func (ic *InstallationClient) fetchRequiredChecks(ctx context.Context, repo, bra
 	}
 	classic, err := ic.classicRequiredChecks(ctx, repo, branch)
 	if errors.Is(err, errClassicProtectionUnreadable) {
+		// Logged once per GitHub read, so cached evaluations stay quiet.
+		if ic.logger != nil {
+			ic.logger.Warn("classic branch protection is unreadable because the GitHub App lacks Administration: read; SchemaBot plans and publishes checks for PRs into this branch",
+				"repo", repo, "branch", branch)
+		}
 		return branchPolicy{contexts: contexts, classicUnreadable: true}, nil
 	}
 	if err != nil {

@@ -18,7 +18,7 @@ var errPRTargetExcluded = errors.New("pull request target is excluded from Schem
 
 func (h *Handler) evaluatePRTarget(ctx context.Context, client *ghclient.InstallationClient, repo string, info *ghclient.PullRequestInfo) (ghclient.PRTargetEligibility, error) {
 	if !h.skipsUnrequiredBranches() {
-		return servedPRTarget(info), nil
+		return servedPRTarget(), nil
 	}
 	return client.EvaluatePRTarget(ctx, repo, info, h.prTargetCheckBases(repo))
 }
@@ -31,9 +31,9 @@ func (h *Handler) skipsUnrequiredBranches() bool {
 }
 
 // servedPRTarget is the decision for every PR while skip_unrequired_branches
-// is off: the target is served.
-func servedPRTarget(info *ghclient.PullRequestInfo) ghclient.PRTargetEligibility {
-	return ghclient.PRTargetEligibility{Target: info.BaseRef, Eligible: true}
+// is off: the target is served. No target is resolved, so Target stays empty.
+func servedPRTarget() ghclient.PRTargetEligibility {
+	return ghclient.PRTargetEligibility{Eligible: true}
 }
 
 func (h *Handler) prTargetCheckBases(repo string) []string {

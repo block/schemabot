@@ -310,7 +310,7 @@ func TestEveryPRTargetServedByDefault(t *testing.T) {
 	info := &ghclient.PullRequestInfo{HeadSHA: "same-head", BaseRef: "parent", DefaultBranch: "trunk"}
 	decision, err := h.evaluatePRTarget(t.Context(), client, "octocat/hello-world", info)
 	require.NoError(t, err)
-	assert.Equal(t, ghclient.PRTargetEligibility{Target: "parent", Eligible: true}, decision)
+	assert.Equal(t, ghclient.PRTargetEligibility{Eligible: true}, decision)
 
 	blocked, err := h.enforcePRTarget(t.Context(), client, "octocat/hello-world", 1, 12345, action.Apply, "staging", "alice", false, false)
 	require.NoError(t, err)
