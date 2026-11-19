@@ -1,7 +1,6 @@
 package github
 
 import (
-	"slices"
 	"sync"
 	"time"
 )
@@ -20,7 +19,7 @@ type branchPolicyCache struct {
 }
 
 type branchPolicyEntry struct {
-	names     []string
+	policy    branchPolicy
 	expiresAt time.Time
 }
 
@@ -31,21 +30,21 @@ func (c *branchPolicyCache) currentTime() time.Time {
 	return time.Now()
 }
 
-func (c *branchPolicyCache) get(key string) ([]string, bool) {
+func (c *branchPolicyCache) get(key string) (branchPolicy, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[key]
 	if !ok {
-		return nil, false
+		return branchPolicy{}, false
 	}
 	if !c.currentTime().Before(entry.expiresAt) {
 		delete(c.entries, key)
-		return nil, false
+		return branchPolicy{}, false
 	}
-	return slices.Clone(entry.names), true
+	return entry.policy.clone(), true
 }
 
-func (c *branchPolicyCache) put(key string, names []string) {
+func (c *branchPolicyCache) put(key string, policy branchPolicy) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.currentTime()
@@ -64,5 +63,5 @@ func (c *branchPolicyCache) put(key string, names []string) {
 			clear(c.entries)
 		}
 	}
-	c.entries[key] = branchPolicyEntry{names: slices.Clone(names), expiresAt: now.Add(branchPolicyTTL)}
+	c.entries[key] = branchPolicyEntry{policy: policy.clone(), expiresAt: now.Add(branchPolicyTTL)}
 }

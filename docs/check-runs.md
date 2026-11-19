@@ -103,10 +103,18 @@ uncached PR metadata reads. A two-environment
 no-work publisher reads one initial target snapshot and performs one final
 uncached check per published environment, in addition to scope discovery and
 revalidation. Existing snapshots are reused for the initial currency check. A successful null
-classic rule proves absence; an ambiguous REST 404 does not. Missing metadata,
+classic rule proves absence; an ambiguous REST 404 does not. Except for the
+missing permission described next, missing metadata,
 permission failures, and incomplete lookup responses stop processing rather
-than permitting exclusion. The GitHub App needs **Administration: read** access
-for protection discovery, in addition to its existing permissions.
+than permitting exclusion.
+
+Reading classic branch protection needs the GitHub App's **Administration:
+read** permission. Without it, SchemaBot cannot tell whether a non-default
+branch requires its check, so it treats every such target as enforced: it
+plans, applies, and publishes Check Runs there, as it did before target
+enforcement existed, and logs a warning naming the missing permission. Rulesets
+are read with the Metadata permission every App has. Grant Administration: read
+to limit SchemaBot to the default branch and the branches that require it.
 
 Before rollout, audit repository and organization rulesets plus classic branch
 protection. Scope SchemaBot requirements to the default branch and intentionally
