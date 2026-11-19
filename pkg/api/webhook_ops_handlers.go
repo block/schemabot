@@ -479,7 +479,21 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Sto
 	return executeChecksScanWith(ctx, cfg, store, req, logger, installationChecksScanClient)
 }
 
+// checksBackfillSupport is every backfill behavior this server implements.
+// Each scan response carries it, so a CLI can refuse a run that would rely on
+// a behavior an older server lacks.
+var checksBackfillSupport = apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}
+
 func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger, resolve checksScanClientResolver) (*ChecksScanResponse, error) {
+	response, err := scanChecks(ctx, cfg, store, req, logger, resolve)
+	if err != nil {
+		return nil, err
+	}
+	response.Supports = checksBackfillSupport
+	return response, nil
+}
+
+func scanChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger, resolve checksScanClientResolver) (*ChecksScanResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}

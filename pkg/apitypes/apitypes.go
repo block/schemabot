@@ -331,6 +331,23 @@ type ChecksScanResponse struct {
 	// the live webhook path that shares the same budget. Nil when the rate
 	// state could not be read (advisory only; the scan itself succeeded).
 	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+	// Supports names the backfill behaviors this server implements. A server
+	// that predates one ignores the request field that asks for it, so the
+	// CLI checks this before relying on a behavior rather than finding out
+	// from what the server did.
+	Supports ChecksBackfillSupport `json:"supports"`
+}
+
+// ChecksBackfillSupport lists the backfill behaviors a server confirms it
+// implements. A field a server leaves unset is a behavior it lacks.
+type ChecksBackfillSupport struct {
+	// NamedPRs means a scan request with prs reads only those PRs, instead of
+	// paging through the repository's open PRs.
+	NamedPRs bool `json:"named_prs,omitempty"`
+	// DeferSchemaPRs means a synthesize request without plan defers each PR
+	// that changes managed schema before writing anything, and checks
+	// rate_limit_floor_percent before every PR it starts.
+	DeferSchemaPRs bool `json:"defer_schema_prs,omitempty"`
 }
 
 // GitHubRateLimit is a point-in-time snapshot of a GitHub installation's

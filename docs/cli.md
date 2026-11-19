@@ -1109,13 +1109,22 @@ https://github.com/acme/store/pull/418  SchemaBot (production)  deferred: change
 https://github.com/acme/store/pull/431  SchemaBot (production)  deferred: changes schema in 4 databases (billing, catalog, orders and 1 more); 409 changed files
 
 2 PRs change managed schema and were not planned, so their Check Runs are still missing and the merge stays blocked. Each plan reads every changed database's schema once per environment. To plan them:
-  schemabot checks backfill acme/store --plan --pr 418,431
+  schemabot checks backfill acme/store -e production --plan --pr 418,431
 Error: checks backfill left 2 deferred schema PRs needing attention
 ```
 
 `--pr` scans only the named PRs instead of paging the repository, and
 `--plan` requires it, so every plan the backfill runs is one an operator
-asked for by number. Plan the PRs whose merges matter most first.
+asked for by number. Plan the PRs whose merges matter most first. The
+printed command keeps the run's `-e` and `--check-name` filters, so it plans
+for the same missing checks.
+
+A server older than the CLI may not defer schema PRs or read named PRs. Each
+scan reports what the server supports, and the command stops before it
+recreates anything the server would handle differently: it refuses `--pr`
+unless the server reads named PRs, and refuses a run without `--dry-run`
+unless the server defers schema PRs. Upgrade the server, or use `--dry-run`
+to report the missing checks without recreating them.
 
 The server checks the GitHub budget before each PR. When the budget falls
 below `--rate-limit-floor` (20% by default), it stops the batch and returns

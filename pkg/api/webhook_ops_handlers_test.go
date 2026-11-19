@@ -1085,6 +1085,7 @@ func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
 	assert.Equal(t, "octo/repo", response.Repo)
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 }
 
 // fakeChecksScanClient adds the installation budget read a scan page ends
@@ -1140,6 +1141,7 @@ func TestExecuteChecksScanSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
 	assert.Empty(t, response.CheckNames)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports, "a skipped repository still tells the CLI what this server supports")
 
 	var entry map[string]any
 	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log line: %s", logs.String())
@@ -1215,6 +1217,7 @@ func TestExecuteChecksScanScansThroughTheResolvedInstallation(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, response.AppNotInstalled)
 	assert.Empty(t, response.GitHubApp)
+	assert.Equal(t, apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}, response.Supports)
 	assert.Equal(t, 1, response.Scanned)
 	require.Len(t, response.Missing, 1)
 	assert.Equal(t, 7, response.Missing[0].Number)

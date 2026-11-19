@@ -243,6 +243,10 @@ type checksBackfillReport struct {
 	// Plan echoes --plan: whether PRs that change managed schema were planned
 	// rather than deferred.
 	Plan bool `json:"plan"`
+	// Environment and CheckName echo -e and --check-name, the filters that
+	// chose which missing checks the run acted on.
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
 	// Interrupted says an operator's Ctrl-C or SIGTERM cut the run short, so
 	// the report holds only what the run learned before it. It is always
 	// present, false on a run that finished.
@@ -346,6 +350,8 @@ func (cmd *ChecksBackfillCmd) Run(ctx context.Context, g *Globals) error {
 		Last:              cmd.Last,
 		DryRun:            cmd.DryRun,
 		Plan:              cmd.Plan,
+		Environment:       cmd.Environment,
+		CheckName:         cmd.CheckName,
 		StuckAfter:        cmd.StuckAfter,
 	}
 	namedPRs := chunkPRNumbers(cmd.PR, checksScanNamedBatchSize)
@@ -395,6 +401,9 @@ scanning:
 			}
 			if err != nil {
 				return fmt.Errorf("scan %s open PRs for missing or stuck Check Runs: %w", repo, err)
+			}
+			if err := cmd.requireServerSupport(chunk.Supports); err != nil {
+				return err
 			}
 			// The server skips repos whose Check Run publishing is turned
 			// off rather than reporting every open PR as missing; record the
@@ -560,6 +569,20 @@ func (cmd *ChecksBackfillCmd) validateScope() error {
 	}
 	if cmd.Plan && len(cmd.PR) == 0 {
 		return fmt.Errorf("--plan requires --pr: each plan reads every changed database's schema once per environment, so name the PRs to plan")
+	}
+	return nil
+}
+
+// requireServerSupport refuses a run that relies on a backfill behavior the
+// server does not confirm. A server that predates one ignores the request
+// field asking for it, so the run would do something other than what the
+// operator asked for rather than fail.
+func (cmd *ChecksBackfillCmd) requireServerSupport(supports apitypes.ChecksBackfillSupport) error {
+	if len(cmd.PR) > 0 && !supports.NamedPRs {
+		return fmt.Errorf("the server does not support --pr: it would scan the repository's open PRs page by page instead of the PRs you named. Upgrade the server, or run without --pr")
+	}
+	if !cmd.DryRun && !supports.DeferSchemaPRs {
+		return fmt.Errorf("the server does not defer PRs that change managed schema: it would plan every one and skip the --rate-limit-floor check between PRs, which can drain the GitHub budget live webhooks share. Upgrade the server, or run with --dry-run to report missing Check Runs without recreating them")
 	}
 	return nil
 }
@@ -1112,11 +1135,38 @@ func writeChecksDeferredHint(w io.Writer, report *checksBackfillReport) error {
 		return err
 	}
 	for _, repo := range sortedKeys(deferredByRepo) {
-		if _, err := fmt.Fprintf(w, "  schemabot checks backfill %s --plan --pr %s\n", repo, strings.Join(deferredByRepo[repo], ",")); err != nil {
+		if _, err := fmt.Fprintf(w, "  schemabot checks backfill %s%s --plan --pr %s\n", repo, checksBackfillFilterFlags(report), strings.Join(deferredByRepo[repo], ",")); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// checksBackfillFilterFlags repeats the run's -e and --check-name filters for
+// a follow-up command, so it acts on the same missing checks this run found.
+// Without them, a PR missing only its production check could be held for an
+// uncompleted staging check and never planned.
+func checksBackfillFilterFlags(report *checksBackfillReport) string {
+	var flags strings.Builder
+	if report.Environment != "" {
+		fmt.Fprintf(&flags, " -e %s", shellQuoteArg(report.Environment))
+	}
+	if report.CheckName != "" {
+		fmt.Fprintf(&flags, " --check-name %s", shellQuoteArg(report.CheckName))
+	}
+	return flags.String()
+}
+
+// shellQuoteArg quotes arg for a POSIX shell when it holds anything beyond
+// characters a shell reads literally, so a printed command pastes as one word.
+func shellQuoteArg(arg string) string {
+	plain := arg != "" && strings.IndexFunc(arg, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("@%_+=:,./-", r)
+	}) < 0
+	if plain {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
 // writeChecksInterruptedNote says, under the headline, that an interrupt cut

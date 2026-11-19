@@ -239,7 +239,7 @@ func TestChecksBackfillRunSkipsNamedDisabledRepo(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/api/checks/scan", r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{Repo: "octo/off", ChecksDisabled: true}))
+		require.NoError(t, json.NewEncoder(w).Encode(currentServerScan(apitypes.ChecksScanResponse{Repo: "octo/off", ChecksDisabled: true})))
 	}))
 	t.Cleanup(server.Close)
 
@@ -269,7 +269,7 @@ func TestChecksBackfillNormalizesStuckAfterOnTheWire(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 		sent = req.StuckAfter
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{Repo: "octo/repo", Scanned: 1}))
+		require.NoError(t, json.NewEncoder(w).Encode(currentServerScan(apitypes.ChecksScanResponse{Repo: "octo/repo", Scanned: 1})))
 	}))
 	t.Cleanup(server.Close)
 
@@ -295,13 +295,13 @@ func checksBackfillScanServer(t *testing.T, missing []apitypes.MissingCheckPR, s
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/api/checks/scan", r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{
+		require.NoError(t, json.NewEncoder(w).Encode(currentServerScan(apitypes.ChecksScanResponse{
 			Repo:       "octo/repo",
 			CheckNames: []string{"SchemaBot (production)"},
 			Scanned:    5,
 			Missing:    missing,
 			Stuck:      stuck,
-		}))
+		})))
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -591,7 +591,7 @@ func newChecksBackfillFleetServer(t *testing.T, declared []string, scans map[str
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			assert.NoError(t, json.NewEncoder(w).Encode(pages[page-1]))
+			assert.NoError(t, json.NewEncoder(w).Encode(currentServerScan(pages[page-1])))
 		case "/api/checks/synthesize":
 			var req apitypes.ChecksSynthesizeRequest
 			if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&req)) {
@@ -885,12 +885,12 @@ func checksBackfillRecreateServer(t *testing.T, prCount int, hold *holdingHandle
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/checks/scan":
-			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{
+			assert.NoError(t, json.NewEncoder(w).Encode(currentServerScan(apitypes.ChecksScanResponse{
 				Repo:       "octo/repo",
 				CheckNames: []string{"SchemaBot (production)"},
 				Scanned:    prCount,
 				Missing:    missing,
-			}))
+			})))
 		case "/api/checks/synthesize":
 			var req apitypes.ChecksSynthesizeRequest
 			assert.NoError(t, json.Unmarshal(body, &req))
@@ -1134,7 +1134,7 @@ func checksBackfillTwoPageScanServer(t *testing.T, hold *holdingHandler) *httpte
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{
+		assert.NoError(t, json.NewEncoder(w).Encode(currentServerScan(apitypes.ChecksScanResponse{
 			Repo:       "octo/repo",
 			CheckNames: []string{"SchemaBot (production)"},
 			Scanned:    100,
@@ -1146,7 +1146,7 @@ func checksBackfillTwoPageScanServer(t *testing.T, hold *holdingHandler) *httpte
 				Number: 9, URL: "https://github.com/octo/repo/pull/9",
 				Checks: []apitypes.IncompleteCheckRun{{Name: "SchemaBot (production)", CheckRunID: 90, Status: "queued"}},
 			}},
-		}))
+		})))
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -1223,7 +1223,7 @@ func TestChecksBackfillCancelDuringFleetScanReportsOnlyTheReposRead(t *testing.T
 				hold.ServeHTTP(w, r)
 				return
 			}
-			assert.NoError(t, json.NewEncoder(w).Encode(scans[req.Repo]))
+			assert.NoError(t, json.NewEncoder(w).Encode(currentServerScan(scans[req.Repo])))
 		default:
 			t.Errorf("unexpected request path %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -1450,6 +1450,9 @@ type backfillServer struct {
 	mu          sync.Mutex
 	scans       []apitypes.ChecksScanRequest
 	synthesizes []apitypes.ChecksSynthesizeRequest
+	// supports, when set, replaces the behaviors the scan reports, to stand
+	// in for an older server.
+	supports *apitypes.ChecksBackfillSupport
 }
 
 func (s *backfillServer) scanRequests() []apitypes.ChecksScanRequest {
@@ -1475,6 +1478,7 @@ func newBackfillServer(t *testing.T, missing []int, synthesize func(call int, re
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 			server.mu.Lock()
 			server.scans = append(server.scans, req)
+			supports := server.supports
 			server.mu.Unlock()
 			response := apitypes.ChecksScanResponse{Repo: "octo/repo", CheckNames: []string{"SchemaBot (production)"}, Scanned: len(missing)}
 			for _, pr := range missing {
@@ -1484,6 +1488,10 @@ func newBackfillServer(t *testing.T, missing []int, synthesize func(call int, re
 					HeadSHA:      "sha" + strconv.Itoa(pr),
 					MissingNames: []string{"SchemaBot (production)"},
 				})
+			}
+			response = currentServerScan(response)
+			if supports != nil {
+				response.Supports = *supports
 			}
 			assert.NoError(t, json.NewEncoder(w).Encode(response))
 		case "/api/checks/synthesize":
@@ -1650,4 +1658,86 @@ func TestApplySynthesizeResultCountsANotStartedPRAsFailed(t *testing.T) {
 	var action checksBackfillAction
 	applySynthesizeResult(&action, apitypes.ChecksSynthesizeResult{PR: 2, Outcome: "not started: GitHub budget is below 20% (100 of 5000 requests left)", RateLimited: true})
 	assert.Equal(t, "not started: GitHub budget is below 20% (100 of 5000 requests left)", action.Error)
+}
+
+// currentServerScan stamps a scan response with every backfill behavior this
+// CLI relies on, as a server at the same version reports.
+func currentServerScan(response apitypes.ChecksScanResponse) apitypes.ChecksScanResponse {
+	response.Supports = apitypes.ChecksBackfillSupport{NamedPRs: true, DeferSchemaPRs: true}
+	return response
+}
+
+// A server that predates deferral would plan every schema PR and skip the
+// budget floor between PRs, and one that predates named scans would page the
+// repository instead of reading the named PRs. The command refuses both runs
+// before it asks the server to write anything, and says what to do instead.
+// A dry run writes nothing, so it still runs against such a server.
+func TestChecksBackfillRefusesBehaviorsTheServerDoesNotConfirm(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cmd      ChecksBackfillCmd
+		supports apitypes.ChecksBackfillSupport
+		want     string
+	}{
+		"recreate without deferral": {
+			cmd:      ChecksBackfillCmd{Repo: "octo/repo", StuckAfter: "1h"},
+			supports: apitypes.ChecksBackfillSupport{NamedPRs: true},
+			want:     "the server does not defer PRs that change managed schema: it would plan every one and skip the --rate-limit-floor check between PRs, which can drain the GitHub budget live webhooks share. Upgrade the server, or run with --dry-run to report missing Check Runs without recreating them",
+		},
+		"named PRs": {
+			cmd:      ChecksBackfillCmd{Repo: "octo/repo", PR: []int{7}, DryRun: true, StuckAfter: "1h"},
+			supports: apitypes.ChecksBackfillSupport{DeferSchemaPRs: true},
+			want:     "the server does not support --pr: it would scan the repository's open PRs page by page instead of the PRs you named. Upgrade the server, or run without --pr",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := newBackfillServer(t, []int{7}, createdForEach)
+			server.supports = &tc.supports
+
+			var runErr error
+			captureStdout(func() {
+				runErr = tc.cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+			})
+			require.EqualError(t, runErr, tc.want)
+			assert.Empty(t, server.synthesizeRequests())
+		})
+	}
+
+	server := newBackfillServer(t, []int{7}, createdForEach)
+	server.supports = &apitypes.ChecksBackfillSupport{}
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", DryRun: true, StuckAfter: "1h"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+	assert.EqualError(t, runErr, "checks backfill left 1 PR with missing Check Runs needing attention")
+	assert.Contains(t, output, "https://github.com/octo/repo/pull/7")
+}
+
+// The printed command that plans the deferred PRs repeats the run's -e and
+// --check-name filters, so the follow-up acts on the same missing checks. A
+// check name with spaces is quoted so the command pastes as typed.
+func TestChecksBackfillDeferredHintKeepsTheRunsFilters(t *testing.T) {
+	server := newBackfillServer(t, []int{7}, func(_ int, req apitypes.ChecksSynthesizeRequest) apitypes.ChecksSynthesizeResponse {
+		return apitypes.ChecksSynthesizeResponse{Repo: req.Repo, Results: []apitypes.ChecksSynthesizeResult{
+			{PR: 7, Outcome: "deferred: PR changes managed schema", Deferred: true, Databases: []string{"orders"}, ChangedFiles: 1},
+		}}
+	})
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", Environment: "production", CheckName: "SchemaBot (production)", StuckAfter: "1h"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	assert.EqualError(t, runErr, "checks backfill left 1 deferred schema PR needing attention")
+	assert.Contains(t, output, "  schemabot checks backfill octo/repo -e production --check-name 'SchemaBot (production)' --plan --pr 7\n")
+}
+
+func TestShellQuoteArg(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "production", shellQuoteArg("production"))
+	assert.Equal(t, "'SchemaBot (production)'", shellQuoteArg("SchemaBot (production)"))
+	assert.Equal(t, `'it'\''s'`, shellQuoteArg("it's"))
+	assert.Equal(t, "''", shellQuoteArg(""))
 }
