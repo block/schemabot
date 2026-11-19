@@ -15,13 +15,35 @@ section that does not apply. AGENTS.md (Git section) has the full rules.
 
 <!-- One line per change. Do not walk the diff file by file. -->
 
-<!--
-Diagram: required when the change has a shape (flow, state, lifecycle,
-concurrency, ownership). Put it in a fenced code block. When it rewrites
-behavior, draw Before and After in the same form, traced through one
-concrete example named in the sentence above it, and mark where the old
-behavior goes wrong. Delete this comment if the change has no shape.
+## Before and after
 
+<!--
+Required when the change has a shape: a flow, a state change, a lifecycle,
+concurrency, or ownership. Delete this section only for a change with no
+shape (a comment, a test, a copy edit, a dependency bump). Trace one
+concrete example through both halves, named in the sentence above the
+diagram. Draw both halves in the same form and node order, and mark with
+✗ where the old behavior goes wrong. Keep it in the fenced block, then
+re-read it as a grid: borders, corners, and connectors line up. For a
+change that only adds behavior, the After half alone is enough.
+-->
+
+<One sentence naming the example's inputs.>
+
+```
+Before                          After
+
+┌────────────────────┐          ┌────────────────────┐
+│ <state or step>    │          │ <state or step>    │
+└─────────┬──────────┘          └─────────┬──────────┘
+          │ <event>                       │ <event>
+          ▼                               ▼
+┌────────────────────┐          ┌────────────────────┐
+│ <outcome>          │ ✗ <why>  │ <outcome>          │
+└────────────────────┘          └────────────────────┘
+```
+
+<!--
 UX changes (PR comments, check summaries, CLI output): add one collapsed
 <details> block per scenario with the rendered output, plus the prior
 rendering when it replaces existing output. Paste PR comment markdown bare,
