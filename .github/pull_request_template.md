@@ -15,7 +15,7 @@ section that does not apply. AGENTS.md (Git section) has the full rules.
 
 <!-- One line per change. Do not walk the diff file by file. -->
 
-## Before and after
+### Before and after
 
 <!--
 Required when the change has a shape: a flow, a state change, a lifecycle,
