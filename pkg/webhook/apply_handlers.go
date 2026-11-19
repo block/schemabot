@@ -1525,11 +1525,11 @@ func isLockAcquiredSinceVetting(err error) bool {
 }
 
 // isVettedLockGone reports whether a row-pinned release found that the lock
-// row unlock vetted no longer holds the lock: no lock is held at all
-// (ErrLockNotFound), or the row is held under another owner (ErrLockNotOwned).
-// Each means the lock the command targeted is gone and nothing this command
-// vetted is left to release; the caller logs the specific error so the cause
-// stays distinguishable.
+// row the caller (unlock, or PR close cleanup) vetted no longer holds the
+// lock: no lock is held at all (ErrLockNotFound), or the row is held under
+// another owner (ErrLockNotOwned). Each means the lock the caller targeted is
+// gone and nothing it vetted is left to release; the caller logs the specific
+// error so the cause stays distinguishable.
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
 		errors.Is(err, storage.ErrLockNotOwned)
