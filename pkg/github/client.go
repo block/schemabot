@@ -313,6 +313,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		checkStatusSingleflight: c.checkStatusSingleflight,
 		treeLevels:              newTreeLevelCache(),
 		prETags:                 newPRETagCache(),
+		blobs:                   newBlobContentCache(),
 	}
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
@@ -397,6 +398,7 @@ func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSl
 		trustedCheckAppSlugs: trustedCheckAppSlugs,
 		treeLevels:           newTreeLevelCache(),
 		prETags:              newPRETagCache(),
+		blobs:                newBlobContentCache(),
 	}
 	ic.storeAppSlug(appSlug)
 	return ic
@@ -451,6 +453,11 @@ type InstallationClient struct {
 	// so a repeat read of an unchanged pull request is a conditional request
 	// that GitHub answers with 304 without spending primary rate limit.
 	prETags *prETagCache
+
+	// blobs holds schema file content by blob SHA, so a file whose content did
+	// not change is read from GitHub once per installation, however many
+	// environments, plans, and pushes read it.
+	blobs *blobContentCache
 }
 
 // InstallationID returns the GitHub App installation this client is scoped
@@ -3424,7 +3431,16 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
+			// The listing and the read name the same commit only when the ref
+			// is a full commit SHA; a branch could move between them and
+			// return other content than the listed blob, so it is not cached.
+			blobSHA := ""
+			if fullObjectSHA.MatchString(headSHA) {
+				blobSHA = loc.blobSHA
+			}
+			content, err := ic.cachedBlobContent(repo, blobSHA, func() (string, error) {
+				return ic.FetchFileContent(ctx, repo, loc.fetchPath, headSHA)
+			})
 			if err != nil {
 				results <- fileResult{err: fmt.Errorf("fetch %s: %w", loc.fetchPath, err)}
 				return
@@ -3532,7 +3548,9 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.FetchBlobContent(ctx, repo, entry.SHA)
+			content, err := ic.cachedBlobContent(repo, entry.SHA, func() (string, error) {
+				return ic.FetchBlobContent(ctx, repo, entry.SHA)
+			})
 			if err != nil {
 				results <- fileResult{err: fmt.Errorf("fetch %s: %w", entry.Path, err)}
 				return
@@ -3579,6 +3597,10 @@ func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo
 type schemaFileLocator struct {
 	fetchPath   string
 	displayPath string
+	// blobSHA is the file's blob SHA from the directory listing, which keys
+	// its content in the installation's blob cache. Empty when the listing
+	// did not report one; the file is then read without the cache.
+	blobSHA string
 }
 
 // schemaFileLocators lists every schema file directly under the schema root and
@@ -3601,7 +3623,7 @@ func (ic *InstallationClient) schemaFileLocators(ctx context.Context, repo, ref,
 	for _, entry := range rootEntries {
 		switch entry.GetType() {
 		case "file":
-			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath()})
+			locators = append(locators, schemaFileLocator{fetchPath: entry.GetPath(), displayPath: entry.GetPath(), blobSHA: entry.GetSHA()})
 		case "dir", "symlink":
 			namespaceEntries = append(namespaceEntries, entry)
 		default:
@@ -3657,7 +3679,7 @@ func (ic *InstallationClient) directoryFileLocators(ctx context.Context, repo, r
 				"repo", repo, "ref", ref, "path", sub.GetPath(), "type", sub.GetType())
 			continue
 		}
-		locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath()})
+		locators = append(locators, schemaFileLocator{fetchPath: sub.GetPath(), displayPath: sub.GetPath(), blobSHA: sub.GetSHA()})
 	}
 	return locators, nil
 }
@@ -3711,6 +3733,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		locators = append(locators, schemaFileLocator{
 			fetchPath:   sub.GetPath(),
 			displayPath: path.Join(schemaPath, symlinkName, path.Base(sub.GetPath())),
+			blobSHA:     sub.GetSHA(),
 		})
 	}
 	return locators, nil
