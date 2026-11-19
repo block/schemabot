@@ -118,6 +118,9 @@ func (s *sequenceStorage) Checks() storage.CheckStore {
 	return s.checks
 }
 
+// sequenceCheckStore returns one database's check from successive polls, in
+// order. It stores no aggregate row, so an aggregate read finds none and does
+// not consume a poll result.
 type sequenceCheckStore struct {
 	storage.CheckStore
 	results []*storage.Check
@@ -125,6 +128,9 @@ type sequenceCheckStore struct {
 }
 
 func (s *sequenceCheckStore) Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*storage.Check, error) {
+	if dbType == aggregateSentinel && database == aggregateSentinel {
+		return nil, nil
+	}
 	s.calls++
 	if len(s.results) == 0 {
 		return nil, nil

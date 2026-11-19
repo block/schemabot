@@ -142,6 +142,14 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	// A PR too large to plan automatically cannot merge until it is split, so
+	// applying any part of it is refused before anything is planned or locked.
+	if refused, err := h.refuseApplyOnOversizedPR(ctx, repo, pr, installationID, action.Apply, environment, requestedBy, result); err != nil {
+		return true, fmt.Errorf("apply command auto-plan size gate %s#%d: %w", repo, pr, err)
+	} else if refused {
+		return false, nil
+	}
+
 	// Fix checks stuck at "in_progress" from crashed applies after the actor
 	// is authorized to run apply for this database.
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
@@ -897,6 +905,14 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command actor authorization gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
+		return false, nil
+	}
+
+	// A pending confirmation may predate the size block, so the block is
+	// re-checked here rather than trusted from the apply that proposed it.
+	if refused, err := h.refuseApplyOnOversizedPR(ctx, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, result); err != nil {
+		return true, fmt.Errorf("apply-confirm command auto-plan size gate %s#%d: %w", repo, pr, err)
+	} else if refused {
 		return false, nil
 	}
 

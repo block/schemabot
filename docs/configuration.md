@@ -13,6 +13,7 @@
 - [Drivers](#drivers)
 - [Metrics](#metrics)
 - [Rate Limits](#rate-limits)
+- [Auto-plan Limits](#auto-plan-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
 - [Storage Dialect](#storage-dialect)
@@ -1123,6 +1124,43 @@ disabled, every caller shares one budget. There is no `per_target` lane. A
 refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
 it is returned before any GitHub call is made. Set `enabled: false` to turn
 enforcement off.
+
+## Auto-plan Limits
+
+An automatic plan reads every schema file a PR changes, once for each
+environment, in every database the PR touches, and every read comes out of the
+GitHub App installation's rate limit, which all pull requests share. A PR that
+rewrites schema across many databases at once, such as a bulk rename or a
+generated reformat, can spend enough of that budget to stop required checks
+from posting on every other PR.
+
+So before it reads any schema content, an automatic plan measures the PR from
+its changed-file list and the configs discovery already found, and refuses a PR
+that is larger than one plan covers:
+
+```yaml
+auto_plan_limits:
+  max_databases: 10      # default: 10
+  max_schema_files: 100  # default: 100
+```
+
+- `max_databases` is the most databases one automatic plan covers.
+- `max_schema_files` is the most changed schema files one automatic plan covers
+  when the PR changes more than one database. A PR that changes one database is
+  never over it, because one database is what `schemabot plan -d <database>`
+  plans, so splitting the PR cannot make that plan smaller.
+
+A refused PR gets a failing aggregate check with `blocking_reason`
+`auto_plan_size_limit` (see [Blocking Reasons](check-runs.md#blocking-reasons))
+and one comment naming the counts, the limit, and the way forward. See
+[the comment](../TEMPLATES.md#pr-too-large-to-plan-automatically-too-many-databases)
+in TEMPLATES.md. While the block stands, `schemabot apply` is refused. An
+explicit `schemabot plan -d <database>` still plans the one database it names,
+but it does not clear the block. The block clears when an automatic plan of a
+later commit finds the PR within the limits.
+
+Omit a field to keep its default. Values must not be negative, which fails
+validation at startup.
 
 ## Pending Drops
 

@@ -77,6 +77,7 @@ const (
 	BlockConfigDiscoveryFailed            = "schema_config_discovery_failed"
 	BlockPlanPublishVerificationFailed    = "plan_publish_verification_failed"
 	BlockPRFileCapExceeded                = "pr_file_cap_exceeded"
+	BlockAutoPlanSizeLimit                = "auto_plan_size_limit"
 	BlockManagedDirMissingConfig          = "managed_dir_missing_config"
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
 	BlockParticipantUnresolved            = "participant_unresolved"
@@ -131,6 +132,7 @@ var blockClasses = map[string]blockClass{
 	BlockConfigDiscoveryFailed:            blockGuard,
 	BlockPlanPublishVerificationFailed:    blockGuard,
 	BlockPRFileCapExceeded:                blockGuard,
+	BlockAutoPlanSizeLimit:                blockGuard,
 	BlockManagedDirMissingConfig:          blockGuard,
 	BlockNoAllowedConfiguredEnvironments:  blockGuard,
 	BlockNarrowedApply:                    blockGuard,
