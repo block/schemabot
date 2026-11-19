@@ -253,9 +253,19 @@ func (s *Server) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	resp, err := s.client.Plan(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(planErrorCode(err), err.Error())
 	}
 	return resp, nil
+}
+
+// planErrorCode maps a Plan failure to its gRPC code. A plan the engine refused
+// is the schema files' to fix, not a fault of this server, so it is
+// FailedPrecondition; callers that alert on Internal do not page for it.
+func planErrorCode(err error) codes.Code {
+	if engine.IsPlanRefused(err) {
+		return codes.FailedPrecondition
+	}
+	return codes.Internal
 }
 
 func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
