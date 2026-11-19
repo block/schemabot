@@ -337,18 +337,28 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 	return nil
 }
 
-// ResponseReadError means the server started answering a read request and the
+// ResponseReadError means the server started answering a request and the
 // response body then failed before it was complete: the connection was reset,
 // an HTTP/2 stream was reset, or the read timed out. The server was reached,
 // so this is not a ConnectionError, and no complete answer arrived, so it is
 // not an APIError. The cause varies with the protocol in use, which is why
 // callers that poll match this type instead of the cause.
+//
+// Method and Path name a request that changes something, such as a stop. The
+// server received that request before its answer failed, so the message
+// carries the same warning a ConnectionError does. Both are empty for a read.
 type ResponseReadError struct {
-	Err error
+	Method string
+	Path   string
+	Err    error
 }
 
 func (e *ResponseReadError) Error() string {
-	return "read response: " + e.Err.Error()
+	msg := "read response: " + e.Err.Error()
+	if changesServerState(e.Method) {
+		msg += "\n" + mayHaveActedWarning(e.Path)
+	}
+	return msg
 }
 
 func (e *ResponseReadError) Unwrap() error {
@@ -375,7 +385,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return &ResponseReadError{Method: method, Path: path, Err: err}
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -421,7 +431,7 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return &ResponseReadError{Method: http.MethodPost, Path: path, Err: err}
 	}
 
 	// Control endpoints answer 202 Accepted when the request is durably
@@ -580,7 +590,7 @@ func (e *ConnectionError) Unwrap() error {
 // unknown host never reached the server, so those keep their short messages.
 // Any other failure of a request that changes something, such as an apply or
 // a stop, may have happened after the server received it, so the message says
-// so and names the command that shows what the server did.
+// so and names the command that shows what the server did with that request.
 func (e *ConnectionError) message() string {
 	if isConnectionRefused(e.Err) {
 		return fmt.Sprintf("cannot connect to %s (is the server running?)", e.Endpoint)
@@ -596,10 +606,65 @@ func (e *ConnectionError) message() string {
 		msg = fmt.Sprintf("connection failed: %s: %s", e.Endpoint, cause)
 	}
 	if mayHaveReachedServer(e.Err) {
-		msg += fmt.Sprintf("\nThe server may already have acted on this request. Run '%s' to check before you send it again.",
-			cliname.Command("status"))
+		msg += "\n" + mayHaveActedWarning(failedRequestPath(e.Err))
 	}
 	return msg
+}
+
+// checkCommands maps each API path that changes something to the command that
+// shows the result: the apply for an apply or a control request, the settings
+// for a settings update, the locks for a lock change. A path that is not
+// listed has no single command that shows what the server did.
+var checkCommands = map[string]string{
+	"/api/apply":         "status",
+	"/api/cutover":       "status",
+	"/api/stop":          "status",
+	"/api/cancel":        "status",
+	"/api/start":         "status",
+	"/api/release":       "status",
+	"/api/revert":        "status",
+	"/api/skip-revert":   "status",
+	"/api/settings":      "settings",
+	"/api/locks":         "locks",
+	"/api/locks/acquire": "locks",
+}
+
+// mayHaveActedWarning is the line a failed request that changes something
+// ends with. It names the command that shows what the server did with a
+// request to path, so the operator checks the thing they tried to change. A
+// path with no such command gets the warning without one.
+func mayHaveActedWarning(path string) string {
+	const warning = "The server may already have acted on this request."
+	// The endpoint may carry a path of its own ahead of the API path.
+	if i := strings.LastIndex(path, "/api/"); i >= 0 {
+		path = path[i:]
+	}
+	command, ok := checkCommands[path]
+	if !ok {
+		return warning + " Check what it did before you send it again."
+	}
+	return fmt.Sprintf("%s Run '%s' to check before you send it again.", warning, cliname.Command(command))
+}
+
+// changesServerState reports whether a request with this method can change
+// something on the server. An empty method is a read, since nothing says it
+// changed anything.
+func changesServerState(method string) bool {
+	return method != "" && !strings.EqualFold(method, http.MethodGet) && !strings.EqualFold(method, http.MethodHead)
+}
+
+// failedRequestPath returns the URL path of the request the HTTP client
+// failed to complete, or "" when the cause does not name it.
+func failedRequestPath(err error) string {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return ""
+	}
+	u, parseErr := url.Parse(urlErr.URL)
+	if parseErr != nil {
+		return ""
+	}
+	return u.Path
 }
 
 // isConnectionRefused reports whether the server's host refused the
@@ -652,7 +717,8 @@ func mayHaveReachedServer(err error) bool {
 	if !errors.As(err, &urlErr) {
 		return false
 	}
-	if urlErr.Op == "Get" || urlErr.Op == "Head" {
+	// The HTTP client records the method as "Post", not "POST".
+	if !changesServerState(urlErr.Op) {
 		return false
 	}
 	var opErr *net.OpError

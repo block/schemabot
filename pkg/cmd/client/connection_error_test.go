@@ -53,6 +53,32 @@ func droppingServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// truncatingServer reads each request, starts answering it with status, and
+// then cuts the answer off partway through its body, as a server shutting
+// down mid-response does.
+func truncatingServer(t *testing.T, status int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		// A declared length the body never reaches makes the early end
+		// visible to the client.
+		w.Header().Set("Content-Length", "64")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"accepted":`))
+		_ = http.NewResponseController(w).Flush()
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// truncatedOK is a truncatingServer whose cut-off answer reports success.
+func truncatedOK(t *testing.T) *httptest.Server {
+	t.Helper()
+	return truncatingServer(t, http.StatusOK)
+}
+
 // closedPortEndpoint returns an endpoint on a loopback port nothing listens on.
 func closedPortEndpoint(t *testing.T) string {
 	t.Helper()
@@ -72,7 +98,14 @@ func requireConnectionError(t *testing.T, err error) *ConnectionError {
 	return connErr
 }
 
-var statusHint = "Run '" + cliname.Command("status") + "' to check before you send it again."
+const mayHaveActed = "The server may already have acted on this request."
+
+// checkHint is the end of the warning when command shows what the server did.
+func checkHint(command string) string {
+	return "Run '" + cliname.Command(command) + "' to check before you send it again."
+}
+
+var statusHint = checkHint("status")
 
 // An apply request that times out after the server read it may still have
 // started the apply. The operator sees that the request timed out, the
@@ -116,6 +149,86 @@ func TestDroppedPostNamesTheCauseAndWarnsItMayHaveTakenEffect(t *testing.T) {
 	msg := requireConnectionError(t, err).Error()
 	assert.Contains(t, msg, "connection failed: "+srv.URL+": EOF")
 	assert.Contains(t, msg, statusHint)
+}
+
+// A stop is recorded before the server acknowledges it. When the 202 answer is
+// cut off partway through, the stop still takes effect, so the operator gets
+// the same warning as when no answer arrived at all.
+func TestTruncatedAcceptedStopWarnsItMayHaveTakenEffect(t *testing.T) {
+	srv := truncatingServer(t, http.StatusAccepted)
+
+	var result map[string]any
+	err := doPostInto(srv.URL, "/api/stop", map[string]string{"apply_id": "apply-abc"}, &result)
+
+	var readErr *ResponseReadError
+	require.ErrorAs(t, err, &readErr)
+	assert.Equal(t, "read response: unexpected EOF\n"+mayHaveActed+" "+statusHint, err.Error())
+}
+
+// A read whose answer is cut off changed nothing, so it carries no warning.
+func TestTruncatedGetCarriesNoWarning(t *testing.T) {
+	srv := truncatingServer(t, http.StatusOK)
+
+	var result map[string]any
+	err := doGetIntoWithClient(t.Context(), srv.Client(), srv.URL, "/api/status", &result)
+
+	var readErr *ResponseReadError
+	require.ErrorAs(t, err, &readErr)
+	assert.Equal(t, "read response: unexpected EOF", err.Error())
+}
+
+// The warning sends the operator to the command that shows the thing they
+// tried to change: the settings after a settings update, the locks after a
+// lock change. It does so whether no answer arrived or the answer was cut off.
+func TestWarningNamesTheCommandThatShowsWhatTheRequestChanged(t *testing.T) {
+	releaseLock := func(endpoint string) error {
+		return ReleaseLock(endpoint, "orders", "mysql", "cli:alice")
+	}
+	acquireLock := func(endpoint string) error {
+		_, err := AcquireLock(endpoint, "orders", "mysql", "cli:alice", "", 0)
+		return err
+	}
+	setSetting := func(endpoint string) error {
+		return SetSetting(endpoint, "require_review", "true")
+	}
+	tests := []struct {
+		name     string
+		server   func(t *testing.T) *httptest.Server
+		basePath string
+		send     func(endpoint string) error
+		wantHint string
+	}{
+		{name: "settings update, no answer", server: droppingServer, send: setSetting, wantHint: checkHint("settings")},
+		{name: "settings update, answer cut off", server: truncatedOK, send: setSetting, wantHint: checkHint("settings")},
+		{name: "lock release, no answer", server: droppingServer, send: releaseLock, wantHint: checkHint("locks")},
+		{name: "lock release, answer cut off", server: truncatedOK, send: releaseLock, wantHint: checkHint("locks")},
+		{name: "lock acquire, no answer", server: droppingServer, send: acquireLock, wantHint: checkHint("locks")},
+		{name: "lock acquire, answer cut off", server: truncatedOK, send: acquireLock, wantHint: checkHint("locks")},
+		{name: "endpoint with a path of its own", server: droppingServer, basePath: "/schemabot", send: setSetting, wantHint: checkHint("settings")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := tc.server(t)
+
+			err := tc.send(srv.URL + tc.basePath)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "\n"+mayHaveActed+" "+tc.wantHint)
+		})
+	}
+}
+
+// A request with no single command that shows its result still warns, without
+// pointing the operator at a command that cannot answer the question.
+func TestWarningNamesNoCommandWhenNoneShowsTheResult(t *testing.T) {
+	srv := droppingServer(t)
+
+	var result map[string]any
+	err := doPostInto(srv.URL, "/api/checks/synthesize", map[string]string{"repository": "acme/orders"}, &result)
+
+	msg := requireConnectionError(t, err).Error()
+	assert.Contains(t, msg, "\n"+mayHaveActed+" Check what it did before you send it again.")
+	assert.NotContains(t, msg, "Run '")
 }
 
 // A refused connection never delivered the request, so the message stays the

@@ -763,7 +763,7 @@ func AcquireLock(endpoint, database, dbType, owner, repo string, pr int) (*LockI
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, &ResponseReadError{Method: http.MethodPost, Path: "/api/locks/acquire", Err: err}
 	}
 
 	// Check for lock conflict (HTTP 409)
