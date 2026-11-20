@@ -88,6 +88,11 @@ func TestFreezes(t *testing.T, h Harness) {
 
 		_, err = store.Freezes().Create(ctx, plannedFreeze("production", start, start.Add(time.Hour), "manual-chill", "event-1"))
 		require.NoError(t, err, "another source may reuse the external id")
+
+		// External ids belong to the source and compare byte for byte on
+		// both dialects, so ids differing only in case are distinct entries.
+		_, err = store.Freezes().Create(ctx, plannedFreeze("production", start, start.Add(time.Hour), "chill-calendar", "Event-1"))
+		require.NoError(t, err, "external ids are case-sensitive")
 	})
 
 	t.Run("Create_ManyManualFreezes", func(t *testing.T) {

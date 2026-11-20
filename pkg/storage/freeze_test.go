@@ -88,6 +88,8 @@ func TestEnvironmentFreezeValidate(t *testing.T) {
 		{name: "start", mutate: func(f *EnvironmentFreeze) { f.StartsAt = time.Time{} }, want: "start time is required"},
 		{name: "end before start", mutate: func(f *EnvironmentFreeze) { f.EndsAt = &before }, want: "end time must be after"},
 		{name: "planned without end", mutate: func(f *EnvironmentFreeze) { f.Kind = FreezeKindPlanned }, want: "planned freeze needs an end time"},
+		{name: "blank deployment", mutate: func(f *EnvironmentFreeze) { f.Deployments = []string{"cash", " "} }, want: "deployments must not contain an empty name"},
+		{name: "blank database", mutate: func(f *EnvironmentFreeze) { f.Databases = []string{""} }, want: "databases must not contain an empty name"},
 		{name: "reason", mutate: func(f *EnvironmentFreeze) { f.Reason = "  " }, want: "reason is required"},
 		{name: "creator", mutate: func(f *EnvironmentFreeze) { f.CreatedBy = "" }, want: "creator is required"},
 		{name: "source", mutate: func(f *EnvironmentFreeze) { f.Source = "" }, want: "source is required"},

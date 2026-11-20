@@ -11,7 +11,7 @@ CREATE TABLE `environment_freezes` (
   `reason` text NOT NULL,
   `created_by` varchar(255) NOT NULL,
   `source` varchar(64) NOT NULL,
-  `external_id` varchar(255) DEFAULT NULL,
+  `external_id` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,
   `lifted_by` varchar(255) DEFAULT NULL,
   `lift_reason` text,
   `lifted_at` datetime(6) DEFAULT NULL,

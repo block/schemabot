@@ -169,13 +169,12 @@ func freezeEnvironmentFilter(environment string) (string, []any) {
 }
 
 // freezeScopeValue renders a scope column value: the canonical entries as a
-// JSON array, where an empty array means the whole environment.
+// JSON array, where an empty array means the whole environment. Validate
+// already refused blank entries, so none is dropped here.
 func freezeScopeValue(scope []string) (string, error) {
 	canonical := make([]string, 0, len(scope))
 	for _, entry := range scope {
-		if key := storage.CanonicalKey(entry); key != "" {
-			canonical = append(canonical, key)
-		}
+		canonical = append(canonical, storage.CanonicalKey(entry))
 	}
 	encoded, err := json.Marshal(canonical)
 	if err != nil {

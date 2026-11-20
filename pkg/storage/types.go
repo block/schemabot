@@ -499,6 +499,18 @@ func scopeIncludes(scope []string, value string) bool {
 	return false
 }
 
+// hasBlankEntry reports whether scope names an empty entry. An empty scope
+// list covers everything, so a blank entry must be refused rather than
+// dropped: dropping it would widen the freeze to the whole level.
+func hasBlankEntry(scope []string) bool {
+	for _, entry := range scope {
+		if strings.TrimSpace(entry) == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // Validate reports the first problem that makes the freeze unfit to store.
 func (f *EnvironmentFreeze) Validate() error {
 	switch {
@@ -518,6 +530,10 @@ func (f *EnvironmentFreeze) Validate() error {
 		return errors.New("freeze end time must be after its start time")
 	case f.Kind == FreezeKindPlanned && f.EndsAt == nil:
 		return errors.New("a planned freeze needs an end time")
+	case hasBlankEntry(f.Deployments):
+		return errors.New("freeze deployments must not contain an empty name")
+	case hasBlankEntry(f.Databases):
+		return errors.New("freeze databases must not contain an empty name")
 	case strings.TrimSpace(f.Reason) == "":
 		return errors.New("freeze reason is required")
 	case strings.TrimSpace(f.CreatedBy) == "":
