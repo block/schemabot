@@ -2173,7 +2173,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 			Database:    plan.Database,
 			Repository:  plan.Repository,
 			Action:      storage.FreezeOverrideActionApply,
-			TargetID:    applyOverrideTarget(plan, req.Target),
+			TargetID:    applyOverrideTarget(plan, req.Target, s.applyOverrideMembers(plan.Database, req.Environment, plan.Deployment, req.Target)),
 			Override:    strings.TrimSpace(req.Override),
 		}, resolveCaller(ctx, req.Caller))
 		if err != nil {

@@ -187,7 +187,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	assert.Equal(t, []string{"freeze freeze-incident"}, stored.Blockers)
 	assert.Equal(t, "rita", stored.RequestedBy)
 	assert.Equal(t, "fix for incident 42", stored.Reason)
-	assert.Equal(t, []string{"staging", "apply", applyOverrideTarget(executeApplyTestPlan(), "")}, []string{stored.Environment, stored.Action, stored.TargetID})
+	assert.Equal(t, []string{"staging", "apply", gateApplyTarget(svc)}, []string{stored.Environment, stored.Action, stored.TargetID})
 	assert.Equal(t, freezeTestNow.Add(storage.FreezeOverrideMaxLifetime), stored.ExpiresAt)
 	assert.Nil(t, applies.apply, "a refused apply must not be created")
 	rec = postAs(t, mux, overrideRequester, "/api/apply", overrideApplyBody)
@@ -443,7 +443,7 @@ func TestFreezeOverrideDoesNotCoverAFreezeLandingBeforeTheWrite(t *testing.T) {
 	mock.applies = epochCheckingApplyStore{ApplyStore: applies, freezes: freezes}
 	store := withOverrides(svc)
 	request, err := store.Create(t.Context(), &storage.FreezeOverrideRequest{
-		Identifier: "ovr-1", Environment: "staging", Action: storage.FreezeOverrideActionApply, TargetID: applyOverrideTarget(executeApplyTestPlan(), ""),
+		Identifier: "ovr-1", Environment: "staging", Action: storage.FreezeOverrideActionApply, TargetID: gateApplyTarget(svc),
 		Database: "testdb", Blockers: []string{"freeze freeze-incident"}, Reason: "fix", RequestedBy: "rita", ExpiresAt: freezeTestNow.Add(time.Hour),
 	})
 	require.NoError(t, err)
@@ -557,18 +557,30 @@ func TestAuthorizeFreezeApprove(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "none are configured")
 }
 
+// gateApplyTarget is the override target of the gate tests' apply.
+func gateApplyTarget(svc *Service) string {
+	plan := executeApplyTestPlan()
+	return applyOverrideTarget(plan, "", svc.applyOverrideMembers(plan.Database, "staging", plan.Deployment, ""))
+}
+
 // An apply's override covers the schema it asks for, not one plan: a
 // repeated command plans afresh and must still find its approval.
 func TestApplyOverrideTargetIsTheSchemaNotThePlan(t *testing.T) {
 	plan := executeApplyTestPlan()
 	replanned := executeApplyTestPlan()
 	replanned.PlanIdentifier = "plan-2"
-	assert.Equal(t, applyOverrideTarget(plan, ""), applyOverrideTarget(replanned, ""))
+	one := []string{"main"}
+	assert.Equal(t, applyOverrideTarget(plan, "", one), applyOverrideTarget(replanned, "", one))
 
 	changed := executeApplyTestPlan()
 	changed.SchemaFiles = schema.SchemaFiles{"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)"}}}
-	assert.NotEqual(t, applyOverrideTarget(plan, ""), applyOverrideTarget(changed, ""))
-	assert.NotEqual(t, applyOverrideTarget(plan, ""), applyOverrideTarget(plan, "member-a"))
+	assert.NotEqual(t, applyOverrideTarget(plan, "", one), applyOverrideTarget(changed, "", one))
+	assert.NotEqual(t, applyOverrideTarget(plan, "", one), applyOverrideTarget(plan, "member-a", []string{"member-a"}))
+
+	// A rollout that gained a member is a new target: the approval named
+	// the members it was asked for.
+	assert.NotEqual(t, applyOverrideTarget(plan, "", one), applyOverrideTarget(replanned, "", []string{"main", "eu"}))
+	assert.Equal(t, applyOverrideTarget(plan, "", []string{"main", "eu"}), applyOverrideTarget(plan, "", []string{"eu", "main"}), "member order does not matter")
 }
 
 // The gate records only a verified requester. An in-process caller with no

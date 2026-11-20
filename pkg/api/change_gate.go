@@ -352,18 +352,41 @@ func overrideCaller(ctx context.Context) (string, bool) {
 }
 
 // applyOverrideTarget names what an override of an apply covers: the
-// database, the rollout member it is narrowed to, and the schema it asks
-// for. It is not the plan's identifier, because each apply from a pull
-// request or the CLI plans afresh, and a repeated command would never find
-// its approval. A changed schema is a new target and needs a new approval.
-func applyOverrideTarget(plan *storage.Plan, target string) string {
-	files, err := json.Marshal(plan.SchemaFiles) // map keys marshal sorted
+// database, the rollout member it is narrowed to, the members it runs on and
+// the schema it asks for. It is not the plan's identifier, because each apply
+// from a pull request or the CLI plans afresh, and a repeated command would
+// never find its approval. A changed schema, or a rollout that gained or lost
+// a member, is a new target and needs a new approval.
+func applyOverrideTarget(plan *storage.Plan, target string, members []string) string {
+	sorted := slices.Sorted(slices.Values(members))
+	covered, err := json.Marshal(struct {
+		Files   any      `json:"files"` // map keys marshal sorted
+		Members []string `json:"members"`
+	}{plan.SchemaFiles, sorted})
 	if err != nil {
 		// Fail safe: a target no approval names.
 		return plan.PlanIdentifier
 	}
-	sum := sha256.Sum256(files)
+	sum := sha256.Sum256(covered)
 	return fmt.Sprintf("%s/%s@%x", plan.Database, target, sum[:8])
+}
+
+// applyOverrideMembers lists the rollout members an apply runs on: the one it
+// is narrowed to, or every configured member. When the config does not
+// resolve them, the apply runs on the plan's own deployment alone.
+func (s *Service) applyOverrideMembers(database, environment, deployment, target string) []string {
+	if target != "" {
+		return []string{target}
+	}
+	targets, err := s.config.ResolveDatabaseTargets(database, environment)
+	if err != nil || len(targets) == 0 {
+		return []string{deployment}
+	}
+	members := make([]string, 0, len(targets))
+	for _, t := range targets {
+		members = append(members, t.MemberID())
+	}
+	return members
 }
 
 // isFreezeAdmissionRefusal reports whether the admission write refused the
