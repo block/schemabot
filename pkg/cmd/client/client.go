@@ -358,6 +358,13 @@ func CallApplyAPI(endpoint, planID, environment, caller string, options map[stri
 // runs, a client capability rather than consent; see
 // apitypes.ApplyRequest.RendersRollout.
 func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, rendersRollout bool, options map[string]string) (*apitypes.ApplyResponse, error) {
+	return CallApplyAPIWithOverride(endpoint, planID, environment, caller, target, rendersRollout, "", options)
+}
+
+// CallApplyAPIWithOverride is CallApplyAPIForTarget that also asks a freeze
+// approver to let the apply through when a freeze refuses it. An empty override
+// asks for nothing.
+func CallApplyAPIWithOverride(endpoint, planID, environment, caller, target string, rendersRollout bool, override string, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{
 		PlanID:         planID,
 		Environment:    environment,
@@ -365,6 +372,7 @@ func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string,
 		Options:        options,
 		Target:         target,
 		RendersRollout: rendersRollout,
+		Override:       strings.TrimSpace(override),
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {
@@ -376,8 +384,8 @@ func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string,
 // callControlAPI posts an apply-scoped control request to path and decodes the
 // typed response. Control operations share the same ControlRequest body and
 // differ only by endpoint path and response type.
-func callControlAPI[Resp any](endpoint, path, environment, applyID string) (*Resp, error) {
-	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
+func callControlAPI[Resp any](endpoint, path, environment, applyID, override string) (*Resp, error) {
+	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner(), Override: strings.TrimSpace(override)}
 	var result Resp
 	if err := doPostInto(endpoint, path, req, &result); err != nil {
 		return nil, err
@@ -387,7 +395,13 @@ func callControlAPI[Resp any](endpoint, path, environment, applyID string) (*Res
 
 // CallCutoverAPI calls the cutover API and returns the typed result.
 func CallCutoverAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/cutover", environment, applyID)
+	return CallCutoverAPIWithOverride(endpoint, environment, applyID, "")
+}
+
+// CallCutoverAPIWithOverride is CallCutoverAPI that also asks a freeze approver
+// to let the cutover through when a freeze refuses it.
+func CallCutoverAPIWithOverride(endpoint, environment, applyID, override string) (*apitypes.ControlResponse, error) {
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/cutover", environment, applyID, override)
 }
 
 // GetProgress fetches progress for a schema change by apply ID.
@@ -652,32 +666,38 @@ func isSchemaFile(name string) bool {
 
 // CallStopAPI calls the stop API and returns the typed result.
 func CallStopAPI(endpoint, environment, applyID string) (*apitypes.StopResponse, error) {
-	return callControlAPI[apitypes.StopResponse](endpoint, "/api/stop", environment, applyID)
+	return callControlAPI[apitypes.StopResponse](endpoint, "/api/stop", environment, applyID, "")
 }
 
 // CallCancelAPI calls the cancel API and returns the typed result.
 func CallCancelAPI(endpoint, environment, applyID string) (*apitypes.CancelResponse, error) {
-	return callControlAPI[apitypes.CancelResponse](endpoint, "/api/cancel", environment, applyID)
+	return callControlAPI[apitypes.CancelResponse](endpoint, "/api/cancel", environment, applyID, "")
 }
 
 // CallStartAPI calls the start API and returns the typed result.
 func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartResponse, error) {
-	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID)
+	return CallStartAPIWithOverride(endpoint, environment, applyID, "")
+}
+
+// CallStartAPIWithOverride is CallStartAPI that also asks a freeze approver to
+// let the start through when a freeze refuses it.
+func CallStartAPIWithOverride(endpoint, environment, applyID, override string) (*apitypes.StartResponse, error) {
+	return callControlAPI[apitypes.StartResponse](endpoint, "/api/start", environment, applyID, override)
 }
 
 // CallReleaseAPI calls the release API and returns the typed result.
 func CallReleaseAPI(endpoint, environment, applyID string) (*apitypes.ReleaseResponse, error) {
-	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID)
+	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID, "")
 }
 
 // CallRevertAPI calls the revert API and returns the typed result.
 func CallRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/revert", environment, applyID)
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/revert", environment, applyID, "")
 }
 
 // CallSkipRevertAPI calls the skip-revert API and returns the typed result.
 func CallSkipRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
-	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/skip-revert", environment, applyID)
+	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/skip-revert", environment, applyID, "")
 }
 
 // ExitWithJSON outputs a JSON error response and exits with code 1.

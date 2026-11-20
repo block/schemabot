@@ -2647,7 +2647,7 @@ freeze:
 
 The middleware admits `freeze.groups` members to write-tier endpoints, and the freeze handlers (`POST /api/freezes`, `POST /api/freezes/{id}/lift`) allow them. Approving an override (`POST /api/freezes/overrides/{id}/approve`) is for `freeze.groups` members only, not `write_groups`: the caller must be verified and must not be the requester. Every other mutating handler still requires `write_groups` or a database's `operator_groups`, and database operator grants do not cover freezes, which reach past any one database. Members also get the read tier, deployment-wide. `freeze.groups` requires `auth.type: forward_auth`, and its entries must be unique; either mistake is a startup error. Under other auth types, freezes follow the plain admin write gate.
 
-The CLI sets, lists, shows and lifts freezes and approves override requests: see [Freeze an environment](cli.md#freeze-an-environment).
+The CLI sets, lists, shows and lifts freezes and approves override requests, and asks for an override with `--override` on `apply`, `start` and `cutover`: see [Freeze an environment](cli.md#freeze-an-environment).
 
 ### Tenant-scoped command routing
 

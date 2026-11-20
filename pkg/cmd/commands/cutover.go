@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -12,7 +13,8 @@ import (
 // CutoverCmd triggers cutover for a deferred schema change.
 type CutoverCmd struct {
 	ControlFlags
-	Watch bool `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
+	Watch    bool   `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
+	Override string `help:"Reason to ask a freeze approver to let this change through a freeze" name:"override"`
 }
 
 // Run executes the cutover command.
@@ -53,9 +55,10 @@ func (cmd *CutoverCmd) Run(ctx context.Context, g *Globals) error {
 	var cutoverResult *apitypes.ControlResponse
 	err = withLoading("Requesting cutover...", true, func() error {
 		var cutoverErr error
-		cutoverResult, cutoverErr = client.CallCutoverAPI(ep, cmd.Environment, cmd.ApplyID)
+		cutoverResult, cutoverErr = client.CallCutoverAPIWithOverride(ep, cmd.Environment, cmd.ApplyID, cmd.Override)
 		return cutoverErr
 	})
+	err = reportChangeGate(err, cmd.Environment, "cutover", strings.TrimSpace(cmd.Override) != "", false)
 	if err != nil {
 		return err
 	}

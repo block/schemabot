@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -158,4 +159,57 @@ func WriteFreezeOverride(r apitypes.FreezeOverrideRequest) {
 	row("Requested by", ui.TerminalSafeLine(r.RequestedBy))
 	row("Reason", ui.TerminalSafeLine(r.Reason))
 	row("Expires", freezeTime(r.ExpiresAt))
+}
+
+// ChangeGateRefusedData is what a freeze refusal of an apply, start or cutover
+// tells the operator.
+type ChangeGateRefusedData struct {
+	Environment string
+	// Operation is "apply", "start" or "cutover".
+	Operation string
+	Blockers  []apitypes.ChangeGateBlocker
+	// OverrideRequest is the request SchemaBot recorded for this caller, nil
+	// when it recorded none.
+	OverrideRequest *apitypes.FreezeOverrideRequest
+	// OverrideAsked says the operator passed --override.
+	OverrideAsked bool
+	// Message is the server's refusal, which says why no override request
+	// was recorded when one was asked for.
+	Message string
+}
+
+// ChangeGateRefusedText is the refusal as lines, so a caller that cannot print
+// it to stdout can carry the same words in an error.
+func ChangeGateRefusedText(d ChangeGateRefusedData) []string {
+	outcome := "This change did not start."
+	if d.Operation == "cutover" {
+		outcome = "This cutover did not start."
+	}
+	lines := []string{fmt.Sprintf("✗ %s is frozen. %s", ui.TerminalSafeLine(d.Environment), outcome)}
+	for _, b := range d.Blockers {
+		until := "until lifted"
+		if b.EndsAt != nil {
+			until = "until " + freezeTime(*b.EndsAt)
+		}
+		lines = append(lines, fmt.Sprintf("   %s  %s  (%s)", ui.TerminalSafeLine(b.ID), ui.TerminalSafeLine(b.Reason), until))
+	}
+	switch {
+	case d.OverrideRequest != nil:
+		id := ui.TerminalSafeLine(d.OverrideRequest.ID)
+		lines = append(lines, fmt.Sprintf("Override requested: %s. A freeze approver other than you must run '%s', then run this command again.",
+			id, cliname.Command("freeze", "approve", id)))
+	case !d.OverrideAsked:
+		lines = append(lines, `To ask for an override, run the same command with --override "<reason>".`)
+	default:
+		lines = append(lines, "No override request was recorded. SchemaBot said: "+ui.TerminalSafeLine(d.Message))
+	}
+	return lines
+}
+
+// WriteChangeGateRefused writes the refusal of an apply, start or cutover by a
+// freeze.
+func WriteChangeGateRefused(d ChangeGateRefusedData) {
+	for _, line := range ChangeGateRefusedText(d) {
+		fmt.Println(line)
+	}
 }
