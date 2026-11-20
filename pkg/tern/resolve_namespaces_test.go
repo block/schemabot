@@ -24,6 +24,13 @@ func newResolveTestClient(databaseType, dsn string, overrides map[string]string)
 	}, logger: slog.New(slog.DiscardHandler)}
 }
 
+func resolveScope(t *testing.T, c *LocalClient) string {
+	t.Helper()
+	resp, err := c.ResolveNamespaces(t.Context(), &ternv1.ResolveNamespacesRequest{Database: "shop", Namespaces: []string{"shop"}})
+	require.NoError(t, err)
+	return resp.GetScope()
+}
+
 func resolveNamespaces(t *testing.T, c *LocalClient, namespaces ...string) (map[string]string, error) {
 	t.Helper()
 	resp, err := c.ResolveNamespaces(t.Context(), &ternv1.ResolveNamespacesRequest{Database: "shop", Namespaces: namespaces})
@@ -72,6 +79,19 @@ func TestLocalClientResolveNamespaces(t *testing.T) {
 		assert.ErrorContains(t, err, "does not authorize namespace")
 	})
 
+	t.Run("a MySQL default namespace planned and applied in different schemas is refused", func(t *testing.T) {
+		c := newResolveTestClient(storage.DatabaseTypeMySQL, "root@tcp(localhost:3306)/", nil)
+		_, err := resolveNamespaces(t, c, "default")
+		require.ErrorContains(t, err, `namespace "default" is planned in schema "default" but applied in schema "shop"`)
+	})
+
+	t.Run("a MySQL default namespace planned and applied in one schema resolves to it", func(t *testing.T) {
+		c := newResolveTestClient(storage.DatabaseTypeMySQL, "root@tcp(localhost:3306)/", map[string]string{"default": "shop_eu", "shop": "shop_eu"})
+		schemas, err := resolveNamespaces(t, c, "default")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"default": "shop_eu"}, schemas)
+	})
+
 	t.Run("an empty MySQL namespace on a namespace-free DSN is refused", func(t *testing.T) {
 		c := newResolveTestClient(storage.DatabaseTypeMySQL, "root@tcp(localhost:3306)/", nil)
 		_, err := resolveNamespaces(t, c, "")
@@ -83,6 +103,26 @@ func TestLocalClientResolveNamespaces(t *testing.T) {
 		schemas, err := resolveNamespaces(t, c, "shop", "shop_sharded")
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{"shop": "shop", "shop_sharded": "shop_sharded"}, schemas)
+	})
+
+	t.Run("MySQL and Strata schemas are named across the whole target", func(t *testing.T) {
+		assert.Empty(t, resolveScope(t, newResolveTestClient(storage.DatabaseTypeMySQL, "root@tcp(localhost:3306)/", nil)))
+		assert.Empty(t, resolveScope(t, newResolveTestClient(storage.DatabaseTypeStrata, "", nil)))
+	})
+
+	t.Run("PostgreSQL schemas belong to the database the DSN opens", func(t *testing.T) {
+		assert.Equal(t, "shop_eu", resolveScope(t, newResolveTestClient(storage.DatabaseTypePostgres, "postgres://localhost:5432/shop_eu", nil)))
+		assert.Equal(t, "ledger", resolveScope(t, newResolveTestClient(storage.DatabaseTypePostgres, "host=localhost dbname=ledger", nil)))
+	})
+
+	t.Run("Vitess keyspaces belong to the PlanetScale database the target addresses", func(t *testing.T) {
+		named := newResolveTestClient(storage.DatabaseTypeVitess, "", nil)
+		named.config.Metadata = map[string]string{"organization": "acme", "database": "shop-ps"}
+		assert.Equal(t, "acme/shop-ps", resolveScope(t, named))
+
+		unnamed := newResolveTestClient(storage.DatabaseTypeVitess, "", nil)
+		unnamed.config.Metadata = map[string]string{"organization": "acme"}
+		assert.Equal(t, "acme/shop", resolveScope(t, unnamed), "without database metadata the SchemaBot database names the PlanetScale database")
 	})
 
 	t.Run("an engine type the client does not know is unsupported", func(t *testing.T) {
@@ -109,31 +149,41 @@ func (c *resolveAnsweringClient) ResolveNamespaces(context.Context, *ternv1.Reso
 	return c.resp, c.err
 }
 
-// Over gRPC, a data plane that predates the RPC and one whose engine cannot
-// resolve namespaces both reach the control plane as
-// ErrResolveNamespacesUnsupported, so the caller fails closed the same way for
-// each. Any other failure stays an ordinary error naming the database and
-// target, and a resolution passes through unchanged.
+// Over gRPC, a data plane that predates the RPC reaches the control plane as
+// ErrResolveNamespacesUnimplemented, which upgrading it fixes, and one whose
+// engine cannot resolve namespaces as ErrResolveNamespacesUnsupported, which
+// upgrading does not. Both fail closed. Any other failure stays an ordinary
+// error naming the database and target, and a resolution passes through
+// unchanged.
 func TestGRPCClientResolveNamespaces(t *testing.T) {
 	req := &ternv1.ResolveNamespacesRequest{Database: "shop", Type: storage.DatabaseTypeMySQL, Target: "shop-eu", Namespaces: []string{"shop"}}
 	logger := slog.New(slog.DiscardHandler)
 
 	t.Run("a resolution passes through", func(t *testing.T) {
-		client := newRetryTestClient(t, NewServer(&resolveAnsweringClient{resp: &ternv1.ResolveNamespacesResponse{Schemas: map[string]string{"shop": "shop_eu"}}}, logger))
+		client := newRetryTestClient(t, NewServer(&resolveAnsweringClient{resp: &ternv1.ResolveNamespacesResponse{Scope: "shop_db", Schemas: map[string]string{"shop": "shop_eu"}}}, logger))
 		resp, err := client.ResolveNamespaces(t.Context(), req)
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{"shop": "shop_eu"}, resp.GetSchemas())
+		assert.Equal(t, "shop_db", resp.GetScope())
 	})
 	t.Run("an engine that cannot resolve namespaces", func(t *testing.T) {
 		client := newRetryTestClient(t, NewServer(&resolveAnsweringClient{err: ErrResolveNamespacesUnsupported}, logger))
 		_, err := client.ResolveNamespaces(t.Context(), req)
 		require.ErrorIs(t, err, ErrResolveNamespacesUnsupported)
+		assert.NotErrorIs(t, err, ErrResolveNamespacesUnimplemented)
 		assert.ErrorContains(t, err, "database shop target shop-eu")
+	})
+	t.Run("a data plane whose client cannot resolve namespaces", func(t *testing.T) {
+		client := newRetryTestClient(t, NewServer(&resolveIncapableClient{}, logger))
+		_, err := client.ResolveNamespaces(t.Context(), req)
+		require.ErrorIs(t, err, ErrResolveNamespacesUnsupported)
+		assert.NotErrorIs(t, err, ErrResolveNamespacesUnimplemented)
 	})
 	t.Run("a data plane that predates the RPC", func(t *testing.T) {
 		client := newRetryTestClient(t, &ternv1.UnimplementedTernServer{})
 		_, err := client.ResolveNamespaces(t.Context(), req)
-		require.ErrorIs(t, err, ErrResolveNamespacesUnsupported)
+		require.ErrorIs(t, err, ErrResolveNamespacesUnimplemented)
+		assert.NotErrorIs(t, err, ErrResolveNamespacesUnsupported)
 	})
 	t.Run("a resolution that fails", func(t *testing.T) {
 		client := newRetryTestClient(t, NewServer(&resolveAnsweringClient{err: errors.New(`target does not authorize namespace "shop"`)}, logger))
@@ -142,6 +192,20 @@ func TestGRPCClientResolveNamespaces(t *testing.T) {
 		assert.ErrorContains(t, err, "database shop target shop-eu")
 		assert.NotErrorIs(t, err, ErrResolveNamespacesUnsupported)
 	})
+}
+
+// resolveIncapableClient is a client an embedder supplies that implements
+// Client but not NamespaceResolver.
+type resolveIncapableClient struct {
+	Client
+}
+
+// A client that does not implement NamespaceResolver still satisfies Client,
+// and asking it to resolve namespaces fails closed rather than guessing.
+func TestResolveNamespacesWithAClientThatCannotResolve(t *testing.T) {
+	_, err := ResolveNamespacesWith(t.Context(), &resolveIncapableClient{}, &ternv1.ResolveNamespacesRequest{Database: "shop"})
+	require.ErrorIs(t, err, ErrResolveNamespacesUnsupported)
+	assert.ErrorContains(t, err, "for database shop cannot resolve namespaces")
 }
 
 // Through the TargetRouter, a namespace resolution is answered from the
@@ -209,4 +273,40 @@ func (r inventoryTargets) ResolveTarget(_ context.Context, req inventory.Request
 	}
 	target.Target = req.Target
 	return &target, nil
+}
+
+// The resolver answers with the schema a plan connects to and the schema an
+// apply of the plan's recorded namespace connects to, so the shared schema
+// check compares the schema the data plane writes. For every namespace,
+// including the MySQL "default" and its alias for the database, the resolved
+// schema matches both connections or the namespace is refused.
+func TestLocalClientResolveNamespacesMatchesThePlannerConnection(t *testing.T) {
+	for name, overrides := range map[string]map[string]string{
+		"no overrides":                        nil,
+		"default and database share a schema": {"default": "shop_eu", "shop": "shop_eu", "ledger": "ledger_eu"},
+		"default and database differ":         {"default": "shop_a", "shop": "shop_b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newResolveTestClient(storage.DatabaseTypeMySQL, "root@tcp(localhost:3306)/", overrides)
+			for _, namespace := range []string{"default", "shop", "ledger"} {
+				schemas, resolveErr := resolveNamespaces(t, c, namespace)
+				planned, planErr := c.credentialsForMySQLNamespace(namespace)
+				applied, applyErr := c.credentialsForMySQLNamespace(c.planNamespace(namespace))
+				if planErr != nil || applyErr != nil {
+					require.Error(t, resolveErr, "namespace %q: a connection the data plane cannot open must not resolve", namespace)
+					continue
+				}
+				plannedDB, err := mysqlDSNDatabase(planned.DSN)
+				require.NoError(t, err)
+				appliedDB, err := mysqlDSNDatabase(applied.DSN)
+				require.NoError(t, err)
+				if plannedDB != appliedDB {
+					require.Error(t, resolveErr, "namespace %q is planned in %q and applied in %q, so it has no single schema", namespace, plannedDB, appliedDB)
+					continue
+				}
+				require.NoError(t, resolveErr, "namespace %q", namespace)
+				assert.Equal(t, plannedDB, schemas[namespace], "namespace %q", namespace)
+			}
+		})
+	}
 }

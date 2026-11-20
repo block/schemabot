@@ -96,8 +96,10 @@ service Tern {
   // databases' namespaces as separate tables.
   //
   // It is read-only and runs nothing on the target. A namespace the
-  // target does not authorize fails the request, and a data plane that
-  // predates this RPC returns UNIMPLEMENTED; the caller fails closed on both.
+  // target does not authorize fails the request, an engine that cannot
+  // resolve namespaces returns FAILED_PRECONDITION, and a data plane that
+  // predates this RPC returns UNIMPLEMENTED; the caller fails closed on all
+  // three.
   rpc ResolveNamespaces(ResolveNamespacesRequest) returns (ResolveNamespacesResponse) {
     option (google.api.http) = {
       post: "/v1/resolve-namespaces"
@@ -438,6 +440,12 @@ message ResolveNamespacesRequest {
 // addresses on the target.
 message ResolveNamespacesResponse {
   map<string, string> schemas = 1;
+  // The container the schemas belong to when the engine addresses one below
+  // the target: the database a PostgreSQL connection opens, or the
+  // PlanetScale organization and database a Vitess target addresses. It is
+  // empty when schema names are unique across the whole target, as MySQL
+  // databases are. Two schemas are one only when scope and name both agree.
+  string scope = 2;
 }
 
 // PullSchemaRequest requests a live schema export for a database route.

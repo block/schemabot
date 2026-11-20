@@ -177,10 +177,35 @@ var (
 	// for a database type whose engine cannot compare files.
 	ErrCompareSchemaFileChangeUnsupported = errors.New("schema file comparison unsupported for database type")
 	// ErrResolveNamespacesUnsupported marks a namespace resolution the data
-	// plane cannot answer: an engine whose namespaces it does not know how to
-	// map to schemas, or a data plane that predates the RPC.
+	// plane cannot answer for this database: its engine type has no known
+	// mapping from namespaces to schemas, or its client does not implement
+	// NamespaceResolver. Upgrading the data plane does not change the answer.
 	ErrResolveNamespacesUnsupported = errors.New("namespace resolution unsupported")
+	// ErrResolveNamespacesUnimplemented marks a data plane that predates the
+	// ResolveNamespaces RPC. Upgrading that data plane lets it answer.
+	ErrResolveNamespacesUnimplemented = errors.New("data plane predates namespace resolution")
 )
+
+// NamespaceResolver is the optional client capability behind
+// ResolveNamespaces. It reports the schema each namespace of a database
+// addresses on one of its targets, so the control plane can tell when two
+// namespaces with different names are one schema. It is read-only and runs
+// nothing on the target. Clients this package builds implement it; a client
+// supplied by an embedder that does not is refused with
+// ErrResolveNamespacesUnsupported by ResolveNamespacesWith.
+type NamespaceResolver interface {
+	ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error)
+}
+
+// ResolveNamespacesWith asks client to resolve namespaces, and fails closed
+// with ErrResolveNamespacesUnsupported when the client cannot.
+func ResolveNamespacesWith(ctx context.Context, client Client, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
+	resolver, ok := client.(NamespaceResolver)
+	if !ok {
+		return nil, fmt.Errorf("tern client %T for database %s cannot resolve namespaces: %w", client, req.GetDatabase(), ErrResolveNamespacesUnsupported)
+	}
+	return resolver.ResolveNamespaces(ctx, req)
+}
 
 // SchemaFileChangeComparer is the optional engine capability behind
 // CompareSchemaFileChange. An engine whose schema files can only be
@@ -221,12 +246,6 @@ type Client interface {
 	// each version on the target in a rolled-back transaction. It is
 	// read-only; the review gate asks it for files it cannot compare offline.
 	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
-
-	// ResolveNamespaces reports the schema each namespace of a database
-	// addresses on one of its targets, so the control plane can tell when two
-	// namespaces with different names are one schema. It is read-only and
-	// runs nothing on the target.
-	ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error)
 
 	// Apply executes a previously generated plan.
 	// Validates that the schema hasn't changed since Plan was called.

@@ -103,6 +103,7 @@ import (
 	"github.com/block/spirit/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5/pgconn"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"google.golang.org/protobuf/proto"
 
@@ -1683,11 +1684,19 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 // target without them addresses the namespace itself. An engine type this
 // client does not know is refused with ErrResolveNamespacesUnsupported, since
 // nothing says what its namespaces address.
+//
+// The response's scope names what the schemas belong to below the target, so
+// the same schema name in two PostgreSQL databases, or in two PlanetScale
+// databases, is not mistaken for one schema.
 func (c *LocalClient) ResolveNamespaces(_ context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("resolve namespaces request is required")
 	}
 	pinned, err := c.pinnedDatabase()
+	if err != nil {
+		return nil, fmt.Errorf("resolve namespaces for database %s: %w", c.config.Database, err)
+	}
+	scope, err := c.schemaScope()
 	if err != nil {
 		return nil, fmt.Errorf("resolve namespaces for database %s: %w", c.config.Database, err)
 	}
@@ -1700,15 +1709,65 @@ func (c *LocalClient) ResolveNamespaces(_ context.Context, req *ternv1.ResolveNa
 		if namespace == "" && usesPerNamespaceCredentials(c.config.Type) {
 			return nil, fmt.Errorf("resolve namespaces for database %s: MySQL namespace is required for a namespace-free target DSN", c.config.Database)
 		}
-		physical, err := c.physicalNamespace(namespace)
+		physical, err := c.resolvedNamespace(namespace)
 		if err != nil {
 			return nil, fmt.Errorf("resolve namespace %q for database %s: %w", namespace, c.config.Database, err)
 		}
 		schemas[namespace] = physical
 	}
 	c.logger.Debug("LocalClient.ResolveNamespaces: resolved namespaces",
-		"database", c.config.Database, "database_type", c.config.Type, "target", req.GetTarget(), "schemas", schemas)
-	return &ternv1.ResolveNamespacesResponse{Schemas: schemas}, nil
+		"database", c.config.Database, "database_type", c.config.Type, "target", req.GetTarget(), "scope", scope, "schemas", schemas)
+	return &ternv1.ResolveNamespacesResponse{Schemas: schemas, Scope: scope}, nil
+}
+
+// resolvedNamespace returns the one schema a namespace addresses on a target
+// whose DSN names no database. A plan connects to the namespace's own schema,
+// while its tasks are recorded under planNamespace, which maps the MySQL
+// "default" namespace to the database, and an apply connects to that. When the
+// two land in different schemas the namespace has no single answer, so it is
+// refused rather than reported as either.
+func (c *LocalClient) resolvedNamespace(namespace string) (string, error) {
+	planned, err := c.physicalNamespace(namespace)
+	if err != nil {
+		return "", err
+	}
+	recorded := c.planNamespace(namespace)
+	if recorded == namespace {
+		return planned, nil
+	}
+	applied, err := c.physicalNamespace(recorded)
+	if err != nil {
+		return "", fmt.Errorf("namespace %q is applied as %q: %w", namespace, recorded, err)
+	}
+	if applied != planned {
+		return "", fmt.Errorf("namespace %q is planned in schema %q but applied in schema %q; rename the namespace to the schema it should address", namespace, planned, applied)
+	}
+	return planned, nil
+}
+
+// schemaScope returns what this target's schemas belong to below the target:
+// the database a PostgreSQL DSN opens, or the PlanetScale organization and
+// database a Vitess target addresses. MySQL databases and Strata keyspaces are
+// named across the whole target, so their scope is empty.
+func (c *LocalClient) schemaScope() (string, error) {
+	switch c.config.Type {
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata:
+		return "", nil
+	case storage.DatabaseTypeVitess:
+		database := c.config.Metadata["database"]
+		if database == "" {
+			database = c.config.Database
+		}
+		return c.config.Metadata["organization"] + "/" + database, nil
+	case storage.DatabaseTypePostgres:
+		cfg, err := pgconn.ParseConfig(c.config.TargetDSN)
+		if err != nil {
+			return "", fmt.Errorf("parse PostgreSQL target DSN: %w", err)
+		}
+		return cfg.Database, nil
+	default:
+		return "", fmt.Errorf("database type %q: %w", c.config.Type, ErrResolveNamespacesUnsupported)
+	}
 }
 
 // pinnedDatabase returns the database a MySQL target's DSN names, which every

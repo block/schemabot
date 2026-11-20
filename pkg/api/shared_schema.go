@@ -89,7 +89,17 @@ func (c *ServerConfig) SharedSchemaPeers(repo, database, environment string) ([]
 // the data plane knows it, since it depends on the target's connection and
 // schema overrides.
 type NamespaceResolver interface {
-	ResolveNamespaces(ctx context.Context, database, environment string, target routing.ExecutionTarget, namespaces []string) (map[string]string, error)
+	ResolveNamespaces(ctx context.Context, database, environment string, target routing.ExecutionTarget, namespaces []string) (NamespacePlacement, error)
+}
+
+// NamespacePlacement is where a database's namespaces land on one target.
+type NamespacePlacement struct {
+	// Scope is what the schemas belong to below the target, such as the
+	// PostgreSQL database a connection opens. Schemas of two databases are
+	// one only when their scopes match.
+	Scope string
+	// Schemas maps each namespace to the schema it addresses.
+	Schemas map[string]string
 }
 
 // CheckSharedSchemaIgnoreLists refuses a database whose schema files and
@@ -140,7 +150,10 @@ func (c *ServerConfig) CheckSharedSchemaIgnoreLists(ctx context.Context, environ
 		return err
 	}
 
-	schemas := &memberSchemas{resolver: resolver, environment: environment, resolved: map[string]map[string]string{}}
+	schemas := &memberSchemas{resolver: resolver, environment: environment, resolved: map[string]NamespacePlacement{}}
+	// A MySQL-family target can fold schema names to lower case, so there
+	// two spellings are compared as one schema; PostgreSQL keeps them apart.
+	foldSchemaNames := schema.DialectForDatabaseType(dbConfig.Type) != schema.DialectPostgres
 	report := &SharedSchemaIgnoreListsError{Environment: environment, reported: map[string]bool{}}
 	for _, peer := range peers {
 		peerTargets, err := c.ResolveDatabaseTargets(peer.Database, environment)
@@ -165,7 +178,7 @@ func (c *ServerConfig) CheckSharedSchemaIgnoreLists(ctx context.Context, environ
 			if err != nil {
 				return err
 			}
-			report.compare(member.self.Target, selfSide, selfSchemas, peerSide, peerSchemas)
+			report.compare(member.self.Target, foldSchemaNames, selfSide, selfSchemas, peerSide, peerSchemas)
 		}
 	}
 	if report.empty() {
@@ -215,17 +228,17 @@ func heldNamespaces(target routing.ExecutionTarget, files map[string]*ternv1.Sch
 type memberSchemas struct {
 	resolver    NamespaceResolver
 	environment string
-	resolved    map[string]map[string]string
+	resolved    map[string]NamespacePlacement
 }
 
 // of returns the schema each of namespaces addresses on target. A resolution
 // that leaves a namespace without a schema is an error: the namespace could
 // not be compared, and comparing the rest would pass a pair the check did not
 // see whole.
-func (m *memberSchemas) of(ctx context.Context, database string, target routing.ExecutionTarget, namespaces []string) (map[string]string, error) {
+func (m *memberSchemas) of(ctx context.Context, database string, target routing.ExecutionTarget, namespaces []string) (NamespacePlacement, error) {
 	key := database + "\x00" + target.MemberID()
-	if schemas, ok := m.resolved[key]; ok {
-		return schemas, nil
+	if placement, ok := m.resolved[key]; ok {
+		return placement, nil
 	}
 	failed := func(cause error) error {
 		return &NamespaceResolutionError{
@@ -237,17 +250,17 @@ func (m *memberSchemas) of(ctx context.Context, database string, target routing.
 			Cause:       cause,
 		}
 	}
-	schemas, err := m.resolver.ResolveNamespaces(ctx, database, m.environment, target, namespaces)
+	placement, err := m.resolver.ResolveNamespaces(ctx, database, m.environment, target, namespaces)
 	if err != nil {
-		return nil, failed(err)
+		return NamespacePlacement{}, failed(err)
 	}
 	for _, namespace := range namespaces {
-		if schemas[namespace] == "" {
-			return nil, failed(fmt.Errorf("data plane resolved no schema for namespace %q", namespace))
+		if placement.Schemas[namespace] == "" {
+			return NamespacePlacement{}, failed(fmt.Errorf("data plane resolved no schema for namespace %q", namespace))
 		}
 	}
-	m.resolved[key] = schemas
-	return schemas, nil
+	m.resolved[key] = placement
+	return placement, nil
 }
 
 // NamespaceResolutionError is a failure to learn which schemas a database's
@@ -271,10 +284,11 @@ func (e *NamespaceResolutionError) Error() string {
 
 func (e *NamespaceResolutionError) Unwrap() error { return e.Cause }
 
-// DataPlaneTooOld reports whether the data plane refused the resolution as one
-// it cannot answer, which upgrading the data plane fixes.
+// DataPlaneTooOld reports whether the data plane predates namespace
+// resolution, which upgrading it fixes. A data plane whose engine cannot
+// resolve namespaces is not too old, and upgrading it does not help.
 func (e *NamespaceResolutionError) DataPlaneTooOld() bool {
-	return errors.Is(e.Cause, tern.ErrResolveNamespacesUnsupported)
+	return errors.Is(e.Cause, tern.ErrResolveNamespacesUnimplemented)
 }
 
 // sharedSchemaSide is one database of a pair, parsed for comparison.
@@ -400,9 +414,12 @@ func (e *SharedSchemaIgnoreListsError) empty() bool {
 	return len(e.Missing) == 0 && len(e.Doubled) == 0 && len(e.DeclaredElsewhere) == 0
 }
 
-// firstReport reports whether a finding is new, and records it.
+// firstReport reports whether a finding is new, and records it. Tables are
+// keyed as the files spell them, so two spellings of one name are each
+// reported: an ignore_tables entry matches case exactly, so each spelling
+// needs its own.
 func (e *SharedSchemaIgnoreListsError) firstReport(kind, database, other, table string) bool {
-	key := kind + "\x00" + database + "\x00" + other + "\x00" + declaredTableKey(table)
+	key := kind + "\x00" + database + "\x00" + other + "\x00" + table
 	if e.reported[key] {
 		return false
 	}
@@ -416,18 +433,19 @@ func (e *SharedSchemaIgnoreListsError) firstReport(kind, database, other, table 
 // match it as a pattern. Whether two declarations are one table is decided
 // ignoring case, which errs toward refusing on a target that folds table
 // names.
-func (e *SharedSchemaIgnoreListsError) compare(target string, self sharedSchemaSide, selfSchemas map[string]string, peer sharedSchemaSide, peerSchemas map[string]string) {
-	selfBySchema := namespacesBySchema(selfSchemas)
-	peerBySchema := namespacesBySchema(peerSchemas)
-	for _, name := range slices.Sorted(maps.Keys(selfBySchema)) {
-		peerNamespaces, ok := peerBySchema[name]
+func (e *SharedSchemaIgnoreListsError) compare(target string, foldSchemaNames bool, self sharedSchemaSide, selfPlacement NamespacePlacement, peer sharedSchemaSide, peerPlacement NamespacePlacement) {
+	selfBySchema := namespacesBySchema(selfPlacement, foldSchemaNames)
+	peerBySchema := namespacesBySchema(peerPlacement, foldSchemaNames)
+	for _, identity := range slices.Sorted(maps.Keys(selfBySchema)) {
+		peerSchema, ok := peerBySchema[identity]
 		if !ok {
 			continue
 		}
-		shared := sharedSchema{name: name, target: target}
-		e.addDoubled(shared, self, selfBySchema[name], peer, peerNamespaces)
-		e.addMissing(shared, self, selfBySchema[name], peer, peerNamespaces)
-		e.addMissing(shared, peer, peerNamespaces, self, selfBySchema[name])
+		selfSchema := selfBySchema[identity]
+		shared := sharedSchema{name: selfSchema.name, target: target}
+		e.addDoubled(shared, self, selfSchema.namespaces, peer, peerSchema.namespaces)
+		e.addMissing(shared, self, selfSchema.namespaces, peer, peerSchema.namespaces)
+		e.addMissing(shared, peer, peerSchema.namespaces, self, selfSchema.namespaces)
 	}
 }
 
@@ -437,14 +455,34 @@ type sharedSchema struct {
 	target string
 }
 
-// namespacesBySchema inverts a namespace-to-schema resolution, listing each
-// schema's namespaces sorted.
-func namespacesBySchema(schemas map[string]string) map[string][]string {
-	byName := map[string][]string{}
-	for _, namespace := range slices.Sorted(maps.Keys(schemas)) {
-		byName[schemas[namespace]] = append(byName[schemas[namespace]], namespace)
+// resolvedSchema is one schema a database's namespaces land in on a target:
+// its name as the data plane spells it, and the namespaces stored there.
+type resolvedSchema struct {
+	name       string
+	namespaces []string
+}
+
+// namespacesBySchema inverts a placement, listing each schema's namespaces
+// sorted. Schemas are keyed by their scope and name, with the name folded
+// when the target may fold schema names, so two databases' schemas match
+// whenever the target could store them as one.
+func namespacesBySchema(placement NamespacePlacement, foldSchemaNames bool) map[string]resolvedSchema {
+	bySchema := map[string]resolvedSchema{}
+	for _, namespace := range slices.Sorted(maps.Keys(placement.Schemas)) {
+		name := placement.Schemas[namespace]
+		identityName := name
+		if foldSchemaNames {
+			identityName = schema.CaseFoldKey(name)
+		}
+		identity := placement.Scope + "\x00" + identityName
+		resolved := bySchema[identity]
+		if resolved.name == "" {
+			resolved.name = name
+		}
+		resolved.namespaces = append(resolved.namespaces, namespace)
+		bySchema[identity] = resolved
 	}
-	return byName
+	return bySchema
 }
 
 // addDoubled records the tables both databases declare in the shared schema.
@@ -454,7 +492,7 @@ func (e *SharedSchemaIgnoreListsError) addDoubled(shared sharedSchema, self shar
 			peerFolded := foldedTableSet(peer.declared[peerNamespace])
 			var doubled []string
 			for _, table := range self.declared[selfNamespace] {
-				if peerFolded[declaredTableKey(table)] && e.firstReport("doubled", self.Database, peer.Database, table) {
+				if peerFolded[sharedTableKey(table)] && e.firstReport("doubled", self.Database, peer.Database, table) {
 					doubled = append(doubled, table)
 				}
 			}
@@ -488,8 +526,8 @@ func (e *SharedSchemaIgnoreListsError) addMissing(shared sharedSchema, declarer 
 	ownerAnywhere := map[string]string{}
 	for _, namespace := range slices.Sorted(maps.Keys(owner.declared)) {
 		for _, table := range owner.declared[namespace] {
-			if _, ok := ownerAnywhere[declaredTableKey(table)]; !ok {
-				ownerAnywhere[declaredTableKey(table)] = namespace
+			if _, ok := ownerAnywhere[sharedTableKey(table)]; !ok {
+				ownerAnywhere[sharedTableKey(table)] = namespace
 			}
 		}
 	}
@@ -497,10 +535,10 @@ func (e *SharedSchemaIgnoreListsError) addMissing(shared sharedSchema, declarer 
 	for _, declarerNamespace := range declarerNamespaces {
 		var tables, entries []string
 		for _, table := range declarer.declared[declarerNamespace] {
-			if ownerHere[declaredTableKey(table)] {
+			if ownerHere[sharedTableKey(table)] {
 				continue
 			}
-			if declaredIn, ok := ownerAnywhere[declaredTableKey(table)]; ok {
+			if declaredIn, ok := ownerAnywhere[sharedTableKey(table)]; ok {
 				if e.firstReport("elsewhere", owner.Database, declarer.Database, table) {
 					e.DeclaredElsewhere = append(e.DeclaredElsewhere, TableDeclaredElsewhere{
 						Database:        owner.Database,
@@ -612,7 +650,7 @@ func sharedPlacement(declarer, tables, namespace, owner, ownerNamespace, schemaN
 func foldedTableSet(tables []string) map[string]bool {
 	set := make(map[string]bool, len(tables))
 	for _, table := range tables {
-		set[declaredTableKey(table)] = true
+		set[sharedTableKey(table)] = true
 	}
 	return set
 }
@@ -630,4 +668,11 @@ func pronoun(tables []string) string {
 		return "it"
 	}
 	return "them"
+}
+
+// sharedTableKey is the key under which two declarations are one table: the
+// same case folding the engines use to refuse a declared table that
+// ignore_tables also withholds, so the check and the plan agree.
+func sharedTableKey(table string) string {
+	return schema.CaseFoldKey(table)
 }

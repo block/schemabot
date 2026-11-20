@@ -11,6 +11,7 @@ import (
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
 )
 
@@ -449,16 +450,19 @@ func namespacedSide(database, namespace string, ignore []string, tables ...strin
 // addresses. Any other namespace addresses a schema of its own name.
 type targetSchemas struct {
 	pinned map[string]string
+	// scopes gives a database's scope on every member, as a PostgreSQL
+	// connection to its own database would.
+	scopes map[string]string
 	err    error
 	// omit names a namespace the resolution leaves out of its answer.
 	omit  string
 	calls []string
 }
 
-func (r *targetSchemas) ResolveNamespaces(_ context.Context, database, _ string, target routing.ExecutionTarget, namespaces []string) (map[string]string, error) {
+func (r *targetSchemas) ResolveNamespaces(_ context.Context, database, _ string, target routing.ExecutionTarget, namespaces []string) (NamespacePlacement, error) {
 	r.calls = append(r.calls, fmt.Sprintf("%s@%s:%v", database, target.MemberID(), namespaces))
 	if r.err != nil {
-		return nil, r.err
+		return NamespacePlacement{}, r.err
 	}
 	schemas := make(map[string]string, len(namespaces))
 	for _, namespace := range namespaces {
@@ -470,7 +474,7 @@ func (r *targetSchemas) ResolveNamespaces(_ context.Context, database, _ string,
 			schemas[namespace] = namespace
 		}
 	}
-	return schemas, nil
+	return NamespacePlacement{Scope: r.scopes[database], Schemas: schemas}, nil
 }
 
 func pinnedTo(schemaName string) *targetSchemas {
@@ -681,10 +685,15 @@ func TestCheckSharedSchemaIgnoreLists_UnresolvedNamespacesFailClosed(t *testing.
 		tooOld   bool
 	}{
 		"a data plane too old to answer": {
-			resolver: &targetSchemas{err: fmt.Errorf("upgrade it: %w", tern.ErrResolveNamespacesUnsupported)},
+			resolver: &targetSchemas{err: fmt.Errorf("upgrade it: %w", tern.ErrResolveNamespacesUnimplemented)},
 			database: "shop",
-			want:     `resolve the schemas that namespaces [shop] of database "shop" address on target "shop-001" of deployment "us" in environment "production": upgrade it: namespace resolution unsupported`,
+			want:     `resolve the schemas that namespaces [shop] of database "shop" address on target "shop-001" of deployment "us" in environment "production": upgrade it: data plane predates namespace resolution`,
 			tooOld:   true,
+		},
+		"a data plane whose engine cannot answer": {
+			resolver: &targetSchemas{err: fmt.Errorf("engine declines: %w", tern.ErrResolveNamespacesUnsupported)},
+			database: "shop",
+			want:     `resolve the schemas that namespaces [shop] of database "shop" address on target "shop-001" of deployment "us" in environment "production": engine declines: namespace resolution unsupported`,
 		},
 		"a resolution that fails": {
 			resolver: &targetSchemas{err: errors.New("connection refused")},
@@ -715,4 +724,118 @@ func TestCheckSharedSchemaIgnoreLists_UnresolvedNamespacesFailClosed(t *testing.
 		err := cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, nil)
 		require.ErrorContains(t, err, `namespace resolver is required to compare database "shop"`)
 	})
+}
+
+// Two PostgreSQL databases on one target each keep their tables in schema
+// public. Each connection opens its own PostgreSQL database, so the two public
+// schemas are different schemas and their tables are never compared. Only
+// when both connections open the same database is public one schema.
+func TestCheckSharedSchemaIgnoreLists_SchemasInDifferentDatabasesAreNotShared(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+	catalog := SharedSchemaDatabase{
+		Database:    "catalog",
+		ConfigPath:  "db/catalog/schemabot.yaml",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{"public": postgresCreateTables("products")},
+	}
+	search := SharedSchemaDatabase{
+		Database:    "catalog_search",
+		ConfigPath:  "db/catalog_search/schemabot.yaml",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{"public": postgresCreateTables("terms")},
+	}
+
+	t.Run("each database opens its own", func(t *testing.T) {
+		resolver := &targetSchemas{scopes: map[string]string{"catalog": "catalog", "catalog_search": "catalog_search"}}
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", catalog, []SharedSchemaDatabase{search}, resolver))
+	})
+
+	t.Run("both open the same database", func(t *testing.T) {
+		resolver := &targetSchemas{scopes: map[string]string{"catalog": "catalog", "catalog_search": "catalog"}}
+		mismatch := requireListsMismatch(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", catalog, []SharedSchemaDatabase{search}, resolver))
+		require.Len(t, mismatch.Missing, 2)
+		assert.Equal(t, "public", mismatch.Missing[0].Schema)
+	})
+}
+
+// A MySQL target can store schema names in lower case, so namespaces Shop
+// and shop of two databases may be one schema there, and the check compares
+// them. PostgreSQL keeps Public and public apart, so it does not.
+func TestCheckSharedSchemaIgnoreLists_SchemaNameCase(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+
+	t.Run("MySQL folds", func(t *testing.T) {
+		shop := namespacedSide("shop", "Shop", nil, "settings")
+		sharded := namespacedSide("shop_sharded", "shop", nil, "orders")
+		mismatch := requireListsMismatch(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
+		require.Len(t, mismatch.Missing, 2)
+		assert.Equal(t, "Shop", mismatch.Missing[0].Schema)
+	})
+
+	t.Run("PostgreSQL does not", func(t *testing.T) {
+		catalog := SharedSchemaDatabase{Database: "catalog", SchemaFiles: map[string]*ternv1.SchemaFiles{"Public": postgresCreateTables("products")}}
+		search := SharedSchemaDatabase{Database: "catalog_search", SchemaFiles: map[string]*ternv1.SchemaFiles{"public": postgresCreateTables("terms")}}
+		require.NoError(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", catalog, []SharedSchemaDatabase{search}, &targetSchemas{}))
+	})
+}
+
+// shop_sharded declares orders in one schema shop shares and Orders in
+// another. An ignore_tables entry matches case exactly, so each spelling is
+// reported with the entries it needs, rather than the second being folded
+// into the first and left unprotected.
+func TestCheckSharedSchemaIgnoreLists_EachSpellingIsReported(t *testing.T) {
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+	shop := SharedSchemaDatabase{
+		Database:   "shop",
+		ConfigPath: "db/shop/schemabot.yaml",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"north": createTables("settings"),
+			"south": createTables("sequences"),
+		},
+	}
+	sharded := SharedSchemaDatabase{
+		Database:   "shop_sharded",
+		ConfigPath: "db/shop_sharded/schemabot.yaml",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"north": createTables("orders"),
+			"south": createTables("Orders"),
+		},
+		IgnoreTables: []string{"settings", "sequences"},
+	}
+
+	mismatch := requireListsMismatch(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
+	require.Len(t, mismatch.Missing, 2)
+	assert.Equal(t, "north", mismatch.Missing[0].Namespace)
+	assert.Equal(t, []string{"orders"}, mismatch.Missing[0].Tables)
+	assert.Equal(t, []string{"orders"}, mismatch.Missing[0].Entries)
+	assert.Equal(t, "south", mismatch.Missing[1].Namespace)
+	assert.Equal(t, []string{"Orders"}, mismatch.Missing[1].Tables)
+	assert.Equal(t, []string{"Orders", "orders"}, mismatch.Missing[1].Entries)
+}
+
+// Two declarations are one table under the same case folding the planner
+// uses to refuse a declared table that ignore_tables withholds. shop declares
+// ſettings in its archive namespace, which folds to settings, so the
+// settings shop_sharded declares in the shared namespace cannot be ignored:
+// an entry would also withhold ſettings, which shop's plan refuses.
+func TestCheckSharedSchemaIgnoreLists_TablesFoldTheWayThePlannerFolds(t *testing.T) {
+	require.Equal(t, schema.CaseFoldKey("settings"), schema.CaseFoldKey("ſettings"), "the planner folds ſ to s")
+	cfg, err := ParseServerConfig([]byte(sharedTargetConfig))
+	require.NoError(t, err)
+	shop := SharedSchemaDatabase{
+		Database:   "shop",
+		ConfigPath: "db/shop/schemabot.yaml",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"shop":    createTables("orders"),
+			"archive": createTables("ſettings"),
+		},
+	}
+	sharded := namespacedSide("shop_sharded", "shop", []string{"orders"}, "settings")
+
+	mismatch := requireListsMismatch(t, cfg.CheckSharedSchemaIgnoreLists(t.Context(), "production", shop, []SharedSchemaDatabase{sharded}, &targetSchemas{}))
+	assert.Empty(t, mismatch.Missing)
+	require.Len(t, mismatch.DeclaredElsewhere, 1)
+	assert.Equal(t, "settings", mismatch.DeclaredElsewhere[0].Table)
+	assert.Equal(t, "archive", mismatch.DeclaredElsewhere[0].OwnerDeclaredIn)
 }

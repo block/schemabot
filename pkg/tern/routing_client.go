@@ -201,7 +201,7 @@ func (c *RoutingClient) ResolveNamespaces(ctx context.Context, req *ternv1.Resol
 	routedReq := proto.Clone(req).(*ternv1.ResolveNamespacesRequest)
 	routedReq.Type = target.DatabaseType
 	routedReq.Target = target.Target
-	return client.ResolveNamespaces(ctx, routedReq)
+	return ResolveNamespacesWith(ctx, client, routedReq)
 }
 
 // Apply executes a stored plan on its plan-time execution target.

@@ -312,7 +312,7 @@ func (r *TargetRouter) ResolveNamespaces(ctx context.Context, req *ternv1.Resolv
 			routedReq.Type = resolved.DatabaseType
 			routedReq.Target = resolved.Target
 			var dispatchErr error
-			response, dispatchErr = gen.client.ResolveNamespaces(ctx, routedReq)
+			response, dispatchErr = ResolveNamespacesWith(ctx, gen.client, routedReq)
 			return dispatchErr
 		})
 	return response, err

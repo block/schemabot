@@ -495,12 +495,16 @@ func (c *GRPCClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.Co
 }
 
 // ResolveNamespaces asks the remote data plane which schema each namespace
-// addresses on a target. A data plane that predates the RPC, or whose engine
-// cannot resolve namespaces, answers UNIMPLEMENTED, which is returned as
+// addresses on a target. A data plane that predates the RPC answers
+// UNIMPLEMENTED, returned as ErrResolveNamespacesUnimplemented, and one whose
+// engine cannot resolve namespaces answers FAILED_PRECONDITION, returned as
 // ErrResolveNamespacesUnsupported.
 func (c *GRPCClient) ResolveNamespaces(ctx context.Context, req *ternv1.ResolveNamespacesRequest) (*ternv1.ResolveNamespacesResponse, error) {
 	resp, err := c.client.ResolveNamespaces(ctx, req)
-	if status.Code(err) == codes.Unimplemented {
+	switch status.Code(err) {
+	case codes.Unimplemented:
+		return nil, fmt.Errorf("remote data plane predates namespace resolution for database %s target %s: %w: %w", req.GetDatabase(), req.GetTarget(), ErrResolveNamespacesUnimplemented, err)
+	case codes.FailedPrecondition:
 		return nil, fmt.Errorf("remote data plane cannot resolve namespaces for database %s target %s: %w: %w", req.GetDatabase(), req.GetTarget(), ErrResolveNamespacesUnsupported, err)
 	}
 	if err != nil {

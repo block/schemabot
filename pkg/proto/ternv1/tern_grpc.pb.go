@@ -110,9 +110,11 @@ type TernClient interface {
 	// database, so the control plane asks the data plane before it treats two
 	// databases' namespaces as separate tables.
 	//
-	// It is read-only and opens no connection to the target. A namespace the
-	// target does not authorize fails the request, and a data plane that
-	// predates this RPC returns UNIMPLEMENTED; the caller fails closed on both.
+	// It is read-only and runs nothing on the target. A namespace the
+	// target does not authorize fails the request, an engine that cannot
+	// resolve namespaces returns FAILED_PRECONDITION, and a data plane that
+	// predates this RPC returns UNIMPLEMENTED; the caller fails closed on all
+	// three.
 	ResolveNamespaces(ctx context.Context, in *ResolveNamespacesRequest, opts ...grpc.CallOption) (*ResolveNamespacesResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
@@ -520,9 +522,11 @@ type TernServer interface {
 	// database, so the control plane asks the data plane before it treats two
 	// databases' namespaces as separate tables.
 	//
-	// It is read-only and opens no connection to the target. A namespace the
-	// target does not authorize fails the request, and a data plane that
-	// predates this RPC returns UNIMPLEMENTED; the caller fails closed on both.
+	// It is read-only and runs nothing on the target. A namespace the
+	// target does not authorize fails the request, an engine that cannot
+	// resolve namespaces returns FAILED_PRECONDITION, and a data plane that
+	// predates this RPC returns UNIMPLEMENTED; the caller fails closed on all
+	// three.
 	ResolveNamespaces(context.Context, *ResolveNamespacesRequest) (*ResolveNamespacesResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.

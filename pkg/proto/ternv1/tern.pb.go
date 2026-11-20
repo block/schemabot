@@ -679,8 +679,14 @@ func (x *ResolveNamespacesRequest) GetNamespaces() []string {
 // ResolveNamespacesResponse maps each requested namespace to the schema it
 // addresses on the target.
 type ResolveNamespacesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Schemas       map[string]string      `protobuf:"bytes,1,rep,name=schemas,proto3" json:"schemas,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Schemas map[string]string      `protobuf:"bytes,1,rep,name=schemas,proto3" json:"schemas,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// The container the schemas belong to when the engine addresses one below
+	// the target: the database a PostgreSQL connection opens, or the
+	// PlanetScale organization and database a Vitess target addresses. It is
+	// empty when schema names are unique across the whole target, as MySQL
+	// databases are. Two schemas are one only when scope and name both agree.
+	Scope         string `protobuf:"bytes,2,opt,name=scope,proto3" json:"scope,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -720,6 +726,13 @@ func (x *ResolveNamespacesResponse) GetSchemas() map[string]string {
 		return x.Schemas
 	}
 	return nil
+}
+
+func (x *ResolveNamespacesResponse) GetScope() string {
+	if x != nil {
+		return x.Scope
+	}
+	return ""
 }
 
 // PullSchemaRequest requests a live schema export for a database route.
@@ -5714,9 +5727,10 @@ const file_tern_proto_rawDesc = "" +
 	"\x06target\x18\x04 \x01(\tR\x06target\x12\x1e\n" +
 	"\n" +
 	"namespaces\x18\x05 \x03(\tR\n" +
-	"namespaces\"\xa2\x01\n" +
+	"namespaces\"\xb8\x01\n" +
 	"\x19ResolveNamespacesResponse\x12I\n" +
-	"\aschemas\x18\x01 \x03(\v2/.tern.v1.ResolveNamespacesResponse.SchemasEntryR\aschemas\x1a:\n" +
+	"\aschemas\x18\x01 \x03(\v2/.tern.v1.ResolveNamespacesResponse.SchemasEntryR\aschemas\x12\x14\n" +
+	"\x05scope\x18\x02 \x01(\tR\x05scope\x1a:\n" +
 	"\fSchemasEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xde\x01\n" +
