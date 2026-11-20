@@ -3,12 +3,15 @@
 package spirit
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -89,7 +92,16 @@ func applyAlters(t *testing.T, dsn string, changes map[string]engine.TableChange
 		require.NotEmpty(t, changes[table].DDL, "the plan alters table %s", table)
 		ddlStatements = append(ddlStatements, changes[table].DDL)
 	}
+	database, finalState, errorMessage := runAlters(t, dsn, tables, ddlStatements, policy)
+	require.Equal(t, engine.StateCompleted, finalState, "schema change error: %s", errorMessage)
+	return database
+}
 
+// runAlters runs ddlStatements on tables through the alter phase and returns
+// the target's schema name with the schema change's final state and error
+// message.
+func runAlters(t *testing.T, dsn string, tables, ddlStatements []string, policy directPolicy) (string, engine.State, string) {
+	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})
 	host, username, password, database, err := parseDSN(dsn)
@@ -104,13 +116,13 @@ func applyAlters(t *testing.T, dsn string, changes map[string]engine.TableChange
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, policy)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false, policy)
 
 	eng.mu.Lock()
-	finalState, errorMessage := eng.runningSchemaChange.state, eng.runningSchemaChange.errorMessage
-	eng.mu.Unlock()
-	require.Equal(t, engine.StateCompleted, finalState, "schema change error: %s", errorMessage)
-	return database
+	defer eng.mu.Unlock()
+	return database, eng.runningSchemaChange.state, eng.runningSchemaChange.errorMessage
 }
 
 // foreignKeyCount returns how many foreign keys table holds on the target.
@@ -254,6 +266,55 @@ func TestEngine_ExecuteAlterPhase_ForeignKeyChildDirectBeforeParentCopies(t *tes
 		assert.Equal(t, wantRows, rowCount(t, db, table), "table %s keeps its rows", table)
 	}
 	assert.Zero(t, foreignKeyCount(t, db, database, "fk_owners"), "the foreign key is dropped")
+}
+
+// Any ALTER on a foreign key's parent also waits for the metadata locks of
+// the tables that reference it. A transaction left open on the child blocks a
+// direct column add on the parent, but it holds no lock on the parent, so the
+// kill, scoped to the altered table, never reaches it. The apply fails as busy
+// after the first bounded attempt, and the message names the child as a table
+// whose lock the change can wait for. The open transaction keeps its
+// session, and the parent is untouched.
+func TestEngine_ExecuteAlterPhase_LockOnForeignKeyChildFailsBusy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	createForeignKeyPair(t, db)
+
+	reader, err := db.Conn(t.Context())
+	require.NoError(t, err, "acquire the reading session")
+	defer utils.CloseAndLog(reader)
+	_, err = reader.ExecContext(t.Context(), "BEGIN")
+	require.NoError(t, err, "open the transaction")
+	// Ending the transaction first lets the conn return to the pool on an
+	// early failure while it still holds the child's metadata lock.
+	defer func() { _, _ = reader.ExecContext(t.Context(), "ROLLBACK") }()
+	var readerID int64
+	require.NoError(t, reader.QueryRowContext(t.Context(), "SELECT CONNECTION_ID()").Scan(&readerID))
+	var rows int
+	require.NoError(t, reader.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM `fk_owners`").Scan(&rows),
+		"read the child, taking its shared metadata lock until the transaction ends")
+	require.Equal(t, 2, rows)
+
+	const lockWaitSeconds = 1
+	_, state, errorMessage := runAlters(t, dsn, []string{"fk_groups"},
+		[]string{"ALTER TABLE `fk_groups` ADD COLUMN `note` varchar(20) DEFAULT NULL"},
+		directPolicy{Enabled: true, MaxTableBytes: 100 << 20, LockAcquisitionTimeoutSeconds: lockWaitSeconds})
+
+	require.Equal(t, engine.StateFailed, state)
+	assert.Contains(t, errorMessage, `Table "fk_groups" is busy`)
+	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts,", lockWaitSeconds, directMaxAttempts))
+	assert.Contains(t, errorMessage, `The change can also wait for the metadata locks of "fk_owners", linked to "fk_groups" by a foreign key. SchemaBot never kills a transaction holding one of those, and stops at the first attempt that waits for one.`)
+	assert.Contains(t, errorMessage, `the server log names any session on "fk_groups" that blocked the change`)
+	assert.NotContains(t, errorMessage, "Lock wait timeout exceeded",
+		"the driver's own words are for the server log, not the pull request")
+
+	assert.True(t, sessionExists(t, db, readerID), "the transaction open on the child is not killed")
+	_, err = reader.ExecContext(t.Context(), "ROLLBACK")
+	require.NoError(t, err, "end the child's transaction")
+	var notes int
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fk_groups' AND COLUMN_NAME = 'note'`).Scan(&notes))
+	assert.Zero(t, notes, "the parent is untouched")
 }
 
 // createTriggerTable creates a table whose trigger fills a column on insert,

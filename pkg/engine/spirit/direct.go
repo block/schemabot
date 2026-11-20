@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/mysql"
@@ -906,15 +908,24 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 				// SYSTEM_USER, as does any KILL after a grant routing confirmed
 				// is revoked. Spirit logs which of these it hit through the kill
 				// logger above.
-				logger.Error("direct execution failed: statement could not acquire the table's metadata lock; the force-kill did not clear the blocker",
-					"database", database, "table", ds.table, "lock_wait_timeout_seconds", lockWaitSeconds,
-					"max_attempts", forceExecConfig.MaxRetries, "error", err)
-				// The table name comes from the plan and the timeout from this
-				// deployment's own configuration, so this sentence is safe to
-				// show on the pull request that asked for the change.
-				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
-					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts, killing the transactions blocking the lock between them. It stops after the first attempt that meets a session it will not or cannot kill: a session holding an explicit LOCK TABLES, a transaction too large to roll back safely, or a session of a SYSTEM_USER account, which only a user that also has SYSTEM_USER may kill. Retry when those sessions have finished; the server log names the session that blocked the change.",
-					ds.table, lockWaitSeconds, forceExecConfig.MaxRetries))
+				// A statement on a table linked by a foreign key can also wait
+				// for the linked tables' metadata locks. The kill is scoped to
+				// the altered table, so a transaction open on a linked table is
+				// never killed, and the attempt that waited for it is the last.
+				linked, linkErr := foreignKeyLinkedTables(ctx, db, database, ds.table)
+				if linkErr != nil {
+					logger.Warn("could not read the tables linked to the busy table by a foreign key; the failure message names only the table itself",
+						"database", database, "table", ds.table, "error", linkErr)
+				}
+				logger.Error("direct execution failed: statement could not acquire the metadata locks it needs; the force-kill did not clear the blocker",
+					"database", database, "table", ds.table, "foreign_key_linked_tables", linked,
+					"lock_wait_timeout_seconds", lockWaitSeconds, "max_attempts", forceExecConfig.MaxRetries, "error", err)
+				// The table names come from the plan and the target's own
+				// dictionary, and the timeout from this deployment's own
+				// configuration, so this message is safe to show on the pull
+				// request that asked for the change.
+				e.setSchemaChangeFailed(engine.OperatorErrorf(err, "%s",
+					busyTableMessage(ds.table, lockWaitSeconds, forceExecConfig.MaxRetries, linked)))
 				return false
 			}
 			logger.Error("direct execution failed",
@@ -928,6 +939,60 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 		e.emitTableLog(ds.table, "statement completed as native MySQL DDL")
 	}
 	return true
+}
+
+// busyTableMessage is the operator message for a direct statement that could
+// not acquire its metadata locks within its attempts. linked names the tables
+// joined to table by a foreign key, whose metadata locks the statement may also
+// wait for and whose holders SchemaBot never kills.
+func busyTableMessage(table string, lockWaitSeconds int64, attempts int, linked []string) string {
+	msg := fmt.Sprintf("Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts, killing the transactions blocking the lock between them. It stops after the first attempt that meets a session it will not or cannot kill: a session holding an explicit LOCK TABLES, a transaction too large to roll back safely, or a session of a SYSTEM_USER account, which only a user that also has SYSTEM_USER may kill.",
+		table, lockWaitSeconds, attempts)
+	if len(linked) == 0 {
+		return msg + " Retry when those sessions have finished; the server log names the session that blocked the change."
+	}
+	quoted := make([]string, len(linked))
+	for i, name := range linked {
+		quoted[i] = strconv.Quote(name)
+	}
+	return msg + fmt.Sprintf(" The change can also wait for the metadata locks of %s, linked to %q by a foreign key. SchemaBot never kills a transaction holding one of those, and stops at the first attempt that waits for one. Retry when those sessions have finished; the server log names any session on %q that blocked the change.",
+		strings.Join(quoted, ", "), table, table)
+}
+
+// foreignKeyLinkedTables returns the tables joined to table by a foreign key in
+// either direction, in name order: the tables it references and the tables
+// that reference it. A self-referencing foreign key links no other table, so it
+// is left out. A table in another schema is named schema.table.
+func foreignKeyLinkedTables(ctx context.Context, db *sql.DB, database, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT UNIQUE_CONSTRAINT_SCHEMA, REFERENCED_TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ?
+		  AND NOT (UNIQUE_CONSTRAINT_SCHEMA = ? AND REFERENCED_TABLE_NAME = ?)
+		UNION
+		SELECT CONSTRAINT_SCHEMA, TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS
+		WHERE UNIQUE_CONSTRAINT_SCHEMA = ? AND REFERENCED_TABLE_NAME = ?
+		  AND NOT (CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ?)`,
+		database, table, database, table, database, table, database, table)
+	if err != nil {
+		return nil, fmt.Errorf("read the foreign keys linking table %q: %w", table, err)
+	}
+	defer utils.CloseAndLog(rows)
+	var linked []string
+	for rows.Next() {
+		var schema, name string
+		if err := rows.Scan(&schema, &name); err != nil {
+			return nil, fmt.Errorf("read the foreign keys linking table %q: %w", table, err)
+		}
+		if schema != database {
+			name = schema + "." + name
+		}
+		linked = append(linked, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the foreign keys linking table %q: %w", table, err)
+	}
+	slices.Sort(linked)
+	return linked, nil
 }
 
 // emitTableLog routes an operator-facing message for a table to the apply log

@@ -129,6 +129,14 @@ the table's size again, and if the table has grown past the bound since the
 plan, the statement runs on the engine's default path instead, with an Info
 log. It is not blocked, as a statement the engine refuses outright would be.
 
+A statement on a table linked by a foreign key can also wait for the linked
+tables' metadata locks. Any `ALTER` on a parent waits for the locks of the
+tables that reference it, and adding or dropping a foreign key waits for the
+lock of the table it references. The kill only ends transactions holding the
+altered table's own lock, so a transaction left open on a linked table is never
+killed. The statement stops after the attempt that waited for it, and the
+apply fails as busy, naming the linked tables.
+
 When both ends of a foreign key run directly, the plan's own `DROP FOREIGN
 KEY` runs before any statement the engine copies, because every direct
 statement runs first.
