@@ -1160,6 +1160,7 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartOperator(ctx)
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartWebhookInboxMonitor(ctx)
+	s.svc.StartFreezeMonitor(ctx)
 	s.svc.StartOperatorStuckPendingMonitor(ctx)
 	s.svc.StartPendingDropsCleaner(ctx)
 }

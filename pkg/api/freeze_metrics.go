@@ -1,0 +1,208 @@
+package api
+
+import (
+	"context"
+	"sort"
+	"time"
+
+	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+const (
+	// FreezeMetricsInterval is how often SchemaBot records which environments
+	// are frozen. A planned freeze starts and ends by time rather than by an
+	// API call, so only a periodic snapshot keeps the gauge current.
+	FreezeMetricsInterval = 30 * time.Second
+
+	// FreezeMetricsTimeout bounds a single snapshot so a slow database cannot
+	// stall the monitor loop.
+	FreezeMetricsTimeout = 5 * time.Second
+)
+
+// StartFreezeMonitor starts a background loop that records, per environment,
+// whether a freeze is in effect. It is a no-op without freeze storage.
+func (s *Service) StartFreezeMonitor(ctx context.Context) {
+	if s.storage == nil {
+		s.logger.Debug("freeze monitor not started because storage is unavailable")
+		return
+	}
+
+	s.freezeMonitorMu.Lock()
+	if s.freezeMonitorCancel != nil {
+		s.freezeMonitorMu.Unlock()
+		s.logger.Info("freeze monitor already running")
+		return
+	}
+	monitorCtx, cancel := context.WithCancel(ctx)
+	s.freezeMonitorCancel = cancel
+	s.freezeMonitorMu.Unlock()
+
+	// Export the failure counter at 0 before any pass runs, so the first
+	// failure shows up as an increase rather than as a new series at 1.
+	metrics.InitEnvironmentFreezeCollectionFailures(monitorCtx)
+
+	interval := s.freezeMetricsInterval
+	if interval <= 0 {
+		interval = FreezeMetricsInterval
+	}
+	s.freezeMonitorWg.Go(func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		s.CollectFreezeMetrics(monitorCtx)
+		for {
+			select {
+			case <-monitorCtx.Done():
+				s.logger.Debug("freeze monitor stopping", "error", monitorCtx.Err())
+				return
+			case <-ticker.C:
+				s.CollectFreezeMetrics(monitorCtx)
+			}
+		}
+	})
+	s.logger.Info("freeze monitor started", "interval", interval, "timeout", FreezeMetricsTimeout)
+}
+
+// StopFreezeMonitor stops the background freeze monitor. Safe to call
+// multiple times.
+func (s *Service) StopFreezeMonitor() {
+	s.freezeMonitorMu.Lock()
+	cancel := s.freezeMonitorCancel
+	if cancel == nil {
+		s.freezeMonitorMu.Unlock()
+		return
+	}
+	s.freezeMonitorCancel = nil
+	s.freezeMonitorMu.Unlock()
+
+	cancel()
+	s.drainMonitor(&s.freezeMonitorWg, "freeze_monitor")
+}
+
+// CollectFreezeMetrics records the freeze gauges once. For each environment
+// this instance serves, schemabot.environment.frozen is 1 per scope with a
+// freeze in effect (a whole-environment freeze, or one narrowed to some
+// deployments or databases) and 0 otherwise, and
+// schemabot.environment.freeze_open_seconds is the age of the oldest
+// open-ended freeze in effect. A peer environment has its own store, so this
+// instance cannot know whether it is frozen and reports nothing for it. Both
+// "in effect" and the age use the database clock, as the change gate does. It
+// is exported so tests can run one synchronous collection.
+func (s *Service) CollectFreezeMetrics(ctx context.Context) {
+	if err := ctx.Err(); err != nil {
+		s.logger.Debug("freeze metrics collection skipped because context is done", "error", err)
+		return
+	}
+	if s.storage == nil || s.storage.Freezes() == nil {
+		s.logger.Debug("freeze metrics collection skipped because freeze storage is unavailable")
+		return
+	}
+
+	collectCtx, cancel := context.WithTimeout(ctx, FreezeMetricsTimeout)
+	defer cancel()
+
+	now, inEffect, err := freezeSnapshot(collectCtx, s.storage.Freezes())
+	if err != nil {
+		// A stop that lands mid-query cancels the monitor context. That is an
+		// orderly shutdown, not a stale gauge, so it must not count as a failure.
+		if ctx.Err() != nil {
+			s.logger.Debug("freeze metrics collection aborted because context is done", "error", err)
+			return
+		}
+		// Leaving the published snapshot in place re-exports the last one. The
+		// failure counter tells operators it is stale.
+		metrics.RecordEnvironmentFreezeCollectionFailure(ctx)
+		s.logger.Warn("freeze metrics collection failed", "error", err)
+		return
+	}
+
+	states := make(map[string]*environmentFreezeState)
+	state := func(environment string) *environmentFreezeState {
+		environment = storage.CanonicalKey(environment)
+		if states[environment] == nil {
+			states[environment] = &environmentFreezeState{}
+		}
+		return states[environment]
+	}
+	for _, environment := range s.config.KnownEnvironments() {
+		if s.config.ServesEnvironment(environment) {
+			state(environment)
+		}
+	}
+	for _, freeze := range inEffect {
+		// A row for an environment this instance does not serve is left over
+		// from before the environment moved to a peer or out of config. The
+		// peer's store decides whether it is frozen, so the row is not
+		// reported; the seen environments below still return to 0.
+		if !s.config.ServesEnvironment(freeze.Environment) {
+			continue
+		}
+		state(freeze.Environment).add(freeze, now)
+	}
+	// Record every environment that was ever reported frozen too, so an
+	// environment dropped from config after its freeze ends returns to 0
+	// instead of re-exporting 1 forever.
+	s.freezeMonitorMu.Lock()
+	if s.freezeMonitorSeen == nil {
+		s.freezeMonitorSeen = make(map[string]bool)
+	}
+	for environment := range s.freezeMonitorSeen {
+		state(environment)
+	}
+	for environment, st := range states {
+		if st.whole || st.partial {
+			s.freezeMonitorSeen[environment] = true
+		}
+	}
+	s.freezeMonitorMu.Unlock()
+
+	environments := make([]string, 0, len(states))
+	for environment := range states {
+		environments = append(environments, environment)
+	}
+	sort.Strings(environments)
+	samples := make([]metrics.EnvironmentFreezeSample, 0, len(environments))
+	for _, environment := range environments {
+		st := states[environment]
+		samples = append(samples, metrics.EnvironmentFreezeSample{
+			Environment: environment,
+			Whole:       st.whole,
+			Partial:     st.partial,
+			OpenFor:     st.openFor,
+		})
+	}
+	// One snapshot for every environment and scope, swapped whole: a scrape
+	// reads all of this pass or all of the last, never a mix of the two.
+	metrics.PublishEnvironmentFreezes(samples)
+}
+
+// freezeSnapshot reads the database clock and the freezes in effect.
+func freezeSnapshot(ctx context.Context, freezes storage.FreezeStore) (time.Time, []*storage.EnvironmentFreeze, error) {
+	now, err := freezes.Now(ctx)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	inEffect, err := freezes.ListInEffect(ctx, "")
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	return now, inEffect, nil
+}
+
+// environmentFreezeState is one environment's freeze gauges.
+type environmentFreezeState struct {
+	whole   bool
+	partial bool
+	openFor time.Duration
+}
+
+func (st *environmentFreezeState) add(freeze *storage.EnvironmentFreeze, now time.Time) {
+	if len(freeze.Deployments) == 0 && len(freeze.Databases) == 0 {
+		st.whole = true
+	} else {
+		st.partial = true
+	}
+	if freeze.EndsAt == nil {
+		st.openFor = max(st.openFor, now.Sub(freeze.StartsAt))
+	}
+}

@@ -254,6 +254,16 @@ type Service struct {
 	webhookInboxWg       sync.WaitGroup
 	webhookInboxInterval time.Duration
 
+	freezeMonitorMu     sync.Mutex
+	freezeMonitorCancel context.CancelFunc
+	freezeMonitorWg     sync.WaitGroup
+	// freezeMonitorSeen holds every environment the monitor has reported
+	// frozen, so each keeps a series that returns to 0.
+	freezeMonitorSeen map[string]bool
+	// freezeMetricsInterval overrides FreezeMetricsInterval when positive,
+	// so a test can watch the monitor loop itself.
+	freezeMetricsInterval time.Duration
+
 	// Operator stuck-pending apply monitor loop management.
 	stuckPendingMu     sync.Mutex
 	stuckPendingCancel context.CancelFunc
@@ -1028,6 +1038,7 @@ func (s *Service) Close() error {
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
 	s.StopWebhookInboxMonitor()
+	s.StopFreezeMonitor()
 	s.StopOperatorStuckPendingMonitor()
 
 	s.ternMu.Lock()
