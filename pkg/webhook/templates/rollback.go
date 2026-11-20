@@ -81,7 +81,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 
 func writeRollbackCancel(sb *strings.Builder, tenant string) {
 	sb.WriteString("To cancel, comment:\n")
-	fmt.Fprintf(sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", tenant))
+	fmt.Fprintf(sb, "```\n%s\n```\n", AppendTenantFlag("schemabot unlock", tenant))
 }
 
 // RenderRollbackUnsafeChangesBlocked renders the refusal posted when
@@ -219,7 +219,7 @@ func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo stri
 			"A lock is currently held by %s.\n\n%s",
 			database, environment,
 			caller.PullRequestMarkdownLink(lockRepo, lockPR),
-			otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", tenant), lockedApply)))
+			otherPRLockReleaseHint(AppendTenantFlag("schemabot unlock", tenant), lockedApply)))
 	}
 	return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
@@ -296,7 +296,7 @@ func RenderRollbackOfRolloutUnsupported(data RollbackOfRolloutUnsupportedData) s
 		sb.WriteString("Then run:\n")
 	}
 	command := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Database)
-	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag(command, data.Tenant))
+	fmt.Fprintf(&sb, "```\n%s\n```\n", AppendTenantFlag(command, data.Tenant))
 	return sb.String()
 }
 
@@ -364,8 +364,8 @@ func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, t
 		"If the lock persists, force-release it:\n"+
 		"```\n%s\n```",
 		database, environment, caller.Short(lockOwner),
-		appendTenantFlag("schemabot unlock", tenant),
-		appendTenantFlag(fmt.Sprintf("schemabot unlock -d %s --force", database), tenant))
+		AppendTenantFlag("schemabot unlock", tenant),
+		AppendTenantFlag(fmt.Sprintf("schemabot unlock -d %s --force", database), tenant))
 }
 
 // RenderRollbackNotAccepted renders the message posted when the apply service

@@ -521,13 +521,19 @@ func (e *ChangeGateRefusedError) Error() string {
 // Blocked is the refusal without what it says about an override request: what
 // blocks the change, and that it clears when the blockers end.
 func (e *ChangeGateRefusedError) Blocked() string {
+	return e.BlockedWith(func(reason string) string { return reason })
+}
+
+// BlockedWith is Blocked with each blocker's reason written by reason, for a
+// caller that renders the refusal where a person's text needs escaping.
+func (e *ChangeGateRefusedError) BlockedWith(reason func(string) string) string {
 	parts := make([]string, 0, len(e.Blockers))
 	for _, blocker := range e.Blockers {
 		until := "until lifted"
 		if blocker.EndsAt != nil {
 			until = "until " + blocker.EndsAt.UTC().Format(time.RFC3339)
 		}
-		parts = append(parts, fmt.Sprintf("%s %s (%s, %s)", blocker.Gate, blocker.ID, blocker.Reason, until))
+		parts = append(parts, fmt.Sprintf("%s %s (%s, %s)", blocker.Gate, blocker.ID, reason(blocker.Reason), until))
 	}
 	return fmt.Sprintf("blocked in %s by %s; try again after it ends or is lifted", e.Environment, strings.Join(parts, "; "))
 }

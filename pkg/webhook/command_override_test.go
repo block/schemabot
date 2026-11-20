@@ -118,7 +118,9 @@ func TestParseCommandOverride(t *testing.T) {
 // Rollback, revert and the pinned rollback skip the freeze gate, so --override
 // on them is an unsupported flag, as -d and --target are where unsupported.
 func TestOverrideFlagIsSupportedOnApplyStartAndCutoverOnly(t *testing.T) {
-	supported := map[string]bool{action.Apply: true, action.Start: true, action.Cutover: true}
+	// apply-confirm takes it because an apply that must discard an unfinished
+	// copy stops for confirmation before the freeze gate runs.
+	supported := map[string]bool{action.Apply: true, action.ApplyConfirm: true, action.Start: true, action.Cutover: true}
 	for _, spec := range commandSpecs {
 		assert.Equal(t, supported[spec.Name], spec.SupportsOverride, spec.Name)
 		assert.Equal(t, supported[spec.Name], commandSupportsOverrideFlag(spec.Name), spec.Name)
@@ -128,7 +130,6 @@ func TestOverrideFlagIsSupportedOnApplyStartAndCutoverOnly(t *testing.T) {
 	for _, comment := range []string{
 		`schemabot rollback apply_abc123 -e production --override "fix"`,
 		`schemabot revert apply_abc123 -e production --override "fix"`,
-		`schemabot apply-confirm -e production --override "fix"`,
 		`schemabot stop apply_abc123 -e production --override=fix`,
 	} {
 		result := p.ParseCommand(comment)

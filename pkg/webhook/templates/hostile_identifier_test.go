@@ -1,8 +1,10 @@
 package templates
 
 import (
+	"html"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -237,4 +239,54 @@ func TestMarkdownReasonDefusesEveryMention(t *testing.T) {
 func unmanagedSchemaPassingCheckSummary(identifier string) string {
 	_, summary := RenderUnmanagedSchemaPassingCheck(identifier, []UnmanagedSchemaConfigNoticeData{{Database: identifier, SchemaPath: identifier}})
 	return summary
+}
+
+// A reason in an error detail notifies nobody once RenderGenericError escapes
+// it: a mention is inline code, and a character reference that spells an @ is
+// shown as text rather than decoded.
+func TestErrorDetailReasonDefusesEveryMention(t *testing.T) {
+	for _, reason := range []string{
+		"page @oncall",
+		"@octocat@hubot",
+		"@acme/db-admins@hubot",
+		"ask &#64;octocat to approve",
+		"ask &commat;octocat to approve",
+		"@octocat``a ` b``",
+		"`a`@octocat`b`@hubot",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			escaped := html.EscapeString(ErrorDetailReason(reason))
+			mapOutsideCodeSpans(escaped, func(prose string) string {
+				assert.NotContains(t, prose, "@", "an @ outside a code span can notify")
+				assert.NotContains(t, strings.ReplaceAll(prose, "&amp;", ""), "&#64;")
+				return prose
+			})
+		})
+	}
+}
+
+// The ampersand and the less than sign are left to the HTML escape, so a
+// reason reads as written once GitHub decodes the entities.
+func TestErrorDetailReasonLeavesHTMLToTheEscape(t *testing.T) {
+	assert.Equal(t, "R&D latency <= 5ms", ErrorDetailReason("R&D latency <= 5ms"))
+	assert.Equal(t, "see <b>this</b>", ErrorDetailReason("see <b>this</b>"))
+	assert.Equal(t, `SEV-1234 \*payments\*`, ErrorDetailReason("SEV-1234 *payments*"))
+}
+
+func TestRedactedReason(t *testing.T) {
+	assert.Equal(t, "page [endpoint redacted] now", RedactedReason("  page db-1:3306 now ", 100))
+
+	// Redaction comes before the clamp, so the result is within the limit.
+	clamped := RedactedReason(strings.Repeat("a:12 ", 100), 150)
+	assert.LessOrEqual(t, utf8.RuneCountInString(clamped), 150)
+	assert.True(t, strings.HasSuffix(clamped, "…"), clamped)
+	assert.NotContains(t, clamped, "a:12")
+
+	// A cut never leaves part of a redaction marker behind.
+	for limit := 2; limit < 40; limit++ {
+		got := strings.TrimSuffix(RedactedReason("x [endpoint redacted] y", limit), "…")
+		if i := strings.LastIndexByte(got, '['); i >= 0 {
+			assert.True(t, strings.HasPrefix(got[i:], redactionMarker), "limit %d: %q", limit, got)
+		}
+	}
 }

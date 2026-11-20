@@ -620,7 +620,7 @@ func (h *Handler) executeApply(
 			h.releaseApplyLockIfIntentUnchanged(releaseCtx, repo, pr, database, dbType, environment, expectedPendingPlanID, "change gate refused")
 			cancel()
 			h.logger.Info("apply refused by a change gate", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
+			h.postChangeGateRefusal(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
 			return
 		}
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
@@ -927,7 +927,7 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		return msgs.lockIntentChanged
 	}
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		return "This change did not start: it is " + changeGateRefusalDetail(refused)
+		return "This change did not start: it is " + changeGateRefusalDetail(refused, msgs.command, msgs.tenant)
 	}
 	if unavailable, ok := errors.AsType[*api.ChangeGateUnavailableError](err); ok {
 		return unavailable.UserMessage()

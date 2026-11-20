@@ -187,29 +187,29 @@ func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []Sc
 func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	item, ok := singleCommandItem(items)
 	if !ok {
-		return appendTenantFlag("schemabot plan -e <environment> -d <database>", tenant)
+		return AppendTenantFlag("schemabot plan -e <environment> -d <database>", tenant)
 	}
 	cmd := fmt.Sprintf("schemabot plan -e %s", flattenIdentifier(item.Environment))
 	if item.Database != "" {
 		cmd += fmt.Sprintf(" -d %s", flattenIdentifier(item.Database))
 	}
-	return appendTenantFlag(cmd, tenant)
+	return AppendTenantFlag(cmd, tenant)
 }
 
 func stopCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	item, ok := singleCommandItem(items)
 	if !ok || item.ApplyID == "" {
-		return appendTenantFlag("schemabot stop <apply-id> -e <environment>", tenant)
+		return AppendTenantFlag("schemabot stop <apply-id> -e <environment>", tenant)
 	}
-	return appendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", flattenIdentifier(item.ApplyID), flattenIdentifier(item.Environment)), tenant)
+	return AppendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", flattenIdentifier(item.ApplyID), flattenIdentifier(item.Environment)), tenant)
 }
 
 func rollbackCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	item, ok := singleCommandItem(items)
 	if !ok || item.ApplyID == "" {
-		return appendTenantFlag("schemabot rollback <apply-id> -e <environment>", tenant)
+		return AppendTenantFlag("schemabot rollback <apply-id> -e <environment>", tenant)
 	}
-	return appendTenantFlag(fmt.Sprintf("schemabot rollback %s -e %s", flattenIdentifier(item.ApplyID), flattenIdentifier(item.Environment)), tenant)
+	return AppendTenantFlag(fmt.Sprintf("schemabot rollback %s -e %s", flattenIdentifier(item.ApplyID), flattenIdentifier(item.Environment)), tenant)
 }
 
 func singleCommandItem(items []SchemaChangeReconciliationItem) (SchemaChangeReconciliationItem, bool) {

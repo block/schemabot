@@ -206,7 +206,11 @@ func runControlCommand[R any](
 	resp, err := execute(ctx, request)
 	if err != nil {
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
-		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, controlErrorMessage(err))
+		post := h.postCommandError
+		if isChangeGateError(err) {
+			post = h.postChangeGateRefusal
+		}
+		post(repo, pr, installationID, actionName, result.Environment, requestedBy, controlErrorMessage(err, actionName, h.deploymentTenant()))
 		return nil
 	}
 	if resp == nil {
@@ -267,9 +271,10 @@ func (h *Handler) withPullRequestOverrideRequester(ctx context.Context, client *
 
 // controlErrorMessage renders a failed control command for the PR. A freeze
 // refusal reads as it does for an apply; other errors post as they are.
-func controlErrorMessage(err error) string {
+// command and tenant are as changeGateRefusalDetail takes them.
+func controlErrorMessage(err error, command, tenant string) string {
 	if refused, ok := errors.AsType[*api.ChangeGateRefusedError](err); ok {
-		return changeGateRefusalDetail(refused)
+		return changeGateRefusalDetail(refused, command, tenant)
 	}
 	return err.Error()
 }

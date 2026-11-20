@@ -55,7 +55,7 @@ func RenderUnsupportedTargetFlag(action string) string {
 // RenderUnsupportedOverrideFlag renders the message posted when `--override`
 // is supplied to a command that no freeze can refuse.
 func RenderUnsupportedOverrideFlag(action string) string {
-	return fmt.Sprintf("The `--override` flag is not supported for `%s`. Only `apply`, `start` and `cutover` take it.", action)
+	return fmt.Sprintf("The `--override` flag is not supported for `%s`. Only `apply`, `apply-confirm`, `start` and `cutover` take it.", action)
 }
 
 // RenderInvalidOverrideReason renders the message posted when the reason

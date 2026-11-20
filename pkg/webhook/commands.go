@@ -76,7 +76,7 @@ var commandSpecs = []CommandSpec{
 		SupportsSkipRevert: true, SupportsDeferCutover: true,
 		SupportsAllowUnsafe: true, SupportsTarget: true, SupportsOverride: true},
 	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
-		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
+		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true, SupportsOverride: true},
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
 	{Name: action.FixLint, SupportsDB: true},
 	{Name: action.Stop, RequiresEnv: true, HasApplyID: true},

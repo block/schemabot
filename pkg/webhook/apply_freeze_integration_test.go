@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
@@ -44,7 +45,8 @@ func TestE2EApplyIsRefusedDuringAFreeze(t *testing.T) {
 	})
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "This change did not start: it is blocked in "+driftEnv+" by freeze "+freezeID+" (incident 42, until lifted)")
+	refusal := awaitCommentContaining(t, apply, "This change did not start: it is blocked in "+driftEnv+" by freeze "+freezeID+" (incident 42, until lifted)")
+	assert.Contains(t, refusal, "run the same command again with `--override` followed by your reason in quotes")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -77,8 +79,14 @@ func TestE2EApplyConfirmIsRefusedDuringAFreeze(t *testing.T) {
 	})
 
 	result := sendApplyConfirm(t, svc, dbName, "schemabot apply-confirm -e staging")
-	awaitCommentContaining(t, result, "This change did not start: it is blocked in staging by freeze "+freezeID+" (incident 43, until lifted)")
+	refusal := awaitCommentContaining(t, result, "This change did not start: it is blocked in staging by freeze "+freezeID+" (incident 43, until lifted)")
+	assert.Contains(t, refusal, "The pending confirmation was released. To ask a freeze approver to let it through, run `apply` again, then run `apply-confirm` with `--override`")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
+
+	// This is why the refusal says to run apply first: apply-confirm again,
+	// --override or not, finds nothing to confirm.
+	again := sendApplyConfirm(t, svc, dbName, `schemabot apply-confirm -e staging --override "hotfix"`)
+	awaitCommentContaining(t, again, "No apply lock is held for this database. Run `apply` first")
 }

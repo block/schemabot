@@ -31,6 +31,23 @@ func (h *Handler) postCommandError(
 	repo string, pr int, installationID int64,
 	commandName, environment, requestedBy, errorDetail string,
 ) {
+	h.postCommandErrorWithin(repo, pr, installationID, commandName, environment, requestedBy, errorDetail, 0)
+}
+
+// postChangeGateRefusal is postCommandError for a change gate's refusal,
+// which SchemaBot writes itself and whose last sentences say how to get the
+// change through, so it is posted under the longer MaxChangeGateRefusalLen.
+func (h *Handler) postChangeGateRefusal(
+	repo string, pr int, installationID int64,
+	commandName, environment, requestedBy, errorDetail string,
+) {
+	h.postCommandErrorWithin(repo, pr, installationID, commandName, environment, requestedBy, errorDetail, templates.MaxChangeGateRefusalLen)
+}
+
+func (h *Handler) postCommandErrorWithin(
+	repo string, pr int, installationID int64,
+	commandName, environment, requestedBy, errorDetail string, detailLimit int,
+) {
 	h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
 		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
@@ -38,6 +55,7 @@ func (h *Handler) postCommandError(
 		Environments: h.deploymentEnvironmentScope(environment),
 		CommandName:  commandName,
 		ErrorDetail:  userFacingErrorDetail(errorDetail),
+		DetailLimit:  detailLimit,
 	}))
 }
 

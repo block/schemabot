@@ -186,6 +186,12 @@ func inlineCodeStatement(text string) string {
 // render intact; anything longer is clamped with a truncation marker.
 const maxCommentErrorLen = 500
 
+// MaxChangeGateRefusalLen bounds a freeze refusal's error detail. SchemaBot
+// writes the refusal around reasons it clamps, and the override request ID and
+// the approval instructions come last, so the default bound would cut them off
+// behind a long freeze reason.
+const MaxChangeGateRefusalLen = 3000
+
 // maxCommentVSchemaDiffLen bounds the VSchema diffs rendered into one comment
 // — a budget shared across every keyspace's diff, not granted per diff — so
 // enormous diffs (such as the first sharding pass over a keyspace with many
@@ -297,16 +303,34 @@ var grpcStatusPrefixRe = regexp.MustCompile(`rpc error: code = [A-Za-z]+ desc = 
 // whitespace, and clamps the length by rune count. The raw error remains
 // available server-side in the apply logs, so nothing is lost for triage.
 func sanitizeCommentError(msg string) string {
+	return sanitizeCommentErrorWithin(msg, maxCommentErrorLen)
+}
+
+// sanitizeCommentErrorWithin is sanitizeCommentError with its own rune bound.
+func sanitizeCommentErrorWithin(msg string, limit int) string {
 	msg = strings.ReplaceAll(msg, "\r\n", "\n")
 	msg = strings.ReplaceAll(msg, "\r", "\n")
 	msg = stripControlText(msg)
 	msg = grpcStatusPrefixRe.ReplaceAllString(msg, "")
 	msg = redactConnectionDetails(msg)
 	msg = strings.TrimSpace(msg)
-	if runes := []rune(msg); len(runes) > maxCommentErrorLen {
-		msg = trimPartialRedactionMarker(string(runes[:maxCommentErrorLen-1])) + "…"
+	if runes := []rune(msg); len(runes) > limit {
+		msg = trimPartialRedactionMarker(string(runes[:limit-1])) + "…"
 	}
 	return msg
+}
+
+// RedactedReason redacts a person's reason, such as a freeze's, as an error
+// detail is redacted, then clamps it to limit runes, marking a cut with "…".
+// Redaction can lengthen text, so a caller that budgets a detail under a bound
+// redacts each reason before it counts it; the sanitizer the whole detail goes
+// through then has nothing left to lengthen.
+func RedactedReason(reason string, limit int) string {
+	reason = strings.TrimSpace(redactConnectionDetails(stripControlText(reason)))
+	if runes := []rune(reason); len(runes) > limit {
+		reason = strings.TrimSpace(trimPartialRedactionMarker(string(runes[:limit-1]))) + "…"
+	}
+	return reason
 }
 
 // redactionMarker is the placeholder every redaction pass substitutes for

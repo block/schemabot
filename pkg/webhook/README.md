@@ -190,13 +190,17 @@ those operator controls today.
 
 ### Freeze override
 
-`apply`, `start` and `cutover` take `--override "<reason>"` (also
+`apply`, `apply-confirm`, `start` and `cutover` take `--override "<reason>"` (also
 `--override=<reason>` and single quotes). Quotes group only this flag's value;
 without them the reason is the next word. When a freeze refuses the command,
 SchemaBot records an override request for the commenter and the pull request's
 author, and the comment names it. The reason is trimmed, must not be blank, and
-is at most 500 characters. `rollback`, `revert` and `apply-confirm` do not take
-the flag, and rollbacks skip the freeze gate.
+is at most 500 characters. `apply-confirm` takes it because an apply that must
+discard an unfinished copy stops for that confirmation before the freeze gate
+runs. A refused `apply-confirm` releases the pending confirmation, so the
+comment tells the commenter to run `apply` again and then `apply-confirm`.
+`rollback` and `revert` do not take the flag, and rollbacks skip the freeze
+gate.
 
 A request from a pull request is recorded as `github:<login>` for both the
 commenter and the author, and only a pull request approves it: the API route
@@ -211,7 +215,17 @@ approvers are their own list and not the admins and operators of PR commands.
 that the request came from this pull request, and storage's refusals of the
 requester, the author, an approved request and an expired one. Approval is
 recorded as `github:<login>`. On an aggregate repo the request lives in one
-deployment, so the others stay silent on an unknown ID.
+deployment, so the others stay silent on an unknown ID; the refusal therefore
+names the approve command with the deployment's `--tenant`, so a pasted
+command is always answered.
+
+The refusal (`changeGateRefusalDetail`) lists each freeze with its reason and
+end. Without `--override`, a command that takes the flag is told how to ask
+for one. With a recorded request, it shows the reason the approver sees, who
+may approve, the approve command, and that the commenter then runs the command
+again, since an approved override admits only the person who asked. Freeze and
+override reasons are a person's text, written so a mention in them notifies
+nobody (`templates.ErrorDetailReason`).
 
 ## Error Handling
 

@@ -64,8 +64,11 @@ var overrideIDPattern = regexp.MustCompile(`^ovr-[0-9a-z]{1,64}$`)
 //
 // Every rule is decided here, so none depends on the caller (AZ-10):
 //   - the ID has the shape of an override request ID;
-//   - the commenter is a freeze approver (in.IsApprover), checked once the
-//     request exists so a stranger learns nothing about it;
+//   - the commenter is a freeze approver (in.IsApprover), checked after the
+//     lookup: on an aggregate repo a deployment that does not store the
+//     request stays silent, and it must decide that before reading any team
+//     membership. A non-approver can tell a real ID from an unknown one, which
+//     reveals nothing, since IDs are random;
 //   - the request was asked for on a pull request, the reverse of the HTTP
 //     approval route, which takes only API and CLI requests;
 //   - that pull request is this one, in this repository;
