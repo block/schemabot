@@ -68,7 +68,7 @@ func runFreezeCmd(endpoint string, run func(*Globals) error) (string, error) {
 
 func TestFreezeCreateCmdPrintsTheFreezeAndSendsItsFlags(t *testing.T) {
 	f := freezeFixture()
-	f.Deployments, f.Databases = []string{"payments"}, []string{"orders", "games"}
+	f.Deployments, f.Databases, f.Running = []string{"payments"}, []string{"orders", "games"}, "stop"
 	api := &freezeAPI{status: http.StatusCreated, reply: f}
 	endpoint := api.start(t)
 
@@ -83,6 +83,8 @@ func TestFreezeCreateCmdPrintsTheFreezeAndSendsItsFlags(t *testing.T) {
 	assert.Contains(t, out, "freeze-abc created: production frozen (on demand, until lifted) by dana. Reason: SEV-1234 payments latency\n")
 	assert.Contains(t, out, "Scope:           deployments payments; databases orders, games\n")
 	assert.Contains(t, out, "Starts:          2026-11-21T10:00:00Z\n")
+	// stop is only recorded, so the confirmation must not read as applies stopped.
+	assert.Contains(t, out, "Running applies: stop (recorded; running applies are not stopped yet, use 'schemabot stop')\n")
 	assert.Equal(t, http.MethodPost, api.method)
 	assert.Equal(t, "/api/freezes", api.path)
 	assert.Equal(t, "SEV-1234 payments latency", api.body["reason"])
@@ -102,6 +104,7 @@ func TestFreezeCreateCmdPlannedWindow(t *testing.T) {
 	out, err := runFreezeCmd(endpoint, cmd.Run)
 
 	require.NoError(t, err)
+	assert.Contains(t, out, "Running applies: continue\n")
 	assert.Contains(t, out, "production freeze scheduled (planned, until 2026-11-22T10:00:00Z)")
 	assert.Equal(t, "planned", api.body["kind"])
 	assert.Equal(t, "2026-11-21T10:00:00Z", api.body["starts_at"])

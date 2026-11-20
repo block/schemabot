@@ -56,7 +56,16 @@ func WriteFreezeCreated(f apitypes.Freeze) {
 		freezeKind(f.Kind), freezeUntil(f), ui.TerminalSafeLine(f.CreatedBy), ui.TerminalSafeLine(f.Reason))
 	fmt.Printf("   Scope:           %s\n", freezeScope(f))
 	fmt.Printf("   Starts:          %s\n", freezeTime(f.StartsAt))
-	fmt.Printf("   Running applies: %s\n", ui.TerminalSafeLine(f.Running))
+	fmt.Printf("   Running applies: %s\n", freezeRunning(f.Running))
+}
+
+// freezeRunning shows the recorded running policy. SchemaBot does not act on
+// stop yet, so a responder must not read it as applies having stopped.
+func freezeRunning(policy string) string {
+	if policy == "stop" {
+		return ui.TerminalSafeLine(policy) + " (recorded; running applies are not stopped yet, use 'schemabot stop')"
+	}
+	return ui.TerminalSafeLine(policy)
 }
 
 // WriteFreezeLifted writes the confirmation of a lifted freeze.

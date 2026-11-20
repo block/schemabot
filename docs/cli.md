@@ -621,7 +621,7 @@ someone lifts it. Setting or lifting one is a write, and
 so without any other write access.
 
 ```console
-$ schemabot freeze -e production --reason "SEV-1234 payments latency" --running stop
+$ schemabot freeze -e production --reason "SEV-1234 payments latency"
 $ schemabot freeze -e production --reason "holiday freeze" --planned \
     --start 2026-12-20T00:00:00Z --end 2027-01-03T00:00:00Z
 $ schemabot freeze list -e production
@@ -630,8 +630,9 @@ $ schemabot unfreeze freeze-abc123 --reason "SEV resolved"
 ```
 
 `--deployment` and `--database` narrow a freeze and repeat; without them it
-covers the whole environment. `--running` is `continue` (the default) or
-`stop`, what happens to applies already running in scope. Times are RFC3339 and
+covers the whole environment. `--running` records `continue` (the default) or
+`stop` for applies already running in scope. SchemaBot does not act on `stop`
+yet, so stop a running apply with `schemabot stop`. Times are RFC3339 and
 print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
 and the recent ones.
 
