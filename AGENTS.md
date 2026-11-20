@@ -317,6 +317,7 @@ When the upstream fix is right but cannot wait for a release, land the smallest 
 - **Always use testify** (`require` and `assert` from `github.com/stretchr/testify`) in tests. Never use raw `if err != nil { t.Fatalf(...) }` patterns.
   - Use `require` for preconditions and setup where failure should stop the test.
   - Use `assert` for verification checks where you want all assertions to run (e.g., checking multiple fields).
+  - Lint bans raw `Fatal` and `Fatalf` calls only in the packages already converted to testify; the `forbidigo` exclusion in `.golangci.yaml` names them. The rule applies to every package, whether lint enforces it there yet or not.
 - **Use `t.Context()`** instead of `context.Background()` or `context.TODO()` in tests. This ties the context to the test lifecycle — the context is cancelled when the test ends. Test helper functions that need a context must accept `*testing.T` and use `t.Context()` — never `context.Background()`. **Exception: cleanup code** (`t.Cleanup` callbacks and deferred functions that run after the test finishes) must use `context.Background()` because `t.Context()` is already cancelled by the time cleanup runs.
 - **Prefer integration tests** with MySQL testcontainers over unit tests when possible.
 - **No `time.Sleep` for readiness waits.** Never use a fixed sleep to wait for a server or service to be ready. Instead, poll with a deadline (e.g., retry a health check endpoint in a loop with a short sleep between attempts). For testcontainers, use built-in wait strategies.
