@@ -948,7 +948,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	require.Len(t, result.Changes[0].TableChanges, 1)
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
-	assert.Contains(t, change.ModeReason, "in-place ALTER TABLE",
+	assert.Contains(t, change.ModeReason, "in-place changes that need ownership",
 		"the reason must name the tier whose access is missing")
 	assert.Contains(t, change.ModeReason, "provision with: GRANT",
 		"the reason must carry the exact provisioning statement")
@@ -956,7 +956,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		"the reason must carry the exact failed catalog check")
 	causes := engine.BlockedCauses(change.ModeReason)
 	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
-	assert.Contains(t, causes[0], "in-place ALTER TABLE", "the privilege cause comes first")
+	assert.Contains(t, causes[0], "in-place changes that need ownership", "the privilege cause comes first")
 	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size`),
 		"the size cause follows the privilege cause: %q", causes[1])
 }

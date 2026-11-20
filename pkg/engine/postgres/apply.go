@@ -950,6 +950,14 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
+	case executor.CodeEnumTypeDrift:
+		// The type name an ADD VALUE spells resolved to a different type
+		// than the one the engine checked, and the attempt rolled back with
+		// nothing added. The plan's view of the type is stale, so only a
+		// re-plan changes the outcome.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the enum type the planned statement for %s names is a different type than the one checked", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodeDataFault:
 		// The server rejected the table's rows as the statement would shape
 		// them (a value the new type will not hold, a constraint the rows
