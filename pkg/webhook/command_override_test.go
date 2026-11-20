@@ -22,8 +22,9 @@ func TestSplitCommandWords(t *testing.T) {
 		"apply --overridden fix",
 		"apply -e production --override fix",
 	} {
-		words, bad := splitCommandWords(line)
+		words, bound, bad := splitCommandWords(line)
 		assert.Equal(t, strings.Fields(line), words, line)
+		assert.Empty(t, bound, line)
 		assert.False(t, bad, line)
 	}
 
@@ -48,7 +49,7 @@ func TestSplitCommandWords(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			words, bad := splitCommandWords(tt.line)
+			words, _, bad := splitCommandWords(tt.line)
 			assert.Equal(t, tt.words, words)
 			assert.Equal(t, tt.bad, bad)
 		})
@@ -76,6 +77,12 @@ func TestParseCommandOverride(t *testing.T) {
 		{name: "empty", comment: `schemabot apply -e production --override ""`, action: action.Apply, given: true},
 		{name: "blank", comment: `schemabot apply -e production --override "  "`, action: action.Apply, override: "  ", given: true},
 		{name: "no value", comment: `schemabot apply -e production --override`, action: action.Apply, given: true},
+		// A quoted or `=` value is the reason even when it opens with a dash;
+		// only a bare word that looks like a flag is not.
+		{name: "quoted reason opening with a dash", comment: `schemabot apply -e production --override "- incident follow-up"`, action: action.Apply, override: "- incident follow-up", given: true},
+		{name: "equals quoted reason opening with a dash", comment: `schemabot apply -e production --override="- incident follow-up"`, action: action.Apply, override: "- incident follow-up", given: true},
+		{name: "equals reason opening with a dash", comment: `schemabot apply -e production --override=-hotfix`, action: action.Apply, override: "-hotfix", given: true},
+		{name: "a flag after it is not the reason", comment: `schemabot apply --override -e production`, action: action.Apply, given: true},
 		{name: "absent", comment: `schemabot apply -e production`, action: action.Apply},
 		{name: "unterminated quote", comment: `schemabot apply -e production --override "fix the index`, unmatched: "malformed"},
 		{name: "text after the closing quote", comment: `schemabot apply -e production --override "fix"index`, unmatched: "malformed"},
