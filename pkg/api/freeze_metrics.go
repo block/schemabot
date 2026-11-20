@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"time"
 
@@ -126,6 +127,13 @@ func (s *Service) CollectFreezeMetrics(ctx context.Context) {
 		}
 	}
 	for _, freeze := range inEffect {
+		// A row for an environment this instance does not serve is left over
+		// from before the environment moved to a peer or out of config. The
+		// peer's store decides whether it is frozen, so the row is not
+		// reported; the seen environments below still return to 0.
+		if !s.config.ServesEnvironment(freeze.Environment) {
+			continue
+		}
 		state(freeze.Environment).add(freeze, now)
 	}
 	// Record every environment that was ever reported frozen too, so an
@@ -152,8 +160,20 @@ func (s *Service) CollectFreezeMetrics(ctx context.Context) {
 	sort.Strings(environments)
 	for _, environment := range environments {
 		st := states[environment]
-		metrics.RecordEnvironmentFrozen(ctx, environment, metrics.FreezeScopeEnvironment, st.whole)
-		metrics.RecordEnvironmentFrozen(ctx, environment, metrics.FreezeScopePartial, st.partial)
+		// Record the scope in effect before clearing the other, so a scrape
+		// between the two never sees both at 0 while a freeze holds
+		// throughout, such as a whole-environment freeze replaced by a
+		// partial one.
+		scopes := []struct {
+			name   string
+			frozen bool
+		}{{metrics.FreezeScopeEnvironment, st.whole}, {metrics.FreezeScopePartial, st.partial}}
+		if st.partial && !st.whole {
+			slices.Reverse(scopes)
+		}
+		for _, scope := range scopes {
+			metrics.RecordEnvironmentFrozen(ctx, environment, scope.name, scope.frozen)
+		}
 		metrics.RecordEnvironmentFreezeOpenSeconds(ctx, environment, st.openFor)
 	}
 }

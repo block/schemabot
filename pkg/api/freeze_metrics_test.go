@@ -101,12 +101,16 @@ func TestCollectFreezeMetricsCountsFailure(t *testing.T) {
 
 // A staging-only instance names production in its environment order, but
 // production's freezes live in another store. Reporting production as 0 would
-// read as "not frozen" while it may be, so the instance reports nothing for it.
+// read as "not frozen" while it may be, so the instance reports nothing for it,
+// even for a production freeze left in its own store from before production
+// moved to the peer.
 func TestCollectFreezeMetricsSkipsPeerEnvironments(t *testing.T) {
 	reader := newFreezeMetricsReader(t)
 	config := freezeMetricsConfig([]string{"staging"}, "staging", "production")
 	config.EnvironmentOrder = []string{"staging", "production"}
-	svc := New(&mockStorageWithFreezes{freezes: &memoryFreezeStore{clock: clock.NewFake(freezeTestNow)}}, config, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store := &memoryFreezeStore{clock: clock.NewFake(freezeTestNow)}
+	createMetricsFreeze(t, store, "freeze-left-behind", nil)
+	svc := New(&mockStorageWithFreezes{freezes: store}, config, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	svc.CollectFreezeMetrics(t.Context())
 
