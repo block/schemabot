@@ -665,6 +665,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := refuseDropTablesAlsoIgnored(req.DropTables, req.IgnoreTables); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Planning stages a change against a specific database and reads its live
 	// schema, so it takes the same per-database authorization as apply.
@@ -979,6 +983,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			"repository", req.Repository,
 			"drop_tables", req.DropTables,
 		)
+	}
+	if err := refuseDropTablesAlsoIgnored(req.DropTables, req.IgnoreTables); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "drop_tables entry also ignored")
+		return nil, nil, err
 	}
 	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, req.Database, resolvedTarget.DatabaseType, req.Environment, req.DropTables); err != nil {
 		span.RecordError(err)

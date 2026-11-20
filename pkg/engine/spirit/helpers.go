@@ -40,15 +40,14 @@ func parseDSN(dsn string) (host, username, password, database string, err error)
 	return cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, nil
 }
 
-// withoutDropTablesEntries returns the live tables other than the ones the
-// plan's drop_tables lists.
-func withoutDropTablesEntries(current []table.TableSchema, drops engine.DroppedTables) []table.TableSchema {
-	if drops.Empty() {
+// withoutTables returns the live tables other than the named ones.
+func withoutTables(current []table.TableSchema, names []string) []table.TableSchema {
+	if len(names) == 0 {
 		return current
 	}
 	kept := make([]table.TableSchema, 0, len(current))
 	for _, ts := range current {
-		if !drops.Names(ts.Name) {
+		if !slices.Contains(names, ts.Name) {
 			kept = append(kept, ts)
 		}
 	}

@@ -35,6 +35,16 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		assert.NotContains(t, msg, "again without")
 	})
 
+	// An apply refused because its plan drops a working table of an apply
+	// stopped since the plan was made names the entry, that apply, and what
+	// to do with it, rather than the generic line.
+	t.Run("drop of an unsettled apply's working table names the apply", func(t *testing.T) {
+		err := fmt.Errorf("create apply: %w", &api.DropTablesInUseError{Entry: "_users_new", ApplyID: "apply-7f3a", ApplyState: "stopped", Table: "users"})
+		assert.Equal(t,
+			`drop_tables entry "_users_new" is a working table of apply apply-7f3a, which is stopped and changes table "users". Dropping it would discard that apply's copy. Start or cancel it, then plan again.`,
+			applyExecutionErrorMessage(action.Apply, "staging", "", err))
+	})
+
 	t.Run("lock intent change remains actionable", func(t *testing.T) {
 		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "staging", "", fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
 	})

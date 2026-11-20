@@ -159,6 +159,57 @@ func TestEngine_Plan_DropTablesEntryIsNotRestoredByARollback(t *testing.T) {
 	assert.Equal(t, []string{"executions"}, reverted, "the rollback reverts the managed table and does not recreate the dropped leftover")
 }
 
+// Only the entries the naming conventions skip are left out of the definitions
+// a rollback restores. A listed table with an ordinary name is one the plan
+// drops either way, so a rollback recreates it exactly as it would without the
+// list, while a listed "_" leftover and a listed archive table stay dropped.
+// Archive tables are skipped by the schema loader, or after ignore_tables is
+// matched when ignore_tables names an archive table, and both paths are run.
+func TestEngine_Plan_DropTablesRecordsOrdinaryEntriesForARollback(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ignoreTables []string
+	}{
+		{name: "archive tables skipped by the loader"},
+		{name: "archive tables skipped after ignore_tables is matched", ignoreTables: []string{"reports_archive_2023"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn, db := setupTestMySQL(t)
+			cleanupTables(t, db)
+			cleanupPendingDropsDB(t, db)
+
+			for _, stmt := range []string{
+				`CREATE TABLE executions (id INT PRIMARY KEY)`,
+				`CREATE TABLE legacy_notes (id INT PRIMARY KEY, body TEXT)`,
+				"CREATE TABLE `_jobs_old` (id INT PRIMARY KEY)",
+				`CREATE TABLE orders_archive_2024 (id INT PRIMARY KEY)`,
+				`CREATE TABLE reports_archive_2023 (id INT PRIMARY KEY)`,
+			} {
+				_, err := db.ExecContext(t.Context(), stmt)
+				require.NoError(t, err, stmt)
+			}
+
+			eng := newEngineWithShortQuietPeriod(t, db)
+			plan, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database: testDatabase,
+				SchemaFiles: testSchemaFiles(map[string]string{
+					"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY)`,
+				}),
+				Credentials:  &engine.Credentials{DSN: dsn},
+				IgnoreTables: tc.ignoreTables,
+				DropTables:   []string{"legacy_notes", "_jobs_old", "orders_archive_2024"},
+			})
+			require.NoError(t, err, "Plan()")
+			assert.ElementsMatch(t, []string{"legacy_notes", "_jobs_old", "orders_archive_2024"}, droppedTables(plan))
+			require.Len(t, plan.Changes, 1)
+			originals := plan.Changes[0].OriginalFiles
+			assert.Contains(t, originals, "legacy_notes.sql", "an ordinary listed table is recorded for a rollback")
+			assert.NotContains(t, originals, "_jobs_old.sql", "a listed leftover the planner skips by its name is not recorded")
+			assert.NotContains(t, originals, "orders_archive_2024.sql", "a listed archive table the planner skips by its name is not recorded")
+		})
+	}
+}
+
 // A name alone does not prove a table is abandoned. The shadow table of an
 // online schema change another tool is running is written continuously, so a
 // drop_tables entry written within the quiet period fails the plan instead of

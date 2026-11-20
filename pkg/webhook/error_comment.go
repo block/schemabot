@@ -58,9 +58,18 @@ func (h *Handler) deploymentEnvironmentScope(environment string) []string {
 	return config.AllowedEnvironments
 }
 
+// dropTablesCheckFailedMessage is the PR comment line for a plan refused
+// because SchemaBot could not read whether an apply still needs a table the
+// config lists under drop_tables.
+const dropTablesCheckFailedMessage = "SchemaBot could not check whether an apply that may still resume needs a table listed under `drop_tables`, so the plan was refused. Run the command again; if it fails again, the SchemaBot server logs have the cause."
+
 func userFacingError(err error) string {
 	if message, ok := userFacingConfigNotAuthorizedError(err); ok {
 		return message
+	}
+	// The cause is a storage failure the server logs with its identifiers.
+	if _, ok := errors.AsType[*api.DropTablesCheckError](err); ok {
+		return dropTablesCheckFailedMessage
 	}
 	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {

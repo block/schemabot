@@ -1,15 +1,21 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -20,10 +26,14 @@ import (
 // the plans of the applies already on the database by row ID.
 type storedPlans struct {
 	capturingPlanStore
-	byID map[int64]*storage.Plan
+	byID    map[int64]*storage.Plan
+	readErr error
 }
 
 func (s *storedPlans) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	if s.readErr != nil {
+		return nil, s.readErr
+	}
 	return s.byID[id], nil
 }
 
@@ -168,13 +178,157 @@ func TestExecutePlanRefusesDropsOfAWorkingTableFromAnOperationsOwnPlan(t *testin
 	assert.Nil(t, client.planReq)
 }
 
-// Whether a stopped apply still needs a table can only be answered from
-// storage. When storage cannot be read, the drop is refused rather than
-// planned as though no apply needed it, and the error says which check failed.
-func TestExecutePlanRefusesDropTablesWhenUnsettledAppliesCannotBeRead(t *testing.T) {
-	plans := &storedPlans{}
-	client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-drops"}}
-	svc := dropTablesService(plans, &unsettledApplyStore{err: errors.New("storage unavailable")}, nil, client)
+// Whether an apply that may still resume needs a table can only be answered
+// from storage: the applies that have not settled, their operations, and the
+// plans they run. When any of these cannot be read, or an apply names no plan,
+// the drop is refused rather than planned as though the apply needed nothing,
+// and the error says which read failed.
+func TestExecutePlanRefusesDropTablesWhenWhatAnApplyChangesCannotBeRead(t *testing.T) {
+	const prefix = "check drop_tables for payments/staging against applies that may still resume: "
+	for _, tc := range []struct {
+		name          string
+		unsettledErr  error
+		planID        int64
+		stored        bool
+		planReadErr   error
+		operationsErr error
+		want          string
+	}{
+		{name: "the unsettled applies cannot be listed", unsettledErr: errors.New("storage unavailable"), want: prefix + "storage unavailable"},
+		{name: "the apply names no plan", want: prefix + "apply apply-7f3a: neither the apply nor its operations name a plan, so the tables the apply changes are unknown"},
+		{name: "the named plan is not stored", planID: 7, want: prefix + "apply apply-7f3a: plan 7 is not stored, so the tables the apply changes are unknown"},
+		{name: "the plan cannot be read", planID: 7, stored: true, planReadErr: errors.New("plan read failed"), want: prefix + "apply apply-7f3a: load plan 7: plan read failed"},
+		{name: "the operations cannot be listed", planID: 7, stored: true, operationsErr: errors.New("operations unavailable"), want: prefix + "apply apply-7f3a: list operations: operations unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply, plan := applyAltering("apply-7f3a", state.Apply.Stopped, "payments", "staging", 11, tc.planID, "orders")
+			plans := &storedPlans{byID: map[int64]*storage.Plan{}, readErr: tc.planReadErr}
+			if tc.stored {
+				plans.byID[tc.planID] = plan
+			}
+			client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-drops"}}
+			svc := dropTablesService(plans,
+				&unsettledApplyStore{unsettled: []*storage.Apply{apply}, err: tc.unsettledErr},
+				&staticApplyOperationStore{err: tc.operationsErr}, client)
+
+			_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+				Database:    "payments",
+				Environment: "staging",
+				Type:        storage.DatabaseTypeMySQL,
+				SchemaFiles: map[string]*ternv1.SchemaFiles{
+					"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+				},
+				DropTables: []string{"_users_old"},
+			})
+
+			require.EqualError(t, err, tc.want)
+			_, checkFailed := errors.AsType[*DropTablesCheckError](err)
+			assert.True(t, checkFailed, "a read failure is typed so a PR comment shows a fixed line instead of its cause")
+			assert.Nil(t, client.planReq, "nothing is planned when what the apply changes is unknown")
+			assert.Nil(t, plans.created)
+		})
+	}
+}
+
+// The API answers a drop of a working table with 409 and the active-apply
+// code, naming the apply, so a client can tell a refusal it resolves from a
+// server error. The plan and the apply handlers answer it the same way.
+func TestHandlersAnswer409ForADropOfAnUnsettledApplysWorkingTable(t *testing.T) {
+	t.Run("plan", func(t *testing.T) {
+		apply, plan := applyAltering("apply-7f3a", state.Apply.Stopped, "payments", "staging", 11, 7, "users")
+		client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-drops"}}
+		svc := dropTablesService(&storedPlans{byID: map[int64]*storage.Plan{7: plan}},
+			&unsettledApplyStore{unsettled: []*storage.Apply{apply}}, nil, client)
+		rec := postJSON(t, svc.handlePlan, "/api/plan", PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: map[string]*ternv1.SchemaFiles{
+				"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+			},
+			DropTables: []string{"_users_new"},
+		})
+
+		assert.Equal(t, http.StatusConflict, rec.Code)
+		assert.Contains(t, rec.Body.String(), apitypes.ErrCodeActiveApplyExists)
+		assert.Contains(t, rec.Body.String(), "plan rejected: drop_tables entry \\\"_users_new\\\" is a working table of apply apply-7f3a")
+		assert.Nil(t, client.planReq)
+	})
+	t.Run("apply", func(t *testing.T) {
+		svc, created, _ := applyServiceWithAStoppedApplyOnUsers()
+		rec := postJSON(t, svc.handleApply, "/api/apply", ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+		assert.Equal(t, http.StatusConflict, rec.Code)
+		assert.Contains(t, rec.Body.String(), apitypes.ErrCodeActiveApplyExists)
+		assert.Contains(t, rec.Body.String(), "apply rejected: drop_tables entry \\\"_users_new\\\" is a working table of apply apply-7f3a")
+		assert.Nil(t, created.apply)
+	})
+}
+
+// postJSON sends body to handler as a JSON POST to path and returns the
+// recorded response.
+func postJSON(t *testing.T, handler http.HandlerFunc, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	encoded, err := json.Marshal(body)
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, bytes.NewReader(encoded))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	return rec
+}
+
+// A table listed under both drop_tables and ignore_tables is refused before
+// any data plane is asked to plan. The engine refuses the overlap too, but a
+// data plane that predates drop_tables reads only ignore_tables and would
+// withhold the table without a word, leaving the requested drop unplanned and
+// unreported.
+func TestPlanRefusesATableListedUnderDropAndIgnoreTables(t *testing.T) {
+	request := PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		IgnoreTables: []string{"orders_archive_2024"},
+		DropTables:   []string{"orders_archive_2024"},
+	}
+	const want = `drop_tables entry "orders_archive_2024" is also withheld by ignore_tables. Remove it from one of the two lists`
+
+	t.Run("API", func(t *testing.T) {
+		client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+		rec := postJSON(t, withheldDropService(&capturingPlanStore{}, client).handlePlan, "/api/plan", request)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), `drop_tables entry \"orders_archive_2024\" is also withheld by ignore_tables`)
+		assert.Nil(t, client.planReq)
+	})
+	t.Run("pull request", func(t *testing.T) {
+		client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+		_, err := withheldDropService(&capturingPlanStore{}, client).ExecutePlan(t.Context(), request)
+
+		require.EqualError(t, err, want)
+		assert.Nil(t, client.planReq)
+	})
+}
+
+// A data plane that predates drop_tables plans as though the list were empty:
+// the listed leftover stays, disclosed as a table skipped by its name. The
+// plan is kept, because that is the outcome the repository had before it
+// asked, and the server logs the entries it did not drop so an operator can
+// tell why the drop is missing.
+func TestExecutePlanLogsDropTablesEntriesAnOlderDataPlaneIgnored(t *testing.T) {
+	plans := &capturingPlanStore{}
+	client := &mockTernClient{planResp: &ternv1.PlanResponse{
+		PlanId: "plan-old-data-plane",
+		ExemptTables: []*ternv1.ExemptTables{
+			{Namespace: "payments", Tables: []string{"_orders_old"}, Reason: engine.ExemptReasonLeadingUnderscore},
+		},
+	}}
+	svc := withheldDropService(plans, client)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
 
 	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
 		Database:    "payments",
@@ -183,20 +337,20 @@ func TestExecutePlanRefusesDropTablesWhenUnsettledAppliesCannotBeRead(t *testing
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
 		},
-		DropTables: []string{"_users_old"},
+		DropTables: []string{"_orders_old"},
 	})
 
-	require.EqualError(t, err, "check drop_tables for payments/staging against applies that may still resume: storage unavailable")
-	_, inUse := errors.AsType[*DropTablesInUseError](err)
-	assert.False(t, inUse, "a storage failure is a server error, not a refusal of the request")
-	assert.Nil(t, client.planReq)
-	assert.Nil(t, plans.created)
+	require.NoError(t, err)
+	assert.NotNil(t, plans.created, "the plan is kept")
+	assert.Contains(t, logs.String(), "plan does not drop drop_tables entries that the planner still skips by their names")
+	assert.Contains(t, logs.String(), "ignored_entries=[_orders_old]")
 }
 
-// Storage admits a new apply past a stopped one, so an apply can be stopped
-// after a plan listing its copy was made. Apply creation runs the same check
-// against the plan's recorded drop list and refuses before anything is stored.
-func TestExecuteApplyRefusesDropOfAWorkingTableOfAnApplyStoppedAfterThePlan(t *testing.T) {
+// applyServiceWithAStoppedApplyOnUsers wires a service whose stored plan-1
+// for testdb in staging lists _users_new under drop_tables, while apply-7f3a,
+// which alters users, is stopped there. created captures an apply if one is
+// ever stored.
+func applyServiceWithAStoppedApplyOnUsers() (*Service, *capturingApplyStore, *capturingTaskStore) {
 	plan := executeApplyTestPlan()
 	plan.RecordDropTables([]string{"_users_new"})
 	stopped, stoppedPlan := applyAltering("apply-7f3a", state.Apply.Stopped, "testdb", "staging", 11, 7, "users")
@@ -212,6 +366,14 @@ func TestExecuteApplyRefusesDropOfAWorkingTableOfAnApplyStoppedAfterThePlan(t *t
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": &mockTernClient{},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return svc, created, tasks
+}
+
+// Storage admits a new apply past a stopped one, so an apply can be stopped
+// after a plan listing its copy was made. Apply creation runs the same check
+// against the plan's recorded drop list and refuses before anything is stored.
+func TestExecuteApplyRefusesDropOfAWorkingTableOfAnApplyStoppedAfterThePlan(t *testing.T) {
+	svc, created, tasks := applyServiceWithAStoppedApplyOnUsers()
 
 	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
 

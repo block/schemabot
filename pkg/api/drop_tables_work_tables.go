@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -45,6 +46,38 @@ func (e *DropTablesInUseError) Error() string {
 		e.Entry, e.ApplyID, owner, remedy)
 }
 
+// DropTablesCheckError is the working-table check failing to read what the
+// applies that have not settled change. The drop is refused, since it cannot
+// be shown safe. The cause is storage's, so a PR comment shows a fixed line
+// and the server log carries the cause.
+type DropTablesCheckError struct {
+	Database    string
+	Environment string
+	Err         error
+}
+
+func (e *DropTablesCheckError) Error() string {
+	return fmt.Sprintf("check drop_tables for %s/%s against applies that may still resume: %v", e.Database, e.Environment, e.Err)
+}
+
+func (e *DropTablesCheckError) Unwrap() error { return e.Err }
+
+// refuseDropTablesAlsoIgnored refuses a request whose drop_tables names a
+// table its ignore_tables withholds. The engine refuses the same overlap, but
+// a data plane that predates drop_tables reads only ignore_tables and would
+// withhold the table without a word, so the control plane refuses it first.
+func refuseDropTablesAlsoIgnored(dropTables, ignoreTables []string) error {
+	drops, err := engine.NewDroppedTables(dropTables)
+	if err != nil {
+		return err
+	}
+	ignored, err := engine.NewIgnoredTables(ignoreTables)
+	if err != nil {
+		return err
+	}
+	return drops.RefuseIgnored(ignored)
+}
+
 // refuseDropsOfUnsettledApplyWorkTables refuses drop_tables entries that name a
 // working table of an apply on the same database and environment that has not
 // settled, stopped ones included, since a stopped apply resumes from its copy.
@@ -60,7 +93,9 @@ func (s *Service) refuseDropsOfUnsettledApplyWorkTables(ctx context.Context, dat
 	}
 	unsettled, err := s.storage.Applies().GetUnsettled(ctx)
 	if err != nil {
-		return fmt.Errorf("check drop_tables for %s/%s against applies that may still resume: %w", database, environment, err)
+		s.logger.Error("drop_tables refused: the applies that may still resume could not be read",
+			"database", database, "database_type", databaseType, "environment", environment, "drop_tables", dropTables, "error", err)
+		return &DropTablesCheckError{Database: database, Environment: environment, Err: err}
 	}
 	for _, apply := range unsettled {
 		if !appliesToSameDatabase(apply, database, databaseType, environment) {
@@ -70,7 +105,9 @@ func (s *Service) refuseDropsOfUnsettledApplyWorkTables(ctx context.Context, dat
 		}
 		owners, err := s.workTableOwners(ctx, apply)
 		if err != nil {
-			return fmt.Errorf("check drop_tables for %s/%s against apply %s: %w", database, environment, apply.ApplyIdentifier, err)
+			s.logger.Error("drop_tables refused: the tables an apply that may still resume changes could not be read",
+				append(apply.LogAttrs(), "drop_tables", dropTables, "error", err)...)
+			return &DropTablesCheckError{Database: database, Environment: environment, Err: fmt.Errorf("apply %s: %w", apply.ApplyIdentifier, err)}
 		}
 		for _, entry := range dropTables {
 			if table, ok := owners[entry]; ok {
