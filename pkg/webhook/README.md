@@ -180,6 +180,7 @@ schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] 
 | `skip-revert` | Yes | Make changes permanent |
 | `rollback <apply-id>` | Yes | Generate rollback plan |
 | `rollback-confirm` | Yes | Execute rollback |
+| `freeze approve <ovr-id>` | No (the request names it) | Approve a freeze override request from the pull request it was made on |
 | `fix-lint` | No | Auto-fix lint warnings |
 | `help` | No | Show command reference |
 
@@ -200,8 +201,17 @@ the flag, and rollbacks skip the freeze gate.
 A request from a pull request is recorded as `github:<login>` for both the
 commenter and the author, and only a pull request approves it: the API route
 refuses it, since a GitHub login cannot be matched to an API subject. The
-command that approves from a pull request arrives next; until then a request
-from a pull request stays pending and expires after 24 hours.
+command that approves it is `schemabot freeze approve <ovr-id>`, commented on
+that pull request by a member of a `freeze.github_teams` team
+(`handleFreezeApproveCommand`). It takes no `-e` and does not plan or check
+anything; the delivery's signature is the only authorization it needs, since
+approvers are their own list and not the admins and operators of PR commands.
+`api.Service.ApprovePullRequestOverride` decides it: the ID's shape, the team
+(read through the repository's installation, refusing when it cannot be read),
+that the request came from this pull request, and storage's refusals of the
+requester, the author, an approved request and an expired one. Approval is
+recorded as `github:<login>`. On an aggregate repo the request lives in one
+deployment, so the others stay silent on an unknown ID.
 
 ## Error Handling
 

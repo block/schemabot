@@ -25,3 +25,10 @@ func TestRenderHelpCommentListsOverrideFlag(t *testing.T) {
 	assert.Contains(t, rendered, "`--override \"<reason>\"`")
 	assert.Contains(t, rendered, "(apply, start and cutover)")
 }
+
+// The freeze approval is listed, and takes the override request's ID.
+func TestRenderHelpCommentListsFreezeApprove(t *testing.T) {
+	rendered := RenderHelpComment()
+	assert.Contains(t, rendered, "`schemabot freeze approve <ovr-id>`")
+	assert.Contains(t, rendered, "Approve a freeze override request asked for on this PR")
+}

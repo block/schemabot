@@ -27,6 +27,7 @@ func TestCommandSpecs_CoverEveryDispatcherAction(t *testing.T) {
 		action.Cutover,
 		action.Rollback,
 		action.RollbackConfirm,
+		action.Freeze,
 	}
 	for _, name := range required {
 		_, ok := specByName[name]

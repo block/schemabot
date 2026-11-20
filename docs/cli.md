@@ -639,6 +639,8 @@ and the recent ones.
 A second person approves a request to let one change through a freeze. Read it
 with `freeze override <ovr-id>` and approve it with `freeze approve <ovr-id>`.
 Only a verified member of `freeze.groups` other than the requester may approve.
+A request asked for on a pull request is approved there instead, by a
+`freeze.github_teams` member commenting `schemabot freeze approve <ovr-id>`.
 Each command prints the server's reason when it refuses.
 
 ## Follow and control a change

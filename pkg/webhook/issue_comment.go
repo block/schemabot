@@ -612,6 +612,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
+	case action.Freeze:
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
+			h.handleFreezeApproveCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "freeze approve started"})
 	case action.SkipRevert:
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
@@ -661,7 +666,9 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 //     lives in exactly one deployment's storage — non-owners silently skip the
 //     lookup miss (see silentOnUnscopedFanOut) and only the owner acts;
 //   - rollback-confirm routes by the pinned pending rollback plan for the
-//     PR/environment, held only by the deployment that posted the plan.
+//     PR/environment, held only by the deployment that posted the plan;
+//   - freeze approve routes by the override request identifier, which lives
+//     in exactly one deployment's storage; the others skip the lookup miss.
 //
 // An action outside the set requires an explicit -t until a single-owner
 // discriminator is established for it.
@@ -670,7 +677,8 @@ func actionFansOutUnscoped(a string) bool {
 	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock,
 		action.Rollback, action.RollbackConfirm,
 		action.Stop, action.Cancel, action.Start, action.Release,
-		action.Cutover, action.SkipRevert, action.Revert:
+		action.Cutover, action.SkipRevert, action.Revert,
+		action.Freeze:
 		return true
 	default:
 		return false
