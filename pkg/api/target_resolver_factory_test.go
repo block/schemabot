@@ -254,7 +254,7 @@ func TestBuildCredentialResolverAWSSMValidatesRegionsBeforeLoadingAWSConfig(t *t
 	cfg.SecretsManagerEndpoints = map[string]string{"us-west-2": "http://secretsmanager.us-west-2.example.internal"}
 	_, err = buildCredentialResolver(t.Context(), cfg, nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `target_resolver.etre.credentials.secrets_manager_endpoints: secrets manager endpoint for region "us-west-2": "http://secretsmanager.us-west-2.example.internal" must use https`)
+	assert.Contains(t, err.Error(), `target_resolver.etre.credentials.secrets_manager_endpoints: secrets manager endpoint for region "us-west-2": endpoint URL must use https`)
 	assert.NotContains(t, err.Error(), "load AWS config")
 }
 

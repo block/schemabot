@@ -661,28 +661,35 @@ func TestNewValidatesSecretsManagerEndpoints(t *testing.T) {
 	_, err := New(ok)
 	require.NoError(t, err)
 
-	cases := map[string]map[string]string{
-		`secrets manager endpoint for region "eu-west-1": the region is neither the home region nor a reachable region`: {"eu-west-1": "https://secretsmanager.example.internal"},
-		`secrets manager endpoint for region "us-east-1": "http://secretsmanager.example.internal" must use https`:      {"us-east-1": "http://secretsmanager.example.internal"},
-		`secrets manager endpoint for region "us-east-1": "secretsmanager.example.internal" must use https`:             {"us-east-1": "secretsmanager.example.internal"},
-		`secrets manager endpoint for region "us-east-1": "https://" names no host`:                                     {"us-east-1": "https://"},
-		`secrets manager endpoint for region "us-east-1": "https://secretsmanager.example.internal/v1" must not have a path`: {
-			"us-east-1": "https://secretsmanager.example.internal/v1",
-		},
-		`secrets manager endpoint for region "us-east-1": "https://secretsmanager.example.internal?x=1" must not have a query or fragment`: {
-			"us-east-1": "https://secretsmanager.example.internal?x=1",
-		},
-		`secrets manager endpoint for region "us-east-1": endpoint URL must not carry credentials`: {"us-east-1": "https://user:pass@secretsmanager.example.internal"},
+	cases := []struct {
+		name      string
+		endpoints map[string]string
+		want      string
+	}{
+		{"region not read in", map[string]string{"eu-west-1": "https://secretsmanager.example.internal"}, `secrets manager endpoint for region "eu-west-1": the region is neither the home region nor a reachable region`},
+		{"http", map[string]string{"us-east-1": "http://secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must use https`},
+		{"no scheme", map[string]string{"us-east-1": "secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must use https`},
+		{"no host", map[string]string{"us-east-1": "https://"}, `secrets manager endpoint for region "us-east-1": endpoint URL names no host`},
+		{"path", map[string]string{"us-east-1": "https://secretsmanager.example.internal/v1"}, `secrets manager endpoint for region "us-east-1": endpoint URL must not have a path`},
+		{"query", map[string]string{"us-east-1": "https://secretsmanager.example.internal?x=1"}, `secrets manager endpoint for region "us-east-1": endpoint URL must not have a query or fragment`},
+		{"credentials", map[string]string{"us-east-1": "https://user:pass@secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must not carry credentials`},
+		// A value the parser rejects, or reads as something other than a host
+		// URL, can still carry credentials, and the error never repeats it.
+		{"unparseable with credentials", map[string]string{"us-east-1": "https://user:pass@secretsmanager.example.internal:bad"}, `secrets manager endpoint for region "us-east-1": endpoint is not a valid URL`},
+		{"opaque with credentials", map[string]string{"us-east-1": "user:pass@secretsmanager.example.internal"}, `secrets manager endpoint for region "us-east-1": endpoint URL must use https`},
 		// Regions are checked in sorted order, so the first bad entry reported is stable.
-		`secrets manager endpoint for region "ap-south-1"`: {"us-east-1": "http://a.example.internal", "ap-south-1": "https://b.example.internal"},
+		{"sorted", map[string]string{"us-east-1": "http://a.example.internal", "ap-south-1": "https://b.example.internal"}, `secrets manager endpoint for region "ap-south-1"`},
 	}
-	for want, endpoints := range cases {
-		cfg := base
-		cfg.SecretsManagerEndpoints = endpoints
-		_, err := New(cfg)
-		require.Error(t, err, want)
-		assert.Contains(t, err.Error(), want)
-		assert.NotContains(t, err.Error(), "pass", "an endpoint's credentials never reach the error")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			cfg.SecretsManagerEndpoints = tc.endpoints
+			_, err := New(cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+			assert.NotContains(t, err.Error(), "pass", "an endpoint's credentials never reach the error")
+			assert.NotContains(t, err.Error(), "example.internal", "an endpoint's value never reaches the error")
+		})
 	}
 
 	err = ValidateSecretsManagerEndpoints("us-west-2", nil, map[string]string{"us-east-1": "https://secretsmanager.example.internal"})

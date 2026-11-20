@@ -312,22 +312,25 @@ func validateEndpoints(reachable map[string]bool, endpoints map[string]string) e
 
 // validateEndpointURL requires an https URL that names only a host (and
 // optionally a port). The SDK appends nothing a path could usefully prefix, and
-// credentials in the URL would end up in logs and errors.
+// credentials in the URL would end up in logs and errors. No error repeats the
+// value or the parser's message, which quotes it: a malformed value can carry
+// credentials the checks below never get to recognize, and the caller already
+// names the region and the configuration path.
 func validateEndpointURL(raw string) error {
 	u, err := url.Parse(raw)
 	switch {
 	case err != nil:
-		return fmt.Errorf("%q is not a URL: %w", raw, err)
+		return fmt.Errorf("endpoint is not a valid URL")
 	case u.User != nil:
 		return fmt.Errorf("endpoint URL must not carry credentials")
 	case u.Scheme != "https":
-		return fmt.Errorf("%q must use https", raw)
+		return fmt.Errorf("endpoint URL must use https")
 	case u.Hostname() == "":
-		return fmt.Errorf("%q names no host", raw)
+		return fmt.Errorf("endpoint URL names no host")
 	case u.Path != "" && u.Path != "/":
-		return fmt.Errorf("%q must not have a path", raw)
+		return fmt.Errorf("endpoint URL must not have a path")
 	case u.RawQuery != "" || u.Fragment != "":
-		return fmt.Errorf("%q must not have a query or fragment", raw)
+		return fmt.Errorf("endpoint URL must not have a query or fragment")
 	}
 	return nil
 }
